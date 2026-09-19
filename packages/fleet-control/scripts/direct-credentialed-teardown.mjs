@@ -2,6 +2,7 @@
 
 import { isDeepStrictEqual } from 'node:util';
 
+import { databaseExportReceiptKey } from '../src/export-file-name.ts';
 import { validateDirectConformanceConfig } from './direct-credentialed-conformance-config.mjs';
 import {
   bucketPages,
@@ -175,7 +176,7 @@ function confirmedExportKeys(scenario, prefix) {
   const add = (proof) => {
     const receipt = proof?.receipt;
     if (!receipt) refuse('invalid-state');
-    const key = `${prefix}/receipts/v1/${receipt.databaseId}/${receipt.operationId}.sql`;
+    const key = databaseExportReceiptKey(prefix, receipt);
     if (!keys.includes(key)) keys.push(key);
   };
   add(scenario?.proofs.exports.a);

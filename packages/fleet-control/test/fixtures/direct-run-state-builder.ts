@@ -21,6 +21,7 @@ import {
 } from '../../scripts/direct-credentialed-run-state.mjs';
 import type { DirectScenarioState } from '../../scripts/direct-credentialed-scenario.mjs';
 import { DIRECT_SCENARIO_PHASES } from '../../scripts/direct-credentialed-scenario-budget.mjs';
+import { databaseExportReceiptKey } from '../../src/export-file-name.js';
 
 export const directories: string[] = [];
 export const journals = new Set<DirectRunJournal>();
@@ -641,8 +642,7 @@ export const EXPORT_IDENTITY = {
 } as const;
 
 export function exportKey(prefix: string, role: 'a' | 'b') {
-  const { databaseId, operationId } = EXPORT_IDENTITY[role];
-  return `${prefix}/receipts/v1/${databaseId}/${operationId}.sql`;
+  return databaseExportReceiptKey(prefix, EXPORT_IDENTITY[role]);
 }
 
 export function completeScenario(): MutableScenario {

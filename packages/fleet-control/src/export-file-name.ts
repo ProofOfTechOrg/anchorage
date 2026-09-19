@@ -3,6 +3,14 @@
 const FILE_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const WINDOWS_DEVICE_NAME = /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)/i;
 
+export function databaseExportReceiptKey(
+  resourcePrefix: string,
+  identity: { readonly databaseId: string; readonly operationId: string },
+): string {
+  const prefix = resourcePrefix === '' ? '' : `${resourcePrefix}/`;
+  return `${prefix}receipts/v1/${identity.databaseId}/${identity.operationId}.sql`;
+}
+
 export function isPortablePathSegment(value: string): boolean {
   return (
     FILE_NAME_PATTERN.test(value) &&

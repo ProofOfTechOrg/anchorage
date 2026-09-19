@@ -3,7 +3,10 @@
 import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { exactActiveVersionId } from '../src/active-route.ts';
-import { isPortablePathSegment } from '../src/export-file-name.ts';
+import {
+  databaseExportReceiptKey,
+  isPortablePathSegment,
+} from '../src/export-file-name.ts';
 import { providerBindingsToPlainWorkerShape } from '../src/provider-binding-inventory.ts';
 import { cancelBodyWithoutAwait } from './direct-credentialed-body-cancel.mjs';
 import {
@@ -639,7 +642,7 @@ export async function verifyDirectDecommissionExport(input) {
     integer(metadata.generation);
     integer(metadata.size, 1);
     hash(metadata.sha256);
-    key = `${ctx.config.resourcePrefix}/receipts/v1/${receipt.databaseId}/${receipt.operationId}.sql`;
+    key = databaseExportReceiptKey(ctx.config.resourcePrefix, receipt);
   } catch {
     refuse('invalid-input');
   }

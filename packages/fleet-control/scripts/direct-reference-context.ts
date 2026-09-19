@@ -25,6 +25,7 @@ import {
   deploymentSpecDigest,
   type FleetRecord,
 } from '@proofoftech/fleet-control/cloudflare-control-plane';
+import { databaseExportReceiptKey } from '../src/export-file-name.js';
 import type { DirectRunManifest } from './direct-credentialed-conformance-preflight.mjs';
 import {
   type DirectFixtureRelease,
@@ -372,7 +373,7 @@ export async function createDirectReferenceContext(
         expectedSize < 1
       )
         refused();
-      const key = `${manifest.resourcePrefix}/receipts/v1/${identity.databaseId}/${identity.operationId}.sql`;
+      const key = databaseExportReceiptKey(manifest.resourcePrefix, identity);
       const expected = {
         anchorageReceiptVersion: '1',
         anchorageReceiptAuthority: authority,
