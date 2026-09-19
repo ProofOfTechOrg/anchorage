@@ -281,9 +281,8 @@ export function useRunPolling(
       }
     }
 
-    // Returns true once every tracked run is finished or abandoned — the only
-    // two ways polling can stop. A swallowed error used to render as a plausible
-    // 'pending' that never became terminal, so a broken run polled forever.
+    // Failed status reads stay visible as errors; abandonment limits retries
+    // when a run remains unavailable.
     async function poll(): Promise<boolean> {
       const pollable = pollableRuns(runs, healthy);
       if (pollable.length === 0) {

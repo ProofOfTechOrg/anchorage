@@ -450,8 +450,6 @@ describe('piiSecrets', () => {
       // #given — a 20-char base64-class run. Shannon entropy ceilings at
       // log2(20) ~= 4.32 < the 4.5-bit default, so a length-20 candidate can
       // never reach the threshold; the {23} floor drops it as a candidate.
-      // Red-first: the prior {20} floor matched it — a dead zone of candidates
-      // that could never fire.
       const twentyCharCandidate = 'aB3xQ9mK7pL2vN8fR4tY';
 
       // #when / #then — white-box: the candidate regex finds no match

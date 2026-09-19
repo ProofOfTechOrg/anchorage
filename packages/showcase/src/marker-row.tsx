@@ -1,5 +1,5 @@
-// A marker glyph beside its text, in the row styling the explainer surfaces
-// share.
+// Shared spacing and typography keep explanatory rows consistent without
+// duplicating the layout for markers and text.
 
 import { HStack } from '@astryxdesign/core/HStack';
 import { Text } from '@astryxdesign/core/Text';
