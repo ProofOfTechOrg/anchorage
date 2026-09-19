@@ -17,6 +17,18 @@ export { DIRECT_MAX_UPLOAD_BYTES } from './direct-credentialed-conformance-limit
 export const DIRECT_MANIFEST_MODULE = 'direct-run-manifest.js';
 
 const REFERENCE_CORE_MODULES = new Set(['crypto', 'async_hooks', 'buffer']);
+
+// The Node builtins a tenant artifact's bundle is observed to reach for: a
+// self-containment check on the bundler's output and a tripwire on the
+// artifact's host-API surface. `inspectImport` decides what it governs. A
+// builtin the bundle reaches for and this set lacks reds
+// `test/direct-credentialed-artifacts.test.ts`; a member the bundle stops
+// reaching for reds nothing. The set grants no capability — `child_process`
+// and `fs` are already here — and it is not an egress control. `dns`, `http`,
+// `https` and `net` are here because `@mastra/core`'s built-in web-fetch tool
+// resolves through, screens with and connects over them rather than the
+// ambient `fetch`, and the module graph behind `@mastra/core/workflows` — the
+// subpath flowsafe's durable-object runner imports — retains that tool.
 const TENANT_CORE_MODULES = new Set([
   'stream',
   'child_process',
@@ -32,10 +44,25 @@ const TENANT_CORE_MODULES = new Set([
   'url',
   'path/posix',
   'string_decoder',
+  'dns',
+  'http',
+  'https',
+  'net',
 ]);
 
-function invalid(field) {
-  return new Error(`direct conformance preflight has invalid ${field}`);
+const PREFLIGHT_REFUSAL = Symbol('direct conformance preflight refusal');
+
+function invalid(field, options) {
+  const error = new Error(
+    `direct conformance preflight has invalid ${field}`,
+    options,
+  );
+  Object.defineProperty(error, PREFLIGHT_REFUSAL, { value: true });
+  return error;
+}
+
+function isPreflightRefusal(value) {
+  return value instanceof Error && value[PREFLIGHT_REFUSAL] === true;
 }
 
 function sha256(bytes) {
@@ -122,8 +149,11 @@ function inspectModule(text, reference, field, wasm) {
   if (syntax.status !== 0) throw invalid(`${field} JavaScript`);
   try {
     inspectModuleStructure(text, reference, field, wasm);
-  } catch {
-    throw invalid(`${field} module inspection`);
+  } catch (cause) {
+    throw invalid(
+      `${field} module inspection`,
+      isPreflightRefusal(cause) ? { cause } : undefined,
+    );
   }
 }
 
@@ -198,7 +228,9 @@ function inspectModuleStructure(text, reference, field, wasm) {
       specifier.text !== 'cloudflare:workers' &&
       !coreModules.has(specifier.text.replace(/^node:/, ''))
     ) {
-      throw invalid(`${field} module dependency`);
+      throw invalid(
+        `${field} module dependency ${JSON.stringify(specifier.text.slice(0, 120))}`,
+      );
     }
   };
   const pending = [source];

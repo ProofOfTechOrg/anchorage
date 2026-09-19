@@ -149,6 +149,46 @@ describe('direct artifact preflight', () => {
   });
 
   it.each([
+    'dns',
+    'http',
+    'https',
+    'net',
+  ])('admits the static %s tenant dependency', async (dependency) => {
+    const f = await fixture(
+      REFERENCE,
+      `${TENANT}\nimport ${JSON.stringify(dependency)};`,
+    );
+    await expect(prepare(f.configPath)).resolves.toBeDefined();
+  });
+
+  it.each([
+    'dns',
+    'http',
+    'https',
+    'net',
+  ])('refuses the static %s reference dependency', async (dependency) => {
+    const f = await fixture(
+      `${REFERENCE}\nimport ${JSON.stringify(dependency)};`,
+      TENANT,
+    );
+    await expect(prepare(f.configPath)).rejects.toThrow(
+      /reference artifact module inspection/,
+    );
+  });
+
+  it('carries the refused dependency as the cause of a tenant inspection failure', async () => {
+    const f = await fixture(REFERENCE, `${TENANT}\nimport 'vm';`);
+    await expect(prepare(f.configPath)).rejects.toMatchObject({
+      message: expect.stringContaining('tenant artifact module inspection'),
+      cause: expect.objectContaining({
+        message: expect.stringContaining(
+          'tenant artifact module dependency "vm"',
+        ),
+      }),
+    });
+  });
+
+  it.each([
     'reference',
     'tenant',
   ] as const)('rejects unresolved star exports for the %s role', async (role) => {
@@ -194,8 +234,16 @@ describe('direct artifact preflight', () => {
       `direct conformance preflight has invalid ${role} artifact module inspection`,
     );
     // `toThrow(string)` is a substring match, so the replacement message alone
-    // would also pass for a message that carried the compiler's words too.
+    // would also pass for a message that carried the compiler's words too, and
+    // it reads `message` only, so the chain carries its own assertion: the
+    // preflight forwards a `cause` for its own refusals, and a compiler failure
+    // is not one of them.
     await expect(prepare(f.configPath)).rejects.not.toThrow(/secret-sentinel/u);
+    const failure = await prepare(f.configPath).catch(
+      (error: unknown) => error,
+    );
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).cause).toBeUndefined();
   });
 
   it.each([
