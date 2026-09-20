@@ -311,7 +311,6 @@ describe('direct conformance configuration', () => {
   it.each([
     ['referenceWorker', 'cpuLimitMs', 300_000],
     ['deployment', 'cpuLimitMs', 300_000],
-    ['referenceWorker', 'subrequestLimit', 10_000_000],
     ['deployment', 'subrequestLimit', 10_000_000],
     ['referenceWorker', 'requestTimeoutMs', 2_147_483_647],
     ['referenceWorker', 'invocationTimeoutMs', 2_147_483_647],
@@ -321,6 +320,22 @@ describe('direct conformance configuration', () => {
       expect(() => validate(changed([target, key], value))).toThrow();
     expect(() => validate(changed([target, key], 1))).not.toThrow();
     expect(() => validate(changed([target, key], maximum))).not.toThrow();
+  });
+
+  it('keeps the provider-request ceiling within the Worker subrequest limit', () => {
+    const above = changed(['referenceWorker', 'subrequestLimit'], 9);
+    objectAt(above, ['referenceWorker']).maxProviderRequests = 10;
+    expect(() => validate(above)).toThrow(
+      'direct conformance config has invalid referenceWorker.maxProviderRequests',
+    );
+
+    const equal = changed(['referenceWorker', 'subrequestLimit'], 9);
+    objectAt(equal, ['referenceWorker']).maxProviderRequests = 9;
+    expect(() => validate(equal)).not.toThrow();
+
+    const below = changed(['referenceWorker', 'subrequestLimit'], 10);
+    objectAt(below, ['referenceWorker']).maxProviderRequests = 9;
+    expect(() => validate(below)).not.toThrow();
   });
 
   it('uses the production inventory request-budget domain and a finite clock', () => {

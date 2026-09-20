@@ -313,7 +313,7 @@ export function describePlainWorkerConformance(
       );
       expect(harness.world.customDomains).toEqual([
         {
-          id: expect.any(String),
+          id: expect.stringMatching(/.+/u),
           hostname: spec.routeHostname,
           service: spec.scriptName,
         },
@@ -373,7 +373,7 @@ export function describePlainWorkerConformance(
 
       expect(stagedDeployment).toEqual([
         { versionId: initial.record.artifactVersion, percentage: 100 },
-        { versionId: expect.any(String), percentage: 0 },
+        { versionId: expect.stringMatching(/.+/u), percentage: 0 },
       ]);
       expect(stagedDigest).toBe(deploymentSpecDigest(targetSpec));
       expect(migrated).toMatchObject({
@@ -423,7 +423,7 @@ export function describePlainWorkerConformance(
         const script = harness.world.scripts.get(targetSpec.scriptName);
         expect(script?.deployment).toEqual([
           { versionId: initial.record.artifactVersion, percentage: 100 },
-          { versionId: expect.any(String), percentage: 0 },
+          { versionId: expect.stringMatching(/.+/u), percentage: 0 },
         ]);
         expect(harness.world.mutationLog).toContain(
           `deploy-candidate:${targetSpec.scriptName}`,

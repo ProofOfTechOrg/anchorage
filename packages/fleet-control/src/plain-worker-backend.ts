@@ -967,11 +967,11 @@ export class PlainWorkerBackend implements ProvisioningBackend {
     };
     const assertIdentity = (
       version: PlainWorkerVersionDetail,
-      requiredReleases: readonly ReleaseIdentity[],
+      admissibleReleaseIdentities: readonly ReleaseIdentity[],
     ): void => {
       const plainText = this.#plainTextBindings(version);
       const databaseIds = this.#databaseIds(version);
-      const release = requiredReleases.find(
+      const release = admissibleReleaseIdentities.find(
         (candidate) =>
           candidate.specDigest === plainText.get('FLEET_SPEC_DIGEST') &&
           String(candidate.releaseSchemaVersion) ===

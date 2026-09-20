@@ -1,4 +1,4 @@
-// The run status poll, extracted from the old showcase-panels RunStatusPanel.
+// Run-status polling and stream reconciliation for the run cards.
 // Self-scheduling 3s chain per effect run; a run stops being polled when it
 // reaches a terminal status or is abandoned (hard API error, or 5 consecutive
 // transient failures). Abandonment is surfaced on the RunResult (`stopped`) so
@@ -105,7 +105,7 @@ function isTransient(error: unknown): boolean {
  * Runs NOT covered by a healthy stream socket — what the poll must still
  * fetch. DL-021: the run channel is WHOLESALE, so a healthy socket fully owns
  * its run's result and the poll skips it; `healthy` stays empty in poll-only
- * mode, so this returns every run and the poll behaves exactly as before.
+ * mode, so this returns the tracked runs for polling.
  */
 export function pollableRuns(
   runs: readonly RunEntry[],
@@ -132,13 +132,14 @@ export function mergeRunResults(
   }
   for (const [runId, result] of entries) {
     // Keep the last good summary visible beneath the error banner.
-    next[runId] = result.error
-      ? {
-          summary: previous[runId]?.summary,
-          error: result.error,
-          stopped: result.stopped,
-        }
-      : result;
+    next[runId] =
+      result.error !== undefined
+        ? {
+            summary: previous[runId]?.summary,
+            error: result.error,
+            stopped: result.stopped,
+          }
+        : result;
   }
   return next;
 }
@@ -175,9 +176,8 @@ export function useRunPolling(
   // biome's exhaustive-deps misreads a defaulted parameter as an outer-scope
   // value.
   retryNonce: number,
-  // Optional live per-run stream. Absent => the poll below is the sole source
-  // (today's behavior, unchanged). Present => each run gets a WebSocket that
-  // pauses its poll while healthy (DL-021).
+  // Optional live per-run stream. Without it, polling supplies run status.
+  // With it, each run gets a WebSocket that pauses its poll while healthy.
   stream?: RunStreamOption,
 ): Record<string, RunResult> {
   const [results, setResults] = useState<Record<string, RunResult>>({});
@@ -205,15 +205,15 @@ export function useRunPolling(
     // a run's socket is healthy the poll PAUSES for it and the socket owns its
     // result; the poll resumes covering it on socket close/error. Per-effect-run
     // (like `abandoned`), so StrictMode's double invoke gets its own set + its
-    // own sockets. Never populated in poll-only mode, so the poll then covers
-    // every run exactly as before.
+    // own sockets. It stays empty in poll-only mode, so polling covers the
+    // tracked runs.
     const healthy = new Set<string>();
     const connections: StreamConnection[] = [];
 
     // Additive live subscription: one run-channel socket per tracked run. The
     // ticket thunk mints + shapes the run address; subscribeApprovalStream
-    // reconnects with backoff and parses each frame. Absent stream => skipped
-    // (poll-only, unchanged).
+    // reconnects with backoff and parses each frame. Without a stream, this
+    // subscription block is skipped.
     if (stream) {
       for (const run of runs) {
         const connection = subscribeApprovalStream({

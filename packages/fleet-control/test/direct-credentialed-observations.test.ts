@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { execFile } from 'node:child_process';
+import { access, rm } from 'node:fs/promises';
 import { promisify } from 'node:util';
 import {
   afterEach,
@@ -18,6 +19,7 @@ import {
 } from '../scripts/direct-credentialed-observations.mjs';
 import { expectBuiltDist } from './fixtures/built-dist.js';
 import {
+  closeDirectObservationFixture,
   directObservationFixture,
   OBSERVATION_TOKEN,
   observationHash,
@@ -80,9 +82,48 @@ beforeEach(() => {
 afterEach(async () => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
-  for (const f of fixtures.splice(0)) {
-    await f.close();
-    expect(f.unexpected).toEqual([]);
+  const cleanup = await Promise.all(
+    fixtures.splice(0).map(async (fixtureValue) => {
+      const failures: unknown[] = [];
+      try {
+        await fixtureValue.close();
+      } catch (error) {
+        failures.push(error);
+      }
+      try {
+        expect(fixtureValue.unexpected).toEqual([]);
+      } catch (error) {
+        failures.push(error);
+      }
+      return failures;
+    }),
+  );
+  const failures = cleanup.flat();
+  if (failures.length)
+    throw new AggregateError(failures, 'observation fixture cleanup failed');
+});
+
+it('removes the fixture directory when journal closure rejects', async () => {
+  const fixtureValue = await directObservationFixture();
+  const sentinel = new Error('journal-close-sentinel');
+  const closeJournal = fixtureValue.journal.close.bind(fixtureValue.journal);
+  try {
+    await expect(
+      closeDirectObservationFixture(
+        {
+          async close() {
+            await closeJournal();
+            throw sentinel;
+          },
+        },
+        fixtureValue.directory,
+      ),
+    ).rejects.toBe(sentinel);
+    await expect(access(fixtureValue.directory)).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+  } finally {
+    await rm(fixtureValue.directory, { recursive: true, force: true });
   }
 });
 

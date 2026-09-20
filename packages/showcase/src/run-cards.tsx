@@ -130,9 +130,10 @@ function RunCard({
 }): ReactElement {
   const summary = result?.summary;
   const pollError = result?.error;
+  const hasPollError = pollError !== undefined;
   // A failed STATUS READ is not a run status: say so, rather than rendering it
   // as a plausible-looking 'pending'.
-  const status = pollError ? UNAVAILABLE : (summary?.status ?? 'pending');
+  const status = hasPollError ? UNAVAILABLE : (summary?.status ?? 'pending');
   const susp =
     summary && status === 'suspended' ? suspensionOf(summary) : undefined;
   const guide = WORKFLOW_GUIDES[run.workflowId];
@@ -223,11 +224,11 @@ function RunCard({
           ) : null}
         </HStack>
         <StepChips workflowId={run.workflowId} suspendedStep={susp?.step} />
-        {pollError ? (
+        {hasPollError ? (
           <VStack gap={2}>
             <Banner
               status="error"
-              title={`Could not read run status: ${pollError}`}
+              title={`Could not read run status: ${pollError || UNAVAILABLE}`}
             />
             {result?.stopped ? (
               // Polling gave up (hard error or repeated transient failures);
@@ -240,7 +241,7 @@ function RunCard({
                   onClick={onRetryPolling}
                 />
                 <Text size="sm" color="secondary">
-                  Polling stopped after repeated failures.
+                  Polling stopped.
                 </Text>
               </HStack>
             ) : null}
@@ -296,7 +297,7 @@ function RunCard({
             )}
           </VStack>
         ) : null}
-        {summary?.result !== undefined || summary?.error ? (
+        {summary?.result !== undefined || summary?.error !== undefined ? (
           <VStack gap={2}>
             <HStack gap={2} align="center" wrap="wrap">
               {badge ? (
@@ -314,8 +315,11 @@ function RunCard({
                 {guide.shortCircuitNote}
               </Text>
             ) : null}
-            {summary.error ? (
-              <Banner status="error" title={summary.error} />
+            {summary.error !== undefined ? (
+              <Banner
+                status="error"
+                title={summary.error || 'No error details available'}
+              />
             ) : null}
             {summary.result !== undefined ? (
               <Collapsible

@@ -478,8 +478,11 @@ export async function teardownDirectReference(input) {
       const pending = teardown?.pending ?? null;
       if (pending && (pending.kind !== kind || pending.key !== key))
         refuse('invalid-state');
-      const merged = (rereadSettled) => {
-        const entry = { ...receipt(), ...settlement(rereadSettled) };
+      const merged = (receiptSettledByReread) => {
+        const entry = {
+          ...receipt(),
+          ...settlement(receiptSettledByReread),
+        };
         return {
           ...receipts,
           [field]: append ? [...receipts[field], entry] : entry,

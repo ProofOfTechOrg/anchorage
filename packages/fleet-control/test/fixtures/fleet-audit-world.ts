@@ -6,22 +6,12 @@
  * import this file; the recorder NEVER writes it, so the recorded literals can
  * never rewrite their own input.
  *
- * The world freezes the SHIPPED behavior of `auditFleetDrift` in
- * `src/fleet.ts` — the findings and collaborator calls its bounded stage
- * helpers and `auditRecordStep` produce — so any change to them is provably
- * behavior-equivalent. It drives every finding kind `auditFleetDrift` itself
- * pushes except `duplicate-database` (pinned exact-order by
- * `test/fleet.test.ts`'s "finds duplicate ownership, version drift, and
- * re-arms stale maintenance"); provider-supplied inventory-finding kinds are
- * represented by the single seeded `stale-route`. It also records both
- * the exact findings array AND the exact sequence of calls the function makes
- * onto its `store`, `backendFor`, `specFor`, and `maintenanceSecretFor`
- * collaborators (the "op log") — every
- * `withDeploymentLease`/`get`/`put`/`inspect`/`ensureMaintenance` call, every
- * `resolver:<kind>` invocation, and every `lease.assertOwned()` call (tagged
- * `assertOwned:<tenantTag>:<environment>`, the only op token that carries a
- * key — every other token is bare because relative order alone identifies it
- * against this frozen, single-pass world).
+ * The world freezes selected shipped behavior of `auditFleetDrift` in
+ * `src/fleet.ts`: its findings and the collaborator calls made by its bounded
+ * stage helpers and `auditRecordStep`. It records the findings array and an op
+ * log for calls through `store`, `backendFor`, `specFor`, and
+ * `maintenanceSecretFor`. Keyed lease assertions include the deployment key;
+ * bare tokens are identified by their position in this single-pass fixture.
  *
  * Most records are independent "stories", each engineered to trip one or a
  * few specific `findings.push(...)` sites in `auditFleetDrift`; a handful of

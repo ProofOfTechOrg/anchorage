@@ -28,6 +28,16 @@ vi.mock('../scripts/direct-reference-context.js', () => ({
 
 afterEach(() => vi.clearAllMocks());
 
+async function closeComposedFixtures(
+  closers: readonly (() => Promise<void>)[],
+): Promise<void> {
+  const failures = (
+    await Promise.allSettled(closers.map((close) => close()))
+  ).flatMap((result) => (result.status === 'rejected' ? [result.reason] : []));
+  if (failures.length)
+    throw new AggregateError(failures, 'composed fixture cleanup failed');
+}
+
 it.each([
   ...providerRefusalCases,
   {
@@ -141,9 +151,27 @@ it.each([
       expect(resumed.snapshot().lastInvocation?.state).toBe('settled');
     }
   } finally {
-    await resumed?.close();
-    await local.close();
+    await closeComposedFixtures([
+      () => resumed?.close() ?? Promise.resolve(),
+      () => local.close(),
+    ]);
   }
+});
+
+it('continues composed cleanup after the first closer rejects', async () => {
+  const calls: string[] = [];
+  const sentinel = new Error('resumed-close-sentinel');
+  const failure = closeComposedFixtures([
+    async () => {
+      calls.push('resumed');
+      throw sentinel;
+    },
+    async () => {
+      calls.push('local');
+    },
+  ]).catch((error: unknown) => error);
+  await expect(failure).resolves.toBeInstanceOf(AggregateError);
+  expect(calls).toEqual(['resumed', 'local']);
 });
 
 it('classifies a raw Promise.all dispatch rejection after attempts exhaust', async () => {

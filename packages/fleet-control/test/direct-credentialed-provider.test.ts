@@ -180,12 +180,12 @@ describe('the body-cancel leaf', () => {
     );
   });
 
-  it('hands the body and the reason to the built package on first call', async () => {
+  it('hands the body and reason through the pending module load', async () => {
     const cancel = vi.fn(() => Promise.resolve());
     const reason = new Error('refusal');
     expect(cancelBodyWithoutAwait({ cancel }, reason)).toBeUndefined();
-    await new Promise((listenReady) => {
-      setImmediate(listenReady);
+    await new Promise((resolveOnImmediate) => {
+      setImmediate(resolveOnImmediate);
     });
     // The load starts at module evaluation, so a release issued before it
     // resolves lands with it rather than on the next turn.
@@ -195,7 +195,7 @@ describe('the body-cancel leaf', () => {
     expect(cancel).toHaveBeenCalledWith(reason);
   });
 
-  it("issues a release in the calling turn once the leaf's load has resolved", async () => {
+  it('issues a release in the calling turn once the callable is cached', async () => {
     const first = vi.fn(() => Promise.resolve());
     cancelBodyWithoutAwait({ cancel: first }, new Error('warm'));
     await vi.waitFor(() => {
@@ -219,8 +219,8 @@ describe('the body-cancel leaf', () => {
     for (const absent of [undefined, null, {}, 'body'])
       expect(cancelBodyWithoutAwait(absent, reason)).toBeUndefined();
     expect(cancelBodyWithoutAwait(body, reason)).toBeUndefined();
-    await new Promise((serverClosed) => {
-      setImmediate(serverClosed);
+    await new Promise((resolveOnImmediate) => {
+      setImmediate(resolveOnImmediate);
     });
     await vi.waitFor(() => {
       expect(reads).toBe(1);

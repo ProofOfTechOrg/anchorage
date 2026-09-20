@@ -2627,17 +2627,14 @@ describe('fleet operations', () => {
 
   it('commits the invocation authority before migration staging, candidate maintenance, and promotion dispatches', async () => {
     class TimelineFleetStore extends FleetStore {
-      private readonly timeline: string[];
-
-      constructor(eventTimeline: string[]) {
+      constructor(private readonly eventTimeline: string[]) {
         super();
-        this.timeline = eventTimeline;
       }
 
       override async put(value: FleetRecord): Promise<void> {
         await super.put(value);
         const carrier = value.invocationAuthority;
-        this.timeline.push(
+        this.eventTimeline.push(
           `put:${value.phase}:${
             carrier
               ? carrier.authorizedAt === null

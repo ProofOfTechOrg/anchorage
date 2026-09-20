@@ -76,21 +76,12 @@ describe('direct reference HTTP boundary', () => {
       new Error('complete attachment scan returned an early match'),
     ],
     [
-      'R2 suffix',
-      new Error("R2 returned incomplete metadata for 'fixture-bucket' secret"),
-    ],
-    [
       'R2 newline',
       new Error("R2 returned incomplete metadata for 'fixture-bucket'\n"),
     ],
     [
       'date newline',
       new Error("R2 bucket 'fixture-bucket' has no valid creation date\n"),
-    ],
-    ['illegal bucket', new Error("R2 returned incomplete metadata for '-bad'")],
-    [
-      'oversize bucket',
-      new Error(`R2 returned incomplete metadata for '${'a'.repeat(64)}'`),
     ],
     [
       'wrong class',
@@ -132,6 +123,48 @@ describe('direct reference HTTP boundary', () => {
       ok: false,
       error: { code: 'operation-refused' },
     });
+    expect(response.headers.get('cache-control')).toBe('no-store');
+  });
+
+  const r2Messages = [
+    (name: string) => `R2 returned incomplete metadata for '${name}'`,
+    (name: string) => `R2 bucket '${name}' has no valid creation date`,
+  ];
+
+  it.each(
+    r2Messages.flatMap((message) =>
+      ['ab', '-bad', 'bad-', 'a'.repeat(64), 'private/token', 'UPPER'].map(
+        (name) => [message(name), name] as const,
+      ),
+    ),
+  )('keeps malformed R2 bucket %s at fixed 500', async (message) => {
+    const { handle, dispatch } = fixture();
+    dispatch.mockRejectedValue(new Error(message));
+    const response = await handle(request());
+    expect(response.status).toBe(500);
+    expect(await response.json()).toEqual({
+      contractVersion: 1,
+      ok: false,
+      error: { code: 'operation-refused' },
+    });
+    expect(response.headers.get('cache-control')).toBe('no-store');
+  });
+
+  it.each(
+    r2Messages.flatMap((message) =>
+      ['abc', 'a'.repeat(63)].map((name) => [message(name), name] as const),
+    ),
+  )('classifies bounded R2 bucket %s as a fixed 409', async (message) => {
+    const { handle, dispatch } = fixture();
+    dispatch.mockRejectedValue(new Error(message));
+    const response = await handle(request());
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({
+      contractVersion: 1,
+      ok: false,
+      error: { code: 'operation-refused' },
+    });
+    expect(response.headers.get('cache-control')).toBe('no-store');
   });
 
   it('snapshots signature properties once', async () => {
@@ -501,9 +534,8 @@ describe('direct reference HTTP boundary inside workerd', () => {
   beforeAll(async () => {
     directory = await mkdtemp(join(tmpdir(), 'direct-http-'));
     const main = join(directory, 'worker.ts');
-    // The 100 ms invocation deadline belongs to the probe modes, whose bodies
-    // never settle; a request without a probe carries a deadline wide enough
-    // that the workerd round trip cannot spend it.
+    // Probe modes use a short deadline to bound bodies that do not settle. The
+    // ordinary request uses the production-scale fixture deadline.
     await writeFile(
       main,
       `import {handleDirectReferenceHttpRequest} from ${JSON.stringify(fileURLToPath(new URL('../scripts/direct-reference-http.ts', import.meta.url)))};

@@ -275,6 +275,8 @@ export function validateDirectConformanceConfig(value, options = {}) {
   );
   if (maxProviderRequests < 9)
     throw invalid('referenceWorker.maxProviderRequests');
+  if (maxProviderRequests > referenceRuntime.subrequestLimit)
+    throw invalid('referenceWorker.maxProviderRequests');
   const deployment = object(
     input.deployment,
     [...RUNTIME_KEYS, 'spec'],

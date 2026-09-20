@@ -6,7 +6,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { preflightDirectConformance } from '../../scripts/direct-credentialed-conformance-preflight.mjs';
 import type { DirectExpectedWorkerVersion } from '../../scripts/direct-credentialed-observations.mjs';
-import { openDirectRunState } from '../../scripts/direct-credentialed-run-state.mjs';
+import {
+  type DirectRunJournal,
+  openDirectRunState,
+} from '../../scripts/direct-credentialed-run-state.mjs';
 import type { DirectReferenceAction } from '../../scripts/direct-reference-contract.mjs';
 import type { DirectDecommissionExportMetadata } from '../../scripts/direct-reference-lifecycle.js';
 
@@ -25,6 +28,17 @@ export type ObservationHook = (
   request: Request,
   fallback: () => Response,
 ) => Response | Promise<Response>;
+
+export async function closeDirectObservationFixture(
+  journal: Pick<DirectRunJournal, 'close'>,
+  directory: string,
+): Promise<void> {
+  try {
+    await journal.close();
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+}
 
 export async function directObservationFixture(
   timeout = 1000,
@@ -424,8 +438,7 @@ export async function directObservationFixture(
       };
     },
     async close() {
-      await journal.close();
-      await rm(directory, { recursive: true, force: true });
+      await closeDirectObservationFixture(journal, directory);
     },
   };
 }

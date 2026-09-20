@@ -18,17 +18,11 @@ export const DIRECT_MANIFEST_MODULE = 'direct-run-manifest.js';
 
 const REFERENCE_CORE_MODULES = new Set(['crypto', 'async_hooks', 'buffer']);
 
-// The Node builtins a tenant artifact's bundle is observed to reach for: a
-// self-containment check on the bundler's output and a tripwire on the
-// artifact's host-API surface. `inspectImport` decides what it governs. A
-// builtin the bundle reaches for and this set lacks reds
-// `test/direct-credentialed-artifacts.test.ts`; a member the bundle stops
-// reaching for reds nothing. The set grants no capability — `child_process`
-// and `fs` are already here — and it is not an egress control. `dns`, `http`,
-// `https` and `net` are here because `@mastra/core`'s built-in web-fetch tool
-// resolves through, screens with and connects over them rather than the
-// ambient `fetch`, and the module graph behind `@mastra/core/workflows` — the
-// subpath flowsafe's durable-object runner imports — retains that tool.
+// Node builtins admitted for literal tenant imports. `inspectImport` applies
+// this list to static declarations and literal dynamic imports; computed tenant
+// imports remain a runtime concern. The set grants no capability and is not an
+// egress control. `dns`, `http`, `https` and `net` support the web-fetch tool
+// retained by the module graph behind `@mastra/core/workflows`.
 const TENANT_CORE_MODULES = new Set([
   'stream',
   'child_process',

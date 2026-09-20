@@ -2694,22 +2694,22 @@ async function seedInventoryGeneration(
   rows: readonly FleetInventoryStagedRow[] = inventoryRows(`gen-${index}`),
   facts: readonly FleetInventoryStagedFact[] = inventoryFacts(),
 ): Promise<number> {
-  const inventoryRunId = inventoryOperationId(index);
+  const inventoryRunOperationId = inventoryOperationId(index);
   return store.withAccountInventoryLease(async (lease) => {
     const started = await lease.startRun({
-      operationId: inventoryRunId,
+      operationId: inventoryRunOperationId,
       options: INVENTORY_OPTIONS,
       optionsDigest: INVENTORY_DIGEST,
     });
     const committedRun = await lease.commitChunk({
-      operationId: inventoryRunId,
+      operationId: inventoryRunOperationId,
       expectedRevision: started.progress.revision,
       runRecord: inventoryCommitted(started, rows, facts),
       rows,
       facts,
     });
     const ref = await lease.finalizeRun({
-      operationId: inventoryRunId,
+      operationId: inventoryRunOperationId,
       expectedRevision: committedRun.progress.revision,
       manifest: committedRun.progress.stagedCounts,
       factCount: committedRun.progress.factCount,
@@ -2775,17 +2775,17 @@ async function inventoryCommitRefusal(
   await readyInventoryStore(db);
   const database = hideResultsDatabase(new D1FleetStateDatabase(db));
   const store = inventoryStore(database);
-  const inventoryRunId = inventoryOperationId(21);
+  const inventoryRunOperationId = inventoryOperationId(21);
   return store.withAccountInventoryLease(async (lease) => {
     const started = await lease.startRun({
-      operationId: inventoryRunId,
+      operationId: inventoryRunOperationId,
       options: INVENTORY_OPTIONS,
       optionsDigest: INVENTORY_DIGEST,
     });
     const seededRows = inventoryRows('prior');
     const seededFacts = inventoryFacts();
     const prior = await lease.commitChunk({
-      operationId: inventoryRunId,
+      operationId: inventoryRunOperationId,
       expectedRevision: 0,
       runRecord: inventoryCommitted(started, seededRows, seededFacts),
       rows: seededRows,
@@ -2813,7 +2813,7 @@ async function inventoryCommitRefusal(
       [...seededFacts, fact],
     );
     const input = {
-      operationId: inventoryRunId,
+      operationId: inventoryRunOperationId,
       expectedRevision: prior.progress.revision,
       runRecord: intended,
       rows: fault === 'row-conflict' ? [row, existingRow] : [row],
@@ -2924,17 +2924,17 @@ async function inventoryCommitReplay(
   await readyInventoryStore(db);
   const database = hideResultsDatabase(new D1FleetStateDatabase(db));
   const store = inventoryStore(database);
-  const inventoryRunId = inventoryOperationId(22);
+  const inventoryRunOperationId = inventoryOperationId(22);
   return store.withAccountInventoryLease(async (lease) => {
     const started = await lease.startRun({
-      operationId: inventoryRunId,
+      operationId: inventoryRunOperationId,
       options: INVENTORY_OPTIONS,
       optionsDigest: INVENTORY_DIGEST,
     });
     const rows = inventoryRows('prior');
     const facts = inventoryFacts();
     const input = {
-      operationId: inventoryRunId,
+      operationId: inventoryRunOperationId,
       expectedRevision: 0,
       runRecord: inventoryCommitted(started, rows, facts),
       rows,
@@ -2950,7 +2950,7 @@ async function inventoryCommitReplay(
     switch (change) {
       case 'failed':
         await lease.failRun({
-          operationId: inventoryRunId,
+          operationId: inventoryRunOperationId,
           expectedRevision: accepted.progress.revision,
           reason: 'operator-abandoned',
         });
@@ -3084,7 +3084,7 @@ async function inventoryMaximumChunk(db: D1Database): Promise<unknown> {
 
 async function inventoryStartAtomicity(db: D1Database): Promise<unknown> {
   await readyInventoryStore(db);
-  const inventoryRunId = inventoryOperationId(0);
+  const inventoryRunOperationId = inventoryOperationId(0);
   const stores = Array.from({ length: 16 }, () =>
     inventoryStore(new D1FleetStateDatabase(db)),
   );
@@ -3092,7 +3092,7 @@ async function inventoryStartAtomicity(db: D1Database): Promise<unknown> {
     stores.map((store) =>
       store.withAccountInventoryLease((lease) =>
         lease.startRun({
-          operationId: inventoryRunId,
+          operationId: inventoryRunOperationId,
           options: INVENTORY_OPTIONS,
           optionsDigest: INVENTORY_DIGEST,
         }),
@@ -3157,7 +3157,7 @@ async function inventoryCrossAccountStart(
   if (!firstStore || !secondStore) throw new Error('collision stores missing');
   await seedInventoryGeneration(firstStore, 24);
   await seedInventoryGeneration(secondStore, 25);
-  const inventoryRunId = inventoryOperationId(26);
+  const inventoryRunOperationId = inventoryOperationId(26);
   const nextOperationId = inventoryOperationId(27);
   const start = (store: D1FleetInventoryRunStore, id: string) =>
     store.withAccountInventoryLease((lease) =>
@@ -3168,11 +3168,11 @@ async function inventoryCrossAccountStart(
       }),
     );
   const before = await inventorySnapshot(db);
-  const first = start(firstStore, inventoryRunId);
+  const first = start(firstStore, inventoryRunOperationId);
   if (!concurrent) await first;
   const attempts = await Promise.allSettled([
     first,
-    start(secondStore, inventoryRunId),
+    start(secondStore, inventoryRunOperationId),
   ]);
   const afterCollision = await inventorySnapshot(db);
   const winnerIndex = attempts.findIndex(
@@ -3184,11 +3184,11 @@ async function inventoryCrossAccountStart(
   if (!winner || !loser) {
     throw new Error(`collision outcomes: ${JSON.stringify(attempts)}`);
   }
-  const refused = await start(loser, inventoryRunId).then(
+  const refused = await start(loser, inventoryRunOperationId).then(
     () => null,
     (error: unknown) => errorShape(error),
   );
-  const replay = await start(winner, inventoryRunId);
+  const replay = await start(winner, inventoryRunOperationId);
   const busy = await start(winner, nextOperationId).then(
     () => null,
     (error: unknown) => errorShape(error),
@@ -3203,7 +3203,7 @@ async function inventoryCrossAccountStart(
     (error: unknown) => errorShape(error),
   );
   return {
-    operationId: inventoryRunId,
+    operationId: inventoryRunOperationId,
     nextOperationId,
     winnerAccount: accounts[winnerIndex],
     loserAccount: accounts[loserIndex],
@@ -3283,10 +3283,10 @@ async function inventoryPartialPrune(
 
 async function inventoryDenseFinalization(db: D1Database): Promise<unknown> {
   const store = await readyInventoryStore(db);
-  const inventoryRunId = inventoryOperationId(40);
+  const inventoryRunOperationId = inventoryOperationId(40);
   return store.withAccountInventoryLease(async (lease) => {
     const started = await lease.startRun({
-      operationId: inventoryRunId,
+      operationId: inventoryRunOperationId,
       options: INVENTORY_OPTIONS,
       optionsDigest: INVENTORY_DIGEST,
     });
@@ -3295,7 +3295,7 @@ async function inventoryDenseFinalization(db: D1Database): Promise<unknown> {
       { kind: 'meta', ordinal: 2, payload: { index: 2 } },
     ];
     const current = await lease.commitChunk({
-      operationId: inventoryRunId,
+      operationId: inventoryRunOperationId,
       expectedRevision: 0,
       runRecord: inventoryCommitted(started, rows, []),
       rows,
@@ -3304,7 +3304,7 @@ async function inventoryDenseFinalization(db: D1Database): Promise<unknown> {
     const before = await inventorySnapshot(db);
     const refused = await lease
       .finalizeRun({
-        operationId: inventoryRunId,
+        operationId: inventoryRunOperationId,
         expectedRevision: 1,
         manifest: current.progress.stagedCounts,
         factCount: 0,
@@ -3320,20 +3320,20 @@ async function inventoryDenseFinalization(db: D1Database): Promise<unknown> {
       payload: { index: 1 },
     };
     const complete = await lease.commitChunk({
-      operationId: inventoryRunId,
+      operationId: inventoryRunOperationId,
       expectedRevision: 1,
       runRecord: inventoryCommitted(current, [...rows, missing], []),
       rows: [missing],
       facts: [],
     });
     await lease.finalizeRun({
-      operationId: inventoryRunId,
+      operationId: inventoryRunOperationId,
       expectedRevision: 2,
       manifest: complete.progress.stagedCounts,
       factCount: 0,
     });
     return {
-      operationId: inventoryRunId,
+      operationId: inventoryRunOperationId,
       before,
       afterRefusal,
       refused,
@@ -3427,7 +3427,7 @@ async function inventoryPinPruneRace(
 async function inventoryPruneActiveRace(db: D1Database): Promise<unknown> {
   await readyInventoryStore(db);
   const delegate = new D1FleetStateDatabase(db);
-  const inventoryRunId = inventoryOperationId(35);
+  const inventoryRunOperationId = inventoryOperationId(35);
   let arm = false;
   let afterPromotion: unknown = null;
   const database: FleetStateDatabase = {
@@ -3440,7 +3440,7 @@ async function inventoryPruneActiveRace(db: D1Database): Promise<unknown> {
           .prepare(
             'UPDATE anchorage_fleet_inventory_heads SET active_operation_id = ? WHERE account_id = ?',
           )
-          .bind(inventoryRunId, INVENTORY_ACCOUNT)
+          .bind(inventoryRunOperationId, INVENTORY_ACCOUNT)
           .run();
         afterPromotion = await inventorySnapshot(db);
       }
@@ -3450,21 +3450,21 @@ async function inventoryPruneActiveRace(db: D1Database): Promise<unknown> {
   const store = inventoryStore(database);
   await store.withAccountInventoryLease(async (lease) => {
     const started = await lease.startRun({
-      operationId: inventoryRunId,
+      operationId: inventoryRunOperationId,
       options: INVENTORY_OPTIONS,
       optionsDigest: INVENTORY_DIGEST,
     });
     const rows = inventoryRows('prune-active-race');
     const facts = inventoryFacts();
     await lease.commitChunk({
-      operationId: inventoryRunId,
+      operationId: inventoryRunOperationId,
       expectedRevision: 0,
       runRecord: inventoryCommitted(started, rows, facts),
       rows,
       facts,
     });
     await lease.failRun({
-      operationId: inventoryRunId,
+      operationId: inventoryRunOperationId,
       expectedRevision: 1,
       reason: 'operator-abandoned',
     });
@@ -3473,7 +3473,7 @@ async function inventoryPruneActiveRace(db: D1Database): Promise<unknown> {
   arm = true;
   const pruned = await store.pruneInventoryGenerations({ limit: 1 });
   return {
-    operationId: inventoryRunId,
+    operationId: inventoryRunOperationId,
     before,
     afterPromotion,
     pruned,
@@ -3491,18 +3491,18 @@ async function inventoryFailureRecovery(db: D1Database): Promise<unknown> {
     leaseRenewalIntervalMs: 30_000,
   });
   await seedInventoryGeneration(store, 28);
-  const inventoryRunId = inventoryOperationId(29);
+  const inventoryRunOperationId = inventoryOperationId(29);
   const nextOperationId = inventoryOperationId(30);
   const staged = await store.withAccountInventoryLease(async (lease) => {
     const started = await lease.startRun({
-      operationId: inventoryRunId,
+      operationId: inventoryRunOperationId,
       options: INVENTORY_OPTIONS,
       optionsDigest: INVENTORY_DIGEST,
     });
     const rows = inventoryRows('failure-recovery');
     const facts = inventoryFacts();
     return lease.commitChunk({
-      operationId: inventoryRunId,
+      operationId: inventoryRunOperationId,
       expectedRevision: started.progress.revision,
       runRecord: inventoryCommitted(started, rows, facts),
       rows,
@@ -3510,7 +3510,7 @@ async function inventoryFailureRecovery(db: D1Database): Promise<unknown> {
     });
   });
   const input = {
-    operationId: inventoryRunId,
+    operationId: inventoryRunOperationId,
     expectedRevision: staged.progress.revision,
     reason: 'operator-abandoned' as const,
   };
@@ -3624,17 +3624,17 @@ async function inventoryFinalizedContinuationRecovery(
     leaseTtlMs: 60_000,
     leaseRenewalIntervalMs: 30_000,
   });
-  const inventoryRunId = inventoryOperationId(31);
+  const inventoryRunOperationId = inventoryOperationId(31);
   const staged = await store.withAccountInventoryLease(async (lease) => {
     const started = await lease.startRun({
-      operationId: inventoryRunId,
+      operationId: inventoryRunOperationId,
       options: INVENTORY_OPTIONS,
       optionsDigest: INVENTORY_DIGEST,
     });
     const rows = inventoryRows('finalized-continuation');
     const facts = inventoryFacts();
     return lease.commitChunk({
-      operationId: inventoryRunId,
+      operationId: inventoryRunOperationId,
       expectedRevision: started.progress.revision,
       runRecord: inventoryCommitted(started, rows, facts),
       rows,
@@ -3650,7 +3650,7 @@ async function inventoryFinalizedContinuationRecovery(
   };
   const token = {
     version: 1 as const,
-    operationId: inventoryRunId,
+    operationId: inventoryRunOperationId,
     revision: staged.progress.revision,
   };
   const before = await inventorySnapshot(db);
@@ -3773,14 +3773,14 @@ async function inventoryFinalizedContinuationRecovery(
 
 async function inventoryCommitConcurrency(db: D1Database): Promise<unknown> {
   const store = await readyInventoryStore(db);
-  const inventoryRunId = inventoryOperationId(1);
+  const inventoryRunOperationId = inventoryOperationId(1);
   // The account lease serializes lease HOLDERS, so the guarded commit batch can
   // only be raced by concurrent calls under one lease. Concurrency is expressed
   // exactly like coldConcurrentSchemaInitialization: Promise.allSettled over N
   // writers inside the one request.
   return store.withAccountInventoryLease(async (lease) => {
     const started = await lease.startRun({
-      operationId: inventoryRunId,
+      operationId: inventoryRunOperationId,
       options: INVENTORY_OPTIONS,
       optionsDigest: INVENTORY_DIGEST,
     });
@@ -3792,7 +3792,7 @@ async function inventoryCommitConcurrency(db: D1Database): Promise<unknown> {
       ];
       const base = inventoryCommitted(started, rows, []);
       return {
-        operationId: inventoryRunId,
+        operationId: inventoryRunOperationId,
         expectedRevision: started.progress.revision,
         // Each writer's intended record differs, so the winner is the writer
         // whose own record the guarded UPDATE persisted.
@@ -3829,18 +3829,20 @@ async function inventoryCommitConcurrency(db: D1Database): Promise<unknown> {
     // The winner's own replay is the lost-response case: its rows are already
     // present byte-identically at the intended revision, so it converges on the
     // persisted record without advancing the revision a second time.
-    const beforeReplay = (await store.readRunByOperation(inventoryRunId))
-      ?.progress.revision;
+    const beforeReplay = (
+      await store.readRunByOperation(inventoryRunOperationId)
+    )?.progress.revision;
     const replayResult = await lease.commitChunk(winning).then(
       (runRecord) =>
         JSON.stringify(runRecord) === JSON.stringify(winning.runRecord),
       () => false,
     );
-    const afterReplay = (await store.readRunByOperation(inventoryRunId))
-      ?.progress.revision;
+    const afterReplay = (
+      await store.readRunByOperation(inventoryRunOperationId)
+    )?.progress.revision;
     const lostResponseReplay =
       replayResult && beforeReplay === afterReplay ? 'converged' : 'conflict';
-    const persisted = await store.readRunByOperation(inventoryRunId);
+    const persisted = await store.readRunByOperation(inventoryRunOperationId);
     if (!persisted) throw new Error('inventory commit race lost its run');
     const trailing = {
       kind: 'meta' as const,
@@ -3848,7 +3850,7 @@ async function inventoryCommitConcurrency(db: D1Database): Promise<unknown> {
       payload: { writer: 'trailing' },
     };
     const advanced = await lease.commitChunk({
-      operationId: inventoryRunId,
+      operationId: inventoryRunOperationId,
       expectedRevision: persisted.progress.revision,
       runRecord: inventoryCommitted(persisted, [...shared, trailing], []),
       rows: [trailing],
@@ -3894,24 +3896,24 @@ async function inventoryFinalizeConvergence(db: D1Database): Promise<unknown> {
   await readyInventoryStore(db);
   const database = hideResultsDatabase(new D1FleetStateDatabase(db));
   const store = inventoryStore(database);
-  const inventoryRunId = inventoryOperationId(2);
+  const inventoryRunOperationId = inventoryOperationId(2);
   const rows = inventoryRows('finalize');
   const facts = inventoryFacts();
   const refs = await store.withAccountInventoryLease(async (lease) => {
     const started = await lease.startRun({
-      operationId: inventoryRunId,
+      operationId: inventoryRunOperationId,
       options: INVENTORY_OPTIONS,
       optionsDigest: INVENTORY_DIGEST,
     });
     const committedRun = await lease.commitChunk({
-      operationId: inventoryRunId,
+      operationId: inventoryRunOperationId,
       expectedRevision: started.progress.revision,
       runRecord: inventoryCommitted(started, rows, facts),
       rows,
       facts,
     });
     const input = {
-      operationId: inventoryRunId,
+      operationId: inventoryRunOperationId,
       expectedRevision: committedRun.progress.revision,
       manifest: committedRun.progress.stagedCounts,
       factCount: committedRun.progress.factCount,
@@ -3972,13 +3974,13 @@ async function inventoryCorruptUnreadable(db: D1Database): Promise<unknown> {
     () => null,
     (error: unknown) => errorShape(error),
   );
-  const inventoryRunId = inventoryOperationId(5);
+  const inventoryRunOperationId = inventoryOperationId(5);
   const rows = inventoryRows('mismatch');
   const facts = inventoryFacts();
   const finalizeError = await store
     .withAccountInventoryLease(async (lease) => {
       const started = await lease.startRun({
-        operationId: inventoryRunId,
+        operationId: inventoryRunOperationId,
         options: INVENTORY_OPTIONS,
         optionsDigest: INVENTORY_DIGEST,
       });
@@ -3986,7 +3988,7 @@ async function inventoryCorruptUnreadable(db: D1Database): Promise<unknown> {
       // finalize's in-SQL count guard is what refuses.
       const overstated = inventoryCommitted(started, rows, facts);
       const committedRun = await lease.commitChunk({
-        operationId: inventoryRunId,
+        operationId: inventoryRunOperationId,
         expectedRevision: started.progress.revision,
         runRecord: {
           ...overstated,
@@ -3999,7 +4001,7 @@ async function inventoryCorruptUnreadable(db: D1Database): Promise<unknown> {
         facts,
       });
       return lease.finalizeRun({
-        operationId: inventoryRunId,
+        operationId: inventoryRunOperationId,
         expectedRevision: committedRun.progress.revision,
         manifest: committedRun.progress.stagedCounts,
         factCount: committedRun.progress.factCount,
@@ -4009,7 +4011,7 @@ async function inventoryCorruptUnreadable(db: D1Database): Promise<unknown> {
       () => null,
       (error: unknown) => errorShape(error),
     );
-  const run = await store.readRunByOperation(inventoryRunId);
+  const run = await store.readRunByOperation(inventoryRunOperationId);
   return {
     readError,
     finalizeError,

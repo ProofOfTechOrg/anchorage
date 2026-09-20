@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import type { DirectRunManifest } from '../../scripts/direct-credentialed-conformance-preflight.mjs';
+import { recoverDirectForceResidual } from '../../scripts/direct-reference-force.js';
+import { DirectReferenceExecutionError } from '../../scripts/direct-reference-http.js';
 import {
   createDirectReferenceContext,
   type DirectReferenceContext,
   type DirectReferenceEnvironment,
-} from '../../scripts/direct-reference-context.js';
-import { recoverDirectForceResidual } from '../../scripts/direct-reference-force.js';
-import { DirectReferenceExecutionError } from '../../scripts/direct-reference-http.js';
+} from './direct-reference-context-harness.js';
 
 export type ForceBudgetStage = 'fence' | 'empty' | 'bucket';
 
@@ -102,27 +102,21 @@ export async function directForceBudgetProbe(
       const footprint = JSON.parse(retained.identityJson) as {
         buckets: Array<{ observedCreationDate: string | null }>;
       };
-      const participants = footprint.buckets.filter(
-        (bucket) => bucket.observedCreationDate !== null,
-      ).length;
-      if (participants === 0 || participants !== footprint.buckets.length) {
+      if (
+        footprint.buckets.length === 0 ||
+        footprint.buckets.some((bucket) => bucket.observedCreationDate === null)
+      ) {
         throw new Error('force probe requires retained application buckets');
       }
       const original = plane.backend.assertApplicationR2Empty;
       const empty = original.bind(plane.backend);
       const peers: Array<ReturnType<typeof empty>> = [];
-      let scheduled!: () => void;
-      const group = new Promise<void>((resolve) => {
-        scheduled = resolve;
-      });
       plane.backend.assertApplicationR2Empty = async (...args) => {
         const chosen = peers.length === 0;
         const reading = empty(...args);
         peers.push(reading);
-        if (peers.length === participants) scheduled();
         await reading;
         if (!chosen) return;
-        await group;
         await Promise.all(peers);
         return exhaust();
       };

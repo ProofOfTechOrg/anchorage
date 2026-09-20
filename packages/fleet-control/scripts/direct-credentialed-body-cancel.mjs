@@ -11,10 +11,9 @@
 //
 // The load starts at module evaluation and a rejection is caught there, so an
 // unbuilt checkout raises no unhandled rejection and the promise resolves to
-// `undefined`. A release issued before the load resolves is deferred to it; a
-// release issued after it has resolved is issued in the caller's own turn,
-// which is what a refusing exit about to end the process needs. The release
-// is not awaited: a hostile source can hang its own cancel.
+// `undefined`. A release issued before the load resolves is deferred to it;
+// once resolved, the cached callable runs in the caller's turn. The release is
+// not awaited: a hostile source can hang its own cancel.
 const home = import('../dist/database-export-store.js').catch(() => undefined);
 let release;
 
