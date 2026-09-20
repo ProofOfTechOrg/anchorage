@@ -45,11 +45,11 @@ The verification list below mirrors the CI `verify-core` job in order;
 pnpm install --frozen-lockfile
 pnpm github:check
 pnpm github:check:test
-pnpm test:node-tools
 pnpm lint
 pnpm typecheck
 pnpm test
 pnpm build
+pnpm test:node-tools
 pnpm docs:check
 pnpm docs:check:test
 pnpm docs:api

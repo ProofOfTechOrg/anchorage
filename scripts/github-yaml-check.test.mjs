@@ -2915,7 +2915,7 @@ test('every tracked workflow installs before it invokes pnpm', () => {
   );
 });
 
-test('the verify-core job runs its installed-dependency checks in order', () => {
+test('the verify-core job runs every command in order', () => {
   assert.deepEqual(
     readVerifyCoreJob()
       .steps.filter((step) => typeof step.run === 'string')
@@ -2924,11 +2924,11 @@ test('the verify-core job runs its installed-dependency checks in order', () => 
       'pnpm install --frozen-lockfile',
       'pnpm github:check',
       'pnpm github:check:test',
-      'pnpm test:node-tools',
       'pnpm lint',
       'pnpm typecheck',
       'pnpm test:without-direct-scenario',
       'pnpm build',
+      'pnpm test:node-tools',
       'pnpm docs:check',
       'pnpm docs:check:test',
       'pnpm docs:api',

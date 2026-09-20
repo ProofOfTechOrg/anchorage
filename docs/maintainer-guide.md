@@ -25,11 +25,11 @@ The commands below mirror the CI `verify-core` job after dependency installation
 ```bash
 pnpm github:check
 pnpm github:check:test
-pnpm test:node-tools
 pnpm lint
 pnpm typecheck
 pnpm test
 pnpm build
+pnpm test:node-tools
 pnpm docs:check
 pnpm docs:check:test
 pnpm docs:api

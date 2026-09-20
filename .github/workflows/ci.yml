@@ -51,9 +51,6 @@ jobs:
       - name: Test the .github YAML checker and the verify gate it pins
         run: pnpm github:check:test
 
-      - name: Test root Node tools
-        run: pnpm test:node-tools
-
       - name: Lint
         run: pnpm lint
 
@@ -73,6 +70,11 @@ jobs:
 
       - name: Build
         run: pnpm build
+
+      # These suites run the agent-starter token script against flowsafe's
+      # built `approval-api` entry, so they require the Build step's output.
+      - name: Test root Node tools
+        run: pnpm test:node-tools
 
       - name: Check documentation
         run: pnpm docs:check
