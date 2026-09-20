@@ -210,7 +210,7 @@ function secretAssignmentDetector(): Detector {
 // (shannonEntropy >= threshold) is unchanged — deliberately NOT the rejected
 // per-candidate clamp min(threshold, log2(len)) (RA-004), which would flag any
 // all-distinct run regardless of the configured bar. DL-005 (F5) set the {23}
-// floor for the 4.5 default only; hardcoding it silently drops the 20..22-char
+// floor for a 4.5 threshold; hardcoding it silently drops the 20..22-char
 // candidates a lower configured threshold can still legitimately flag
 // (4.0 -> floor 20 -> log2(20)=4.32 >= 4.0). Examples:
 //   4.5 -> max(20, ceil(2^4.5)=23) = 23   (default; byte-identical to DL-005)

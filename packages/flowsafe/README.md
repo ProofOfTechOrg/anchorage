@@ -103,7 +103,7 @@ export class AppRunner extends DurableObjectRunner<Env> {
 }
 ```
 
-`init()` creates D1-backed Mastra storage from the conventional `DB` binding unless you inject storage. Workflow definitions use the same `createWorkflow()` and `createStep()` shape as Mastra. Flowsafe pins `@mastra/cloudflare-d1` 1.3.2 because the shipped D1 storage is written against that release's domain surface: it subclasses the adapter's background-tasks domain to apply the `TaskFilter.resourceId` predicate the adapter declares but omits from its SQL builder, and hand-writes the schedules, notifications, and thread-state domains the adapter does not ship at all. The pin also holds the adapter on its `@cloudflare/workers-types` v4 peer, which is the major Flowsafe still builds against.
+`init()` creates D1-backed Mastra storage from the conventional `DB` binding unless you inject storage. Workflow definitions use the same `createWorkflow()` and `createStep()` shape as Mastra. Flowsafe pins `@mastra/cloudflare-d1` 1.3.2 because the shipped D1 storage is written against that release's domain surface: it subclasses the adapter's background-tasks domain to apply the `TaskFilter.resourceId` predicate the adapter accepts but omits from its SQL builder, and hand-writes the schedules, notifications, and thread-state domains the adapter does not ship at all. `D1StorageOptions.domains` accepts host-supplied `workflowDefinitions` and `knowledge` domains, which have no D1-backed defaults. The pin also holds the adapter on its `@cloudflare/workers-types` v4 peer, which is the major Flowsafe still builds against.
 
 If the deployment uses a table prefix, pass one shared constant to storage and host maintenance:
 

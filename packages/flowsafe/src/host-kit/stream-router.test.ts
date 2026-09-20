@@ -632,7 +632,7 @@ describe('createStreamRouter run-route passthrough', () => {
 
   it('passes a 5xx refusal through with its status and reason intact', async () => {
     // #given — a run-status read refused because the deployment is fenced.
-    // Collapsing every 5xx into a bare 500 leaves a stream caller unable to
+    // Collapsing this refusal into a bare 500 leaves a stream caller unable to
     // tell a migration from a broken deployment.
     const router = routerWith(() =>
       Promise.reject(

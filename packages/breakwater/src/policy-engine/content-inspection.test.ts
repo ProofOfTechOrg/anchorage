@@ -478,12 +478,11 @@ describe('piiSecrets', () => {
     it('extracts and flags a 20-char maximally-random candidate when entropyThreshold is lowered to 4.0', async () => {
       // #given — at a 4.0-bit bar the candidate-length floor derives to
       // max(20, ceil(2^4.0)=16) = 20, so 20..22-char candidates are extracted
-      // again. The {23} floor hardcoded to the 4.5 default silently dropped
-      // them (the recall regression this fixes). This 20-char run is all-
+      // by this threshold. A hardcoded {23} floor misses this candidate.
+      // This 20-char run is all-
       // distinct base64-class chars, so its Shannon entropy is exactly
       // log2(20) ~= 4.32 >= 4.0 (not flaky), and the shape gate passes (digits
-      // + mixed case). RED-FIRST: on the hardcoded-{23} code the 20-char
-      // candidate is never extracted, so highEntropy returns allowed.
+      // + mixed case).
       const evaluator = piiSecrets({
         detectors: ['highEntropy'],
         entropyThreshold: 4.0,
@@ -596,7 +595,7 @@ describe('piiSecrets', () => {
       expect(piiSecrets().channels).toEqual(['answer', 'reasoning', 'object']);
     });
 
-    it('enables every detector by default', async () => {
+    it('enables email detection by default', async () => {
       // #given
       const evaluator = piiSecrets();
 

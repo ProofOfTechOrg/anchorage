@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Env-var parsing pins. The stakes are operational: numberVar guards the
 // demo's spend caps (where a rejected `0` silently reverts an incident
-// freeze to the 500-run fallback) and boolVar guards the kill switch (where
-// any spelling but the one literal reads as "demo stays up").
+// freeze to the 500-run fallback) and boolVar guards the kill switch, where
+// malformed values must take its configured fail-closed polarity.
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 

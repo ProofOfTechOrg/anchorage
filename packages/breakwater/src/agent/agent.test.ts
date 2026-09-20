@@ -1029,7 +1029,7 @@ describe('Mastra Agent execution-entry inventory', () => {
     // classified there. A name belongs here only while the two cores disagree
     // about it: it goes once the pin catches up, and a name on NEITHER version
     // is dead and belongs in no list at all.
-    const forwardClassified: string[] = [];
+    const forwardClassified: readonly string[] = [];
     const classified = [
       ...wrapped,
       ...intentionallyUnavailable,

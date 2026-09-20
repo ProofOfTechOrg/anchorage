@@ -33,6 +33,8 @@
     "examples",
     "vitest.config.ts",
     "test-support/d1-type-compatibility.ts",
+    // The packed .mjs gates import this .ts helper through Node type stripping,
+    // which the TypeScript program cannot discover from a source import.
     "test-support/module-edges.ts",
     "test-support/r2-type-compatibility.ts",
     "deploy/worker.ts",

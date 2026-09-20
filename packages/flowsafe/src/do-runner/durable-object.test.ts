@@ -4887,8 +4887,8 @@ describe('DurableObjectRunner suspension deadlines', () => {
     const { state, values } = durableKeyValueStorageFixture();
     const env = makeProductionEnv();
     // A deadline request whose compare-and-swap does not match: the route
-    // returns the current terminal summary without finalizing, a terminal path
-    // that can leave the record armed for a run that can never suspend again.
+    // returns the current terminal summary without finalizing. The cleanup
+    // prevents that counterfactual path from retaining an armed record.
     env.runtime = {
       cancelActiveExecution: vi.fn(async () => undefined),
       ...statusStub(async () => ({ runId: 'run-noop', status: 'timed_out' })),
@@ -6043,8 +6043,8 @@ describe('DurableObjectRunner suspension deadlines', () => {
 
     await runner.alarm();
 
-    // The wake's own read is authoritativeStatus, so a pin left on `status`
-    // would pass however the name were used.
+    // The doubles expose both read methods, so malformed parsed ids must reach
+    // neither one.
     expect(reads.authoritativeStatus).not.toHaveBeenCalled();
     expect(reads.status).not.toHaveBeenCalled();
     expect(events.at(-1)).toBe('deleteAlarm');

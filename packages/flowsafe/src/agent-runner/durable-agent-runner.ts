@@ -201,10 +201,10 @@
 // sendToolApproval, which it files `intentionallyUnavailable`
 // (packages/breakwater/src/agent/agent.test.ts). It diverges on
 // listSuspendedRuns, which it files under `explicitlyNonExecution` — the same
-// divergence as listActiveRuns, and for the same reason: a
-// narrowed HANDLE can only omit, so a data-returning member is harmless there,
-// while an INSTANCE Mastra calls in-process must throw. The two members
-// blocked below diverge the same way; each entry records it.
+// divergence as listActiveRuns, and for the same reason: a narrowed HANDLE can
+// only omit, so a data-returning member is harmless there, while an INSTANCE
+// Mastra calls in-process must throw. The two members blocked below diverge the
+// same way; each entry records it.
 //
 // Two more Agent-level members are blocked. Read from the @mastra/core 1.67.0
 // dist, the declared peer; offsets here are 1.67.0-vintage, in
@@ -214,19 +214,18 @@
 //
 //   - listActiveThreadRuns() (:38214) is the discovery ground one scope wider
 //     than listActiveRuns. It takes no arguments and returns `{ runId,
-//     resourceId, threadId }` for every thread on the pubsub instance with a
-//     run in flight (storage-MbGlKLkB.js:1011-1023), and that state is keyed
-//     by pubsub instance rather than by agent (`#statesByPubSub`, :150, read
-//     through #getState :294), so it narrows by neither principal nor agent
-//     where the two listings above at least narrow by agentId. The in-process
-//     sibling getActiveThreadRunId() stays non-execution because it makes the
-//     caller name the (resourceId, threadId) pair: it confirms where this
-//     enumerates. Breakwater files it `explicitlyNonExecution`
-//     (agent.test.ts) for the reason it files listActiveRuns there: a
-//     narrowed HANDLE can only omit, so a data-returning member is harmless
-//     there, while an INSTANCE Mastra calls in-process must throw. Cost, stated
-//     rather than left to be rediscovered: core's AgentController aggregates
-//     this member across its backing agents
+//     resourceId, threadId }` for every thread on the pubsub instance with a run
+//     in flight (storage-MbGlKLkB.js:1011-1023), and that state is keyed by
+//     pubsub instance rather than by agent (`#statesByPubSub`, :150, read through
+//     #getState :294), so it narrows by neither principal nor agent where the two
+//     listings above at least narrow by agentId. The in-process sibling
+//     getActiveThreadRunId() stays non-execution because it makes the caller name
+//     the (resourceId, threadId) pair: it confirms where this enumerates.
+//     Breakwater files it `explicitlyNonExecution` (agent.test.ts) for the reason
+//     it files listActiveRuns there: a narrowed HANDLE can only omit, so a
+//     data-returning member is harmless there, while an INSTANCE Mastra calls
+//     in-process must throw. Cost, stated rather than left to be rediscovered:
+//     core's AgentController aggregates this member across its backing agents
 //     (agent-controller-CKgKFyMR.js:5722-5725), so that aggregation now throws.
 //     It is already unusable over this class — the same controller calls the
 //     blocked sendToolApproval() at :4089 and :4118.
@@ -238,10 +237,10 @@
 //     the containment those inherited members rely on IS virtual dispatch on
 //     `this`, so one call moves every run those paths start onto an agent
 //     carrying none of these overrides — no caller-minted runId assertion, no
-//     executeWorkflow, no #startRequesters backstop. subscribeToThread drives
-//     no run of its own; the field moves its replay target all the same. It is
-//     public in the type surface (agent.d.ts:229 declares it with no
-//     modifier), so unlike getLegacyHandler it takes no private cast.
+//     executeWorkflow, no #startRequesters backstop. subscribeToThread drives no
+//     run of its own; the field moves its replay target all the same. It is
+//     public in the type surface (agent.d.ts:229 declares it with no modifier),
+//     so unlike getLegacyHandler it takes no private cast.
 //     Breakwater files it `explicitlyNonExecution` (agent.test.ts) for the
 //     reason it files the listings there: a narrowed HANDLE can only omit, so
 //     a setter is harmless there, while an INSTANCE Mastra calls in-process
@@ -1200,9 +1199,9 @@ export class FlowsafeDurableAgent<
   /**
    * Refuse the thread-level run enumerator.
    * `listActiveThreadRuns()` takes no arguments and returns a runId plus the
-   * resourceId and threadId parsed out of the key for every thread on the
-   * pubsub instance with a run in flight, and core keys that state by pubsub
-   * instance rather than by agent — so it is the same discovery ground as
+   * resourceId and threadId parsed out of the key for every thread on the pubsub
+   * instance with a run in flight, and core keys that state by pubsub instance
+   * rather than by agent — so it is the same discovery ground as
    * {@link FlowsafeDurableAgent.listActiveRuns} with the last scoping gone.
    * The in-process sibling `getActiveThreadRunId()` stays inherited because it
    * makes the caller name the (resourceId, threadId) pair it confirms.
@@ -1334,8 +1333,7 @@ export class FlowsafeDurableAgent<
    * Signature caveat: the base method is generic in OUTPUT, which
    * `Parameters<>` instantiates to its `undefined` default and so types too
    * narrowly to satisfy the base. The options parameter is widened to
-   * `unknown` — the one supertype that fits every instantiation. Re-check on
-   * every peer bump.
+   * `unknown` so it fits each instantiation. Re-check on a peer bump.
    */
   override async sendToolApproval(_options: unknown): Promise<never> {
     throw unavailableRunEntry(
@@ -1345,20 +1343,18 @@ export class FlowsafeDurableAgent<
   }
 
   /**
-   * Refuse the thread-runtime target swap. It sets one private
-   * field that the thread-runtime paths resolve their target through, falling
-   * back to `this`; the refusal in `BLOCKED_RUN_ENTRIES` names those paths,
-   * for the core it is written against. So the containment those inherited
-   * members rely on is virtual dispatch on `this`, and one call to this setter
-   * moves every run they start, and their replay targets with them, onto an
-   * agent with none of these overrides in the chain. That is the fourth ground
-   * reached by installing a second execution surface rather than by calling
-   * one.
+   * Refuse the thread-runtime target swap. It sets one private field that the
+   * thread-runtime paths resolve their target through, falling back to `this`;
+   * the refusal in `BLOCKED_RUN_ENTRIES` names those paths, for the core it is
+   * written against. So the containment those inherited members rely on is
+   * virtual dispatch on `this`, and one call to this setter moves every run they
+   * start, and their replay targets with them, onto an agent with none of these
+   * overrides in the chain. That is the fourth ground reached by installing a
+   * second execution surface rather than by calling one.
    *
    * Signature caveat: the parameter is `unknown` rather than core's
-   * `Agent<any, any, any, any>`. `unknown` is the one supertype of core's
-   * parameter, so it satisfies that base without depending on method
-   * bivariance.
+   * `Agent<any, any, any, any>`. `unknown` satisfies that base without
+   * depending on method bivariance.
    */
   override __setThreadRuntimeAgent(_agent: unknown): never {
     throw unavailableRunEntry(

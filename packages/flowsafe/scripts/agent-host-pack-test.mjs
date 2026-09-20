@@ -1151,30 +1151,27 @@ const unsupportedNotificationRoutes = signals.createThreadSignalRoutes({
     getNotification: async () => { unsupportedNotificationReads++; return null; },
   }),
 });
-async function withCapturedErrors(run) {
-  const logged = [];
+async function withSuppressedErrors(run) {
   const consoleError = console.error;
-  let response;
   try {
-    console.error = (...args) => { logged.push(args.map(String).join(' ')); };
-    response = await run();
+    console.error = () => undefined;
+    return await run();
   } finally {
     console.error = consoleError;
   }
-  return { response, logged };
 }
-const { response: unsupportedNotificationResponse } = await withCapturedErrors(() => unsupportedNotificationRoutes(new Request('https://thread/signal/notifications/dispatch', {
+const unsupportedNotificationResponse = await withSuppressedErrors(() => unsupportedNotificationRoutes(new Request('https://thread/signal/notifications/dispatch', {
   method: 'POST', body: JSON.stringify({ notificationIds: ['packed-notification'], resourceId: 'notification-thread', agentId: 'writer', now: notificationNow.toISOString() }),
 }), { threadId: 'notification-thread', principal: notificationContext.principal, init: doRunner.init({ storage: new InMemoryStore() }, { executionFence: 'none', startIdempotency: 'none' }) }));
 assert.equal(unsupportedNotificationResponse.status, 502);
 assert.deepEqual(await unsupportedNotificationResponse.json(), { error: 'internal error' });
 assert.equal(unsupportedNotificationReads, 0);
 // Ingestion needs no storage method the dispatch route above is missing: it
-// hands the record to core's inline sender, and the non-runtime-driven agent
+// hands the record to the fixture's sender, and the non-runtime-driven agent
 // is what the degraded field reports. The send count separates a real delivery
 // from a route that answered without reaching the sender.
 const ingestionResponse = await unsupportedNotificationRoutes(new Request('https://thread/signal/notification', {
-  method: 'POST', body: JSON.stringify({ source: 'constructor', kind: 'changed', summary: 'ingested' }),
+  method: 'POST', body: JSON.stringify({ source: 'packed', kind: 'changed', summary: 'ingested' }),
 }), { threadId: 'notification-thread', principal: notificationContext.principal, init: doRunner.init({ storage: new InMemoryStore() }, { executionFence: 'none', startIdempotency: 'none' }) });
 assert.equal(ingestionResponse.status, 200);
 assert.deepEqual(await ingestionResponse.json(), { record: { id: 'sent' }, degraded: 'not-runtime-driven' });

@@ -906,15 +906,15 @@ export function createThreadAgentHost(
       return { owner: principalOwner(scope.principal) };
     }
     if (!threaded) throw new AgentHostRequestError(404, 'run not found');
-    const [threadOwner, resourceOwnerId] = await Promise.all([
+    const [threadOwner, resolvedResourceOwner] = await Promise.all([
       ownership.owner('thread', ref.threadId),
       ownership.owner('resource', ref.resourceId),
     ]);
     if (
       !threadOwner ||
-      !resourceOwnerId ||
-      threadOwner.kind !== resourceOwnerId.kind ||
-      threadOwner.id !== resourceOwnerId.id
+      !resolvedResourceOwner ||
+      threadOwner.kind !== resolvedResourceOwner.kind ||
+      threadOwner.id !== resolvedResourceOwner.id
     ) {
       throw new AgentHostRequestError(404, 'run not found');
     }

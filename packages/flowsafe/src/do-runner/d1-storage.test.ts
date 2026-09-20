@@ -717,14 +717,14 @@ describe('createD1Storage table prefix', () => {
     );
   });
 
-  it('preserves inherited and non-enumerable disabled or custom domain overrides', async () => {
+  it('preserves own, inherited and non-enumerable disabled or custom domain overrides', async () => {
     const binding = sqliteUnitDatabase(openSqlite()) as D1DatabaseBinding;
     const custom = new FencedWorkflowsStorageD1({ binding: binding as never });
     // @mastra/cloudflare-d1 backs neither of these domains, so a host-supplied
     // store is the only value either can resolve to.
     const definitions = { upsert: async () => undefined };
     const knowledge = { query: async () => [] };
-    for (const mode of ['inherited', 'non-enumerable']) {
+    for (const mode of ['own', 'inherited', 'non-enumerable']) {
       for (const workflows of [false, custom]) {
         for (const supplied of [false, true]) {
           const values = {
@@ -735,17 +735,19 @@ describe('createD1Storage table prefix', () => {
             knowledge: supplied ? knowledge : false,
           };
           const domains =
-            mode === 'inherited'
-              ? Object.create(values)
-              : Object.defineProperties(
-                  {},
-                  Object.fromEntries(
-                    Object.entries(values).map(([key, value]) => [
-                      key,
-                      { value },
-                    ]),
-                  ),
-                );
+            mode === 'own'
+              ? values
+              : mode === 'inherited'
+                ? Object.create(values)
+                : Object.defineProperties(
+                    {},
+                    Object.fromEntries(
+                      Object.entries(values).map(([key, value]) => [
+                        key,
+                        { value },
+                      ]),
+                    ),
+                  );
           Object.defineProperty(domains, 'ignored', {
             enumerable: true,
             get() {

@@ -382,6 +382,11 @@ an unproven row in place: affected calls continue to fail closed. Without the
 acknowledgement, an absent legacy key cannot execute because an old writer
 could still create it after inspection.
 
+`createConnector()` validates `idempotencyKeyMigration` at construction and
+reads it on each execute or migration call. Setting the acknowledgement after
+construction takes effect on the next call; withdrawing it makes the next call
+fail with `IDEMPOTENCY_MIGRATION_REQUIRED` or refuse the migration.
+
 For the shipped D1 store, inventory and migrate through the connector-bound
 helpers instead of constructing storage keys or writing ad hoc SQL:
 
@@ -813,7 +818,7 @@ An egress-declaring connector needs an observed transport call somewhere in the 
 
 Audit witnesses come from this case's supplied logger, during its invocation, with a `decisionCode` and `resource` equal to the subject connector's id. Setup logs, agent-policy records, and another connector's decisions cannot establish the subject's audit wiring or change its result. This attribution separates ordinary composition; it does not authenticate an arbitrary logger caller. `decisionCodes` preserves invocation-window events for diagnosis, including nested connector codes and `undefined` for events without a code; like `guardedHosts`, it is empty for a case the eligibility rule above excludes.
 
-Egress is not separated the same way. Once a case binds its subject, the supplied base transport checks each host against that subject's registered `egress`, whatever code is holding it: a nested connector the subject composes, handed the subject's `policies.fetch`, reaches a host only its own manifest declares and the transport refuses it there, recorded with cause `host-not-declared`. Before that binding — while the probe or a case factory is constructing — the transport has no declaration to read and refuses the call with cause `no-egress-declaration`. Declare on the subject every host its composition reaches, or give the nested connector its own transport and accept that traffic through it is unobserved.
+Egress is not separated the same way. Once a case binds its subject, the supplied base transport checks each host against that subject's registered `egress`, whatever code is holding it: a nested connector the subject composes, handed the subject's `policies.fetch`, reaches a host only its own manifest declares and the transport refuses it there, recorded with cause `host-not-declared`. Before that binding, a successfully parsed URL and host reached while the probe or a case factory is constructing finds no declaration to read and is refused with cause `no-egress-declaration`. Declare on the subject every host its composition reaches, or give the nested connector its own transport and accept that traffic through it is unobserved.
 
 Input-schema failures and `invokeConnector` pre-flight refusals have no expectation arm. Test them in ordinary connector tests. Supplied here, they report `proved: 'nothing'` with `CASE_EXPECTATION_UNMET`, whatever the case declared, because the gate boundary was never reached. Cases refused before invocation by instrumentation, factory construction, registration, posture, or manifest checks, and cases with an invocation setup failure, never run their invocation and are ineligible under the eligibility rule above. These cases add no expectation or wiring failure. Any escape recorded during their setup still becomes `NETWORK_IO_OUTSIDE_RUNTIME_FETCH`.
 

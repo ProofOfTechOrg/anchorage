@@ -9,6 +9,7 @@ import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import {
   type ExecutionFenceDatabase,
   ExecutionFenceStore,
+  RESERVED_EXECUTION_CONTEXT_KEYS,
 } from '../do-runner/index.js';
 import type { ScheduleFireClaim } from './schedules-d1.js';
 import { createScheduleTargetPolicy } from './target-policy.js';
@@ -1160,9 +1161,10 @@ describe('reserved-key barrier helpers', () => {
     expect(isReservedScheduleContextKey('my.custom')).toBe(false);
   });
 
-  it('every RESERVED_SCHEDULE_CONTEXT_KEYS entry is matched by the prefix predicate (no drift)', () => {
-    // The explicit list and the prefix-based matcher must not diverge.
-    expect(RESERVED_SCHEDULE_CONTEXT_KEYS.length).toBeGreaterThan(0);
+  it('shares the execution-context inventory and delegates its predicate', () => {
+    expect(RESERVED_SCHEDULE_CONTEXT_KEYS).toBe(
+      RESERVED_EXECUTION_CONTEXT_KEYS,
+    );
     for (const key of RESERVED_SCHEDULE_CONTEXT_KEYS) {
       expect(isReservedScheduleContextKey(key)).toBe(true);
     }

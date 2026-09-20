@@ -538,12 +538,13 @@ export class BackgroundTaskHost {
    *
    * `manager.init(pubsub)` is the only thing that subscribes `handleDispatch`,
    * and `handleDispatch` is what writes `status: 'running'` — the CLAIM. It
-   * also runs `recoverStaleTasks()`, which on @mastra/core 1.53.0 does two
+   * also runs `recoverStaleTasks()`, which on @mastra/core 1.67.0 does two
    * destructive things behind a closed fence:
    *
    *   1. every stranded `running` row with `maxRetries === 0` (the DEFAULT) is
    *      marked `failed` outright, before any executor is consulted; and
-   *   2. every `pending` row is re-dispatched, i.e. claimed.
+   *   2. pending rows are re-dispatched subject to the manager's concurrency
+   *      limit.
    *
    * Neither is reachable from inside an executor, which is why the gate lives
    * here and not there. Skipping init leaves pending rows pending and stranded

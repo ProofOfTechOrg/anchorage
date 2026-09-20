@@ -759,12 +759,6 @@ export class ApprovalService {
   /**
    * CAS-transitions a stale open record (pending/claimed/escalated, bound to
    * a suspension its step has since moved past) straight to 'rejected'.
-   * host-kit's reconcileApprovalsForSummary calls this before filing a fresh
-   * record for a step whose only open record no longer matches the run's
-   * current (suspendedAt, resumeCount) fingerprint. Without this transition,
-   * every poll would re-list the stale record through the open-step
-   * uniqueness index and file nothing.
-   *
    * Deliberately bypasses decide(): a rejection decision resumes the run
    * with declined semantics via #resume(), and a stale record must die
    * WITHOUT touching a run that is already suspended at a DIFFERENT

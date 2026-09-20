@@ -10,11 +10,30 @@ import {
   stripReservedExecutionContext,
 } from './execution-context.js';
 
+const EXPECTED_RESERVED_EXECUTION_CONTEXT_KEYS = [
+  'breakwater.connectorGrants',
+  'breakwater.connectorExecution',
+  'breakwater.actor',
+  'breakwater.principalPermissions',
+  'breakwater.workflowScope',
+  'breakwater.isolationScope',
+  'mastra:goal',
+  'flowsafe.runProvenance',
+  'flowsafe.runLifecycle',
+  'startReservation',
+  'runId',
+  'threadId',
+  'resourceId',
+  '__proto__',
+  'constructor',
+  'prototype',
+] as const;
+
 describe('execution-context trust boundary', () => {
-  it('reserves capabilities, correlation ids, goal state, and meta-keys', () => {
-    for (const key of RESERVED_EXECUTION_CONTEXT_KEYS) {
-      expect(isReservedExecutionContextKey(key), key).toBe(true);
-    }
+  it('reserves the independent capability, correlation, goal, lifecycle, and meta-key inventory', () => {
+    expect([...RESERVED_EXECUTION_CONTEXT_KEYS].sort()).toEqual(
+      [...EXPECTED_RESERVED_EXECUTION_CONTEXT_KEYS].sort(),
+    );
     expect(isReservedExecutionContextKey('breakwater.futureCapability')).toBe(
       true,
     );
@@ -22,6 +41,24 @@ describe('execution-context trust boundary', () => {
     expect(isReservedExecutionContextKey(RUN_PROVENANCE_CONTEXT_KEY)).toBe(
       true,
     );
+  });
+
+  it.each(
+    EXPECTED_RESERVED_EXECUTION_CONTEXT_KEYS,
+  )('rejects and strips the independent reserved key %s', (key) => {
+    expect(isReservedExecutionContextKey(key)).toBe(true);
+    const external = Object.fromEntries([[key, 'forged']]);
+    expect(() =>
+      assertNoReservedExecutionContext(external, 'body.context'),
+    ).toThrow(ReservedExecutionContextError);
+    const stored = Object.fromEntries([
+      [key, 'forged'],
+      ['application.locale', 'en-US'],
+    ]);
+    const safe = stripReservedExecutionContext(stored);
+    expect(safe).toEqual({ 'application.locale': 'en-US' });
+    expect(Object.getPrototypeOf(safe)).toBe(Object.prototype);
+    expect(Object.hasOwn(safe, key)).toBe(false);
   });
 
   it('rejects reserved external keys and strips them from stored compatibility context', () => {

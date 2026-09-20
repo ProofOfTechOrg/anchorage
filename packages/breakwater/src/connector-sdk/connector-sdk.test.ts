@@ -20,6 +20,7 @@ import {
   type Actor,
   PRINCIPAL_PERMISSIONS_CONTEXT_KEY,
 } from '../rbac/index.js';
+import { ATOMIC_LEGACY_IDEMPOTENCY_MIGRATION } from './idempotency-migration.js';
 import {
   type AtomicIdempotencyStore,
   CONNECTOR_EXECUTION_CONTEXT_KEY,
@@ -44,6 +45,7 @@ import {
   InMemoryIdempotencyStore,
   InMemoryRateLimitStore,
   invokeConnector,
+  migrateLegacyConnectorIdempotency,
 } from './index.js';
 import { replaceConnectorInvocation } from './invocation-registry.js';
 
@@ -617,17 +619,23 @@ function countingAccessor<T extends object>(
   return () => reads;
 }
 
-function countingConfig(
-  field: keyof ConnectorConfig,
+function connectorConfig(
   overrides: Partial<ConnectorConfig> = {},
-): { config: ConnectorConfig; reads: () => number } {
-  const config: ConnectorConfig = {
+): ConnectorConfig {
+  return {
     id: 'salesforce.createContact',
     description: 'Create a Salesforce contact',
     execute: async () => ({ ok: true }),
     permissions: { sideEffect: 'write' },
     ...overrides,
   };
+}
+
+function countingConfig(
+  field: keyof ConnectorConfig,
+  overrides: Partial<ConnectorConfig> = {},
+): { config: ConnectorConfig; reads: () => number } {
+  const config = connectorConfig(overrides);
   return { config, reads: countingAccessor(config, field) };
 }
 
@@ -637,14 +645,7 @@ function countingPolicies(
 ): { config: ConnectorConfig; reads: () => number } {
   const policies: ConnectorPolicies = { ...overrides.policies };
   const reads = countingAccessor(policies, field);
-  const config: ConnectorConfig = {
-    id: 'salesforce.createContact',
-    description: 'Create a Salesforce contact',
-    execute: async () => ({ ok: true }),
-    permissions: { sideEffect: 'write' },
-    ...overrides,
-    policies,
-  };
+  const config = connectorConfig({ ...overrides, policies });
   return { config, reads };
 }
 
@@ -5472,6 +5473,90 @@ describe('connector decision taxonomy', () => {
     expect(reserve).toHaveBeenCalledTimes(
       legacyState === 'absent' && acknowledged ? 1 : 0,
     );
+  });
+
+  it('honors an idempotency migration acknowledgement set after construction', async () => {
+    const execute = vi.fn(async () => 'executed');
+    const store = {
+      inspect: vi.fn(() => ({ state: 'absent' as const })),
+      get: vi.fn(() => undefined),
+      reserve: vi.fn(() => ({ state: 'reserved' as const, token: 'lease' })),
+      put: vi.fn(),
+      release: vi.fn(),
+    };
+    const policies: ConnectorPolicies = { idempotencyStore: store };
+    const tool = createConnectorBase({
+      id: 'migration.late-acknowledgement',
+      description: 'Observe acknowledgement timing',
+      permissions: { sideEffect: 'read', idempotencyKey: true },
+      policies,
+      execute,
+    });
+
+    policies.idempotencyKeyMigration = 'legacy-writers-drained';
+
+    await expect(
+      run(tool, {}, makeContext({ idempotencyKey: 'operation' })),
+    ).resolves.toBe('executed');
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+
+  it('denies an idempotent call after its migration acknowledgement is withdrawn', async () => {
+    const execute = vi.fn(async () => 'executed');
+    const store = {
+      inspect: vi.fn(() => ({ state: 'absent' as const })),
+      get: vi.fn(() => undefined),
+      put: vi.fn(),
+    };
+    const policies: ConnectorPolicies = {
+      idempotencyKeyMigration: 'legacy-writers-drained',
+      idempotencyStore: store,
+    };
+    const tool = createConnectorBase({
+      id: 'migration.withdrawn-acknowledgement',
+      description: 'Observe acknowledgement withdrawal',
+      permissions: { sideEffect: 'read', idempotencyKey: true },
+      policies,
+      execute,
+    });
+
+    delete policies.idempotencyKeyMigration;
+
+    await expect(
+      run(tool, {}, makeContext({ idempotencyKey: 'operation' })),
+    ).rejects.toMatchObject({ code: 'IDEMPOTENCY_MIGRATION_REQUIRED' });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('honors a migrator acknowledgement set after construction', async () => {
+    const migrate = vi.fn(async (request) => ({
+      state: 'migrated' as const,
+      record: request.targetRecord,
+    }));
+    const store = {
+      inspect: vi.fn(() => ({ state: 'absent' as const })),
+      get: vi.fn(() => undefined),
+      put: vi.fn(),
+      [ATOMIC_LEGACY_IDEMPOTENCY_MIGRATION]: migrate,
+    };
+    const policies: ConnectorPolicies = { idempotencyStore: store };
+    const tool = createConnectorBase({
+      id: 'migration.late-migrator-acknowledgement',
+      description: 'Observe migrator acknowledgement timing',
+      permissions: { sideEffect: 'read', idempotencyKey: true },
+      policies,
+      execute: async () => 'executed',
+    });
+
+    policies.idempotencyKeyMigration = 'legacy-writers-drained';
+
+    await expect(
+      migrateLegacyConnectorIdempotency(tool, {
+        idempotencyKey: 'operation:legacy',
+        expectedRecord: { result: 'legacy' },
+      }),
+    ).resolves.toEqual({ state: 'migrated', record: { result: 'legacy' } });
+    expect(migrate).toHaveBeenCalledTimes(1);
   });
 
   it.each([

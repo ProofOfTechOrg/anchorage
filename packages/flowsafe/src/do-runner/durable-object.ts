@@ -1900,8 +1900,8 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
           );
         }
         const {
-          workflowId: resumedWorkflowId,
-          runId: resumedRunId,
+          workflowId: startWorkflowId,
+          runId: startRunId,
           inputData,
           initialState,
           requestContext,
@@ -1911,24 +1911,24 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
           idempotencyKey: rawIdempotencyKey,
           startReservation: suppliedReservation,
         } = body ?? {};
-        if (typeof resumedWorkflowId !== 'string') {
+        if (typeof startWorkflowId !== 'string') {
           return json({ error: 'workflowId is required' }, 400);
         }
         // The DO never generates a runId: the trusted Worker mints the id and
         // addresses this instance with it. A start without one is a caller bug,
         // not a request for generation.
-        if (typeof resumedRunId !== 'string') {
+        if (typeof startRunId !== 'string') {
           return json(
             { error: 'runId is required (server-minted by the run router)' },
             400,
           );
         }
-        if (!isPathSafeId(resumedWorkflowId) || !isPathSafeId(resumedRunId)) {
+        if (!isPathSafeId(startWorkflowId) || !isPathSafeId(startRunId)) {
           throw new InvalidRunRequestError(
             'workflowId and runId must be URL-path-safe identifiers',
           );
         }
-        this.#assertRunIdentity(resumedWorkflowId, resumedRunId);
+        this.#assertRunIdentity(startWorkflowId, startRunId);
         // The key rides the internal channel and nothing else. Validated here
         // rather than trusted because this body is JSON: an unvalidated value
         // would reach the fence's proof-only comparison and the runtime's
@@ -1944,9 +1944,9 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
         if (
           startReservation &&
           (startReservation.key !== idempotencyKey ||
-            startReservation.runId !== resumedRunId ||
+            startReservation.runId !== startRunId ||
             startReservation.targetKind !== 'workflow' ||
-            startReservation.targetId !== resumedWorkflowId ||
+            startReservation.targetId !== startWorkflowId ||
             startReservation.threadId !== undefined ||
             startReservation.owner.kind !== principal.kind ||
             startReservation.owner.id !== principal.id ||
@@ -1957,7 +1957,7 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
           );
         const startIdentity = normalizeStartIdentity({
           owner: { kind: principal.kind, id: principal.id },
-          target: { kind: 'workflow', id: resumedWorkflowId },
+          target: { kind: 'workflow', id: startWorkflowId },
         });
         // Only this local preflight can release the captured claim. Admission
         // and proof binding belong to Runtime after durable preparation.
@@ -1982,8 +1982,8 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
         }
         const source = await this.#startSource(
           principal,
-          resumedWorkflowId,
-          resumedRunId,
+          startWorkflowId,
+          startRunId,
           scheduleId,
           dispatchId,
         );
@@ -1997,11 +1997,11 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
           : requestContext;
         const runtime = this.#ensureRuntime();
         await this.#recoverPendingRunOwner();
-        const existing = await runtime.status(resumedWorkflowId, resumedRunId);
+        const existing = await runtime.status(startWorkflowId, startRunId);
         if (existing) {
           const registered = await this.runOwnership(this.env).owner(
             'run',
-            resumedRunId,
+            startRunId,
           );
           if (
             !registered ||
@@ -2009,34 +2009,34 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
             registered.id !== owner.id
           ) {
             throw new Error(
-              `existing run '${resumedRunId}' has no matching committed owner`,
+              `existing run '${startRunId}' has no matching committed owner`,
             );
           }
           throw new RunAlreadyExistsError(
-            resumedWorkflowId,
-            resumedRunId,
+            startWorkflowId,
+            startRunId,
             existing.status,
           );
         }
         let recovery: RunOwnerRecovery = {
           version: 2,
           phase: 'preparing',
-          workflowId: resumedWorkflowId,
-          runId: resumedRunId,
+          workflowId: startWorkflowId,
+          runId: startRunId,
           token: crypto.randomUUID(),
           owner,
           ...(startReservation ? { startReservation } : {}),
         };
         const frame: RunStartFrame = { token: recovery.token, unwound: false };
-        const frameKey = this.#inFlightKey(resumedWorkflowId, resumedRunId);
+        const frameKey = this.#inFlightKey(startWorkflowId, startRunId);
         this.#startsInFlight.set(frameKey, frame);
         try {
           await this.#armRunOwnerRecovery(recovery);
-          await this.#reserveRunOwner(resumedRunId, owner, recovery.token);
+          await this.#reserveRunOwner(startRunId, owner, recovery.token);
           let summary: RunSummary;
           try {
-            summary = await runtime.start(resumedWorkflowId, {
-              runId: resumedRunId,
+            summary = await runtime.start(startWorkflowId, {
+              runId: startRunId,
               inputData: resolvedInput,
               initialState: resolvedState,
               ...(storedRequestContext !== undefined

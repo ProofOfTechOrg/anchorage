@@ -90,17 +90,14 @@ export function agentAuditContextFromRequestContext(
   if (!value || typeof value !== 'object') return undefined;
   try {
     const candidate = value as Record<string, unknown>;
-    for (const field of AGENT_AUDIT_REQUIRED_FIELDS) {
-      if (
-        typeof candidate[field] !== 'string' ||
-        candidate[field].length === 0
-      ) {
-        return undefined;
-      }
-    }
+    const agentId = candidate.agentId;
+    if (typeof agentId !== 'string' || agentId.length === 0) return undefined;
+    const entryPath = candidate.entryPath;
+    if (typeof entryPath !== 'string' || entryPath.length === 0)
+      return undefined;
     const context: AgentAuditContext = {
-      agentId: candidate.agentId as string,
-      entryPath: candidate.entryPath as string,
+      agentId,
+      entryPath,
     };
     for (const field of AGENT_AUDIT_OPTIONAL_FIELDS) {
       const fieldValue = candidate[field];

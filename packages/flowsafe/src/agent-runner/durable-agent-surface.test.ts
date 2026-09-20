@@ -145,9 +145,8 @@ const blockedByRunner = blockedEntries.filter(
  *
  * Offsets in the reasons below are @mastra/core 1.67.0-vintage, in
  * dist/create-durable-agent-DFHwqN2K.js unless another file is named. A member
- * whose prototype level differs between the pinned peer and a newer core gets a
- * VERSION_SKEW row; the table is empty while the pinned peer is the newest core
- * this inventory was read against.
+ * whose prototype level differs between the pinned peer and a newer core gets
+ * a VERSION_SKEW row.
  */
 const nonExecution = [
   '__fork',
@@ -174,13 +173,13 @@ const nonExecution = [
   // (:6598) flips any locally held controller and then calls
   // requestRemoteAbort (:6626), which publishes an abort request over pubsub
   // (:272) to whichever process holds the run — and abortRunStream returns
-  // `aborted || this.#isRunExecuting(runId)` (:6585), a boolean existence
-  // oracle for a run id the caller may not own. Breakwater's narrowed handle
-  // omits both (agent.test.ts, in `intentionallyUnavailable`), a divergence
-  // running the opposite way to the ones durable-agent-runner.ts records, where
-  // breakwater is the weaker side: a handle can omit a member, while an
-  // instance Mastra calls in-process can only refuse it, and neither of these
-  // matches a blocked ground.
+  // `aborted || this.#isRunExecuting(runId)` (:6585), a boolean existence oracle
+  // for a run id the caller may not own. Breakwater's narrowed handle omits both
+  // (agent.test.ts, in `intentionallyUnavailable`), a divergence running the
+  // opposite way to the ones durable-agent-runner.ts records, where breakwater
+  // is the weaker side: a handle can omit a member, while an instance Mastra
+  // calls in-process can only refuse it, and neither of these matches a blocked
+  // ground.
   'abortRunStream',
   'abortThreadStream',
   'agent',
@@ -330,8 +329,7 @@ const delegatingToGuard = [
  * Offsets in the reasons below are @mastra/core 1.67.0-vintage, in
  * dist/agent-Dk0N0Nlg.js unless another file is named. A member whose prototype
  * level differs between the pinned peer and a newer core gets a VERSION_SKEW
- * row; the table is empty while the pinned peer is the newest core this
- * inventory was read against.
+ * row.
  */
 const agentNonExecution = [
   '__getDrainPendingSignals',
@@ -481,7 +479,7 @@ interface SkewRow {
   newest: SkewLevel;
 }
 
-const VERSION_SKEW: Record<string, SkewRow> = {};
+const VERSION_SKEW: Readonly<Record<string, Readonly<SkewRow>>> = {};
 
 // Rows are read as entries, never indexed by name: the name and its row travel
 // together, so every read below is total whatever the table holds.
@@ -1171,8 +1169,8 @@ describe('FlowsafeDurableAgent prototype surface inventory', () => {
 
     // #when every member name in that block is collected. The comment writes
     // them bare beside their dist offsets — listActiveThreadRuns() (:38214) —
-    // where the document backticks them, so the form here is `member()` with
-    // no fence around it.
+    // where the document backticks them, so the form here is `member()` with no
+    // fence around it.
     const comment = source.slice(0, commentEnd).join('\n');
     const named = new Set(
       (comment.match(/[A-Za-z_]+\(\)/g) ?? []).map((call) => call.slice(0, -2)),

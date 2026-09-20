@@ -96,9 +96,9 @@ export function schedulesStore(db: Env['DB']): D1SchedulesStorage {
  * poller, and the approval services that decide-then-resume all have to be
  * gating the SAME database as the runtime they sit in front of.
  *
- * The memo is the package's own `executionFenceFor` rather than a fifth copy
- * beside the four above — it is keyed on the binding for exactly the reason the
- * rest of this file is, and sharing it means this host and the flowsafe
+ * The memo uses the package's `executionFenceFor` instead of constructing
+ * another store. It is keyed on the binding for exactly the reason the rest of
+ * this file is, and sharing it means this host and the flowsafe
  * internals a route reaches through hand back the same store for one database.
  * The local name stays because it is what every call site in this host reads.
  */

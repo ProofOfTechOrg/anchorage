@@ -386,7 +386,7 @@ export async function abandonApprovalsForRun(
  *    escalated, bound to a suspension the step has since moved past —
  *    produced e.g. by the raw grant-free resume route re-suspending the step
  *    while an earlier request still sits open) is SUPERSEDED first
- *    (ApprovalService.supersedeStale: a CAS transition straight to
+ *    (ApprovalService.supersedeStaleAsPrincipal: a CAS transition straight to
  *    'rejected', system-attributed, audited as approval.supersede, never
  *    through decide() — so it never touches the run) before the fresh file,
  *    closing the loop where a stale-but-open record otherwise never heals

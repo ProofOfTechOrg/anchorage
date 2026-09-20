@@ -62,7 +62,7 @@ export interface D1StorageOptions {
   /**
    * Additional storage domains composed over the D1Store default, such as
    * notifications and thread state, which @mastra/cloudflare-d1 does not ship, so
-   * they are flowsafe-owned D1 impls). Injected rather than imported so this
+   * they are flowsafe-owned D1 impls. Injected rather than imported so this
    * lower layer never depends on `signals/` (which imports do-runner) — build
    * them with `createSignalStorageDomains()` and pass them here. The default
    * workflow domain supports explicit initial-admission scopes; false/custom
