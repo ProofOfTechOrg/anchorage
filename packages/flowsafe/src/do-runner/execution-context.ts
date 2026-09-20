@@ -17,7 +17,11 @@ export const RUN_PROVENANCE_CONTEXT_KEY = 'flowsafe.runProvenance';
 /**
  * Runtime-owned request-context keys. The predicate below also reserves the
  * complete `breakwater.*` namespace so future capability keys are protected
- * before this inventory is updated.
+ * before this inventory is updated. A stored context carrying a reserved key
+ * injects a standing capability or objective into each woken run, the
+ * stored-capability class of the approval create-route leak. `__proto__`,
+ * `constructor`, and `prototype` remain reserved so parsed JSON cannot mutate
+ * a copied context's prototype.
  */
 export const RESERVED_EXECUTION_CONTEXT_KEYS: readonly string[] = [
   BREAKWATER_CONNECTOR_GRANTS_KEY,

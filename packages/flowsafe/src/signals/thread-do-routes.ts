@@ -1163,7 +1163,7 @@ async function handleNotificationDispatch(options: {
       persistenceAllowed: options.persistenceAllowed,
       memoryAvailable: options.memoryAvailable,
       signal: deliverableSignal,
-      deliverActive: (runId, memoryAvailable) =>
+      deliverActive: (runId, activeMemoryAvailable) =>
         options.agent.sendSignal(deliverableSignal, {
           runId,
           threadId: options.threadId,
@@ -1171,7 +1171,7 @@ async function handleNotificationDispatch(options: {
           ifActive: { behavior: 'deliver' },
           ifIdle: {
             behavior:
-              memoryAvailable && options.persistenceAllowed
+              activeMemoryAvailable && options.persistenceAllowed
                 ? 'persist'
                 : 'discard',
           },
@@ -1524,7 +1524,7 @@ async function handleWake(options: {
    */
   executionFence: ExecutionFenceReading;
   proof?: SignalProofGuard;
-  deliverActive(runId: string, memoryAvailable: boolean): WakeDelivery;
+  deliverActive(runId: string, activeMemoryAvailable: boolean): WakeDelivery;
   persist(): WakeDelivery;
 }): Promise<Response> {
   return options.serializeWake(async () => {
@@ -2044,7 +2044,7 @@ async function handleScheduleSignal(options: {
       dispatchId,
       safeContext: { ...requestContext, ...idleRequestContext },
       activeDiscardAllowed: ifActive.behavior === 'discard',
-      deliverActive: (activeRunId, memoryAvailable) =>
+      deliverActive: (activeRunId, activeMemoryAvailable) =>
         options.agent.sendSignal(deliverableSignal, {
           runId: activeRunId,
           threadId: options.threadId,
@@ -2052,7 +2052,9 @@ async function handleScheduleSignal(options: {
           ifActive,
           ifIdle: {
             behavior:
-              memoryAvailable && persistenceAllowed ? 'persist' : 'discard',
+              activeMemoryAvailable && persistenceAllowed
+                ? 'persist'
+                : 'discard',
           },
         }),
       persist: () =>

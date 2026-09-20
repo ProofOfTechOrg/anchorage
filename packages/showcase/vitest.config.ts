@@ -15,8 +15,10 @@ export default defineConfig({
         find: /^@flowsafe-test\/(.*)$/,
         replacement: src('../flowsafe/test-support/$1'),
       },
-      // Cross-package specifiers resolve to SOURCE (exact matches, mirroring
-      // tsconfig.worker.json) so tests never depend on a built dist.
+      // Exact aliases resolve these roots to source. Tests importing
+      // breakwater/policy-engine or /rbac resolve through dist, which the root
+      // pnpm typecheck builds through showcase's pretypecheck during its
+      // recursive package run.
       {
         find: /^@proofoftech\/breakwater$/,
         replacement: src('../breakwater/src/index.ts'),

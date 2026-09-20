@@ -773,9 +773,10 @@ export class ApprovalService {
    * supersedeStaleAsPrincipal instead (host-kit/approval-bridge.ts); this is
    * the host-facing ApprovalActor form of the same transition, exported
    * through `./approval-api` for hosts that file and un-file approvals under
-   * an actor. Authorized like create() (CAN_CREATE, not CAN_REVIEW):
-   * superseding is the "un-file" half of the same filing operation, not a
-   * reviewer decision.
+   * an actor. It remains public for those hosts even though no in-repo
+   * production path calls it. Authorized like create() (CAN_CREATE, not
+   * CAN_REVIEW): superseding is the "un-file" half of the same filing
+   * operation, not a reviewer decision.
    *
    * Returns null — mirroring the store's own CAS contract, rather than
    * throwing — when the record is unknown or already left the OPEN set (a

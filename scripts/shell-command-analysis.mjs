@@ -5,12 +5,17 @@ import { Language, Parser } from 'web-tree-sitter';
 // This checker covers pnpm executed directly by a Bash-parsed workflow run
 // block and pnpm/action-setup steps handled by the YAML adapter. Package
 // scripts, script files, actions, action inputs, BASH_ENV, and programs that
-// may spawn pnpm are opaque. The finite model is conservative for syntax it
-// cannot classify, but it is not a defence against deliberately obfuscated
-// workflow text.
+// may spawn pnpm are opaque. A run block for which hasPnpmToken returns false
+// produces no limit issue or pnpm usage/install flag. The finite model is
+// conservative for syntax it cannot classify, but it is not a defence against
+// deliberately obfuscated workflow text.
 
 const require = createRequire(import.meta.url);
 const GITHUB_EXPRESSION_MARKER = '\u{E000}';
+
+export function hasPnpmToken(source) {
+  return /(?:^|[^A-Za-z0-9_])pnpm(?:$|[^A-Za-z0-9_])/u.test(source);
+}
 
 await Parser.init();
 const bashLanguage = await Language.load(
@@ -121,7 +126,6 @@ const INSTALL_OPTIONS = new Map([
 const ADD_OPTIONS = new Map([
   ...pnpmOptions('establish', 0, [
     '--aggregate-output',
-    '--allow-build',
     '--color',
     '--ignore-scripts',
     '--no-color',
@@ -151,6 +155,7 @@ const ADD_OPTIONS = new Map([
     '-w',
   ]),
   ...pnpmOptions('establish', 1, [
+    '--allow-build',
     '--loglevel',
     '--reporter',
     '--save-catalog-name',
@@ -221,6 +226,19 @@ for (const name of ['--dir', '--prefix', '-C']) {
   INSTALL_OPTIONS.set(name, { arity: 1, behavior: 'directory' });
   ADD_OPTIONS.set(name, { arity: 1, behavior: 'directory' });
 }
+
+export const PNPM_OPTION_POLICIES = Object.freeze(
+  Object.fromEntries(
+    [...PNPM_COMMAND_OPTIONS].map(([command, options]) => [
+      command,
+      Object.freeze(
+        [...options].map(([name, policy]) =>
+          Object.freeze({ name, ...policy }),
+        ),
+      ),
+    ]),
+  ),
+);
 
 const SHORT_PNPM_OPTIONS = new Map(
   [...PNPM_OPTION_ARITIES].filter(([name]) => /^-[^-]$/u.test(name)),
@@ -429,13 +447,13 @@ function inlineOption(token, option) {
     : undefined;
 }
 
-function parseShortPnpmOptions(token) {
+function parseShortOptions(token, options) {
   if (!/^-[^-]+/u.test(token)) return undefined;
   const parsed = [];
   for (let index = 1; index < token.length; index += 1) {
     const name = `-${token[index]}`;
-    const arity = SHORT_PNPM_OPTIONS.get(name);
-    if (arity === undefined) return undefined;
+    const arity = options.get(name);
+    if (arity === undefined) return { unmodelled: name };
     if (arity === 0) {
       parsed.push({ name });
       continue;
@@ -443,9 +461,9 @@ function parseShortPnpmOptions(token) {
     let value = token.slice(index + 1);
     if (value.startsWith('=')) value = value.slice(1);
     parsed.push({ name, value: value || undefined });
-    return parsed;
+    return { parsed };
   }
-  return parsed;
+  return { parsed };
 }
 
 function pnpmInvocation(tokens) {
@@ -500,16 +518,16 @@ function pnpmInvocation(tokens) {
       continue;
     }
     if (optionsEnabled && token.startsWith('-') && token !== '-') {
-      const combined = parseShortPnpmOptions(token);
-      if (!combined) {
-        unresolved ??= `unmodelled pnpm option ${token}`;
+      const combined = parseShortOptions(token, SHORT_PNPM_OPTIONS);
+      if (!combined || combined.unmodelled) {
+        unresolved ??= `unmodelled pnpm option ${combined?.unmodelled ?? token}`;
         if (subcommand === undefined) {
           unresolvedBeforeSubcommand = true;
           break;
         }
         continue;
       }
-      for (const option of combined) {
+      for (const option of combined.parsed) {
         if (
           PNPM_OPTION_ARITIES.get(option.name) === 1 &&
           option.value === undefined
@@ -606,24 +624,33 @@ function unwrap(tokens, specification) {
       continue;
     }
     if (token.startsWith('-') && token !== '-') {
-      let optionName = token.split('=', 1)[0];
-      let arity = specification.options.get(optionName);
-      let attachedValue;
-      if (arity === undefined && /^-[^-].+/u.test(token)) {
-        optionName = token.slice(0, 2);
-        arity = specification.options.get(optionName);
-        attachedValue = token.slice(2);
-      }
-      if (arity === undefined)
-        return { limit: `unmodelled wrapper option ${optionName}` };
-      if (
-        arity === 1 &&
-        attachedValue === undefined &&
-        inlineOption(token, optionName) === undefined
-      ) {
-        if (tokens[index + 1]?.value === undefined)
-          return { limit: `non-literal ${optionName} operand` };
-        index += 1;
+      const longOption = token.startsWith('--');
+      const optionName = token.split('=', 1)[0];
+      const parsed = longOption
+        ? specification.options.has(optionName)
+          ? {
+              parsed: [
+                {
+                  name: optionName,
+                  value: inlineOption(token, optionName),
+                },
+              ],
+            }
+          : { unmodelled: optionName }
+        : parseShortOptions(token, specification.options);
+      if (!parsed || parsed.unmodelled)
+        return {
+          limit: `unmodelled wrapper option ${parsed?.unmodelled ?? optionName}`,
+        };
+      for (const option of parsed.parsed) {
+        if (
+          specification.options.get(option.name) === 1 &&
+          option.value === undefined
+        ) {
+          if (tokens[index + 1]?.value === undefined)
+            return { limit: `non-literal ${option.name} operand` };
+          index += 1;
+        }
       }
       continue;
     }
@@ -777,6 +804,7 @@ function issue(context, kind, node, reason) {
 }
 
 function recordLimit(node, state, context, reason) {
+  if (!context.hasPnpmToken) return;
   context.usesPnpm = true;
   if (!state.suppressLimits) {
     issue(context, 'limit', node, reason);
@@ -821,9 +849,16 @@ function analyzeCommand(node, state, context, mode, metadata = {}) {
       ),
   };
   const classification = classifyCommand(commandTokens(node), commandContext);
-  if (classification.kind !== 'neutral' && classification.kind !== 'state')
+  if (
+    context.hasPnpmToken &&
+    classification.kind !== 'neutral' &&
+    classification.kind !== 'state'
+  )
     context.usesPnpm = true;
-  if (['install', 'neutral-install'].includes(classification.kind))
+  if (
+    context.hasPnpmToken &&
+    ['install', 'neutral-install'].includes(classification.kind)
+  )
     context.installsPnpm = true;
   if (classification.kind === 'limit') {
     recordLimit(node, state, context, classification.reason);
@@ -895,7 +930,7 @@ function analyzeCommand(node, state, context, mode, metadata = {}) {
 }
 
 function namedChildren(children) {
-  return children.filter((child) => child.isNamed);
+  return children.filter((child) => child.isNamed && child.type !== 'comment');
 }
 
 const SEQUENCE_SEPARATORS = new Set([
@@ -944,12 +979,25 @@ function analyzeSequence(children, state, context, mode) {
 
 function analyzeList(node, state, context, mode, metadata) {
   const children = node.children;
-  const operands = children.filter((child) => child.isNamed);
+  const operands = namedChildren(children);
   if (operands.length === 0) return { failure: state, success: state };
   const listMode = metadata.listFinal ? mode : 'limit';
-  let outcome = analyzeNode(operands[0], state, context, listMode, {
-    listFinal: true,
-  });
+  const operandMode = (operand, final) =>
+    !final &&
+    ['case_statement', 'compound_statement', 'if_statement'].includes(
+      operand.type,
+    )
+      ? 'limit'
+      : listMode;
+  let outcome = analyzeNode(
+    operands[0],
+    state,
+    context,
+    operandMode(operands[0], operands.length === 1),
+    {
+      listFinal: true,
+    },
+  );
   for (let index = 1; index < operands.length && !context.stopped; index += 1) {
     const left = operands[index - 1];
     const right = operands[index];
@@ -970,7 +1018,7 @@ function analyzeList(node, state, context, mode, metadata) {
         right,
         outcome.success,
         context,
-        listMode,
+        operandMode(right, index === operands.length - 1),
         {
           listFinal: true,
         },
@@ -992,7 +1040,7 @@ function analyzeList(node, state, context, mode, metadata) {
         right,
         outcome.failure,
         context,
-        listMode,
+        operandMode(right, index === operands.length - 1),
         {
           listFinal: true,
         },
@@ -1260,6 +1308,27 @@ const NODE_HANDLERS = new Map([
 ]);
 
 const MODELLED_CONTAINER_TYPES = new Set(NODE_HANDLERS.keys());
+export const NODE_HANDLER_TYPES = Object.freeze([...NODE_HANDLERS.keys()]);
+export const UNMODELLED_NODE_TYPES = Object.freeze([
+  '_expression',
+  '_primary_expression',
+  '_statement',
+  'ansi_c_string',
+  'comment',
+  'extglob_pattern',
+  'file_descriptor',
+  'heredoc_content',
+  'heredoc_end',
+  'heredoc_start',
+  'raw_string',
+  'regex',
+  'simple_expansion',
+  'special_variable_name',
+  'string_content',
+  'test_operator',
+  'variable_name',
+  'word',
+]);
 
 function analyzeNode(node, state, context, mode = 'normal', metadata = {}) {
   if (context.stopped) return { failure: state, success: state };
@@ -1285,12 +1354,13 @@ export function analyzePnpmCommands(
 ) {
   const parser = new Parser();
   parser.setLanguage(bashLanguage);
-  const parseSource = source.replace(/\$\{\{[^\r\n]*?\}\}/gu, (expression) =>
+  const parseSource = source.replace(/\$\{\{[\s\S]*?\}\}/gu, (expression) =>
     GITHUB_EXPRESSION_MARKER.repeat(expression.length),
   );
   const tree = parser.parse(parseSource);
   try {
     const context = {
+      hasPnpmToken: hasPnpmToken(source),
       installPolicy,
       installsPnpm: false,
       issues: [],

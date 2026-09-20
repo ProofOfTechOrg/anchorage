@@ -18,6 +18,7 @@ import {
   verifyDirectDecommissionExport,
 } from '../scripts/direct-credentialed-observations.mjs';
 import { expectBuiltDist } from './fixtures/built-dist.js';
+import { closeFixtures } from './fixtures/cleanup.js';
 import {
   closeDirectObservationFixture,
   directObservationFixture,
@@ -82,25 +83,14 @@ beforeEach(() => {
 afterEach(async () => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
-  const cleanup = await Promise.all(
-    fixtures.splice(0).map(async (fixtureValue) => {
-      const failures: unknown[] = [];
-      try {
-        await fixtureValue.close();
-      } catch (error) {
-        failures.push(error);
-      }
-      try {
-        expect(fixtureValue.unexpected).toEqual([]);
-      } catch (error) {
-        failures.push(error);
-      }
-      return failures;
-    }),
+  const fixtureValues = fixtures.splice(0);
+  await closeFixtures(
+    fixtureValues.map((fixtureValue) => () => fixtureValue.close()),
+    fixtureValues.map(
+      (fixtureValue) => () => expect(fixtureValue.unexpected).toEqual([]),
+    ),
+    'observation fixture cleanup failed',
   );
-  const failures = cleanup.flat();
-  if (failures.length)
-    throw new AggregateError(failures, 'observation fixture cleanup failed');
 });
 
 it('removes the fixture directory when journal closure rejects', async () => {

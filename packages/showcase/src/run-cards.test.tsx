@@ -86,6 +86,7 @@ describe('RunCards polling errors', () => {
     expect(
       screen.getByText(`Could not read run status: ${UNAVAILABLE}`),
     ).toBeInTheDocument();
+    expect(screen.getByText('Polling stopped.')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Retry live updates' }));
     expect(onRetryPolling).toHaveBeenCalledTimes(1);
     rendered.unmount();

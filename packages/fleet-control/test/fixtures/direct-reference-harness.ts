@@ -54,6 +54,7 @@ import type {
   directForceBudgetProbe,
   ForceBudgetStage,
 } from './direct-force-budget-probe.js';
+import { recoveryApplicationSpec } from './direct-reference-context-harness.js';
 import {
   type D1State,
   deploymentIdentity,
@@ -280,19 +281,9 @@ export async function createDirectReferenceHarness(
       secrets[role],
       binding,
     );
-    if (role !== 'recovery' || !policy.recoveryApplicationR2Bucket) return spec;
-    if (!spec.application)
-      throw new Error('recovery fixture has no application bindings');
-    return {
-      ...spec,
-      application: {
-        ...spec.application,
-        r2Buckets: [
-          ...spec.application.r2Buckets,
-          { name: policy.recoveryApplicationR2Bucket },
-        ],
-      },
-    };
+    return role === 'recovery'
+      ? recoveryApplicationSpec(spec, policy.recoveryApplicationR2Bucket)
+      : spec;
   });
   /** True for the run's own export bucket, false for a tenant's. */
   const isExportBucket = (name: string | undefined) =>
@@ -895,6 +886,9 @@ export async function createDirectReferenceHarness(
     const budgetProbeSource = fileURLToPath(
       new URL('./direct-force-budget-probe.ts', import.meta.url),
     );
+    const recoveryEnvironment = policy.recoveryApplicationR2Bucket
+      ? `,DIRECT_RECOVERY_R2_BUCKET:${JSON.stringify(policy.recoveryApplicationR2Bucket)}`
+      : '';
     await writeFile(
       main,
       `import {createDirectReferenceWorker} from ${JSON.stringify(workerSource)};
@@ -902,7 +896,7 @@ import {directForceBudgetProbe} from ${JSON.stringify(budgetProbeSource)};
 const manifest=${JSON.stringify(manifest)};
 const providerFetch=async(input,init)=>{const request=new Request(input,init);if(request.url==='data:,')return fetch(request);const headers=new Headers(request.headers);headers.set('X-Direct-Fixture-Url',request.url);return fetch('http://127.0.0.1:${address.port}/',{method:request.method,headers,body:request.body,signal:request.signal,redirect:'manual'});};
 const worker=createDirectReferenceWorker(manifest,{fetch:providerFetch});
-let instance; export default {async fetch(request,env){instance??=crypto.randomUUID();const current={...env,CLOUDFLARE_API_TOKEN:'inert-provider-token',FLEET_DIRECT_CONFORMANCE_INVOKE_SECRET:'inert-invoke',DIRECT_RUN_BINDING:${JSON.stringify(JSON.stringify(binding))},DIRECT_DEPLOYMENT_SECRETS:${JSON.stringify(JSON.stringify(secrets))},DIRECT_RECOVERY_R2_BUCKET:${JSON.stringify(policy.recoveryApplicationR2Bucket)}};const response=new URL(request.url).pathname==='/__fixture/force-budget'?Response.json(await directForceBudgetProbe(manifest,current,(await request.json()).stage,providerFetch,request.signal)):await worker.fetch(request,current);response.headers.set('X-Fixture-Instance',instance);return response;}};`,
+let instance; export default {async fetch(request,env){instance??=crypto.randomUUID();const current={...env,CLOUDFLARE_API_TOKEN:'inert-provider-token',FLEET_DIRECT_CONFORMANCE_INVOKE_SECRET:'inert-invoke',DIRECT_RUN_BINDING:${JSON.stringify(JSON.stringify(binding))},DIRECT_DEPLOYMENT_SECRETS:${JSON.stringify(JSON.stringify(secrets))}${recoveryEnvironment}};const response=new URL(request.url).pathname==='/__fixture/force-budget'?Response.json(await directForceBudgetProbe(manifest,current,(await request.json()).stage,providerFetch,request.signal)):await worker.fetch(request,current);response.headers.set('X-Fixture-Instance',instance);return response;}};`,
     );
     const options = {
       root: directory,

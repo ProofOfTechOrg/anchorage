@@ -21,17 +21,13 @@ import { isRunStartPendingError } from '../do-runner/execution-admission.js';
 // advanced nextFireAt, so the capped fire is consumed without a hot retry.
 //
 // STORED-CONTEXT BARRIER: a schedule's stored WorkflowSchedule.requestContext
-// is NEVER forwarded verbatim into a fired leg. The tick STRIPS every reserved
-// key: the whole `breakwater.` namespace and core's goal key, before handing
-// the remainder to the start seam. The reserved set exactly matches
-// #requestContextFor's keys: two scope keys and the grant key. A stripped
-// context shares NO key with the runtime-derived context. There is normally
-// nothing to collide. buildScheduledLegContext keeps the stored context FIRST
-// and the runtime-derived context LAST. For a host applying stored context, a
-// reserved key that slips the strip still LOSES to the runtime value. The DO
-// target resolves this sanitized context from the exact prepared trigger
-// snapshot. RunnerRuntime merges it below provider/runtime-derived values. It
-// never trusts a forwarded body copy.
+// is not forwarded verbatim into a fired leg. The tick strips the shared
+// RESERVED_EXECUTION_CONTEXT_KEYS inventory before handing the remainder to the
+// start seam. buildScheduledLegContext keeps stored context first and
+// runtime-derived context last, so a reserved key that escapes stripping still
+// loses to the runtime value. The DO target resolves this sanitized context
+// from the prepared trigger snapshot. RunnerRuntime merges it below
+// provider/runtime-derived values rather than trusting a forwarded body copy.
 
 import { ScheduleInputSchema } from '@mastra/core/schedules';
 import { computeNextFireAt } from '@mastra/core/workflows';
@@ -64,14 +60,7 @@ import {
  */
 export const RESERVED_SCHEDULE_CONTEXT_KEYS = RESERVED_EXECUTION_CONTEXT_KEYS;
 
-/**
- * A key is reserved iff it is in the `breakwater.` namespace (covers all four
- * base keys AND any future breakwater key) or is core's goal key. A stored
- * schedule context carrying any of these would inject a standing capability /
- * objective into every woken run — the same stored-capability class as the
- * approval create-route leak. The three object meta-keys are also reserved so
- * parsed JSON cannot mutate a copied context's prototype.
- */
+/** Delegates schedule context admission to RESERVED_EXECUTION_CONTEXT_KEYS. */
 export function isReservedScheduleContextKey(key: string): boolean {
   return isReservedExecutionContextKey(key);
 }

@@ -7,6 +7,7 @@ import { isInvokedAsEntryPoint } from './entry-point.mjs';
 import {
   analyzePnpmCommands,
   classifyPnpmInstallArguments,
+  hasPnpmToken,
   isRepositoryRootPath,
 } from './shell-command-analysis.mjs';
 
@@ -287,7 +288,7 @@ function firstPnpmIssue(job, workflowRunDefaults) {
     if (shellKind.kind === 'other') {
       // The Bash grammar cannot classify another shell's strings and comments,
       // so unsupported shells retain a lexical pnpm check.
-      if (/\bpnpm\b/u.test(step.run) && establishment !== 'unconditional') {
+      if (hasPnpmToken(step.run) && establishment !== 'unconditional') {
         return {
           index,
           step,

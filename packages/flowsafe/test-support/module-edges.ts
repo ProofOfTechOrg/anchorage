@@ -2,6 +2,8 @@
 // Shared line-oriented edge patterns for Flowsafe's packed declaration gates
 // and source leaf-edge tests. Fleet Control's static graph uses a TypeScript AST
 // walk because it resolves a different surface.
+// This file imports nothing relative: packed .mjs gates load its .ts path under
+// Node type stripping, where a .js specifier has no emitted file to resolve.
 
 /**
  * Each pattern is one line form a source names another module in: a `from`

@@ -204,6 +204,8 @@ The bounded engine never persists the raw diagnostic bytes a one-shot audit comp
 
 An audit start pins its finalized inventory generation through completion and replay. See [audit an account under a request budget](fleet-control.md#audit-an-account-under-a-request-budget) for release, adoption, and custom-store behavior.
 
+A crash between a terminal commit and its pin release leaves a terminal-but-still-pinned window that the next prune or abandonment call closes, release-first, so an orphan pin cannot outlive its operation.
+
 Bounded audit advances re-read and re-parse accumulated state, so their provider-work bound does not bound CPU, memory, or billed rows. See [audit an account under a request budget](fleet-control.md#audit-an-account-under-a-request-budget) for the aggregate cost model and measurements.
 
 ### Bounded fleet migration

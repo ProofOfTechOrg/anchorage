@@ -1139,10 +1139,10 @@ describe('FlowsafeDurableAgent prototype surface inventory', () => {
     );
 
     // #then every key of the reason table is among them. A SUBSET tie, not an
-    // equality: those bullets also name the thread-runtime readers and the
-    // entry points that already enforce the host-minted run id, in the same
-    // backticked form and with nothing separating them, so a name the document
-    // carries that is no key belongs there.
+    // equality: those bullets also name entry points that already enforce the
+    // host-minted run id, in the same backticked form and with nothing
+    // separating them, so a name the document carries that is no key belongs
+    // there.
     expect(
       blockedEntries.filter((method) => !documented.has(method)),
       'BLOCKED_RUN_ENTRIES names an entry that docs/durable-agents.md leaves out of its four grounds. The reason table is authoritative — document the entry under the ground it falls in, in the same commit.',

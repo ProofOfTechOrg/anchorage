@@ -71,8 +71,9 @@ jobs:
       - name: Build
         run: pnpm build
 
-      # These suites run the agent-starter token script against flowsafe's
-      # built `approval-api` entry, so they require the Build step's output.
+      # The `mint` cases in scripts/entry-point.test.mjs run the agent-starter
+      # token script against flowsafe's built `approval-api` entry, so this step
+      # needs the Build step's output.
       - name: Test root Node tools
         run: pnpm test:node-tools
 
@@ -325,7 +326,7 @@ jobs:
           INSTALLED_CORE=$(pnpm --filter @proofoftech/breakwater exec node -p 'require("@mastra/core/package.json").version')
           INSTALLED_D1=$(pnpm --filter @proofoftech/flowsafe exec node -p 'require("@mastra/cloudflare-d1/package.json").version')
           relation() {
-            node -e 'const [baseline,requested]=process.argv.slice(1); const valid=/^\d+\.\d+\.\d+$/; if(!valid.test(baseline)||!valid.test(requested)) process.exit(2); const order=(left,right)=>{const a=left.split(".").map(Number);const b=right.split(".").map(Number);for(let i=0;i<a.length;i+=1){if(a[i]!==b[i])return a[i]-b[i];}return 0;}; if(baseline===requested)console.log("equality");else if(order(requested,baseline)>0)console.log("newer");else process.exit(1);' "$1" "$2"
+            node -e 'const [baseline,requested]=process.argv.slice(1); const valid=/^\d+\.\d+\.\d+$/; if(!valid.test(baseline)||!valid.test(requested)){console.error(`unusable version pair ${baseline} / ${requested}`);process.exit(2);} const order=(left,right)=>{const a=left.split(".").map(Number);const b=right.split(".").map(Number);for(let i=0;i<a.length;i+=1){if(a[i]!==b[i])return a[i]-b[i];}return 0;}; if(baseline===requested)console.log("equality");else if(order(requested,baseline)>0)console.log("newer");else{console.error(`requested ${requested} is older than baseline ${baseline}`);process.exit(1);}' "$1" "$2"
           }
           CORE_COVERAGE=$(relation "$BASELINE_CORE" "$EXPECTED_CORE")
           D1_COVERAGE=$(relation "$BASELINE_D1" "$EXPECTED_D1")

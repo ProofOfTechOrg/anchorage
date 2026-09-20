@@ -18,6 +18,7 @@ import { DirectReferenceExecutionError } from '../scripts/direct-reference-http.
 import { DirectReferenceJournalError } from '../scripts/direct-reference-journal.js';
 import { DirectReferenceTransport } from '../scripts/direct-reference-transport.js';
 import { createDirectReferenceWorker } from '../scripts/direct-reference-worker.js';
+import { closeFixtures } from './fixtures/cleanup.js';
 import { directFixtureManifest } from './fixtures/direct-credentialed-config.js';
 import { directObservationFixture } from './fixtures/direct-observations.js';
 import { providerRefusalCases } from './fixtures/direct-provider-errors.js';
@@ -28,14 +29,15 @@ vi.mock('../scripts/direct-reference-context.js', () => ({
 
 afterEach(() => vi.clearAllMocks());
 
-async function closeComposedFixtures(
-  closers: readonly (() => Promise<void>)[],
+async function closeWorkerFixtures(
+  resumed: Pick<DirectRunJournal, 'close'> | undefined,
+  closeLocal: () => Promise<void>,
 ): Promise<void> {
-  const failures = (
-    await Promise.allSettled(closers.map((close) => close()))
-  ).flatMap((result) => (result.status === 'rejected' ? [result.reason] : []));
-  if (failures.length)
-    throw new AggregateError(failures, 'composed fixture cleanup failed');
+  await closeFixtures(
+    [() => resumed?.close() ?? Promise.resolve(), closeLocal],
+    [],
+    'composed fixture cleanup failed',
+  );
 }
 
 it.each([
@@ -151,25 +153,24 @@ it.each([
       expect(resumed.snapshot().lastInvocation?.state).toBe('settled');
     }
   } finally {
-    await closeComposedFixtures([
-      () => resumed?.close() ?? Promise.resolve(),
-      () => local.close(),
-    ]);
+    await closeWorkerFixtures(resumed, () => local.close());
   }
 });
 
 it('continues composed cleanup after the first closer rejects', async () => {
   const calls: string[] = [];
   const sentinel = new Error('resumed-close-sentinel');
-  const failure = closeComposedFixtures([
-    async () => {
-      calls.push('resumed');
-      throw sentinel;
+  const failure = closeWorkerFixtures(
+    {
+      async close() {
+        calls.push('resumed');
+        throw sentinel;
+      },
     },
     async () => {
       calls.push('local');
     },
-  ]).catch((error: unknown) => error);
+  ).catch((error: unknown) => error);
   await expect(failure).resolves.toBeInstanceOf(AggregateError);
   expect(calls).toEqual(['resumed', 'local']);
 });

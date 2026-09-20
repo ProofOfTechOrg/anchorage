@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { isAbsolute, sep } from 'node:path';
 import test from 'node:test';
 import {
-  command,
   newTagAnnouncement,
   PROBE_TIMEOUT_MS,
   PUBLISH_PREREQUISITES,
@@ -262,16 +262,25 @@ test('incomplete publication lookups stay operational failures despite E404 outp
 });
 
 test('the command seam forwards the hard timeout signal to a real child', () => {
-  const started = performance.now();
-  const result = command(
+  const moduleUrl = new URL('./publish-ordered.mjs', import.meta.url).href;
+  const script = `import { command } from ${JSON.stringify(moduleUrl)};
+const result = command(process.execPath, ['-e', "process.on('SIGTERM', () => {}); setInterval(() => {}, 1_000)"], { capture: true, killSignal: 'SIGKILL', timeout: 50 });
+process.stdout.write(JSON.stringify({ signal: result.signal, errorCode: result.error?.code }));`;
+  const outer = spawnSync(
     process.execPath,
-    ['-e', "process.on('SIGTERM', () => {}); setInterval(() => {}, 1_000)"],
-    { capture: true, killSignal: 'SIGKILL', timeout: 50 },
+    ['--input-type=module', '--eval', script],
+    {
+      encoding: 'utf8',
+      killSignal: 'SIGKILL',
+      timeout: 2_000,
+    },
   );
 
+  assert.equal(outer.error, undefined);
+  assert.equal(outer.status, 0, outer.stderr);
+  const result = JSON.parse(outer.stdout);
   assert.equal(result.signal, 'SIGKILL');
-  assert.equal(result.error?.code, 'ETIMEDOUT');
-  assert.ok(performance.now() - started < 2_000);
+  assert.equal(result.errorCode, 'ETIMEDOUT');
 });
 
 test('lookup failures stop publishing and remain retryable during visibility polling', async () => {

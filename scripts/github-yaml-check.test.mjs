@@ -8,6 +8,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { afterEach, test } from 'node:test';
@@ -22,8 +23,14 @@ import {
   PUBLISH_PREREQUISITES,
   VISIBILITY_DEADLINE_MS,
 } from './publish-ordered.mjs';
+import {
+  NODE_HANDLER_TYPES,
+  PNPM_OPTION_POLICIES,
+  UNMODELLED_NODE_TYPES,
+} from './shell-command-analysis.mjs';
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const require = createRequire(import.meta.url);
 
 const temporaryDirectories = [];
 const realTimeout = spawnSync('which', ['timeout'], {
@@ -94,6 +101,19 @@ function readVerifyCoreJob() {
   const job = readWorkflow().jobs['verify-core'];
   assert.ok(job, 'the CI workflow contains the `verify-core` job');
   return job;
+}
+
+function bashFenceAfter(path, marker) {
+  const lines = readFileSync(join(repositoryRoot, path), 'utf8').split('\n');
+  const markerIndex = lines.findIndex((line) => line.includes(marker));
+  assert.notEqual(markerIndex, -1, `${path} contains '${marker}'`);
+  const fenceStart = lines.findIndex(
+    (line, index) => index > markerIndex && line === '```bash',
+  );
+  assert.notEqual(fenceStart, -1, `${path} has a bash fence after '${marker}'`);
+  const fenceEnd = lines.indexOf('```', fenceStart + 1);
+  assert.notEqual(fenceEnd, -1, `${path} closes its bash fence`);
+  return lines.slice(fenceStart + 1, fenceEnd).filter(Boolean);
 }
 
 function runVerifyGate(step, needs) {
@@ -199,6 +219,7 @@ function runNewestVersion(stub) {
   writeFileSync(
     join(directory, 'timeout'),
     `#!/usr/bin/env bash
+set -e
 printf 'timeout %s\\n' "$*" >> "$CALL_LOG"
 test "$1" = '--signal=KILL'
 test "$2" = '90s'
@@ -218,6 +239,7 @@ exec "$REAL_TIMEOUT" --signal=KILL 0.1s "$@"
   return {
     error: run.error,
     status: run.status,
+    stderr: run.stderr,
     stdout: run.stdout,
     lookups: calls.filter((line) => line.startsWith('npm ')),
     sleeps: calls.filter((line) => line === 'sleep').length,
@@ -709,6 +731,12 @@ function limitedPnpm(job, step, command, reason) {
 
 function githubExpression(body) {
   return ['$', '{{ ', body, ' }}'].join('');
+}
+
+// hasPnpmToken keeps conservative limit analysis inside fixtures that model a
+// non-literal pnpm spelling while preserving the reported command text.
+function withPnpmToken(source) {
+  return `${source}; : pnpm`;
 }
 
 function indentYamlBlock(source, spaces = 10) {
@@ -1223,7 +1251,12 @@ test('executable-position syntax is classified by its reduced command word', () 
   const rows = [
     ['literal', 'pnpm run build', 'missing', 'pnpm run build'],
     ['quoted', '"pnpm" run build', 'missing', '"pnpm" run build'],
-    ['concatenated', "p'n'pm run build", 'missing', "p'n'pm run build"],
+    [
+      'concatenated',
+      withPnpmToken("p'n'pm run build"),
+      'missing',
+      "p'n'pm run build",
+    ],
     [
       'ansi-c',
       "$'pnpm' run build",
@@ -1233,7 +1266,7 @@ test('executable-position syntax is classified by its reduced command word', () 
     ],
     [
       'expansion',
-      '$PM run build',
+      withPnpmToken('$PM run build'),
       'limit',
       '$PM run build',
       'non-literal executable',
@@ -1247,21 +1280,21 @@ test('executable-position syntax is classified by its reduced command word', () 
     ],
     [
       'github-expression',
-      `${githubExpression('matrix.pm')} run build`,
+      withPnpmToken(`${githubExpression('matrix.pm')} run build`),
       'limit',
       `${githubExpression('matrix.pm')} run build`,
       'non-literal executable',
     ],
     [
       'backslash',
-      'p\\npm run build',
+      withPnpmToken('p\\npm run build'),
       'limit',
       'p\\npm run build',
       'non-literal executable',
     ],
     [
       'line-continuation',
-      'pn\\\npm run build',
+      withPnpmToken('pn\\\npm run build'),
       'limit',
       'pn\\\npm run build',
       'non-literal executable',
@@ -1337,6 +1370,10 @@ test('transparent wrappers classify wrapped consumers and installs', () => {
     steps:
       - name: env chdir
         run: env -C elsewhere pnpm install
+  clustered-wrapper-option:
+    steps:
+      - name: background sudo
+        run: sudo -nb pnpm install
 `),
     [
       missingPnpm(
@@ -1351,6 +1388,12 @@ test('transparent wrappers classify wrapped consumers and installs', () => {
         'env -C elsewhere pnpm install',
         'unmodelled wrapper option -C',
       ),
+      limitedPnpm(
+        'clustered-wrapper-option',
+        'background sudo',
+        'sudo -nb pnpm install',
+        'unmodelled wrapper option -b',
+      ),
     ],
   );
 });
@@ -1364,7 +1407,8 @@ test('code-bearing shells limit while script files and data commands stay opaque
   bash-s:
     steps:
       - name: bash stdin option
-        run: bash -s
+        run: |
+${indentYamlBlock(withPnpmToken('bash -s'))}
   here-string:
     steps:
       - name: bash here string
@@ -1830,6 +1874,18 @@ test('list facts follow successful exits and export from the final statement', (
       - run: pnpm install && false || true
       - name: after joined paths
         run: pnpm run build
+  compound-left:
+    steps:
+      - name: compound left operand
+        run: "{ pnpm install; true; } && pnpm run build"
+  if-left:
+    steps:
+      - name: if left operand
+        run: "if true; then pnpm install; true; fi && pnpm run build"
+  case-left:
+    steps:
+      - name: case left operand
+        run: "case x in x) pnpm install; true ;; esac && pnpm run build"
 `);
 
   assert.deepEqual(diagnostics, [
@@ -1840,7 +1896,43 @@ test('list facts follow successful exits and export from the final statement', (
       'after joined paths',
       'pnpm run build',
     ),
+    limitedPnpm('compound-left', 'compound left operand', 'pnpm install'),
+    limitedPnpm('if-left', 'if left operand', 'pnpm install'),
+    limitedPnpm('case-left', 'case left operand', 'pnpm install'),
   ]);
+});
+
+test('comments do not change list finality and multiline expressions stay non-literal', () => {
+  assert.deepEqual(
+    pnpmDiagnosticSummary(`jobs:
+  trailing-comment:
+    steps:
+      - run: |
+          pnpm install && pnpm run build
+          # The list remains the final statement.
+  interleaved-comment:
+    steps:
+      - run: |
+          pnpm install &&
+          # The comment is not a list operand.
+          pnpm run build
+  multiline-expression:
+    steps:
+      - name: expression install
+        run: |
+          pnpm install \${{
+            inputs.flags
+          }}
+`),
+    [
+      limitedPnpm(
+        'multiline-expression',
+        'expression install',
+        ['pnpm install $', '{{\n  inputs.flags\n}}'].join(''),
+        'non-literal pnpm argument',
+      ),
+    ],
+  );
 });
 
 test('if and case export branch intersections and reject condition installs', () => {
@@ -2428,18 +2520,7 @@ ${indentYamlBlock(parseError)}
         'pnpm install',
         'install is not guaranteed',
       ),
-      limitedPnpm(
-        'coprocess',
-        'coprocess definition',
-        'coproc echo hi',
-        'code-bearing coproc',
-      ),
-      limitedPnpm(
-        'no-pnpm-function',
-        'opaque function',
-        'greet() { echo hi; }',
-        'code-bearing function_definition',
-      ),
+      missingPnpm('coprocess', 'step 2', 'pnpm run build'),
       missingPnpm('exec-argument', 'later consumer', 'pnpm run build'),
       limitedPnpm(
         'exec-option',
@@ -2451,6 +2532,23 @@ ${indentYamlBlock(parseError)}
   );
 });
 
+test('pnpm-free code-bearing commands stay outside conditional-step limits', () => {
+  const condition = githubExpression('matrix.enabled');
+  assert.deepEqual(
+    pnpmDiagnosticSummary(`jobs:
+  eval:
+    steps:
+      - if: ${condition}
+        run: eval "$CMD"
+  bash:
+    steps:
+      - if: ${condition}
+        run: bash -c "$CMD"
+`),
+    [],
+  );
+});
+
 test('backslashes in quoted and concatenated executables are non-literal', () => {
   const rows = [
     ['double-quoted', '"pn\\\npm" run build'],
@@ -2458,17 +2556,36 @@ test('backslashes in quoted and concatenated executables are non-literal', () =>
     ['concatenated', "p' n\\\\'pm run build".replace(' ', '')],
   ];
   for (const [job, command] of rows) {
+    const source = withPnpmToken(command);
     assert.deepEqual(
       pnpmDiagnosticSummary(`jobs:
   ${job}:
     steps:
       - name: probe
-        run: ${JSON.stringify(command)}
+        run: ${JSON.stringify(source)}
 `),
       [limitedPnpm(job, 'probe', command, 'non-literal executable')],
       job,
     );
   }
+});
+
+test('the Bash dispatch and explicit unmodelled sets cover the pinned grammar', () => {
+  const nodeTypes = JSON.parse(
+    readFileSync(
+      require.resolve('tree-sitter-bash/src/node-types.json'),
+      'utf8',
+    ),
+  );
+  const namedTypes = nodeTypes
+    .filter(({ named }) => named)
+    .map(({ type }) => type)
+    .sort();
+  const classifiedTypes = [
+    ...new Set([...NODE_HANDLER_TYPES, ...UNMODELLED_NODE_TYPES]),
+  ].sort();
+
+  assert.deepEqual(classifiedTypes, namedTypes);
 });
 
 test('transparent wrapper context cross-product preserves command classification', () => {
@@ -2513,18 +2630,21 @@ test('transparent wrapper context cross-product preserves command classification
     {
       label: 'sh-heredoc',
       source: (wrapper) => `${wrapper} sh <<'SCRIPT'\npnpm run build\nSCRIPT`,
+      reportedCommand: (wrapper) => `${wrapper} sh`,
       reason: 'code-bearing sh',
       result: 'limit',
     },
     {
       label: 'sh-pipe',
-      source: (wrapper) => `printf input | ${wrapper} sh`,
+      source: (wrapper) => withPnpmToken(`printf input | ${wrapper} sh`),
+      reportedCommand: (wrapper) => `${wrapper} sh`,
       reason: 'code-bearing sh',
       result: 'limit',
     },
     {
       label: 'nonliteral-executable',
-      source: (wrapper) => `${wrapper} $PM run build`,
+      source: (wrapper) => withPnpmToken(`${wrapper} $PM run build`),
+      reportedCommand: (wrapper) => `${wrapper} $PM run build`,
       reason: 'non-literal executable',
       result: 'limit',
     },
@@ -2549,9 +2669,7 @@ ${indentYamlBlock(source)}${
       if (column.result === 'missing') {
         expected.push(missingPnpm(job, 'probe', source));
       } else if (column.result === 'limit') {
-        const command = ['sh-heredoc', 'sh-pipe'].includes(column.label)
-          ? `${wrapper} sh`
-          : source;
+        const command = column.reportedCommand?.(wrapper) ?? source;
         expected.push(limitedPnpm(job, 'probe', command, column.reason));
       } else if (wrapperName === 'xargs') {
         expected.push(missingPnpm(job, 'later consumer', 'pnpm run build'));
@@ -2641,200 +2759,77 @@ ${childJobs.join('\n')}
 });
 
 test('install and add option policies are command-specific on both sides of the subcommand', () => {
-  const rows = {
+  // The cross-product pins behavior mapping end to end; arity fidelity comes
+  // from literal lists transcribed from the pinned pnpm declarations.
+  const valueTakingOptions = {
     install: [
-      ...[
-        '--aggregate-output',
-        '--color',
-        '--fix-lockfile',
-        '--force',
-        '--frozen-lockfile',
-        '--ignore-scripts',
-        '--no-color',
-        '--no-frozen-lockfile',
-        '--no-hoist',
-        '--no-lockfile',
-        '--no-verify-store-integrity',
-        '--offline',
-        '--optimistic-repeat-install',
-        '--prefer-frozen-lockfile',
-        '--prefer-offline',
-        '--recursive',
-        '--shamefully-hoist',
-        '--side-effects-cache',
-        '--side-effects-cache-readonly',
-        '--silent',
-        '--stream',
-        '--strict-peer-dependencies',
-        '--update-checksums',
-        '--use-running-store-server',
-        '--use-stderr',
-        '--use-store-server',
-        '--verify-store-integrity',
-        '--workspace-root',
-        '-r',
-        '-s',
-        '-w',
-      ].map((name) => [name, 0, 'establish']),
-      ...[
-        '--child-concurrency',
-        '--hoist-pattern',
-        '--loglevel',
-        '--network-concurrency',
-        '--package-import-method',
-        '--public-hoist-pattern',
-        '--reporter',
-        '--store-dir',
-        '--trust-policy',
-        '--trust-policy-exclude',
-        '--trust-policy-ignore-after',
-        '--virtual-store-dir',
-      ].map((name) => [name, 1, 'establish']),
-      ...[
-        '--dev',
-        '--global',
-        '--help',
-        '--ignore-workspace',
-        '--lockfile-only',
-        '--no-optional',
-        '--prod',
-        '--production',
-        '--resolution-only',
-        '--version',
-        '-D',
-        '-P',
-        '-g',
-        '-h',
-        '-v',
-      ].map((name) => [name, 0, 'neutral']),
-      ...['--filter', '--filter-prod', '--modules-dir', '-F'].map((name) => [
-        name,
-        1,
-        'neutral',
-      ]),
-      ...['--dir', '--prefix', '-C'].map((name) => [
-        name,
-        1,
-        'neutral',
-        'packages/example',
-      ]),
-      ...[
-        '--bail',
-        '--fail-if-no-match',
-        '--ignore-pnpmfile',
-        '--include-workspace-root',
-        '--link-workspace-packages',
-        '--merge-git-branch-lockfiles',
-        '--no-bail',
-        '--no-link-workspace-packages',
-        '--no-shared-workspace-lockfile',
-        '--no-sort',
-        '--parallel',
-        '--report-summary',
-        '--reverse',
-        '--shared-workspace-lockfile',
-        '--sort',
-      ].map((name) => [name, 0, 'limit']),
-      ...[
-        '--changed-files-ignore-pattern',
-        '--global-dir',
-        '--lockfile-dir',
-        '--test-pattern',
-        '--workspace-concurrency',
-      ].map((name) => [name, 1, 'limit']),
+      '--changed-files-ignore-pattern',
+      '--child-concurrency',
+      '--dir',
+      '--filter',
+      '--filter-prod',
+      '--global-dir',
+      '--hoist-pattern',
+      '--lockfile-dir',
+      '--loglevel',
+      '--modules-dir',
+      '--network-concurrency',
+      '--package-import-method',
+      '--prefix',
+      '--public-hoist-pattern',
+      '--reporter',
+      '--store-dir',
+      '--test-pattern',
+      '--trust-policy',
+      '--trust-policy-exclude',
+      '--trust-policy-ignore-after',
+      '--virtual-store-dir',
+      '--workspace-concurrency',
+      '-C',
+      '-F',
     ],
     add: [
-      ...[
-        '--aggregate-output',
-        '--allow-build',
-        '--color',
-        '--ignore-scripts',
-        '--no-color',
-        '--no-save-exact',
-        '--no-save-workspace-protocol',
-        '--offline',
-        '--prefer-offline',
-        '--recursive',
-        '--save-catalog',
-        '--save-dev',
-        '--save-exact',
-        '--save-optional',
-        '--save-peer',
-        '--save-prod',
-        '--save-workspace-protocol',
-        '--silent',
-        '--stream',
-        '--use-stderr',
-        '--workspace',
-        '--workspace-root',
-        '-D',
-        '-E',
-        '-O',
-        '-P',
-        '-r',
-        '-s',
-        '-w',
-      ].map((name) => [name, 0, 'establish']),
-      ...[
-        '--loglevel',
-        '--reporter',
-        '--save-catalog-name',
-        '--store-dir',
-        '--virtual-store-dir',
-      ].map((name) => [name, 1, 'establish']),
-      ...[
-        '--config',
-        '--dev',
-        '--global',
-        '--help',
-        '--ignore-workspace',
-        '--lockfile-only',
-        '--no-optional',
-        '--prod',
-        '--production',
-        '--resolution-only',
-        '--version',
-        '-g',
-        '-h',
-        '-v',
-      ].map((name) => [name, 0, 'neutral']),
-      ...['--filter', '--filter-prod', '--modules-dir', '-F'].map((name) => [
-        name,
-        1,
-        'neutral',
-      ]),
-      ...['--dir', '--prefix', '-C'].map((name) => [
-        name,
-        1,
-        'neutral',
-        'packages/example',
-      ]),
-      ...[
-        '--bail',
-        '--fail-if-no-match',
-        '--include-workspace-root',
-        '--link-workspace-packages',
-        '--no-bail',
-        '--no-link-workspace-packages',
-        '--no-shared-workspace-lockfile',
-        '--no-sort',
-        '--reverse',
-        '--shared-workspace-lockfile',
-        '--sort',
-      ].map((name) => [name, 0, 'limit']),
-      ...[
-        '--changed-files-ignore-pattern',
-        '--global-dir',
-        '--test-pattern',
-        '--workspace-concurrency',
-      ].map((name) => [name, 1, 'limit']),
+      '--allow-build',
+      '--changed-files-ignore-pattern',
+      '--dir',
+      '--filter',
+      '--filter-prod',
+      '--global-dir',
+      '--loglevel',
+      '--modules-dir',
+      '--prefix',
+      '--reporter',
+      '--save-catalog-name',
+      '--store-dir',
+      '--test-pattern',
+      '--virtual-store-dir',
+      '--workspace-concurrency',
+      '-C',
+      '-F',
     ],
   };
+  for (const subcommand of ['install', 'add']) {
+    assert.deepEqual(
+      PNPM_OPTION_POLICIES[subcommand]
+        .filter(({ arity }) => arity === 1)
+        .map(({ name }) => name)
+        .sort(),
+      valueTakingOptions[subcommand],
+      `${subcommand} value-taking options`,
+    );
+  }
   const jobs = [];
   const expected = [];
-  for (const [subcommand, options] of Object.entries(rows)) {
-    for (const [index, [name, arity, result, operand]] of options.entries()) {
-      const option = arity === 1 ? `${name} ${operand ?? 'value'}` : name;
+  for (const subcommand of ['install', 'add']) {
+    const options = PNPM_OPTION_POLICIES[subcommand];
+    for (const [index, { name, arity, behavior }] of options.entries()) {
+      const operand =
+        behavior === 'directory'
+          ? 'packages/example'
+          : name === '--allow-build'
+            ? 'esbuild'
+            : 'value';
+      const option = arity === 1 ? `${name} ${operand}` : name;
       for (const position of ['before', 'after']) {
         const job = `${subcommand}-${index}-${position}`;
         const command =
@@ -2847,9 +2842,9 @@ test('install and add option policies are command-specific on both sides of the 
         run: ${command}
       - name: later consumer
         run: pnpm run build`);
-        if (result === 'neutral') {
+        if (behavior === 'neutral' || behavior === 'directory') {
           expected.push(missingPnpm(job, 'later consumer', 'pnpm run build'));
-        } else if (result === 'limit') {
+        } else if (behavior === 'limit') {
           expected.push(
             limitedPnpm(
               job,
@@ -2868,6 +2863,83 @@ ${jobs.join('\n')}
 `),
     expected,
   );
+});
+
+test('link-workspace-packages Boolean and deep forms remain diagnostic', () => {
+  const rows = [
+    [
+      'install-before-bare',
+      'pnpm --link-workspace-packages install',
+      limitedPnpm(
+        'install-before-bare',
+        'option probe',
+        'pnpm --link-workspace-packages install',
+        'pnpm install option --link-workspace-packages is not establishing',
+      ),
+    ],
+    [
+      'install-after-bare',
+      'pnpm install --link-workspace-packages',
+      limitedPnpm(
+        'install-after-bare',
+        'option probe',
+        'pnpm install --link-workspace-packages',
+        'pnpm install option --link-workspace-packages is not establishing',
+      ),
+    ],
+    [
+      'install-before-deep',
+      'pnpm --link-workspace-packages deep install',
+      missingPnpm(
+        'install-before-deep',
+        'option probe',
+        'pnpm --link-workspace-packages deep install',
+      ),
+    ],
+    [
+      'install-after-deep',
+      'pnpm install --link-workspace-packages deep',
+      limitedPnpm(
+        'install-after-deep',
+        'option probe',
+        'pnpm install --link-workspace-packages deep',
+        'pnpm install option --link-workspace-packages is not establishing',
+      ),
+    ],
+    [
+      'add-before-bare',
+      'pnpm --link-workspace-packages add package',
+      limitedPnpm(
+        'add-before-bare',
+        'option probe',
+        'pnpm --link-workspace-packages add package',
+        'pnpm add option --link-workspace-packages is not establishing',
+      ),
+    ],
+    [
+      'add-after-bare',
+      'pnpm add --link-workspace-packages package',
+      limitedPnpm(
+        'add-after-bare',
+        'option probe',
+        'pnpm add --link-workspace-packages package',
+        'pnpm add option --link-workspace-packages is not establishing',
+      ),
+    ],
+  ];
+
+  for (const [job, command, expected] of rows) {
+    assert.deepEqual(
+      pnpmDiagnosticSummary(`jobs:
+  ${job}:
+    steps:
+      - name: option probe
+        run: ${command}
+`),
+      [expected],
+      job,
+    );
+  }
 });
 
 test('repository-root spellings agree across command, workflow, and action contexts', () => {
@@ -2915,36 +2987,68 @@ test('every tracked workflow installs before it invokes pnpm', () => {
   );
 });
 
-test('the verify-core job runs every command in order', () => {
+test('the verify-core job declares every run command in order', () => {
+  const commands = readVerifyCoreJob()
+    .steps.filter((step) => typeof step.run === 'string')
+    .map((step) => step.run);
+  assert.deepEqual(commands, [
+    'pnpm install --frozen-lockfile',
+    'pnpm github:check',
+    'pnpm github:check:test',
+    'pnpm lint',
+    'pnpm typecheck',
+    'pnpm test:without-direct-scenario',
+    'pnpm build',
+    'pnpm test:node-tools',
+    'pnpm docs:check',
+    'pnpm docs:check:test',
+    'pnpm docs:api',
+    'pnpm test:release-order',
+    'pnpm test:release-invocation',
+    'pnpm test:packed-breakwater',
+    'pnpm test:packed-fleet-control',
+    'pnpm test:packed-flowsafe-agent-host',
+    'pnpm test:packed-flowsafe-provisioning',
+    'pnpm --filter @proofoftech/flowsafe test:signals-client-export',
+    'pnpm --filter @proofoftech/flowsafe typecheck:react18',
+    'pnpm --filter showcase run react-doctor',
+    'pnpm --filter @proofoftech/flowsafe spike:verify',
+    'pnpm test:conformance-config',
+    'pnpm conformance:verify',
+  ]);
+  assert.ok(
+    commands.indexOf('pnpm test:node-tools') > commands.indexOf('pnpm build'),
+    'scripts/entry-point.test.mjs mint cases need the Build step output',
+  );
+});
+
+test('the node-tools script names both root Node suites', () => {
+  const { scripts } = JSON.parse(
+    readFileSync(join(repositoryRoot, 'package.json'), 'utf8'),
+  );
+  assert.match(scripts['test:node-tools'], /scripts\/entry-point\.test\.mjs/u);
+  assert.match(
+    scripts['test:node-tools'],
+    /scripts\/baseline-recorder\.test\.mjs/u,
+  );
+});
+
+test('the public verification lists mirror verify-core', () => {
+  const commands = readVerifyCoreJob()
+    .steps.filter((step) => typeof step.run === 'string')
+    .map((step) => step.run);
+  const contributorCommands = commands.map((command) =>
+    command === 'pnpm test:without-direct-scenario' ? 'pnpm test' : command,
+  );
+  const maintainerCommands = contributorCommands.slice(1);
+
   assert.deepEqual(
-    readVerifyCoreJob()
-      .steps.filter((step) => typeof step.run === 'string')
-      .map((step) => step.run),
-    [
-      'pnpm install --frozen-lockfile',
-      'pnpm github:check',
-      'pnpm github:check:test',
-      'pnpm lint',
-      'pnpm typecheck',
-      'pnpm test:without-direct-scenario',
-      'pnpm build',
-      'pnpm test:node-tools',
-      'pnpm docs:check',
-      'pnpm docs:check:test',
-      'pnpm docs:api',
-      'pnpm test:release-order',
-      'pnpm test:release-invocation',
-      'pnpm test:packed-breakwater',
-      'pnpm test:packed-fleet-control',
-      'pnpm test:packed-flowsafe-agent-host',
-      'pnpm test:packed-flowsafe-provisioning',
-      'pnpm --filter @proofoftech/flowsafe test:signals-client-export',
-      'pnpm --filter @proofoftech/flowsafe typecheck:react18',
-      'pnpm --filter showcase run react-doctor',
-      'pnpm --filter @proofoftech/flowsafe spike:verify',
-      'pnpm test:conformance-config',
-      'pnpm conformance:verify',
-    ],
+    bashFenceAfter('CONTRIBUTING.md', 'The verification list below mirrors'),
+    contributorCommands,
+  );
+  assert.deepEqual(
+    bashFenceAfter('docs/maintainer-guide.md', '## Verification'),
+    maintainerCommands,
   );
 });
 
@@ -3003,14 +3107,19 @@ test('the canary summary distinguishes equality from forward-version coverage', 
 });
 
 test('the canary refuses mismatched and missing installed versions', () => {
-  for (const installedCore of ['1.67.0', '']) {
+  for (const [installedCore, installedD1] of [
+    ['1.67.0', '1.4.0'],
+    ['', '1.4.0'],
+    ['1.68.0', '1.3.2'],
+    ['1.68.0', ''],
+  ]) {
     const result = runMastraVersionAssertion({
       baselineCore: '1.67.0',
       baselineD1: '1.3.2',
       expectedCore: '1.68.0',
       expectedD1: '1.4.0',
       installedCore,
-      installedD1: '1.4.0',
+      installedD1,
     });
     assert.equal(result.run.error, undefined);
     assert.ok(result.run.status > 0);
@@ -3018,9 +3127,39 @@ test('the canary refuses mismatched and missing installed versions', () => {
   }
 });
 
+test('the canary diagnoses invalid and older requested versions', () => {
+  const older = runMastraVersionAssertion({
+    baselineCore: '1.67.0',
+    baselineD1: '1.3.2',
+    expectedCore: '1.66.0',
+    expectedD1: '1.4.0',
+    installedCore: '1.66.0',
+    installedD1: '1.4.0',
+  });
+  assert.ok(older.run.status > 0);
+  assert.match(
+    older.run.stderr,
+    /requested 1\.66\.0 is older than baseline 1\.67\.0/u,
+  );
+
+  const invalid = runMastraVersionAssertion({
+    baselineCore: '^1.67.0',
+    baselineD1: '1.3.2',
+    expectedCore: '1.68.0',
+    expectedD1: '1.4.0',
+    installedCore: '1.68.0',
+    installedD1: '1.4.0',
+  });
+  assert.ok(invalid.run.status > 0);
+  assert.match(
+    invalid.run.stderr,
+    /unusable version pair \^1\.67\.0 \/ 1\.68\.0/u,
+  );
+});
+
 // This one reads the gate's shape and shells out to nothing, so it reports the
 // deletions below on every machine.
-test('the ci.yml gate job stays reachable and depends on at least one job', () => {
+test('the ci.yml gate job stays reachable and depends on its required jobs', () => {
   const { job } = readVerifyGateJob();
 
   assert.equal(
@@ -3028,10 +3167,7 @@ test('the ci.yml gate job stays reachable and depends on at least one job', () =
     'always()',
     'without `if: always()` a failed dependency skips the gate job, and GitHub reports a skipped required check as success',
   );
-  assert.ok(
-    Array.isArray(job.needs) && job.needs.length > 0,
-    'an empty `needs` list leaves the gate passing with nothing verified',
-  );
+  assert.deepEqual(job.needs, ['verify-core', 'direct-scenario']);
   assert.ok(
     !job.needs.includes('mastra-compat'),
     'the compat canary reports an upstream release, so naming it here would block merges on an upstream red',
@@ -3228,6 +3364,18 @@ test('the ci.yml canary exhausts killed partial E404 lookups', () => {
   assert.equal(run.stdout, '');
 });
 
+test('the ci.yml canary retries completed non-1 E404 responses', () => {
+  const run = runNewestVersion(
+    npmStub(`printf 'npm error code E404\\n'`, 'exit 2'),
+  );
+
+  assert.equal(run.error, undefined);
+  assert.ok(run.status > 0);
+  assert.equal(run.lookups.length, 3);
+  assert.equal(run.sleeps, 2);
+  assert.match(run.stderr, /npm view .* failed: npm error code E404/u);
+});
+
 for (const status of [125, 126, 127]) {
   test(`the ci.yml canary refuses timeout-wrapper status ${status} without retrying`, () => {
     const run = runNewestVersion(
@@ -3240,6 +3388,10 @@ for (const status of [125, 126, 127]) {
     assert.equal(run.timeouts.length, 1);
     assert.equal(run.sleeps, 0);
     assert.equal(run.stdout, '');
+    assert.match(
+      run.stderr,
+      new RegExp(`timeout wrapper failed with status ${status}`, 'u'),
+    );
   });
 }
 

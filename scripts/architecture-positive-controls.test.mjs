@@ -430,9 +430,13 @@ const parse = (projectPath) => {
     true,
   );
 };
-const initializerOf = (source, property) => {
+const initializerOf = (
+  source,
+  property,
+  { recursive = true, required = true, label } = {},
+) => {
   const found = [];
-  const visit = (node) => {
+  const collect = (node) => {
     if (
       ts.isPropertyAssignment(node) &&
       ts.isIdentifier(node.name) &&
@@ -440,14 +444,23 @@ const initializerOf = (source, property) => {
     ) {
       found.push(node.initializer);
     }
+  };
+  const visit = (node) => {
+    collect(node);
     ts.forEachChild(node, visit);
   };
-  visit(source);
-  assert.equal(
-    found.length,
-    1,
-    `${relative(root, source.fileName)} sets '${property}' once`,
-  );
+  if (recursive) visit(source);
+  else ts.forEachChild(source, collect);
+  const sourceLabel =
+    label ??
+    relative(root, source.getSourceFile?.().fileName ?? source.fileName);
+  if (required)
+    assert.equal(found.length, 1, `${sourceLabel} sets '${property}' once`);
+  else
+    assert.ok(
+      found.length <= 1,
+      `${sourceLabel} sets '${property}' at most once`,
+    );
   return found[0];
 };
 // The array element that is not a string literal and still leaves the parse
@@ -525,12 +538,11 @@ test('every root vitest project declares its expected name', () => {
     [...rootProjectPaths].sort(),
   );
   for (const projectPath of rootProjectPaths) {
-    const projectName = initializerOf(parse(projectPath), 'name');
-    assert.ok(
-      ts.isStringLiteralLike(projectName),
-      `${projectPath} names its project with a string literal`,
+    assert.equal(
+      explicitProjectName(projectPath),
+      rootProjectNames[projectPath],
+      projectPath,
     );
-    assert.equal(projectName.text, rootProjectNames[projectPath], projectPath);
   }
 });
 
@@ -903,27 +915,23 @@ test('Biome enforces noShadow without an override bypass', () => {
   }
 });
 
-function explicitProjectName(projectPath) {
-  const source = parse(projectPath);
-  const names = [];
-  const visit = (node) => {
-    if (
-      ts.isPropertyAssignment(node) &&
-      ts.isIdentifier(node.name) &&
-      node.name.text === 'name'
-    ) {
-      names.push(node.initializer);
-    }
-    ts.forEachChild(node, visit);
-  };
-  visit(source);
-  assert.ok(names.length <= 1, `${projectPath} sets 'name' at most once`);
-  if (names.length === 0) return undefined;
+function explicitProjectName(projectPath, source = parse(projectPath)) {
+  const project = initializerOf(source, 'test');
   assert.ok(
-    ts.isStringLiteralLike(names[0]),
+    ts.isObjectLiteralExpression(project),
+    `${projectPath} sets 'test' to an object literal`,
+  );
+  const name = initializerOf(project, 'name', {
+    label: projectPath,
+    recursive: false,
+    required: false,
+  });
+  if (name === undefined) return undefined;
+  assert.ok(
+    ts.isStringLiteralLike(name),
     `${projectPath} names its project with a string literal`,
   );
-  return names[0].text;
+  return name.text;
 }
 
 function resolvedProjectName(projectPath) {
@@ -965,7 +973,7 @@ function assertProjectSelections(scripts, declared) {
   for (const [script, selectedProject] of selections) {
     assert.ok(
       declared.has(selectedProject),
-      `script '${script}' selects '${selectedProject}', absent from rootProjectNames`,
+      `script '${script}' selects '${selectedProject}', absent from the discovered Vitest projects`,
     );
   }
   return selections;
@@ -984,6 +992,16 @@ test('root --project selections name discovered vitest projects', () => {
     negated: "vitest run --project '!fleet-control-direct-scenario'",
     package: "vitest run --project '@proofoftech/breakwater'",
   };
+  const synthetic = ts.createSourceFile(
+    join(root, 'vitest.synthetic.config.ts'),
+    "export default { test: { plugins: [{ name: 'not-a-project' }] } };",
+    ts.ScriptTarget.Latest,
+    true,
+  );
+  assert.equal(
+    explicitProjectName('vitest.synthetic.config.ts', synthetic),
+    undefined,
+  );
 
   assert.deepEqual(assertProjectSelections(fixtures, declared), [
     ['double', 'flowsafe-harness'],
@@ -998,7 +1016,7 @@ test('root --project selections name discovered vitest projects', () => {
   ]) {
     assert.throws(
       () => assertProjectSelections({ invalid: command }, declared),
-      /absent from rootProjectNames/u,
+      /absent from the discovered Vitest projects/u,
     );
   }
 });

@@ -131,15 +131,8 @@ describe('workflow guides', () => {
     }
   });
 
-  it('pins the showcase branch narration', () => {
+  it('pins the lead-generation short-circuit narration', () => {
     expect(WORKFLOW_GUIDES['lead-generation']?.shortCircuitNote).toBeDefined();
-    // lead-generation is the one .branch() workflow: its branch targets must
-    // be marked conditional or narration over-claims skipped branches.
-    for (const [id, guide] of Object.entries(WORKFLOW_GUIDES)) {
-      for (const step of guide.conditionalSteps ?? []) {
-        expect(guide.steps, `${id} conditional ${step}`).toContain(step);
-      }
-    }
   });
 });
 

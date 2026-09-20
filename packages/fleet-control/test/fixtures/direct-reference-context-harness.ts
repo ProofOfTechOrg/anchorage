@@ -14,7 +14,7 @@ import type { FleetRecord } from '../../src/types.js';
 
 export * from '../../scripts/direct-reference-context.js';
 
-function recoverySpec(
+export function recoveryApplicationSpec(
   spec: CloudflareDeploymentSpec,
   bindingName: string | undefined,
 ): CloudflareDeploymentSpec {
@@ -30,18 +30,6 @@ function recoverySpec(
   };
 }
 
-function recordSpecDigest(record: FleetRecord): string | undefined {
-  let digest =
-    record.phase === 'migrating'
-      ? record.pendingSpecDigest
-      : record.desiredSpecDigest;
-  if (record.cleanupIntent?.authority.kind === 'provisioning-rollback')
-    digest = record.cleanupIntent.authority.requestedSpecDigest;
-  if (record.decommissionIntent?.identity.mode.kind === 'normal')
-    digest = record.decommissionIntent.identity.mode.requestedSpecDigest;
-  return digest;
-}
-
 export async function createDirectReferenceContext(
   ...args: Parameters<typeof createBaseDirectReferenceContext>
 ): ReturnType<typeof createBaseDirectReferenceContext> {
@@ -52,6 +40,11 @@ export async function createDirectReferenceContext(
   const bindingName = environment.DIRECT_RECOVERY_R2_BUCKET;
   if (!bindingName) return context;
   const specs = new Map<string, CloudflareDeploymentSpec>();
+  const recoverySpecs = new Map<
+    CloudflareDeploymentSpec,
+    CloudflareDeploymentSpec
+  >();
+  const baseDigestByRecoveryDigest = new Map<string, string>();
   for (const role of ['a', 'b', 'recovery'] as const) {
     for (const release of [
       'initial',
@@ -59,10 +52,16 @@ export async function createDirectReferenceContext(
       ...(role === 'recovery' ? ['failed-recovery' as const] : []),
     ] as const) {
       const spec = context.spec(role, release);
-      specs.set(
-        `${role}:${release}`,
-        role === 'recovery' ? recoverySpec(spec, bindingName) : spec,
-      );
+      const replacement =
+        role === 'recovery' ? recoveryApplicationSpec(spec, bindingName) : spec;
+      specs.set(`${role}:${release}`, replacement);
+      if (replacement !== spec) {
+        recoverySpecs.set(spec, replacement);
+        baseDigestByRecoveryDigest.set(
+          deploymentSpecDigest(replacement),
+          deploymentSpecDigest(spec),
+        );
+      }
     }
   }
   return {
@@ -71,13 +70,15 @@ export async function createDirectReferenceContext(
       return specs.get(`${role}:${release}`) ?? context.spec(role, release);
     },
     specFor(record: FleetRecord) {
-      const role = context.roleFor(record);
-      const digest = recordSpecDigest(record);
-      const match = [...specs.entries()].find(
-        ([key, spec]) =>
-          key.startsWith(`${role}:`) && deploymentSpecDigest(spec) === digest,
-      );
-      return match?.[1] ?? context.specFor(record);
+      const normalized = JSON.parse(
+        JSON.stringify(record, (_key, value) =>
+          typeof value === 'string'
+            ? (baseDigestByRecoveryDigest.get(value) ?? value)
+            : value,
+        ),
+      ) as FleetRecord;
+      const selected = context.specFor(normalized);
+      return recoverySpecs.get(selected) ?? selected;
     },
   };
 }

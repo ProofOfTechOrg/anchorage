@@ -37,6 +37,7 @@ import {
   connectorEgressPosture,
   connectorManifest,
   createConnector as createConnectorBase,
+  D1IdempotencyStore,
   DRY_RUN_CONTEXT_KEY,
   IDEMPOTENCY_KEY_CONTEXT_KEY,
   type IdempotencyRecord,
@@ -46,6 +47,8 @@ import {
   InMemoryRateLimitStore,
   invokeConnector,
   migrateLegacyConnectorIdempotency,
+  type SingleTenantConnectorPoliciesOptions,
+  singleTenantConnectorPolicies,
 } from './index.js';
 import { replaceConnectorInvocation } from './invocation-registry.js';
 
@@ -5557,6 +5560,127 @@ describe('connector decision taxonomy', () => {
       }),
     ).resolves.toEqual({ state: 'migrated', record: { result: 'legacy' } });
     expect(migrate).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses a migrator call after its acknowledgement is withdrawn', async () => {
+    const migrate = vi.fn(async (request) => ({
+      state: 'migrated' as const,
+      record: request.targetRecord,
+    }));
+    const store = {
+      inspect: vi.fn(() => ({ state: 'absent' as const })),
+      get: vi.fn(() => undefined),
+      put: vi.fn(),
+      [ATOMIC_LEGACY_IDEMPOTENCY_MIGRATION]: migrate,
+    };
+    const policies: ConnectorPolicies = {
+      idempotencyKeyMigration: 'legacy-writers-drained',
+      idempotencyStore: store,
+    };
+    const tool = createConnectorBase({
+      id: 'migration.withdrawn-migrator-acknowledgement',
+      description: 'Observe migrator acknowledgement withdrawal',
+      permissions: { sideEffect: 'read', idempotencyKey: true },
+      policies,
+      execute: async () => 'executed',
+    });
+
+    delete policies.idempotencyKeyMigration;
+
+    await expect(
+      migrateLegacyConnectorIdempotency(tool, {
+        idempotencyKey: 'operation:legacy',
+        expectedRecord: { result: 'legacy' },
+      }),
+    ).rejects.toThrow(
+      "connector migration.withdrawn-migrator-acknowledgement: ambiguous legacy idempotency migration requires a scoped or colon-bearing key and idempotencyKeyMigration 'legacy-writers-drained'",
+    );
+    expect(migrate).not.toHaveBeenCalled();
+  });
+
+  it('uses a single-tenant preset migration acknowledgement from its frozen snapshot', async () => {
+    const database = {
+      prepare(query: string) {
+        const statement = {
+          bind() {
+            return statement;
+          },
+          async first() {
+            return query.includes('INSERT INTO') &&
+              query.includes('RETURNING key')
+              ? { key: 'claimed' }
+              : null;
+          },
+          async run() {
+            if (query.startsWith('ALTER TABLE'))
+              throw new Error('duplicate column');
+            return { success: true };
+          },
+        };
+        return statement;
+      },
+    };
+    const store = new D1IdempotencyStore(database as never);
+    const options: SingleTenantConnectorPoliciesOptions = {
+      durableStores: { idempotency: store },
+      idempotencyKeyMigration: 'legacy-writers-drained' as const,
+      audit: { mode: 'development' as const, allowUnaudited: true as const },
+      egress: { allowedDomains: [] },
+      permissions: { principalPermissions: 'not-configured' as const },
+    };
+    const policies = singleTenantConnectorPolicies(options);
+    const execute = vi.fn(async () => 'executed');
+    const tool = createConnectorBase({
+      id: 'migration.preset-snapshot',
+      description: 'Observe preset acknowledgement timing',
+      permissions: { sideEffect: 'read', idempotencyKey: true },
+      policies,
+      execute,
+    });
+
+    delete options.idempotencyKeyMigration;
+    expect(Reflect.deleteProperty(policies, 'idempotencyKeyMigration')).toBe(
+      false,
+    );
+    await expect(
+      run(tool, {}, makeContext({ idempotencyKey: 'operation' })),
+    ).resolves.toBe('executed');
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+
+  it('uses the frozen preset acknowledgement for a migrator call', async () => {
+    const database = {
+      prepare() {
+        throw new Error('migration must stop at the snapshot store boundary');
+      },
+    };
+    const store = new D1IdempotencyStore(database as never);
+    const options: SingleTenantConnectorPoliciesOptions = {
+      durableStores: { idempotency: store },
+      idempotencyKeyMigration: 'legacy-writers-drained' as const,
+      audit: { mode: 'development' as const, allowUnaudited: true as const },
+      egress: { allowedDomains: [] },
+      permissions: { principalPermissions: 'not-configured' as const },
+    };
+    const policies = singleTenantConnectorPolicies(options);
+    const tool = createConnectorBase({
+      id: 'migration.preset-migrator-snapshot',
+      description: 'Observe preset migrator acknowledgement timing',
+      permissions: { sideEffect: 'read', idempotencyKey: true },
+      policies,
+      execute: async () => 'executed',
+    });
+
+    delete options.idempotencyKeyMigration;
+
+    await expect(
+      migrateLegacyConnectorIdempotency(tool, {
+        idempotencyKey: 'operation:legacy',
+        expectedRecord: { result: 'legacy' },
+      }),
+    ).rejects.toThrow(
+      'connector migration.preset-migrator-snapshot: supported legacy idempotency migration requires D1IdempotencyStore with transactional batch() support',
+    );
   });
 
   it.each([

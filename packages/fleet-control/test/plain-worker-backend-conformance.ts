@@ -375,6 +375,9 @@ export function describePlainWorkerConformance(
         { versionId: initial.record.artifactVersion, percentage: 100 },
         { versionId: expect.stringMatching(/.+/u), percentage: 0 },
       ]);
+      expect(stagedDeployment?.[1]?.versionId).not.toBe(
+        initial.record.artifactVersion,
+      );
       expect(stagedDigest).toBe(deploymentSpecDigest(targetSpec));
       expect(migrated).toMatchObject({
         phase: 'ready',
@@ -425,6 +428,9 @@ export function describePlainWorkerConformance(
           { versionId: initial.record.artifactVersion, percentage: 100 },
           { versionId: expect.stringMatching(/.+/u), percentage: 0 },
         ]);
+        expect(script?.deployment?.[1]?.versionId).not.toBe(
+          initial.record.artifactVersion,
+        );
         expect(harness.world.mutationLog).toContain(
           `deploy-candidate:${targetSpec.scriptName}`,
         );

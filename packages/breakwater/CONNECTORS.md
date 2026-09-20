@@ -382,10 +382,16 @@ an unproven row in place: affected calls continue to fail closed. Without the
 acknowledgement, an absent legacy key cannot execute because an old writer
 could still create it after inspection.
 
-`createConnector()` validates `idempotencyKeyMigration` at construction and
-reads it on each execute or migration call. Setting the acknowledgement after
-construction takes effect on the next call; withdrawing it makes the next call
-fail with `IDEMPOTENCY_MIGRATION_REQUIRED` or refuse the migration.
+`createConnector()` validates `idempotencyKeyMigration` at construction. A
+connector built from caller-held `policies` reads the live property on each
+execute that reaches the absent-legacy migration gate and on each validated,
+ambiguous `migrate()` attempt that reaches the acknowledgement gate. A replay,
+an `IDEMPOTENCY_CONFLICT` denial, or an `IDEMPOTENCY_LEGACY_AMBIGUOUS` denial
+for an existing legacy key resolves before that execute read. Setting or
+withdrawing the acknowledgement after construction therefore affects the next
+eligible call. A connector built from `singleTenantConnectorPolicies()` reads
+the preset's frozen snapshot, so later changes to the preset inputs do not
+change its acknowledgement.
 
 For the shipped D1 store, inventory and migrate through the connector-bound
 helpers instead of constructing storage keys or writing ad hoc SQL:

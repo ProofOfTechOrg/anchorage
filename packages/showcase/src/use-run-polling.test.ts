@@ -176,7 +176,7 @@ describe('startPollingLoop', () => {
     const poll = vi
       .fn<() => Promise<boolean>>()
       .mockImplementationOnce(() => first)
-      .mockResolvedValue(true);
+      .mockResolvedValue(false);
 
     const stop = startPollingLoop(poll, 100);
     expect(poll).toHaveBeenCalledTimes(1);

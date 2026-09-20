@@ -235,6 +235,16 @@ describe('deriveRunEvents', () => {
     expect(done?.detail).toContain('boom');
   });
 
+  it('narrates an empty failed-run error with fallback detail', () => {
+    const events = deriveRunEvents(
+      summary(),
+      summary({ status: 'failed', error: '' }),
+      RUN,
+    );
+    const done = events.find((event) => event.kind === 'run.failed');
+    expect(done?.detail).toContain('no error detail');
+  });
+
   it.each([
     'cancelled',
     'timed_out',

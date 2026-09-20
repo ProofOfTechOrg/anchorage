@@ -84,7 +84,7 @@ export function useSnapshotNarration(
         events.push(
           pollTroubleEvent(run.runId, {
             stopped: next.stopped === 'hard',
-            message: next.error ?? 'status reads are failing',
+            message: next.error || 'status reads are failing',
           }),
         );
       }

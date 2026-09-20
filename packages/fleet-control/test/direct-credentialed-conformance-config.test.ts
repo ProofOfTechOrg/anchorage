@@ -323,10 +323,58 @@ describe('direct conformance configuration', () => {
   });
 
   it('keeps the provider-request ceiling within the Worker subrequest limit', () => {
+    // This field stays separate because the shared bounds table accepts 1,
+    // below the minimum valid maxProviderRequests value of 9.
+    const invalidValues = [
+      [
+        0,
+        'direct conformance config has invalid referenceWorker.subrequestLimit',
+      ],
+      [
+        -1,
+        'direct conformance config has invalid referenceWorker.subrequestLimit',
+      ],
+      [
+        1.5,
+        'direct conformance config has invalid referenceWorker.subrequestLimit',
+      ],
+      [NaN, 'direct conformance config has invalid plain JSON data'],
+      [Infinity, 'direct conformance config has invalid plain JSON data'],
+      [
+        null,
+        'direct conformance config has invalid referenceWorker.subrequestLimit',
+      ],
+      [
+        '50',
+        'direct conformance config has invalid referenceWorker.subrequestLimit',
+      ],
+      [
+        10_000_001,
+        'direct conformance config has invalid referenceWorker.subrequestLimit',
+      ],
+      [
+        1,
+        'direct conformance config has referenceWorker.maxProviderRequests greater than referenceWorker.subrequestLimit',
+      ],
+      [
+        8,
+        'direct conformance config has referenceWorker.maxProviderRequests greater than referenceWorker.subrequestLimit',
+      ],
+    ] as const;
+    for (const [value, message] of invalidValues) {
+      const raw = changed(['referenceWorker', 'subrequestLimit'], value);
+      objectAt(raw, ['referenceWorker']).maxProviderRequests = 9;
+      expect(() => validate(raw)).toThrow(message);
+    }
+
+    expect(() =>
+      validate(changed(['referenceWorker', 'subrequestLimit'], 10_000_000)),
+    ).not.toThrow();
+
     const above = changed(['referenceWorker', 'subrequestLimit'], 9);
     objectAt(above, ['referenceWorker']).maxProviderRequests = 10;
     expect(() => validate(above)).toThrow(
-      'direct conformance config has invalid referenceWorker.maxProviderRequests',
+      'direct conformance config has referenceWorker.maxProviderRequests greater than referenceWorker.subrequestLimit',
     );
 
     const equal = changed(['referenceWorker', 'subrequestLimit'], 9);

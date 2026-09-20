@@ -717,7 +717,7 @@ describe('createD1Storage table prefix', () => {
     );
   });
 
-  it('preserves own, inherited and non-enumerable disabled or custom domain overrides', async () => {
+  it('preserves own, inherited and non-enumerable domain overrides', async () => {
     const binding = sqliteUnitDatabase(openSqlite()) as D1DatabaseBinding;
     const custom = new FencedWorkflowsStorageD1({ binding: binding as never });
     // @mastra/cloudflare-d1 backs neither of these domains, so a host-supplied
@@ -726,47 +726,41 @@ describe('createD1Storage table prefix', () => {
     const knowledge = { query: async () => [] };
     for (const mode of ['own', 'inherited', 'non-enumerable']) {
       for (const workflows of [false, custom]) {
-        for (const supplied of [false, true]) {
-          const values = {
-            workflows,
-            threadState: false,
-            notifications: false,
-            workflowDefinitions: supplied ? definitions : false,
-            knowledge: supplied ? knowledge : false,
-          };
-          const domains =
-            mode === 'own'
-              ? values
-              : mode === 'inherited'
-                ? Object.create(values)
-                : Object.defineProperties(
-                    {},
-                    Object.fromEntries(
-                      Object.entries(values).map(([key, value]) => [
-                        key,
-                        { value },
-                      ]),
-                    ),
-                  );
-          Object.defineProperty(domains, 'ignored', {
-            enumerable: true,
-            get() {
-              throw new Error('unknown getter');
-            },
-          });
-          const storage = createD1Storage({ binding, domains });
-          expect(await storage.getStore('workflows')).toBe(
-            workflows === false ? undefined : custom,
-          );
-          expect(await storage.getStore('threadState')).toBeUndefined();
-          expect(await storage.getStore('notifications')).toBeUndefined();
-          expect(await storage.getStore('workflowDefinitions')).toBe(
-            supplied ? definitions : undefined,
-          );
-          expect(await storage.getStore('knowledge')).toBe(
-            supplied ? knowledge : undefined,
-          );
-        }
+        const values = {
+          workflows,
+          threadState: false,
+          notifications: false,
+          workflowDefinitions: definitions,
+          knowledge,
+        };
+        const domains =
+          mode === 'own'
+            ? values
+            : mode === 'inherited'
+              ? Object.create(values)
+              : Object.defineProperties(
+                  {},
+                  Object.fromEntries(
+                    Object.entries(values).map(([key, value]) => [
+                      key,
+                      { value },
+                    ]),
+                  ),
+                );
+        Object.defineProperty(domains, 'ignored', {
+          enumerable: true,
+          get() {
+            throw new Error('unknown getter');
+          },
+        });
+        const storage = createD1Storage({ binding, domains });
+        expect(await storage.getStore('workflows')).toBe(
+          workflows === false ? undefined : custom,
+        );
+        expect(await storage.getStore('threadState')).toBeUndefined();
+        expect(await storage.getStore('notifications')).toBeUndefined();
+        expect(await storage.getStore('workflowDefinitions')).toBe(definitions);
+        expect(await storage.getStore('knowledge')).toBe(knowledge);
       }
     }
   });

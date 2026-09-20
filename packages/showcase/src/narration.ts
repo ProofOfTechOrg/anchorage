@@ -358,7 +358,7 @@ function terminalEvents(
       zone: 'do',
       kind: 'run.failed',
       title: `Run ${next.status}: ${run.title}`,
-      detail: `${next.error ?? 'no error detail'}. The D1 snapshot is retained; last known state stays on the run card.`,
+      detail: `${next.error || 'no error detail'}. The D1 snapshot is retained; last known state stays on the run card.`,
       tone: 'danger',
       runId: run.runId,
       observed: true,

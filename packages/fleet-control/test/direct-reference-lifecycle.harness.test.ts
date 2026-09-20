@@ -17,6 +17,7 @@ import type { DirectDecommissionExportMetadata } from '../scripts/direct-referen
 import type { CleanupAdvanceResult } from '../src/cleanup-advance.js';
 import type { DecommissionAdvanceResult } from '../src/decommission-advance.js';
 import { deploymentSpecDigest } from '../src/spec-digest.js';
+import { closeFixtures } from './fixtures/cleanup.js';
 import { directFixtureManifest } from './fixtures/direct-credentialed-config.js';
 import { directObservationFixture } from './fixtures/direct-observations.js';
 import {
@@ -46,21 +47,63 @@ async function settleWithin<T>(
   }
 }
 
-async function settleCleanup(
-  closers: readonly (() => Promise<void>)[],
-): Promise<unknown[]> {
-  return (await Promise.allSettled(closers.map((close) => close()))).flatMap(
-    (result) => (result.status === 'rejected' ? [result.reason] : []),
+async function finishNativeRefusalCleanup(options: {
+  bodyFailure?: unknown;
+  closers: readonly (() => Promise<void>)[];
+  settled: readonly PromiseSettledResult<unknown>[];
+  postCheck: () => void;
+}): Promise<void> {
+  await closeFixtures(
+    [
+      ...(options.bodyFailure === undefined
+        ? []
+        : [async () => Promise.reject(options.bodyFailure)]),
+      ...options.closers,
+    ],
+    [
+      ...options.settled.map((result) => async () => {
+        expect(result.status).toBe('fulfilled');
+      }),
+      async () => options.postCheck(),
+    ],
+    'native refusal cleanup failed',
   );
 }
 
-function captureAssertion(failures: unknown[], assertion: () => void): void {
-  try {
-    assertion();
-  } catch (error) {
-    failures.push(error);
-  }
-}
+it('settles closers before running post-checks', async () => {
+  const state: string[] = [];
+  await closeFixtures(
+    [
+      async () => {
+        await Promise.resolve();
+        state.push('closed');
+      },
+    ],
+    [() => expect(state).toEqual(['closed'])],
+    'ordered cleanup failed',
+  );
+});
+
+it('runs later closers after a synchronous throw', async () => {
+  const calls: string[] = [];
+  const sentinel = new Error('first-close-sentinel');
+  const failure = closeFixtures(
+    [
+      () => {
+        calls.push('first-close');
+        throw sentinel;
+      },
+      () => {
+        calls.push('second-close');
+      },
+    ],
+    [],
+    'synchronous cleanup failed',
+  ).catch((error: unknown) => error);
+
+  expect(calls).toEqual(['first-close', 'second-close']);
+  await expect(failure).resolves.toMatchObject({ errors: [sentinel] });
+});
 
 describe.sequential('direct lifecycle through native control state', {
   timeout: 180_000,
@@ -708,37 +751,15 @@ describe.sequential('private force through native control state', {
     restore?.();
     release();
     const settled = await Promise.allSettled(held);
-    const failures = await settleCleanup([
-      () => local.close(),
-      () => fixture?.close() ?? Promise.resolve(),
-    ]);
-    if (bodyFailure !== undefined) failures.unshift(bodyFailure);
-    for (const result of settled)
-      captureAssertion(failures, () => expect(result.status).toBe('fulfilled'));
-    captureAssertion(failures, () =>
-      expect(fixture?.bridgeErrors ?? []).toEqual([]),
-    );
-    if (failures.length)
-      throw new AggregateError(failures, 'native refusal cleanup failed');
-  });
-
-  it('attempts later native cleanup and post-checks after a closer rejects', async () => {
-    const calls: string[] = [];
-    const sentinel = new Error('first-close-sentinel');
-    const failures = await settleCleanup([
-      async () => {
-        calls.push('first-close');
-        throw sentinel;
-      },
-      async () => {
-        calls.push('second-close');
-      },
-    ]);
-    captureAssertion(failures, () => {
-      calls.push('post-check');
-      expect(calls).toEqual(['first-close', 'second-close', 'post-check']);
+    await finishNativeRefusalCleanup({
+      bodyFailure,
+      closers: [
+        () => local.close(),
+        () => fixture?.close() ?? Promise.resolve(),
+      ],
+      settled,
+      postCheck: () => expect(fixture?.bridgeErrors ?? []).toEqual([]),
     });
-    expect(failures).toEqual([sentinel]);
   });
 
   it.each([

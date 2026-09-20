@@ -142,6 +142,7 @@ function compareVersions(left, right) {
   return 0;
 }
 
+/** Release-only peer-floor gate run after Changesets versions the packages. */
 export function prerequisitePeerFloorViolations(manifests) {
   const missingEdge = missingPeerEdgeViolation(manifests);
   const violations = missingEdge ? [missingEdge] : [];
