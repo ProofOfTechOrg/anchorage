@@ -784,11 +784,11 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
                 cursor !== null &&
                 typeof cursor !== 'string') ||
               [totalPages, totalCount, perPage].some(
-                (value) =>
-                  value !== undefined &&
-                  (typeof value !== 'number' ||
-                    !Number.isSafeInteger(value) ||
-                    value < 0),
+                (parsedValue) =>
+                  parsedValue !== undefined &&
+                  (typeof parsedValue !== 'number' ||
+                    !Number.isSafeInteger(parsedValue) ||
+                    parsedValue < 0),
               ) ||
               (rows.length === 0 &&
                 ((typeof cursor === 'string' && cursor.length > 0) ||

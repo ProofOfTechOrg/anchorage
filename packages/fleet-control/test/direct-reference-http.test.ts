@@ -479,9 +479,9 @@ describe('direct reference HTTP boundary', () => {
       return { status: 'complete' };
     });
     let responseSettled = false;
-    const result = handle(request()).then((response) => {
+    const result = handle(request()).then((resolvedResponse) => {
       responseSettled = true;
-      return response;
+      return resolvedResponse;
     });
     await abortObserved;
     expect(responseSettled).toBe(false);

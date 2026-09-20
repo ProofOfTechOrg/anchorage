@@ -4383,8 +4383,11 @@ describe('fleet provisioning', () => {
 
   it('commits the invocation authority durably before each candidate-invoking dispatch', async () => {
     class FlipTimelineStore extends MemoryStore {
-      constructor(private readonly timeline: string[]) {
+      private readonly timeline: string[];
+
+      constructor(eventTimeline: string[]) {
         super();
+        this.timeline = eventTimeline;
       }
 
       override async put(record: FleetRecord): Promise<void> {

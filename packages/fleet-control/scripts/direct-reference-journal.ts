@@ -132,7 +132,11 @@ function kindFor(slot: string): DirectOperationKind {
   if (slot === 'migration-next') return 'migration';
   if (slot === 'cleanup-recovery-initial') return 'cleanup';
   for (const kind of ['cleanup', 'decommission'] as const)
-    if (['a', 'b', 'recovery'].some((role) => slot === `${kind}-${role}`))
+    if (
+      ['a', 'b', 'recovery'].some(
+        (fixtureRole) => slot === `${kind}-${fixtureRole}`,
+      )
+    )
       return kind;
   return stateError();
 }

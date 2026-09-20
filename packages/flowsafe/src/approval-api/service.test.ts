@@ -755,7 +755,7 @@ describe('ApprovalService.decide', () => {
     };
     const backing = harness.backend.store();
     const store: ApprovalStore = {
-      create: (input) => backing.create(input),
+      create: (approvalInput) => backing.create(approvalInput),
       get: async (id) => {
         const current = await backing.get(id);
         mutableSource.id = 'mutated';

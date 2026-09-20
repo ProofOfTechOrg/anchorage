@@ -111,11 +111,11 @@ interface TestEnv {
 }
 
 class TestHost extends SignalProviderHost<TestEnv> {
-  constructor(state: SignalProviderHostState | undefined, env: TestEnv) {
+  constructor(hostState: SignalProviderHostState | undefined, env: TestEnv) {
     const identityDatabase =
       env.identityDatabase ?? deploymentIdentityDatabase();
     super(
-      state,
+      hostState,
       Object.assign(env, {
         DEPLOYMENT_TENANT: 'acme',
         DEPLOYMENT_IDENTITY_SECRET: TEST_DEPLOYMENT_IDENTITY_SECRET,
@@ -276,18 +276,18 @@ describe('SignalProviderHost.poll', () => {
     },
   ])('records $scenario as terminal=$terminal (the DO answered $status)', async ({
     status,
-    providerId,
+    providerId: signalProviderId,
     tally,
     terminal,
   }) => {
     // #given — a bound delivery the thread DO answers with that status
     const factory = new InMemorySubscriptionStoreFactory();
-    await seed(factory, 'acme', providerId, 'acme_t1');
+    await seed(factory, 'acme', signalProviderId, 'acme_t1');
     const addressed: string[] = [];
     const host = new TestHost(state(SIGNAL_PROVIDER_HOST_INSTANCE_NAME), {
       factory,
       topology: stubTopology(addressed, undefined, status),
-      providers: [pollProvider(providerId)],
+      providers: [pollProvider(signalProviderId)],
     });
     const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
 

@@ -327,8 +327,8 @@ function bindings(value, expected, checkRelease) {
         }
       : {}),
   };
-  for (const [name, value] of Object.entries(vars))
-    if (indexed.get(name).value !== value) refuse();
+  for (const [name, bindingValue] of Object.entries(vars))
+    if (indexed.get(name).value !== bindingValue) refuse();
   if (
     !['1', '2'].includes(indexed.get('APPLICATION_RELEASE').value) ||
     indexed.get('FLEET_SCHEMA_VERSION').value !==

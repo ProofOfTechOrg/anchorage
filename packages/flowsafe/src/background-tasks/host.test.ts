@@ -298,7 +298,7 @@ describe('BackgroundTaskHost — execution lifecycle', () => {
     vi.spyOn(mastra, 'stopWorkers').mockImplementation(async () => {
       calls.push('stop-workers');
     });
-    const init = vi.spyOn(backgroundTaskManagerForTests(host), 'init');
+    const initSpy = vi.spyOn(backgroundTaskManagerForTests(host), 'init');
     const managerShutdown = vi.spyOn(
       backgroundTaskManagerForTests(host),
       'shutdown',
@@ -307,7 +307,7 @@ describe('BackgroundTaskHost — execution lifecycle', () => {
     // #when / #then
     await expect(host.boot()).rejects.toBe(primary);
     expect(calls).toEqual(['start-workers', 'stop-workers']);
-    expect(init).not.toHaveBeenCalled();
+    expect(initSpy).not.toHaveBeenCalled();
     expect(managerShutdown).not.toHaveBeenCalled();
 
     await expect(host.shutdown()).resolves.toBeUndefined();
@@ -925,7 +925,7 @@ describe('BackgroundTaskHost and the deployment execution fence', () => {
     const startWorkers = vi
       .spyOn(mastra, 'startWorkers')
       .mockImplementation(async () => undefined);
-    const init = vi
+    const initSpy = vi
       .spyOn(backgroundTaskManagerForTests(host), 'init')
       .mockImplementation(async () => undefined);
 
@@ -939,12 +939,12 @@ describe('BackgroundTaskHost and the deployment execution fence', () => {
     // second time, and every dispatch is then handled twice: double claim,
     // double body execution — with `#managerNeedsShutdown`/`#workersNeedStop`
     // being booleans, teardown would stop only one of the two.
-    expect(init).toHaveBeenCalledTimes(1);
+    expect(initSpy).toHaveBeenCalledTimes(1);
     expect(startWorkers).toHaveBeenCalledTimes(1);
 
     // #and — a later boot still rides the settled memo rather than re-starting.
     await host.boot();
-    expect(init).toHaveBeenCalledTimes(1);
+    expect(initSpy).toHaveBeenCalledTimes(1);
     expect(startWorkers).toHaveBeenCalledTimes(1);
   });
 

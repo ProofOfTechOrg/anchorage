@@ -150,17 +150,17 @@ describeLinux('durable bootstrap state', () => {
     const f = await fixture(4);
     const journal = await opened({ ...f.input, mode: 'run' });
     await confirmedBootstrap(f, journal);
-    const first = await journal.reserveInvocation(f.request());
+    const firstReservation = await journal.reserveInvocation(f.request());
     await expect(
       journal.recordBootstrapObservation({
         kind: 'control-read',
-        ordinal: first.ordinal,
+        ordinal: firstReservation.ordinal,
       }),
     ).rejects.toMatchObject({ code: 'outcome-unknown' });
-    await journal.settleInvocation(first);
+    await journal.settleInvocation(firstReservation);
     await journal.recordBootstrapObservation({
       kind: 'control-read',
-      ordinal: first.ordinal,
+      ordinal: firstReservation.ordinal,
     });
     const second = await journal.reserveInvocation(
       f.request({ kind: 'tenant-probe', role: 'a', operation: 'health' }),
@@ -213,8 +213,8 @@ describeLinux('durable bootstrap state', () => {
   it('normalizes v1 without dropping settled history or resetting the budget', async () => {
     const f = await fixture(2);
     const journal = await opened({ ...f.input, mode: 'run' });
-    const first = await journal.reserveInvocation(f.request());
-    await journal.settleInvocation(first);
+    const firstReservation = await journal.reserveInvocation(f.request());
+    await journal.settleInvocation(firstReservation);
     await closed(journal);
     const path = join(journal.directory, 'journal.json');
     const original = JSON.parse(await readFile(path, 'utf8'));
@@ -288,7 +288,7 @@ describeLinux('durable bootstrap state', () => {
     try {
       const error = await journal
         .confirmBootstrapMutation(receipts(f)[0])
-        .catch((error: unknown) => error);
+        .catch((caughtError: unknown) => caughtError);
       expect(error).toMatchObject({ code: 'invalid-state' });
       expect(String(error)).not.toContain('receipt-sync-secret-sentinel');
       await expect(
@@ -469,7 +469,7 @@ describeLinux('durable direct invocation state', () => {
     ]) {
       const error = await journal
         .reserveInvocation(body)
-        .catch((error: unknown) => error);
+        .catch((failure: unknown) => failure);
       expect(error).toMatchObject({ code: 'invalid-state' });
       expect(String(error)).not.toContain(CLAIM);
       expect(await readFile(join(journal.directory, 'journal.json'))).toEqual(
@@ -800,8 +800,8 @@ describeLinux('durable direct invocation state', () => {
   it('keeps the maximum safe invocation count compact and refuses overflow', async () => {
     const f = await fixture(Number.MAX_SAFE_INTEGER);
     const journal = await opened({ ...f.input, mode: 'run' });
-    const first = await journal.reserveInvocation(f.request());
-    await journal.settleInvocation(first);
+    const firstReservation = await journal.reserveInvocation(f.request());
+    await journal.settleInvocation(firstReservation);
     await closed(journal);
     const path = join(f.runDirectory, 'journal.json');
     const value = JSON.parse(await readFile(path, 'utf8'));
@@ -924,8 +924,8 @@ describeLinux('durable scenario state', () => {
       { databaseId: 'database-a', scriptName: 'script-a' },
     ]) {
       const { f, journal } = await scenarioJournal();
-      const state = scenarioWith((state) => {
-        state[field] = {
+      const state = scenarioWith((draftState) => {
+        draftState[field] = {
           ordinal: 3,
           action: { kind: 'force-terminal', role: 'a' },
           outcome: 'returned',

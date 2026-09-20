@@ -340,8 +340,9 @@ export async function recoverDirectForce(
           readFrozenLifecycleSpec(context, initial, 'recovery') !==
             context.spec('recovery', 'initial') ||
           (record.applicationResources ?? []).some(
-            (resource) =>
-              resource.state !== 'created' || !resource.creationDate,
+            (applicationResource) =>
+              applicationResource.state !== 'created' ||
+              !applicationResource.creationDate,
           )
         )
           throw new DirectReferenceJournalError('prerequisite-unavailable');

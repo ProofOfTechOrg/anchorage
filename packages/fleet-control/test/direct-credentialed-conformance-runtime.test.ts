@@ -731,7 +731,7 @@ process.stderr.write = (...args) => {
     let readsAtPreflight: string[] | undefined;
     let readsAfterRun: string[] | undefined;
     const result = await entryWithRuntime(async (input) => {
-      const result = await runDirectConformance({
+      const runtimeResult = await runDirectConformance({
         ...input,
         modules: {
           preflight: async () => {
@@ -742,7 +742,7 @@ process.stderr.write = (...args) => {
         },
       });
       readsAfterRun = [...reads];
-      return result;
+      return runtimeResult;
     }, credentials);
     expect(readsAtPreflight).toEqual([]);
     expect(readsAfterRun).toEqual([...DIRECT_CREDENTIAL_VARIABLES]);

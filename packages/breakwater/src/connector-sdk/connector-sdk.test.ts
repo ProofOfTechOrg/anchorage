@@ -274,11 +274,11 @@ async function run<TInput>(
       context: ToolExecutionContext,
     ) => Promise<unknown>;
   },
-  input: TInput,
+  toolInput: TInput,
   context: ToolExecutionContext = makeContext(),
 ): Promise<unknown> {
   if (!tool.execute) throw new Error('tool has no execute');
-  return tool.execute(input, context);
+  return tool.execute(toolInput, context);
 }
 
 // Invokes tool.execute with the context argument omitted entirely — the
@@ -2379,7 +2379,8 @@ describe('required-permissions gate', () => {
     const composite = createConnector({
       id: 'crm.settleAccount',
       description: 'Composite settlement calling a nested connector',
-      execute: async (_input, context) => run(inner.tool, input, context),
+      execute: async (_input, executionContext) =>
+        run(inner.tool, input, executionContext),
       permissions: {
         sideEffect: 'read',
         requiredPermissions: ['contacts.write'],
@@ -5778,9 +5779,9 @@ describe('connector decision taxonomy', () => {
       execute: async (_, context) => {
         try {
           return await run(inner, {}, context);
-        } catch (error) {
-          innerError = error;
-          throw error;
+        } catch (nestedFailure) {
+          innerError = nestedFailure;
+          throw nestedFailure;
         }
       },
     });

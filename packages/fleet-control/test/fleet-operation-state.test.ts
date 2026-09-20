@@ -1137,7 +1137,7 @@ describe('operation fake guarded progress contract', () => {
             { ...stored, payload: { ...stored.payload, tenantTag: 'other' } },
           ],
         })
-        .catch((error: unknown) => error);
+        .catch((failure: unknown) => failure);
       expect(store.operations.get(operationId)).toEqual(auditInitial);
       expect(store.rows.get(`${operationId}:record`)).toEqual([stored]);
       expect(error).toBeInstanceOf(Error);

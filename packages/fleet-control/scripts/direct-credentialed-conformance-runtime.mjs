@@ -249,7 +249,7 @@ export async function runDirectConformance(input) {
   let evidenceWritten = false;
   const result = (
     exitCode,
-    summary,
+    runSummary,
     evidencePathReported = null,
     // The fixed line an admission refusal prints, handed over by the branch
     // that refuses. A refusal supplies one and prints no stdout summary; the
@@ -265,15 +265,15 @@ export async function runDirectConformance(input) {
         stderrLine: inspected.serialized,
       };
     };
-    let lines = inspect(summary);
-    summary = JSON.parse(lines.stderrLine);
+    let lines = inspect(runSummary);
+    runSummary = JSON.parse(lines.stderrLine);
     if (!stderrOnly && lines.hit) {
       exitCode = exits.evidenceFailed;
-      summary = evidenceFailureSummary(
+      runSummary = evidenceFailureSummary(
         evidenceWritten,
-        summary.code === codes.evidenceFailed ? undefined : lines.hit,
+        runSummary.code === codes.evidenceFailed ? undefined : lines.hit,
       );
-      lines = inspect(summary);
+      lines = inspect(runSummary);
     }
     if (!stderrOnly && Buffer.byteLength(lines.stdoutLine) > 4096) {
       // A summary too large to print is replaced by a fixed one; the run keeps
@@ -299,7 +299,7 @@ export async function runDirectConformance(input) {
     }
     return {
       exitCode,
-      summary: lines.stderrLine ? JSON.parse(lines.stderrLine) : summary,
+      summary: lines.stderrLine ? JSON.parse(lines.stderrLine) : runSummary,
       evidencePath: evidencePathReported,
       stdoutLine: lines.stdoutLine,
       stderrLine: lines.stderrLine,

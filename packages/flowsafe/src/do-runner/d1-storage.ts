@@ -1393,7 +1393,7 @@ export async function purgeExpiredWorkflowRuns(
       const rawRows = snapshotResultRows(result);
       if (
         rawRows.length > 1 ||
-        rawRows.some((row) =>
+        rawRows.some((rawRow) =>
           [
             'workflow_name',
             'run_id',
@@ -1401,7 +1401,7 @@ export async function purgeExpiredWorkflowRuns(
             'snapshot',
             'createdAt',
             'updatedAt',
-          ].some((key) => !Object.hasOwn(row, key)),
+          ].some((key) => !Object.hasOwn(rawRow, key)),
         )
       )
         throw new Error('run retention raw snapshot result is malformed');

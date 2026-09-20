@@ -1764,24 +1764,24 @@ describeLinux('SDK direct bootstrap', () => {
         deadlineMs: 4_000,
       }),
     );
-    const probes: Request[] = [];
+    const capturedProbes: Request[] = [];
     const fetchRequest: typeof fetch = async (input, init) => {
       const request = new Request(input, init);
       if (new URL(request.url).hostname.endsWith('.workers.dev'))
-        probes.push(request);
+        capturedProbes.push(request);
       return f.fetchRequest(input, init);
     };
     const result = f
       .run({ fetch: fetchRequest })
       .catch((error: unknown) => error);
-    await vi.waitFor(() => expect(probes).toHaveLength(1));
+    await vi.waitFor(() => expect(capturedProbes).toHaveLength(1));
     await vi.advanceTimersByTimeAsync(4_000);
     await expect(result).resolves.toMatchObject({
       code: 'provider-unavailable',
     });
-    expect(probes).toHaveLength(2);
+    expect(capturedProbes).toHaveLength(2);
     expect(
-      probes.every((request) => !request.headers.has('authorization')),
+      capturedProbes.every((request) => !request.headers.has('authorization')),
     ).toBe(true);
     expect(f.journal.snapshot()).toMatchObject({
       invocationCount: 0,
@@ -1791,12 +1791,12 @@ describeLinux('SDK direct bootstrap', () => {
 
   it('refuses an ingress readiness deadline with provider-unavailable and no invocation reserved', async () => {
     const f = await fixture();
-    let probes = 0;
+    let probeCalls = 0;
     const fetchRequest: typeof fetch = async (input, init) => {
       const request = new Request(input, init);
       if (new URL(request.url).hostname.endsWith('.workers.dev')) {
         expect(request.headers.has('authorization')).toBe(false);
-        probes++;
+        probeCalls++;
         const elapsed = performance.now() + 120_000;
         vi.spyOn(performance, 'now').mockReturnValue(elapsed);
         return new Response('<html>missing</html>', { status: 404 });
@@ -1807,7 +1807,7 @@ describeLinux('SDK direct bootstrap', () => {
       code: 'provider-unavailable',
       message: 'provider-unavailable',
     });
-    expect(probes).toBe(1);
+    expect(probeCalls).toBe(1);
     expect(f.journal.snapshot()).toMatchObject({
       invocationCount: 0,
       lastInvocation: null,

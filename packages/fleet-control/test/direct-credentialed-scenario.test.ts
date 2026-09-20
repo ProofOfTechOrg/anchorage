@@ -130,7 +130,9 @@ describe.sequential('scenario proof failures in native reference state', {
         desiredSpecDigest: string;
       }[];
     };
-    const record = control.records.find((record) => record.role === 'a');
+    const record = control.records.find(
+      (candidateRecord) => candidateRecord.role === 'a',
+    );
     if (!record) throw new Error('native fixture record is missing');
     const expected = {
       ...input,
@@ -1191,32 +1193,32 @@ describe('scenario resume re-entry against a settled journal', () => {
     } = {},
   ) => {
     const identity = options.identity ?? 'matching';
-    const state = seed('force-terminal-a', (state) => {
-      state.mutation = settledCall(
+    const state = seed('force-terminal-a', (draftState) => {
+      draftState.mutation = settledCall(
         'force-terminal',
         'returned',
         3,
         { role: 'a' },
         attempts,
       ) as MutableScenario['mutation'];
-      present(state.mutation).before =
+      present(draftState.mutation).before =
         identity === 'absent'
           ? null
           : {
               databaseId:
                 identity === 'foreign'
                   ? 'foreign-database'
-                  : present(state.proofs.decommission.a).databaseId,
-              scriptName: present(state.proofs.decommission.a).scriptName,
+                  : present(draftState.proofs.decommission.a).databaseId,
+              scriptName: present(draftState.proofs.decommission.a).scriptName,
             };
-      state.proofs.terminalForce = { a: null };
-      present(state.proofs.steps[0]).step = 'arm-maintenance';
-      present(state.proofs.steps[1]).step = 'arm-maintenance';
-      state.proofs.restart = restartProof(target.f, {
+      draftState.proofs.terminalForce = { a: null };
+      present(draftState.proofs.steps[0]).step = 'arm-maintenance';
+      present(draftState.proofs.steps[1]).step = 'arm-maintenance';
+      draftState.proofs.restart = restartProof(target.f, {
         resumedProcess: { ...RESUMED },
         replayOrdinal: 3,
       }) as MutableScenario['proofs']['restart'];
-      state.records = state.records.map((entry) =>
+      draftState.records = draftState.records.map((entry) =>
         entry.role === 'a' ? recordFacts({ role: 'a', present: false }) : entry,
       );
     });
@@ -1298,22 +1300,22 @@ describe('scenario resume re-entry against a settled journal', () => {
   it('terminal force resume: reconciles the mutation against the record it still holds', async () => {
     const target = await scenarioJournal(DIRECT_SCENARIO_MIN_INVOCATIONS);
     const attempts = { provider: 0, maintenance: 0, application: 0 };
-    const state = seed('force-terminal-a', (state) => {
-      state.mutation = settledCall(
+    const state = seed('force-terminal-a', (draftState) => {
+      draftState.mutation = settledCall(
         'force-terminal',
         'returned',
         3,
         { role: 'a' },
         attempts,
       ) as MutableScenario['mutation'];
-      present(state.mutation).before = {
-        databaseId: present(state.proofs.decommission.a).databaseId,
-        scriptName: present(state.proofs.decommission.a).scriptName,
+      present(draftState.mutation).before = {
+        databaseId: present(draftState.proofs.decommission.a).databaseId,
+        scriptName: present(draftState.proofs.decommission.a).scriptName,
       };
-      state.proofs.terminalForce = { a: null };
-      present(state.proofs.steps[0]).step = 'arm-maintenance';
-      present(state.proofs.steps[1]).step = 'arm-maintenance';
-      state.proofs.restart = restartProof(target.f, {
+      draftState.proofs.terminalForce = { a: null };
+      present(draftState.proofs.steps[0]).step = 'arm-maintenance';
+      present(draftState.proofs.steps[1]).step = 'arm-maintenance';
+      draftState.proofs.restart = restartProof(target.f, {
         resumedProcess: { ...RESUMED },
         replayOrdinal: 3,
       }) as MutableScenario['proofs']['restart'];
@@ -1321,7 +1323,7 @@ describe('scenario resume re-entry against a settled journal', () => {
       // recorded present, so the resumed run reads the deletion through the
       // reconciliation the force permits rather than from a record that
       // already agreed with the provider.
-      state.reconciledOrdinal = 2;
+      draftState.reconciledOrdinal = 2;
     });
     await target.journal.recordScenario(state);
     expect(stored(target).records[0]).toMatchObject({
@@ -1387,24 +1389,24 @@ describe('scenario resume re-entry against a settled journal', () => {
       'observation-mismatch',
     ],
     ['refused response', undefined, 'reference-refused', 'reference-refused'],
-  ] as const)('terminal force settlement: %s', async (_title, witness, failure, reason) => {
+  ] as const)('terminal force settlement: %s', async (_title, witnessKind, failure, reason) => {
     const target = await scenarioJournal(DIRECT_SCENARIO_MIN_INVOCATIONS);
-    const state = seed('force-terminal-a', (state) => {
-      state.proofs.terminalForce = { a: null };
-      present(state.proofs.steps[0]).step = 'arm-maintenance';
-      present(state.proofs.steps[1]).step = 'arm-maintenance';
-      state.proofs.restart = restartProof(target.f, {
+    const state = seed('force-terminal-a', (draftState) => {
+      draftState.proofs.terminalForce = { a: null };
+      present(draftState.proofs.steps[0]).step = 'arm-maintenance';
+      present(draftState.proofs.steps[1]).step = 'arm-maintenance';
+      draftState.proofs.restart = restartProof(target.f, {
         resumedProcess: { ...RESUMED },
         replayOrdinal: 3,
       }) as MutableScenario['proofs']['restart'];
     });
     const before =
-      witness === 'matching'
+      witnessKind === 'matching'
         ? {
             databaseId: present(state.proofs.decommission.a).databaseId,
             scriptName: present(state.proofs.decommission.a).scriptName,
           }
-        : witness;
+        : witnessKind;
     await target.journal.recordScenario(state);
     const { invocation, actions } = reference(target, { interrupted: true });
     const force: DirectInvocationClient = {
@@ -1454,7 +1456,7 @@ describe('scenario resume re-entry against a settled journal', () => {
       actions.filter((action) => action.kind === 'force-terminal'),
     ).toHaveLength(1);
     expect(stored(target).proofs.terminalForce.a).toBeNull();
-    if (witness === 'matching')
+    if (witnessKind === 'matching')
       expect(settled).toMatchObject({
         outcome: 'returned',
         before,
@@ -1466,7 +1468,7 @@ describe('scenario resume re-entry against a settled journal', () => {
         before: null,
         attempts: { provider: 0, maintenance: 0, application: 0 },
       });
-    else if (witness === null)
+    else if (witnessKind === null)
       expect(settled).toMatchObject({
         outcome: 'returned',
         before: null,
@@ -1588,10 +1590,10 @@ describe('scenario resume re-entry against a settled journal', () => {
   it('issues no second migration start and consumes the injection only at the interrupt', async () => {
     const target = await scenarioJournal(DIRECT_SCENARIO_MIN_INVOCATIONS);
     await target.journal.recordScenario(
-      seed('migration-start', (state) => {
+      seed('migration-start', (draftState) => {
         const call = settledCall('migration-start', 'returned', 3);
-        state.lastCall = call as MutableScenario['lastCall'];
-        state.mutation = call as MutableScenario['mutation'];
+        draftState.lastCall = call as MutableScenario['lastCall'];
+        draftState.mutation = call as MutableScenario['mutation'];
       }) as DirectScenarioState,
     );
     const { actions, invocation } = reference(target, { interrupted: false });
@@ -1614,15 +1616,16 @@ describe('scenario resume re-entry against a settled journal', () => {
     const target = await scenarioJournal(DIRECT_SCENARIO_MIN_INVOCATIONS);
     const frozen = restartProof(target.f, {});
     await target.journal.recordScenario(
-      seed('migration-interrupt', (state) => {
+      seed('migration-interrupt', (draftState) => {
         const call = settledCall(
           'migration-continue',
           'injected-response-loss',
           2,
         );
-        state.lastCall = call as MutableScenario['lastCall'];
-        state.mutation = call as MutableScenario['mutation'];
-        state.proofs.restart = frozen as MutableScenario['proofs']['restart'];
+        draftState.lastCall = call as MutableScenario['lastCall'];
+        draftState.mutation = call as MutableScenario['mutation'];
+        draftState.proofs.restart =
+          frozen as MutableScenario['proofs']['restart'];
       }) as DirectScenarioState,
     );
     const { actions, invocation } = reference(target, { interrupted: true });

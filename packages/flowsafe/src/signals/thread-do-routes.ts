@@ -2186,7 +2186,7 @@ async function handleMessage(
       persistenceAllowed: options.persistenceAllowed,
       memoryAvailable: options.memoryAvailable,
       message,
-      deliverActive: (runId, memoryAvailable) =>
+      deliverActive: (runId, hasMemory) =>
         agent.sendMessage(message, {
           runId,
           threadId,
@@ -2196,9 +2196,7 @@ async function handleMessage(
           // when both the memory and authorization gates allow the write.
           ifIdle: {
             behavior:
-              memoryAvailable && options.persistenceAllowed
-                ? 'persist'
-                : 'discard',
+              hasMemory && options.persistenceAllowed ? 'persist' : 'discard',
           },
         }),
       persist: () =>
@@ -2398,7 +2396,7 @@ async function handleSignal(
       memoryAvailable: options.memoryAvailable,
       signal,
       activeDiscardAllowed: activeBehavior === 'discard',
-      deliverActive: (runId, memoryAvailable) =>
+      deliverActive: (runId, hasMemory) =>
         agent.sendSignal(signal, {
           runId,
           threadId,
@@ -2406,9 +2404,7 @@ async function handleSignal(
           ifActive: { behavior: deliveredActiveBehavior },
           ifIdle: {
             behavior:
-              memoryAvailable && options.persistenceAllowed
-                ? 'persist'
-                : 'discard',
+              hasMemory && options.persistenceAllowed ? 'persist' : 'discard',
           },
         }),
       persist: () =>

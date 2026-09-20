@@ -467,10 +467,10 @@ class CleanupBackend implements ProvisioningBackend {
     _database: DatabaseReference,
     tenantTag: string,
     _fence: unknown,
-    options: SeedDeploymentIdentityOptions,
+    seedOptions: SeedDeploymentIdentityOptions,
   ): Promise<void> {
     this.call('seedDeploymentIdentity');
-    this.seededFenceStates.push(options.initialExecutionFenceState);
+    this.seededFenceStates.push(seedOptions.initialExecutionFenceState);
     this.databaseOwner = tenantTag;
   }
 

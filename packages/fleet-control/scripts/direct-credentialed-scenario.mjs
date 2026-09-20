@@ -122,7 +122,11 @@ export async function runDirectCredentialedScenario(input) {
     state.mutation = null;
     await persist();
   };
-  const invoke = async (action, mutates = false, migration = null) => {
+  const invoke = async (
+    action,
+    mutates = false,
+    migrationInvocation = null,
+  ) => {
     const snapshot = journal.snapshot();
     requireFact(!mutationPending(snapshot), 'outcome-unknown');
     const remaining =
@@ -133,7 +137,7 @@ export async function runDirectCredentialedScenario(input) {
       action: actionSummary(action),
       outcome: 'prepared',
       attempts: null,
-      migration,
+      migration: migrationInvocation,
     };
     state.lastCall = call;
     if (mutates) state.mutation = call;
@@ -235,11 +239,13 @@ export async function runDirectCredentialedScenario(input) {
       );
     const records = fresh.records.map(recordFacts);
     equal(
-      records.map((record) => record.role),
+      records.map((remoteRecord) => remoteRecord.role),
       [...SCENARIO_ROLES],
     );
     for (const remote of records) {
-      const known = state.records.find((record) => record.role === remote.role);
+      const known = state.records.find(
+        (knownRecord) => knownRecord.role === remote.role,
+      );
       if (!known)
         requireFact(!remote.present || allowed.roles.includes(remote.role));
       else if (!allowed.roles.includes(remote.role)) equal(remote, known);
@@ -263,9 +269,9 @@ export async function runDirectCredentialedScenario(input) {
     control = fresh;
     return fresh;
   };
-  const mutate = async (action, migration = null) => {
+  const mutate = async (action, migrationInvocation = null) => {
     await sync();
-    return invoke(action, true, migration);
+    return invoke(action, true, migrationInvocation);
   };
   const fenceTransition = async (role, operation) => {
     const before = state.proofs.fence[operation][role].before;

@@ -132,10 +132,10 @@ class FakeStore implements ScheduleTickStore {
     metadata: Record<string, unknown>,
   ): Promise<void> {
     const index = this.triggers.findIndex(
-      (trigger) =>
-        trigger.id === id &&
-        trigger.scheduleId === scheduleId &&
-        trigger.outcome === 'deferred',
+      (candidateTrigger) =>
+        candidateTrigger.id === id &&
+        candidateTrigger.scheduleId === scheduleId &&
+        candidateTrigger.outcome === 'deferred',
     );
     if (index === -1) return;
     const trigger = this.triggers[index];

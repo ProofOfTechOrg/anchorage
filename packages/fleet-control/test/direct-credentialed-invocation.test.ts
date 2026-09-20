@@ -144,7 +144,9 @@ async function expectUnknown(
     ...f.options,
     fetch: fetchMock,
   });
-  const error = await client.invoke(action).catch((error: unknown) => error);
+  const error = await client
+    .invoke(action)
+    .catch((failure: unknown) => failure);
   expect(error).toBeInstanceOf(DirectInvocationError);
   expect(error).toMatchObject({ code: 'outcome-unknown' });
   expect(String(error)).not.toContain(SECRET);
@@ -642,8 +644,8 @@ describeLinux('Node authenticated direct invocation', () => {
     const received = new Promise<http.ServerResponse>((resolve) => {
       receive = resolve;
     });
-    const request = await localReference((_incoming, outgoing) => {
-      receive(outgoing);
+    const request = await localReference((_incoming, outgoingResponse) => {
+      receive(outgoingResponse);
     });
     vi.useFakeTimers();
     const client = createDirectInvocationClient(f.options);
@@ -677,8 +679,8 @@ describeLinux('Node authenticated direct invocation', () => {
     const received = new Promise<http.ServerResponse>((resolve) => {
       receive = resolve;
     });
-    const request = await localReference((_incoming, outgoing) => {
-      receive(outgoing);
+    const request = await localReference((_incoming, outgoingResponse) => {
+      receive(outgoingResponse);
     });
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
     const invocation = createDirectInvocationClient(f.options).invoke({
@@ -708,7 +710,7 @@ describeLinux('Node authenticated direct invocation', () => {
     const received = new Promise<http.ServerResponse>((resolve) => {
       receive = resolve;
     });
-    const request = await localReference((incoming, outgoing) => {
+    const request = await localReference((incoming, outgoingResponse) => {
       let body = '';
       incoming.setEncoding('utf8');
       incoming.on('data', (chunk) => {
@@ -717,16 +719,16 @@ describeLinux('Node authenticated direct invocation', () => {
       incoming.on('end', () => {
         bodies.push(body);
         if (bodies.length === 1) {
-          if (action.kind === 'control-read') outgoing.destroy();
+          if (action.kind === 'control-read') outgoingResponse.destroy();
           else {
-            outgoing.writeHead(404, { 'content-type': 'text/html' });
-            outgoing.end('<html>not ready</html>');
+            outgoingResponse.writeHead(404, { 'content-type': 'text/html' });
+            outgoingResponse.end('<html>not ready</html>');
           }
           return;
         }
-        outgoing.writeHead(200, responseHeaders);
-        outgoing.write('{');
-        receive(outgoing);
+        outgoingResponse.writeHead(200, responseHeaders);
+        outgoingResponse.write('{');
+        receive(outgoingResponse);
       });
     });
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });

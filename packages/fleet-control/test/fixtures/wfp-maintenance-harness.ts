@@ -130,8 +130,8 @@ export async function createWfpMaintenanceHarness(
       },
     },
     DISPATCH: {
-      get(scriptName, _arguments, options) {
-        calls.push({ scriptName, options });
+      get(scriptName, _arguments, requestOptions) {
+        calls.push({ scriptName, options: requestOptions });
         const name =
           scriptName === catalog.scriptName
             ? 'wfp-catalog'
@@ -143,8 +143,8 @@ export async function createWfpMaintenanceHarness(
       },
     },
   };
-  const requestFetch: typeof fetch = async (input, init) => {
-    const request = new Request(input, init);
+  const requestFetch: typeof fetch = async (requestInput, init) => {
+    const request = new Request(requestInput, init);
     requests.push(request.clone());
     return dispatchWorker.fetch(request, dispatcher);
   };

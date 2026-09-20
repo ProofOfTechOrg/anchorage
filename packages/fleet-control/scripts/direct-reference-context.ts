@@ -305,7 +305,8 @@ export async function createDirectReferenceContext(
     )
       refused();
     const role = (['a', 'b', 'recovery'] as const).find(
-      (role) => manifest.names.roles[role].tenantTag === record.tenantTag,
+      (candidateRole) =>
+        manifest.names.roles[candidateRole].tenantTag === record.tenantTag,
     );
     if (!role) refused();
     const names = manifest.names.roles[role];
@@ -380,13 +381,13 @@ export async function createDirectReferenceContext(
         anchorageDatabaseId: identity.databaseId,
         anchorageOperationId: identity.operationId,
       };
-      const object = await environment.EXPORTS.head(key);
+      const exportObject = await environment.EXPORTS.head(key);
       transport.assertWithinBudget();
-      const metadata = object?.customMetadata;
+      const metadata = exportObject?.customMetadata;
       if (
-        !object ||
-        object.key !== key ||
-        object.size !== expectedSize ||
+        !exportObject ||
+        exportObject.key !== key ||
+        exportObject.size !== expectedSize ||
         !metadata ||
         typeof metadata !== 'object' ||
         Array.isArray(metadata) ||

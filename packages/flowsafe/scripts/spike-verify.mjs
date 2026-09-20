@@ -1580,7 +1580,11 @@ async function main() {
       await waitOpen(spike, 10_000);
       // The hub broadcasts presence on connect — a subscription barrier proving
       // acceptWebSocket registered this socket before the mutation fans out.
-      await waitFrame(spike, (frame) => frame?.type === 'presence', 10_000);
+      await waitFrame(
+        spike,
+        (receivedFrame) => receivedFrame?.type === 'presence',
+        10_000,
+      );
 
       const peerTicket = await mintTicketApi(
         'hub',
@@ -1589,7 +1593,11 @@ async function main() {
       );
       const peer = connectWs(peerTicket.url, peerTicket.ticket);
       await waitOpen(peer, 10_000);
-      await waitFrame(peer, (frame) => frame?.type === 'presence', 10_000);
+      await waitFrame(
+        peer,
+        (receivedFrame) => receivedFrame?.type === 'presence',
+        10_000,
+      );
 
       // Decide the approval -> fires a 'decided' event over the deployment hub.
       const decided = await http(
@@ -1664,7 +1672,11 @@ async function main() {
       const ticket = await mintTicketApi('hub', undefined, AUTH.viewer);
       const sock = connectWs(ticket.url, ticket.ticket);
       await waitOpen(sock, 10_000);
-      await waitFrame(sock, (frame) => frame?.type === 'presence', 10_000);
+      await waitFrame(
+        sock,
+        (receivedFrame) => receivedFrame?.type === 'presence',
+        10_000,
+      );
 
       const decided = await http(
         'POST',

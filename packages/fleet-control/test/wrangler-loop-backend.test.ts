@@ -206,10 +206,10 @@ class FakeRouteApi implements PlainWorkerRouteApi {
 
   async withMutationFence<T>(
     fence: ExternalMutationFence,
-    operation: () => Promise<T>,
+    mutationOperation: () => Promise<T>,
   ): Promise<T> {
     await fence.assertOwned();
-    return operation();
+    return mutationOperation();
   }
 
   async queryDatabase(
@@ -340,9 +340,9 @@ function databaseRouteMethods(): Pick<
   | 'deleteDatabase'
 > {
   return {
-    async withMutationFence(fence, operation) {
+    async withMutationFence(fence, mutationOperation) {
       await fence.assertOwned();
-      return operation();
+      return mutationOperation();
     },
     async queryDatabase() {
       return [];

@@ -562,13 +562,13 @@ export class StartIdempotencyStore {
           );
       };
     } else {
-      let ready: Promise<void> | undefined;
+      let storageReady: Promise<void> | undefined;
       this.#ready = () => {
-        ready ??= this.#createSchema().catch((error: unknown) => {
-          ready = undefined;
+        storageReady ??= this.#createSchema().catch((error: unknown) => {
+          storageReady = undefined;
           throw error;
         });
-        return ready;
+        return storageReady;
       };
     }
   }

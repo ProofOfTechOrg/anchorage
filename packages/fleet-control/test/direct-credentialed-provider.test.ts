@@ -184,8 +184,8 @@ describe('the body-cancel leaf', () => {
     const cancel = vi.fn(() => Promise.resolve());
     const reason = new Error('refusal');
     expect(cancelBodyWithoutAwait({ cancel }, reason)).toBeUndefined();
-    await new Promise((resolve) => {
-      setImmediate(resolve);
+    await new Promise((listenReady) => {
+      setImmediate(listenReady);
     });
     // The load starts at module evaluation, so a release issued before it
     // resolves lands with it rather than on the next turn.
@@ -219,8 +219,8 @@ describe('the body-cancel leaf', () => {
     for (const absent of [undefined, null, {}, 'body'])
       expect(cancelBodyWithoutAwait(absent, reason)).toBeUndefined();
     expect(cancelBodyWithoutAwait(body, reason)).toBeUndefined();
-    await new Promise((resolve) => {
-      setImmediate(resolve);
+    await new Promise((serverClosed) => {
+      setImmediate(serverClosed);
     });
     await vi.waitFor(() => {
       expect(reads).toBe(1);

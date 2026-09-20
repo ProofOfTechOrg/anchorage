@@ -96,7 +96,7 @@ describe('connector egress conformance timeouts', () => {
           { ...quietCase, name: 'skipped' },
         ],
       })
-      .catch((error: unknown) => error);
+      .catch((failure: unknown) => failure);
     // #then
     expect(error).toBeInstanceOf(sdk.ConnectorConformanceError);
     if (!(error instanceof sdk.ConnectorConformanceError)) throw error;
@@ -127,7 +127,7 @@ describe('connector egress conformance timeouts', () => {
         manifest: noEgress,
         cases: [quietCase],
       })
-      .catch((error: unknown) => error);
+      .catch((failure: unknown) => failure);
     expect(later).toBeInstanceOf(sdk.ConnectorConformanceError);
     if (!(later instanceof sdk.ConnectorConformanceError)) throw later;
     expect(later.report.findings).toEqual([
@@ -167,7 +167,7 @@ describe('connector egress conformance timeouts', () => {
         ],
       },
     );
-    const error = await run.catch((error: unknown) => error);
+    const error = await run.catch((failure: unknown) => failure);
     // #then
     expect(error).toBeInstanceOf(sdk.ConnectorConformanceError);
     if (!(error instanceof sdk.ConnectorConformanceError)) throw error;

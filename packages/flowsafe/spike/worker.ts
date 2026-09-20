@@ -259,11 +259,11 @@ function fetchDeploymentObject(
   stub: ReturnType<DurableObjectNamespace['get']>,
   env: Env,
   input: string,
-  init?: RequestInit,
+  requestInit?: RequestInit,
 ): Promise<Response> {
   return stub.fetch(
     stampDeploymentIdentityRequest(
-      new Request(input, init),
+      new Request(input, requestInit),
       env.DEPLOYMENT_IDENTITY_SECRET,
     ),
   );

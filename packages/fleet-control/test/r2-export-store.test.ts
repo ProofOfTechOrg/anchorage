@@ -1755,14 +1755,14 @@ describe('R2DatabaseExportStore', () => {
     }
 
     for (const metadataMutation of [
-      (metadata: Record<string, string>) => {
-        Reflect.deleteProperty(metadata, 'anchorageOperationId');
+      (recordedMetadata: Record<string, string>) => {
+        Reflect.deleteProperty(recordedMetadata, 'anchorageOperationId');
       },
-      (metadata: Record<string, string>) => {
-        metadata.extra = 'no';
+      (recordedMetadata: Record<string, string>) => {
+        recordedMetadata.extra = 'no';
       },
-      (metadata: Record<string, string>) => {
-        metadata.anchorageReceiptAuthority = 'r2://other/receipts/v1';
+      (recordedMetadata: Record<string, string>) => {
+        recordedMetadata.anchorageReceiptAuthority = 'r2://other/receipts/v1';
       },
     ]) {
       const bucket = new FakeR2Bucket();

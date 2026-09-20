@@ -2066,7 +2066,9 @@ describe('CloudflareProvisioningClient', () => {
 
     expect(rawRequests).toHaveLength(3);
     expect(
-      rawRequests.every((request) => request.authorization === 'Bearer token'),
+      rawRequests.every(
+        (recordedRequest) => recordedRequest.authorization === 'Bearer token',
+      ),
     ).toBe(true);
     expect(rawRequests.at(-1)?.url.searchParams.get('cursor')).toBe(
       'next-page',

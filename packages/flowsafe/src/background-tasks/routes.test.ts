@@ -35,12 +35,14 @@ function createBackgroundTaskRoutes(
 function stubManager(tasks: BackgroundTask[]): BackgroundTaskManagerType {
   return {
     getTask: async (taskId: string) =>
-      tasks.find((task) => task.id === taskId) ?? null,
+      tasks.find((candidateTask) => candidateTask.id === taskId) ?? null,
     listTasks: async (filter: TaskFilter) => {
       const matched = tasks.filter(
-        (task) =>
-          (filter.runId === undefined || task.runId === filter.runId) &&
-          (filter.threadId === undefined || task.threadId === filter.threadId),
+        (candidateTask) =>
+          (filter.runId === undefined ||
+            candidateTask.runId === filter.runId) &&
+          (filter.threadId === undefined ||
+            candidateTask.threadId === filter.threadId),
       );
       return { tasks: matched, total: matched.length };
     },

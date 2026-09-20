@@ -100,9 +100,9 @@ function artifact(value, field) {
       throw invalid(`${field}.auxiliaryWasm`);
     const names = new Set([mainModule]);
     auxiliaryWasm = Object.freeze(
-      input.auxiliaryWasm.map((value) => {
+      input.auxiliaryWasm.map((auxiliaryArtifact) => {
         const descriptor = object(
-          value,
+          auxiliaryArtifact,
           ['file', 'name', 'sha256'],
           `${field}.auxiliaryWasm`,
         );

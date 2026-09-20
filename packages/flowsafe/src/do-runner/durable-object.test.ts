@@ -1604,12 +1604,12 @@ describe('DurableObjectRunner.fetch', () => {
     const start = vi.fn(
       async (
         _workflowId: string,
-        options: Parameters<RunnerRuntime['start']>[1],
+        startOptions: Parameters<RunnerRuntime['start']>[1],
       ) => ({
-        runId: options.runId,
+        runId: startOptions.runId,
         status: 'success' as const,
-        requestedBy: options.requestedBy,
-        requestedByKind: options.requestedByKind,
+        requestedBy: startOptions.requestedBy,
+        requestedByKind: startOptions.requestedByKind,
       }),
     );
     const runtime = {
@@ -2532,16 +2532,19 @@ describe('DurableObjectRunner.fetch', () => {
     // The gate re-suspends on a falsy resume, so snapshot provenance accrues a
     // resume ordinal.
     class ResuspendRunner extends DurableObjectRunner<TestEnv> {
-      protected runOwnership(env: TestEnv): DurableObjectRunOwnershipStore {
-        return env.owners;
+      protected runOwnership(
+        runtimeEnv: TestEnv,
+      ): DurableObjectRunOwnershipStore {
+        return runtimeEnv.owners;
       }
 
-      protected build(env: TestEnv): RunnerRuntime {
+      protected build(runtimeEnv: TestEnv): RunnerRuntime {
         const { createWorkflow, createStep, runtime } = init(
-          { storage: env.storage },
+          { storage: runtimeEnv.storage },
           {
-            executionFence: env.fence ?? newTestExecutionFence(env.storage),
-            startIdempotency: newTestStartIdempotency(env.storage),
+            executionFence:
+              runtimeEnv.fence ?? newTestExecutionFence(runtimeEnv.storage),
+            startIdempotency: newTestStartIdempotency(runtimeEnv.storage),
           },
         );
         const gate = createStep({
@@ -2931,8 +2934,8 @@ describe('DurableObjectRunner.fetch', () => {
     const namespace: RunnerNamespaceLike<string> = {
       idFromName: (name) => name,
       get: () => ({
-        fetch: (url, init) =>
-          evicted.fetch(new Request(url, init as RequestInit)),
+        fetch: (url, requestInit) =>
+          evicted.fetch(new Request(url, requestInit as RequestInit)),
       }),
     };
     const topology = createDoRunTopology(

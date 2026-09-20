@@ -1133,10 +1133,10 @@ describe('strict initial-admission reservation observations', () => {
     'schema',
   ])('rejects inherited slots in the reservation %s observation', async (mode) => {
     const { sqlite, binding } = schemaHarness(3);
-    const sparse = (rows: unknown[]) =>
+    const sparse = (sparseRows: unknown[]) =>
       Object.setPrototypeOf(
-        new Array(rows.length),
-        Object.assign(Object.create(Array.prototype), rows),
+        new Array(sparseRows.length),
+        Object.assign(Object.create(Array.prototype), sparseRows),
       );
     if (mode === 'schema') {
       const columns = sqlite
@@ -1163,13 +1163,13 @@ describe('strict initial-admission reservation observations', () => {
       const result = (await execute()) as { results: unknown[] };
       if (!sql.startsWith('SELECT * FROM flowsafe_start_idempotency'))
         return result;
-      const rows = [null];
-      Object.defineProperty(rows, Symbol.iterator, {
+      const malformedRows = [null];
+      Object.defineProperty(malformedRows, Symbol.iterator, {
         value: function* () {
           yield* result.results;
         },
       });
-      return { results: rows };
+      return { results: malformedRows };
     });
     await expect(
       new StartIdempotencyStore(wrapped).readForAdmission('key'),
@@ -1207,13 +1207,13 @@ describe('strict initial-admission reservation observations', () => {
             return ++reads === 1 ? result.results : new Array(1);
           },
         };
-      const rows: unknown[] = [];
-      Object.defineProperty(rows, 0, {
+      const oversizeRows: unknown[] = [];
+      Object.defineProperty(oversizeRows, 0, {
         get() {
           return ++reads === 1 ? result.results[0] : undefined;
         },
       });
-      return { results: rows };
+      return { results: oversizeRows };
     });
     expect(
       (await new StartIdempotencyStore(wrapped).readForAdmission('key'))?.runId,
@@ -1320,7 +1320,7 @@ describe('strict initial-admission reservation observations', () => {
     expect((await store.read('key'))?.threadId).toBeUndefined();
     const error = await store
       .readForAdmission('key')
-      .catch((error: unknown) => error);
+      .catch((failure: unknown) => failure);
     expect(error).toMatchObject({
       status: 503,
       cause: {
@@ -1584,7 +1584,7 @@ describe('reservation binding representation', () => {
       else {
         const error = await store
           .reserve(workflowRequest('new', 'new-run'))
-          .catch((error: unknown) => error);
+          .catch((caughtError: unknown) => caughtError);
         expect(error).toBeInstanceOf(StartReservationUnreadableError);
         if (outcome === 'before') {
           expect((error as Error).cause).toBe(failure);
@@ -1942,7 +1942,7 @@ describe('reservation binding representation', () => {
       () => store.read('key'),
       () => store.reservationsForRuns(['run']),
     ]) {
-      const error = await read().catch((error: unknown) => error);
+      const error = await read().catch((failure: unknown) => failure);
       expect(error).toBeInstanceOf(StartReservationUnreadableError);
       expect((error as StartReservationUnreadableError).status).toBe(503);
       expect(String((error as Error).cause)).toContain(scenario.cause);
@@ -2015,7 +2015,7 @@ describe('reservation binding representation', () => {
       const error = await (scenario.lookup
         ? store.reservationsForRuns(['run'])
         : store.read('key')
-      ).catch((error: unknown) => error);
+      ).catch((failure: unknown) => failure);
       expect(error, scenario.name).toBeInstanceOf(
         StartReservationUnreadableError,
       );

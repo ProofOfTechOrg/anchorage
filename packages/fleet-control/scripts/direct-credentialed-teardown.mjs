@@ -427,17 +427,17 @@ export async function teardownDirectReference(input) {
         settleAttempts: 1,
       };
     };
-    const isSettled = (observation) =>
+    const isSettled = (settleObservation) =>
       DIRECT_RESIDUAL_SURFACES.every((name) => {
-        const entry = observation.surfaces[name];
+        const entry = settleObservation.surfaces[name];
         return (
           entry.prefixCount === 0 &&
           (entry.globalCount === null || entry.globalCount === 0)
         );
       }) &&
-      observation.versionsGone !== false &&
-      observation.dispatch.kind !== 'fail-closed' &&
-      observation.dispatch.prefixCount === 0;
+      settleObservation.versionsGone !== false &&
+      settleObservation.dispatch.kind !== 'fail-closed' &&
+      settleObservation.dispatch.prefixCount === 0;
     const settle = async (attempts) => {
       let observation;
       for (let attempt = 1; attempt <= attempts; attempt += 1) {
@@ -478,8 +478,8 @@ export async function teardownDirectReference(input) {
       const pending = teardown?.pending ?? null;
       if (pending && (pending.kind !== kind || pending.key !== key))
         refuse('invalid-state');
-      const merged = (settledByReread) => {
-        const entry = { ...receipt(), ...settlement(settledByReread) };
+      const merged = (rereadSettled) => {
+        const entry = { ...receipt(), ...settlement(rereadSettled) };
         return {
           ...receipts,
           [field]: append ? [...receipts[field], entry] : entry,

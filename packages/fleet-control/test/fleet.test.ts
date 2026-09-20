@@ -491,7 +491,7 @@ class FleetStore implements FleetStateStore {
         mutationLeaseTtlMs: 15 * 60_000,
         assertOwned: async () => {},
         renew: async () => {},
-        put: (record) => this.put(record),
+        put: (nextRecord) => this.put(nextRecord),
         delete: () => this.delete(tenantTag),
       });
     } finally {
@@ -940,11 +940,11 @@ describe('fleet operations', () => {
         now: 10_000,
       });
 
-    const healthy = await audit(inventory.namespaceIds);
-    expect(healthy.map((finding) => finding.kind)).not.toContain(
+    const auditResult = await audit(inventory.namespaceIds);
+    expect(auditResult.map((finding) => finding.kind)).not.toContain(
       'orphan-namespace',
     );
-    expect(healthy.map((finding) => finding.kind)).not.toContain(
+    expect(auditResult.map((finding) => finding.kind)).not.toContain(
       'missing-namespace',
     );
 
@@ -2627,8 +2627,11 @@ describe('fleet operations', () => {
 
   it('commits the invocation authority before migration staging, candidate maintenance, and promotion dispatches', async () => {
     class TimelineFleetStore extends FleetStore {
-      constructor(private readonly timeline: string[]) {
+      private readonly timeline: string[];
+
+      constructor(eventTimeline: string[]) {
         super();
+        this.timeline = eventTimeline;
       }
 
       override async put(value: FleetRecord): Promise<void> {
@@ -3412,10 +3415,10 @@ describe('fleet operations', () => {
       },
     });
 
-    store.failNextPutWhen = (next, current) =>
+    store.failNextPutWhen = (next, currentRecord) =>
       next.migrationIntent?.subphase === 'schema-applied' &&
       next.platformResources?.egressProxy?.policyDigest !==
-        current?.platformResources?.egressProxy?.policyDigest
+        currentRecord?.platformResources?.egressProxy?.policyDigest
         ? 'state write failed after platform mutation'
         : undefined;
     await expect(migrate()).rejects.toThrow(/after platform mutation/);

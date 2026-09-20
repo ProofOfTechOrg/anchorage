@@ -466,7 +466,7 @@ export function createAgentThreadTopology<Id>(
       const sendStart = async (
         targetThreadId: string,
         targetRunId: string,
-        idempotencyKey?: string,
+        requestIdempotencyKey?: string,
         suppliedReservation?: StartReservationReading,
       ): Promise<AgentRunEnvelope> => {
         const startReservation =
@@ -493,7 +493,9 @@ export function createAgentThreadTopology<Id>(
                 providerOptions: input.providerOptions,
                 // The key rides the internal Worker-to-DO channel only, so the
                 // fence's proof-only state can match it inside the runtime.
-                ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
+                ...(requestIdempotencyKey === undefined
+                  ? {}
+                  : { idempotencyKey: requestIdempotencyKey }),
                 ...(startReservation === undefined ? {} : { startReservation }),
                 ...(input.scheduleId !== undefined
                   ? { scheduleId: input.scheduleId }
@@ -526,10 +528,10 @@ export function createAgentThreadTopology<Id>(
           mintRunId,
         },
         {
-          persisted: (reservation) =>
-            reservedRunEnvelope(context, input.agentId, reservation),
-          live: (reservation) =>
-            reservedRunLive(context, input.agentId, reservation),
+          persisted: (persistedReservation) =>
+            reservedRunEnvelope(context, input.agentId, persistedReservation),
+          live: (liveReservation) =>
+            reservedRunLive(context, input.agentId, liveReservation),
         },
         options.executionFence,
         mutationEpoch,
@@ -763,13 +765,13 @@ function publicApproval(
   if (record.runScoped !== undefined && typeof record.runScoped !== 'boolean')
     invalid();
   for (const field of ['suspendedAt', 'resumedAt', 'resumeCount']) {
-    const value = record[field];
+    const fieldValue = record[field];
     if (
-      value !== undefined &&
-      (typeof value !== 'number' ||
-        !Number.isFinite(value) ||
+      fieldValue !== undefined &&
+      (typeof fieldValue !== 'number' ||
+        !Number.isFinite(fieldValue) ||
         (field === 'resumeCount' &&
-          (!Number.isSafeInteger(value) || value < 0)))
+          (!Number.isSafeInteger(fieldValue) || fieldValue < 0)))
     )
       invalid();
   }

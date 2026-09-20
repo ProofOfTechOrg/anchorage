@@ -1338,11 +1338,11 @@ describe('PlainWorkerBackend core policy', () => {
           return async function (
             this: unknown,
             identity: DatabaseExportReceiptIdentity,
-            receiptFence: ExternalMutationFence,
+            restoreFence: ExternalMutationFence,
           ) {
             receiver = this;
             received = identity;
-            await receiptFence.assertOwned();
+            await restoreFence.assertOwned();
             return {
               location: 'memory://receipt',
               size: 4,

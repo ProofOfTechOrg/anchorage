@@ -65,8 +65,11 @@ const keys = (value: unknown, expected: readonly string[]) =>
 // same inspection's `hit`.
 const inspected = (
   evidence: object,
-  sentinels: { secrets: readonly string[]; literals: readonly string[] },
-) => inspectDirectEvidence(evidence, sentinels).hit;
+  evidenceSentinels: {
+    secrets: readonly string[];
+    literals: readonly string[];
+  },
+) => inspectDirectEvidence(evidence, evidenceSentinels).hit;
 const leafAt = (document: unknown, keyPath: string) =>
   keyPath
     .split('.')
@@ -588,9 +591,9 @@ describe.sequential('direct evidence', () => {
 
   it('publishes the scanned bytes including the newline observed during read-back', async () => {
     const { f, evidence } = await evidenceFixture();
-    const inspected = inspectDirectEvidence(evidence, sentinels);
-    expect(inspected.hit).toBeNull();
-    const scanned = Buffer.from(inspected.serialized);
+    const inspectionResult = inspectDirectEvidence(evidence, sentinels);
+    expect(inspectionResult.hit).toBeNull();
+    const scanned = Buffer.from(inspectionResult.serialized);
     let received: Buffer | undefined;
     expect(
       await writeDirectEvidence({
@@ -794,9 +797,9 @@ describe.sequential('direct evidence', () => {
       string,
       unknown
     >;
-    const keys = keyPath.split('.');
-    const leaf = keys.pop() as string;
-    object(leafAt(carried, keys.join('.')))[leaf] = 'a:b';
+    const pathKeys = keyPath.split('.');
+    const leaf = pathKeys.pop() as string;
+    object(leafAt(carried, pathKeys.join('.')))[leaf] = 'a:b';
     expect(inspected(carried, sentinels)).toBeNull();
     expect(
       await writeDirectEvidence({

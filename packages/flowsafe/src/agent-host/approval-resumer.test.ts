@@ -39,12 +39,12 @@ function record(overrides: Partial<ApprovalRecord> = {}): ApprovalRecord {
   };
 }
 
-function contextFor(principal: ExecutionPrincipal): ActorContext {
-  const actor = principalActor(principal);
+function contextFor(executionPrincipal: ExecutionPrincipal): ActorContext {
+  const actor = principalActor(executionPrincipal);
   return {
     actor,
-    principal,
-    resourceOwner: { kind: principal.kind, id: principal.id },
+    principal: executionPrincipal,
+    resourceOwner: { kind: executionPrincipal.kind, id: executionPrincipal.id },
     service: () => {
       throw new Error('unused');
     },
@@ -120,7 +120,8 @@ describe('createAgentApprovalResumer', () => {
       fallback,
       agents,
       topology: topology(),
-      contextForPrincipal: async (principal) => contextFor(principal),
+      contextForPrincipal: async (executionPrincipal) =>
+        contextFor(executionPrincipal),
     });
     await expect(
       resume(
@@ -140,7 +141,8 @@ describe('createAgentApprovalResumer', () => {
       fallback: vi.fn(),
       agents,
       topology: topology(),
-      contextForPrincipal: async (principal) => contextFor(principal),
+      contextForPrincipal: async (executionPrincipal) =>
+        contextFor(executionPrincipal),
     });
     await expect(
       legacy(
@@ -162,7 +164,8 @@ describe('createAgentApprovalResumer', () => {
         },
       ],
       topology: topology(),
-      contextForPrincipal: async (principal) => contextFor(principal),
+      contextForPrincipal: async (executionPrincipal) =>
+        contextFor(executionPrincipal),
     });
     await expect(restricted(record(), 'approve')).rejects.toThrow(
       'may no longer resume',

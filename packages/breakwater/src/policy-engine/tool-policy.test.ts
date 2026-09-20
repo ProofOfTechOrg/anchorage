@@ -332,7 +332,8 @@ describe('crossWorkflowIsolation', () => {
   }
 
   const policy = crossWorkflowIsolation({
-    targetScopeOf: (call) => (call.input as { workflowId?: string }).workflowId,
+    targetScopeOf: (toolCall) =>
+      (toolCall.input as { workflowId?: string }).workflowId,
   });
 
   it('allows calls that do not address workflow state', async () => {

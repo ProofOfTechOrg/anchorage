@@ -382,11 +382,11 @@ export async function preflightDirectConformance(input) {
   if (referenceUploadBytes > DIRECT_MAX_UPLOAD_BYTES)
     throw invalid('reference upload size');
   const moduleTable = referenceModules.map(
-    ({ name, contentType, byteLength, sha256 }) => ({
+    ({ name, contentType, byteLength, sha256: moduleDigest }) => ({
       name,
       contentType,
       byteLength,
-      sha256,
+      sha256: moduleDigest,
     }),
   );
   return Object.freeze({

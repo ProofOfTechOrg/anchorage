@@ -1738,7 +1738,7 @@ describe('connector egress conformance', () => {
     const packageUrl = new URL('../../package.json', import.meta.url);
     // #when
     const guide = readFileSync(guideUrl, 'utf8');
-    const manifest: { files?: string[] } = JSON.parse(
+    const packageManifest: { files?: string[] } = JSON.parse(
       readFileSync(packageUrl, 'utf8'),
     );
     // #then
@@ -1746,7 +1746,7 @@ describe('connector egress conformance', () => {
       'under Conformance limits in the CONNECTORS.md that ships with this package',
     );
     expect(guide).toContain('\n### Conformance limits\n');
-    expect(manifest.files).toContain('CONNECTORS.md');
+    expect(packageManifest.files).toContain('CONNECTORS.md');
   });
 
   it('restores the installed entry points when a later install fails', async () => {

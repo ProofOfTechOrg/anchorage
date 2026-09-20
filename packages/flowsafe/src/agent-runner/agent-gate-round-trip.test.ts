@@ -671,12 +671,12 @@ describe('agent gate grant round-trip (both suspension shapes)', () => {
     const service = new ApprovalService({
       store,
       executionFence: 'none',
-      resumeRun: (record, decision) =>
+      resumeRun: (resumeRecord, decision) =>
         reconstructed.resumeViaRuntime({
-          runId: record.runId,
-          requestedBy: record.decidedBy ?? 'reviewer-1',
-          step: record.stepPath,
-          resumeData: defaultResumeData(record, decision),
+          runId: resumeRecord.runId,
+          requestedBy: resumeRecord.decidedBy ?? 'reviewer-1',
+          step: resumeRecord.stepPath,
+          resumeData: defaultResumeData(resumeRecord, decision),
         }),
     });
     const [record] = await queueApprovalForSuspension(

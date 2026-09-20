@@ -127,9 +127,12 @@ async function createHarness(options: { canPersist?: boolean } = {}) {
     serializeDispatch: async (_scope, operation) => operation(),
     canPersist: () => options.canPersist ?? true,
     resolveNotificationsStorage: async () => {
-      const storage = await mastra.getStorage()?.getStore('notifications');
-      if (!storage) throw new Error('notifications storage unavailable');
-      return storage;
+      const notificationStorage = await mastra
+        .getStorage()
+        ?.getStore('notifications');
+      if (!notificationStorage)
+        throw new Error('notifications storage unavailable');
+      return notificationStorage;
     },
   });
   return { agent, mastra, memory, notifications, pubsub, routes, start };

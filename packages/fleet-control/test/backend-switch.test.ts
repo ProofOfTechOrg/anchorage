@@ -1510,18 +1510,18 @@ describe('backend switch state machine', () => {
       priorSpec,
       targetSpec,
     });
-    const describe = (
+    const describeTarget = (
       value: import('../src/host-routing.js').HostRoutingTarget,
     ) => `${value.scriptName}:${value.policyHosts.join(',')}`;
     const expectedRouteSet = [...expectedRoutes].sort();
 
     expect(provider.removedRouteTargets).toHaveLength(1);
-    expect(provider.removedRouteTargets[0]?.map(describe).sort()).toEqual(
+    expect(provider.removedRouteTargets[0]?.map(describeTarget).sort()).toEqual(
       expectedRouteSet,
     );
     expect(
       completed.decommissionSnapshot?.routeTargets
-        .map(({ routeTarget }) => describe(routeTarget))
+        .map(({ routeTarget }) => describeTarget(routeTarget))
         .sort(),
     ).toEqual(expectedRouteSet);
     const conflictingFallback = store.record.migrationIntent
@@ -1539,7 +1539,9 @@ describe('backend switch state machine', () => {
     expect(
       externalRouteExpectations(conflictingFallback)
         .map((expectation) =>
-          describe(externalHostRoutingTarget(conflictingFallback, expectation)),
+          describeTarget(
+            externalHostRoutingTarget(conflictingFallback, expectation),
+          ),
         )
         .sort(),
     ).toEqual(expectedRouteSet);
@@ -3349,9 +3351,9 @@ describe('backend switch state machine', () => {
       {
         label: 'hostile transparent proxy',
         inspection: new Proxy(structuredClone(pendingInspection), {
-          get(target, key, receiver) {
+          get(proxyTarget, key, receiver) {
             hostileProxyGetCalls += 1;
-            return Reflect.get(target, key, receiver);
+            return Reflect.get(proxyTarget, key, receiver);
           },
         }),
       },

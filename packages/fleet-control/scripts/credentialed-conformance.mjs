@@ -344,8 +344,8 @@ function trackedPlainWorkerRouteApi(routeApi, tracking) {
   });
 }
 
-function trackedPlainWorkerBackend(backend, runner, tracking) {
-  return new Proxy(backend, {
+function trackedPlainWorkerBackend(trackedBackend, runner, tracking) {
+  return new Proxy(trackedBackend, {
     get(target, property) {
       if (property === 'revokeCredentials') {
         return async (...arguments_) => {

@@ -334,7 +334,7 @@ function harness(
     authoritativeStartState: vi.fn(
       async (_workflowId: string, runId: string) => {
         const call = mocked.stream.mock.calls.find(
-          (call) => call[1]?.runId === runId,
+          (streamCall) => streamCall[1]?.runId === runId,
         );
         if (options.runtime?.status) {
           const override = await options.runtime.status(_workflowId, runId);
@@ -1204,7 +1204,7 @@ describe('C direct thread host capture', () => {
     const reserve = vi.spyOn(fixture.resourceAccess, 'reserveAll');
     const pending = fixture.host.start(scope, input);
     const outcome = pending.then(
-      (result) => ({ result }),
+      (completedResult) => ({ result: completedResult }),
       (error: unknown) => ({ error }),
     );
     try {
@@ -6737,13 +6737,13 @@ describe('agent host selector lookup isolation', () => {
         get: () => ({
           fetch: (async (
             request: Request | string,
-            init?: import('../host-kit/thread-topology.js').ThreadRequestInit,
+            requestInit?: import('../host-kit/thread-topology.js').ThreadRequestInit,
           ) => {
             const url = typeof request === 'string' ? request : request.url;
             hits.push(url);
             try {
               return (
-                (await f.host.route(new Request(url, init), f.scope)) ??
+                (await f.host.route(new Request(url, requestInit), f.scope)) ??
                 new Response(null, { status: 404 })
               );
             } catch (error) {
@@ -7219,11 +7219,11 @@ describe('FS8 D3 host R1 ordinary legacy agent lifecycle', () => {
     ['absent', false],
   ] as const)('retires terminal resume using canonical principal and actual owner despite changed requester (%s threaded=%s)', async (provenance, threaded) => {
     const fixture = await hostR1AgentFixture({ provenance, threaded });
-    const { FlowsafeDurableAgent } = await import(
+    const { FlowsafeDurableAgent: ReloadedDurableAgent } = await import(
       '../agent-runner/durable-agent-runner.js'
     );
     const resume = vi
-      .spyOn(FlowsafeDurableAgent.prototype, 'resumeViaRuntime')
+      .spyOn(ReloadedDurableAgent.prototype, 'resumeViaRuntime')
       .mockImplementation(async () => {
         fixture.snapshot.status = 'success';
         fixture.snapshot.result = { result: 'resumed' };

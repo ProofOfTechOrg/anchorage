@@ -150,7 +150,9 @@ describe('fixed Worker observations through the native SDK', () => {
         list.splice(i, 1);
       });
       corruptions.push((list) => {
-        const b = required(list.find((b) => b.name === name));
+        const b = required(
+          list.find((listedBinding) => listedBinding.name === name),
+        );
         b.type = 'plain_text';
         b.text = 'not-a-secret-binding';
       });
@@ -1087,7 +1089,7 @@ describe('normal export raw-byte proof', () => {
       );
     });
     const error = await verifyDirectDecommissionExport(input).catch(
-      (error: unknown) => error,
+      (failure: unknown) => failure,
     );
     expect(error).toMatchObject(errorShape);
     expect(String(error)).not.toMatch(/private_sql_sentinel|provider-token/u);

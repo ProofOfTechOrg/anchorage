@@ -187,7 +187,7 @@ function recipeForRecord(context: DirectReferenceContext, record: FleetRecord) {
       ? ['initial', 'next', 'failed-recovery']
       : ['initial', 'next'];
   const release = releases.find(
-    (release) => context.spec(role, release) === spec,
+    (candidateRelease) => context.spec(role, candidateRelease) === spec,
   );
   if (!release) throw new DirectReferenceJournalError();
   return { role, release, spec };

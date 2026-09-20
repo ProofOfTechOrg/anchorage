@@ -141,8 +141,10 @@ export function zoneAuthorityResponse(
   const zoneIndex = parts.indexOf('zones');
   const zoneId = zoneIndex >= 0 ? parts[zoneIndex + 1] : undefined;
   if (zoneId && url.pathname.endsWith(`/zones/${zoneId}`)) {
-    const zone = zones.find((zone) =>
-      typeof zone === 'string' ? zone === zoneId : zone.id === zoneId,
+    const zone = zones.find((candidateZone) =>
+      typeof candidateZone === 'string'
+        ? candidateZone === zoneId
+        : candidateZone.id === zoneId,
     );
     // An unmatched zone detail leaves the request to the caller's fallback.
     if (zone)
@@ -378,8 +380,8 @@ export function restProjection(world: ProviderWorld): CloudflareFixtureHandler {
             ({ name }) =>
               requestedName === null || name.startsWith(requestedName),
           )
-          .map(({ databaseId, name }) => ({
-            uuid: databaseId,
+          .map(({ databaseId: listedDatabaseId, name }) => ({
+            uuid: listedDatabaseId,
             name,
           })),
       );
@@ -388,7 +390,9 @@ export function restProjection(world: ProviderWorld): CloudflareFixtureHandler {
       const name = bodyField('name');
       if (
         typeof name === 'string' &&
-        world.databases.some((database) => database.name === name)
+        world.databases.some(
+          (candidateDatabase) => candidateDatabase.name === name,
+        )
       ) {
         return failedResponse();
       }
@@ -479,8 +483,8 @@ export function restProjection(world: ProviderWorld): CloudflareFixtureHandler {
       const beyondFirst = pageBeyondFirst(target);
       if (beyondFirst) return beyondFirst;
       return pageArray(
-        [...world.scripts.entries()].flatMap(([id, script]) =>
-          script.present ? [{ id }] : [],
+        [...world.scripts.entries()].flatMap(([id, entryScript]) =>
+          entryScript.present ? [{ id }] : [],
         ),
       );
     }
@@ -727,8 +731,8 @@ export function restProjection(world: ProviderWorld): CloudflareFixtureHandler {
                 source: 'api',
                 strategy: 'percentage',
                 versions: script.deployment.map(
-                  ({ versionId, percentage }) => ({
-                    version_id: versionId,
+                  ({ versionId: deployedVersionId, percentage }) => ({
+                    version_id: deployedVersionId,
                     percentage,
                   }),
                 ),
@@ -743,8 +747,8 @@ export function restProjection(world: ProviderWorld): CloudflareFixtureHandler {
         {
           items:
             pageNumber === 1
-              ? script.versions.map(({ versionId, tag }) => ({
-                  id: versionId,
+              ? script.versions.map(({ versionId: listedVersionId, tag }) => ({
+                  id: listedVersionId,
                   annotations:
                     tag === undefined ? undefined : { 'workers/tag': tag },
                 }))

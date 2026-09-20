@@ -531,8 +531,8 @@ describe('hub fan-out wiring (host-approval-service, tested here — see file he
     const service = buildHostApprovalService(store, {
       systemPrincipalId: 'sys',
       resumeRun: async (record) => ({ runId: record.runId, status: 'success' }),
-      stream: (event) => {
-        pending.push(hubTopology.publish(event));
+      stream: (streamEvent) => {
+        pending.push(hubTopology.publish(streamEvent));
       },
       // In-memory approval store — no database, nothing to fence.
       executionFence: 'none',

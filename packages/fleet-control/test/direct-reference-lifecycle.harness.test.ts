@@ -351,8 +351,8 @@ describe.sequential('direct lifecycle through native control state', {
             customMetadata: originalMetadata,
           }),
         ]);
-        const errors = [...failures, ...restored].flatMap((result) =>
-          result.status === 'rejected' ? [result.reason] : [],
+        const errors = [...failures, ...restored].flatMap((settledResult) =>
+          settledResult.status === 'rejected' ? [settledResult.reason] : [],
         );
         if (errors.length)
           throw new AggregateError(
@@ -1359,10 +1359,12 @@ describe.sequential('private force through native control state', {
         },
         {
           ...original,
-          buckets: original.buckets.map((bucket: Record<string, unknown>) => ({
-            ...bucket,
-            observedCreationDate: null,
-          })),
+          buckets: original.buckets.map(
+            (bucketRecord: Record<string, unknown>) => ({
+              ...bucketRecord,
+              observedCreationDate: null,
+            }),
+          ),
         },
         {
           ...original,

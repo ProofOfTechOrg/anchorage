@@ -277,24 +277,24 @@ export function captureConnectorDenialMetadata(
 
 /** @internal */
 export function captureConnectorEvaluatorMetadata(
-  decision: unknown,
+  candidateDecision: unknown,
 ): ConnectorDenialMetadata {
   if (
-    decision === null ||
-    typeof decision !== 'object' ||
-    Array.isArray(decision) ||
-    'retryable' in decision ||
-    'policyKind' in decision
+    candidateDecision === null ||
+    typeof candidateDecision !== 'object' ||
+    Array.isArray(candidateDecision) ||
+    'retryable' in candidateDecision ||
+    'policyKind' in candidateDecision
   ) {
     return invalidMetadata();
   }
-  const code = Object.getOwnPropertyDescriptor(decision, 'code');
-  const details = Object.getOwnPropertyDescriptor(decision, 'details');
+  const code = Object.getOwnPropertyDescriptor(candidateDecision, 'code');
+  const details = Object.getOwnPropertyDescriptor(candidateDecision, 'details');
   if (
     (code && !('value' in code)) ||
     (details && !('value' in details)) ||
-    (!code && 'code' in decision) ||
-    (!details && 'details' in decision)
+    (!code && 'code' in candidateDecision) ||
+    (!details && 'details' in candidateDecision)
   ) {
     return invalidMetadata();
   }

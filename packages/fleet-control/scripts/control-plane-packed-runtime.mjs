@@ -84,13 +84,13 @@ export async function verifyControlPlanePackedRuntime({
   try {
     await server.listen();
     const worker = server.getWorker();
-    async function probe(action, token) {
+    async function probe(action, probeToken) {
       const response = await worker.fetch('/packed-control-plane', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
           action,
-          ...(token === undefined ? {} : { token }),
+          ...(probeToken === undefined ? {} : { token: probeToken }),
         }),
         signal: AbortSignal.timeout(30_000),
       });

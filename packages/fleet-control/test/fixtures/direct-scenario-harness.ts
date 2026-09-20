@@ -175,7 +175,7 @@ ${directBridgePreamble({
   expect({ status, stderr }).toEqual({ status: 0, stderr: '' });
   const line = stdout
     .split('\n')
-    .find((line) => line.startsWith('SCENARIO_RESULT '));
+    .find((outputLine) => outputLine.startsWith('SCENARIO_RESULT '));
   if (!line) {
     if (
       fault !== 'fence-reopen-after-settle' &&

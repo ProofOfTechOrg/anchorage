@@ -457,7 +457,8 @@ export async function createDirectReferenceHarness(
   ): Promise<Response> {
     const url = new URL(request.url);
     const role = roles.find(
-      (role) => url.hostname === manifest.names.roles[role].routeHostname,
+      (candidateRole) =>
+        url.hostname === manifest.names.roles[candidateRole].routeHostname,
     );
     if (!role) throw new Error('unknown fixture application role');
     const adminRoute = ADMIN_ROUTES.includes(url.pathname);
@@ -478,16 +479,16 @@ export async function createDirectReferenceHarness(
     );
     if (!record) throw new Error('missing fixture application record');
     const database = world.databases.find(
-      (database) => database.databaseId === record.databaseId,
+      (candidateDatabase) => candidateDatabase.databaseId === record.databaseId,
     );
     const active = activeVersion(world.scripts.get(record.scriptName));
     if (!database || !active)
       throw new Error('missing active fixture application');
     const releaseBinding = active.bindings.find(
-      (binding) =>
-        binding &&
-        typeof binding === 'object' &&
-        Reflect.get(binding, 'name') === 'APPLICATION_RELEASE',
+      (durableBinding) =>
+        durableBinding &&
+        typeof durableBinding === 'object' &&
+        Reflect.get(durableBinding, 'name') === 'APPLICATION_RELEASE',
     );
     const release =
       releaseBinding && typeof releaseBinding === 'object'
@@ -549,7 +550,8 @@ export async function createDirectReferenceHarness(
   const projection = recordingFetch(async (request) => {
     const url = new URL(request.url);
     const application = specs.some(
-      (spec) => url.origin === `https://${spec.routeHostname}`,
+      (candidateSpec) =>
+        url.origin === `https://${candidateSpec.routeHostname}`,
     );
     if (application && policy.applicationProbes)
       return applicationProbe(request);
@@ -576,12 +578,14 @@ export async function createDirectReferenceHarness(
           return new Response('invalid fixture version', { status: 409 });
       }
       const view = new Proxy(world, {
-        get(target, key) {
-          if (key === 'maintenanceOrigin') return spec.maintenanceBaseUrl;
-          if (key === 'routeOrigin') return `https://${spec.routeHostname}`;
-          if (key === 'scripts')
+        get(target, propertyKey) {
+          if (propertyKey === 'maintenanceOrigin')
+            return spec.maintenanceBaseUrl;
+          if (propertyKey === 'routeOrigin')
+            return `https://${spec.routeHostname}`;
+          if (propertyKey === 'scripts')
             return new Map(script ? [[spec.scriptName, script]] : []);
-          const value = Reflect.get(target, key);
+          const value = Reflect.get(target, propertyKey);
           return typeof value === 'function' ? value.bind(target) : value;
         },
       });
@@ -614,7 +618,9 @@ export async function createDirectReferenceHarness(
     if (!name && request.method === 'POST') {
       const requested = (request.body as { name?: unknown }).name;
       const records = await Promise.all(
-        specs.map((spec) => fleetStore.get(spec.tenantTag, spec.environment)),
+        specs.map((deploymentSpec) =>
+          fleetStore.get(deploymentSpec.tenantTag, deploymentSpec.environment),
+        ),
       );
       // `scripts/direct-credentialed-bootstrap.mjs` creates the export bucket
       // in the `default` jurisdiction, and the first arm answers that create.
@@ -678,7 +684,9 @@ export async function createDirectReferenceHarness(
       const objects = await exportBytes.list({
         prefix: url.searchParams.get('prefix') ?? '',
       });
-      return single(objects.objects.map(({ key }) => ({ key })));
+      return single(
+        objects.objects.map(({ key: objectKey }) => ({ key: objectKey })),
+      );
     }
     if (match[2] && request.method === 'GET') {
       expect(url.searchParams.get('per_page')).toBe('1');

@@ -1047,13 +1047,13 @@ describe.sequential('D1FleetStateStore Wrangler harness', {
     };
     const reachDeleteVerify = async () => {
       const exportVerify = await reachExportVerify();
-      const exported = await step({
+      const exportResult = await step({
         kind: 'continue',
         token: exportVerify.result.token,
       });
       const deleteDiscover = await step({
         kind: 'continue',
-        token: exported.result.token,
+        token: exportResult.result.token,
       });
       return step({
         kind: 'continue',

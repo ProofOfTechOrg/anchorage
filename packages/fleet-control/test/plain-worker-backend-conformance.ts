@@ -830,14 +830,14 @@ export function describePlainWorkerConformance(
               fetch: projected.fetch,
               wait,
             });
-        const upload = vi.spyOn(harness.world, 'consumeFailure');
+        const uploadSpy = vi.spyOn(harness.world, 'consumeFailure');
         return {
           ...harness,
           backend,
           wait,
           uploadAttempts: () =>
             harness.exportDirectory
-              ? upload.mock.calls.filter(
+              ? uploadSpy.mock.calls.filter(
                   ([operation]) => operation === 'uploadCandidate',
                 ).length
               : projected.requests.filter(({ method, url }) => {

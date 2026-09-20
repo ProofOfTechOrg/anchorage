@@ -3842,12 +3842,13 @@ export async function migrateFleet(options: {
         const { admitted, plan, reread } = await admitFleetMigrationItem(
           {
             store: options.store,
-            backendFor: (record) => options.backendFor(record),
-            specFor: (record) => options.specFor(record),
-            secretsFor: (record) => options.secretsFor(record),
-            finalizedStateProviderFor: (record) =>
-              options.finalizedStateProviderFor?.(record),
-            settlementFor: (record) => options.settlementFor?.(record),
+            backendFor: (targetRecord) => options.backendFor(targetRecord),
+            specFor: (targetRecord) => options.specFor(targetRecord),
+            secretsFor: (targetRecord) => options.secretsFor(targetRecord),
+            finalizedStateProviderFor: (targetRecord) =>
+              options.finalizedStateProviderFor?.(targetRecord),
+            settlementFor: (targetRecord) =>
+              options.settlementFor?.(targetRecord),
             lease,
             attestationOptions,
             // Read at each legacy site: helpers capture the clock function,

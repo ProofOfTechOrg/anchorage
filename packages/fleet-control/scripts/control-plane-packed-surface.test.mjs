@@ -88,11 +88,14 @@ async function fixture(context) {
     installedRoot,
     verify: () =>
       verifyControlPlanePackedSurface({ consumerDirectory, packageRoot }),
-    async replace(file, before, after) {
+    async replace(file, beforeText, afterText) {
       const path = join(installedRoot, 'dist', file);
       const source = await readFile(path, 'utf8');
-      assert.ok(source.includes(before), `mutation anchor missing in ${file}`);
-      await writeFile(path, source.replace(before, after));
+      assert.ok(
+        source.includes(beforeText),
+        `mutation anchor missing in ${file}`,
+      );
+      await writeFile(path, source.replace(beforeText, afterText));
     },
   };
 }

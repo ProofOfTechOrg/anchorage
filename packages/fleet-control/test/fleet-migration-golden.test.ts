@@ -74,10 +74,10 @@ describe('fleet migration golden baselines', () => {
       .spyOn(fleet, 'migrateFleet')
       .mockImplementationOnce(async (options) => {
         const record = options.records.find(
-          (record) => record.tenantTag === tenantTag,
+          (candidateRecord) => candidateRecord.tenantTag === tenantTag,
         );
         const foreignRecord = options.records.find(
-          (record) => record.tenantTag !== tenantTag,
+          (candidateRecord) => candidateRecord.tenantTag !== tenantTag,
         );
         if (!record || !foreignRecord)
           throw new Error('missing credential fixtures');

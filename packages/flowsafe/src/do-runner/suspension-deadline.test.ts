@@ -1152,7 +1152,8 @@ describe('mergeSuspensionDeadlines', () => {
     expect(merged[0]).toEqual(abandoned);
     expect(
       merged.some(
-        (entry) => entry.step === `step-${MAX_SUSPENSION_DEADLINES_PER_RUN}`,
+        (deadlineEntry) =>
+          deadlineEntry.step === `step-${MAX_SUSPENSION_DEADLINES_PER_RUN}`,
       ),
     ).toBe(false);
     expect(nextSuspensionDeadlineAt(storedRecord(merged))).toBe(

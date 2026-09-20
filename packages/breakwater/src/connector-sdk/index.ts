@@ -1494,9 +1494,9 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
               inspectionOperation = 'inspect';
               legacy = await store.inspect(legacyKey);
             } else {
-              const record = await store.get(legacyKey);
-              legacy = record
-                ? { state: 'replay', record }
+              const legacyRecord = await store.get(legacyKey);
+              legacy = legacyRecord
+                ? { state: 'replay', record: legacyRecord }
                 : { state: 'absent' };
             }
           } catch (error) {

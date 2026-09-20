@@ -704,7 +704,11 @@ export class PlainWorkerBackend implements ProvisioningBackend {
     versions?: readonly PlainWorkerVersionSummary[],
   ): Promise<string> {
     const listed = versions ?? (await this.#listVersions(spec));
-    if (!listed?.some((version) => version.versionId === artifactVersion)) {
+    if (
+      !listed?.some(
+        (listedVersion) => listedVersion.versionId === artifactVersion,
+      )
+    ) {
       throw new Error(
         `Worker '${spec.scriptName}' is missing persisted artifact version '${artifactVersion}'`,
       );
@@ -963,11 +967,11 @@ export class PlainWorkerBackend implements ProvisioningBackend {
     };
     const assertIdentity = (
       version: PlainWorkerVersionDetail,
-      expectedReleases: readonly ReleaseIdentity[],
+      requiredReleases: readonly ReleaseIdentity[],
     ): void => {
       const plainText = this.#plainTextBindings(version);
       const databaseIds = this.#databaseIds(version);
-      const release = expectedReleases.find(
+      const release = requiredReleases.find(
         (candidate) =>
           candidate.specDigest === plainText.get('FLEET_SPEC_DIGEST') &&
           String(candidate.releaseSchemaVersion) ===
@@ -1777,8 +1781,12 @@ export class PlainWorkerBackend implements ProvisioningBackend {
       : await this.#findCandidate(spec);
     const candidateDeployed =
       candidateId !== undefined &&
-      status.versions.some((version) => version.id === candidateId);
-    const active = status.versions.find((version) => version.percentage > 0);
+      status.versions.some(
+        (deployedVersion) => deployedVersion.id === candidateId,
+      );
+    const active = status.versions.find(
+      (deployedVersion) => deployedVersion.percentage > 0,
+    );
     const artifactVersion = candidateDeployed ? candidateId : active?.id;
     if (!artifactVersion) {
       throw new Error('plain Worker deployment status has no active version');

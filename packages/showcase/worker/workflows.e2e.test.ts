@@ -588,7 +588,7 @@ describe('showcase run routes', () => {
         runId,
         inputData,
         principal,
-        mutationEpoch,
+        mutationEpoch: heldMutationEpoch,
       }) => {
         const resources = harness.storeFactory.resources();
         const resourceOwner = principalOwner(principal);
@@ -599,7 +599,7 @@ describe('showcase run routes', () => {
           return await harness.runtime.start(workflowId, {
             runId,
             inputData,
-            mutationEpoch,
+            mutationEpoch: heldMutationEpoch,
             requestedBy: principal.id,
             requestedByKind: principal.kind,
           });
