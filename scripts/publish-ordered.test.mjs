@@ -2,10 +2,13 @@ import assert from 'node:assert/strict';
 import { isAbsolute, sep } from 'node:path';
 import test from 'node:test';
 import {
+  command,
   newTagAnnouncement,
+  PROBE_TIMEOUT_MS,
   PUBLISH_PREREQUISITES,
   peerFloorGrammarViolations,
   prerequisitePeerFloorViolations,
+  published,
   publishInvocation,
   publishRelease,
   VISIBILITY_DEADLINE_MS,
@@ -71,6 +74,10 @@ function fakeClock() {
   const sleeps = [];
   let current = 0;
   return {
+    advance: (ms) => {
+      current += ms;
+    },
+    current: () => current,
     sleeps,
     seams: {
       now: () => current,
@@ -162,6 +169,156 @@ test('the visibility probe revalidates the packument and bounds its fetch', () =
   }
 });
 
+test('the publication lookup pins its process policy and classifies completed results', () => {
+  const calls = [];
+  const run = (program, args, options) => {
+    calls.push({ program, args, options });
+    return {
+      error: undefined,
+      signal: null,
+      status: 0,
+      stderr: 'npm warning stays diagnostic',
+      stdout: '"9.9.9"',
+    };
+  };
+
+  assert.equal(published('package', '9.9.9', run), true);
+  assert.equal(
+    published('package', '1.0.0', (_program, _args, options) => ({
+      error: undefined,
+      signal: null,
+      status: 0,
+      stderr: '',
+      stdout: '"2.0.0"',
+      options,
+    })),
+    false,
+  );
+  assert.deepEqual(calls, [
+    {
+      program: 'npm',
+      args: viewInvocation('package', '9.9.9'),
+      options: {
+        capture: true,
+        killSignal: 'SIGKILL',
+        timeout: PROBE_TIMEOUT_MS,
+      },
+    },
+  ]);
+  assert.equal(
+    published('package', '9.9.9', () => ({
+      error: undefined,
+      signal: null,
+      status: 1,
+      stderr: 'npm error code E404',
+      stdout: '',
+    })),
+    false,
+  );
+  assert.throws(
+    () =>
+      published('package', '9.9.9', () => ({
+        error: undefined,
+        signal: null,
+        status: 0,
+        stderr: '',
+        stdout: 'not json',
+      })),
+    SyntaxError,
+  );
+});
+
+test('incomplete publication lookups stay operational failures despite E404 output', () => {
+  const incompleteResults = [
+    {
+      error: new Error('spawn failed'),
+      signal: null,
+      status: null,
+      stderr: '',
+      stdout: 'E404',
+    },
+    {
+      error: undefined,
+      signal: 'SIGKILL',
+      status: null,
+      stderr: 'E404',
+      stdout: '',
+    },
+    {
+      error: undefined,
+      signal: null,
+      status: null,
+      stderr: '',
+      stdout: '404 Not Found',
+    },
+  ];
+
+  for (const result of incompleteResults) {
+    assert.throws(
+      () => published('package', '9.9.9', () => result),
+      /npm view failed for package@9\.9\.9/u,
+    );
+  }
+});
+
+test('the command seam forwards the hard timeout signal to a real child', () => {
+  const started = performance.now();
+  const result = command(
+    process.execPath,
+    ['-e', "process.on('SIGTERM', () => {}); setInterval(() => {}, 1_000)"],
+    { capture: true, killSignal: 'SIGKILL', timeout: 50 },
+  );
+
+  assert.equal(result.signal, 'SIGKILL');
+  assert.equal(result.error?.code, 'ETIMEDOUT');
+  assert.ok(performance.now() - started < 2_000);
+});
+
+test('lookup failures stop publishing and remain retryable during visibility polling', async () => {
+  const partial = {
+    error: undefined,
+    signal: 'SIGKILL',
+    status: null,
+    stderr: '',
+    stdout: 'E404',
+  };
+  const releaseCalls = [];
+  await assert.rejects(
+    publishRelease({
+      peerFloors: async () => {},
+      version: () => '9.9.9',
+      published: () => published('package', '9.9.9', () => partial),
+      publish: async () => releaseCalls.push('publish'),
+      waitUntilPublished: async () => releaseCalls.push('wait'),
+      ensureTag: async () => releaseCalls.push('tag'),
+      publishRemainder: async () => releaseCalls.push('remainder'),
+    }),
+    /killed by SIGKILL/u,
+  );
+  assert.deepEqual(releaseCalls, []);
+
+  const clock = fakeClock();
+  let attempts = 0;
+  await waitUntilPublished('package', '9.9.9', {
+    ...clock.seams,
+    isPublished: (name, version) =>
+      published(name, version, () => {
+        attempts += 1;
+        return attempts === 1
+          ? partial
+          : {
+              error: undefined,
+              signal: null,
+              status: 0,
+              stderr: '',
+              stdout: '"9.9.9"',
+            };
+      }),
+  });
+  assert.equal(attempts, 2);
+  assert.deepEqual(clock.sleeps, [VISIBILITY_POLL_MS]);
+});
+
 // The floor is the 2026-09-18 release's measured 8m32s from acceptance to
 // visibility, so a deadline cut below what has already been observed reds here
 // rather than on the next release.
@@ -181,6 +338,10 @@ test('a prerequisite already visible on the first probe never sleeps', async () 
   });
 
   assert.deepEqual(clock.sleeps, []);
+});
+
+test('the default monotonic clock remains callable by the visibility wait', async () => {
+  await waitUntilPublished('package', '1.0.0', { isPublished: () => true });
 });
 
 test('a prerequisite that appears later is polled at the visibility interval', async () => {
@@ -223,17 +384,17 @@ test('an expiring wait probes at the deadline before it gives up', async () => {
       ...clock.seams,
       isPublished: () => {
         probes += 1;
+        clock.advance(1_000);
         return false;
       },
     }),
     { message: '@proofoftech/breakwater@9.9.9 did not become visible on npm' },
   );
 
-  assert.equal(
-    clock.sleeps.reduce((total, ms) => total + ms, 0),
-    VISIBILITY_DEADLINE_MS,
-  );
-  assert.equal(probes, VISIBILITY_DEADLINE_MS / VISIBILITY_POLL_MS + 1);
+  assert.equal(clock.sleeps.at(-1), 7_000);
+  assert.ok(clock.sleeps.at(-1) < VISIBILITY_POLL_MS);
+  assert.equal(clock.current(), VISIBILITY_DEADLINE_MS + 1_000);
+  assert.equal(probes, 114);
 });
 
 test('an expired wait names a probe that failed during it', async () => {
@@ -282,8 +443,6 @@ test('a satisfied prerequisite peer floor passes', () => {
   assert.deepEqual(prerequisitePeerFloorViolations(peerFloorFixture()), []);
 });
 
-// Deleting the peer declaration is what empties the edge set, and both gates
-// iterate it, so an empty set has to fail rather than pass unexercised.
 test('manifests with no prerequisite peer edge fail the gate closed', () => {
   const violations = prerequisitePeerFloorViolations(
     new Map([

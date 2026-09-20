@@ -1,11 +1,6 @@
 import { defineConfig } from 'vitest/config';
 
-// One `vitest` process for the whole workspace: `pnpm test` / `pnpm test:watch`
-// at the root run every package's suite (each with its own config/aliases),
-// with unified reporting and cross-package watch. Root `package.json` splits
-// that run by project name for CI: `test:without-direct-scenario` and
-// `test:direct-scenario` pass `--project`, and the `verify-core` and
-// `direct-scenario` jobs in `.github/workflows/ci.yml` run one each.
+// One `vitest` process provides unified reporting and cross-package watch.
 export default defineConfig({
   test: {
     projects: [

@@ -10,6 +10,8 @@ Repository documentation, architecture, and publication checks. Markdown syntax 
 - `docs-check.test.mjs` — `node:test` fixtures for the documentation checker.
 - `github-yaml-check.mjs` — validates every YAML file under `.github`.
 - `github-yaml-check.test.mjs` — `node:test` suite for `github-yaml-check.mjs` and for the tracked workflows themselves.
+- `shell-command-analysis.mjs` — parses Bash workflow steps for the pnpm
+  installation-order check.
 - `publish-ordered.mjs` — publishes the `PUBLISH_PREREQUISITES` packages before the Changesets remainder and gates release on prerequisite peer floors.
 - `publish-ordered.test.mjs` — `node:test` suite for `publish-ordered.mjs`.
 - `publish-invocation-check.mjs` — dry-runs the real publish command per package and validates peer-floor grammar in CI and the release pre-flight.

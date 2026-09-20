@@ -36,8 +36,8 @@ export function activity(f) {
  * Children inherit the environment, then default `NODE_OPTIONS` to empty and
  * `COREPACK_ENABLE_NETWORK` and `COREPACK_ENABLE_AUTO_PIN` to `0`. Per-call
  * `env` overrides those defaults and inherited values.
- * These defaults exclude inherited Node flags and keep child package-manager
- * calls offline without Corepack pinning a version in the fixture manifest.
+ * These defaults exclude inherited Node flags and disable Corepack's network
+ * and manifest-autopinning paths.
  */
 export function createChildProcessFixture({
   prefix,

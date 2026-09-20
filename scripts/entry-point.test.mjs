@@ -227,6 +227,23 @@ for (const kind of ['root', 'seed', 'mint', 'emit']) {
     });
   }
 
+  test(`${kind}: a self-referential argv symlink fails loudly`, async (t) => {
+    const f = fixture(t, kind);
+    const loop = join(f.directory, 'argv-loop');
+    symlinkSync(loop, loop, 'file');
+    const entry = join(f.root, 'importer.mjs');
+    writeFileSync(
+      entry,
+      `process.exitCode = 7; process.argv[1] = ${JSON.stringify(loop)}; await import(${JSON.stringify(pathToFileURL(f.entry).href)});`,
+    );
+    const result = await run(f, { entry, argv: f.argv, env: f.env });
+    assert.equal(result.status, 1);
+    assert.equal(result.stdout, '');
+    assert.match(result.stderr, /ELOOP: too many symbolic links encountered/u);
+    assert.equal(activity(f), '');
+    if (f.output) assert.equal(existsSync(f.output), false);
+  });
+
   test(`${kind}: an eval worker import stays inert when its virtual name aliases the module`, async (t) => {
     const f = fixture(t, kind);
     symlinkSync(f.entry, join(f.directory, '[worker eval]'), 'file');

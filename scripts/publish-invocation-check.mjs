@@ -7,9 +7,9 @@
 // argv-forwarding defect this exists to catch, which reached main unexercised
 // and published nothing.
 //
-// COVERAGE, precisely: the grammar check validates every prerequisite peer
-// edge, and `--dry-run` runs prepack, packs the tarball, and parses the full argv
-// through `npm publish`, then stops. It makes no registry request at all —
+// The grammar check validates prerequisite peer edges. `--dry-run` runs prepack,
+// packs the tarball, and parses the full argv through `npm publish`, then stops.
+// It makes no registry request at all —
 // verified by pointing npm at an unroutable registry, which still exits 0
 // immediately. That is what makes it safe to run on every build with no
 // credentials, and it is also the limit: this cannot catch authentication,
@@ -29,7 +29,7 @@
 import {
   command,
   failureReason,
-  missingPrerequisitePeerEdge,
+  missingPeerEdgeViolation,
   PUBLISH_PREREQUISITES,
   peerFloorGrammarViolations,
   prerequisiteManifests,
@@ -41,7 +41,7 @@ const manifests = prerequisiteManifests();
 // Version containment belongs to publishRelease after pending changesets bump versions.
 const peerFloorGrammar = peerFloorGrammarViolations(manifests);
 const peerEdges = [...prerequisitePeerEdges(manifests)];
-const missingPeerEdge = missingPrerequisitePeerEdge(manifests);
+const missingPeerEdge = missingPeerEdgeViolation(manifests);
 let invocationFailed = false;
 
 if (missingPeerEdge) {

@@ -38,7 +38,8 @@ export function command(program, args, options = {}) {
   const result = spawnSync(program, args, {
     cwd: options.cwd ?? ROOT,
     encoding: 'utf8',
-    ...(options.timeout === undefined ? {} : { timeout: options.timeout }),
+    timeout: options.timeout,
+    killSignal: options.killSignal,
     ...(options.capture ? {} : { stdio: 'inherit' }),
   });
   return {
@@ -120,11 +121,10 @@ export function peerFloorGrammarViolations(manifests) {
 
 /**
  * Both peer-floor gates iterate the prerequisite peer edges, so an empty edge
- * set passes each of them having checked nothing — which is what deleting a
- * peer declaration produces. The message is roster-generic because the
- * manifests say which edges exist, never which ought to.
+ * set passes each of them having checked nothing. The message is roster-generic
+ * because the manifests say which edges exist, never which ought to.
  */
-export function missingPrerequisitePeerEdge(manifests) {
+export function missingPeerEdgeViolation(manifests) {
   const [edge] = prerequisitePeerEdges(manifests);
   if (edge) return undefined;
   return 'no prerequisite declares a peer dependency on another prerequisite; the peer-floor gates would verify nothing';
@@ -142,14 +142,8 @@ function compareVersions(left, right) {
   return 0;
 }
 
-/**
- * Release-only version gate, wired through publishRelease after the Version
- * Packages PR. Between a floor raise and that PR, the source tree legitimately
- * fails it: Flowsafe requires Breakwater >=0.15.0 while the pending changeset
- * `.changeset/lucky-moons-attend.md` still leaves Breakwater at 0.14.0.
- */
 export function prerequisitePeerFloorViolations(manifests) {
-  const missingEdge = missingPrerequisitePeerEdge(manifests);
+  const missingEdge = missingPeerEdgeViolation(manifests);
   const violations = missingEdge ? [missingEdge] : [];
   violations.push(
     ...peerFloorGrammarViolations(manifests).map(({ message }) => message),
@@ -171,15 +165,14 @@ export function prerequisitePeerFloorViolations(manifests) {
   return violations;
 }
 
-const PROBE_TIMEOUT_MS = 90_000;
+// The process bound survives npm ignoring its own fetch configuration.
+export const PROBE_TIMEOUT_MS = 90_000;
 
 /**
  * `--prefer-online` revalidates the cached packument: inside npm's cached
  * packument TTL a poll is otherwise answered from a copy that predates the
  * publish, so the wait below would read its own stale cache for the whole
- * deadline. The fetch bounds end one probe within about a minute, and
- * PROBE_TIMEOUT_MS holds that bound from outside npm rather than resting on
- * npm honouring its own configuration.
+ * deadline. The fetch settings normally end one probe within about a minute.
  */
 export function viewInvocation(name, version) {
   return [
@@ -195,11 +188,21 @@ export function viewInvocation(name, version) {
   ];
 }
 
-function published(name, version) {
-  const result = command('npm', viewInvocation(name, version), {
+export function published(name, version, run = command) {
+  const result = run('npm', viewInvocation(name, version), {
     capture: true,
+    killSignal: 'SIGKILL',
     timeout: PROBE_TIMEOUT_MS,
   });
+  if (
+    result.error ||
+    result.signal !== null ||
+    !Number.isInteger(result.status)
+  ) {
+    throw new Error(
+      `npm view failed for ${name}@${version}: ${failureReason(result)}: ${result.stdout}\n${result.stderr}`,
+    );
+  }
   if (result.status === 0) {
     return JSON.parse(result.stdout) === version;
   }

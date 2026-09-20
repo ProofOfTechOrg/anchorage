@@ -24,6 +24,8 @@ on:
   push:
     branches: [main]
 
+# A publish must not be cancelled mid-run because cancellation can leave a
+# prerequisite published before its tag and dependent packages exist.
 concurrency: release-${{ github.ref }}
 
 permissions:
@@ -35,9 +37,7 @@ jobs:
     runs-on: ubuntu-latest
     # Covers PUBLISH_PREREQUISITES.length visibility waits of
     # VISIBILITY_DEADLINE_MS (scripts/publish-ordered.mjs) plus the rest of the
-    # job. The `concurrency` group above has no `cancel-in-progress`, so a run
-    # queued behind a wedged one is cancelled when a third push queues, not
-    # merely delayed.
+    # job.
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4

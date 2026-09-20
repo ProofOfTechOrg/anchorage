@@ -26,6 +26,7 @@
     "docs:check:test": "node scripts/docs-check.test.mjs",
     "github:check": "node scripts/github-yaml-check.mjs",
     "github:check:test": "node --test scripts/github-yaml-check.test.mjs",
+    "test:node-tools": "node --test scripts/entry-point.test.mjs scripts/baseline-recorder.test.mjs",
     "architecture:check": "pnpm run architecture:check:rules && pnpm run architecture:controls",
     "architecture:check:rules": "dependency-cruise packages --exclude '(?:^|/)(?:node_modules|dist|\\.wrangler|\\.vite|coverage)/|^packages/flowsafe/src/.*\\.(?:test|stories)\\.(?:ts|tsx)$'",
     "architecture:check:agent-starter": "dependency-cruise packages/agent-starter/src packages/agent-starter/test packages/agent-starter/scripts",
@@ -64,10 +65,12 @@
     "publint": "0.3.22",
     "remark-gfm": "4.0.1",
     "remark-parse": "11.0.0",
+    "tree-sitter-bash": "0.25.1",
     "typedoc": "^0.28.19",
     "unified": "11.0.5",
     "unist-util-visit": "5.1.0",
     "vitest": "^4.1.8",
+    "web-tree-sitter": "0.27.0",
     "wrangler": "4.129.0",
     "yaml": "2.9.0"
   },
@@ -78,13 +81,11 @@
   "packageManager": "pnpm@10.34.4",
   "pnpm": {
     "ignoredBuiltDependencies": [
+      "tree-sitter-bash",
       "workerd"
     ],
     "overrides": {
-      "@hono/node-server": "2.0.10",
-      "@modelcontextprotocol/sdk": "1.30.0",
       "fast-uri": "3.1.5",
-      "ip-address": "10.3.1",
       "js-yaml@3": "3.15.1",
       "js-yaml@4": "4.3.1",
       "miniflare@5.20260730.0-alpha>workerd": "1.20260903.1",

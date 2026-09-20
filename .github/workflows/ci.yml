@@ -51,6 +51,9 @@ jobs:
       - name: Test the .github YAML checker and the verify gate it pins
         run: pnpm github:check:test
 
+      - name: Test root Node tools
+        run: pnpm test:node-tools
+
       - name: Lint
         run: pnpm lint
 
@@ -264,6 +267,8 @@ jobs:
       - name: Bump @mastra/core to newest 1.x
         id: mastra_versions
         run: |
+          BASELINE_CORE=$(node -p "require('./packages/breakwater/package.json').devDependencies['@mastra/core']")
+          BASELINE_D1=$(node -p "require('./packages/flowsafe/package.json').dependencies['@mastra/cloudflare-d1']")
           # A registry blip reds the probe for the wrong reason, so a lookup is
           # retried; an E404 is a permanent answer that ends the attempts.
           # Errexit does not reach inside `$( )`, so the function tests each
@@ -274,13 +279,23 @@ jobs:
             local attempt output version
             for attempt in 1 2 3; do
               [ "$attempt" -eq 1 ] || sleep 20
-              if output=$(npm view "$1" version --json --fetch-timeout=30000 --fetch-retries=1 --fetch-retry-mintimeout=1000 --fetch-retry-maxtimeout=5000); then
+              if output=$(timeout --signal=KILL 90s npm view "$1" version --json --fetch-timeout=30000 --fetch-retries=1 --fetch-retry-mintimeout=1000 --fetch-retry-maxtimeout=5000); then
                 version=$(printf '%s' "$output" | node -e 'const d=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(Array.isArray(d)?d.at(-1):d)') || return 1
                 [ -n "$version" ] || return 1
                 printf '%s\n' "$version"
                 return 0
+              else
+                status=$?
               fi
-              case "$output" in *E404*) break ;; esac
+              if [ "$status" -eq 1 ]; then
+                case "$output" in *E404*) break ;; esac
+              fi
+              case "$status" in
+                125|126|127)
+                  printf 'timeout wrapper failed with status %s\n' "$status" >&2
+                  return 1
+                  ;;
+              esac
             done
             printf 'npm view %s failed: %s\n' "$1" "$output" >&2
             return 1
@@ -289,6 +304,8 @@ jobs:
           D1_VERSION=$(newest_version '@mastra/cloudflare-d1@^1')
           echo "core=$CORE_VERSION" >> "$GITHUB_OUTPUT"
           echo "d1=$D1_VERSION" >> "$GITHUB_OUTPUT"
+          echo "baseline_core=$BASELINE_CORE" >> "$GITHUB_OUTPUT"
+          echo "baseline_d1=$BASELINE_D1" >> "$GITHUB_OUTPUT"
           pnpm -r update --config.minimum-release-age=0 "@mastra/core@$CORE_VERSION" "@mastra/cloudflare-d1@$D1_VERSION"
           pnpm --filter @proofoftech/breakwater list @mastra/core
           pnpm --filter @proofoftech/flowsafe list @mastra/core @mastra/cloudflare-d1
@@ -298,13 +315,20 @@ jobs:
       # run means nothing.
       - name: Assert the newest 1.x packages are installed
         env:
+          BASELINE_CORE: ${{ steps.mastra_versions.outputs.baseline_core }}
+          BASELINE_D1: ${{ steps.mastra_versions.outputs.baseline_d1 }}
           EXPECTED_CORE: ${{ steps.mastra_versions.outputs.core }}
           EXPECTED_D1: ${{ steps.mastra_versions.outputs.d1 }}
         run: |
           INSTALLED_CORE=$(pnpm --filter @proofoftech/breakwater exec node -p 'require("@mastra/core/package.json").version')
           INSTALLED_D1=$(pnpm --filter @proofoftech/flowsafe exec node -p 'require("@mastra/cloudflare-d1/package.json").version')
-          echo "core: expected=$EXPECTED_CORE installed=$INSTALLED_CORE"
-          echo "d1: expected=$EXPECTED_D1 installed=$INSTALLED_D1"
+          relation() {
+            node -e 'const [baseline,requested]=process.argv.slice(1); const valid=/^\d+\.\d+\.\d+$/; if(!valid.test(baseline)||!valid.test(requested)) process.exit(2); const order=(left,right)=>{const a=left.split(".").map(Number);const b=right.split(".").map(Number);for(let i=0;i<a.length;i+=1){if(a[i]!==b[i])return a[i]-b[i];}return 0;}; if(baseline===requested)console.log("equality");else if(order(requested,baseline)>0)console.log("newer");else process.exit(1);' "$1" "$2"
+          }
+          CORE_COVERAGE=$(relation "$BASELINE_CORE" "$EXPECTED_CORE")
+          D1_COVERAGE=$(relation "$BASELINE_D1" "$EXPECTED_D1")
+          echo "core: baseline=$BASELINE_CORE requested=$EXPECTED_CORE installed=$INSTALLED_CORE coverage=$CORE_COVERAGE" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "d1: baseline=$BASELINE_D1 requested=$EXPECTED_D1 installed=$INSTALLED_D1 coverage=$D1_COVERAGE" | tee -a "$GITHUB_STEP_SUMMARY"
           test "$EXPECTED_CORE" = "$INSTALLED_CORE"
           test "$EXPECTED_D1" = "$INSTALLED_D1"
 
@@ -318,8 +342,6 @@ jobs:
 
       # Bundles the flowsafe spike Worker so this job can see a published-dist
       # bundling regression that typecheck and test structurally cannot.
-      # continue-on-error keeps a red here from skipping the tripwire suites
-      # below; the final step carries the outcome to the job status.
       - name: Bundle the flowsafe spike Worker against newest core
         id: bundle
         continue-on-error: true
@@ -332,11 +354,11 @@ jobs:
       # The typecheck and bundle steps swallow their own status, so this step
       # is what carries a red probe to the job status; the tripwire suites red
       # it themselves. The summary lines report a flip (upstream fix, or a new
-      # regression) without opening the log, and `if: always()` reaches them
-      # past a red suite.
+      # regression) without opening the log, and the condition reaches them
+      # past a red suite without running after cancellation.
       - name: Fail the job on a red probe
         id: probe_outcome
-        if: always()
+        if: ${{ !cancelled() }}
         run: |
           echo "library typecheck against newest core: ${{ steps.typecheck.outcome }}" >> "$GITHUB_STEP_SUMMARY"
           echo "spike bundle against newest core: ${{ steps.bundle.outcome }}" >> "$GITHUB_STEP_SUMMARY"

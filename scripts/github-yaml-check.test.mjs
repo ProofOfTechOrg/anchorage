@@ -18,6 +18,7 @@ import {
   runGithubYamlCheck,
 } from './github-yaml-check.mjs';
 import {
+  PROBE_TIMEOUT_MS,
   PUBLISH_PREREQUISITES,
   VISIBILITY_DEADLINE_MS,
 } from './publish-ordered.mjs';
@@ -25,6 +26,9 @@ import {
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
 const temporaryDirectories = [];
+const realTimeout = spawnSync('which', ['timeout'], {
+  encoding: 'utf8',
+}).stdout.trim();
 
 afterEach(() => {
   for (const directory of temporaryDirectories.splice(0)) {
@@ -33,14 +37,28 @@ afterEach(() => {
 });
 
 function fixture(files) {
-  const githubDirectory = mkdtempSync(join(tmpdir(), 'anchorage-github-yaml-'));
-  temporaryDirectories.push(githubDirectory);
+  const githubDirectory = scratchDirectory('anchorage-github-yaml-');
   for (const [path, contents] of Object.entries(files)) {
     const absolutePath = join(githubDirectory, path);
     mkdirSync(dirname(absolutePath), { recursive: true });
     writeFileSync(absolutePath, contents);
   }
   return githubDirectory;
+}
+
+function scratchDirectory(prefix) {
+  const githubDirectory = mkdtempSync(join(tmpdir(), prefix));
+  temporaryDirectories.push(githubDirectory);
+  return githubDirectory;
+}
+
+function runShell(script, env, options = {}) {
+  return spawnSync('bash', ['-e', '-c', script], {
+    cwd: options.cwd,
+    encoding: 'utf8',
+    env: { ...process.env, ...env },
+    timeout: 5_000,
+  });
 }
 
 function captureRun(githubDirectory) {
@@ -72,6 +90,12 @@ function readVerifyGateJob() {
   return { job, step: steps[0] };
 }
 
+function readVerifyCoreJob() {
+  const job = readWorkflow().jobs['verify-core'];
+  assert.ok(job, 'the CI workflow contains the `verify-core` job');
+  return job;
+}
+
 function runVerifyGate(step, needs) {
   const variables = Object.keys(step.env ?? {});
   assert.equal(
@@ -79,10 +103,7 @@ function runVerifyGate(step, needs) {
     1,
     'the verify gate step carries the needs context in one env variable',
   );
-  return spawnSync('bash', ['-e', '-c', step.run], {
-    encoding: 'utf8',
-    env: { ...process.env, [variables[0]]: JSON.stringify(needs) },
-  });
+  return runShell(step.run, { [variables[0]]: JSON.stringify(needs) });
 }
 
 function resultListing(needs) {
@@ -152,34 +173,55 @@ const NPM_STUBS = {
     'exit 1',
   ),
   unparsable: npmStub(`printf 'not a JSON body\\n'`),
+  empty: npmStub(`printf '""\\n'`),
   newestWithWarning: npmStub(
     `printf 'npm warn Unknown env config "x"\\n' >&2`,
     `printf '["1.67.0"]\\n'`,
   ),
+  e404ThenNewest: npmStub(
+    `if [ "$(grep -c '^npm ' "$CALL_LOG")" -lt 2 ]; then`,
+    `  printf 'npm error code E404\\n'`,
+    '  while :; do sleep 1; done',
+    'fi',
+    `printf '"1.67.0"\\n'`,
+  ),
+  repeatedKilledE404: npmStub(
+    `printf 'npm error code E404\\n'`,
+    'while :; do sleep 1; done',
+  ),
 };
 
 function runNewestVersion(stub) {
-  const directory = mkdtempSync(join(tmpdir(), 'anchorage-npm-stub-'));
-  temporaryDirectories.push(directory);
+  const directory = scratchDirectory('anchorage-npm-stub-');
   const callLog = join(directory, 'calls');
   writeFileSync(callLog, '');
   writeFileSync(join(directory, 'npm'), stub, { mode: 0o755 });
+  writeFileSync(
+    join(directory, 'timeout'),
+    `#!/usr/bin/env bash
+printf 'timeout %s\\n' "$*" >> "$CALL_LOG"
+test "$1" = '--signal=KILL'
+test "$2" = '90s'
+shift 2
+exec "$REAL_TIMEOUT" --signal=KILL 0.1s "$@"
+`,
+    { mode: 0o755 },
+  );
 
-  const run = spawnSync('bash', ['-e', '-c', newestVersionScript()], {
-    encoding: 'utf8',
-    env: {
-      ...process.env,
-      CALL_LOG: callLog,
-      PATH: `${directory}:${process.env.PATH}`,
-    },
+  const run = runShell(newestVersionScript(), {
+    CALL_LOG: callLog,
+    PATH: `${directory}:${process.env.PATH}`,
+    REAL_TIMEOUT: realTimeout,
   });
 
   const calls = readFileSync(callLog, 'utf8').split('\n').filter(Boolean);
   return {
+    error: run.error,
     status: run.status,
     stdout: run.stdout,
     lookups: calls.filter((line) => line.startsWith('npm ')),
     sleeps: calls.filter((line) => line === 'sleep').length,
+    timeouts: calls.filter((line) => line.startsWith('timeout ')),
   };
 }
 
@@ -203,13 +245,52 @@ function runProbeOutcome(step, outcomes) {
     `the outcome step reads a context this case cannot supply: ${step.run}`,
   );
 
-  const directory = mkdtempSync(join(tmpdir(), 'anchorage-step-summary-'));
-  temporaryDirectories.push(directory);
+  const directory = scratchDirectory('anchorage-step-summary-');
   const summaryFile = join(directory, 'summary');
-  const run = spawnSync('bash', ['-e', '-c', script], {
-    encoding: 'utf8',
-    env: { ...process.env, GITHUB_STEP_SUMMARY: summaryFile },
-  });
+  const run = runShell(script, { GITHUB_STEP_SUMMARY: summaryFile });
+  return { run, summary: readFileSync(summaryFile, 'utf8') };
+}
+
+function runMastraVersionAssertion({
+  baselineCore,
+  baselineD1,
+  expectedCore,
+  expectedD1,
+  installedCore,
+  installedD1,
+}) {
+  const step = (readCompatCanaryJob().steps ?? []).find(
+    ({ name }) => name === 'Assert the newest 1.x packages are installed',
+  );
+  assert.ok(step, 'the canary asserts its requested package versions');
+  const directory = scratchDirectory('anchorage-mastra-versions-');
+  const summaryFile = join(directory, 'summary');
+  writeFileSync(summaryFile, '');
+  writeFileSync(
+    join(directory, 'pnpm'),
+    `#!/usr/bin/env bash
+case "$*" in
+  *breakwater*) printf '%s\\n' "$INSTALLED_CORE" ;;
+  *flowsafe*) printf '%s\\n' "$INSTALLED_D1" ;;
+  *) exit 2 ;;
+esac
+`,
+    { mode: 0o755 },
+  );
+  const run = runShell(
+    step.run,
+    {
+      BASELINE_CORE: baselineCore,
+      BASELINE_D1: baselineD1,
+      EXPECTED_CORE: expectedCore,
+      EXPECTED_D1: expectedD1,
+      GITHUB_STEP_SUMMARY: summaryFile,
+      INSTALLED_CORE: installedCore,
+      INSTALLED_D1: installedD1,
+      PATH: `${directory}:${process.env.PATH}`,
+    },
+    { cwd: repositoryRoot },
+  );
   return { run, summary: readFileSync(summaryFile, 'utf8') };
 }
 
@@ -585,25 +666,2237 @@ test('flags a pnpm invocation before an install, in whichever spelling installs'
         file: `${basename(githubDirectory)}/workflows/ci.yml`,
         code: 'MISSING_PNPM_INSTALL',
         message:
-          'job `uninstalled` invokes pnpm in `Read the installed version` with no earlier install step',
+          'job `uninstalled` invokes pnpm in `Read the installed version` with no earlier install step: pnpm --filter pkg exec node -p 1',
       },
       {
         file: `${basename(githubDirectory)}/workflows/ci.yml`,
         code: 'MISSING_PNPM_INSTALL',
         message:
-          'job `action-setup-without-install` invokes pnpm in `Build` with no earlier install step',
+          'job `action-setup-without-install` invokes pnpm in `Build` with no earlier install step: pnpm -r build',
       },
     ],
   );
 });
 
-// The checker already parses every tracked workflow, so a job that reaches
-// pnpm before installing fails here rather than on the runner.
-test('every tracked workflow installs before it invokes pnpm', () => {
-  const result = checkGithubYamlFiles(join(repositoryRoot, '.github'));
+function pnpmDiagnostics(workflow) {
+  return checkGithubYamlFiles(
+    fixture({ 'workflows/ci.yml': workflow }),
+  ).errors.filter(({ code }) =>
+    ['MISSING_PNPM_INSTALL', 'PNPM_ANALYSIS_LIMIT'].includes(code),
+  );
+}
+
+function pnpmDiagnosticSummary(workflow) {
+  return pnpmDiagnostics(workflow).map(({ code, message }) => ({
+    code,
+    message,
+  }));
+}
+
+function missingPnpm(job, step, command) {
+  return {
+    code: 'MISSING_PNPM_INSTALL',
+    message: `job \`${job}\` invokes pnpm in \`${step}\` with no earlier install step: ${command}`,
+  };
+}
+
+function limitedPnpm(job, step, command, reason) {
+  return {
+    code: 'PNPM_ANALYSIS_LIMIT',
+    message: `job \`${job}\` step \`${step}\` cannot be shown to run pnpm only after an install (${reason ?? 'install is not guaranteed'}): ${command}`,
+  };
+}
+
+function githubExpression(body) {
+  return ['$', '{{ ', body, ' }}'].join('');
+}
+
+function indentYamlBlock(source, spaces = 10) {
+  const prefix = ' '.repeat(spaces);
+  return source
+    .split('\n')
+    .map((line) => `${prefix}${line}`)
+    .join('\n');
+}
+
+test('the pnpm analysis reads command structure without treating data as commands', () => {
+  const diagnostics = pnpmDiagnostics(`jobs:
+  data:
+    steps:
+      - run: |
+          printf '%s' 'pnpm run quoted'
+          # pnpm run commented
+          cat <<'TEXT'
+          pnpm run quoted-heredoc
+          TEXT
+          pnpm install
+          pnpm run build
+  expanded-heredoc:
+    steps:
+      - name: heredoc expansion
+        run: |
+          cat <<TEXT
+          $(pnpm run generated)
+          TEXT
+          pnpm install
+  nested-substitution:
+    steps:
+      - name: nested expansion
+        run: echo "$(printf '%s' "$(pnpm run nested)")"
+  backtick-substitution:
+    steps:
+      - name: backtick expansion
+        run: echo \`pnpm run backtick\`
+  unicode-prefix:
+    steps:
+      - name: unicode command
+        run: |
+          printf 'café'
+          pnpm run build
+`);
 
   assert.deepEqual(
-    result.errors.filter(({ code }) => code === 'MISSING_PNPM_INSTALL'),
+    diagnostics.map(({ code, message }) => ({ code, message })),
+    [
+      {
+        code: 'MISSING_PNPM_INSTALL',
+        message:
+          'job `expanded-heredoc` invokes pnpm in `heredoc expansion` with no earlier install step: pnpm run generated',
+      },
+      {
+        code: 'MISSING_PNPM_INSTALL',
+        message:
+          'job `nested-substitution` invokes pnpm in `nested expansion` with no earlier install step: pnpm run nested',
+      },
+      {
+        code: 'MISSING_PNPM_INSTALL',
+        message:
+          'job `backtick-substitution` invokes pnpm in `backtick expansion` with no earlier install step: pnpm run backtick',
+      },
+      {
+        code: 'MISSING_PNPM_INSTALL',
+        message:
+          'job `unicode-prefix` invokes pnpm in `unicode command` with no earlier install step: pnpm run build',
+      },
+    ],
+  );
+});
+
+test('the pnpm analysis exports installation facts from successful paths', () => {
+  const diagnostics = pnpmDiagnostics(`jobs:
+  both-branches:
+    steps:
+      - run: |
+          if test -n "$VALUE"; then pnpm install; else pnpm i; fi
+          pnpm run build
+  one-branch:
+    steps:
+      - name: conditional install
+        run: |
+          if test -n "$VALUE"; then pnpm install; fi
+          pnpm run build
+  loop:
+    steps:
+      - name: loop install
+        run: |
+          while test -n "$VALUE"; do pnpm install; done
+          pnpm run build
+  braces:
+    steps:
+      - run: |
+          { pnpm install; }
+          pnpm run build
+  short-circuit:
+    steps:
+      - name: conditional chain
+        run: |
+          test -n "$VALUE" && pnpm install || true
+          pnpm run build
+  matching-condition:
+    steps:
+      - if: \${{ github.event_name == 'push' }}
+        run: pnpm install
+      - if: \${{ github.event_name == 'push' }}
+        run: pnpm run build
+  changing-condition:
+    steps:
+      - if: \${{ steps.setup.outcome == 'success' }}
+        run: pnpm install
+      - name: uncertain consumer
+        if: \${{ steps.setup.outcome == 'success' }}
+        run: pnpm run build
+  tolerated-install:
+    steps:
+      - continue-on-error: true
+        run: pnpm install
+      - name: build after tolerated failure
+        run: pnpm run build
+`);
+
+  assert.deepEqual(
+    diagnostics.map(({ code, message }) => ({ code, message })),
+    [
+      {
+        code: 'MISSING_PNPM_INSTALL',
+        message:
+          'job `one-branch` invokes pnpm in `conditional install` with no earlier install step: pnpm run build',
+      },
+      {
+        code: 'PNPM_ANALYSIS_LIMIT',
+        message:
+          'job `loop` step `loop install` cannot be shown to run pnpm only after an install (install is not guaranteed): pnpm install',
+      },
+      {
+        code: 'PNPM_ANALYSIS_LIMIT',
+        message:
+          'job `short-circuit` step `conditional chain` cannot be shown to run pnpm only after an install (install is not guaranteed): pnpm install',
+      },
+      {
+        code: 'PNPM_ANALYSIS_LIMIT',
+        message:
+          'job `changing-condition` step `step 1` cannot be shown to run pnpm only after an install (step condition is not stable): $' +
+          "{{ steps.setup.outcome == 'success' }}",
+      },
+      {
+        code: 'MISSING_PNPM_INSTALL',
+        message:
+          'job `tolerated-install` invokes pnpm in `build after tolerated failure` with no earlier install step: pnpm run build',
+      },
+    ],
+  );
+});
+
+test('the pnpm command policy distinguishes consumers from workspace installs', () => {
+  const diagnostics = pnpmDiagnostics(`jobs:
+  filter-operand:
+    steps:
+      - name: filter operand
+        run: pnpm --filter install run build
+  quoted-equals-operand:
+    steps:
+      - name: quoted equals operand
+        run: pnpm --filter="install" run build
+  local-add:
+    steps:
+      - run: pnpm add package
+      - run: pnpm run build
+  global-add:
+    steps:
+      - run: pnpm add --global package
+      - name: build after global add
+        run: pnpm run build
+  other-directory:
+    steps:
+      - run: pnpm --dir packages/example install
+      - name: build after other directory
+        run: pnpm run build
+  lockfile-only:
+    steps:
+      - run: pnpm install --lockfile-only
+      - name: build after lockfile update
+        run: pnpm run build
+  independent:
+    steps:
+      - run: pnpm dlx tool && pnpm create package
+  wrappers:
+    steps:
+      - run: env CI=1 pnpm install
+      - run: time pnpm run build
+  repeated-install:
+    steps:
+      - run: xargs -r pnpm install
+      - name: build after xargs
+        run: pnpm run build
+  repeated-consumer:
+    steps:
+      - name: xargs consumer
+        run: xargs -n 1 pnpm run build
+  unknown-option:
+    steps:
+      - name: unknown option
+        run: pnpm --future-option install run build
+`);
+
+  assert.deepEqual(
+    diagnostics.map(({ code, message }) => ({ code, message })),
+    [
+      {
+        code: 'MISSING_PNPM_INSTALL',
+        message:
+          'job `filter-operand` invokes pnpm in `filter operand` with no earlier install step: pnpm --filter install run build',
+      },
+      {
+        code: 'MISSING_PNPM_INSTALL',
+        message:
+          'job `quoted-equals-operand` invokes pnpm in `quoted equals operand` with no earlier install step: pnpm --filter="install" run build',
+      },
+      {
+        code: 'MISSING_PNPM_INSTALL',
+        message:
+          'job `global-add` invokes pnpm in `build after global add` with no earlier install step: pnpm run build',
+      },
+      {
+        code: 'MISSING_PNPM_INSTALL',
+        message:
+          'job `other-directory` invokes pnpm in `build after other directory` with no earlier install step: pnpm run build',
+      },
+      {
+        code: 'MISSING_PNPM_INSTALL',
+        message:
+          'job `lockfile-only` invokes pnpm in `build after lockfile update` with no earlier install step: pnpm run build',
+      },
+      {
+        code: 'MISSING_PNPM_INSTALL',
+        message:
+          'job `repeated-install` invokes pnpm in `build after xargs` with no earlier install step: pnpm run build',
+      },
+      {
+        code: 'MISSING_PNPM_INSTALL',
+        message:
+          'job `repeated-consumer` invokes pnpm in `xargs consumer` with no earlier install step: xargs -n 1 pnpm run build',
+      },
+      {
+        code: 'PNPM_ANALYSIS_LIMIT',
+        message:
+          'job `unknown-option` step `unknown option` cannot be shown to run pnpm only after an install (unmodelled pnpm option --future-option): pnpm --future-option install run build',
+      },
+    ],
+  );
+});
+
+test('install qualifiers have the same meaning on both sides of the pnpm subcommand', () => {
+  const commands = [
+    'pnpm --global add package',
+    'pnpm add --global package',
+    'pnpm -g add package',
+    'pnpm add -g package',
+    'pnpm --lockfile-only install',
+    'pnpm install --lockfile-only',
+    'pnpm --dir packages/example install',
+    'pnpm --dir=packages/example install',
+    'pnpm install --dir packages/example',
+    'pnpm install --dir=packages/example',
+    'pnpm -C packages/example install',
+    'pnpm -C=packages/example install',
+    'pnpm install -C packages/example',
+    'pnpm install -C=packages/example',
+    'pnpm --prefix packages/example install',
+    'pnpm --prefix=packages/example install',
+    'pnpm install --prefix packages/example',
+    'pnpm install --prefix=packages/example',
+  ];
+
+  for (const [index, command] of commands.entries()) {
+    const diagnostics = pnpmDiagnostics(`jobs:
+  option-${index}:
+    steps:
+      - run: ${command}
+      - name: workspace consumer
+        run: pnpm run build
+`);
+    assert.deepEqual(
+      diagnostics.map(({ code, message }) => ({ code, message })),
+      [
+        {
+          code: 'MISSING_PNPM_INSTALL',
+          message: `job \`option-${index}\` invokes pnpm in \`workspace consumer\` with no earlier install step: pnpm run build`,
+        },
+      ],
+      command,
+    );
+  }
+});
+
+test('an unresolved install argv reports the install instead of a later consumer', () => {
+  const diagnostics = pnpmDiagnostics(`jobs:
+  unknown-after-subcommand:
+    steps:
+      - name: unknown install option
+        run: pnpm install --future-option value
+      - run: pnpm run build
+  expanded-install-argument:
+    steps:
+      - name: expanded install argument
+        run: pnpm install "$OPTIONS"
+      - run: pnpm run build
+`);
+
+  assert.deepEqual(
+    diagnostics.map(({ code, message }) => ({ code, message })),
+    [
+      {
+        code: 'PNPM_ANALYSIS_LIMIT',
+        message:
+          'job `unknown-after-subcommand` step `unknown install option` cannot be shown to run pnpm only after an install (unmodelled pnpm option --future-option): pnpm install --future-option value',
+      },
+      {
+        code: 'PNPM_ANALYSIS_LIMIT',
+        message:
+          'job `expanded-install-argument` step `expanded install argument` cannot be shown to run pnpm only after an install (non-literal pnpm argument): pnpm install "$OPTIONS"',
+      },
+    ],
+  );
+});
+
+test('elif, case, and C-style loop installation facts follow their execution paths', () => {
+  const diagnostics = pnpmDiagnostics(`jobs:
+  elif-without-else:
+    steps:
+      - name: elif without else
+        run: |
+          if test -n "$A"; then pnpm install; elif test -n "$B"; then pnpm i; fi
+          pnpm run build
+  elif-with-else:
+    steps:
+      - name: elif with else
+        run: |
+          if test -n "$A"; then true; elif test -n "$B"; then pnpm install; else pnpm i; fi
+          pnpm run build
+  all-if-arms:
+    steps:
+      - run: |
+          if test -n "$A"; then pnpm install; elif test -n "$B"; then pnpm i; else pnpm add package; fi
+          pnpm run build
+  case-without-wildcard:
+    steps:
+      - name: case without wildcard
+        run: |
+          case "$RUNNER_OS" in Linux) pnpm install ;; Darwin) pnpm i ;; esac
+          pnpm run build
+  case-with-wildcard:
+    steps:
+      - run: |
+          case "$RUNNER_OS" in Linux) pnpm install ;; *) pnpm i ;; esac
+          pnpm run build
+  c-style-loop:
+    steps:
+      - name: C-style loop
+        run: |
+          for ((index = 0; index < COUNT; index++)); do pnpm install; done
+          pnpm run build
+`);
+
+  assert.deepEqual(
+    diagnostics.map(({ code, message }) => ({ code, message })),
+    [
+      {
+        code: 'MISSING_PNPM_INSTALL',
+        message:
+          'job `elif-without-else` invokes pnpm in `elif without else` with no earlier install step: pnpm run build',
+      },
+      {
+        code: 'MISSING_PNPM_INSTALL',
+        message:
+          'job `elif-with-else` invokes pnpm in `elif with else` with no earlier install step: pnpm run build',
+      },
+      {
+        code: 'MISSING_PNPM_INSTALL',
+        message:
+          'job `case-without-wildcard` invokes pnpm in `case without wildcard` with no earlier install step: pnpm run build',
+      },
+      {
+        code: 'PNPM_ANALYSIS_LIMIT',
+        message:
+          'job `c-style-loop` step `C-style loop` cannot be shown to run pnpm only after an install (install is not guaranteed): pnpm install',
+      },
+    ],
+  );
+});
+
+test('non-establishing command contexts distinguish installs from consumers', () => {
+  const diagnostics = pnpmDiagnostics(`jobs:
+  piped-install:
+    steps:
+      - name: piped install
+        run: pnpm install | tee install.log
+      - run: pnpm run build
+  negated-install:
+    steps:
+      - name: negated install
+        run: '! pnpm install'
+      - run: pnpm run build
+  piped-consumer:
+    steps:
+      - name: piped consumer
+        run: printf ready | pnpm run build
+  negated-consumer:
+    steps:
+      - name: negated consumer
+        run: '! pnpm run build'
+  process-substitution-install:
+    steps:
+      - name: process substitution install
+        run: cat < <(pnpm install)
+  unnamed-consumer:
+    steps:
+      - run: |
+          printf ready
+          pnpm run build
+`);
+
+  assert.deepEqual(
+    diagnostics.map(({ code, message }) => ({ code, message })),
+    [
+      {
+        code: 'PNPM_ANALYSIS_LIMIT',
+        message:
+          'job `piped-install` step `piped install` cannot be shown to run pnpm only after an install (install is not guaranteed): pnpm install',
+      },
+      {
+        code: 'PNPM_ANALYSIS_LIMIT',
+        message:
+          'job `negated-install` step `negated install` cannot be shown to run pnpm only after an install (install is not guaranteed): pnpm install',
+      },
+      {
+        code: 'MISSING_PNPM_INSTALL',
+        message:
+          'job `piped-consumer` invokes pnpm in `piped consumer` with no earlier install step: pnpm run build',
+      },
+      {
+        code: 'MISSING_PNPM_INSTALL',
+        message:
+          'job `negated-consumer` invokes pnpm in `negated consumer` with no earlier install step: pnpm run build',
+      },
+      {
+        code: 'PNPM_ANALYSIS_LIMIT',
+        message:
+          'job `process-substitution-install` step `process substitution install` cannot be shown to run pnpm only after an install (install is not guaranteed): pnpm install',
+      },
+      {
+        code: 'MISSING_PNPM_INSTALL',
+        message:
+          'job `unnamed-consumer` invokes pnpm in `step 1` with no earlier install step: pnpm run build',
+      },
+    ],
+  );
+});
+
+test('transparent wrappers expose pnpm consumers while unknown runners limit', () => {
+  const wrappers = [
+    'command',
+    'builtin',
+    'exec',
+    'sudo',
+    'nohup',
+    'nice',
+    'timeout 10',
+    'stdbuf -oL',
+    'npx',
+    'corepack',
+  ];
+  const jobs = wrappers
+    .map(
+      (wrapper, index) => `  wrapper-${index}:
+    steps:
+      - name: ${wrapper} wrapper
+        run: ${wrapper} pnpm run build`,
+    )
+    .join('\n');
+  const diagnostics = pnpmDiagnostics(`jobs:
+${jobs}
+  lookups:
+    steps:
+      - run: command -v pnpm
+      - run: command -V pnpm
+      - run: which pnpm
+      - run: type pnpm
+      - run: printf '%s' 'pnpm'
+`);
+
+  assert.deepEqual(
+    diagnostics.map(({ code, message }) => ({ code, message })),
+    wrappers.map((wrapper, index) =>
+      index < 8
+        ? {
+            code: 'MISSING_PNPM_INSTALL',
+            message: `job \`wrapper-${index}\` invokes pnpm in \`${wrapper} wrapper\` with no earlier install step: ${wrapper} pnpm run build`,
+          }
+        : {
+            code: 'PNPM_ANALYSIS_LIMIT',
+            message: `job \`wrapper-${index}\` step \`${wrapper} wrapper\` cannot be shown to run pnpm only after an install (unmodelled ${wrapper} invocation): ${wrapper} pnpm run build`,
+          },
+    ),
+  );
+});
+
+test('executable-position syntax is classified by its reduced command word', () => {
+  const rows = [
+    ['literal', 'pnpm run build', 'missing', 'pnpm run build'],
+    ['quoted', '"pnpm" run build', 'missing', '"pnpm" run build'],
+    ['concatenated', "p'n'pm run build", 'missing', "p'n'pm run build"],
+    [
+      'ansi-c',
+      "$'pnpm' run build",
+      'limit',
+      "$'pnpm' run build",
+      'non-literal executable',
+    ],
+    [
+      'expansion',
+      '$PM run build',
+      'limit',
+      '$PM run build',
+      'non-literal executable',
+    ],
+    [
+      'command-substitution',
+      '$(which pnpm) run build',
+      'limit',
+      '$(which pnpm) run build',
+      'non-literal executable',
+    ],
+    [
+      'github-expression',
+      `${githubExpression('matrix.pm')} run build`,
+      'limit',
+      `${githubExpression('matrix.pm')} run build`,
+      'non-literal executable',
+    ],
+    [
+      'backslash',
+      'p\\npm run build',
+      'limit',
+      'p\\npm run build',
+      'non-literal executable',
+    ],
+    [
+      'line-continuation',
+      'pn\\\npm run build',
+      'limit',
+      'pn\\\npm run build',
+      'non-literal executable',
+    ],
+  ];
+
+  for (const [job, command, kind, reportedCommand, reason] of rows) {
+    const expected =
+      kind === 'missing'
+        ? missingPnpm(job, 'probe', reportedCommand)
+        : limitedPnpm(job, 'probe', reportedCommand, reason);
+    assert.deepEqual(
+      pnpmDiagnosticSummary(`jobs:
+  ${job}:
+    steps:
+      - name: probe
+        run: ${JSON.stringify(command)}
+`),
+      [expected],
+      job,
+    );
+  }
+});
+
+test('transparent wrappers classify wrapped consumers and installs', () => {
+  const wrappers = [
+    ['env', 'env CI=1'],
+    ['time', 'time'],
+    ['command', 'command'],
+    ['builtin', 'builtin'],
+    ['exec', 'exec'],
+    ['sudo', 'sudo'],
+    ['nohup', 'nohup'],
+    ['nice', 'nice'],
+    ['timeout', 'timeout 10'],
+    ['stdbuf', 'stdbuf -oL'],
+  ];
+  for (const [job, wrapper] of wrappers) {
+    assert.deepEqual(
+      pnpmDiagnosticSummary(`jobs:
+  ${job}-consumer:
+    steps:
+      - name: wrapped consumer
+        run: ${wrapper} pnpm run build
+  ${job}-install:
+    steps:
+      - run: ${wrapper} pnpm install
+      - run: pnpm run build
+`),
+      [
+        missingPnpm(
+          `${job}-consumer`,
+          'wrapped consumer',
+          `${wrapper} pnpm run build`,
+        ),
+      ],
+      job,
+    );
+  }
+
+  assert.deepEqual(
+    pnpmDiagnosticSummary(`jobs:
+  xargs-consumer:
+    steps:
+      - name: repeated consumer
+        run: xargs -n 1 pnpm run build
+  xargs-install:
+    steps:
+      - run: xargs -n 1 pnpm install
+      - name: after repeated install
+        run: pnpm run build
+  unknown-wrapper-option:
+    steps:
+      - name: env chdir
+        run: env -C elsewhere pnpm install
+`),
+    [
+      missingPnpm(
+        'xargs-consumer',
+        'repeated consumer',
+        'xargs -n 1 pnpm run build',
+      ),
+      missingPnpm('xargs-install', 'after repeated install', 'pnpm run build'),
+      limitedPnpm(
+        'unknown-wrapper-option',
+        'env chdir',
+        'env -C elsewhere pnpm install',
+        'unmodelled wrapper option -C',
+      ),
+    ],
+  );
+});
+
+test('code-bearing shells limit while script files and data commands stay opaque', () => {
+  const diagnostics = pnpmDiagnosticSummary(`jobs:
+  bash-c:
+    steps:
+      - name: bash command string
+        run: bash -c 'pnpm run build'
+  bash-s:
+    steps:
+      - name: bash stdin option
+        run: bash -s
+  here-string:
+    steps:
+      - name: bash here string
+        run: bash <<< 'pnpm run build'
+  heredoc:
+    steps:
+      - name: bash heredoc
+        run: |
+          bash <<'SCRIPT'
+          pnpm run build
+          SCRIPT
+  pipe:
+    steps:
+      - name: pipe to shell
+        run: printf '%s' 'pnpm run build' | sh
+  script-file:
+    steps:
+      - run: bash script.sh
+      - name: later consumer
+        run: pnpm run build
+  neutral-commands:
+    steps:
+      - run: |
+          command -v "pnpm"
+          command -V pnpm
+          which pnpm
+          type pnpm
+          hash pnpm
+          echo pnpm
+          printf '%s' pnpm
+          : pnpm
+          true pnpm
+          false pnpm
+          test pnpm
+          [ pnpm ]
+          [[ pnpm ]]
+          corepack enable pnpm
+          corepack prepare pnpm
+          corepack use pnpm
+          corepack install pnpm
+          npm install pnpm
+  unknown-runners:
+    steps:
+      - name: npx runner
+        run: npx pnpm run build
+  corepack-runner:
+    steps:
+      - name: corepack runner
+        run: corepack pnpm run build
+  yarn-runner:
+    steps:
+      - name: yarn runner
+        run: yarn dlx pnpm run build
+  non-matches:
+    steps:
+      - run: echo pnpm-lock.yaml .pnpm-store @pnpm/exe PNPM_HOME
+`);
+
+  assert.deepEqual(diagnostics, [
+    limitedPnpm(
+      'bash-c',
+      'bash command string',
+      "bash -c 'pnpm run build'",
+      'code-bearing bash',
+    ),
+    limitedPnpm('bash-s', 'bash stdin option', 'bash -s', 'code-bearing bash'),
+    limitedPnpm(
+      'here-string',
+      'bash here string',
+      "bash <<< 'pnpm run build'",
+      'code-bearing bash',
+    ),
+    limitedPnpm('heredoc', 'bash heredoc', 'bash', 'code-bearing bash'),
+    limitedPnpm('pipe', 'pipe to shell', 'sh', 'code-bearing sh'),
+    missingPnpm('script-file', 'later consumer', 'pnpm run build'),
+    limitedPnpm(
+      'unknown-runners',
+      'npx runner',
+      'npx pnpm run build',
+      'unmodelled npx invocation',
+    ),
+    limitedPnpm(
+      'corepack-runner',
+      'corepack runner',
+      'corepack pnpm run build',
+      'unmodelled corepack invocation',
+    ),
+    limitedPnpm(
+      'yarn-runner',
+      'yarn runner',
+      'yarn dlx pnpm run build',
+      'unmodelled yarn invocation',
+    ),
+  ]);
+});
+
+test('process substitutions and background terminators keep installs conditional', () => {
+  const diagnostics = pnpmDiagnosticSummary(`jobs:
+  argument-process-substitution:
+    steps:
+      - name: argument consumer
+        run: diff <(pnpm run build) expected
+  redirect-process-substitution:
+    steps:
+      - name: redirect consumer
+        run: tee >(pnpm run build) < input
+  background-install:
+    steps:
+      - name: background install
+        run: pnpm install &
+      - run: pnpm run build
+  background-consumer:
+    steps:
+      - name: background consumer
+        run: pnpm run build &
+  brace-background:
+    steps:
+      - name: brace background
+        run: '{ pnpm install & }'
+  subshell-background:
+    steps:
+      - name: subshell background
+        run: (pnpm install &)
+`);
+
+  assert.deepEqual(diagnostics, [
+    missingPnpm(
+      'argument-process-substitution',
+      'argument consumer',
+      'pnpm run build',
+    ),
+    missingPnpm(
+      'redirect-process-substitution',
+      'redirect consumer',
+      'pnpm run build',
+    ),
+    limitedPnpm('background-install', 'background install', 'pnpm install'),
+    missingPnpm('background-consumer', 'background consumer', 'pnpm run build'),
+    limitedPnpm('brace-background', 'brace background', 'pnpm install'),
+    limitedPnpm('subshell-background', 'subshell background', 'pnpm install'),
+  ]);
+});
+
+test('documented pnpm install options distinguish narrowing from ordinary installs', () => {
+  const narrowing = [
+    '--global',
+    '-g',
+    '--lockfile-only',
+    '--dir packages/example',
+    '-C packages/example',
+    '--prefix packages/example',
+    '--filter pkg',
+    '-F pkg',
+    '--ignore-workspace',
+    '--prod',
+    '-P',
+    '--production',
+    '--dev',
+    '-D',
+    '--no-optional',
+  ];
+  for (const [index, option] of narrowing.entries()) {
+    for (const command of [
+      `pnpm ${option} install`,
+      `pnpm install ${option}`,
+    ]) {
+      const job = `narrow-${index}`;
+      assert.deepEqual(
+        pnpmDiagnosticSummary(`jobs:
+  ${job}:
+    steps:
+      - run: ${command}
+      - name: later consumer
+        run: pnpm run build
+`),
+        [missingPnpm(job, 'later consumer', 'pnpm run build')],
+        command,
+      );
+    }
+  }
+
+  const establishing = [
+    'pnpm install -w --ignore-scripts --offline --force --frozen-lockfile',
+    'pnpm add -D -w --save-exact package',
+    'pnpm add -Dw --save-exact package',
+  ];
+  for (const [index, command] of establishing.entries()) {
+    assert.deepEqual(
+      pnpmDiagnosticSummary(`jobs:
+  ordinary-${index}:
+    steps:
+      - run: ${command}
+      - run: pnpm run build
+`),
+      [],
+      command,
+    );
+  }
+
+  assert.deepEqual(
+    pnpmDiagnosticSummary(`jobs:
+  unknown-before:
+    steps:
+      - name: unknown before subcommand
+        run: pnpm --future-option value install
+  unknown-after:
+    steps:
+      - name: unknown after subcommand
+        run: pnpm install --future-option value
+  nonliteral-before:
+    steps:
+      - name: nonliteral before subcommand
+        run: pnpm "$COMMAND" run build
+`),
+    [
+      limitedPnpm(
+        'unknown-before',
+        'unknown before subcommand',
+        'pnpm --future-option value install',
+        'unmodelled pnpm option --future-option',
+      ),
+      limitedPnpm(
+        'unknown-after',
+        'unknown after subcommand',
+        'pnpm install --future-option value',
+        'unmodelled pnpm option --future-option',
+      ),
+      limitedPnpm(
+        'nonliteral-before',
+        'nonliteral before subcommand',
+        'pnpm "$COMMAND" run build',
+        'non-literal pnpm argument',
+      ),
+    ],
+  );
+});
+
+test('working-directory precedence controls whether an install is workspace-wide', () => {
+  const diagnostics = pnpmDiagnosticSummary(`defaults:
+  run:
+    working-directory: packages/workflow
+jobs:
+  default-root:
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - run: pnpm install
+      - run: pnpm run build
+  step-root:
+    defaults:
+      run:
+        working-directory: packages/job
+    steps:
+      - working-directory: ./
+        run: pnpm install
+      - run: pnpm run build
+  step-non-root:
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - name: step directory
+        working-directory: packages/example
+        run: pnpm install
+  job-non-root:
+    defaults:
+      run:
+        working-directory: packages/example
+    steps:
+      - name: job directory
+        run: pnpm install
+  workflow-non-root:
+    steps:
+      - name: workflow directory
+        run: pnpm install
+  expression-directory:
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - name: expression directory
+        working-directory: \${{ github.workspace }}
+        run: pnpm install
+`);
+
+  assert.deepEqual(diagnostics, [
+    limitedPnpm('step-non-root', 'step directory', 'pnpm install'),
+    limitedPnpm('job-non-root', 'job directory', 'pnpm install'),
+    limitedPnpm('workflow-non-root', 'workflow directory', 'pnpm install'),
+    limitedPnpm('expression-directory', 'expression directory', 'pnpm install'),
+  ]);
+
+  const defaults = [
+    [
+      'job-root',
+      `jobs:
+  job-root:
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - run: pnpm install
+      - run: pnpm run build`,
+      [],
+    ],
+    [
+      'job-expression',
+      `jobs:
+  job-expression:
+    defaults:
+      run:
+        working-directory: \${{ github.workspace }}
+    steps:
+      - name: install
+        run: pnpm install`,
+      [limitedPnpm('job-expression', 'install', 'pnpm install')],
+    ],
+    [
+      'workflow-root',
+      `defaults:
+  run:
+    working-directory: .
+jobs:
+  workflow-root:
+    steps:
+      - run: pnpm install
+      - run: pnpm run build`,
+      [],
+    ],
+    [
+      'workflow-expression',
+      `defaults:
+  run:
+    working-directory: \${{ github.workspace }}
+jobs:
+  workflow-expression:
+    steps:
+      - name: install
+        run: pnpm install`,
+      [limitedPnpm('workflow-expression', 'install', 'pnpm install')],
+    ],
+  ];
+  for (const [label, workflow, expected] of defaults) {
+    assert.deepEqual(pnpmDiagnosticSummary(workflow), expected, label);
+  }
+});
+
+test('directory and shell-option mutations prevent later installs from establishing', () => {
+  const rows = [
+    ['cd', 'cd packages/example'],
+    ['pushd', 'pushd packages/example'],
+    ['popd', 'popd'],
+    ['set-plus-e', 'set +e'],
+    ['set-other-option', 'set -o vi'],
+    ['set-positional', 'set -- value'],
+    ['shopt', 'shopt -s inherit_errexit'],
+  ];
+  for (const [job, setup] of rows) {
+    assert.deepEqual(
+      pnpmDiagnosticSummary(`jobs:
+  ${job}:
+    steps:
+      - name: changed shell state
+        run: |
+          ${setup}
+          pnpm install
+`),
+      [limitedPnpm(job, 'changed shell state', 'pnpm install')],
+      job,
+    );
+  }
+
+  for (const [job, setup] of [
+    ['set-minus-e', 'set -e'],
+    ['set-minus-u', 'set -u'],
+    ['set-minus-x', 'set -x'],
+    ['set-combined', 'set -euo pipefail'],
+    ['set-errexit', 'set -o errexit'],
+    ['set-nounset', 'set -o nounset'],
+    ['set-pipefail', 'set -o pipefail'],
+  ]) {
+    assert.deepEqual(
+      pnpmDiagnosticSummary(`jobs:
+  ${job}:
+    steps:
+      - run: |
+          ${setup}
+          pnpm install
+          pnpm run build
+`),
+      [],
+      job,
+    );
+  }
+});
+
+test('standard shells establish installs and custom Bash templates do not', () => {
+  const diagnostics = pnpmDiagnosticSummary(`jobs:
+  default-shell:
+    steps:
+      - run: pnpm install
+      - run: pnpm run build
+  exact-bash:
+    steps:
+      - shell: bash
+        run: pnpm install
+      - run: pnpm run build
+  exact-sh:
+    steps:
+      - shell: sh
+        run: pnpm install
+      - run: pnpm run build
+  custom-with-e:
+    steps:
+      - name: custom Bash with errexit
+        shell: /usr/bin/bash -e {0}
+        run: pnpm install
+  custom-without-e:
+    steps:
+      - name: custom Bash without errexit
+        shell: /usr/bin/bash {0}
+        run: pnpm install
+`);
+
+  assert.deepEqual(diagnostics, [
+    limitedPnpm('custom-with-e', 'custom Bash with errexit', 'pnpm install'),
+    limitedPnpm(
+      'custom-without-e',
+      'custom Bash without errexit',
+      'pnpm install',
+    ),
+  ]);
+});
+
+test('list facts follow successful exits and export from the final statement', () => {
+  const diagnostics = pnpmDiagnosticSummary(`jobs:
+  final-and:
+    steps:
+      - run: pnpm install && pnpm run build
+      - run: pnpm run test
+  non-final-and:
+    steps:
+      - name: non-final list
+        run: |
+          pnpm install && pnpm run build
+          echo done
+  fallback-success:
+    steps:
+      - run: pnpm install || true
+      - name: after fallback
+        run: pnpm run build
+  failure-arm-cannot-succeed:
+    steps:
+      - run: pnpm install || false
+      - run: pnpm run build
+  all-success-paths-install:
+    steps:
+      - run: false && pnpm install || pnpm install
+      - run: pnpm run build
+  some-success-paths-skip:
+    steps:
+      - run: pnpm install && false || true
+      - name: after joined paths
+        run: pnpm run build
+`);
+
+  assert.deepEqual(diagnostics, [
+    limitedPnpm('non-final-and', 'non-final list', 'pnpm install'),
+    missingPnpm('fallback-success', 'after fallback', 'pnpm run build'),
+    missingPnpm(
+      'some-success-paths-skip',
+      'after joined paths',
+      'pnpm run build',
+    ),
+  ]);
+});
+
+test('if and case export branch intersections and reject condition installs', () => {
+  const diagnostics = pnpmDiagnosticSummary(`jobs:
+  exhaustive-case-alternative:
+    steps:
+      - run: |
+          case "$RUNNER_OS" in
+            Linux) pnpm install ;;
+            Darwin|*) pnpm i ;;
+          esac
+          pnpm run build
+  case-fallthrough:
+    steps:
+      - name: fallthrough case
+        run: |
+          case "$RUNNER_OS" in
+            Linux) pnpm install ;&
+            *) pnpm i ;;
+          esac
+  if-condition:
+    steps:
+      - name: if condition install
+        run: if pnpm install; then pnpm run build; fi
+  elif-condition:
+    steps:
+      - name: elif condition install
+        run: if false; then true; elif pnpm install; then pnpm run build; fi
+  while-condition:
+    steps:
+      - name: while condition install
+        run: while pnpm install; do pnpm run build; done
+  until-condition:
+    steps:
+      - name: until condition install
+        run: until pnpm install; do pnpm run build; done
+  case-selector:
+    steps:
+      - name: case selector install
+        run: case $(pnpm install) in value) pnpm run build ;; esac
+`);
+
+  assert.deepEqual(diagnostics, [
+    limitedPnpm(
+      'case-fallthrough',
+      'fallthrough case',
+      `case "$RUNNER_OS" in
+  Linux) pnpm install ;&
+  *) pnpm i ;;
+esac`,
+      'case fallthrough',
+    ),
+    limitedPnpm('if-condition', 'if condition install', 'pnpm install'),
+    limitedPnpm('elif-condition', 'elif condition install', 'pnpm install'),
+    limitedPnpm('while-condition', 'while condition install', 'pnpm install'),
+    limitedPnpm('until-condition', 'until condition install', 'pnpm install'),
+    limitedPnpm('case-selector', 'case selector install', 'pnpm install'),
+  ]);
+});
+
+test('later-step status conditions do not inherit a prior install fact', () => {
+  const rows = [
+    ['always', githubExpression('always()')],
+    ['failure', githubExpression('failure()')],
+    ['cancelled', githubExpression('cancelled()')],
+    ['not-cancelled', githubExpression('!cancelled()')],
+    ['unreadable', githubExpression('matrix.run_consumer')],
+  ];
+  for (const [job, condition] of rows) {
+    assert.deepEqual(
+      pnpmDiagnosticSummary(`jobs:
+  ${job}:
+    steps:
+      - run: pnpm install
+      - name: conditional consumer
+        if: ${condition}
+        run: pnpm run build
+`),
+      [
+        limitedPnpm(
+          job,
+          'conditional consumer',
+          condition,
+          'step condition is not stable',
+        ),
+      ],
+      job,
+    );
+  }
+
+  assert.deepEqual(
+    pnpmDiagnosticSummary(`jobs:
+  stable:
+    steps:
+      - run: pnpm install
+      - name: stable consumer
+        if: \${{ github.event_name == 'push' }}
+        run: pnpm run build
+`),
+    [],
+  );
+});
+
+test('the first limit stops a job and established installs suppress later limits', () => {
+  const diagnostics = pnpmDiagnosticSummary(`jobs:
+  first-limit:
+    steps:
+      - name: unknown runner
+        run: npx pnpm run build
+      - name: later consumer
+        run: pnpm run test
+  installed-first:
+    steps:
+      - run: pnpm install
+      - run: npx pnpm run build
+      - run: eval 'pnpm run test'
+  installed-before-background:
+    steps:
+      - run: pnpm install
+      - run: pnpm install &
+`);
+
+  assert.deepEqual(diagnostics, [
+    limitedPnpm(
+      'first-limit',
+      'unknown runner',
+      'npx pnpm run build',
+      'unmodelled npx invocation',
+    ),
+  ]);
+});
+
+test('continue-on-error expressions make action and shell installs unknown', () => {
+  const diagnostics = pnpmDiagnostics(`jobs:
+  shell-expression:
+    steps:
+      - name: shell expression
+        continue-on-error: \${{ matrix.allow_failure }}
+        run: pnpm install
+      - run: pnpm run build
+  action-expression:
+    steps:
+      - name: action expression
+        uses: pnpm/action-setup@v4
+        continue-on-error: \${{ matrix.allow_failure }}
+        with: { run_install: true }
+      - run: pnpm run build
+  action-condition-expression:
+    steps:
+      - name: action condition expression
+        if: \${{ steps.probe.outcome == 'success' }}
+        uses: pnpm/action-setup@v4
+        with: { run_install: true }
+      - run: pnpm run build
+  shell-false:
+    steps:
+      - continue-on-error: false
+        run: pnpm install
+      - run: pnpm run build
+  action-absent:
+    steps:
+      - uses: pnpm/action-setup@v4
+        with: { run_install: true }
+      - run: pnpm run build
+  action-tolerated:
+    steps:
+      - continue-on-error: true
+        uses: pnpm/action-setup@v4
+        with: { run_install: true }
+      - name: consumer after tolerated action
+        run: pnpm run build
+`);
+
+  assert.deepEqual(
+    diagnostics.map(({ code, message }) => ({ code, message })),
+    [
+      {
+        code: 'PNPM_ANALYSIS_LIMIT',
+        message:
+          'job `shell-expression` step `shell expression` cannot be shown to run pnpm only after an install (continue-on-error is not literal): $' +
+          '{{ matrix.allow_failure }}',
+      },
+      {
+        code: 'PNPM_ANALYSIS_LIMIT',
+        message:
+          'job `action-expression` step `action expression` cannot be shown to run pnpm only after an install (continue-on-error is not literal): $' +
+          '{{ matrix.allow_failure }}',
+      },
+      {
+        code: 'PNPM_ANALYSIS_LIMIT',
+        message:
+          'job `action-condition-expression` step `action condition expression` cannot be shown to run pnpm only after an install (step condition is not stable): $' +
+          "{{ steps.probe.outcome == 'success' }}",
+      },
+      {
+        code: 'MISSING_PNPM_INSTALL',
+        message:
+          'job `action-tolerated` invokes pnpm in `consumer after tolerated action` with no earlier install step: pnpm run build',
+      },
+    ],
+  );
+});
+
+test('unknown conditions use parsed Bash commands and established installs gate limits', () => {
+  const diagnostics = pnpmDiagnostics(`jobs:
+  unknown-condition-data:
+    steps:
+      - if: \${{ steps.probe.outcome == 'success' }}
+        run: |
+          printf '%s' 'pnpm run quoted'
+          # pnpm run commented
+          cat <<'TEXT'
+          pnpm run heredoc
+          TEXT
+  limit-after-install:
+    steps:
+      - run: pnpm install
+      - name: eval after install
+        run: eval 'pnpm run build'
+`);
+
+  assert.deepEqual(diagnostics, []);
+});
+
+test('step, job, and workflow shell selection use GitHub precedence', () => {
+  const diagnostics = pnpmDiagnostics(`defaults:
+  run:
+    shell: pwsh
+jobs:
+  workflow-default:
+    steps:
+      - name: workflow shell
+        run: pnpm install
+  job-default:
+    defaults:
+      run:
+        shell: cmd
+    steps:
+      - name: job shell
+        run: pnpm install
+  step-override:
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: explicit Bash
+        shell: bash
+        run: pnpm run build
+`);
+
+  assert.deepEqual(
+    diagnostics.map(({ code, message }) => ({ code, message })),
+    [
+      {
+        code: 'PNPM_ANALYSIS_LIMIT',
+        message:
+          'job `workflow-default` step `workflow shell` cannot be shown to run pnpm only after an install (step shell is not Bash-compatible): pwsh',
+      },
+      {
+        code: 'PNPM_ANALYSIS_LIMIT',
+        message:
+          'job `job-default` step `job shell` cannot be shown to run pnpm only after an install (step shell is not Bash-compatible): cmd',
+      },
+      {
+        code: 'MISSING_PNPM_INSTALL',
+        message:
+          'job `step-override` invokes pnpm in `explicit Bash` with no earlier install step: pnpm run build',
+      },
+    ],
+  );
+});
+
+test('action setup inputs and unsupported command indirection fail conservatively', () => {
+  const diagnostics = pnpmDiagnostics(`jobs:
+  action-true:
+    steps:
+      - uses: pnpm/action-setup@v4
+        with: { run_install: true }
+      - run: pnpm run build
+  action-false:
+    steps:
+      - uses: pnpm/action-setup@v4
+        with: { run_install: 'false' }
+      - name: false input consumer
+        run: pnpm run build
+  action-empty:
+    steps:
+      - uses: pnpm/action-setup@v4
+        with: { run_install: [] }
+      - name: empty input consumer
+        run: pnpm run build
+  action-null:
+    steps:
+      - uses: pnpm/action-setup@v4
+        with: { run_install: null }
+      - name: null input consumer
+        run: pnpm run build
+  action-config:
+    steps:
+      - uses: pnpm/action-setup@v4
+        with:
+          run_install:
+            - args: [--frozen-lockfile]
+      - run: pnpm run build
+  loose-prefix:
+    steps:
+      - uses: pnpm/action-setup-helper@v4
+        with: { run_install: true }
+      - name: loose prefix consumer
+        run: pnpm run build
+  function:
+    steps:
+      - name: function indirection
+        run: install_deps() { pnpm install; }
+  eval:
+    steps:
+      - name: eval indirection
+        run: eval 'pnpm install'
+  dynamic:
+    steps:
+      - name: dynamic executable
+        run: \${RUNNER:-pnpm} install
+  other-shell:
+    steps:
+      - name: powershell command
+        shell: pwsh
+        run: pnpm install
+`);
+
+  assert.deepEqual(
+    diagnostics.map(({ code, message }) => ({ code, message })),
+    [
+      {
+        code: 'MISSING_PNPM_INSTALL',
+        message:
+          'job `action-false` invokes pnpm in `false input consumer` with no earlier install step: pnpm run build',
+      },
+      {
+        code: 'MISSING_PNPM_INSTALL',
+        message:
+          'job `action-empty` invokes pnpm in `empty input consumer` with no earlier install step: pnpm run build',
+      },
+      {
+        code: 'MISSING_PNPM_INSTALL',
+        message:
+          'job `action-null` invokes pnpm in `null input consumer` with no earlier install step: pnpm run build',
+      },
+      {
+        code: 'MISSING_PNPM_INSTALL',
+        message:
+          'job `loose-prefix` invokes pnpm in `loose prefix consumer` with no earlier install step: pnpm run build',
+      },
+      {
+        code: 'PNPM_ANALYSIS_LIMIT',
+        message:
+          'job `function` step `function indirection` cannot be shown to run pnpm only after an install (code-bearing function_definition): install_deps() { pnpm install; }',
+      },
+      {
+        code: 'PNPM_ANALYSIS_LIMIT',
+        message:
+          "job `eval` step `eval indirection` cannot be shown to run pnpm only after an install (code-bearing eval): eval 'pnpm install'",
+      },
+      {
+        code: 'PNPM_ANALYSIS_LIMIT',
+        message:
+          'job `dynamic` step `dynamic executable` cannot be shown to run pnpm only after an install (non-literal executable): $' +
+          '{RUNNER:-pnpm} install',
+      },
+      {
+        code: 'PNPM_ANALYSIS_LIMIT',
+        message:
+          'job `other-shell` step `powershell command` cannot be shown to run pnpm only after an install (step shell is not Bash-compatible): pwsh',
+      },
+    ],
+  );
+});
+
+test('pnpm/action-setup run_install entries establish only a root full install', () => {
+  const action = 'pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1';
+  assert.deepEqual(
+    pnpmDiagnosticSummary(`jobs:
+  lockfile-only:
+    steps:
+      - name: narrow action
+        uses: ${action}
+        with:
+          run_install: |
+            args: [--lockfile-only]
+      - name: later consumer
+        run: pnpm run build
+  production-only:
+    steps:
+      - uses: ${action}
+        with:
+          run_install:
+            args: [--prod]
+      - name: later consumer
+        run: pnpm run build
+  filtered:
+    steps:
+      - uses: ${action}
+        with:
+          run_install:
+            args: [--filter, pkg]
+      - name: later consumer
+        run: pnpm run build
+  global:
+    steps:
+      - uses: ${action}
+        with:
+          run_install:
+            args: [--global]
+      - name: later consumer
+        run: pnpm run build
+  non-root:
+    steps:
+      - uses: ${action}
+        with:
+          run_install:
+            cwd: packages/example
+      - name: later consumer
+        run: pnpm run build
+  narrow-array:
+    steps:
+      - uses: ${action}
+        with:
+          run_install:
+            - args: [--lockfile-only]
+            - cwd: packages/example
+      - name: later consumer
+        run: pnpm run build
+  array-with-full-install:
+    steps:
+      - uses: ${action}
+        with:
+          run_install:
+            - args: [--lockfile-only]
+            - recursive: true
+              args: [--frozen-lockfile]
+            - unexpected: value
+      - run: pnpm run build
+  block-array-with-full-install:
+    steps:
+      - uses: ${action}
+        with:
+          run_install: |
+            - args: [--lockfile-only]
+            - recursive: true
+              args: [--frozen-lockfile]
+      - run: pnpm run build
+  unreadable-key:
+    steps:
+      - name: unknown action key
+        uses: ${action}
+        with:
+          run_install:
+            unexpected: value
+  unreadable-value:
+    steps:
+      - name: dynamic action args
+        uses: ${action}
+        with:
+          run_install:
+            args: ["${githubExpression('matrix.install_args')}"]
+  unreadable-recursive:
+    steps:
+      - name: non-boolean recursive
+        uses: ${action}
+        with:
+          run_install:
+            recursive: yes
+`),
+    [
+      missingPnpm('lockfile-only', 'later consumer', 'pnpm run build'),
+      missingPnpm('production-only', 'later consumer', 'pnpm run build'),
+      missingPnpm('filtered', 'later consumer', 'pnpm run build'),
+      missingPnpm('global', 'later consumer', 'pnpm run build'),
+      missingPnpm('non-root', 'later consumer', 'pnpm run build'),
+      missingPnpm('narrow-array', 'later consumer', 'pnpm run build'),
+      limitedPnpm(
+        'unreadable-key',
+        'unknown action key',
+        action,
+        'unmodelled pnpm/action-setup key unexpected',
+      ),
+      limitedPnpm(
+        'unreadable-value',
+        'dynamic action args',
+        action,
+        'non-literal pnpm/action-setup args',
+      ),
+      limitedPnpm(
+        'unreadable-recursive',
+        'non-boolean recursive',
+        action,
+        'non-literal pnpm/action-setup recursive value',
+      ),
+    ],
+  );
+});
+
+test('tolerated steps retain their installation fact inside their own block', () => {
+  const condition = githubExpression('matrix.allow_failure');
+  assert.deepEqual(
+    pnpmDiagnosticSummary(`jobs:
+  straight-line:
+    steps:
+      - continue-on-error: true
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run build
+  and-list:
+    steps:
+      - continue-on-error: true
+        run: pnpm install --frozen-lockfile && pnpm run build
+  dynamic-tolerance:
+    steps:
+      - name: dynamic tolerance
+        continue-on-error: ${condition}
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run build
+`),
+    [
+      limitedPnpm(
+        'dynamic-tolerance',
+        'dynamic tolerance',
+        condition,
+        'continue-on-error is not literal',
+      ),
+    ],
+  );
+});
+
+test('parse errors, argument limits, coproc, and exec option positions fail conservatively', () => {
+  const parseError = `if true; then
+  (
+fi
+pnpm install
+pnpm build`;
+  assert.deepEqual(
+    pnpmDiagnosticSummary(`jobs:
+  root-error:
+    steps:
+      - name: malformed block
+        run: |
+${indentYamlBlock(parseError)}
+  argument-limit:
+    steps:
+      - name: substitution before consumer
+        run: pnpm build $(pnpm install)
+  coprocess:
+    steps:
+      - name: coprocess definition
+        run: coproc echo hi
+      - run: pnpm run build
+  no-pnpm-function:
+    steps:
+      - name: opaque function
+        run: greet() { echo hi; }
+  exec-argument:
+    steps:
+      - run: exec node build.js -a
+      - name: later consumer
+        run: pnpm run build
+  exec-option:
+    steps:
+      - name: exec alternate name
+        run: exec -a alternate /bin/pnpm install
+  timeout-separator:
+    steps:
+      - run: timeout -- 10 pnpm install
+      - run: pnpm run build
+`),
+    [
+      limitedPnpm(
+        'root-error',
+        'malformed block',
+        `${parseError}\n`,
+        'Bash parse error',
+      ),
+      limitedPnpm(
+        'argument-limit',
+        'substitution before consumer',
+        'pnpm install',
+        'install is not guaranteed',
+      ),
+      limitedPnpm(
+        'coprocess',
+        'coprocess definition',
+        'coproc echo hi',
+        'code-bearing coproc',
+      ),
+      limitedPnpm(
+        'no-pnpm-function',
+        'opaque function',
+        'greet() { echo hi; }',
+        'code-bearing function_definition',
+      ),
+      missingPnpm('exec-argument', 'later consumer', 'pnpm run build'),
+      limitedPnpm(
+        'exec-option',
+        'exec alternate name',
+        'exec -a alternate /bin/pnpm install',
+        'unmodelled wrapper option -a',
+      ),
+    ],
+  );
+});
+
+test('backslashes in quoted and concatenated executables are non-literal', () => {
+  const rows = [
+    ['double-quoted', '"pn\\\npm" run build'],
+    ['single-quoted', "'pn\\npm' run build"],
+    ['concatenated', "p' n\\\\'pm run build".replace(' ', '')],
+  ];
+  for (const [job, command] of rows) {
+    assert.deepEqual(
+      pnpmDiagnosticSummary(`jobs:
+  ${job}:
+    steps:
+      - name: probe
+        run: ${JSON.stringify(command)}
+`),
+      [limitedPnpm(job, 'probe', command, 'non-literal executable')],
+      job,
+    );
+  }
+});
+
+test('transparent wrapper context cross-product preserves command classification', () => {
+  const wrappers = [
+    ['env', 'env CI=1'],
+    ['time', 'time'],
+    ['command', 'command'],
+    ['builtin', 'builtin'],
+    ['exec', 'exec'],
+    ['sudo', 'sudo'],
+    ['nohup', 'nohup'],
+    ['nice', 'nice'],
+    ['timeout', 'timeout -- 10'],
+    ['stdbuf', 'stdbuf -oL'],
+    ['xargs', 'xargs -n 1'],
+  ];
+  const columns = [
+    {
+      label: 'consumer',
+      source: (wrapper) => `${wrapper} pnpm run build`,
+      reason: undefined,
+      result: 'missing',
+    },
+    {
+      label: 'install',
+      source: (wrapper) => `${wrapper} pnpm install`,
+      reason: undefined,
+      result: 'install',
+    },
+    {
+      label: 'bash-c',
+      source: (wrapper) => `${wrapper} bash -c 'pnpm run build'`,
+      reason: 'code-bearing bash',
+      result: 'limit',
+    },
+    {
+      label: 'bash-here-string',
+      source: (wrapper) => `${wrapper} bash <<< 'pnpm run build'`,
+      reason: 'code-bearing bash',
+      result: 'limit',
+    },
+    {
+      label: 'sh-heredoc',
+      source: (wrapper) => `${wrapper} sh <<'SCRIPT'\npnpm run build\nSCRIPT`,
+      reason: 'code-bearing sh',
+      result: 'limit',
+    },
+    {
+      label: 'sh-pipe',
+      source: (wrapper) => `printf input | ${wrapper} sh`,
+      reason: 'code-bearing sh',
+      result: 'limit',
+    },
+    {
+      label: 'nonliteral-executable',
+      source: (wrapper) => `${wrapper} $PM run build`,
+      reason: 'non-literal executable',
+      result: 'limit',
+    },
+  ];
+  const jobs = [];
+  const expected = [];
+  for (const [wrapperName, wrapper] of wrappers) {
+    for (const column of columns) {
+      const job = `${wrapperName}-${column.label}`;
+      const source = column.source(wrapper);
+      jobs.push(`  ${job}:
+    steps:
+      - name: probe
+        run: |
+${indentYamlBlock(source)}${
+  column.result === 'install'
+    ? `
+      - name: later consumer
+        run: pnpm run build`
+    : ''
+}`);
+      if (column.result === 'missing') {
+        expected.push(missingPnpm(job, 'probe', source));
+      } else if (column.result === 'limit') {
+        const command = ['sh-heredoc', 'sh-pipe'].includes(column.label)
+          ? `${wrapper} sh`
+          : source;
+        expected.push(limitedPnpm(job, 'probe', command, column.reason));
+      } else if (wrapperName === 'xargs') {
+        expected.push(missingPnpm(job, 'later consumer', 'pnpm run build'));
+      }
+    }
+  }
+  assert.deepEqual(
+    pnpmDiagnosticSummary(`jobs:
+${jobs.join('\n')}
+`),
+    expected,
+  );
+});
+
+test('current-shell constructs export taints and child-shell constructs do not', () => {
+  const taints = [
+    ['cd', 'cd packages/example'],
+    ['pushd', 'pushd packages/example'],
+    ['set', 'set +e'],
+    ['shopt', 'shopt -s nullglob'],
+  ];
+  const currentShellConstructs = [
+    ['brace', (taint) => `{ ${taint}; }`],
+    ['negation', (taint) => `! ${taint}`],
+    ['for', (taint) => `for value in one; do ${taint}; done`],
+    [
+      'c-for',
+      (taint) => `for ((index = 0; index < 1; index++)); do ${taint}; done`,
+    ],
+    ['while', (taint) => `while ${taint}; do break; done`],
+    ['until', (taint) => `until ${taint}; do break; done`],
+    ['if-condition', (taint) => `if ${taint}; then :; fi`],
+    ['if-then', (taint) => `if true; then ${taint}; else :; fi`],
+    [
+      'if-elif',
+      (taint) => `if false; then :; elif true; then ${taint}; else :; fi`,
+    ],
+    ['if-else', (taint) => `if false; then :; else ${taint}; fi`],
+    ['case-arm', (taint) => `case value in value) ${taint} ;; esac`],
+    ['list', (taint) => `${taint} && true`],
+  ];
+  const jobs = [];
+  const expected = [];
+  for (const [constructName, construct] of currentShellConstructs) {
+    for (const [taintName, taint] of taints) {
+      const job = `${constructName}-${taintName}`;
+      jobs.push(`  ${job}:
+    steps:
+      - name: probe
+        run: |
+          ${construct(taint)}
+          pnpm install`);
+      expected.push(limitedPnpm(job, 'probe', 'pnpm install'));
+    }
+  }
+  assert.deepEqual(
+    pnpmDiagnosticSummary(`jobs:
+${jobs.join('\n')}
+`),
+    expected,
+  );
+
+  const childShellConstructs = [
+    ['subshell', (taint) => `(${taint})`],
+    ['pipeline', (taint) => `${taint} | true`],
+    ['command-substitution', (taint) => `echo "$(${taint})"`],
+    ['process-substitution', (taint) => `cat < <(${taint})`],
+    ['background', (taint) => `${taint} &`],
+  ];
+  const childJobs = [];
+  for (const [constructName, construct] of childShellConstructs) {
+    for (const [taintName, taint] of taints) {
+      childJobs.push(`  ${constructName}-${taintName}:
+    steps:
+      - run: |
+          ${construct(taint)}
+          pnpm install
+          pnpm run build`);
+    }
+  }
+  assert.deepEqual(
+    pnpmDiagnosticSummary(`jobs:
+${childJobs.join('\n')}
+`),
+    [],
+  );
+});
+
+test('install and add option policies are command-specific on both sides of the subcommand', () => {
+  const rows = {
+    install: [
+      ...[
+        '--aggregate-output',
+        '--color',
+        '--fix-lockfile',
+        '--force',
+        '--frozen-lockfile',
+        '--ignore-scripts',
+        '--no-color',
+        '--no-frozen-lockfile',
+        '--no-hoist',
+        '--no-lockfile',
+        '--no-verify-store-integrity',
+        '--offline',
+        '--optimistic-repeat-install',
+        '--prefer-frozen-lockfile',
+        '--prefer-offline',
+        '--recursive',
+        '--shamefully-hoist',
+        '--side-effects-cache',
+        '--side-effects-cache-readonly',
+        '--silent',
+        '--stream',
+        '--strict-peer-dependencies',
+        '--update-checksums',
+        '--use-running-store-server',
+        '--use-stderr',
+        '--use-store-server',
+        '--verify-store-integrity',
+        '--workspace-root',
+        '-r',
+        '-s',
+        '-w',
+      ].map((name) => [name, 0, 'establish']),
+      ...[
+        '--child-concurrency',
+        '--hoist-pattern',
+        '--loglevel',
+        '--network-concurrency',
+        '--package-import-method',
+        '--public-hoist-pattern',
+        '--reporter',
+        '--store-dir',
+        '--trust-policy',
+        '--trust-policy-exclude',
+        '--trust-policy-ignore-after',
+        '--virtual-store-dir',
+      ].map((name) => [name, 1, 'establish']),
+      ...[
+        '--dev',
+        '--global',
+        '--help',
+        '--ignore-workspace',
+        '--lockfile-only',
+        '--no-optional',
+        '--prod',
+        '--production',
+        '--resolution-only',
+        '--version',
+        '-D',
+        '-P',
+        '-g',
+        '-h',
+        '-v',
+      ].map((name) => [name, 0, 'neutral']),
+      ...['--filter', '--filter-prod', '--modules-dir', '-F'].map((name) => [
+        name,
+        1,
+        'neutral',
+      ]),
+      ...['--dir', '--prefix', '-C'].map((name) => [
+        name,
+        1,
+        'neutral',
+        'packages/example',
+      ]),
+      ...[
+        '--bail',
+        '--fail-if-no-match',
+        '--ignore-pnpmfile',
+        '--include-workspace-root',
+        '--link-workspace-packages',
+        '--merge-git-branch-lockfiles',
+        '--no-bail',
+        '--no-link-workspace-packages',
+        '--no-shared-workspace-lockfile',
+        '--no-sort',
+        '--parallel',
+        '--report-summary',
+        '--reverse',
+        '--shared-workspace-lockfile',
+        '--sort',
+      ].map((name) => [name, 0, 'limit']),
+      ...[
+        '--changed-files-ignore-pattern',
+        '--global-dir',
+        '--lockfile-dir',
+        '--test-pattern',
+        '--workspace-concurrency',
+      ].map((name) => [name, 1, 'limit']),
+    ],
+    add: [
+      ...[
+        '--aggregate-output',
+        '--allow-build',
+        '--color',
+        '--ignore-scripts',
+        '--no-color',
+        '--no-save-exact',
+        '--no-save-workspace-protocol',
+        '--offline',
+        '--prefer-offline',
+        '--recursive',
+        '--save-catalog',
+        '--save-dev',
+        '--save-exact',
+        '--save-optional',
+        '--save-peer',
+        '--save-prod',
+        '--save-workspace-protocol',
+        '--silent',
+        '--stream',
+        '--use-stderr',
+        '--workspace',
+        '--workspace-root',
+        '-D',
+        '-E',
+        '-O',
+        '-P',
+        '-r',
+        '-s',
+        '-w',
+      ].map((name) => [name, 0, 'establish']),
+      ...[
+        '--loglevel',
+        '--reporter',
+        '--save-catalog-name',
+        '--store-dir',
+        '--virtual-store-dir',
+      ].map((name) => [name, 1, 'establish']),
+      ...[
+        '--config',
+        '--dev',
+        '--global',
+        '--help',
+        '--ignore-workspace',
+        '--lockfile-only',
+        '--no-optional',
+        '--prod',
+        '--production',
+        '--resolution-only',
+        '--version',
+        '-g',
+        '-h',
+        '-v',
+      ].map((name) => [name, 0, 'neutral']),
+      ...['--filter', '--filter-prod', '--modules-dir', '-F'].map((name) => [
+        name,
+        1,
+        'neutral',
+      ]),
+      ...['--dir', '--prefix', '-C'].map((name) => [
+        name,
+        1,
+        'neutral',
+        'packages/example',
+      ]),
+      ...[
+        '--bail',
+        '--fail-if-no-match',
+        '--include-workspace-root',
+        '--link-workspace-packages',
+        '--no-bail',
+        '--no-link-workspace-packages',
+        '--no-shared-workspace-lockfile',
+        '--no-sort',
+        '--reverse',
+        '--shared-workspace-lockfile',
+        '--sort',
+      ].map((name) => [name, 0, 'limit']),
+      ...[
+        '--changed-files-ignore-pattern',
+        '--global-dir',
+        '--test-pattern',
+        '--workspace-concurrency',
+      ].map((name) => [name, 1, 'limit']),
+    ],
+  };
+  const jobs = [];
+  const expected = [];
+  for (const [subcommand, options] of Object.entries(rows)) {
+    for (const [index, [name, arity, result, operand]] of options.entries()) {
+      const option = arity === 1 ? `${name} ${operand ?? 'value'}` : name;
+      for (const position of ['before', 'after']) {
+        const job = `${subcommand}-${index}-${position}`;
+        const command =
+          position === 'before'
+            ? `pnpm ${option} ${subcommand}${subcommand === 'add' ? ' package' : ''}`
+            : `pnpm ${subcommand} ${option}${subcommand === 'add' ? ' package' : ''}`;
+        jobs.push(`  ${job}:
+    steps:
+      - name: option probe
+        run: ${command}
+      - name: later consumer
+        run: pnpm run build`);
+        if (result === 'neutral') {
+          expected.push(missingPnpm(job, 'later consumer', 'pnpm run build'));
+        } else if (result === 'limit') {
+          expected.push(
+            limitedPnpm(
+              job,
+              'option probe',
+              command,
+              `pnpm ${subcommand} option ${name} is not establishing`,
+            ),
+          );
+        }
+      }
+    }
+  }
+  assert.deepEqual(
+    pnpmDiagnosticSummary(`jobs:
+${jobs.join('\n')}
+`),
+    expected,
+  );
+});
+
+test('repository-root spellings agree across command, workflow, and action contexts', () => {
+  const rootPaths = ['.', './', './/', './.', '././'];
+  const jobs = [];
+  for (const [pathIndex, rootPath] of rootPaths.entries()) {
+    for (const [optionIndex, option] of ['--dir', '-C', '--prefix'].entries()) {
+      jobs.push(`  command-${pathIndex}-${optionIndex}:
+    steps:
+      - run: pnpm install ${option} ${rootPath}
+      - run: pnpm run build`);
+    }
+    jobs.push(`  working-directory-${pathIndex}:
+    steps:
+      - working-directory: ${rootPath}
+        run: pnpm install
+      - run: pnpm run build`);
+    jobs.push(`  action-cwd-${pathIndex}:
+    steps:
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
+        with:
+          run_install:
+            cwd: ${rootPath}
+      - run: pnpm run build`);
+  }
+  assert.deepEqual(
+    pnpmDiagnosticSummary(`jobs:
+${jobs.join('\n')}
+`),
     [],
   );
 });
@@ -611,6 +2904,120 @@ test('every tracked workflow installs before it invokes pnpm', () => {
 // The cases below pin the tracked workflows rather than the checker. They live
 // here because the checker already parses every .github workflow, and a suite
 // of their own would add a verify-core step to run it.
+test('every tracked workflow installs before it invokes pnpm', () => {
+  const result = checkGithubYamlFiles(join(repositoryRoot, '.github'));
+
+  assert.deepEqual(
+    result.errors.filter(({ code }) =>
+      ['MISSING_PNPM_INSTALL', 'PNPM_ANALYSIS_LIMIT'].includes(code),
+    ),
+    [],
+  );
+});
+
+test('the verify-core job runs its installed-dependency checks in order', () => {
+  assert.deepEqual(
+    readVerifyCoreJob()
+      .steps.filter((step) => typeof step.run === 'string')
+      .map((step) => step.run),
+    [
+      'pnpm install --frozen-lockfile',
+      'pnpm github:check',
+      'pnpm github:check:test',
+      'pnpm test:node-tools',
+      'pnpm lint',
+      'pnpm typecheck',
+      'pnpm test:without-direct-scenario',
+      'pnpm build',
+      'pnpm docs:check',
+      'pnpm docs:check:test',
+      'pnpm docs:api',
+      'pnpm test:release-order',
+      'pnpm test:release-invocation',
+      'pnpm test:packed-breakwater',
+      'pnpm test:packed-fleet-control',
+      'pnpm test:packed-flowsafe-agent-host',
+      'pnpm test:packed-flowsafe-provisioning',
+      'pnpm --filter @proofoftech/flowsafe test:signals-client-export',
+      'pnpm --filter @proofoftech/flowsafe typecheck:react18',
+      'pnpm --filter showcase run react-doctor',
+      'pnpm --filter @proofoftech/flowsafe spike:verify',
+      'pnpm test:conformance-config',
+      'pnpm conformance:verify',
+    ],
+  );
+});
+
+test('the canary captures checked-in pins before updating dependencies', () => {
+  const run = canaryStep('mastra_versions').run;
+  const update = run.indexOf('pnpm -r update');
+
+  for (const binding of ['BASELINE_CORE=', 'BASELINE_D1=']) {
+    const capture = run.indexOf(binding);
+    assert.ok(capture >= 0 && capture < update, binding);
+  }
+  assert.match(run, /baseline_core=\$BASELINE_CORE/u);
+  assert.match(run, /baseline_d1=\$BASELINE_D1/u);
+});
+
+test('the canary summary distinguishes equality from forward-version coverage', () => {
+  const core = JSON.parse(
+    readFileSync(
+      join(repositoryRoot, 'packages/breakwater/package.json'),
+      'utf8',
+    ),
+  ).devDependencies['@mastra/core'];
+  const d1 = JSON.parse(
+    readFileSync(
+      join(repositoryRoot, 'packages/flowsafe/package.json'),
+      'utf8',
+    ),
+  ).dependencies['@mastra/cloudflare-d1'];
+  const equal = runMastraVersionAssertion({
+    baselineCore: core,
+    baselineD1: d1,
+    expectedCore: core,
+    expectedD1: d1,
+    installedCore: core,
+    installedD1: d1,
+  });
+  assert.equal(equal.run.error, undefined);
+  assert.equal(equal.run.status, 0, `${equal.run.stdout}\n${equal.run.stderr}`);
+  assert.equal(
+    equal.summary,
+    `core: baseline=${core} requested=${core} installed=${core} coverage=equality\nd1: baseline=${d1} requested=${d1} installed=${d1} coverage=equality\n`,
+  );
+
+  const forward = runMastraVersionAssertion({
+    baselineCore: core,
+    baselineD1: d1,
+    expectedCore: '1.68.0',
+    expectedD1: '1.4.0',
+    installedCore: '1.68.0',
+    installedD1: '1.4.0',
+  });
+  assert.equal(forward.run.error, undefined);
+  assert.equal(forward.run.status, 0, forward.run.stderr);
+  assert.match(forward.summary, /core: .* coverage=newer/u);
+  assert.match(forward.summary, /d1: .* coverage=newer/u);
+});
+
+test('the canary refuses mismatched and missing installed versions', () => {
+  for (const installedCore of ['1.67.0', '']) {
+    const result = runMastraVersionAssertion({
+      baselineCore: '1.67.0',
+      baselineD1: '1.3.2',
+      expectedCore: '1.68.0',
+      expectedD1: '1.4.0',
+      installedCore,
+      installedD1: '1.4.0',
+    });
+    assert.equal(result.run.error, undefined);
+    assert.ok(result.run.status > 0);
+    assert.match(result.summary, /baseline=1\.67\.0 requested=1\.68\.0/u);
+  }
+});
+
 // This one reads the gate's shape and shells out to nothing, so it reports the
 // deletions below on every machine.
 test('the ci.yml gate job stays reachable and depends on at least one job', () => {
@@ -682,18 +3089,25 @@ test('the ci.yml canary reds the job from a final outcome step that reads the id
   const outcome = steps[outcomeIndex];
   assert.equal(
     outcome.if,
-    'always()',
-    'without `if: always()` a red tripwire suite skips the outcome step',
+    '$' + '{{ !cancelled() }}',
+    'the outcome step reports completed probes without running after cancellation',
   );
+  const expectedOutcomes = [
+    ...steps
+      .filter((step) => step['continue-on-error'] === true)
+      .map((step) => step.id),
+    steps[testIndex].id,
+  ].sort();
   assert.deepEqual(
     [...new Set(outcomeReferences(outcome))].sort(),
-    ['bundle', 'tests', 'typecheck'],
-    'the outcome step reports the outcome of every probe the canary runs',
+    expectedOutcomes,
+    'the outcome step reports the continue-on-error probes and the tripwire suites',
   );
 
   for (const [outcomes, succeeds] of [
     [{ typecheck: 'failure', bundle: 'success', tests: 'success' }, false],
     [{ typecheck: 'success', bundle: 'failure', tests: 'success' }, false],
+    [{ typecheck: 'success', bundle: 'success', tests: 'failure' }, true],
     [{ typecheck: 'success', bundle: 'success', tests: 'success' }, true],
   ]) {
     const label = JSON.stringify(outcomes);
@@ -758,6 +3172,14 @@ const NEWEST_VERSION_CASES = [
     stdout: '',
   },
   {
+    title: 'refuses an empty reduced version',
+    stub: NPM_STUBS.empty,
+    lookups: 1,
+    sleeps: 0,
+    succeeds: false,
+    stdout: '',
+  },
+  {
     title: 'reads a version npm answered alongside a warning on stderr',
     stub: NPM_STUBS.newestWithWarning,
     lookups: 1,
@@ -771,7 +3193,9 @@ for (const scenario of NEWEST_VERSION_CASES) {
   test(`the ci.yml canary lookup ${scenario.title}`, () => {
     const run = runNewestVersion(scenario.stub);
 
+    assert.equal(run.error, undefined);
     assert.equal(run.lookups.length, scenario.lookups);
+    assert.equal(run.timeouts.length, scenario.lookups);
     assert.equal(run.sleeps, scenario.sleeps);
     assert.equal(run.stdout, scenario.stdout);
     if (scenario.succeeds) {
@@ -782,10 +3206,48 @@ for (const scenario of NEWEST_VERSION_CASES) {
   });
 }
 
+test('the ci.yml canary retries a killed partial E404 before accepting success', () => {
+  const run = runNewestVersion(NPM_STUBS.e404ThenNewest);
+
+  assert.equal(run.error, undefined);
+  assert.equal(run.status, 0);
+  assert.equal(run.lookups.length, 2);
+  assert.equal(run.timeouts.length, 2);
+  assert.equal(run.sleeps, 1);
+  assert.equal(run.stdout, '1.67.0\n');
+});
+
+test('the ci.yml canary exhausts killed partial E404 lookups', () => {
+  const run = runNewestVersion(NPM_STUBS.repeatedKilledE404);
+
+  assert.equal(run.error, undefined);
+  assert.ok(run.status > 0);
+  assert.equal(run.lookups.length, 3);
+  assert.equal(run.timeouts.length, 3);
+  assert.equal(run.sleeps, 2);
+  assert.equal(run.stdout, '');
+});
+
+for (const status of [125, 126, 127]) {
+  test(`the ci.yml canary refuses timeout-wrapper status ${status} without retrying`, () => {
+    const run = runNewestVersion(
+      npmStub(`printf 'npm error code E404\\n'`, `exit ${status}`),
+    );
+
+    assert.equal(run.error, undefined);
+    assert.ok(run.status > 0);
+    assert.equal(run.lookups.length, 1);
+    assert.equal(run.timeouts.length, 1);
+    assert.equal(run.sleeps, 0);
+    assert.equal(run.stdout, '');
+  });
+}
+
 test("the ci.yml canary lookup bounds npm's own fetch retries", () => {
   const run = runNewestVersion(NPM_STUBS.newest);
 
   assert.equal(run.lookups.length, 1);
+  assert.match(run.timeouts[0], /^timeout --signal=KILL 90s npm view /u);
   for (const flag of [
     '--fetch-timeout=30000',
     '--fetch-retries=1',
@@ -799,20 +3261,25 @@ test("the ci.yml canary lookup bounds npm's own fetch retries", () => {
   }
 });
 
-// The release job spends VISIBILITY_DEADLINE_MS per prerequisite inside
-// publish-ordered.mjs, so a budget below that sum kills the job mid-wait and
-// leaves a prerequisite published but untagged.
+// At the current prerequisite count of two, the allocation keeps nine minutes
+// beyond the wait, probe, and policy reserve. A third prerequisite forces a
+// timeout-minutes decision.
 test('the release job budget outlasts every prerequisite visibility wait', () => {
   const release = parse(
     readFileSync(join(repositoryRoot, '.github/workflows/release.yml'), 'utf8'),
   ).jobs.release;
 
   assert.ok(release, 'the release workflow publishes from the job `release`');
-  assert.ok(
-    release['timeout-minutes'] * 60_000 >
-      PUBLISH_PREREQUISITES.length * VISIBILITY_DEADLINE_MS,
-    `timeout-minutes ${release['timeout-minutes']} does not cover ${PUBLISH_PREREQUISITES.length} waits of ${VISIBILITY_DEADLINE_MS}ms`,
-  );
+  const reserve = 15 * 60_000;
+  const requiredBudget = (prerequisiteCount) =>
+    prerequisiteCount * (VISIBILITY_DEADLINE_MS + PROBE_TIMEOUT_MS) +
+    prerequisiteCount * PROBE_TIMEOUT_MS +
+    reserve;
+  const allocation = release['timeout-minutes'] * 60_000;
+  assert.ok(allocation > requiredBudget(PUBLISH_PREREQUISITES.length));
+  assert.equal(PUBLISH_PREREQUISITES.length, 2);
+  assert.equal(allocation - requiredBudget(2), 9 * 60_000);
+  assert.ok(allocation < requiredBudget(3));
 });
 
 // `bash -e -c` reproduces the runner's default shell for a `run` block that
