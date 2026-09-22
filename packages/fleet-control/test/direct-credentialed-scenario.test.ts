@@ -15,23 +15,23 @@ import {
 import { observeDirectWorkerVersion } from '../scripts/direct-credentialed-observations.mjs';
 import {
   type DirectRunJournal,
+  isAbandonedDirectScenario,
   openDirectRunState,
 } from '../scripts/direct-credentialed-run-state.mjs';
 import {
   type DirectScenarioState,
   runDirectCredentialedScenario,
 } from '../scripts/direct-credentialed-scenario.mjs';
-import {
-  DIRECT_SCENARIO_INVOCATION_BUDGET,
-  DIRECT_SCENARIO_MIN_INVOCATIONS,
-} from '../scripts/direct-credentialed-scenario-budget.mjs';
+import { DIRECT_SCENARIO_MIN_INVOCATIONS } from '../scripts/direct-credentialed-scenario-budget.mjs';
 import {
   hash,
   jsonHash,
   recordFacts,
 } from '../scripts/direct-credentialed-scenario-checks.mjs';
-import { DIRECT_TENANT_OBJECT_BODY } from '../scripts/direct-credentialed-tenant-object.mjs';
+import { directDeploymentSpec } from '../scripts/direct-credentialed-spec.js';
 import type { DirectReferenceAction } from '../scripts/direct-reference-contract.mjs';
+import { DIRECT_REFERENCE_LEASE } from '../scripts/direct-reference-transport.js';
+import { deploymentSpecDigest } from '../src/spec-digest.js';
 import { directObservationFixture } from './fixtures/direct-observations.js';
 import {
   type MutableScenario,
@@ -130,7 +130,9 @@ describe.sequential('scenario proof failures in native reference state', {
         desiredSpecDigest: string;
       }[];
     };
-    const record = control.records.find((record) => record.role === 'a');
+    const record = control.records.find(
+      (candidateRecord) => candidateRecord.role === 'a',
+    );
     if (!record) throw new Error('native fixture record is missing');
     const expected = {
       ...input,
@@ -475,7 +477,7 @@ describe('scenario journal refusal boundaries', () => {
       async invoke(action) {
         const reservation = await local.journal.reserveInvocation(
           JSON.stringify({
-            contractVersion: 1,
+            contractVersion: 2,
             configSha256: local.prepared.configSha256,
             action,
           }),
@@ -544,172 +546,380 @@ describe('scenario journal refusal boundaries', () => {
 describe.sequential('fixed Node scenario through native reference dispatch', {
   timeout: 660_000,
 }, () => {
-  it('completes normal migration, historical recovery and force after a real child restart', async () => {
-    const f = await fixture();
-    const first = await runDirectCredentialedScenario(f.input());
-    expect({
-      first,
-      bridgeErrors: f.native.bridgeErrors,
-      state: f.local.journal.snapshot().scenario,
-    }).toMatchObject({
-      first: { status: 'restart-required' },
-      bridgeErrors: [],
+  it('LV2 singleton continuation native feasibility', async () => {
+    const f = await fixture({
+      maxProviderRequests: 400,
+      nativeArtifacts: true,
+      nativeTenant: true,
     });
-    const initial = f.local.journal.snapshot();
-    const count = initial.invocationCount;
-    expect(await runDirectCredentialedScenario(f.input())).toEqual({
-      status: 'restart-required',
-    });
-    expect(f.local.journal.snapshot().invocationCount).toBe(count);
-    const witness = await f.native.journal().readInterruption();
-    expect(witness).not.toBeNull();
-    const stale = JSON.parse(JSON.parse(witness as string).claimJson);
-    const wrong = await f.native.call({
-      kind: 'migration-continue',
-      token: { ...stale, operationId: 'foreign-operation' },
-    });
-    expect(wrong.response.status).toBe(409);
-    expect(wrong.response.headers.get('X-Direct-Provider-Attempts')).toBe('0');
-    await f.native.reload();
-    const child = await childResume(f);
-    expect({
-      result: child.result,
-      bridgeErrors: f.native.bridgeErrors,
-      journal: await readFile(
-        join(f.local.journal.directory, 'journal.json'),
-        'utf8',
-      ),
-    }).toMatchObject({ result: { status: 'complete' }, bridgeErrors: [] });
-    if (child.result?.status !== 'complete')
-      throw new Error('scenario did not complete');
-    const proofs = child.result.facts;
-    expect(proofs.restart?.process.pid).toBe(process.pid);
-    expect(proofs.restart?.resumedProcess?.pid).not.toBe(process.pid);
-    for (const role of ['a', 'b'] as const) {
-      const fence = proofs.fence;
-      expect(fence.drain[role]).toMatchObject({
-        before: {
-          state: 'open',
-          mutationEpoch: 0,
-          requireMutationEpoch: false,
-        },
-        after: {
-          state: 'draining',
-          mutationEpoch: 1,
-          requireMutationEpoch: true,
-        },
-        ordinal: expect.any(Number),
+    const attempts: Array<{
+      action: string;
+      provider: number;
+      maintenance: number;
+      application: number;
+      elapsedMs: number;
+    }> = [];
+    let leaseOutcome = 'not-reached';
+    const invoke = async (action: DirectReferenceAction) => {
+      const startedAt = performance.now();
+      const result = await f.input().invocation.invoke(action);
+      attempts.push({
+        action:
+          action.kind === 'tenant-continuation' ||
+          action.kind === 'tenant-fence'
+            ? `${action.kind}:${action.operation}`
+            : action.kind,
+        ...result.attempts,
+        elapsedMs: Math.round(performance.now() - startedAt),
       });
-      expect(fence.reopen[role]).toMatchObject({
-        before: {
-          state: 'draining',
-          mutationEpoch: 1,
-          requireMutationEpoch: true,
-        },
-        after: { state: 'open', mutationEpoch: 1, requireMutationEpoch: true },
-        ordinal: expect.any(Number),
+      return result.result;
+    };
+    try {
+      await invoke({
+        kind: 'provision',
+        role: 'a',
+        release: 'initial',
+        cycle: 'reprovision',
       });
-      expect(fence.sweeps[role]).toMatchObject({
-        first: { fence: { state: 'draining' }, ordinal: expect.any(Number) },
-        second: { fence: { state: 'draining' }, ordinal: expect.any(Number) },
-        intervalMs: expect.any(Number),
+      const tenant = f.tenant;
+      const generationA = tenant?.generation;
+      if (!tenant || !generationA)
+        throw new Error('native tenant generation A is missing');
+      const marker = await (await tenant.database())
+        .prepare('SELECT marker FROM direct_conformance_fixture WHERE id=1')
+        .first<{ marker: string }>();
+      expect(marker).toEqual({ marker: 'initial' });
+
+      const control = (await invoke({ kind: 'control-read' })) as {
+        records: Array<{
+          role: string;
+          artifactVersion?: string;
+          databaseId?: string;
+          desiredSpecDigest?: string;
+        }>;
+      };
+      const recordA = control.records.find(({ role }) => role === 'a');
+      if (
+        !recordA?.artifactVersion ||
+        !recordA.databaseId ||
+        !recordA.desiredSpecDigest
+      )
+        throw new Error('native tenant record A is missing');
+      const observationA = await observeDirectWorkerVersion({
+        ...f.input(),
+        role: 'a',
+        applicationRelease: '1',
+        versionId: recordA.artifactVersion,
+        databaseId: recordA.databaseId,
+        specDigest: recordA.desiredSpecDigest,
       });
-      for (const sweep of [
-        fence.sweeps[role]?.first,
-        fence.sweeps[role]?.second,
-      ]) {
-        expect(sweep).not.toBeNull();
-        expect(
-          sweep?.categories.every(
-            (entry) => entry.class !== 'work' || entry.empty,
-          ),
-        ).toBe(true);
-      }
-      expect(fence.probes[role]).toEqual({
-        current: 'accepted',
-        missing: 'missing',
-        stale: 'stale',
-        future: 'future',
-        mutationEpoch: 1,
-        ordinal: expect.any(Number),
-      });
-      expect(proofs.initial[role]?.trafficPercentage).toBe(100);
-      expect(proofs.candidate[role]?.trafficPercentage).toBe(0);
-      expect(proofs.final[role]?.trafficPercentage).toBe(100);
-      expect(proofs.exports[role]?.verified).toBe(true);
-      expect(proofs.decommission[role]?.phase).toBe('decommissioned');
-      const history = proofs.exportVerifications.filter(
-        (entry) => entry.role === role,
+      expect(observationA.currentDeployment.versions).toEqual([
+        { versionId: recordA.artifactVersion, percentage: 100 },
+      ]);
+
+      const challenge = 'a'.repeat(64);
+      const liveness = await tenant.runnerLiveness(
+        f.native.secrets.a.deploymentIdentity,
       );
-      expect(history.length).toBeGreaterThan(0);
-      expect(history.filter((entry) => entry.verified)).toEqual(history);
-      expect(history.at(-1)).toEqual(proofs.exports[role]);
+      expect(liveness.status).toBe(200);
+      expect(await liveness.json()).toEqual({ live: false });
+      const started = (await invoke({
+        kind: 'tenant-continuation',
+        operation: 'start',
+        challenge,
+      })) as {
+        status: number;
+        summary: {
+          runId?: string;
+          status?: string;
+          approval?: { id?: string };
+        };
+      };
+      expect(started).toMatchObject({
+        status: 200,
+        summary: { runId: expect.any(String), status: 'suspended' },
+      });
+      const runId = started.summary.runId;
+      const approvalId = started.summary.approval?.id;
+      if (!runId || !approvalId)
+        throw new Error('native continuation identity is missing');
+
+      const beforeLock = (await invoke({
+        kind: 'tenant-fence',
+        role: 'a',
+        operation: 'read',
+      })) as FenceMutationAfter;
+      const locked = (await invoke({
+        kind: 'tenant-fence',
+        role: 'a',
+        operation: 'lock',
+        expectedMutationEpoch: beforeLock.mutationEpoch,
+        expectedRevision: beforeLock.transitionRevision,
+      })) as { ok: boolean; after?: FenceMutationAfter };
+      expect(locked).toMatchObject({
+        ok: true,
+        after: {
+          state: 'migration-locked',
+          mutationEpoch: beforeLock.mutationEpoch + 1,
+        },
+      });
+
+      const migrated = (await invoke({
+        kind: 'migration-reprovision-a',
+      })) as {
+        databaseId: string;
+        scriptName: string;
+        routeHostname: string;
+        initialVersionId: string;
+        finalVersionId: string;
+        initialSpecDigest: string;
+        targetSpecDigest: string;
+        settlementKey: string;
+      };
+      expect(migrated).toMatchObject({
+        databaseId: generationA.databaseId,
+        initialVersionId: generationA.versionId,
+        finalVersionId: expect.any(String),
+        settlementKey: expect.stringMatching(/^[a-f0-9]{64}$/u),
+      });
+      expect(migrated.finalVersionId).not.toBe(migrated.initialVersionId);
+      const migrationAttempt = attempts.find(
+        ({ action: actionName }) => actionName === 'migration-reprovision-a',
+      );
+      if (!migrationAttempt)
+        throw new Error('native migration timing is missing');
+      leaseOutcome =
+        migrationAttempt.elapsedMs < DIRECT_REFERENCE_LEASE.leaseTtlMs
+          ? 'completed-within-ttl'
+          : 'completed-after-ttl';
+      const generationB = tenant.generation;
+      if (!generationB)
+        throw new Error('native tenant generation B is missing');
+      expect(generationB).toMatchObject({
+        databaseId: generationA.databaseId,
+        maintenanceNamespaceId: generationA.maintenanceNamespaceId,
+        runnerNamespaceId: generationA.runnerNamespaceId,
+        versionId: migrated.finalVersionId,
+        release: '2',
+      });
+
+      const nextSpec = directDeploymentSpec(
+        f.local.prepared.manifest,
+        'a',
+        'next',
+        f.native.secrets.a,
+        f.native.binding,
+      );
+      const observationB = await observeDirectWorkerVersion({
+        ...f.input(),
+        role: 'a',
+        applicationRelease: '2',
+        versionId: migrated.finalVersionId,
+        databaseId: migrated.databaseId,
+        specDigest: deploymentSpecDigest(nextSpec),
+      });
+      expect(observationB.currentDeployment.versions).toEqual([
+        { versionId: migrated.finalVersionId, percentage: 100 },
+      ]);
+      expect(observationB).toMatchObject({
+        databaseId: observationA.databaseId,
+        scriptName: observationA.scriptName,
+        namespaces: observationA.namespaces,
+        schemaVersion: 2,
+        applicationRelease: '2',
+      });
+      expect(f.local.prepared.manifest.tenantModule.sha256).toMatch(
+        /^[a-f0-9]{64}$/u,
+      );
+
+      const beforeRefusal = await invoke({
+        kind: 'tenant-continuation',
+        operation: 'status',
+        runId,
+      });
+      expect(
+        await invoke({
+          kind: 'tenant-continuation',
+          operation: 'resume-locked',
+          runId,
+        }),
+      ).toMatchObject({
+        runId,
+        status: 503,
+        reason: { code: 'EXECUTION_FENCED', state: 'migration-locked' },
+      });
+      expect(
+        await invoke({
+          kind: 'tenant-continuation',
+          operation: 'status',
+          runId,
+        }),
+      ).toEqual(beforeRefusal);
+
+      const beforeUnlock = locked.after;
+      if (!beforeUnlock) throw new Error('native lock reading is missing');
+      expect(
+        await invoke({
+          kind: 'tenant-fence',
+          role: 'a',
+          operation: 'unlock',
+          expectedMutationEpoch: beforeUnlock.mutationEpoch,
+          expectedRevision: beforeUnlock.transitionRevision,
+        }),
+      ).toMatchObject({
+        ok: true,
+        after: {
+          state: 'open',
+          mutationEpoch: beforeUnlock.mutationEpoch,
+          transitionRevision: beforeUnlock.transitionRevision + 1,
+        },
+      });
+      const finished = (await invoke({
+        kind: 'tenant-continuation',
+        operation: 'resume',
+        runId,
+        approvalId,
+      })) as { status: number; summary: Record<string, unknown> };
+      expect(finished.status).toBe(200);
+      expect(finished.summary).toMatchObject({ runId, status: 'success' });
+      expect(JSON.stringify(finished.summary)).toContain(challenge);
+      expect(JSON.stringify(finished.summary)).toContain('"release":"2"');
+      const terminalInventory = (await invoke({
+        kind: 'tenant-fence',
+        role: 'a',
+        operation: 'inventory',
+      })) as {
+        categories: Array<{ category: string; class: string; empty: boolean }>;
+      };
+      console.log(
+        'LV2_TERMINAL_INVENTORY',
+        JSON.stringify(terminalInventory.categories),
+      );
+      expect(
+        terminalInventory.categories.every(
+          ({ class: categoryClass, empty }) =>
+            categoryClass !== 'work' || empty,
+        ),
+      ).toBe(true);
+
+      const script = f.native.world.scripts.get(migrated.scriptName);
+      const active = script?.versions.find(
+        ({ versionId }) => versionId === migrated.finalVersionId,
+      );
+      if (!active) throw new Error('native B provider version is missing');
+      f.native.world.deleteScript(migrated.scriptName);
+      const freshDatabase = f.native.world.createDatabase(
+        f.local.prepared.names.roles.a.databaseName,
+      );
+      const freshBindings = active.bindings.map((entry) => {
+        if (!entry || typeof entry !== 'object') return entry;
+        const binding = { ...entry } as Record<string, unknown>;
+        if (binding.name === 'DB')
+          binding.database_id = freshDatabase.databaseId;
+        if (
+          binding.type === 'durable_object_namespace' &&
+          (binding.name === 'RUNNER' || binding.name === 'MAINTENANCE')
+        )
+          delete binding.namespace_id;
+        if (binding.name === 'APPLICATION_RELEASE') binding.text = '1';
+        if (binding.name === 'FLEET_SPEC_DIGEST')
+          binding.text = migrated.initialSpecDigest;
+        return binding;
+      });
+      const [freshVersion] = f.native.world.applyUpload({
+        scriptName: migrated.scriptName,
+        mode: 'initial',
+        tag: undefined,
+        bindings: freshBindings,
+        mainModule: active.mainModule,
+        modules: active.modules,
+      });
+      if (!freshVersion) throw new Error('fresh provider version is missing');
+      const nativeBinding = (name: string) => {
+        const selected = freshVersion.bindings.find(
+          (entry) =>
+            entry &&
+            typeof entry === 'object' &&
+            Reflect.get(entry, 'name') === name,
+        );
+        const value =
+          selected && typeof selected === 'object'
+            ? Reflect.get(selected, 'namespace_id')
+            : undefined;
+        if (typeof value !== 'string')
+          throw new Error(`fresh namespace '${name}' is missing`);
+        return value;
+      };
+      const freshBucketBinding = freshVersion.bindings.find(
+        (entry) =>
+          entry &&
+          typeof entry === 'object' &&
+          Reflect.get(entry, 'name') === 'PROBE_BUCKET',
+      );
+      const freshBucketName =
+        freshBucketBinding && typeof freshBucketBinding === 'object'
+          ? Reflect.get(freshBucketBinding, 'bucket_name')
+          : undefined;
+      if (typeof freshBucketName !== 'string')
+        throw new Error('fresh native bucket is missing');
+      const freshGeneration = await tenant.activate({
+        spec: directDeploymentSpec(
+          f.local.prepared.manifest,
+          'a',
+          'initial',
+          f.native.secrets.a,
+          f.native.binding,
+        ),
+        versionId: freshVersion.versionId,
+        databaseId: freshDatabase.databaseId,
+        maintenanceNamespaceId: nativeBinding('MAINTENANCE'),
+        runnerNamespaceId: nativeBinding('RUNNER'),
+        deploymentIdentitySecret: f.native.secrets.a.deploymentIdentity,
+        maintenanceAdminSecret: f.native.secrets.a.maintenanceAdmin,
+        applicationToken: f.native.secrets.a.application?.APP_PROBE_TOKEN ?? '',
+        release: '1',
+        bucketName: freshBucketName,
+      });
+      expect(freshGeneration.databaseId).not.toBe(generationA.databaseId);
+      expect(freshGeneration.maintenanceNamespaceId).not.toBe(
+        generationA.maintenanceNamespaceId,
+      );
+      expect(freshGeneration.runnerNamespaceId).not.toBe(
+        generationA.runnerNamespaceId,
+      );
+      expect(freshGeneration.workerName).not.toBe(generationA.workerName);
+
+      console.log(
+        'LV2_NATIVE_FEASIBILITY',
+        JSON.stringify({
+          attempts,
+          migration: attempts.find(
+            ({ action }) => action === 'migration-reprovision-a',
+          ),
+          leaseOutcome,
+          locallyEnforced: {
+            combinedAttempts: 400,
+            invocationDeadlineMs: 600_000,
+            leaseTtlMs: 900_000,
+          },
+          configuredNotLocallyEnforced: {
+            referenceSubrequestLimit: 10_000,
+            tenantSubrequestLimit: 50,
+            cpuLimitMs: 50,
+          },
+        }),
+      );
+    } finally {
+      console.log(
+        'LV2_NATIVE_FEASIBILITY_PARTIAL',
+        JSON.stringify({
+          attempts,
+          leaseOutcome,
+        }),
+      );
+      await closeDirectScenarioFixtures();
     }
-    expect(proofs.terminalForce.a).toEqual({
-      databaseId: proofs.decommission.a?.databaseId,
-      scriptName: proofs.decommission.a?.scriptName,
-      ordinal: expect.any(Number),
-      attempts: { provider: 0, maintenance: 0, application: 0 },
-    });
-    expect(proofs.inventories.after?.routeHostnames).toEqual(
-      proofs.inventories.before?.routeHostnames,
-    );
-    expect(proofs.inventories.after?.routeHostnames).toEqual(
-      (['a', 'b'] as const)
-        .map((role) => f.local.prepared.names.roles[role].routeHostname)
-        .sort(),
-    );
-    expect(proofs.effects).toHaveLength(2);
-    expect(proofs.inventories.before?.calls).toBeGreaterThan(1);
-    expect(proofs.inventories.after?.generation).toBeGreaterThan(
-      proofs.inventories.before?.generation ?? 0,
-    );
-    expect(proofs.audits.before?.findings).toEqual([]);
-    expect(proofs.audits.after?.findings).toEqual([]);
-    expect(proofs.force?.worker.scriptPresent).toBe(true);
-    expect(proofs.residual?.worker.scriptPresent).toBe(false);
-    expect(proofs.force?.priorCleanup.operationId).toBe(
-      proofs.cleanup?.operationId,
-    );
-    expect(proofs.residual?.priorCleanup).toEqual(proofs.force?.priorCleanup);
-    expect(f.native.world.databases).toEqual([]);
-    expect(f.native.buckets.size).toBe(0);
-    expect((await f.native.exportBytes.list()).objects.length).toBeGreaterThan(
-      0,
-    );
-    const serialized = await readFile(
-      join(f.local.journal.directory, 'journal.json'),
-      'utf8',
-    );
-    for (const sentinel of [
-      'APP_PROBE_TOKEN',
-      'inert-provider-token',
-      'inert-invoke',
-      'claimJson',
-      'tokenJson',
-      'SELECT ',
-      'CREATE TABLE ',
-      'INSERT INTO ',
-      DIRECT_TENANT_OBJECT_BODY,
-    ])
-      expect(serialized).not.toContain(sentinel);
-    const budget: Record<string, { ceiling: number }> =
-      DIRECT_SCENARIO_INVOCATION_BUDGET;
-    const phaseCalls: Record<string, number> =
-      JSON.parse(serialized).scenario.phaseCalls;
-    for (const phase of ['fence-drain', 'fence-reopen', 'fence-proofs'])
-      expect(phaseCalls[phase]).toBe(9);
-    expect(
-      Object.entries(phaseCalls).filter(
-        ([phase, calls]) => calls > (budget[phase]?.ceiling ?? 0),
-      ),
-    ).toEqual([]);
-    expect(serialized).not.toContain(JSON.parse(witness as string).claimJson);
-    const resumed = await resume(f);
-    expect((await runDirectCredentialedScenario(f.input(resumed))).status).toBe(
-      'complete',
-    );
-  });
+  }, 660_000);
 });
 
 describe.sequential('fence composition through native reference dispatch', {
@@ -868,9 +1078,13 @@ describe.sequential('fence composition through native reference dispatch', {
     expect(proof?.sweeps.a?.intervalMs).toBe(
       saved.scenario.proofs.fence.sweeps.a?.intervalMs,
     );
-    expect(bodies).toHaveLength(2);
+    expect(bodies).toHaveLength(3);
     expect(bodies[1]).toEqual(bodies[0]);
-    expect(inventoryCount()).toBe(beforeInventory);
+    expect(JSON.parse(bodies[2]?.toString('utf8') ?? '{}')).toMatchObject({
+      expected: 'migration-locked',
+      next: 'open',
+    });
+    expect(inventoryCount()).toBe(beforeInventory + 20);
     expect(proof?.reopen.a?.after).toMatchObject({
       state: 'open',
       mutationEpoch: 1,
@@ -1054,7 +1268,7 @@ describe('scenario resume re-entry against a settled journal', () => {
         actions.push(action);
         const reservation = await handle.reserveInvocation(
           JSON.stringify({
-            contractVersion: 1,
+            contractVersion: 2,
             configSha256: f.prepared.configSha256,
             action,
           }),
@@ -1191,32 +1405,32 @@ describe('scenario resume re-entry against a settled journal', () => {
     } = {},
   ) => {
     const identity = options.identity ?? 'matching';
-    const state = seed('force-terminal-a', (state) => {
-      state.mutation = settledCall(
+    const state = seed('force-terminal-a', (draftState) => {
+      draftState.mutation = settledCall(
         'force-terminal',
         'returned',
         3,
         { role: 'a' },
         attempts,
       ) as MutableScenario['mutation'];
-      present(state.mutation).before =
+      present(draftState.mutation).before =
         identity === 'absent'
           ? null
           : {
               databaseId:
                 identity === 'foreign'
                   ? 'foreign-database'
-                  : present(state.proofs.decommission.a).databaseId,
-              scriptName: present(state.proofs.decommission.a).scriptName,
+                  : present(draftState.proofs.decommission.a).databaseId,
+              scriptName: present(draftState.proofs.decommission.a).scriptName,
             };
-      state.proofs.terminalForce = { a: null };
-      present(state.proofs.steps[0]).step = 'arm-maintenance';
-      present(state.proofs.steps[1]).step = 'arm-maintenance';
-      state.proofs.restart = restartProof(target.f, {
+      draftState.proofs.terminalForce = { a: null };
+      present(draftState.proofs.steps[0]).step = 'arm-maintenance';
+      present(draftState.proofs.steps[1]).step = 'arm-maintenance';
+      draftState.proofs.restart = restartProof(target.f, {
         resumedProcess: { ...RESUMED },
         replayOrdinal: 3,
       }) as MutableScenario['proofs']['restart'];
-      state.records = state.records.map((entry) =>
+      draftState.records = draftState.records.map((entry) =>
         entry.role === 'a' ? recordFacts({ role: 'a', present: false }) : entry,
       );
     });
@@ -1252,7 +1466,7 @@ describe('scenario resume re-entry against a settled journal', () => {
       );
     await run(target, withControlRead(invocation, withoutRoleA));
     noForceTerminal(actions);
-    expect(stored(target).phase).toBe('force-recovery');
+    expect(stored(target).phase).toBe('reprovision-a');
     expect(stored(target).proofs.terminalForce.a).toEqual(proof);
     if (persisted)
       expect(JSON.stringify(stored(target).proofs.terminalForce)).toBe(frozen);
@@ -1298,22 +1512,22 @@ describe('scenario resume re-entry against a settled journal', () => {
   it('terminal force resume: reconciles the mutation against the record it still holds', async () => {
     const target = await scenarioJournal(DIRECT_SCENARIO_MIN_INVOCATIONS);
     const attempts = { provider: 0, maintenance: 0, application: 0 };
-    const state = seed('force-terminal-a', (state) => {
-      state.mutation = settledCall(
+    const state = seed('force-terminal-a', (draftState) => {
+      draftState.mutation = settledCall(
         'force-terminal',
         'returned',
         3,
         { role: 'a' },
         attempts,
       ) as MutableScenario['mutation'];
-      present(state.mutation).before = {
-        databaseId: present(state.proofs.decommission.a).databaseId,
-        scriptName: present(state.proofs.decommission.a).scriptName,
+      present(draftState.mutation).before = {
+        databaseId: present(draftState.proofs.decommission.a).databaseId,
+        scriptName: present(draftState.proofs.decommission.a).scriptName,
       };
-      state.proofs.terminalForce = { a: null };
-      present(state.proofs.steps[0]).step = 'arm-maintenance';
-      present(state.proofs.steps[1]).step = 'arm-maintenance';
-      state.proofs.restart = restartProof(target.f, {
+      draftState.proofs.terminalForce = { a: null };
+      present(draftState.proofs.steps[0]).step = 'arm-maintenance';
+      present(draftState.proofs.steps[1]).step = 'arm-maintenance';
+      draftState.proofs.restart = restartProof(target.f, {
         resumedProcess: { ...RESUMED },
         replayOrdinal: 3,
       }) as MutableScenario['proofs']['restart'];
@@ -1321,7 +1535,7 @@ describe('scenario resume re-entry against a settled journal', () => {
       // recorded present, so the resumed run reads the deletion through the
       // reconciliation the force permits rather than from a record that
       // already agreed with the provider.
-      state.reconciledOrdinal = 2;
+      draftState.reconciledOrdinal = 2;
     });
     await target.journal.recordScenario(state);
     expect(stored(target).records[0]).toMatchObject({
@@ -1331,7 +1545,7 @@ describe('scenario resume re-entry against a settled journal', () => {
     const { invocation, actions } = reference(target, { interrupted: true });
     await run(target, withControlRead(invocation, withoutRoleA));
     noForceTerminal(actions);
-    expect(stored(target).phase).toBe('force-recovery');
+    expect(stored(target).phase).toBe('reprovision-a');
     expect(stored(target).proofs.terminalForce.a).toEqual({
       databaseId: present(state.proofs.decommission.a).databaseId,
       scriptName: present(state.proofs.decommission.a).scriptName,
@@ -1387,24 +1601,24 @@ describe('scenario resume re-entry against a settled journal', () => {
       'observation-mismatch',
     ],
     ['refused response', undefined, 'reference-refused', 'reference-refused'],
-  ] as const)('terminal force settlement: %s', async (_title, witness, failure, reason) => {
+  ] as const)('terminal force settlement: %s', async (_title, witnessKind, failure, reason) => {
     const target = await scenarioJournal(DIRECT_SCENARIO_MIN_INVOCATIONS);
-    const state = seed('force-terminal-a', (state) => {
-      state.proofs.terminalForce = { a: null };
-      present(state.proofs.steps[0]).step = 'arm-maintenance';
-      present(state.proofs.steps[1]).step = 'arm-maintenance';
-      state.proofs.restart = restartProof(target.f, {
+    const state = seed('force-terminal-a', (draftState) => {
+      draftState.proofs.terminalForce = { a: null };
+      present(draftState.proofs.steps[0]).step = 'arm-maintenance';
+      present(draftState.proofs.steps[1]).step = 'arm-maintenance';
+      draftState.proofs.restart = restartProof(target.f, {
         resumedProcess: { ...RESUMED },
         replayOrdinal: 3,
       }) as MutableScenario['proofs']['restart'];
     });
     const before =
-      witness === 'matching'
+      witnessKind === 'matching'
         ? {
             databaseId: present(state.proofs.decommission.a).databaseId,
             scriptName: present(state.proofs.decommission.a).scriptName,
           }
-        : witness;
+        : witnessKind;
     await target.journal.recordScenario(state);
     const { invocation, actions } = reference(target, { interrupted: true });
     const force: DirectInvocationClient = {
@@ -1454,7 +1668,7 @@ describe('scenario resume re-entry against a settled journal', () => {
       actions.filter((action) => action.kind === 'force-terminal'),
     ).toHaveLength(1);
     expect(stored(target).proofs.terminalForce.a).toBeNull();
-    if (witness === 'matching')
+    if (witnessKind === 'matching')
       expect(settled).toMatchObject({
         outcome: 'returned',
         before,
@@ -1466,7 +1680,7 @@ describe('scenario resume re-entry against a settled journal', () => {
         before: null,
         attempts: { provider: 0, maintenance: 0, application: 0 },
       });
-    else if (witness === null)
+    else if (witnessKind === null)
       expect(settled).toMatchObject({
         outcome: 'returned',
         before: null,
@@ -1557,6 +1771,51 @@ describe('scenario resume re-entry against a settled journal', () => {
     });
   });
 
+  it('records the prepared continuation-start run id as abandoned and never replays it', async () => {
+    const target = await scenarioJournal(DIRECT_SCENARIO_MIN_INVOCATIONS);
+    const prepared = {
+      ordinal: target.journal.snapshot().invocationCount + 1,
+      action: {
+        kind: 'tenant-continuation' as const,
+        operation: 'start' as const,
+        challenge: 'a'.repeat(64),
+      },
+      outcome: 'prepared' as const,
+      attempts: null,
+      migration: null,
+    };
+    await target.journal.recordScenario(
+      seed('continuation-start', (state) => {
+        const [armA, armB] = state.proofs.steps;
+        if (!armA || !armB) throw new Error('migration steps are missing');
+        armA.step = 'arm-maintenance';
+        armB.step = 'arm-maintenance';
+        state.proofs.restart = restartProof(target.f, {
+          resumedProcess: { ...RESUMED },
+          replayOrdinal: 3,
+        }) as MutableScenario['proofs']['restart'];
+        state.lastCall = prepared;
+        state.mutation = prepared;
+        state.proofs.continuation.started = null;
+      }) as DirectScenarioState,
+    );
+    const { actions, invocation } = reference(target, { interrupted: false });
+    expect(await run(target, invocation)).toMatchObject({
+      status: 'failed',
+      reason: 'proof-unavailable',
+      detail: 'lost-run-id-abandoned',
+      phase: 'continuation-start',
+    });
+    expect(actions).toEqual([]);
+    expect(stored(target).failure).toMatchObject({
+      code: 'proof-unavailable',
+      detail: 'lost-run-id-abandoned',
+    });
+    expect(isAbandonedDirectScenario(target.journal.snapshot().scenario)).toBe(
+      true,
+    );
+  });
+
   it('reports the persisted failure code after a resume spends an invocation', async () => {
     const target = await scenarioJournal(DIRECT_SCENARIO_MIN_INVOCATIONS);
     await target.journal.recordScenario(
@@ -1566,7 +1825,7 @@ describe('scenario resume re-entry against a settled journal', () => {
     );
     const reservation = await target.journal.reserveInvocation(
       JSON.stringify({
-        contractVersion: 1,
+        contractVersion: 2,
         configSha256: target.f.prepared.configSha256,
         action: { kind: 'control-read' },
       }),
@@ -1588,10 +1847,10 @@ describe('scenario resume re-entry against a settled journal', () => {
   it('issues no second migration start and consumes the injection only at the interrupt', async () => {
     const target = await scenarioJournal(DIRECT_SCENARIO_MIN_INVOCATIONS);
     await target.journal.recordScenario(
-      seed('migration-start', (state) => {
+      seed('migration-start', (draftState) => {
         const call = settledCall('migration-start', 'returned', 3);
-        state.lastCall = call as MutableScenario['lastCall'];
-        state.mutation = call as MutableScenario['mutation'];
+        draftState.lastCall = call as MutableScenario['lastCall'];
+        draftState.mutation = call as MutableScenario['mutation'];
       }) as DirectScenarioState,
     );
     const { actions, invocation } = reference(target, { interrupted: false });
@@ -1614,15 +1873,16 @@ describe('scenario resume re-entry against a settled journal', () => {
     const target = await scenarioJournal(DIRECT_SCENARIO_MIN_INVOCATIONS);
     const frozen = restartProof(target.f, {});
     await target.journal.recordScenario(
-      seed('migration-interrupt', (state) => {
+      seed('migration-interrupt', (draftState) => {
         const call = settledCall(
           'migration-continue',
           'injected-response-loss',
           2,
         );
-        state.lastCall = call as MutableScenario['lastCall'];
-        state.mutation = call as MutableScenario['mutation'];
-        state.proofs.restart = frozen as MutableScenario['proofs']['restart'];
+        draftState.lastCall = call as MutableScenario['lastCall'];
+        draftState.mutation = call as MutableScenario['mutation'];
+        draftState.proofs.restart =
+          frozen as MutableScenario['proofs']['restart'];
       }) as DirectScenarioState,
     );
     const { actions, invocation } = reference(target, { interrupted: true });

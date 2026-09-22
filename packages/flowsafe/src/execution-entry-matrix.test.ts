@@ -287,14 +287,18 @@ async function gatedRuntime(
 ): Promise<RunnerRuntime> {
   const storage = createD1Storage({ binding: database });
   await storage.init();
-  const { createWorkflow, createStep, runtime } = init(
+  const {
+    createWorkflow: workflowFactory,
+    createStep: stepFactory,
+    runtime,
+  } = init(
     { storage },
     {
       executionFence: fence,
       startIdempotency: new StartIdempotencyStore(database),
     },
   );
-  const gate = createStep({
+  const gate = stepFactory({
     id: 'gate',
     inputSchema: z.object({}),
     outputSchema: z.object({}),
@@ -305,7 +309,7 @@ async function gatedRuntime(
       return {};
     },
   });
-  createWorkflow({
+  workflowFactory({
     id: 'gated',
     inputSchema: z.object({}),
     outputSchema: z.object({}),
@@ -2390,15 +2394,18 @@ describe('execution-entry matrix', () => {
       (typeof FENCE_ERROR_AUTHORS)[number]
     >();
     for (const site of sites) {
-      const candidates = FENCE_ERROR_AUTHORS.flatMap((author) => {
-        if (author.file !== site.file || author.error !== site.error) return [];
-        const distance = anchorDistanceBeforeAuthor(author, site);
-        return distance === undefined ? [] : [{ author, distance }];
+      const candidates = FENCE_ERROR_AUTHORS.flatMap((errorAuthor) => {
+        if (errorAuthor.file !== site.file || errorAuthor.error !== site.error)
+          return [];
+        const distance = anchorDistanceBeforeAuthor(errorAuthor, site);
+        return distance === undefined
+          ? []
+          : [{ author: errorAuthor, distance }];
       });
       const nearest = Math.min(...candidates.map(({ distance }) => distance));
       const authors = candidates.filter(({ distance }) => distance === nearest);
       expect(
-        authors.map(({ author }) => author.anchor),
+        authors.map(({ author: matchedAuthor }) => matchedAuthor.anchor),
         `${site.file}:${site.line} must have one declared anchor in the preceding ${ANCHOR_WINDOW_LINES} lines`,
       ).toHaveLength(1);
       const author = authors[0]?.author;

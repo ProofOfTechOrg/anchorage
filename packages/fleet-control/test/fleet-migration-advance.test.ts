@@ -241,11 +241,11 @@ class MemoryOperationStore implements FleetOperationStore {
             throw new Error(
               'commitProgress exceeds the operation batch budget of 100 statements',
             );
-          for (const [kind, watermark] of Object.entries(
+          for (const [watermarkKind, watermark] of Object.entries(
             input.expectedRowWatermarks ?? {},
           )) {
             const below = rows.filter(
-              (row) => row.rowKind === kind && row.ordinal < watermark,
+              (row) => row.rowKind === watermarkKind && row.ordinal < watermark,
             );
             const ordinals = below
               .map((row) => row.ordinal)
@@ -258,7 +258,7 @@ class MemoryOperationStore implements FleetOperationStore {
             )
               throw new Error(
                 fleetOperationWatermarkRunMessage(
-                  kind as FleetOperationRowKind,
+                  watermarkKind as FleetOperationRowKind,
                 ),
               );
           }
@@ -269,13 +269,14 @@ class MemoryOperationStore implements FleetOperationStore {
             prior?.state === 'running' &&
             prior.progress.revision === input.expectedRevision
           ) {
-            for (const [kind, watermark] of Object.entries(
+            for (const [watermarkKind, watermark] of Object.entries(
               input.expectedRowWatermarks ?? {},
             )) {
               const ordinals = new Set(
                 [...persistedRows, ...rows]
                   .filter(
-                    (row) => row.rowKind === kind && row.ordinal < watermark,
+                    (row) =>
+                      row.rowKind === watermarkKind && row.ordinal < watermark,
                   )
                   .map((row) => row.ordinal),
               );
@@ -285,18 +286,18 @@ class MemoryOperationStore implements FleetOperationStore {
             for (const row of updates) {
               if (
                 !persistedRows.some(
-                  (prior) =>
-                    prior.rowKind === row.rowKind &&
-                    prior.ordinal === row.ordinal,
+                  (priorRow) =>
+                    priorRow.rowKind === row.rowKind &&
+                    priorRow.ordinal === row.ordinal,
                 )
               )
                 throw conflict(input.operationId);
             }
             for (const row of rows) {
               const persisted = persistedRows.find(
-                (prior) =>
-                  prior.rowKind === row.rowKind &&
-                  prior.ordinal === row.ordinal,
+                (priorRow) =>
+                  priorRow.rowKind === row.rowKind &&
+                  priorRow.ordinal === row.ordinal,
               );
               if (persisted && payloadBytes(persisted) !== payloadBytes(row))
                 throw new Error('immutable operation row payload differs');
@@ -304,18 +305,18 @@ class MemoryOperationStore implements FleetOperationStore {
             for (const row of rows) {
               if (
                 !persistedRows.some(
-                  (prior) =>
-                    prior.rowKind === row.rowKind &&
-                    prior.ordinal === row.ordinal,
+                  (priorRow) =>
+                    priorRow.rowKind === row.rowKind &&
+                    priorRow.ordinal === row.ordinal,
                 )
               )
                 persistedRows.push(row);
             }
             for (const row of updates) {
               const index = persistedRows.findIndex(
-                (prior) =>
-                  prior.rowKind === row.rowKind &&
-                  prior.ordinal === row.ordinal,
+                (priorRow) =>
+                  priorRow.rowKind === row.rowKind &&
+                  priorRow.ordinal === row.ordinal,
               );
               if (index >= 0) persistedRows[index] = row;
             }
@@ -324,12 +325,13 @@ class MemoryOperationStore implements FleetOperationStore {
           } else {
             if (!prior)
               throw new Error(`no fleet operation '${input.operationId}'`);
-            for (const [kind, watermark] of Object.entries(
+            for (const [watermarkKind, watermark] of Object.entries(
               input.expectedRowWatermarks ?? {},
             )) {
               if (
                 persistedRows.filter(
-                  (row) => row.rowKind === kind && row.ordinal < watermark,
+                  (row) =>
+                    row.rowKind === watermarkKind && row.ordinal < watermark,
                 ).length !== watermark
               )
                 throw conflict(input.operationId);
@@ -339,9 +341,9 @@ class MemoryOperationStore implements FleetOperationStore {
             let complete = true;
             for (const row of [...rows, ...updates]) {
               const persisted = persistedRows.find(
-                (prior) =>
-                  prior.rowKind === row.rowKind &&
-                  prior.ordinal === row.ordinal,
+                (priorRow) =>
+                  priorRow.rowKind === row.rowKind &&
+                  priorRow.ordinal === row.ordinal,
               );
               if (!persisted) complete = false;
               else if (payloadBytes(persisted) !== payloadBytes(row))
@@ -377,8 +379,10 @@ class MemoryOperationStore implements FleetOperationStore {
           )
             throw conflict(input.operationId);
           const rows = this.rows.get(input.operationId) ?? [];
-          for (const [kind, count] of Object.entries(input.expectedRowCounts)) {
-            if (rows.filter((row) => row.rowKind === kind).length !== count)
+          for (const [rowKind, count] of Object.entries(
+            input.expectedRowCounts,
+          )) {
+            if (rows.filter((row) => row.rowKind === rowKind).length !== count)
               throw new Error('finalize counts differ');
           }
           if (
@@ -437,17 +441,18 @@ class MemoryOperationStore implements FleetOperationStore {
           for (const row of updates) {
             if (
               !rows.some(
-                (prior) =>
-                  prior.rowKind === row.rowKind &&
-                  prior.ordinal === row.ordinal,
+                (priorRow) =>
+                  priorRow.rowKind === row.rowKind &&
+                  priorRow.ordinal === row.ordinal,
               )
             )
               throw conflict(input.operationId);
           }
           for (const row of updates) {
             const index = rows.findIndex(
-              (prior) =>
-                prior.rowKind === row.rowKind && prior.ordinal === row.ordinal,
+              (priorRow) =>
+                priorRow.rowKind === row.rowKind &&
+                priorRow.ordinal === row.ordinal,
             );
             rows[index] = row;
           }
@@ -503,7 +508,10 @@ class MemoryOperationStore implements FleetOperationStore {
   item(id = uuid(), ordinal = 0): FleetMigrationItem {
     const row = this.rows
       .get(id)
-      ?.find((row) => row.rowKind === 'item' && row.ordinal === ordinal);
+      ?.find(
+        (candidateRow) =>
+          candidateRow.rowKind === 'item' && candidateRow.ordinal === ordinal,
+      );
     if (!row) throw new Error('missing item fixture');
     return fleetMigrationItemFromUnknown(row.payload);
   }
@@ -1503,7 +1511,7 @@ describe('migration operation fake guarded progress contract', () => {
             updateRows: [updated, missing],
             expectedRowWatermarks: { item: 1 },
           })
-          .catch((error: unknown) => error);
+          .catch((failure: unknown) => failure);
         expect(store.operations.get(uuid())).toEqual(persisted);
         expect(store.rows.get(uuid())).toEqual([row, secondRow]);
         expect(error).toHaveProperty(
@@ -1561,7 +1569,7 @@ describe('migration operation fake guarded progress contract', () => {
             { ...stored, payload: { ...stored.payload, tenantTag: 'other' } },
           ],
         })
-        .catch((error: unknown) => error);
+        .catch((failure: unknown) => failure);
       expect(store.operations.get(uuid())).toEqual(initial);
       expect(store.rows.get(uuid())).toEqual([stored]);
       expect(error).toBeInstanceOf(Error);
@@ -1600,7 +1608,7 @@ describe('migration operation fake guarded progress contract', () => {
             payload: { ...row.payload, status: 'failed' },
           })),
         })
-        .catch((error: unknown) => error);
+        .catch((failure: unknown) => failure);
       expect(store.operations.get(uuid())).toEqual(initial);
       expect(store.rows.get(uuid())).toEqual(rows);
       expect(store.heads.get('migration')).toBe(uuid());
@@ -2763,9 +2771,9 @@ describe('bounded fleet migration', () => {
       [
         'cleared target',
         (record) => {
-          const copy = { ...record };
-          delete copy.platformTarget;
-          return copy;
+          const recordCopy = { ...record };
+          delete recordCopy.platformTarget;
+          return recordCopy;
         },
       ],
       [
@@ -3551,10 +3559,10 @@ describe('bounded fleet migration', () => {
       };
       let described = false;
       let ordinaryReads = 0;
-      const describe = finalized.provider.describeFinalizedState;
+      const describeFinalizedState = finalized.provider.describeFinalizedState;
       finalized.provider.describeFinalizedState = (input) => {
         described = true;
-        return describe(input);
+        return describeFinalizedState(input);
       };
       const selected = function (this: {
         provider: FinalizedOrdinaryStateProvider;
@@ -4052,7 +4060,7 @@ describe('bounded fleet migration', () => {
   });
 
   it('fence and step observe the same shared migrating-carrier refusal', async () => {
-    for (const divergence of ['prior', 'target', 'provider'] as const) {
+    for (const divergenceKind of ['prior', 'target', 'provider'] as const) {
       const finalized = finalizedWorld();
       const world = finalized.world;
       await advanceTo(world, 'seed-identity');
@@ -4060,13 +4068,13 @@ describe('bounded fleet migration', () => {
         const current = { ...reread };
         if (!current.migrationIntent) throw new Error('missing intent');
         const expected =
-          divergence === 'prior'
+          divergenceKind === 'prior'
             ? 'immutable external migration lost its durable release intent'
-            : divergence === 'target'
+            : divergenceKind === 'target'
               ? 'migration retry does not match the persisted platform target'
               : 'async finalized assertion refused';
-        if (divergence === 'prior') delete current.migrationPriorRelease;
-        if (divergence === 'target')
+        if (divergenceKind === 'prior') delete current.migrationPriorRelease;
+        if (divergenceKind === 'target')
           current.migrationIntent = {
             ...current.migrationIntent,
             target: {
@@ -4075,7 +4083,7 @@ describe('bounded fleet migration', () => {
             },
           };
         let completed = 0;
-        if (divergence === 'provider')
+        if (divergenceKind === 'provider')
           finalized.provider.assertFinalizedState = async (input) => {
             await Promise.resolve();
             expect(input.currentRecord).toBe(current);
@@ -4109,7 +4117,7 @@ describe('bounded fleet migration', () => {
             ),
         ])
           await expect(invoke()).rejects.toThrow(expected);
-        expect(completed).toBe(divergence === 'provider' ? 3 : 0);
+        expect(completed).toBe(divergenceKind === 'provider' ? 3 : 0);
       });
     }
   });

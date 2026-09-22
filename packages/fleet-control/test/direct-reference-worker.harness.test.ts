@@ -7,12 +7,17 @@ import { fileURLToPath } from 'node:url';
 import type { D1Database } from '@cloudflare/workers-types';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createTestHarness, type TestHarness } from 'wrangler';
-import { DIRECT_REFERENCE_PATH } from '../scripts/direct-reference-contract.mjs';
+import {
+  DIRECT_REFERENCE_PATH,
+  directReferenceRequestSha256,
+} from '../scripts/direct-reference-contract.mjs';
 import { directFixtureManifest } from './fixtures/direct-credentialed-config.js';
 
 const manifest = directFixtureManifest();
+const deadlineManifest = directFixtureManifest({ invocationTimeoutMs: 1000 });
 const fleetDatabaseId = '00000000-0000-0000-0000-000000000001';
 const quotaDatabaseId = '00000000-0000-0000-0000-000000000002';
+const deadlineFleetDatabaseId = '00000000-0000-0000-0000-000000000003';
 const binding = {
   version: 1,
   accountId: 'account',
@@ -40,6 +45,7 @@ describe.sequential('real direct reference context and inventory', {
   let server: TestHarness;
   let db: D1Database;
   let reload: () => Promise<void>;
+  let invocationOrdinal = 0;
   beforeAll(async () => {
     directory = await mkdtemp(join(tmpdir(), 'direct-reference-'));
     const main = join(directory, 'worker.ts');
@@ -55,7 +61,9 @@ import {recordDirectResource,directSettlementHost} from ${source('../scripts/dir
 import {fleetSettlementKey} from ${source('../src/settlement.ts')};
 import {deploymentSpecDigest} from ${source('../src/spec-digest.ts')};
 const manifest=${JSON.stringify(manifest)};
+const deadlineManifest=${JSON.stringify(deadlineManifest)};
 const binding=${JSON.stringify(binding)};
+const deadlineBinding=${JSON.stringify({ ...binding, fleetDatabaseId: deadlineFleetDatabaseId })};
 const secretMap=${JSON.stringify(secrets)};
 function single(result){return Response.json({success:true,errors:[],messages:[],result});}
 function page(result){return single(result);}
@@ -88,10 +96,11 @@ export default {async fetch(request,env){
   if(mode==='bad-secrets')current.DIRECT_DEPLOYMENT_SECRETS=JSON.stringify({...secretMap,a:{application:{APP_PROBE_TOKEN:'invalid'}}});
   if(mode==='auth-probe')current=new Proxy(current,{get(target,key){if(key==='FLEET_DB'||key==='QUOTA_DB'||key==='EXPORTS')throw new Error('binding touched before authentication');return Reflect.get(target,key);}});
   if(mode==='deadline'){
+    current={...current,FLEET_DB:env.DEADLINE_FLEET_DB,DIRECT_RUN_BINDING:JSON.stringify(deadlineBinding)};
     let count=0,ended=false,observedFailure=null;const oldNow=performance.now,oldSnapshot=DirectReferenceTransport.prototype.snapshot;
     Object.defineProperty(performance,'now',{configurable:true,value:()=>ended?1001:(count++===0?0:10)});
     DirectReferenceTransport.prototype.snapshot=function(){ended=true;const value=oldSnapshot.call(this);observedFailure=value.failure;return value;};
-    try{const worker=createDirectReferenceWorker({...manifest,referenceRuntime:{...manifest.referenceRuntime,invocationTimeoutMs:1000}},{fetch:provider});const response=await worker.fetch(request,current);return Response.json({status:response.status,observedFailure,body:await response.json(),providerCalls:calls.length});}
+    try{const worker=createDirectReferenceWorker(deadlineManifest,{fetch:provider});const response=await worker.fetch(request,current);return Response.json({status:response.status,observedFailure,body:await response.json(),providerCalls:calls.length});}
     finally{Object.defineProperty(performance,'now',{configurable:true,value:oldNow});DirectReferenceTransport.prototype.snapshot=oldSnapshot;}
   }
   if(mode==='residual-claims'){
@@ -173,6 +182,11 @@ export default {async fetch(request,env){
                 database_name: 'reference-quota',
                 database_id: quotaDatabaseId,
               },
+              {
+                binding: 'DEADLINE_FLEET_DB',
+                database_name: 'reference-deadline-fleet',
+                database_id: deadlineFleetDatabaseId,
+              },
             ],
             r2_buckets: [
               { binding: 'EXPORTS', bucket_name: manifest.names.exportBucket },
@@ -208,18 +222,132 @@ export default {async fetch(request,env){
     mode = '',
     authorization = 'Bearer test-invoke',
   ) {
+    const configSha256 =
+      mode === 'deadline'
+        ? deadlineManifest.configSha256
+        : manifest.configSha256;
+    const core = { contractVersion: 2, configSha256, action };
+    return raw(
+      {
+        ...core,
+        reservation:
+          Reflect.get(action as object, 'kind') === 'reconcile-invocation'
+            ? null
+            : {
+                ordinal: ++invocationOrdinal,
+                requestSha256: directReferenceRequestSha256(core),
+              },
+      },
+      mode,
+      authorization,
+    );
+  }
+
+  function raw(body: unknown, mode = '', authorization = 'Bearer test-invoke') {
     return server
       .getWorker()
       .fetch(`https://reference.test${DIRECT_REFERENCE_PATH}?mode=${mode}`, {
         method: 'POST',
         headers: { authorization },
-        body: JSON.stringify({
-          contractVersion: 1,
-          configSha256: manifest.configSha256,
-          action,
-        }),
+        body: JSON.stringify(body),
       });
   }
+
+  it('enforces the v2 hash-bound ledger, terminal reconciliation and cancellation tombstone', async () => {
+    const configSha256 = manifest.configSha256;
+    const core = {
+      contractVersion: 2,
+      configSha256,
+      action: { kind: 'control-read' },
+    };
+    const requestSha256 = directReferenceRequestSha256(core);
+    expect(
+      await (
+        await raw({
+          contractVersion: 1,
+          configSha256,
+          action: core.action,
+        })
+      ).json(),
+    ).toMatchObject({ error: { code: 'invalid-request' } });
+    expect(
+      await (
+        await raw({
+          ...core,
+          reservation: { ordinal: 900, requestSha256: 'a'.repeat(64) },
+        })
+      ).json(),
+    ).toMatchObject({ error: { code: 'request-hash-mismatch' } });
+
+    const reconcile = async (ordinal: number, targetHash: string) =>
+      (
+        await call({
+          kind: 'reconcile-invocation',
+          ordinal,
+          requestSha256: targetHash,
+        })
+      ).json() as Promise<{
+        result?: { state?: string };
+        error?: { code?: string };
+      }>;
+    const executedReservation = { ordinal: 901, requestSha256 };
+    expect(
+      await (await raw({ ...core, reservation: executedReservation })).json(),
+    ).toMatchObject({ ok: true });
+    expect(await reconcile(901, requestSha256)).toMatchObject({
+      result: { state: 'executed' },
+    });
+    const mutationCore = {
+      contractVersion: 2,
+      configSha256,
+      action: { kind: 'force-observe' },
+    };
+    const mutationReservation = {
+      ordinal: 902,
+      requestSha256: directReferenceRequestSha256(mutationCore),
+    };
+    await raw({ ...mutationCore, reservation: mutationReservation });
+    expect(
+      await (
+        await raw({ ...mutationCore, reservation: mutationReservation })
+      ).json(),
+    ).toMatchObject({ error: { code: 'duplicate-ordinal' } });
+
+    expect(
+      await reconcile(902, mutationReservation.requestSha256),
+    ).toMatchObject({
+      result: { state: 'failed' },
+    });
+    await db
+      .prepare(
+        "INSERT INTO direct_reference_invocations (run_key,ordinal,request_sha256,state) VALUES (?,?,?,'received')",
+      )
+      .bind(manifest.resourcePrefix, 903, 'c'.repeat(64))
+      .run();
+    expect(await reconcile(903, 'c'.repeat(64))).toMatchObject({
+      result: { state: 'received' },
+    });
+    const lateCore = {
+      contractVersion: 2,
+      configSha256,
+      action: { kind: 'control-read' },
+    };
+    const cancelledHash = directReferenceRequestSha256(lateCore);
+    expect(await reconcile(904, cancelledHash)).toMatchObject({
+      result: { state: 'cancelled' },
+    });
+    expect(
+      await (
+        await raw({
+          ...lateCore,
+          reservation: { ordinal: 904, requestSha256: cancelledHash },
+        })
+      ).json(),
+    ).toMatchObject({ error: { code: 'duplicate-ordinal' } });
+    expect(await reconcile(901, 'e'.repeat(64))).toMatchObject({
+      error: { code: 'duplicate-ordinal' },
+    });
+  });
 
   it('authenticates before binding access', async () => {
     const response = await call(

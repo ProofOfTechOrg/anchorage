@@ -33,6 +33,8 @@
     "examples",
     "vitest.config.ts",
     "test-support/d1-type-compatibility.ts",
+    // The explicit entry typechecks the helper loaded directly by packed .mjs
+    // gates under Node type stripping.
     "test-support/module-edges.ts",
     "test-support/r2-type-compatibility.ts",
     "deploy/worker.ts",

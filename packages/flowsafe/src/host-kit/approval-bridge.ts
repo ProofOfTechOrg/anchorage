@@ -386,14 +386,14 @@ export async function abandonApprovalsForRun(
  *    escalated, bound to a suspension the step has since moved past —
  *    produced e.g. by the raw grant-free resume route re-suspending the step
  *    while an earlier request still sits open) is SUPERSEDED first
- *    (ApprovalService.supersedeStale: a CAS transition straight to
- *    'rejected', system-attributed, audited as approval.supersede, never
- *    through decide() — so it never touches the run) before the fresh file,
- *    closing the loop where a stale-but-open record otherwise never heals
- *    (every poll re-lists, finds the same open record via the open-step
- *    uniqueness index, and re-files nothing). A stale DECIDED record needs
- *    no supersede — it is already terminal and excluded from grant
- *    derivation by its own (non-'approved', or fingerprint-mismatched)
+ *    (ApprovalService.supersedeStaleAsPrincipal: a CAS transition straight to
+ *    'rejected', attributed to principalActor(principal), audited as
+ *    approval.supersede, never through decide() — so it never touches the run)
+ *    before the fresh file, closing the loop where a stale-but-open record
+ *    otherwise never heals (every poll re-lists, finds the same open record via
+ *    the open-step uniqueness index, and re-files nothing). A stale DECIDED
+ *    record needs no supersede — it is already terminal and excluded from
+ *    grant derivation by its own (non-'approved', or fingerprint-mismatched)
  *    status.
  *  - if a supersede loses its CAS (a real decision won the race between the
  *    list() above and the supersede), this step is left alone for this

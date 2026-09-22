@@ -245,8 +245,8 @@ function observer(binding: D1Database) {
           const result = await target.batch(
             entries.map((entry) => entry.statement),
           );
-          result.forEach((value, index) => {
-            observe(entries[index].sql, entries[index].bindings, value);
+          result.forEach((batchValue, index) => {
+            observe(entries[index].sql, entries[index].bindings, batchValue);
           });
           return result;
         };

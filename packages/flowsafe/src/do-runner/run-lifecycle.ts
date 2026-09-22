@@ -97,12 +97,12 @@ export function nextLifecycleRevision(current: number): number {
 export function terminalCleanupFor(
   lifecycle: RunLifecycleState | undefined,
 ): RunTerminalCleanup | undefined {
-  const terminal = lifecycle?.terminal;
-  if (!lifecycle || !terminal) return undefined;
+  const terminalState = lifecycle?.terminal;
+  if (!lifecycle || !terminalState) return undefined;
   return {
     revision: lifecycle.revision,
-    status: terminal.status,
-    cleanupCompleted: terminal.cleanupCompletedAt !== undefined,
+    status: terminalState.status,
+    cleanupCompleted: terminalState.cleanupCompletedAt !== undefined,
     ...(lifecycle.scheduleDispatch
       ? { scheduleDispatch: lifecycle.scheduleDispatch }
       : {}),
@@ -215,8 +215,8 @@ function terminal(value: unknown): RunLifecycleState['terminal'] | undefined {
   ) {
     throw new Error('stored run lifecycle is malformed');
   }
-  const replayPrincipals = stored.replayPrincipals.map((value) => {
-    const principal = record(value);
+  const replayPrincipals = stored.replayPrincipals.map((principalValue) => {
+    const principal = record(principalValue);
     if (
       !principal ||
       !isExecutionPrincipalKind(principal.kind) ||

@@ -24,6 +24,9 @@ on:
   push:
     branches: [main]
 
+# A publish must not be cancelled mid-run because cancellation can leave a
+# prerequisite published before its tag and dependent packages exist. With one
+# pending run per concurrency group, a third push replaces the queued run.
 concurrency: release-${{ github.ref }}
 
 permissions:
@@ -33,10 +36,9 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
-    # Covers two prerequisite visibility waits of VISIBILITY_DEADLINE_MS
-    # (scripts/publish-ordered.mjs) on top of install, build and the pre-flight.
-    # The `concurrency` group above has no `cancel-in-progress`, so a wedged run
-    # holds the next release behind it for this whole budget.
+    # scripts/github-yaml-check.test.mjs checks this budget from constants in
+    # scripts/publish-ordered.mjs: both probes for each prerequisite, its
+    # visibility deadline, and a policy reserve. It does not bound publish time.
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4

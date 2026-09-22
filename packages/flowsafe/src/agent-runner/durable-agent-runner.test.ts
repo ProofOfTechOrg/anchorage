@@ -2945,9 +2945,8 @@ describe('FS8 D3 agent observation', () => {
       const capability = f.workflows[FENCED_WORKFLOW_STORAGE];
       assert(capability);
       const read = vi.spyOn(capability, 'readSnapshot');
-      const { RunStateUnreadableError } = await import(
-        '../do-runner/runtime.js'
-      );
+      const { RunStateUnreadableError: ReloadedRunStateUnreadableError } =
+        await import('../do-runner/runtime.js');
       const outcome = await f.agent
         .authoritativeAgentStartState(
           corruption === 'runtime' ? ({} as RunnerRuntime) : f.runtime,
@@ -2958,7 +2957,7 @@ describe('FS8 D3 agent observation', () => {
       expect(f.counts.model).toBe(0);
       if (corruption === 'runtime') expect(read).not.toHaveBeenCalled();
       else expect(read).toHaveBeenCalledOnce();
-      expect(outcome).toBeInstanceOf(RunStateUnreadableError);
+      expect(outcome).toBeInstanceOf(ReloadedRunStateUnreadableError);
       if (corruption === 'thread' || corruption === 'agent')
         expect(outcome).toBeInstanceOf(AgentRunSelectorMismatchError);
       else expect(outcome).not.toBeInstanceOf(AgentRunSelectorMismatchError);

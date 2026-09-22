@@ -314,7 +314,7 @@ function assert(condition, message) {
 function assertResponse(response, condition, message) {
   if (condition) return;
   const refusal = new Error(message);
-  cancelBodyWithoutAwait(response?.body, refusal);
+  cancelBodyWithoutAwait(response.body, refusal);
   throw refusal;
 }
 
@@ -344,8 +344,8 @@ function trackedPlainWorkerRouteApi(routeApi, tracking) {
   });
 }
 
-function trackedPlainWorkerBackend(backend, runner, tracking) {
-  return new Proxy(backend, {
+function trackedPlainWorkerBackend(untrackedBackend, runner, tracking) {
+  return new Proxy(untrackedBackend, {
     get(target, property) {
       if (property === 'revokeCredentials') {
         return async (...arguments_) => {
@@ -866,7 +866,7 @@ async function assertEgressAndLimitProbes(deployment) {
     `CPU over-limit request returned ${overLimit.status}`,
   );
   // The over-limit probe reads the status alone.
-  cancelBodyWithoutAwait(overLimit?.body);
+  cancelBodyWithoutAwait(overLimit.body);
   const recovery = await contractRequest(deployment, 'cpu-control');
   assert(
     recovery.completed === true,

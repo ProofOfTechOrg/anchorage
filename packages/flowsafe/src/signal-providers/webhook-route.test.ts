@@ -749,7 +749,7 @@ describe('createWebhookRouter — robustness', () => {
     await seed(factory, 'globex', 'globex_t1');
     const threads = stubThreads();
     const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
-    const router = createWebhookRouter({
+    const webhookRouter = createWebhookRouter({
       providers: {
         test: testProvider({
           buildNotification: (_payload, row) => {
@@ -764,7 +764,7 @@ describe('createWebhookRouter — robustness', () => {
     });
 
     try {
-      const response = await router(webhookRequest('good', {}));
+      const response = await webhookRouter(webhookRequest('good', {}));
 
       expect(response?.status).toBe(200);
       expect(await response?.json()).toEqual({

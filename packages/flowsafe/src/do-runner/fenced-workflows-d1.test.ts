@@ -752,7 +752,7 @@ describe('owned initial terminalization', () => {
             ? value
             : { ...h.request.execution, [field]: value },
       } as InitialTerminalizationRequest)
-      .catch((error: unknown) => error);
+      .catch((failure: unknown) => failure);
     expect(error).toBeInstanceOf(InvalidExecutionIdentityError);
     if (!(error instanceof InvalidExecutionIdentityError))
       throw new Error('expected input error');
@@ -793,7 +793,7 @@ describe('owned initial terminalization', () => {
     const batch = vi.spyOn(h.db, 'batch');
     const error = await h.capability
       .terminalizeInitialAdmission(request)
-      .catch((error: unknown) => error);
+      .catch((failure: unknown) => failure);
     expect(error).toBeInstanceOf(ExecutionFenceUnreadableError);
     expect(error).toMatchObject({
       name: 'ExecutionFenceUnreadableError',
@@ -1012,7 +1012,8 @@ describe('owned initial terminalization', () => {
   ] as const)('never enters engine, adapter upsert/delete, side tables or snapshot callbacks for %s terminalization', async (variant) => {
     const shouldPersist = vi.fn(() => true);
     const prune = vi.fn(
-      ({ snapshot }: { snapshot: WorkflowRunState }) => snapshot,
+      ({ snapshot: runSnapshot }: { snapshot: WorkflowRunState }) =>
+        runSnapshot,
     );
     const h = await fixture({
       keyed: true,
@@ -1189,7 +1190,7 @@ describe('owned initial terminalization', () => {
     });
     const error = await h.capability
       .terminalizeInitialAdmission(h.request)
-      .catch((error: unknown) => error);
+      .catch((failure: unknown) => failure);
     expect(error).toMatchObject({
       status: 503,
       message: 'initial admission cannot be terminalized',
@@ -1201,12 +1202,12 @@ describe('owned initial terminalization', () => {
   });
   it('derives unknown-effects failure solely from the expected initial row', async () => {
     const h = await terminalFixture();
-    const request = h.replace((snapshot) => {
-      snapshot.result = { stale: true };
-      snapshot.error = { message: 'stale' };
-      snapshot.steps = { retained: { output: 'λ' } };
-      snapshot.requestContext[PROVENANCE].unknown = { keep: true };
-      snapshot.requestContext[RUN_LIFECYCLE_CONTEXT_KEY] = {
+    const request = h.replace((runSnapshot) => {
+      runSnapshot.result = { stale: true };
+      runSnapshot.error = { message: 'stale' };
+      runSnapshot.steps = { retained: { output: 'λ' } };
+      runSnapshot.requestContext[PROVENANCE].unknown = { keep: true };
+      runSnapshot.requestContext[RUN_LIFECYCLE_CONTEXT_KEY] = {
         version: 1,
         revision: Number.MAX_SAFE_INTEGER,
         economicOperations: [{ id: 'economic', settlementState: 'disputed' }],
@@ -1271,8 +1272,8 @@ describe('owned initial terminalization', () => {
   ] as const)('honors stored %s intent without new caller authority', async (status) => {
     const h = await terminalFixture();
     const principals = [{ kind: 'service', id: 'original' }];
-    const request = h.replace((snapshot) => {
-      snapshot.requestContext[RUN_LIFECYCLE_CONTEXT_KEY] = {
+    const request = h.replace((runSnapshot) => {
+      runSnapshot.requestContext[RUN_LIFECYCLE_CONTEXT_KEY] = {
         version: 1,
         revision: Number.MAX_SAFE_INTEGER - 1,
         deadlineAt: 123,
@@ -1340,7 +1341,7 @@ describe('owned initial terminalization', () => {
     const prepare = vi.spyOn(h.db, 'prepare');
     const error = await h.capability
       .terminalizeInitialAdmission(request)
-      .catch((error: unknown) => error);
+      .catch((failure: unknown) => failure);
     expect(h.rows()).toEqual(before);
     expect(prepare).not.toHaveBeenCalled();
     if (variant === 'disputed')
@@ -1436,7 +1437,7 @@ describe('owned initial terminalization', () => {
         ...h.request,
         expected: { ...h.request.expected, snapshot },
       })
-      .catch((error: unknown) => error);
+      .catch((failure: unknown) => failure);
     expect(h.rows()).toEqual(before);
     expect(prepare).not.toHaveBeenCalled();
     expect(error).toMatchObject({ status });
@@ -1509,7 +1510,7 @@ describe('owned initial terminalization', () => {
     for (const [request, message] of invalid) {
       const error = await h.capability
         .terminalizeInitialAdmission(request as InitialTerminalizationRequest)
-        .catch((error: unknown) => error);
+        .catch((failure: unknown) => failure);
       expect(error).toBeInstanceOf(InvalidExecutionIdentityError);
       if (!(error instanceof InvalidExecutionIdentityError))
         throw new Error('expected input error');
@@ -1776,7 +1777,7 @@ describe('owned initial terminalization', () => {
     });
     const error = await h.capability
       .terminalizeInitialAdmission(h.request)
-      .catch((error: unknown) => error);
+      .catch((failure: unknown) => failure);
     expect(calls).toHaveBeenCalledTimes(1);
     expect(error).toMatchObject({
       message: 'initial admission cannot be terminalized',
@@ -2158,7 +2159,7 @@ describe('owned initial workflow admission', () => {
         return sparse;
       });
     const reads = vi.spyOn(h.fence, 'readForAdmission');
-    const error = await h.admit().catch((error: unknown) => error);
+    const error = await h.admit().catch((failure: unknown) => failure);
     expect(h.rows()).toHaveLength(1);
     expect(
       (await h.input.reservationStore?.readForAdmission('key'))?.binding,
@@ -2212,7 +2213,7 @@ describe('owned initial workflow admission', () => {
       return results;
     });
     const reads = vi.spyOn(h.fence, 'readForAdmission');
-    const error = await h.admit().catch((error: unknown) => error);
+    const error = await h.admit().catch((failure: unknown) => failure);
     expect(isDefinitiveInitialAdmissionRefusal(error, h.input.execution)).toBe(
       false,
     );
@@ -2226,7 +2227,7 @@ describe('owned initial workflow admission', () => {
     'constructor',
   ])('keeps genuine all-zero evidence private against %s forgery', async (attack) => {
     const h = await fixture({ state: 'draining' });
-    const error = await h.admit().catch((error: unknown) => error);
+    const error = await h.admit().catch((failure: unknown) => failure);
     if (!(error instanceof Error))
       throw new Error('expected genuine all-zero error');
     expect(isDefinitiveInitialAdmissionRefusal(error, h.input.execution)).toBe(
@@ -2305,7 +2306,7 @@ describe('owned initial workflow admission', () => {
     for (const input of invalid) {
       const error = await h.capability
         .withInitialAdmission(input as InitialRunAdmission, create)
-        .catch((error: unknown) => error);
+        .catch((failure: unknown) => failure);
       expect(error).toMatchObject({
         status: 400,
         reason: { code: 'INVALID_EXECUTION_IDENTITY' },
@@ -2456,7 +2457,7 @@ describe('owned initial workflow admission', () => {
     ]) {
       const h = await fixture();
       const batch = vi.spyOn(h.db, 'batch');
-      const error = await direct(h, patch).catch((error: unknown) => error);
+      const error = await direct(h, patch).catch((failure: unknown) => failure);
       expect(error).toBeInstanceOf(Error);
       expect(batch).not.toHaveBeenCalled();
       expect(h.rows()).toEqual([]);
@@ -2481,7 +2482,7 @@ describe('owned initial workflow admission', () => {
       };
       const error = await h
         .admit({ ...h.input, requestContext })
-        .catch((error: unknown) => error);
+        .catch((failure: unknown) => failure);
       expect(error).toBeInstanceOf(InvalidExecutionIdentityError);
       expect(prepare).not.toHaveBeenCalled();
       expect(
@@ -2574,7 +2575,7 @@ describe('owned initial workflow admission', () => {
         h.sql.exec(`UPDATE flowsafe_start_idempotency SET ${change}`);
         return batch(statements);
       });
-      const error = await h.admit().catch((error: unknown) => error);
+      const error = await h.admit().catch((failure: unknown) => failure);
       expect(h.rows()).toEqual([]);
       expect(
         (await h.input.reservationStore?.readForAdmission('key'))?.binding.kind,
@@ -2605,7 +2606,7 @@ describe('owned initial workflow admission', () => {
     h.sql.exec(
       `CREATE TRIGGER reject_write BEFORE ${verb} ON ${table} BEGIN SELECT RAISE(ABORT, 'injected statement failure'); END`,
     );
-    const error = await h.admit().catch((error: unknown) => error);
+    const error = await h.admit().catch((failure: unknown) => failure);
     expect(error).toBeInstanceOf(ExecutionFenceUnreadableError);
     expect(h.rows()).toEqual([]);
     expect(
@@ -2624,7 +2625,7 @@ describe('owned initial workflow admission', () => {
       .withInitialAdmission(h.input, () =>
         other.workflow.createRun({ runId: 'run' }),
       )
-      .catch((error: unknown) => error);
+      .catch((failure: unknown) => failure);
     expect(other.rows()).toHaveLength(1);
     expect(h.rows()).toEqual([]);
     expect(isDefinitiveInitialAdmissionRefusal(error, h.input.execution)).toBe(
@@ -2695,7 +2696,7 @@ describe('owned initial workflow admission', () => {
       }),
     });
     const batch = vi.spyOn(h.db, 'batch');
-    const error = await h.admit().catch((error: unknown) => error);
+    const error = await h.admit().catch((failure: unknown) => failure);
     expect(error).toBeInstanceOf(InvalidExecutionIdentityError);
     expect(batch).not.toHaveBeenCalled();
     expect(h.rows()).toEqual([]);
@@ -2854,7 +2855,7 @@ describe('owned initial workflow admission', () => {
       const create = vi.fn(() => h.workflow.createRun({ runId: 'run' }));
       const error = await h.capability
         .withInitialAdmission(change(h.input), create)
-        .catch((error: unknown) => error);
+        .catch((failure: unknown) => failure);
       expect(error, name).toMatchObject({ reason: { code } });
       expect(prepare, name).not.toHaveBeenCalled();
       expect(batch, name).not.toHaveBeenCalled();
@@ -2891,7 +2892,7 @@ describe('owned initial workflow admission', () => {
         },
       },
     };
-    const error = await h.admit(input).catch((error: unknown) => error);
+    const error = await h.admit(input).catch((failure: unknown) => failure);
     expect(error).toMatchObject({
       status: 409,
       reason: {
@@ -2924,7 +2925,7 @@ describe('owned initial workflow admission', () => {
           h.sql.exec("UPDATE flowsafe_execution_fence SET state = 'open'");
         return result;
       });
-      const error = await h.admit().catch((error: unknown) => error);
+      const error = await h.admit().catch((failure: unknown) => failure);
       expect(error).toMatchObject({
         status: 409,
         reason: { code: 'RUN_ADMISSION_CONFLICT', classification },
@@ -2959,7 +2960,7 @@ describe('owned initial workflow admission', () => {
         .run(...initial.slice(0, 6));
       return batch(statements);
     });
-    const error = await h.admit().catch((error: unknown) => error);
+    const error = await h.admit().catch((failure: unknown) => failure);
     expect(error).toMatchObject({
       reason: { code: 'RUN_ADMISSION_CONFLICT', classification: 'run-exists' },
     });
@@ -2987,7 +2988,7 @@ describe('owned initial workflow admission', () => {
         h.sql.exec(change);
         return result;
       });
-      const error = await h.admit().catch((error: unknown) => error);
+      const error = await h.admit().catch((failure: unknown) => failure);
       expect(error).toMatchObject({
         status: 503,
         reason: { code: 'EXECUTION_FENCE_UNREADABLE' },
@@ -3049,7 +3050,7 @@ describe('owned initial workflow admission', () => {
             );
         throw lost;
       });
-    const error = await h.admit().catch((error: unknown) => error);
+    const error = await h.admit().catch((failure: unknown) => failure);
     expect(error).toMatchObject({ status: 503, cause: lost });
     expect(isDefinitiveInitialAdmissionRefusal(error, h.input.execution)).toBe(
       false,
@@ -3085,7 +3086,7 @@ describe('owned initial workflow admission', () => {
           initial.results[0] = { ...initial.results[0], snapshot: '{}' };
         return result;
       });
-    const error = await h.admit().catch((error: unknown) => error);
+    const error = await h.admit().catch((failure: unknown) => failure);
     expect(error).toBeInstanceOf(ExecutionFenceUnreadableError);
     expect(isDefinitiveInitialAdmissionRefusal(error, h.input.execution)).toBe(
       false,
@@ -3203,7 +3204,7 @@ describe('owned initial workflow admission', () => {
       };
       const batch = vi.spyOn(candidate.db, 'batch');
       const error = await direct(candidate, { snapshot }).catch(
-        (error: unknown) => error,
+        (failure: unknown) => failure,
       );
       expect(error).toBeInstanceOf(InvalidExecutionIdentityError);
       expect(batch).not.toHaveBeenCalled();
@@ -3224,7 +3225,7 @@ describe('owned initial workflow admission', () => {
       .get();
     const error = await h
       .admit({ ...h.input, proof: undefined })
-      .catch((error: unknown) => error);
+      .catch((failure: unknown) => failure);
     expect(error).toMatchObject({
       status: 503,
       reason: { code: 'EXECUTION_FENCED', state },
@@ -3244,7 +3245,7 @@ describe('owned initial workflow admission', () => {
 
   it('requires a positive witness from the matching Core initial write', async () => {
     const h = await fixture({ persist: false });
-    const error = await h.admit().catch((error: unknown) => error);
+    const error = await h.admit().catch((failure: unknown) => failure);
     expect(error).toBeInstanceOf(ExecutionFenceUnreadableError);
     expect(h.onInitialWriteAttempt).not.toHaveBeenCalled();
     expect(isDefinitiveInitialAdmissionRefusal(error, h.input.execution)).toBe(
@@ -3282,7 +3283,7 @@ describe('owned initial workflow admission', () => {
             /* Deliberately swallowed to exercise the scope latch. */
           }
         })
-        .catch((error: unknown) => error);
+        .catch((failure: unknown) => failure);
       expect(error).toBeInstanceOf(InvalidExecutionIdentityError);
       expect(
         isDefinitiveInitialAdmissionRefusal(error, h.input.execution),

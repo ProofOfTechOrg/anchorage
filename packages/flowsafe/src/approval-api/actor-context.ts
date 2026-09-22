@@ -206,7 +206,7 @@ export function captureActorContext(source: ActorContext): ActorContext {
     service,
     newRunId,
     newThreadId,
-    resourceIdFromKey,
+    resourceIdFromKey: resolveResourceId,
     claimResource,
     releaseResource,
     resourceOwnerFor,
@@ -222,7 +222,7 @@ export function captureActorContext(source: ActorContext): ActorContext {
     service: () => service.call(source),
     newRunId: () => newRunId.call(source),
     newThreadId: () => newThreadId.call(source),
-    resourceIdFromKey: (key) => resourceIdFromKey.call(source, key),
+    resourceIdFromKey: (key) => resolveResourceId.call(source, key),
     claimResource: (kind, resourceId) =>
       claimResource.call(source, kind, resourceId),
     releaseResource: (kind, resourceId) =>
@@ -231,7 +231,7 @@ export function captureActorContext(source: ActorContext): ActorContext {
       resourceOwnerFor.call(source, kind, resourceId),
     canAccessResource: (kind, resourceId, access) =>
       canAccessResource.call(source, kind, resourceId, access),
-    canSelfDecide: (role) => canSelfDecide.call(source, role),
+    canSelfDecide: (actorRole) => canSelfDecide.call(source, actorRole),
   };
   return Object.freeze(captured);
 }

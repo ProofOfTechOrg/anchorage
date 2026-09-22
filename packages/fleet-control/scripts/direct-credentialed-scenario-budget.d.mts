@@ -28,6 +28,13 @@ export const DIRECT_SCENARIO_INVOCATION_BUDGET: Readonly<{
   'decommission-a': DirectScenarioPhaseBudget;
   'decommission-b': DirectScenarioPhaseBudget;
   'force-terminal-a': DirectScenarioPhaseBudget;
+  'reprovision-a': DirectScenarioPhaseBudget;
+  'continuation-start': DirectScenarioPhaseBudget;
+  'continuation-lock': DirectScenarioPhaseBudget;
+  'continuation-migrate': DirectScenarioPhaseBudget;
+  'continuation-refuse': DirectScenarioPhaseBudget;
+  'continuation-finish': DirectScenarioPhaseBudget;
+  'decommission-reprovisioned-a': DirectScenarioPhaseBudget;
   'force-recovery': DirectScenarioPhaseBudget;
   'force-observe': DirectScenarioPhaseBudget;
   'recover-force-residual': DirectScenarioPhaseBudget;

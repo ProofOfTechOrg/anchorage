@@ -190,7 +190,7 @@ async function provider(env: Env, invocationId: string) {
   async function respond({
     method,
     url,
-    body,
+    body: requestBody,
   }: ProviderRequest): Promise<Response> {
     if (url.origin !== 'https://api.cloudflare.com') {
       throw new Error(`unexpected inert-provider origin ${url.origin}`);
@@ -247,13 +247,13 @@ async function provider(env: Env, invocationId: string) {
           .all();
         return page(rows.results);
       }
-      if (method === 'POST' && body.name === 'packedlife') {
+      if (method === 'POST' && requestBody.name === 'packedlife') {
         await env.FIXTURE_DB.prepare(
           'INSERT INTO packed_provider_databases (id, name) VALUES (?, ?)',
         )
-          .bind(DATABASE_ID, body.name)
+          .bind(DATABASE_ID, requestBody.name)
           .run();
-        return single({ uuid: DATABASE_ID, name: body.name });
+        return single({ uuid: DATABASE_ID, name: requestBody.name });
       }
     }
     if (path === `${account}/d1/database/${DATABASE_ID}`) {
@@ -277,7 +277,9 @@ async function provider(env: Env, invocationId: string) {
       method === 'POST' &&
       path === `${account}/d1/database/${DATABASE_ID}/query`
     ) {
-      const statements = Array.isArray(body.batch) ? body.batch : [body];
+      const statements = Array.isArray(requestBody.batch)
+        ? requestBody.batch
+        : [requestBody];
       if (statements.some((statement) => statement.sql === MIGRATION)) {
         return failure('packed migration failure after identity seed');
       }
@@ -327,8 +329,8 @@ function transport(
       init?.method ?? (input instanceof Request ? input.method : 'GET')
     ).toUpperCase();
     const raw = init?.body;
-    const body = typeof raw === 'string' ? JSON.parse(raw) : {};
-    return respond({ method, url, body });
+    const requestBody = typeof raw === 'string' ? JSON.parse(raw) : {};
+    return respond({ method, url, body: requestBody });
   };
 }
 
@@ -410,7 +412,7 @@ async function queuedAuthority(env: Env, stale: boolean) {
   let heldB = false;
   const control = plane(
     env,
-    transport(async ({ method, url, body }) => {
+    transport(async ({ method, url, body: requestBody }) => {
       if (
         url.origin !== 'https://api.cloudflare.com' ||
         url.pathname !== '/client/v4/accounts/account/d1/database'
@@ -418,7 +420,9 @@ async function queuedAuthority(env: Env, stale: boolean) {
         throw new Error(`unexpected queue-probe URL ${url.href}`);
       }
       const name =
-        method === 'GET' ? url.searchParams.get('name') : String(body.name);
+        method === 'GET'
+          ? url.searchParams.get('name')
+          : String(requestBody.name);
       seen.push({ method, name, context: contexts.getStore() });
       if (method === 'GET' && name === b) {
         if (!heldB) {

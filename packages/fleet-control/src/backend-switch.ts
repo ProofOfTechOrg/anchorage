@@ -1186,11 +1186,15 @@ function decommissionSnapshot(
   const stateScriptName =
     resources?.stateWorker.scriptName ?? bridge?.scriptName;
   const serializedTargets = new Set<string>();
-  const routeTargets = snapshot.routeTargets.map((value, index) => {
-    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+  const routeTargets = snapshot.routeTargets.map((routeEntry, index) => {
+    if (
+      !routeEntry ||
+      typeof routeEntry !== 'object' ||
+      Array.isArray(routeEntry)
+    ) {
       throw new Error('backend switch state has invalid decommission route');
     }
-    const entry = value as Record<string, unknown>;
+    const entry = routeEntry as Record<string, unknown>;
     requireExactKeys(
       entry,
       ['release', 'target', 'routeTarget'],
@@ -2041,7 +2045,10 @@ function canonicalFleetRecordFromSource(
   }
   const tenantTag = source.tenantTag;
   const environment = source.environment;
-  const applicationResources = Object.hasOwn(source, 'applicationResources')
+  const parsedApplicationResources = Object.hasOwn(
+    source,
+    'applicationResources',
+  )
     ? applicationResourcesFromRecord(source.applicationResources)
     : undefined;
   const applicationBindings = Object.hasOwn(source, 'applicationBindings')
@@ -2054,7 +2061,7 @@ function canonicalFleetRecordFromSource(
     applicationBindings &&
     !sameCanonicalData(
       applicationBindings.r2Buckets,
-      (applicationResources ?? []).map(
+      (parsedApplicationResources ?? []).map(
         ({ name, bucketName, jurisdiction }) => ({
           name,
           bucketName,
@@ -2194,7 +2201,9 @@ function canonicalFleetRecordFromSource(
     ...(shell ? { decommissionIntent: shell } : {}),
     // cleanupIntent is unconditionally rejected above and never emitted here.
     ...(invocationAuthority ? { invocationAuthority } : {}),
-    ...(applicationResources ? { applicationResources } : {}),
+    ...(parsedApplicationResources
+      ? { applicationResources: parsedApplicationResources }
+      : {}),
     ...(applicationBindings ? { applicationBindings } : {}),
     ...(typeof source.durableObjectTag === 'string'
       ? { durableObjectTag: source.durableObjectTag }
@@ -2530,13 +2539,13 @@ export function normalizeSwitchDecommissionEntry(
     throw new Error('backend switch decommission authorization was lost');
   }
   const stable = withoutConsumedSwitchEntryCarriers(record);
-  const applicationResources = switchTeardownApplicationResources(intent);
+  const teardownResources = switchTeardownApplicationResources(intent);
   return {
     ...stable,
     desiredSpecDigest: snapshot.desiredSpecDigest,
     backendSwitchIntent: intent,
     decommissionIntent: shell,
-    applicationResources,
+    applicationResources: teardownResources,
     phase: 'decommission-advancing',
     updatedAt: shell.updatedAt,
   };
@@ -3139,7 +3148,7 @@ export async function reconcileFinalizedBackendSwitchState(input: {
   if (!authorizedIntent) {
     throw new Error('finalized state authorization lost switch intent');
   }
-  const next: FleetRecord = {
+  const nextRecord: FleetRecord = {
     ...committed,
     backendSwitchIntent: {
       ...authorizedIntent,
@@ -3162,8 +3171,8 @@ export async function reconcileFinalizedBackendSwitchState(input: {
       input.target.stateDurableObjectHistoryDigest,
     updatedAt: new Date(input.clock()).toISOString(),
   };
-  await input.lease.put(next);
-  return next;
+  await input.lease.put(nextRecord);
+  return nextRecord;
 }
 
 function assertExternalTarget(spec: DeploymentSpec): void {
@@ -4192,23 +4201,21 @@ async function decommissionBackendSwitchLegacy(options: {
         intent.subphase === 'decommission-bridge-removed' ||
         intent.subphase === 'decommission-application-r2-authorized'
       ) {
-        const applicationR2Progress =
+        const settledR2Progress =
           intent.applicationR2Progress ??
           snapshot.applicationResources.map((resource) => ({
             resource,
             subphase: resource.state,
           }));
         intent = next(intent, 'decommission-application-r2-authorized', {
-          applicationR2Progress,
+          applicationR2Progress: settledR2Progress,
         });
         await lease.put(intent);
         let r2Intent: BackendSwitchIntent = intent;
 
         await convergeApplicationR2Deletion({
           spec: options.targetSpec,
-          resources: applicationR2Progress.map(
-            applicationR2ResourceFromProgress,
-          ),
+          resources: settledR2Progress.map(applicationR2ResourceFromProgress),
           backend: {
             findApplicationR2Bucket: (resource) =>
               options.provider.findSwitchApplicationR2(resource),
@@ -4250,15 +4257,17 @@ async function decommissionBackendSwitchLegacy(options: {
           intent,
           'decommission-export-authorized',
         );
-        const databaseExport = await options.provider.exportSwitchDatabase({
+        const exportResult = await options.provider.exportSwitchDatabase({
           prior: intent.prior,
           targetSpec: options.targetSpec,
           fence: lease,
         });
-        if (databaseExport.databaseId !== intent.prior.databaseId) {
+        if (exportResult.databaseId !== intent.prior.databaseId) {
           throw new Error('backend switch export changed database identity');
         }
-        intent = next(intent, 'decommission-exported', { databaseExport });
+        intent = next(intent, 'decommission-exported', {
+          databaseExport: exportResult,
+        });
         await lease.put(intent);
       }
       if (
@@ -4894,13 +4903,13 @@ async function putBackendSwitchOwnership(
   patch: Partial<FleetRecord> = {},
 ): Promise<FleetRecord> {
   const current = lease.current();
-  const applicationResources = switchTeardownApplicationResources(switchIntent);
+  const teardownResources = switchTeardownApplicationResources(switchIntent);
   const nextRecord: FleetRecord = {
     ...current,
     ...patch,
     backendSwitchIntent: switchIntent,
     decommissionIntent: shell,
-    applicationResources,
+    applicationResources: teardownResources,
     phase:
       shell.state === 'complete' ? 'decommissioned' : 'decommission-advancing',
     updatedAt: current.updatedAt,

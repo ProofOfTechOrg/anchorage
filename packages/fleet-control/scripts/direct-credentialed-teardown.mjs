@@ -2,12 +2,9 @@
 
 import { isDeepStrictEqual } from 'node:util';
 
+import { databaseExportReceiptKey } from '../src/export-file-name.ts';
 import { validateDirectConformanceConfig } from './direct-credentialed-conformance-config.mjs';
 import {
-  bucketPages,
-  classifyDispatchNamespaces,
-  identifier,
-  inventory,
   openDirectProviderSession,
   probeAbsent,
   providerErrorFrom,
@@ -21,8 +18,10 @@ import {
   DIRECT_TEARDOWN_RECOVERABLE_FAILURES,
   REFERENCE_SECRET_NAMES,
 } from './direct-credentialed-reference-vocabulary.mjs';
+import { listDirectCredentialedResiduals } from './direct-credentialed-residual-listing.mjs';
 import {
   DirectRunStateError,
+  isAbandonedDirectScenario,
   mutationPending,
 } from './direct-credentialed-run-state.mjs';
 
@@ -41,10 +40,10 @@ const OBJECT_SETTLE_DELAY_MS = 2_000;
 // binds, sorted because a listing's order is the provider's. Reading the
 // upload's own list makes a bootstrap-side change visible here.
 const EXPECTED_SECRET_NAMES = Object.freeze([...REFERENCE_SECRET_NAMES].sort());
-// Exactly the two receipt objects a complete scenario exports; the journal's
+// Exactly the three receipt objects a complete scenario exports; the journal's
 // `exportObjects` maximum bounds what a record may carry and is not this
 // expectation.
-const CONFIRMED_EXPORT_KEYS = 2;
+const CONFIRMED_EXPORT_KEYS = 3;
 const BOOTSTRAP_RECEIPTS = Object.freeze([
   'fleet',
   'quota',
@@ -170,18 +169,22 @@ export function survivingIdentities(bootstrap, receipts) {
   });
 }
 
-function confirmedExportKeys(scenario, prefix) {
+function confirmedExportKeys(scenario, prefix, allowPartial) {
   const keys = [];
   const add = (proof) => {
     const receipt = proof?.receipt;
-    if (!receipt) refuse('invalid-state');
-    const key = `${prefix}/receipts/v1/${receipt.databaseId}/${receipt.operationId}.sql`;
+    if (!receipt) {
+      if (allowPartial) return;
+      refuse('invalid-state');
+    }
+    const key = databaseExportReceiptKey(prefix, receipt);
     if (!keys.includes(key)) keys.push(key);
   };
   add(scenario?.proofs.exports.a);
   add(scenario?.proofs.exports.b);
-  for (const proof of scenario?.proofs.exportVerifications ?? []) add(proof);
-  if (keys.length !== CONFIRMED_EXPORT_KEYS) refuse('invalid-state');
+  add(scenario?.proofs.reprovisionExports.a);
+  if (!allowPartial && keys.length !== CONFIRMED_EXPORT_KEYS)
+    refuse('invalid-state');
   return keys;
 }
 
@@ -260,22 +263,24 @@ export async function teardownDirectReference(input) {
     const names = bootstrap.context.names;
     const script = names.referenceWorker;
     const bucket = bootstrap.exports.name;
+    const receiptsPrefix = `${prefix}/receipts/v1/`;
     const zoneId = bootstrap.context.zoneId;
     // A recorded refusal is terminal for automation unless its reason is one a
-    // later run clears: an incomplete scenario, or an invocation, bootstrap or
-    // teardown mutation whose outcome was unknown. Each of those reasons is
-    // re-checked by the guard that raises it — the scenario operands in this
-    // expression, `mutationPending` above, and `mutate`'s own re-probe for the
-    // refusal it records; an identity mismatch, a forbidden answer and an
-    // exhausted budget stay terminal.
+    // later run clears. Teardown does not reconcile an invocation-level
+    // outcome-unknown; it only resumes its own pending provider mutation.
+    const abandoned = isAbandonedDirectScenario(snapshot.scenario);
+    const sweptAbandoned = abandoned && snapshot.sweep?.phase === 'complete';
     const refusing =
       (teardown?.phase === 'refused' &&
         !DIRECT_TEARDOWN_RECOVERABLE_FAILURES.includes(teardown.failure)) ||
-      snapshot.scenario?.phase !== 'complete' ||
-      snapshot.scenario.failure !== null;
+      // D-CC-24/25 permit an incomplete abandoned scenario to delete only
+      // after its lifecycle sweep has removed the tenant deployments.
+      (!sweptAbandoned &&
+        (snapshot.scenario?.phase !== 'complete' ||
+          snapshot.scenario.failure !== null));
     const confirmed = refusing
       ? []
-      : confirmedExportKeys(snapshot.scenario, prefix);
+      : confirmedExportKeys(snapshot.scenario, prefix, sweptAbandoned);
     const session = await openDirectProviderSession({
       apiToken,
       fetchRequest: (target, init) => {
@@ -314,79 +319,28 @@ export async function teardownDirectReference(input) {
           .filter((value) => value.startsWith(prefix));
       const listed = (page, field) =>
         surface(matching(page.rows, field), page.exhaustive, page.rows.length);
-      const databaseRowKeys = (row) => {
-        identifier(row.name);
-        return [identifier(row.uuid)];
-      };
-      const databases = await inventory(
-        numbered.d1.database.list({ ...selectors, name: prefix }),
-        databaseRowKeys,
-        bound,
-      );
-      const allDatabases = disposable
-        ? await inventory(
-            numbered.d1.database.list(selectors),
-            databaseRowKeys,
-            bound,
-          )
-        : [];
-      const namespaces = await inventory(
-        numbered.durableObjects.namespaces.list(selectors),
-        (row) => [`id:${identifier(row.id)}`],
-        bound,
-      );
-      const scripts = await singlePage(single.workers.scripts.list(selectors));
-      const buckets = await bucketPages({
+      const listings = await listDirectCredentialedResiduals({
         sdk,
+        numbered,
+        single,
+        APIError,
         selectors,
-        jurisdiction: 'default',
+        zoneId,
+        prefix,
         bound,
+        disposable,
       });
       // Both listings are scoped to the zone the bootstrap recorded, so the
       // `globalCount` each contributes below covers that zone and not the
       // account — the scope `bucketJurisdictions` records for the bucket count.
-      const domains = await singlePage(
-        single.workers.domains.list({ ...selectors, zone_id: zoneId }),
-      );
-      const routes = await singlePage(
-        single.workers.routes.list({ zone_id: zoneId }),
-      );
-      let queues;
-      try {
-        queues = await singlePage(single.queues.list(selectors));
-      } catch (error) {
-        // A 404 is read as an account that carries no queue collection. No
-        // provider capture in this repository attests that reading, so the
-        // empty page it stands in for is recorded `exhaustive: false` and the
-        // counts below are this reading rather than a page the provider sent.
-        if (!(error instanceof APIError) || error.status !== 404) throw error;
-        queues = { rows: [], exhaustive: false };
-      }
-      let dispatch;
-      try {
-        const classified = await classifyDispatchNamespaces(
-          single,
-          selectors,
-          bound,
-        );
-        dispatch = Object.freeze({
-          kind: classified.kind,
-          count: classified.count,
-          status: null,
-          prefixCount: classified.names.filter(
-            (name) => typeof name === 'string' && name.startsWith(prefix),
-          ).length,
-        });
-      } catch (error) {
-        if (!(error instanceof APIError) || providerErrorFrom(error))
-          throw error;
-        dispatch = Object.freeze({
-          kind: 'fail-closed',
-          count: 0,
-          status: error.status ?? null,
-          prefixCount: 0,
-        });
-      }
+      const dispatch = Object.freeze({
+        kind: listings.dispatch.kind,
+        count: listings.dispatch.count,
+        status: listings.dispatch.status,
+        prefixCount: listings.dispatch.names.filter(
+          (name) => typeof name === 'string' && name.startsWith(prefix),
+        ).length,
+      });
       let versionsGone = null;
       if (receipts.worker) {
         let page;
@@ -405,20 +359,24 @@ export async function teardownDirectReference(input) {
         version: 1,
         surfaces: {
           databases: surface(
-            matching(databases, 'name'),
-            true,
-            allDatabases.length,
+            matching(listings.databases.rows, 'name'),
+            listings.databases.exhaustive,
+            listings.allDatabases.rows.length,
           ),
           durableObjectNamespaces: surface(
-            matching(namespaces, 'script'),
-            true,
-            namespaces.length,
+            matching(listings.namespaces.rows, 'script'),
+            listings.namespaces.exhaustive,
+            listings.namespaces.rows.length,
           ),
-          scripts: listed(scripts, 'id'),
-          buckets: surface(matching(buckets, 'name'), true, buckets.length),
-          domains: listed(domains, 'service'),
-          routes: listed(routes, 'script'),
-          queues: listed(queues, 'queue_name'),
+          scripts: listed(listings.scripts, 'id'),
+          buckets: surface(
+            matching(listings.buckets.rows, 'name'),
+            listings.buckets.exhaustive,
+            listings.buckets.rows.length,
+          ),
+          domains: listed(listings.domains, 'service'),
+          routes: listed(listings.routes, 'script'),
+          queues: listed(listings.queues, 'queue_name'),
         },
         bucketJurisdictions: ['default'],
         dispatch,
@@ -426,17 +384,17 @@ export async function teardownDirectReference(input) {
         settleAttempts: 1,
       };
     };
-    const isSettled = (observation) =>
+    const isSettled = (settleObservation) =>
       DIRECT_RESIDUAL_SURFACES.every((name) => {
-        const entry = observation.surfaces[name];
+        const entry = settleObservation.surfaces[name];
         return (
           entry.prefixCount === 0 &&
           (entry.globalCount === null || entry.globalCount === 0)
         );
       }) &&
-      observation.versionsGone !== false &&
-      observation.dispatch.kind !== 'fail-closed' &&
-      observation.dispatch.prefixCount === 0;
+      settleObservation.versionsGone !== false &&
+      settleObservation.dispatch.kind !== 'fail-closed' &&
+      settleObservation.dispatch.prefixCount === 0;
     const settle = async (attempts) => {
       let observation;
       for (let attempt = 1; attempt <= attempts; attempt += 1) {
@@ -477,8 +435,11 @@ export async function teardownDirectReference(input) {
       const pending = teardown?.pending ?? null;
       if (pending && (pending.kind !== kind || pending.key !== key))
         refuse('invalid-state');
-      const merged = (settledByReread) => {
-        const entry = { ...receipt(), ...settlement(settledByReread) };
+      const merged = (receiptSettledByReread) => {
+        const entry = {
+          ...receipt(),
+          ...settlement(receiptSettledByReread),
+        };
         return {
           ...receipts,
           [field]: append ? [...receipts[field], entry] : entry,
@@ -613,7 +574,13 @@ export async function teardownDirectReference(input) {
               ordinal: ceiling,
               settledByReread: true,
             },
-            exportObjects: confirmed.map((key) => ({
+            exportObjects: (sweptAbandoned
+              ? Array.from(
+                  { length: DIRECT_TEARDOWN_MAXIMA.exportObjects },
+                  (_entry, index) => `${receiptsPrefix}capacity-${index}`,
+                )
+              : confirmed
+            ).map((key) => ({
               key,
               ordinal: ceiling,
               settledByReread: true,
@@ -730,7 +697,7 @@ export async function teardownDirectReference(input) {
           single.r2.buckets.objects.list(bucket, {
             ...selectors,
             jurisdiction: 'default',
-            ...(scoped ? { prefix: `${prefix}/receipts/v1/` } : {}),
+            ...(scoped ? { prefix: receiptsPrefix } : {}),
           }),
         )
       ).rows;
@@ -740,17 +707,38 @@ export async function teardownDirectReference(input) {
           refuse('unexpected-object');
       return rows;
     };
+    const admitAbandonedKeys = (rows) => {
+      for (const row of rows) {
+        const key = row?.key;
+        if (typeof key !== 'string' || !key.startsWith(receiptsPrefix))
+          refuse('unexpected-object');
+        if (!confirmed.includes(key)) confirmed.push(key);
+      }
+      if (
+        new Set([
+          ...confirmed,
+          ...receipts.exportObjects.map((entry) => entry.key),
+        ]).size > DIRECT_TEARDOWN_MAXIMA.exportObjects
+      )
+        refuse('unexpected-object');
+      return rows;
+    };
     // One attestation for the whole bucket sequence: the first call proves the
     // bucket, and each delete's `identity` reads that same proof.
     let attested;
     const attestBucket = () => (attested ??= bucketIdentity());
-    if (receipts.exportObjects.length < confirmed.length) {
+    if (
+      !receipts.exports &&
+      (sweptAbandoned || receipts.exportObjects.length < confirmed.length)
+    ) {
       // Ownership is attested before the content checks, so an unexpected
       // object cannot pre-empt the proof that this is the run's own bucket.
       // An absent bucket refuses as `provider-unavailable` here exactly as it
       // does from the listings.
       await attestBucket();
-      inspect(await listObjects(true));
+      const scoped = await listObjects(true);
+      if (sweptAbandoned) admitAbandonedKeys(scoped);
+      else inspect(scoped);
       inspect(await listObjects(false));
       for (const key of confirmed) {
         if (receipts.exportObjects.some((entry) => entry.key === key)) continue;

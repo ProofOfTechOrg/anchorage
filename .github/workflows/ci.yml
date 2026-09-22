@@ -58,7 +58,7 @@ jobs:
         run: pnpm typecheck
 
       # Root vitest workspace: every package's suite in one process, minus the
-      # direct scenario project, which the `direct-scenario` job below runs at
+      # direct scenario projects, which the jobs below run at
       # the same time. The Typecheck step above produces the fleet-control dist
       # this step consumes: fleet-control's `pretypecheck` runs its `prebuild`
       # and `build`. The cap is about 1.8x the slowest measured run of this step
@@ -70,6 +70,12 @@ jobs:
 
       - name: Build
         run: pnpm build
+
+      # The `mint` cases in scripts/entry-point.test.mjs run the agent-starter
+      # token script against flowsafe's built `approval-api` entry, so this step
+      # needs the Build step's output.
+      - name: Test root Node tools
+        run: pnpm test:node-tools
 
       - name: Check documentation
         run: pnpm docs:check
@@ -160,12 +166,11 @@ jobs:
       - name: Conformance artifacts verify (workerd)
         run: pnpm conformance:verify
 
-  # The direct credentialed scenario and the offline fence suite: full
-  # scenario runs against the reference and tenant Workers on local workerd,
-  # about 35 minutes, independent of every `verify-core` step. The suites
-  # import @proofoftech/flowsafe subpaths and the fleet-control package from
-  # their dists, so the job builds fleet-control (whose prebuild builds
-  # breakwater and flowsafe) before running them.
+  # The direct credentialed scenario and offline fence suites run against the
+  # reference and tenant Workers on local workerd in about 35 minutes,
+  # independent of every `verify-core` step. They import flowsafe subpaths and
+  # fleet-control from their dists, so this job builds fleet-control and its
+  # prerequisites before running them.
   direct-scenario:
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -187,22 +192,48 @@ jobs:
         run: pnpm --filter @proofoftech/fleet-control build
 
       - name: Direct scenario suites (workerd)
-        run: pnpm test:direct-scenario
+        run: pnpm test:direct-scenario:fast
+
+  # The process-loss direct scenario suites run in their own project. They
+  # import flowsafe subpaths and fleet-control from their dists, so this job
+  # builds fleet-control and its prerequisites before running them.
+  direct-scenario-seams:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      # Reads the pnpm version from package.json "packageManager".
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+
+      - name: Build fleet-control and its prerequisites
+        run: pnpm --filter @proofoftech/fleet-control build
+
+      - name: Direct scenario process-loss suites (workerd)
+        run: pnpm test:direct-scenario:seams
 
   # The `protect main` ruleset requires the status check named `verify`. This
   # job is that check: it depends on the gating jobs and fails unless `needs`
   # carries at least one entry and every entry reports success, so a red or
-  # cancelled `direct-scenario` blocks a merge to main exactly as a red
-  # `verify-core` does, a job added to `needs` is gating without a further edit
-  # (the assertion reads the whole `needs` context), and an emptied `needs`
-  # list fails the check instead of passing it with nothing verified.
+  # cancelled direct-scenario job blocks a merge to main exactly as a red
+  # `verify-core` does. A job added to `needs` is gating without a further edit
+  # because the assertion reads the whole context, and an emptied `needs` list
+  # fails the check instead of passing it with nothing verified.
   # `if: always()` makes the job run when a dependency fails or is cancelled;
   # without it the job would be skipped, and GitHub reports a skipped job as
   # success for a required check.
   verify:
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    needs: [verify-core, direct-scenario]
+    needs: [verify-core, direct-scenario, direct-scenario-seams]
     if: always()
     steps:
       - name: Require a non-empty needs context in which every job succeeded
@@ -215,7 +246,7 @@ jobs:
   # Mastra compat matrix: the libraries pin behavioral contracts to
   # @mastra/core internals (resume-context merge-over semantics, snapshot
   # shape, the reprocess-part key, the adapter's table inventory). The supported
-  # peer is exactly 1.53.0; run the library suites against the newest
+  # peer is exactly 1.67.0; run the library suites against the newest
   # published 1.x as a signal for a deliberate future compatibility update.
   # Tripwires the job exercises include the runtime.test.ts merge pin, the
   # ProcessorRunner reprocess-key probe, mastra-schema-guard, the
@@ -227,10 +258,9 @@ jobs:
   mastra-compat:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    # Signal, not merge gate: an upstream @mastra/core release that trips a
-    # tripwire must not wedge unrelated PRs. Red here = investigate before the
-    # next release, not before the next merge.
-    continue-on-error: true
+    # A signal, not a merge gate: a probe failure against the newest core reds
+    # this job, and `verify`'s `needs` list does not name it, so that red is a
+    # release investigation rather than a merge blocker.
     steps:
       - uses: actions/checkout@v4
 
@@ -253,31 +283,57 @@ jobs:
       # @mastra/* exclude does not cover and which would wedge the probe on
       # ERR_PNPM_NO_MATURE_MATCHING_VERSION. Scoped to this one resolution;
       # every real install keeps the workspace gate.
-      # The workspace pins packages/flowsafe/patches/@mastra__core@1.53.0.patch
-      # to @mastra/core@1.53.0 through pnpm.patchedDependencies, and pnpm
-      # refuses an install whose patch targets a version no longer in the
-      # graph. This job drops that entry in its disposable checkout and
-      # resolves the newest core unpatched. What the run then reports includes:
-      # the typecheck below, whose red names a type the newest core changed —
-      # today MastraStorageDomains gains workflowDefinitions and knowledge,
-      # which packages/flowsafe/src/do-runner/d1-storage.ts's exhaustive
-      # capture refuses until the pin moves; both packages' surface
-      # inventories, whose red names either the member nobody has read yet or
-      # the skew row that stopped being true, in its own message; and
-      # notification-source-keys.test.ts, which reports whether that core still
-      # needs the pinned patch. Its probe cases fail and its patched-behavior
-      # blocks skip while the seam is open upstream; on a core carrying both
-      # patch subjects upstream the blocks run rather than skip, and the run
-      # here is what confirms they pass. See the maintainer guide's Mastra
-      # compatibility section.
+      # What the run reports includes: the typecheck below, whose red names a
+      # type the newest core changed, such as a storage domain that
+      # packages/flowsafe/src/do-runner/d1-storage.ts's exhaustive capture does
+      # not name; both packages' surface inventories, whose red names either
+      # the member nobody has read yet or the skew row that stopped being true,
+      # in its own message; and notification-source-keys.test.ts, whose cases
+      # hold the newest core to the own-key behaviour mastra-ai/mastra#23693
+      # and #23694 fixed. See the maintainer guide's Mastra compatibility
+      # section.
       - name: Bump @mastra/core to newest 1.x
         id: mastra_versions
         run: |
-          CORE_VERSION=$(npm view '@mastra/core@^1' version --json | node -e 'const d=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(Array.isArray(d)?d.at(-1):d)')
-          D1_VERSION=$(npm view '@mastra/cloudflare-d1@^1' version --json | node -e 'const d=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(Array.isArray(d)?d.at(-1):d)')
+          BASELINE_CORE=$(node -p "require('./packages/breakwater/package.json').devDependencies['@mastra/core']")
+          BASELINE_D1=$(node -p "require('./packages/flowsafe/package.json').dependencies['@mastra/cloudflare-d1']")
+          # A registry blip reds the probe for the wrong reason, so a lookup is
+          # retried; an E404 is a permanent answer that ends the attempts.
+          # Errexit does not reach inside `$( )`, so the function tests each
+          # stage itself: the lookup through `if`, the reduction through `||`
+          # and a non-empty result. The fetch bounds keep one attempt from
+          # spending the job's budget inside npm's own retries.
+          newest_version() {
+            local attempt output version
+            for attempt in 1 2 3; do
+              [ "$attempt" -eq 1 ] || sleep 20
+              if output=$(timeout --signal=KILL 90s npm view "$1" version --json --fetch-timeout=30000 --fetch-retries=1 --fetch-retry-mintimeout=1000 --fetch-retry-maxtimeout=5000); then
+                version=$(printf '%s' "$output" | node -e 'const d=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(Array.isArray(d)?d.at(-1):d)') || return 1
+                [ -n "$version" ] || return 1
+                printf '%s\n' "$version"
+                return 0
+              else
+                status=$?
+              fi
+              if [ "$status" -eq 1 ]; then
+                case "$output" in *E404*) break ;; esac
+              fi
+              case "$status" in
+                125|126|127)
+                  printf 'timeout wrapper failed with status %s\n' "$status" >&2
+                  return 1
+                  ;;
+              esac
+            done
+            printf 'npm view %s failed: %s\n' "$1" "$output" >&2
+            return 1
+          }
+          CORE_VERSION=$(newest_version '@mastra/core@^1')
+          D1_VERSION=$(newest_version '@mastra/cloudflare-d1@^1')
           echo "core=$CORE_VERSION" >> "$GITHUB_OUTPUT"
           echo "d1=$D1_VERSION" >> "$GITHUB_OUTPUT"
-          node -e 'const fs=require("node:fs");const m=JSON.parse(fs.readFileSync("package.json","utf8"));delete m.pnpm.patchedDependencies;fs.writeFileSync("package.json",`${JSON.stringify(m,null,2)}\n`)'
+          echo "baseline_core=$BASELINE_CORE" >> "$GITHUB_OUTPUT"
+          echo "baseline_d1=$BASELINE_D1" >> "$GITHUB_OUTPUT"
           pnpm -r update --config.minimum-release-age=0 "@mastra/core@$CORE_VERSION" "@mastra/cloudflare-d1@$D1_VERSION"
           pnpm --filter @proofoftech/breakwater list @mastra/core
           pnpm --filter @proofoftech/flowsafe list @mastra/core @mastra/cloudflare-d1
@@ -287,40 +343,54 @@ jobs:
       # run means nothing.
       - name: Assert the newest 1.x packages are installed
         env:
+          BASELINE_CORE: ${{ steps.mastra_versions.outputs.baseline_core }}
+          BASELINE_D1: ${{ steps.mastra_versions.outputs.baseline_d1 }}
           EXPECTED_CORE: ${{ steps.mastra_versions.outputs.core }}
           EXPECTED_D1: ${{ steps.mastra_versions.outputs.d1 }}
         run: |
           INSTALLED_CORE=$(pnpm --filter @proofoftech/breakwater exec node -p 'require("@mastra/core/package.json").version')
           INSTALLED_D1=$(pnpm --filter @proofoftech/flowsafe exec node -p 'require("@mastra/cloudflare-d1/package.json").version')
-          echo "core: expected=$EXPECTED_CORE installed=$INSTALLED_CORE"
-          echo "d1: expected=$EXPECTED_D1 installed=$INSTALLED_D1"
+          relation() {
+            node -e 'const [baseline,requested]=process.argv.slice(1); const valid=/^\d+\.\d+\.\d+$/; if(!valid.test(baseline)||!valid.test(requested)){console.error(`unusable version pair ${baseline} / ${requested}`);process.exit(2);} const order=(left,right)=>{const a=left.split(".").map(Number);const b=right.split(".").map(Number);for(let i=0;i<a.length;i+=1){if(a[i]!==b[i])return a[i]-b[i];}return 0;}; if(baseline===requested)console.log("equality");else if(order(requested,baseline)>0)console.log("newer");else{console.error(`requested ${requested} is older than baseline ${baseline}`);process.exit(1);}' "$1" "$2"
+          }
+          CORE_COVERAGE=$(relation "$BASELINE_CORE" "$EXPECTED_CORE")
+          D1_COVERAGE=$(relation "$BASELINE_D1" "$EXPECTED_D1")
+          echo "core: baseline=$BASELINE_CORE requested=$EXPECTED_CORE installed=$INSTALLED_CORE coverage=$CORE_COVERAGE" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "d1: baseline=$BASELINE_D1 requested=$EXPECTED_D1 installed=$INSTALLED_D1 coverage=$D1_COVERAGE" | tee -a "$GITHUB_STEP_SUMMARY"
           test "$EXPECTED_CORE" = "$INSTALLED_CORE"
           test "$EXPECTED_D1" = "$INSTALLED_D1"
 
-      # Step-level continue-on-error, not just the job's: a red step would
-      # otherwise skip the bundling and tripwire steps below.
+      # continue-on-error keeps an expected red from skipping the bundling and
+      # tripwire steps below; the final step is what carries the outcome to the
+      # job status.
       - name: Typecheck libraries against newest core
         id: typecheck
         continue-on-error: true
         run: pnpm --filter @proofoftech/breakwater typecheck && pnpm --filter @proofoftech/flowsafe typecheck
 
       # Bundles the flowsafe spike Worker so this job can see a published-dist
-      # bundling regression that typecheck and test structurally cannot — today
-      # mastra-ai/mastra#20638, which the newest core is EXPECTED to trip.
-      # Step-level continue-on-error, not just the job's: a red step would
-      # otherwise skip the tripwire suites below.
+      # bundling regression that typecheck and test structurally cannot.
       - name: Bundle the flowsafe spike Worker against newest core
         id: bundle
         continue-on-error: true
         run: pnpm --filter @proofoftech/flowsafe spike:bundle-check
 
-      # Step-level continue-on-error hides these results from the job status by
-      # design; surface them on the run summary so a flip (upstream fix, or a
-      # new regression) is visible without opening the log.
-      - name: Report typecheck and bundling outcomes
+      - name: Test libraries against newest core
+        id: tests
+        run: pnpm --filter @proofoftech/breakwater test && pnpm --filter @proofoftech/flowsafe test
+
+      # The typecheck and bundle steps swallow their own status, so this step
+      # is what carries a red probe to the job status; the tripwire suites red
+      # it themselves. The summary lines report a flip (upstream fix, or a new
+      # regression) without opening the log, and the condition reaches them
+      # past a red suite without running after cancellation.
+      - name: Fail the job on a red probe
+        id: probe_outcome
+        if: ${{ !cancelled() }}
         run: |
           echo "library typecheck against newest core: ${{ steps.typecheck.outcome }}" >> "$GITHUB_STEP_SUMMARY"
           echo "spike bundle against newest core: ${{ steps.bundle.outcome }}" >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Test libraries against newest core
-        run: pnpm --filter @proofoftech/breakwater test && pnpm --filter @proofoftech/flowsafe test
+          echo "library suites against newest core: ${{ steps.tests.outcome }}" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ steps.typecheck.outcome }}" = failure ] || [ "${{ steps.bundle.outcome }}" = failure ]; then
+            exit 1
+          fi

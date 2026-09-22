@@ -590,16 +590,19 @@ class FakeApi implements WorkersForPlatformsApi {
 
   async putControlSecrets(
     scriptName: string,
-    secrets: Readonly<Record<string, string>>,
+    deploymentSecrets: Readonly<Record<string, string>>,
   ): Promise<void> {
     this.calls.push('control-secrets');
-    this.controlSecrets.set(scriptName, { ...secrets });
-    this.controlSecretUpdates.push({ scriptName, secrets: { ...secrets } });
+    this.controlSecrets.set(scriptName, { ...deploymentSecrets });
+    this.controlSecretUpdates.push({
+      scriptName,
+      secrets: { ...deploymentSecrets },
+    });
     const live = this.controlWorkers.get(scriptName);
     if (live) {
       this.controlWorkers.set(scriptName, {
         ...live,
-        secretNames: Object.keys(secrets).sort(),
+        secretNames: Object.keys(deploymentSecrets).sort(),
       });
     }
   }

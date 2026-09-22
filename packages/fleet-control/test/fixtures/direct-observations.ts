@@ -4,9 +4,13 @@ import { createHash } from 'node:crypto';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { buildDirectConformanceArtifacts } from '../../scripts/direct-credentialed-artifacts.mjs';
 import { preflightDirectConformance } from '../../scripts/direct-credentialed-conformance-preflight.mjs';
 import type { DirectExpectedWorkerVersion } from '../../scripts/direct-credentialed-observations.mjs';
-import { openDirectRunState } from '../../scripts/direct-credentialed-run-state.mjs';
+import {
+  type DirectRunJournal,
+  openDirectRunState,
+} from '../../scripts/direct-credentialed-run-state.mjs';
 import type { DirectReferenceAction } from '../../scripts/direct-reference-contract.mjs';
 import type { DirectDecommissionExportMetadata } from '../../scripts/direct-reference-lifecycle.js';
 
@@ -26,6 +30,17 @@ export type ObservationHook = (
   fallback: () => Response,
 ) => Response | Promise<Response>;
 
+export async function closeDirectObservationFixture(
+  journal: Pick<DirectRunJournal, 'close'>,
+  directory: string,
+): Promise<void> {
+  try {
+    await journal.close();
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
 export async function directObservationFixture(
   timeout = 1000,
   stage:
@@ -37,6 +52,7 @@ export async function directObservationFixture(
     invocationTimeoutMs?: number;
     maxProviderRequests?: number;
     maxInvocations?: number;
+    nativeArtifacts?: boolean;
   }> = {},
 ) {
   const directory = await mkdtemp(join(tmpdir(), 'direct-observations-'));
@@ -65,14 +81,23 @@ export async function directObservationFixture(
   };
   config.referenceWorker.requestTimeoutMs = timeout;
   config.referenceWorker.invocationTimeoutMs = 2000;
-  Object.assign(config.referenceWorker, runtimeOptions);
-  const configPath = join(directory, 'config.json');
+  const { nativeArtifacts = false, ...referenceRuntime } = runtimeOptions;
+  Object.assign(config.referenceWorker, referenceRuntime);
+  const inputConfigPath = join(directory, 'config.json');
   await Promise.all([
-    writeFile(configPath, JSON.stringify(config)),
+    writeFile(inputConfigPath, JSON.stringify(config)),
     writeFile(join(directory, 'reference.mjs'), reference),
     writeFile(join(directory, 'tenant.mjs'), tenant),
   ]);
-  const prepared = await preflightDirectConformance({ configPath });
+  const built = nativeArtifacts
+    ? await buildDirectConformanceArtifacts({
+        configPath: inputConfigPath,
+        outputDirectory: join(directory, 'built'),
+      })
+    : undefined;
+  const configPath = built?.configPath ?? inputConfigPath;
+  const prepared =
+    built?.prepared ?? (await preflightDirectConformance({ configPath }));
   const journal = await openDirectRunState({
     configPath,
     prepared,
@@ -83,7 +108,7 @@ export async function directObservationFixture(
   async function settle(action: DirectReferenceAction) {
     const reservation = await journal.reserveInvocation(
       JSON.stringify({
-        contractVersion: 1,
+        contractVersion: 2,
         configSha256: prepared.configSha256,
         action,
       }),
@@ -192,6 +217,7 @@ export async function directObservationFixture(
             : target.specDigest,
         APPLICATION_RELEASE:
           current && weights[0]?.version_id !== target.versionId ? '1' : '2',
+        APPROVAL_ALLOW_SELF_DECISION: 'true',
       }).map(([name, text]) => ({ name, type: 'plain_text', text })),
       { name: 'APP_PROBE_TOKEN', type: 'secret_text' },
       { name: 'DEPLOYMENT_IDENTITY_SECRET', type: 'secret_text' },
@@ -287,6 +313,22 @@ export async function directObservationFixture(
     const root = '/client/v4/accounts/account';
     const path = url.pathname;
     let response: (() => Response) | undefined;
+    if (request.method === 'GET' && path === `${root}/workers/domains`)
+      response = () =>
+        providerJson(
+          expected.map((target, index) => ({
+            id: `domain-${index}`,
+            hostname: names.roles[target.role].routeHostname,
+            service: names.roles[target.role].scriptName,
+          })),
+          {
+            page: 1,
+            per_page: expected.length,
+            count: expected.length,
+            total_count: expected.length,
+            total_pages: 1,
+          },
+        );
     for (const [index, target] of expected.entries()) {
       const script = `${root}/workers/scripts/${names.roles[target.role].scriptName}`;
       if (request.method === 'GET' && path === `${script}/deployments`)
@@ -344,6 +386,17 @@ export async function directObservationFixture(
         response = () => providerJson([{ success: true, results: effects }]);
       if (
         body.sql ===
+          "SELECT run_key,observation_kind,observation_key,identity_json,identity_sha256,provenance_json,provenance_sha256 FROM direct_reference_observations WHERE run_key=? AND observation_kind='settlement' AND observation_key=?" &&
+        body.params[0] === config.resourcePrefix
+      ) {
+        const effect = effects.find(
+          ({ observation_key }) => observation_key === body.params[1],
+        );
+        response = () =>
+          providerJson([{ success: true, results: effect ? [effect] : [] }]);
+      }
+      if (
+        body.sql ===
         'SELECT tenant_tag,environment,backend,script_name,database_id,schema_version,artifact_version,desired_spec_digest,phase,settled_settlement_key FROM anchorage_fleet_deployments WHERE tenant_tag=? AND environment=?'
       ) {
         const index = expected.findIndex(
@@ -381,7 +434,7 @@ export async function directObservationFixture(
         `${root}/r2/buckets/${names.exportBucket}/objects/${config.resourcePrefix}/receipts/v1/database-a/operation-a.sql`
     )
       response = () => new Response(exportBytes);
-    if (!response || url.search) {
+    if (!response || (url.search && path !== `${root}/workers/domains`)) {
       unexpected.push(`${request.method} ${path}`);
       throw new Error('unexpected request');
     }
@@ -389,6 +442,7 @@ export async function directObservationFixture(
   };
   return {
     prepared,
+    built,
     journal,
     expected,
     deployment,
@@ -424,8 +478,7 @@ export async function directObservationFixture(
       };
     },
     async close() {
-      await journal.close();
-      await rm(directory, { recursive: true, force: true });
+      await closeDirectObservationFixture(journal, directory);
     },
   };
 }

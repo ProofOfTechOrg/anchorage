@@ -10,6 +10,7 @@
   "exclude": [
     "test/**/*.ts",
     "vitest.config.ts",
-    "vitest.direct-scenario.config.ts"
+    "vitest.direct-scenario.config.ts",
+    "vitest.direct-scenario-seams.config.ts"
   ]
 }

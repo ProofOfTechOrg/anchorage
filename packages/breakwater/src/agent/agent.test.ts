@@ -1023,24 +1023,13 @@ describe('Mastra Agent execution-entry inventory', () => {
       'wrapToolsWithHooks',
       'wrapToolWithHooks',
     ];
-    // Classified above but NOT on Agent.prototype at the pinned 1.53.0, yet
-    // present on newest 1.x. Listed on purpose: the mastra-compat canary job
-    // bumps core to newest 1.x and runs this suite, and these keep it fully
-    // classified there. Drop a name once the pin catches up to it; a name on
-    // NEITHER version is dead and belongs in no list at all.
-    const forwardClassified = [
-      '__markStoredVersionApplied',
-      '__setDeclaredSchedules',
-      '__setThreadRuntimeAgent',
-      'cancelQueuedMessages',
-      'claimThreadOwnership',
-      'discoverThreadPeers',
-      'filterUiMessagesByThread',
-      'getDeclaredSchedules',
-      'listActiveThreadRuns',
-      'resolveNotificationDeliveryDecision',
-      'subscribeThreadEvents',
-    ];
+    // Names classified above but absent from Agent.prototype at the pinned
+    // core, while present on newest 1.x. The mastra-compat canary job bumps
+    // core to newest 1.x and runs this suite, and a name here keeps it fully
+    // classified there. A name belongs here only while the two cores disagree
+    // about it: it goes once the pin catches up, and a name on NEITHER version
+    // is dead and belongs in no list at all.
+    const forwardClassified: readonly string[] = [];
     const classified = [
       ...wrapped,
       ...intentionallyUnavailable,

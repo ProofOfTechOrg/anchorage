@@ -1,65 +1,59 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import { createHash } from 'node:crypto';
 import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DirectProviderError } from '../scripts/direct-credentialed-provider.mjs';
-import {
-  DIRECT_TEARDOWN_MAXIMA,
-  REFERENCE_SECRET_NAMES,
-} from '../scripts/direct-credentialed-reference-vocabulary.mjs';
+import { DIRECT_TEARDOWN_MAXIMA } from '../scripts/direct-credentialed-reference-vocabulary.mjs';
 import type { DirectRunJournal } from '../scripts/direct-credentialed-run-state.mjs';
 import type { DirectTeardownOutcome } from '../scripts/direct-credentialed-teardown.mjs';
 import { teardownDirectReference } from '../scripts/direct-credentialed-teardown.mjs';
 import { CLOUDFLARE_INVENTORY_BOUND } from '../src/cloudflare-client-config.js';
 import { providerJson as json } from './fixtures/direct-observations.js';
 import {
+  API_TOKEN,
+  absent,
+  deployments,
+  forbid,
+  type ListedSurface,
+  ROOT,
+  ROUTES,
+  type Row,
+  SECRET_NAMES,
+  unexpectedRequests,
+  providerWorld as world,
+} from './fixtures/direct-provider-world.js';
+import {
+  abandonedScenario,
   bootstrapContext,
   cleanupDirectRunState,
   closed,
   completeScenario,
-  completeScenarioJournal,
-  exportKey,
   fixture,
   opened,
   present,
-  scenarioJournal,
+  recordCompleteSweep,
   teardownWith,
 } from './fixtures/direct-run-state-builder.js';
 
-const API_TOKEN = 'teardown/provider-token+sentinel==';
-const ACCOUNT = 'account';
-const ROOT = `/client/v4/accounts/${ACCOUNT}`;
-const ROUTES = '/client/v4/zones/zone/workers/routes';
-// The listing answers in the provider's order, which teardown sorts before it
-// compares; the names themselves are the upload's own list.
-const SECRET_NAMES = [...REFERENCE_SECRET_NAMES].sort();
-const unexpectedRequests: string[] = [];
+const exportSha256 = (proof: {
+  receipt: unknown;
+  location: string;
+  size: number;
+  sha256: string;
+}) =>
+  createHash('sha256')
+    .update(
+      JSON.stringify({
+        receipt: proof.receipt,
+        location: proof.location,
+        size: proof.size,
+        sha256: proof.sha256,
+      }),
+    )
+    .digest('hex');
 
-type Hook = (
-  request: Request,
-  url: URL,
-) => Promise<Response | undefined> | Response | undefined;
-type Row = Record<string, unknown>;
-// The world collections whose rows the residual scan classifies by one field.
-type ListedSurface = 'scripts' | 'routes' | 'domains' | 'queues' | 'namespaces';
-
-const absent = (status = 404) =>
-  Response.json(
-    { success: false, errors: [{ code: 10000, message: 'synthetic absence' }] },
-    { status },
-  );
-const forbid = () => absent(403);
-const deployments = (versionId: string) =>
-  json({
-    deployments: [
-      {
-        id: 'deployment',
-        strategy: 'percentage',
-        versions: [{ version_id: versionId, percentage: 100 }],
-      },
-    ],
-  });
 // The bucket read the identity check refuses: the run's own name carrying a
 // creation date that is not the one the bootstrap recorded.
 const changedBucket = (w: { names: { exportBucket: string } }) =>
@@ -67,8 +61,6 @@ const changedBucket = (w: { names: { exportBucket: string } }) =>
     name: w.names.exportBucket,
     creation_date: '2020-01-01T00:00:00.000Z',
   });
-const paged = (url: URL, rows: Row[]) =>
-  json(url.searchParams.has('page') ? [] : rows);
 const never = () =>
   vi.fn<typeof fetch>(() => {
     unexpectedRequests.push('provider call on a refused precondition');
@@ -85,202 +77,6 @@ async function diskState(journal: DirectRunJournal) {
   return JSON.parse(
     await readFile(join(journal.directory, 'journal.json'), 'utf8'),
   ) as { teardown?: Record<string, unknown> };
-}
-
-async function world(
-  options: {
-    limit?: number;
-    disposableAccount?: boolean;
-    complete?: boolean;
-    corroborate?: boolean;
-  } = {},
-) {
-  const limit = options.limit ?? 8;
-  const disposable = options.disposableAccount ?? true;
-  const { f, journal } =
-    options.complete === false
-      ? await scenarioJournal(limit, disposable)
-      : await completeScenarioJournal(limit, disposable);
-  const names = f.prepared.names;
-  const prefix = f.prepared.config.resourcePrefix;
-  const script = `${ROOT}/workers/scripts/${names.referenceWorker}`;
-  const bucketPath = `${ROOT}/r2/buckets/${names.exportBucket}`;
-  const keys = [exportKey(prefix, 'a'), exportKey(prefix, 'b')];
-  const state = {
-    ingress: true,
-    scriptPresent: true,
-    bucketPresent: true,
-    secretNames: [...SECRET_NAMES],
-    versions: [{ id: 'version' }] as Row[],
-    databases: new Map<string, Row>([
-      ['fleet-uuid', { uuid: 'fleet-uuid', name: names.fleetDatabase }],
-      ['quota-uuid', { uuid: 'quota-uuid', name: names.quotaDatabase }],
-    ]),
-    objects: new Set(keys),
-    extraDatabases: [] as Row[],
-    extraBuckets: [] as Row[],
-    namespaces: [] as Row[],
-    scripts: [] as Row[],
-    domains: [] as Row[],
-    routes: [] as Row[],
-    queues: [] as Row[],
-    dispatch: [] as Row[],
-  };
-  let hook: Hook | undefined;
-  const requests: string[] = [];
-  const residualDatabases = (): Row[] => [
-    ...state.databases.values(),
-    ...state.extraDatabases,
-  ];
-  const residualBuckets = (): Row[] => [
-    ...(state.bucketPresent ? [{ name: names.exportBucket }] : []),
-    ...state.extraBuckets,
-  ];
-  const residualScripts = (): Row[] => [
-    ...(state.scriptPresent ? [{ id: names.referenceWorker }] : []),
-    ...state.scripts,
-  ];
-  // The default world sends no `result_info` on any listing: the live shape for
-  // scripts and routes, and the uncorroborated case for the rest.
-  // `corroborate` opts into the attested shape.
-  const listing = (rows: Row[]) =>
-    options.corroborate === true
-      ? json(rows, { total_count: rows.length })
-      : json(rows);
-  const fetchRequest = vi.fn<typeof fetch>(async (input, init) => {
-    const request = new Request(input, init);
-    const url = new URL(request.url);
-    const path = decodeURIComponent(url.pathname);
-    requests.push(`${request.method} ${path}`);
-    if (url.origin !== 'https://api.cloudflare.com') {
-      unexpectedRequests.push('unexpected origin');
-      throw new Error('Unexpected synthetic origin');
-    }
-    expect(request.headers.get('authorization')).toBe(`Bearer ${API_TOKEN}`);
-    const intercepted = await hook?.(request, url);
-    if (intercepted) return intercepted;
-    if (request.method === 'GET') {
-      if (path === `${script}/subdomain`)
-        return json({ enabled: state.ingress, previews_enabled: false });
-      if (path === `${script}/secrets`)
-        return json(state.secretNames.map((name) => ({ name })));
-      if (path === `${script}/deployments`) return deployments('version');
-      if (path === `${script}/versions`)
-        return state.scriptPresent ? json({ items: state.versions }) : absent();
-      if (path === script)
-        return state.scriptPresent
-          ? new Response('synthetic worker bytes', {
-              headers: { 'Content-Type': 'application/javascript' },
-            })
-          : absent();
-      if (path === `${ROOT}/workers/scripts`) return listing(residualScripts());
-      if (path.startsWith(`${ROOT}/d1/database/`)) {
-        const row = state.databases.get(
-          path.slice(`${ROOT}/d1/database/`.length),
-        );
-        return row ? json(row) : absent();
-      }
-      if (path === `${ROOT}/d1/database`) {
-        const name = url.searchParams.get('name');
-        return paged(
-          url,
-          residualDatabases().filter(
-            (row) =>
-              name === null ||
-              (typeof row.name === 'string' && row.name.includes(name)),
-          ),
-        );
-      }
-      if (path === `${ROOT}/workers/durable_objects/namespaces`)
-        return paged(url, state.namespaces);
-      if (path === `${ROOT}/r2/buckets`) {
-        const after = url.searchParams.get('start_after');
-        return json({
-          buckets: residualBuckets().filter(
-            (row) =>
-              after === null ||
-              (typeof row.name === 'string' && row.name > after),
-          ),
-        });
-      }
-      if (path === `${bucketPath}/objects`) {
-        const scoped = url.searchParams.get('prefix');
-        return json(
-          [...state.objects]
-            .filter((key) => scoped === null || key.startsWith(scoped))
-            .map((key) => ({ key })),
-        );
-      }
-      if (path.startsWith(`${bucketPath}/objects/`))
-        return state.objects.has(path.slice(`${bucketPath}/objects/`.length))
-          ? new Response('synthetic export bytes')
-          : absent();
-      if (path === bucketPath)
-        return state.bucketPresent
-          ? json({
-              name: names.exportBucket,
-              creation_date: '2026-09-10T00:00:00.000Z',
-            })
-          : absent();
-      if (path === `${ROOT}/workers/domains`) return listing(state.domains);
-      if (path === ROUTES) return listing(state.routes);
-      if (path === `${ROOT}/queues`) return listing(state.queues);
-      if (path === `${ROOT}/workers/dispatch/namespaces`)
-        return json(state.dispatch);
-    }
-    if (request.method === 'POST' && path === `${script}/subdomain`) {
-      expect(await request.json()).toEqual({
-        enabled: false,
-        previews_enabled: false,
-      });
-      state.ingress = false;
-      return json({ enabled: false, previews_enabled: false });
-    }
-    if (request.method === 'DELETE') {
-      if (path === script) {
-        state.scriptPresent = false;
-        return json(null);
-      }
-      if (path.startsWith(`${ROOT}/d1/database/`)) {
-        state.databases.delete(path.slice(`${ROOT}/d1/database/`.length));
-        return json(null);
-      }
-      if (path.startsWith(`${bucketPath}/objects/`)) {
-        state.objects.delete(path.slice(`${bucketPath}/objects/`.length));
-        return json({});
-      }
-      if (path === bucketPath) {
-        state.bucketPresent = false;
-        return json({});
-      }
-    }
-    unexpectedRequests.push(`${request.method} ${path}`);
-    throw new Error(`Unexpected synthetic request: ${request.method} ${path}`);
-  });
-  return {
-    f,
-    names,
-    prefix,
-    script,
-    bucketPath,
-    keyA: present(keys[0]),
-    keyB: present(keys[1]),
-    state,
-    requests,
-    journal,
-    setHook(value: Hook | undefined) {
-      hook = value;
-    },
-    run() {
-      return teardownDirectReference({
-        prepared: f.prepared,
-        journal,
-        apiToken: API_TOKEN,
-        fetch: fetchRequest,
-        delay: async () => {},
-      });
-    },
-  };
 }
 
 beforeEach(() => {
@@ -352,6 +148,11 @@ describeLinux('direct reference teardown', () => {
       `DELETE ${w.bucketPath}/objects/${w.keyB}`,
       `GET ${w.bucketPath}/objects/${w.keyB}`,
 
+      // delete-export-object replacement a: probe, delete, reread
+      `GET ${w.bucketPath}/objects/${w.keyC}`,
+      `DELETE ${w.bucketPath}/objects/${w.keyC}`,
+      `GET ${w.bucketPath}/objects/${w.keyC}`,
+
       // the prefix settles empty before the bucket goes
       `GET ${w.bucketPath}/objects`,
 
@@ -387,13 +188,14 @@ describeLinux('direct reference teardown', () => {
       quota: { uuid: 'quota-uuid', ordinal: 17, settledByReread: false },
       exports: {
         name: w.names.exportBucket,
-        ordinal: 30,
+        ordinal: 33,
         settledByReread: false,
       },
     });
     expect(outcome.facts.receipts.exportObjects).toEqual([
       { key: w.keyA, ordinal: 23, settledByReread: false },
       { key: w.keyB, ordinal: 26, settledByReread: false },
+      { key: w.keyC, ordinal: 29, settledByReread: false },
     ]);
     expect(outcome.facts.retainedIdentities).toEqual({
       fleetUuid: null,
@@ -515,6 +317,177 @@ describeLinux('direct reference teardown', () => {
     });
   });
 
+  it.each([
+    ['lost continuation run id', 'start'],
+    ['prepared reprovision migration', 'migration-reprovision-a'],
+  ] as const)('cleans an abandoned scenario after %s', async (_name, operation) => {
+    const w = await world({ complete: false });
+    w.state.objects.delete(w.keyC);
+    await w.journal.recordScenario(abandonedScenario(operation));
+    await recordCompleteSweep(w.journal);
+    const outcome = await w.run();
+    expect(outcome.status).toBe('cleaned');
+    expect(w.state).toMatchObject({
+      ingress: false,
+      scriptPresent: false,
+      bucketPresent: false,
+    });
+    expect(w.state.databases.size).toBe(0);
+    expect(w.state.objects.size).toBe(0);
+    expect(outcome.facts.receipts.exportObjects.map(({ key }) => key)).toEqual([
+      w.keyA,
+      w.keyB,
+    ]);
+    expect(
+      w.requests.filter((request) => request.startsWith('DELETE')),
+    ).toEqual(
+      expect.arrayContaining([
+        `DELETE ${w.script}`,
+        `DELETE ${ROOT}/d1/database/fleet-uuid`,
+        `DELETE ${ROOT}/d1/database/quota-uuid`,
+        `DELETE ${w.bucketPath}/objects/${w.keyA}`,
+        `DELETE ${w.bucketPath}/objects/${w.keyB}`,
+        `DELETE ${w.bucketPath}`,
+      ]),
+    );
+    expect((await diskState(w.journal)).teardown).toMatchObject({
+      phase: 'complete',
+      failure: null,
+      receipts: {
+        exportObjects: [{ key: w.keyA }, { key: w.keyB }],
+      },
+    });
+  });
+
+  it('refuses before deletion when an abandoned scenario has no complete sweep', async () => {
+    const w = await world({ complete: false, tenants: true });
+    await w.journal.recordScenario(abandonedScenario());
+    const before = structuredClone({
+      ingress: w.state.ingress,
+      scriptPresent: w.state.scriptPresent,
+      databases: [...w.state.databases],
+      scripts: w.state.scripts,
+      namespaces: w.state.namespaces,
+      domains: w.state.domains,
+      routes: w.state.routes,
+      buckets: w.state.extraBuckets,
+    });
+    const outcome = retained(await w.run());
+    expect(outcome.reason).toBe('scenario-incomplete');
+    expect(w.requests.some((request) => request.startsWith('DELETE'))).toBe(
+      false,
+    );
+    expect({
+      ingress: w.state.ingress,
+      scriptPresent: w.state.scriptPresent,
+      databases: [...w.state.databases],
+      scripts: w.state.scripts,
+      namespaces: w.state.namespaces,
+      domains: w.state.domains,
+      routes: w.state.routes,
+      buckets: w.state.extraBuckets,
+    }).toEqual(before);
+  });
+
+  it('retains a residual prefixed surface after a complete abandoned sweep', async () => {
+    const w = await world({ complete: false, tenants: true });
+    await w.journal.recordScenario(abandonedScenario());
+    await recordCompleteSweep(w.journal);
+    const outcome = retained(await w.run());
+    expect(outcome.reason).toBe('residual-present');
+    expect(outcome.facts.residual?.surfaces.scripts.prefixCount).toBe(3);
+    expect(w.state).toMatchObject({
+      ingress: false,
+      scriptPresent: false,
+      bucketPresent: false,
+    });
+  });
+
+  it('resumes abandoned teardown after export-bucket deletion without re-attesting it', async () => {
+    const w = await world({ complete: false });
+    await w.journal.recordScenario(abandonedScenario());
+    await recordCompleteSweep(w.journal);
+    let interrupted = false;
+    w.setHook((_request, url) => {
+      if (
+        !interrupted &&
+        !w.state.bucketPresent &&
+        url.pathname === `${ROOT}/d1/database`
+      ) {
+        interrupted = true;
+        return absent(503);
+      }
+      return undefined;
+    });
+    expect(retained(await w.run()).reason).toBe('provider-unavailable');
+    expect(interrupted).toBe(true);
+    expect((await diskState(w.journal)).teardown).toMatchObject({
+      phase: 'residual',
+      receipts: { exports: { name: w.names.exportBucket } },
+    });
+    w.setHook(undefined);
+    const before = w.requests.length;
+    expect(await w.run()).toMatchObject({ status: 'cleaned' });
+    expect(
+      w.requests
+        .slice(before)
+        .some((request) => request === `GET ${w.bucketPath}`),
+    ).toBe(false);
+  });
+
+  it('deletes an abandoned scenario export object that has no persisted proof', async () => {
+    const w = await world({ complete: false });
+    w.state.objects.delete(w.keyC);
+    const unpersisted = `${w.prefix}/receipts/v1/unpersisted/export.sql`;
+    w.state.objects.add(unpersisted);
+    await w.journal.recordScenario(abandonedScenario('start'));
+    await recordCompleteSweep(w.journal);
+    const outcome = await w.run();
+    expect(outcome.status).toBe('cleaned');
+    expect(outcome.facts.receipts.exportObjects.map(({ key }) => key)).toEqual([
+      w.keyA,
+      w.keyB,
+      unpersisted,
+    ]);
+    expect(w.requests).toContain(
+      `DELETE ${w.bucketPath}/objects/${unpersisted}`,
+    );
+  });
+
+  it('refuses an abandoned scenario whose receipt prefix exceeds the object bound', async () => {
+    const w = await world({ complete: false });
+    w.state.objects.delete(w.keyC);
+    w.state.objects.add(`${w.prefix}/receipts/v1/unpersisted/first.sql`);
+    w.state.objects.add(`${w.prefix}/receipts/v1/unpersisted/second.sql`);
+    await w.journal.recordScenario(abandonedScenario('start'));
+    await recordCompleteSweep(w.journal);
+    const outcome = retained(await w.run());
+    expect(outcome.reason).toBe('unexpected-object');
+    expect(
+      w.requests.filter(
+        (request) =>
+          request.startsWith('DELETE') && request.includes('/objects/'),
+      ),
+    ).toEqual([]);
+  });
+
+  it('refuses a non-abandoned terminal scenario failure', async () => {
+    const w = await world({ complete: false });
+    const state = completeScenario();
+    state.phase = 'continuation-start';
+    state.failure = {
+      code: 'budget-exhausted',
+      ordinal: 8,
+      detail: 'phase-ceiling',
+    };
+    await w.journal.recordScenario(state);
+    const outcome = retained(await w.run());
+    expect(outcome.reason).toBe('scenario-incomplete');
+    expect(w.requests.some((request) => request.startsWith('DELETE'))).toBe(
+      false,
+    );
+  });
+
   it('re-enters deletion from a recorded refusal the run has since cleared', async () => {
     const w = await world();
     await w.journal.recordTeardown(
@@ -532,23 +505,26 @@ describeLinux('direct reference teardown', () => {
   });
 
   it.each([
-    1, 3,
+    1, 2,
   ])('refuses a confirmed export set of %d keys', async (count) => {
     const w = await world({ complete: false });
     const state = completeScenario();
     const a = present(state.proofs.exports.a);
     if (count === 1) {
       present(state.proofs.exports.b).receipt = structuredClone(a.receipt);
-      state.proofs.exportVerifications = state.proofs.exportVerifications.map(
-        () => structuredClone(a),
-      );
-    } else {
-      // A third distinct receipt: the count is exactly two, not "at most the
-      // journal's `exportObjects` maximum".
-      const third = structuredClone(a);
-      third.receipt.operationId = `${a.receipt.operationId}-third`;
-      state.proofs.exportVerifications = [third];
     }
+    present(state.proofs.reprovisionExports.a).receipt = structuredClone(
+      a.receipt,
+    );
+    state.proofs.exportVerifications = state.proofs.exportVerifications.map(
+      (entry) => {
+        const selected =
+          entry.cycle === 'reprovision'
+            ? present(state.proofs.reprovisionExports.a)
+            : present(state.proofs.exports[entry.role]);
+        return { ...entry, exportSha256: exportSha256(selected) };
+      },
+    );
     await w.journal.recordScenario(state);
     const outcome = retained(await w.run());
     expect(outcome.reason).toBe('invalid-state');
@@ -630,7 +606,7 @@ describeLinux('direct reference teardown', () => {
     expect(outcome.status).toBe('cleaned');
     expect(
       outcome.facts.receipts.exportObjects.map((entry) => entry.key),
-    ).toEqual([w.keyA, w.keyB]);
+    ).toEqual([w.keyA, w.keyB, w.keyC]);
   });
 
   it('refuses an unreadable probe instead of claiming absence', async () => {
@@ -718,7 +694,7 @@ describeLinux('direct reference teardown', () => {
     );
     const first = retained(await w.run());
     expect(first.reason).toBe('outcome-unknown');
-    expect(first.facts.receipts.exportObjects).toHaveLength(2);
+    expect(first.facts.receipts.exportObjects).toHaveLength(3);
     w.setHook(undefined);
     w.state.objects.add(`${w.prefix}/receipts/v1/other/object.sql`);
     const mark = w.requests.length;
@@ -914,7 +890,7 @@ describeLinux('direct reference teardown', () => {
         (entry) => entry.startsWith('DELETE') && entry.includes('/objects/'),
       ),
     ).toEqual([]);
-    expect([...w.state.objects]).toHaveLength(2);
+    expect([...w.state.objects]).toHaveLength(3);
   });
 
   it('settles a first-attempt step whose probe already finds the resource absent', async () => {

@@ -19,7 +19,17 @@ import {
   deriveDirectConformanceNames,
 } from './direct-credentialed-conformance-config.mjs';
 import {
+  DIRECT_RECONCILIATION_MAX,
+  DIRECT_RECONCILIATION_STATES,
   DIRECT_RESIDUAL_SURFACES,
+  DIRECT_SWEEP_ACTIONS,
+  DIRECT_SWEEP_BEFORE_PHASES,
+  DIRECT_SWEEP_CALL_ACTIONS,
+  DIRECT_SWEEP_CALL_OUTCOMES,
+  DIRECT_SWEEP_CYCLES,
+  DIRECT_SWEEP_FAILURE_CODES,
+  DIRECT_SWEEP_FAILURES,
+  DIRECT_SWEEP_PHASES,
   DIRECT_TEARDOWN_FAILURES,
   DIRECT_TEARDOWN_MAXIMA,
   DIRECT_TEARDOWN_MUTATIONS,
@@ -29,6 +39,7 @@ import {
 import { DIRECT_SCENARIO_PHASES } from './direct-credentialed-scenario-budget.mjs';
 import {
   DIRECT_REFERENCE_BODY_LIMIT,
+  directReferenceRequestSha256,
   readDirectReferenceRequest,
 } from './direct-reference-contract.mjs';
 
@@ -54,6 +65,10 @@ const SUMMARY_FIELDS = [
   'afterOrdinal',
   'expectedMutationEpoch',
   'expectedRevision',
+  'challenge',
+  'runId',
+  'approvalId',
+  'cycle',
 ];
 const NUMERIC_SUMMARY_FIELDS = new Set([
   'limit',
@@ -65,7 +80,8 @@ export const DIRECT_RUN_MAX_JOURNAL_BYTES = 256 * 1024;
 export const DIRECT_SCENARIO_ARRAY_MAXIMA = Object.freeze({
   health: 5,
   steps: 64,
-  exportVerifications: 16,
+  // The lifecycle keys are original a, original b, and reprovisioned a.
+  exportVerifications: 3,
   auditFindings: 16,
   footprintVersionIds: 8,
   deploymentVersions: 2,
@@ -106,8 +122,9 @@ function object(value, keys) {
     Array.isArray(value) ||
     Object.keys(value).length !== keys.length ||
     keys.some((key) => !Object.hasOwn(value, key))
-  )
+  ) {
     invalid();
+  }
   return value;
 }
 
@@ -231,16 +248,45 @@ async function decodeRequest(serialized, configSha256) {
   )
     invalid();
   try {
+    const core = JSON.parse(serialized);
+    const requestSha256 = directReferenceRequestSha256(core);
     return await readDirectReferenceRequest(
       new Request('https://direct-conformance.invalid/', {
         method: 'POST',
-        body: serialized,
+        body: JSON.stringify({
+          ...core,
+          reservation: { ordinal: 1, requestSha256 },
+        }),
       }),
       configSha256,
     );
   } catch {
     invalid();
   }
+}
+
+function decodeReconciliations(value, invocationCount) {
+  if (!Array.isArray(value) || value.length > DIRECT_RECONCILIATION_MAX)
+    invalid();
+  let priorOrdinal = 0;
+  return Object.freeze(
+    value.map((entry) => {
+      object(entry, ['ordinal', 'state', 'at']);
+      if (
+        !Number.isSafeInteger(entry.ordinal) ||
+        entry.ordinal <= priorOrdinal ||
+        entry.ordinal > invocationCount ||
+        !DIRECT_RECONCILIATION_STATES.includes(entry.state)
+      )
+        invalid();
+      priorOrdinal = entry.ordinal;
+      return Object.freeze({
+        ordinal: entry.ordinal,
+        state: entry.state,
+        at: runTimestamp(entry.at),
+      });
+    }),
+  );
 }
 
 async function decodeSnapshot(value, binding) {
@@ -252,9 +298,13 @@ async function decodeSnapshot(value, binding) {
       : [
           ...keys,
           'bootstrap',
+          ...(Object.hasOwn(value, 'reconciliations')
+            ? ['reconciliations']
+            : []),
           ...(Object.hasOwn(value, 'createdAt') ? ['createdAt'] : []),
           ...(Object.hasOwn(value, 'resumeCount') ? ['resumeCount'] : []),
           ...(Object.hasOwn(value, 'scenario') ? ['scenario'] : []),
+          ...(Object.hasOwn(value, 'sweep') ? ['sweep'] : []),
           ...(Object.hasOwn(value, 'teardown') ? ['teardown'] : []),
         ],
   );
@@ -296,7 +346,7 @@ async function decodeSnapshot(value, binding) {
       invalid();
     const decoded = await decodeRequest(
       JSON.stringify({
-        contractVersion: 1,
+        contractVersion: 2,
         configSha256: binding.configSha256,
         action: replayableAction(last.action),
       }),
@@ -313,6 +363,9 @@ async function decodeSnapshot(value, binding) {
     ? decodeScenario(value.scenario, value.invocationCount)
     : undefined;
   if (scenario) await validateScenarioActions(scenario, binding);
+  const sweep = Object.hasOwn(value, 'sweep')
+    ? decodeSweep(value.sweep, value.invocationCount)
+    : undefined;
   const teardown = Object.hasOwn(value, 'teardown')
     ? decodeTeardown(value.teardown)
     : undefined;
@@ -323,6 +376,10 @@ async function decodeSnapshot(value, binding) {
     binding,
     invocationCount: value.invocationCount,
     lastInvocation,
+    reconciliations: decodeReconciliations(
+      value.reconciliations ?? [],
+      value.invocationCount,
+    ),
     bootstrap: decodeBootstrap(
       value.version === 1 ? null : value.bootstrap,
       binding,
@@ -330,6 +387,7 @@ async function decodeSnapshot(value, binding) {
       lastInvocation,
     ),
     ...(scenario ? { scenario } : {}),
+    ...(sweep ? { sweep } : {}),
     ...(teardown ? { teardown } : {}),
   });
 }
@@ -383,6 +441,8 @@ export const DIRECT_SCENARIO_FAILURE_DETAILS = Object.freeze([
   'phase-ceiling',
   'run-reserve',
   'below-scenario-floor',
+  'lost-run-id-abandoned',
+  'prepared-invocation-abandoned',
 ]);
 
 export const DIRECT_SCENARIO_OPERATION_SLOTS = Object.freeze([
@@ -398,6 +458,8 @@ export const DIRECT_SCENARIO_OPERATION_SLOTS = Object.freeze([
   'decommission-a',
   'decommission-b',
   'decommission-recovery',
+  'cleanup-a-reprovision',
+  'decommission-a-reprovision',
 ]);
 
 const TEARDOWN_RECEIPT_FIELD = Object.freeze({
@@ -534,6 +596,7 @@ const workerVersionShape = {
   tenantTag: scenarioId,
   environment: scenarioId,
   scriptName: scenarioId,
+  routeHostname: scenarioHostname,
   currentDeployment: {
     deploymentId: scenarioId,
     activeVersionId: scenarioId,
@@ -572,6 +635,8 @@ const workerVersionShape = {
     creationDate: scenarioDate,
   },
 };
+const workerVersionShapeFor = (role) => ({ ...workerVersionShape, role });
+const roleAWorkerVersionShape = workerVersionShapeFor('a');
 const receiptShape = {
   version: 1,
   authority: scenarioLocation,
@@ -587,6 +652,31 @@ const exportShape = {
   sha256: digest,
   sourceInvocationOrdinal: scenarioNumber,
 };
+const exportShapeFor = (role) => ({ ...exportShape, role });
+const roleAExportShape = exportShapeFor('a');
+const exportReferenceShape = (value) => {
+  const reference = scenarioShape(value, {
+    role: normalRole,
+    cycle: scenarioEnum(null, 'reprovision'),
+    sourceInvocationOrdinal: scenarioNumber,
+    exportSha256: digest,
+  });
+  if (reference.cycle === 'reprovision' && reference.role !== 'a') invalid();
+  return reference;
+};
+const exportProofDigest = (proof) =>
+  createHash('sha256')
+    .update(
+      JSON.stringify({
+        receipt: proof.receipt,
+        location: proof.location,
+        size: proof.size,
+        sha256: proof.sha256,
+      }),
+    )
+    .digest('hex');
+const proofDigest = (value) =>
+  createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const cleanupShape = {
   version: 1,
   operationId: scenarioId,
@@ -673,6 +763,82 @@ const decommissionShape = {
   scriptName: scenarioId,
   phase: 'decommissioned',
 };
+const identityShape = {
+  before: scenarioEnum('initial'),
+  after: scenarioEnum('final'),
+  routeHostname: scenarioHostname,
+  evidenceSha256: digest,
+};
+const settlementShape = {
+  role: normalRole,
+  tenantTag: scenarioId,
+  environment: scenarioId,
+  scriptName: scenarioId,
+  databaseId: scenarioId,
+  versionId: scenarioId,
+  specDigest: digest,
+  schemaVersion: 2,
+  settlementKey: digest,
+  identitySha256: digest,
+  provenanceSha256: digest,
+};
+const roleASettlementShape = { ...settlementShape, role: 'a' };
+const migrationWitnessShape = {
+  kind: 'migration-reprovision-a',
+  databaseId: scenarioId,
+  scriptName: scenarioId,
+  routeHostname: scenarioHostname,
+  initialVersionId: scenarioId,
+  finalVersionId: scenarioId,
+  initialSpecDigest: digest,
+  targetSpecDigest: digest,
+  settlementKey: digest,
+};
+const continuationWitness = (value) => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) invalid();
+  const kind = value.kind;
+  if (kind === 'start')
+    return scenarioShape(value, {
+      kind: 'start',
+      workflowId: scenarioId,
+      step: scenarioId,
+      runId: scenarioId,
+      approvalId: scenarioId,
+      status: 'suspended',
+      challengeSha256: digest,
+      suspensionSha256: digest,
+      versionId: scenarioId,
+      emptyBeforeOrdinal: scenarioNumber,
+    });
+  if (kind === 'lock' || kind === 'unlock')
+    return scenarioShape(value, {
+      kind,
+      before: fenceReadingShape,
+      after: fenceReadingShape,
+    });
+  if (kind === 'migration-reprovision-a')
+    return scenarioShape(value, migrationWitnessShape);
+  if (kind === 'resume-locked')
+    return scenarioShape(value, {
+      kind: 'resume-locked',
+      runId: scenarioId,
+      status: 503,
+      code: 'EXECUTION_FENCED',
+      state: 'migration-locked',
+    });
+  if (kind === 'resume')
+    return scenarioShape(value, {
+      kind: 'resume',
+      runId: scenarioId,
+      approvalId: scenarioId,
+      status: 'success',
+      challengeSha256: digest,
+      resultSha256: digest,
+      release: '2',
+      approvalStatus: 'approved',
+    });
+  invalid();
+};
 const callShape = {
   ordinal: scenarioNumber,
   action: (value) => {
@@ -707,6 +873,7 @@ const callShape = {
   before: optional(
     nullable({ databaseId: scenarioId, scriptName: scenarioId }),
   ),
+  witness: optional(continuationWitness),
 };
 const inventoryShape = {
   operationId: scenarioId,
@@ -814,7 +981,7 @@ const effectsShape = boundedArray(
   2,
 );
 const exportVerificationsShape = boundedArray(
-  exportShape,
+  exportReferenceShape,
   DIRECT_SCENARIO_ARRAY_MAXIMA.exportVerifications,
 );
 const categoryShape = {
@@ -856,6 +1023,54 @@ const fenceProbesShape = {
   mutationEpoch: scenarioNumber,
   ordinal: scenarioNumber,
 };
+const continuationProofShape = {
+  started: nullable({
+    sourceInvocationOrdinal: scenarioNumber,
+    workflowId: scenarioId,
+    step: scenarioId,
+    runId: scenarioId,
+    approvalId: scenarioId,
+    challengeSha256: digest,
+    suspensionSha256: digest,
+    versionId: scenarioId,
+    emptyBeforeOrdinal: scenarioNumber,
+  }),
+  locked: nullable({
+    sourceInvocationOrdinal: scenarioNumber,
+    before: fenceReadingShape,
+    after: fenceReadingShape,
+  }),
+  versionB: nullable({
+    sourceInvocationOrdinal: scenarioNumber,
+    initialVersionId: scenarioId,
+    finalVersionId: scenarioId,
+    identitySha256: digest,
+  }),
+  refused: nullable({
+    sourceInvocationOrdinal: scenarioNumber,
+    runId: scenarioId,
+    status: 503,
+    code: 'EXECUTION_FENCED',
+    state: 'migration-locked',
+    suspensionSha256: digest,
+  }),
+  reopened: nullable({
+    sourceInvocationOrdinal: scenarioNumber,
+    before: fenceReadingShape,
+    after: fenceReadingShape,
+  }),
+  finished: nullable({
+    sourceInvocationOrdinal: scenarioNumber,
+    runId: scenarioId,
+    approvalId: scenarioId,
+    status: 'success',
+    challengeSha256: digest,
+    resultSha256: digest,
+    release: '2',
+    approvalStatus: 'approved',
+    emptyAfterOrdinal: scenarioNumber,
+  }),
+};
 const fenceGroupShape = Object.freeze({
   drain: fenceTransitionShape,
   sweeps: fenceSweepsShape,
@@ -887,18 +1102,23 @@ const scenarioSchema = {
   }),
   proofs: {
     initial: {
-      a: nullable(workerVersionShape),
-      b: nullable(workerVersionShape),
-      recovery: nullable(workerVersionShape),
+      a: nullable(workerVersionShapeFor('a')),
+      b: nullable(workerVersionShapeFor('b')),
+      recovery: nullable(workerVersionShapeFor('recovery')),
     },
     candidate: {
-      a: nullable(workerVersionShape),
-      b: nullable(workerVersionShape),
+      a: nullable(workerVersionShapeFor('a')),
+      b: nullable(workerVersionShapeFor('b')),
     },
     final: {
-      a: nullable(workerVersionShape),
-      b: nullable(workerVersionShape),
+      a: nullable(workerVersionShapeFor('a')),
+      b: nullable(workerVersionShapeFor('b')),
     },
+    identities: { a: nullable(identityShape), b: nullable(identityShape) },
+    reprovision: { a: nullable(roleAWorkerVersionShape) },
+    reprovisionFinal: { a: nullable(roleAWorkerVersionShape) },
+    reprovisionSettlement: { a: nullable(roleASettlementShape) },
+    continuation: continuationProofShape,
     objects: {
       a: nullable({ size: scenarioNumber, sha256: digest }),
       b: nullable({ size: scenarioNumber, sha256: digest }),
@@ -937,12 +1157,17 @@ const scenarioSchema = {
     steps: stepsShape,
     effects: effectsShape,
     cleanup: nullable(cleanupShape),
-    exports: { a: nullable(exportShape), b: nullable(exportShape) },
+    exports: {
+      a: nullable(exportShapeFor('a')),
+      b: nullable(exportShapeFor('b')),
+    },
+    reprovisionExports: { a: nullable(roleAExportShape) },
     exportVerifications: exportVerificationsShape,
     decommission: {
       a: nullable(decommissionShape),
       b: nullable(decommissionShape),
     },
+    redecommission: { a: nullable(decommissionShape) },
     terminalForce: {
       a: nullable({
         databaseId: scenarioId,
@@ -985,8 +1210,28 @@ function decodeScenario(value, invocationCount) {
         (call.action.kind === 'force-terminal' && call.outcome !== 'prepared')
     )
       invalid();
+    const witnessed =
+      call.action.kind === 'migration-reprovision-a' ||
+      (call.action.kind === 'tenant-continuation' &&
+        ['start', 'resume-locked', 'resume'].includes(call.action.operation)) ||
+      (call.action.kind === 'tenant-fence' &&
+        ['lock', 'unlock'].includes(call.action.operation));
+    if (
+      Object.hasOwn(call, 'witness') !==
+      (witnessed && call.outcome !== 'prepared')
+    )
+      invalid();
+    if (
+      call.witness &&
+      call.witness.kind !== call.action.operation &&
+      call.witness.kind !== call.action.kind
+    )
+      invalid();
   }
-  for (const proof of Object.values(result.proofs.exports))
+  for (const proof of [
+    ...Object.values(result.proofs.exports),
+    result.proofs.reprovisionExports.a,
+  ])
     if (
       proof &&
       (proof.sourceInvocationOrdinal < 1 ||
@@ -994,6 +1239,73 @@ function decodeScenario(value, invocationCount) {
         proof.size < 1)
     )
       invalid();
+  const histories = new Set();
+  for (const reference of result.proofs.exportVerifications) {
+    if (
+      reference.sourceInvocationOrdinal < 1 ||
+      reference.sourceInvocationOrdinal > invocationCount
+    )
+      invalid();
+    const selected =
+      reference.cycle === 'reprovision'
+        ? result.proofs.reprovisionExports.a
+        : result.proofs.exports[reference.role];
+    if (
+      !selected ||
+      reference.sourceInvocationOrdinal > selected.sourceInvocationOrdinal ||
+      exportProofDigest(selected) !== reference.exportSha256
+    )
+      invalid();
+    const key = `${reference.role}:${reference.cycle ?? 'original'}`;
+    if (histories.has(key)) invalid();
+    histories.add(key);
+  }
+  for (const role of ['a', 'b']) {
+    const identity = result.proofs.identities[role];
+    if (!identity) continue;
+    const before = result.proofs.initial[role];
+    const after = result.proofs.final[role];
+    if (
+      !before ||
+      !after ||
+      before.databaseId !== after.databaseId ||
+      before.scriptName !== after.scriptName ||
+      before.routeHostname !== after.routeHostname ||
+      before.routeHostname !== identity.routeHostname ||
+      before.versionId === after.versionId ||
+      identity.evidenceSha256 !==
+        proofDigest({
+          before: {
+            databaseId: before.databaseId,
+            scriptName: before.scriptName,
+            routeHostname: before.routeHostname,
+            versionId: before.versionId,
+          },
+          after: {
+            databaseId: after.databaseId,
+            scriptName: after.scriptName,
+            routeHostname: after.routeHostname,
+            versionId: after.versionId,
+          },
+        })
+    )
+      invalid();
+  }
+  const versionB = result.proofs.continuation.versionB;
+  if (versionB) {
+    const observation = result.proofs.reprovisionFinal.a;
+    if (
+      !observation ||
+      versionB.identitySha256 !==
+        proofDigest({
+          databaseId: observation.databaseId,
+          scriptName: observation.scriptName,
+          routeHostname: observation.routeHostname,
+          namespaces: observation.namespaces,
+        })
+    )
+      invalid();
+  }
   if (
     new Set(result.operations.map((entry) => entry.slot)).size !==
       result.operations.length ||
@@ -1060,12 +1372,80 @@ function validateScenarioProofs(state, invocationCount) {
           proof.audits[when].generation === proof.inventories[when].generation,
       );
   }
+  if (past('inventory-after')) need(proof.identities.a && proof.identities.b);
   if (past('migration-interrupt')) need(proof.restart);
   if (past('migration-restart'))
     need(proof.restart?.replayOrdinal && proof.restart.resumedProcess);
   if (past('migration')) need(proof.effects.length === 2);
   if (past('cleanup-recovery')) need(proof.cleanup);
   if (past('force-terminal-a')) need(proof.terminalForce.a);
+  if (past('reprovision-a')) need(proof.reprovision.a);
+  if (past('continuation-start'))
+    need(
+      proof.continuation.started &&
+        proof.continuation.started.emptyBeforeOrdinal <
+          proof.continuation.started.sourceInvocationOrdinal,
+    );
+  if (past('continuation-lock'))
+    need(
+      proof.continuation.locked &&
+        proof.continuation.started.sourceInvocationOrdinal <
+          proof.continuation.locked.sourceInvocationOrdinal,
+    );
+  if (past('continuation-migrate'))
+    need(
+      proof.reprovisionFinal.a &&
+        proof.reprovisionSettlement.a &&
+        proof.continuation.versionB &&
+        proof.continuation.locked.sourceInvocationOrdinal <
+          proof.continuation.versionB.sourceInvocationOrdinal,
+    );
+  if (past('continuation-refuse'))
+    need(
+      proof.continuation.refused &&
+        proof.continuation.versionB.sourceInvocationOrdinal <
+          proof.continuation.refused.sourceInvocationOrdinal,
+    );
+  if (past('continuation-finish'))
+    need(
+      proof.continuation.reopened &&
+        proof.continuation.finished &&
+        proof.continuation.refused.sourceInvocationOrdinal <
+          proof.continuation.reopened.sourceInvocationOrdinal &&
+        proof.continuation.reopened.sourceInvocationOrdinal <
+          proof.continuation.finished.sourceInvocationOrdinal &&
+        proof.continuation.finished.sourceInvocationOrdinal <
+          proof.continuation.finished.emptyAfterOrdinal &&
+        proof.continuation.finished.runId ===
+          proof.continuation.started?.runId &&
+        proof.continuation.finished.approvalId ===
+          proof.continuation.started.approvalId &&
+        proof.continuation.finished.challengeSha256 ===
+          proof.continuation.started.challengeSha256,
+    );
+  if (past('continuation-refuse'))
+    need(
+      proof.continuation.refused.runId === proof.continuation.started?.runId &&
+        proof.continuation.refused.suspensionSha256 ===
+          proof.continuation.started.suspensionSha256,
+    );
+  if (past('continuation-migrate'))
+    need(
+      proof.continuation.versionB.initialVersionId ===
+        proof.reprovision.a?.versionId &&
+        proof.continuation.versionB.finalVersionId ===
+          proof.reprovisionFinal.a?.versionId &&
+        proof.reprovision.a.databaseId ===
+          proof.reprovisionFinal.a.databaseId &&
+        proof.reprovision.a.scriptName ===
+          proof.reprovisionFinal.a.scriptName &&
+        proof.reprovision.a.routeHostname ===
+          proof.reprovisionFinal.a.routeHostname &&
+        JSON.stringify(proof.reprovision.a.namespaces) ===
+          JSON.stringify(proof.reprovisionFinal.a.namespaces),
+    );
+  if (past('decommission-reprovisioned-a'))
+    need(proof.reprovisionExports.a && proof.redecommission.a);
   if (past('force-recovery'))
     need(proof.recoveryExportAbsent.beforeOrdinal > 0);
   if (past('force-observe'))
@@ -1099,6 +1479,11 @@ function validateScenarioProofs(state, invocationCount) {
     ...Object.values(proof.recoveryExportAbsent),
     ...proof.health.map((entry) => entry.ordinal),
     ...proof.steps.map((entry) => entry.ordinal),
+    ...Object.values(proof.continuation).map(
+      (entry) => entry?.sourceInvocationOrdinal ?? null,
+    ),
+    proof.continuation.started?.emptyBeforeOrdinal ?? null,
+    proof.continuation.finished?.emptyAfterOrdinal ?? null,
     // A null reaches the bound check and is skipped there, so each group
     // contributes whatever ordinal it carries.
     ...['drain', 'reopen', 'probes'].flatMap((group) =>
@@ -1130,7 +1515,7 @@ async function validateScenarioActions(state, binding) {
     if (!call) continue;
     await decodeRequest(
       JSON.stringify({
-        contractVersion: 1,
+        contractVersion: 2,
         configSha256: binding.configSha256,
         action: replayableAction(call.action),
       }),
@@ -1340,6 +1725,108 @@ const residualShape = {
   versionsGone: nullable(scenarioFlag),
   settleAttempts: teardownSettleAttempts,
 };
+const sweepAttemptsShape = {
+  provider: scenarioNumber,
+  maintenance: scenarioNumber,
+  application: scenarioNumber,
+};
+const sweepCallShape = {
+  ordinal: scenarioNumber,
+  action: scenarioEnum(...DIRECT_SWEEP_CALL_ACTIONS),
+  outcome: scenarioEnum(...DIRECT_SWEEP_CALL_OUTCOMES),
+  attempts: nullable(sweepAttemptsShape),
+};
+const sweepRoleShape = nullable((value) => {
+  if (value?.kind === 'none')
+    return scenarioShape(value, {
+      kind: 'none',
+      cycle: scenarioEnum(...DIRECT_SWEEP_CYCLES),
+      before: scenarioEnum(...DIRECT_SWEEP_BEFORE_PHASES),
+    });
+  if (value?.kind === 'completed')
+    return scenarioShape(value, {
+      kind: 'completed',
+      cycle: scenarioEnum(...DIRECT_SWEEP_CYCLES),
+      before: scenarioEnum(...DIRECT_SWEEP_BEFORE_PHASES),
+      action: scenarioEnum(
+        ...DIRECT_SWEEP_ACTIONS.filter((action) => action !== 'none'),
+      ),
+      after: scenarioEnum('absent', 'decommissioned'),
+      ordinal: scenarioNumber,
+    });
+  if (value?.kind === 'refused')
+    return scenarioShape(value, {
+      kind: 'refused',
+      cycle: scenarioEnum(...DIRECT_SWEEP_CYCLES),
+      before: scenarioEnum(...DIRECT_SWEEP_BEFORE_PHASES),
+      action: scenarioEnum(...DIRECT_SWEEP_ACTIONS),
+      reason: scenarioEnum(...DIRECT_SWEEP_FAILURES),
+    });
+  invalid();
+});
+const sweepShape = {
+  phase: scenarioEnum(...DIRECT_SWEEP_PHASES),
+  roles: {
+    a: sweepRoleShape,
+    b: sweepRoleShape,
+    recovery: sweepRoleShape,
+  },
+  lastCall: nullable(sweepCallShape),
+  failure: nullable({
+    code: scenarioEnum(...DIRECT_SWEEP_FAILURE_CODES),
+    role: scenarioEnum('a', 'b', 'recovery'),
+    reason: scenarioEnum(...DIRECT_SWEEP_FAILURES),
+  }),
+};
+
+function decodeSweep(value, invocationCount) {
+  const result = scenarioShape(value, sweepShape);
+  const expectedCycles = {
+    a: ['original', 'reprovision'],
+    b: ['original'],
+    recovery: ['original'],
+  };
+  for (const [role, entry] of Object.entries(result.roles)) {
+    if (entry && !expectedCycles[role].includes(entry.cycle)) invalid();
+    if (
+      entry &&
+      ((entry.before === 'force-captured' && role !== 'recovery') ||
+        (entry.action === 'force' && role !== 'recovery') ||
+        (entry.kind === 'completed' &&
+          ((entry.action === 'decommission' &&
+            entry.after !== 'decommissioned') ||
+            (entry.action !== 'decommission' && entry.after !== 'absent'))))
+    )
+      invalid();
+    if (
+      entry?.kind === 'completed' &&
+      (entry.ordinal < 1 || entry.ordinal > invocationCount)
+    )
+      invalid();
+  }
+  if (result.lastCall) {
+    const prepared = result.lastCall.outcome === 'prepared';
+    if (
+      prepared !== (result.lastCall.attempts === null) ||
+      result.lastCall.ordinal < 1 ||
+      result.lastCall.ordinal > invocationCount + (prepared ? 1 : 0)
+    )
+      invalid();
+  }
+  if (
+    (result.phase === 'refused') !== (result.failure !== null) ||
+    (result.phase === 'complete' &&
+      Object.values(result.roles).some(
+        (entry) => entry === null || entry.kind === 'refused',
+      )) ||
+    (result.phase !== 'sweeping' && result.lastCall?.outcome === 'prepared') ||
+    (result.phase === 'sweeping' &&
+      Object.values(result.roles).some((entry) => entry?.kind === 'refused')) ||
+    (result.failure && result.roles[result.failure.role]?.kind !== 'refused')
+  )
+    invalid();
+  return result;
+}
 const teardownSettlement = {
   ordinal: scenarioNumber,
   settledByReread: scenarioFlag,
@@ -1449,6 +1936,20 @@ export function mutationPending(snapshot) {
   return (
     snapshot.lastInvocation?.state === 'pending' ||
     Boolean(snapshot.bootstrap?.pending)
+  );
+}
+
+export function isAbandonedDirectScenario(scenario) {
+  // These details are the startup guard's switch for the pre-teardown sweep.
+  // A prepared read-only call joins prepared mutations because neither is
+  // replayed after the process loses its locally observed outcome.
+  return Boolean(
+    scenario !== undefined &&
+      scenario.failure !== null &&
+      scenario.failure.code === 'proof-unavailable' &&
+      ['lost-run-id-abandoned', 'prepared-invocation-abandoned'].includes(
+        scenario.failure.detail,
+      ),
   );
 }
 
@@ -1645,6 +2146,7 @@ async function initializeRun(basePath, base, directory, binding, createdAt) {
       binding,
       invocationCount: 0,
       lastInvocation: null,
+      reconciliations: Object.freeze([]),
       bootstrap: null,
     });
     await writeSnapshot(staging, handle, snapshot);
@@ -1757,12 +2259,17 @@ function runJournal(directory, directoryHandle, base, lock, initial) {
             'initial',
             'candidate',
             'final',
+            'identities',
+            'reprovision',
+            'reprovisionFinal',
+            'reprovisionSettlement',
             'objects',
             'objectDeletions',
             'recoveryExportAbsent',
             'inventories',
             'audits',
             'decommission',
+            'redecommission',
             'terminalForce',
           ])
             for (const [key, proof] of Object.entries(previous.proofs[group]))
@@ -1810,6 +2317,19 @@ function runJournal(directory, directoryHandle, base, lock, initial) {
               if (freshOrdinal < sourceInvocationOrdinal) invalid();
             }
           }
+          if (previous.proofs.reprovisionExports.a) {
+            const { sourceInvocationOrdinal, ...proof } =
+              previous.proofs.reprovisionExports.a;
+            const { sourceInvocationOrdinal: freshOrdinal, ...freshProof } =
+              scenario.proofs.reprovisionExports.a ?? {};
+            equalShape(freshProof, proof);
+            if (freshOrdinal < sourceInvocationOrdinal) invalid();
+          }
+          for (const [key, proof] of Object.entries(
+            previous.proofs.continuation,
+          ))
+            if (proof !== null)
+              equalShape(scenario.proofs.continuation[key], proof);
           for (const key of [
             'steps',
             'effects',
@@ -1824,6 +2344,39 @@ function runJournal(directory, directoryHandle, base, lock, initial) {
           }
         }
         await publishSnapshot({ scenario });
+      });
+    },
+    recordSweep(value) {
+      return enqueue(async () => {
+        assertSettled();
+        if (teardownStarted()) invalid();
+        const sweep = decodeSweep(value, snapshot.invocationCount);
+        const previous = snapshot.sweep;
+        if (!previous && sweep.phase !== 'sweeping') invalid();
+        if (previous) {
+          if (previous.phase !== 'sweeping' || sweep.phase === 'sweeping') {
+            if (previous.phase !== 'sweeping') invalid();
+          }
+          for (const role of ['a', 'b', 'recovery']) {
+            const entry = previous.roles[role];
+            if (entry !== null) equalShape(sweep.roles[role], entry);
+          }
+          if (previous.lastCall) {
+            const call = sweep.lastCall;
+            if (!call) invalid();
+            if (previous.lastCall.outcome === 'prepared') {
+              if (
+                call.ordinal !== previous.lastCall.ordinal ||
+                call.action !== previous.lastCall.action ||
+                call.outcome === 'prepared'
+              )
+                invalid();
+            } else if (call.ordinal < previous.lastCall.ordinal) invalid();
+            else if (call.ordinal === previous.lastCall.ordinal)
+              equalShape(call, previous.lastCall);
+          }
+        }
+        await publish(await withinCapacity({ sweep }));
       });
     },
     recordResume() {
@@ -1891,6 +2444,18 @@ function runJournal(directory, directoryHandle, base, lock, initial) {
       return enqueue(async () => {
         await withinCapacity({ teardown: worstCase });
       });
+    },
+    assertSweepCapacity(worstCase) {
+      return enqueue(async () => {
+        assertSettled();
+        if (teardownStarted()) invalid();
+        await withinCapacity({
+          sweep: decodeSweep(worstCase, snapshot.invocationCount),
+        });
+      });
+    },
+    teardownStarted() {
+      return teardownStarted();
     },
     bindBootstrapContext(context) {
       return enqueue(async () => {
@@ -2006,7 +2571,7 @@ function runJournal(directory, directoryHandle, base, lock, initial) {
         return reservation;
       });
     },
-    settleInvocation(reservation) {
+    settleInvocation(reservation, reconciliation) {
       return enqueue(async () => {
         object(reservation, ['ordinal', 'requestSha256']);
         const last = snapshot.lastInvocation;
@@ -2017,10 +2582,26 @@ function runJournal(directory, directoryHandle, base, lock, initial) {
         )
           invalid();
         if (last.state === 'settled') return;
+        let reconciliations = snapshot.reconciliations;
+        if (reconciliation !== undefined) {
+          object(reconciliation, ['state', 'at']);
+          if (!DIRECT_RECONCILIATION_STATES.includes(reconciliation.state))
+            invalid();
+          const entry = Object.freeze({
+            ordinal: reservation.ordinal,
+            state: reconciliation.state,
+            at: runTimestamp(reconciliation.at),
+          });
+          reconciliations = Object.freeze([
+            ...reconciliations.slice(1 - DIRECT_RECONCILIATION_MAX),
+            entry,
+          ]);
+        }
         await publish(
           Object.freeze({
             ...snapshot,
             lastInvocation: Object.freeze({ ...last, state: 'settled' }),
+            reconciliations,
           }),
         );
       });
@@ -2079,6 +2660,7 @@ export async function openDirectRunState(input) {
   const attached = await attachRunState(input, ['run', 'resume']);
   const { binding, basePath, directory, base, lock } = attached;
   let directoryHandle;
+  let journal;
   try {
     let snapshot;
     if (input.mode === 'run') {
@@ -2101,16 +2683,45 @@ export async function openDirectRunState(input) {
         JOURNAL_TEMPORARY_SUFFIX,
       );
       snapshot = await readSnapshot(join(directory, 'journal.json'), binding);
-      if (mutationPending(snapshot))
-        throw new DirectRunStateError('outcome-unknown');
     }
-    return runJournal(directory, directoryHandle, base, lock, snapshot);
+    journal = runJournal(directory, directoryHandle, base, lock, snapshot);
+    if (
+      input.mode === 'resume' &&
+      snapshot.lastInvocation?.state === 'pending'
+    ) {
+      let reconciliation = 'unreachable';
+      if (typeof input.reprobe === 'function') {
+        try {
+          reconciliation = await input.reprobe({
+            lastInvocation: snapshot.lastInvocation,
+            bootstrap: snapshot.bootstrap,
+          });
+        } catch {
+          reconciliation = 'unreachable';
+        }
+      }
+      if (!DIRECT_RECONCILIATION_STATES.includes(reconciliation))
+        throw new DirectRunStateError('outcome-unknown');
+      await journal.settleInvocation(
+        {
+          ordinal: snapshot.lastInvocation.ordinal,
+          requestSha256: snapshot.lastInvocation.requestSha256,
+        },
+        {
+          state: reconciliation,
+          at: runTimestamp(new Date(runClock(input.now)).toISOString()),
+        },
+      );
+    }
+    return journal;
   } catch (error) {
-    await Promise.allSettled(
-      [directoryHandle, base, lock]
-        .filter((handle) => handle !== undefined)
-        .map((handle) => handle.close()),
-    );
+    if (journal) await Promise.allSettled([journal.close()]);
+    else
+      await Promise.allSettled(
+        [directoryHandle, base, lock]
+          .filter((handle) => handle !== undefined)
+          .map((handle) => handle.close()),
+      );
     throw stateError(error);
   }
 }

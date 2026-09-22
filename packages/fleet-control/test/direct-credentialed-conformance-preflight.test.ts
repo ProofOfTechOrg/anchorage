@@ -143,9 +143,75 @@ describe('direct artifact preflight', () => {
     'undeclared-package',
   ])('rejects a literal template tenant dependency %s', async (dependency) => {
     const f = await fixture(REFERENCE, `${TENANT}\nimport(\`${dependency}\`);`);
-    await expect(prepare(f.configPath)).rejects.toThrow(
-      /tenant artifact module inspection/,
+    const failure = await prepare(f.configPath).catch(
+      (error: unknown) => error,
     );
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toBe(
+      'direct conformance preflight has invalid tenant artifact module inspection',
+    );
+  });
+
+  it.each([
+    'dns',
+    'http',
+    'https',
+    'net',
+  ])('admits the static %s tenant dependency', async (dependency) => {
+    const f = await fixture(
+      REFERENCE,
+      `${TENANT}\nimport ${JSON.stringify(dependency)};`,
+    );
+    await expect(prepare(f.configPath)).resolves.toBeDefined();
+  });
+
+  it.each([
+    'dns',
+    'http',
+    'https',
+    'net',
+  ])('refuses the static %s reference dependency', async (dependency) => {
+    const f = await fixture(
+      `${REFERENCE}\nimport ${JSON.stringify(dependency)};`,
+      TENANT,
+    );
+    const failure = await prepare(f.configPath).catch(
+      (error: unknown) => error,
+    );
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toBe(
+      'direct conformance preflight has invalid reference artifact module inspection',
+    );
+  });
+
+  it('bounds the dependency specifier carried by a refusal cause', async () => {
+    const dependency = 'x'.repeat(200);
+    const f = await fixture(
+      REFERENCE,
+      `${TENANT}\nimport ${JSON.stringify(dependency)};`,
+    );
+    const failure = await prepare(f.configPath).catch(
+      (error: unknown) => error,
+    );
+    expect(failure).toMatchObject({
+      message:
+        'direct conformance preflight has invalid tenant artifact module inspection',
+      cause: {
+        message: `direct conformance preflight has invalid tenant artifact module dependency ${JSON.stringify(dependency.slice(0, 120))}`,
+      },
+    });
+  });
+
+  it('carries the refused dependency as the cause of a tenant inspection failure', async () => {
+    const f = await fixture(REFERENCE, `${TENANT}\nimport 'vm';`);
+    await expect(prepare(f.configPath)).rejects.toMatchObject({
+      message:
+        'direct conformance preflight has invalid tenant artifact module inspection',
+      cause: {
+        message:
+          'direct conformance preflight has invalid tenant artifact module dependency "vm"',
+      },
+    });
   });
 
   it.each([
@@ -194,8 +260,19 @@ describe('direct artifact preflight', () => {
       `direct conformance preflight has invalid ${role} artifact module inspection`,
     );
     // `toThrow(string)` is a substring match, so the replacement message alone
-    // would also pass for a message that carried the compiler's words too.
+    // would also pass for a message that carried the compiler's words too, and
+    // it reads `message` only, so the chain carries its own assertion: the
+    // preflight forwards a `cause` for its own refusals, and a compiler failure
+    // is not one of them.
     await expect(prepare(f.configPath)).rejects.not.toThrow(/secret-sentinel/u);
+    const failure = await prepare(f.configPath).catch(
+      (error: unknown) => error,
+    );
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toBe(
+      `direct conformance preflight has invalid ${role} artifact module inspection`,
+    );
+    expect((failure as Error).cause).toBeUndefined();
   });
 
   it.each([

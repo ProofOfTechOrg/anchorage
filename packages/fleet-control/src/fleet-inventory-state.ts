@@ -700,18 +700,23 @@ export function fleetInventoryStageFromUnknown(
   ) {
     return malformed();
   }
-  const text = shape.text ? candidate[shape.text] : undefined;
-  if (text !== undefined) {
-    if (!boundedString(text)) return malformed();
+  const payloadText = shape.text ? candidate[shape.text] : undefined;
+  if (payloadText !== undefined) {
+    if (!boundedString(payloadText)) return malformed();
     // The cursor carve-out: resumption text is opaque, so it faces the
     // credential control only, never the finding-detail grammar.
-    assertNoCredentialInInventoryText(text, `stage.${String(shape.text)}`);
+    assertNoCredentialInInventoryText(
+      payloadText,
+      `stage.${String(shape.text)}`,
+    );
   }
   // The validated candidate keys are exactly one union member's keys.
   return {
     step,
     ...(shape.ordinal ? { [shape.ordinal]: ordinal } : {}),
-    ...(shape.text && text !== undefined ? { [shape.text]: text } : {}),
+    ...(shape.text && payloadText !== undefined
+      ? { [shape.text]: payloadText }
+      : {}),
   } as FleetInventoryStage;
 }
 

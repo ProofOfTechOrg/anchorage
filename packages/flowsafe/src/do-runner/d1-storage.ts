@@ -62,11 +62,13 @@ export interface D1StorageOptions {
   /**
    * Additional storage domains composed over the D1Store default, such as
    * notifications and thread state, which @mastra/cloudflare-d1 does not ship, so
-   * they are flowsafe-owned D1 impls). Injected rather than imported so this
+   * they are flowsafe-owned D1 impls. Injected rather than imported so this
    * lower layer never depends on `signals/` (which imports do-runner) — build
    * them with `createSignalStorageDomains()` and pass them here. The default
    * workflow domain supports explicit initial-admission scopes; false/custom
-   * workflow overrides retain precedence.
+   * workflow overrides retain precedence. `workflowDefinitions` and `knowledge`
+   * are injectable through this seam on the same terms: @mastra/cloudflare-d1
+   * backs neither, so each resolves undefined unless a host supplies one.
    */
   domains?: MastraStorageDomains;
 }
@@ -83,6 +85,7 @@ export function createD1Storage(
   const domainSource = suppliedDomains ?? {};
   const capturedDomains = {
     workflows: domainSource.workflows,
+    workflowDefinitions: domainSource.workflowDefinitions,
     scores: domainSource.scores,
     memory: domainSource.memory,
     channels: domainSource.channels,
@@ -104,6 +107,7 @@ export function createD1Storage(
     harness: domainSource.harness,
     toolProviderConnections: domainSource.toolProviderConnections,
     threadState: domainSource.threadState,
+    knowledge: domainSource.knowledge,
   } satisfies Record<keyof MastraStorageDomains, unknown>;
   const { workflows: suppliedWorkflows, ...otherDomains } = capturedDomains;
   const id = suppliedId ?? 'flowsafe';
@@ -1389,7 +1393,7 @@ export async function purgeExpiredWorkflowRuns(
       const rawRows = snapshotResultRows(result);
       if (
         rawRows.length > 1 ||
-        rawRows.some((row) =>
+        rawRows.some((rawRow) =>
           [
             'workflow_name',
             'run_id',
@@ -1397,7 +1401,7 @@ export async function purgeExpiredWorkflowRuns(
             'snapshot',
             'createdAt',
             'updatedAt',
-          ].some((key) => !Object.hasOwn(row, key)),
+          ].some((key) => !Object.hasOwn(rawRow, key)),
         )
       )
         throw new Error('run retention raw snapshot result is malformed');

@@ -106,8 +106,8 @@ function projectedHandler(
     }
     if (request.method === 'GET' && url.pathname.endsWith('/workers/scripts')) {
       return pageArray(
-        [...world.scripts.entries()].flatMap(([id, script]) =>
-          script.present ? [{ id }] : [],
+        [...world.scripts.entries()].flatMap(([id, entryScript]) =>
+          entryScript.present ? [{ id }] : [],
         ),
       );
     }

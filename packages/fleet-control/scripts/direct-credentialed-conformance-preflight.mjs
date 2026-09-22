@@ -17,6 +17,12 @@ export { DIRECT_MAX_UPLOAD_BYTES } from './direct-credentialed-conformance-limit
 export const DIRECT_MANIFEST_MODULE = 'direct-run-manifest.js';
 
 const REFERENCE_CORE_MODULES = new Set(['crypto', 'async_hooks', 'buffer']);
+
+// Node builtins admitted for literal tenant imports. `inspectImport` applies
+// this list to static declarations and literal dynamic imports; computed tenant
+// imports remain a runtime concern. The set grants no capability and is not an
+// egress control. `dns`, `http`, `https` and `net` support the web-fetch tool
+// retained by the module graph behind `@mastra/core/workflows`.
 const TENANT_CORE_MODULES = new Set([
   'stream',
   'child_process',
@@ -32,10 +38,25 @@ const TENANT_CORE_MODULES = new Set([
   'url',
   'path/posix',
   'string_decoder',
+  'dns',
+  'http',
+  'https',
+  'net',
 ]);
 
-function invalid(field) {
-  return new Error(`direct conformance preflight has invalid ${field}`);
+const PREFLIGHT_REFUSAL = Symbol('direct conformance preflight refusal');
+
+function invalid(field, options) {
+  const error = new Error(
+    `direct conformance preflight has invalid ${field}`,
+    options,
+  );
+  Object.defineProperty(error, PREFLIGHT_REFUSAL, { value: true });
+  return error;
+}
+
+function isPreflightRefusal(value) {
+  return value instanceof Error && value[PREFLIGHT_REFUSAL] === true;
 }
 
 function sha256(bytes) {
@@ -122,8 +143,11 @@ function inspectModule(text, reference, field, wasm) {
   if (syntax.status !== 0) throw invalid(`${field} JavaScript`);
   try {
     inspectModuleStructure(text, reference, field, wasm);
-  } catch {
-    throw invalid(`${field} module inspection`);
+  } catch (cause) {
+    throw invalid(
+      `${field} module inspection`,
+      isPreflightRefusal(cause) ? { cause } : undefined,
+    );
   }
 }
 
@@ -198,7 +222,9 @@ function inspectModuleStructure(text, reference, field, wasm) {
       specifier.text !== 'cloudflare:workers' &&
       !coreModules.has(specifier.text.replace(/^node:/, ''))
     ) {
-      throw invalid(`${field} module dependency`);
+      throw invalid(
+        `${field} module dependency ${JSON.stringify(specifier.text.slice(0, 120))}`,
+      );
     }
   };
   const pending = [source];
@@ -350,11 +376,11 @@ export async function preflightDirectConformance(input) {
   if (referenceUploadBytes > DIRECT_MAX_UPLOAD_BYTES)
     throw invalid('reference upload size');
   const moduleTable = referenceModules.map(
-    ({ name, contentType, byteLength, sha256 }) => ({
+    ({ name, contentType, byteLength, sha256: moduleDigest }) => ({
       name,
       contentType,
       byteLength,
-      sha256,
+      sha256: moduleDigest,
     }),
   );
   return Object.freeze({

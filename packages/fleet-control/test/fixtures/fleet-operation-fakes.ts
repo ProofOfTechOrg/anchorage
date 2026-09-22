@@ -450,10 +450,11 @@ export class FakeOperationStore implements FleetOperationStore {
       stageRows: async (input) => this.#stageRows(input),
       commitProgress: async (input) => {
         const committed = await this.#commitProgress(input);
-        const lost = this.loseNextSuccessfulCommitProgressResponse;
-        if (lost === undefined) return committed;
+        const lostProgressResponse =
+          this.loseNextSuccessfulCommitProgressResponse;
+        if (lostProgressResponse === undefined) return committed;
         this.loseNextSuccessfulCommitProgressResponse = undefined;
-        throw lost;
+        throw lostProgressResponse;
       },
       finalizeOperation: async (input) => this.#finalizeOperation(kind, input),
       failOperation: async (input) => this.#failOperation(kind, input),

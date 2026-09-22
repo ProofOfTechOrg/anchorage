@@ -182,7 +182,7 @@ describe('D1FleetStateDatabase', () => {
   it('returns batch result sets in order and preserves an empty middle set', async () => {
     const rows = [[{ id: 1 }], [], [{ id: 3 }]];
     const fake = fakeDatabase({
-      batch: () => rows.map((result) => envelope(result)),
+      batch: () => rows.map((rowResult) => envelope(rowResult)),
     });
 
     const result = await new D1FleetStateDatabase(fake.binding).batch([

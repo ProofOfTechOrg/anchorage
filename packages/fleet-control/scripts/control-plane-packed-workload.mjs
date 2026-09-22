@@ -112,12 +112,12 @@ export async function verifyControlPlanePackedWorkload({
   try {
     await server.listen();
     const worker = server.getWorker();
-    async function probe(profile, action, extra = {}, acceptError = false) {
+    async function probe(profileName, action, extra = {}, acceptError = false) {
       const started = performance.now();
       const response = await worker.fetch('/packed-workload', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ profile, action, ...extra }),
+        body: JSON.stringify({ profile: profileName, action, ...extra }),
         signal: AbortSignal.timeout(120000),
       });
       const body = await response.json();
@@ -130,11 +130,13 @@ export async function verifyControlPlanePackedWorkload({
         assert.equal(body.providerRequests, 0);
       return { ...body, status: response.status, elapsedMs };
     }
-    async function seed(profile, count) {
+    async function seed(profileName, count) {
       let offset = 0;
       let summary;
       for (let calls = 0; calls < Math.ceil(count / 100); calls += 1) {
-        const response = await probe(profile, 'seed-generation', { offset });
+        const response = await probe(profileName, 'seed-generation', {
+          offset,
+        });
         assert.ok(response.result.next > offset);
         offset = response.result.next;
         assert.equal(response.result.done, offset === count);
@@ -147,8 +149,8 @@ export async function verifyControlPlanePackedWorkload({
       assert.ok(summary.payloads.maximumPayloadBytes <= 16 * 1024);
       return summary;
     }
-    async function read(profile, count, routes) {
-      const response = await probe(profile, 'read');
+    async function read(profileName, count, routes) {
+      const response = await probe(profileName, 'read');
       assert.deepEqual(response.result, {
         deployments: count,
         databases: count,
@@ -161,8 +163,8 @@ export async function verifyControlPlanePackedWorkload({
       assert.equal(response.metrics.inventoryRows, count * 4 + routes + 1);
       return response;
     }
-    async function start(profile, extra = {}, acceptError = false) {
-      const response = await probe(profile, 'start', extra, acceptError);
+    async function start(profileName, extra = {}, acceptError = false) {
+      const response = await probe(profileName, 'start', extra, acceptError);
       if (response.status === 200) {
         assert.equal(response.result.outcome.status, 'pending');
         assert.equal(response.result.pins, 1);
@@ -173,8 +175,8 @@ export async function verifyControlPlanePackedWorkload({
       }
       return response;
     }
-    async function abandon(profile, state = 'failed') {
-      const response = await probe(profile, 'abandon');
+    async function abandon(profileName, state = 'failed') {
+      const response = await probe(profileName, 'abandon');
       assert.equal(response.result.pins, 0);
       assert.equal(response.result.run.state, state);
       return response;
@@ -235,7 +237,11 @@ export async function verifyControlPlanePackedWorkload({
       assert.equal(measured.start.result.intake.count, count);
       let offset = 0;
       let token;
-      for (let calls = 0; calls < Math.ceil((count - 1) / 100); calls += 1) {
+      for (
+        let pageCalls = 0;
+        pageCalls < Math.ceil((count - 1) / 100);
+        pageCalls += 1
+      ) {
         const response = await probe(name, 'seed-facts', { offset });
         assert.ok(response.result.next > offset);
         offset = response.result.next;

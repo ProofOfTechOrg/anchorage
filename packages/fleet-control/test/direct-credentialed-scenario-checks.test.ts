@@ -34,6 +34,7 @@ import {
   recordFacts,
   requireFact,
   SCENARIO_ROLES,
+  suspensionSha256,
   zeroAttempts,
 } from '../scripts/direct-credentialed-scenario-checks.mjs';
 import { directCleanupReceiptDigest } from '../scripts/direct-reference-receipt.mjs';
@@ -77,6 +78,7 @@ function observation(
     tenantTag: 'tenant',
     environment: 'production',
     scriptName: 'script',
+    routeHostname: 'a.example.test',
     currentDeployment: {
       deploymentId: 'deployment',
       activeVersionId,
@@ -128,6 +130,21 @@ describe('scenario fact helpers', () => {
     });
     expect([...NORMAL_ROLES]).toEqual(['a', 'b']);
     expect([...SCENARIO_ROLES]).toEqual(['a', 'b', 'recovery']);
+  });
+
+  it('binds the suspension digest to the tenant-observed status members', () => {
+    const observed = {
+      runId: 'run-id',
+      status: 'suspended',
+      suspended: [['hold']],
+      suspendPayload: { hold: { reason: 'awaiting-resume' } },
+    };
+    expect(
+      suspensionSha256({
+        ...observed,
+        suspended: [['different-step']],
+      }),
+    ).not.toBe(suspensionSha256(observed));
   });
 
   it('projects operation anchors without the frozen input and records without undefined', () => {
@@ -428,6 +445,14 @@ describe('scenario reconciliation allowance', () => {
       changedBy({ kind: 'provision', role: 'a', release: 'initial' }),
     ).toEqual({ slots: ['cleanup-a'], roles: ['a'] });
     expect(
+      changedBy({
+        kind: 'provision',
+        role: 'a',
+        release: 'initial',
+        cycle: 'reprovision',
+      }),
+    ).toEqual({ slots: ['cleanup-a-reprovision'], roles: ['a'] });
+    expect(
       changedBy({ kind: 'provision', role: 'recovery', release: 'initial' }),
     ).toEqual({ slots: ['cleanup-recovery-initial'], roles: ['recovery'] });
     expect(
@@ -444,6 +469,10 @@ describe('scenario reconciliation allowance', () => {
       slots: ['migration-next'],
       roles: ['a', 'b'],
     });
+    expect(changedBy({ kind: 'migration-reprovision-a' })).toEqual({
+      slots: [],
+      roles: ['a'],
+    });
     expect(changedBy({ kind: 'cleanup-continue', role: 'recovery' })).toEqual({
       slots: ['cleanup-recovery'],
       roles: ['recovery'],
@@ -452,6 +481,13 @@ describe('scenario reconciliation allowance', () => {
       slots: ['decommission-b'],
       roles: ['b'],
     });
+    expect(
+      changedBy({
+        kind: 'decommission-start',
+        role: 'a',
+        cycle: 'reprovision',
+      }),
+    ).toEqual({ slots: ['decommission-a-reprovision'], roles: ['a'] });
     expect(changedBy({ kind: 'force-recovery' })).toEqual({
       slots: [],
       roles: ['recovery'],
@@ -496,6 +532,13 @@ const DECLARED_PHASES = [
   'decommission-a',
   'decommission-b',
   'force-terminal-a',
+  'reprovision-a',
+  'continuation-start',
+  'continuation-lock',
+  'continuation-migrate',
+  'continuation-refuse',
+  'continuation-finish',
+  'decommission-reprovisioned-a',
   'force-recovery',
   'force-observe',
   'recover-force-residual',
@@ -609,7 +652,14 @@ describe('scenario invocation budget', () => {
       ['migration-interrupt', 'migration-restart'],
       ['cleanup-recovery', 'provision-recovery'],
       ['decommission-b', 'force-terminal-a'],
-      ['force-terminal-a', 'force-recovery'],
+      ['force-terminal-a', 'reprovision-a'],
+      ['reprovision-a', 'continuation-start'],
+      ['continuation-start', 'continuation-lock'],
+      ['continuation-lock', 'continuation-migrate'],
+      ['continuation-migrate', 'continuation-refuse'],
+      ['continuation-refuse', 'continuation-finish'],
+      ['continuation-finish', 'decommission-reprovisioned-a'],
+      ['decommission-reprovisioned-a', 'force-recovery'],
       ['force-recovery', 'force-observe'],
       ['force-observe', 'recover-force-residual'],
     ] as const)
@@ -652,13 +702,13 @@ describe('scenario invocation budget', () => {
       reserve: 132,
       ceiling: 216,
     });
-    expect(phaseInvocationReserve('migration')).toBe(516);
+    expect(phaseInvocationReserve('migration')).toBe(656);
     const overspent = { ...calls, migration: 200 };
     expect(
-      refusal(() => checkInvocationHeadroom('migration', overspent, 384)),
+      refusal(() => checkInvocationHeadroom('migration', overspent, 524)),
     ).toBe('accepted');
     expect(
-      cause(() => checkInvocationHeadroom('migration', overspent, 383)),
+      cause(() => checkInvocationHeadroom('migration', overspent, 523)),
     ).toEqual({ code: 'budget-exhausted', detail: 'run-reserve' });
   });
 

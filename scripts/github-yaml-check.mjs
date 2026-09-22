@@ -1,9 +1,15 @@
 import { lstatSync, readdirSync, readFileSync } from 'node:fs';
 import { dirname, extname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { isMap, parseDocument } from 'yaml';
+import { isMap, parseDocument, parse as parseYaml } from 'yaml';
 
 import { isInvokedAsEntryPoint } from './entry-point.mjs';
+import {
+  analyzePnpmCommands,
+  classifyPnpmInstallArguments,
+  hasPnpmToken,
+  isRepositoryRootPath,
+} from './shell-command-analysis.mjs';
 
 const FORBIDDEN_CHARACTER =
   // biome-ignore lint/suspicious/noControlCharactersInRegex: YAML excludes these code points from streams.
@@ -60,6 +66,318 @@ function githubYamlFiles(directory, errors) {
 
   visit(directory);
   return files;
+}
+
+function isWorkflowFile(githubDirectory, file) {
+  return toPosix(relative(githubDirectory, file)).startsWith('workflows/');
+}
+
+function actionInstallEntry(entry) {
+  if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
+    return { kind: 'limit', reason: 'unreadable pnpm/action-setup entry' };
+  }
+  const unknownKey = Object.keys(entry).find(
+    (key) => !['args', 'cwd', 'recursive'].includes(key),
+  );
+  if (unknownKey)
+    return {
+      kind: 'limit',
+      reason: `unmodelled pnpm/action-setup key ${unknownKey}`,
+    };
+  if (entry.recursive !== undefined && typeof entry.recursive !== 'boolean') {
+    return {
+      kind: 'limit',
+      reason: 'non-literal pnpm/action-setup recursive value',
+    };
+  }
+  if (
+    entry.cwd !== undefined &&
+    (typeof entry.cwd !== 'string' || entry.cwd.includes('${{'))
+  ) {
+    return {
+      kind: 'limit',
+      reason: 'non-literal pnpm/action-setup cwd',
+    };
+  }
+  if (entry.cwd !== undefined && !isRepositoryRootPath(entry.cwd)) {
+    return { kind: 'neutral' };
+  }
+  if (
+    entry.args !== undefined &&
+    (!Array.isArray(entry.args) ||
+      entry.args.some(
+        (argument) => typeof argument !== 'string' || argument.includes('${{'),
+      ))
+  ) {
+    return { kind: 'limit', reason: 'non-literal pnpm/action-setup args' };
+  }
+  const classification = classifyPnpmInstallArguments(entry.args ?? [], {
+    recursive: entry.recursive === true,
+  });
+  if (classification.kind === 'install') return { kind: 'install' };
+  if (classification.kind === 'neutral-install') return { kind: 'neutral' };
+  return classification;
+}
+
+function actionSetupInstall(step) {
+  if (
+    typeof step?.uses !== 'string' ||
+    !step.uses.startsWith('pnpm/action-setup@')
+  ) {
+    return { kind: 'none' };
+  }
+  let input = step.with?.run_install;
+  if (typeof input === 'string') {
+    if (input.includes('${{'))
+      return {
+        kind: 'limit',
+        reason: 'non-literal pnpm/action-setup run_install',
+      };
+    if (input.trim() === '') return { kind: 'none' };
+    try {
+      const parsed = parseYaml(input);
+      if (typeof parsed === 'string')
+        return {
+          kind: 'limit',
+          reason: 'unreadable pnpm/action-setup run_install',
+        };
+      input = parsed;
+    } catch {
+      return {
+        kind: 'limit',
+        reason: 'unreadable pnpm/action-setup run_install',
+      };
+    }
+  }
+  if (input === true) input = { recursive: true };
+  if (
+    input === undefined ||
+    input === null ||
+    input === false ||
+    (Array.isArray(input) && input.length === 0)
+  ) {
+    return { kind: 'none' };
+  }
+  const entries = Array.isArray(input) ? input : [input];
+  const results = entries.map(actionInstallEntry);
+  if (results.some(({ kind }) => kind === 'install'))
+    return { kind: 'install' };
+  return (
+    results.find(({ kind }) => kind === 'limit') ??
+    results.find(({ kind }) => kind === 'neutral') ?? { kind: 'none' }
+  );
+}
+
+function stepCondition(step) {
+  const condition = step?.if;
+  if (condition === undefined || condition === null || condition === true) {
+    return { kind: 'unconditional' };
+  }
+  if (
+    condition === false ||
+    (typeof condition === 'string' &&
+      condition.trim().toLowerCase() === 'false')
+  ) {
+    return { kind: 'never' };
+  }
+  if (typeof condition !== 'string') return { kind: 'unknown' };
+  const normalized = condition.trim();
+  if (normalized.toLowerCase() === 'true') return { kind: 'unconditional' };
+  if (
+    /^\$\{\{\s*github\.(?:event_name|ref|ref_name|repository|workflow)\s*(?:==|!=)\s*(['"])[^'"]+\1\s*\}\}$/u.test(
+      normalized,
+    )
+  ) {
+    return { kind: 'stable', key: normalized };
+  }
+  return { kind: 'unknown' };
+}
+
+function continueOnError(step) {
+  const value = step?.['continue-on-error'];
+  if (value === undefined || value === false) return 'strict';
+  if (value === true) return 'tolerated';
+  return 'unknown';
+}
+
+function effectiveRunSetting(step, job, workflowRunDefaults, setting) {
+  return (
+    step?.[setting] ??
+    job?.defaults?.run?.[setting] ??
+    workflowRunDefaults?.[setting]
+  );
+}
+
+function shellPolicy(shell) {
+  if (shell === undefined || shell === null) return { kind: 'standard' };
+  const value = String(shell).trim();
+  if (['bash', 'sh'].includes(value)) return { kind: 'standard' };
+  const firstWord = value.split(/\s+/u, 1)[0];
+  const executable = firstWord.split('/').at(-1);
+  if (['bash', 'dash', 'sh', 'zsh'].includes(executable)) {
+    return { kind: 'custom-bash' };
+  }
+  return { kind: 'other' };
+}
+
+function rootWorkingDirectory(workingDirectory) {
+  if (workingDirectory === undefined || workingDirectory === null) return true;
+  return isRepositoryRootPath(workingDirectory);
+}
+
+function firstPnpmIssue(job, workflowRunDefaults) {
+  let unconditionalInstall = false;
+  const conditionalInstalls = new Set();
+  const steps = Array.isArray(job?.steps) ? job.steps : [];
+  for (const [index, step] of steps.entries()) {
+    const condition = stepCondition(step);
+    if (condition.kind === 'never') continue;
+    const matchingConditionalInstall =
+      condition.kind === 'stable' && conditionalInstalls.has(condition.key);
+    const establishment = unconditionalInstall
+      ? 'unconditional'
+      : matchingConditionalInstall
+        ? 'conditional'
+        : 'none';
+    const actionInstall = actionSetupInstall(step);
+    const failureTolerance = continueOnError(step);
+    const canEstablish = failureTolerance === 'strict';
+    if (actionInstall.kind === 'limit' && !unconditionalInstall) {
+      return {
+        index,
+        step,
+        kind: 'limit',
+        command: String(step.uses),
+        reason: actionInstall.reason,
+      };
+    }
+    if (
+      actionInstall.kind === 'install' &&
+      condition.kind === 'unknown' &&
+      !unconditionalInstall
+    ) {
+      return {
+        index,
+        step,
+        kind: 'limit',
+        command: String(step.if),
+        reason: 'step condition is not stable',
+      };
+    }
+    if (
+      actionInstall.kind === 'install' &&
+      failureTolerance === 'unknown' &&
+      !unconditionalInstall
+    ) {
+      return {
+        index,
+        step,
+        kind: 'limit',
+        command: String(step['continue-on-error']),
+        reason: 'continue-on-error is not literal',
+      };
+    }
+    if (actionInstall.kind === 'install' && canEstablish) {
+      if (condition.kind === 'unconditional') unconditionalInstall = true;
+      else if (condition.kind === 'stable')
+        conditionalInstalls.add(condition.key);
+    }
+    if (typeof step?.run !== 'string') continue;
+    const shell = effectiveRunSetting(step, job, workflowRunDefaults, 'shell');
+    const shellKind = shellPolicy(shell);
+    if (shellKind.kind === 'other') {
+      // The Bash grammar cannot classify another shell's strings and comments,
+      // so unsupported shells retain a lexical pnpm check.
+      if (hasPnpmToken(step.run) && establishment !== 'unconditional') {
+        return {
+          index,
+          step,
+          kind: 'limit',
+          command: String(shell),
+          reason: 'step shell is not Bash-compatible',
+        };
+      }
+      continue;
+    }
+    const workingDirectory = effectiveRunSetting(
+      step,
+      job,
+      workflowRunDefaults,
+      'working-directory',
+    );
+    const installPolicy =
+      shellKind.kind !== 'standard' || !rootWorkingDirectory(workingDirectory)
+        ? 'limit'
+        : 'establish';
+    const analysis = analyzePnpmCommands(step.run, {
+      establishment: condition.kind === 'unknown' ? 'none' : establishment,
+      installPolicy,
+    });
+    if (condition.kind === 'unknown' && analysis.usesPnpm) {
+      return {
+        index,
+        step,
+        kind: 'limit',
+        command: String(step.if),
+        reason: 'step condition is not stable',
+      };
+    }
+    const [shellIssue] = analysis.issues;
+    if (shellIssue) return { ...shellIssue, index, step };
+    if (
+      failureTolerance === 'unknown' &&
+      analysis.installsPnpm &&
+      !unconditionalInstall
+    ) {
+      return {
+        index,
+        step,
+        kind: 'limit',
+        command: String(step['continue-on-error']),
+        reason: 'continue-on-error is not literal',
+      };
+    }
+    if (analysis.establishesInstall && canEstablish) {
+      if (condition.kind === 'unconditional') unconditionalInstall = true;
+      else if (condition.kind === 'stable')
+        conditionalInstalls.add(condition.key);
+    }
+  }
+  return undefined;
+}
+
+// pnpm resolves a workspace script, and the binaries it runs, out of
+// node_modules: a job that reaches one before any step installs fails on the
+// runner over the script it was about to run, not over the missing install.
+function workflowInstallDiagnostics(githubDirectory, file, workflow) {
+  const jobs = workflow?.jobs;
+  if (!jobs || typeof jobs !== 'object') return [];
+  const diagnostics = [];
+  for (const [name, job] of Object.entries(jobs)) {
+    const offender = firstPnpmIssue(job, workflow?.defaults?.run);
+    if (!offender) continue;
+    const step = offender.step.name ?? `step ${offender.index + 1}`;
+    if (offender.kind === 'limit') {
+      diagnostics.push(
+        fileDiagnostic(
+          githubDirectory,
+          file,
+          'PNPM_ANALYSIS_LIMIT',
+          `job \`${name}\` step \`${step}\` cannot be shown to run pnpm only after an install (${offender.reason}): ${offender.command}`,
+        ),
+      );
+      continue;
+    }
+    diagnostics.push(
+      fileDiagnostic(
+        githubDirectory,
+        file,
+        'MISSING_PNPM_INSTALL',
+        `job \`${name}\` invokes pnpm in \`${step}\` with no earlier install step: ${offender.command}`,
+      ),
+    );
+  }
+  return diagnostics;
 }
 
 function parserDiagnostic(githubDirectory, file, error) {
@@ -175,9 +493,10 @@ export function checkGithubYamlFiles(githubDirectory) {
       ),
     );
 
+    let contents;
     try {
       // Materialization surfaces unresolved aliases that parsing alone retains.
-      document.toJS();
+      contents = document.toJS();
     } catch (error) {
       errors.push(
         fileDiagnostic(
@@ -197,6 +516,14 @@ export function checkGithubYamlFiles(githubDirectory) {
           'NOT_A_MAPPING',
           'not a YAML mapping',
         ),
+      );
+      continue;
+    }
+
+    // Only workflows declare jobs; .github's other YAML is ISSUE_TEMPLATE.
+    if (isWorkflowFile(githubDirectory, file)) {
+      errors.push(
+        ...workflowInstallDiagnostics(githubDirectory, file, contents),
       );
     }
   }

@@ -1,7 +1,5 @@
-// A render throw anywhere used to white-screen the whole demo — the worst
-// possible teaching surface. The fallback is deliberately PLAIN HTML with
-// inline styles: if the theme or an Astryx component is what threw, rendering
-// Astryx again inside the boundary would throw again.
+// Plain HTML and inline styles keep the fallback independent of the theme
+// and Astryx components when rendering them fails.
 
 import { Component, type ErrorInfo, type ReactNode } from 'react';
 

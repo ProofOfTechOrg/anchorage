@@ -78,10 +78,10 @@ class WebSocketProbe {
   readonly #socket: WebSocket;
   readonly opened: Promise<void>;
 
-  constructor(base: URL, path: string, ticket: string) {
+  constructor(base: URL, path: string, websocketTicket: string) {
     const url = new URL(path, base);
     url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
-    url.searchParams.set('ticket', ticket);
+    url.searchParams.set('ticket', websocketTicket);
     this.#socket = new WebSocket(url.toString());
     this.#socket.addEventListener('message', (event) => {
       if (typeof event.data !== 'string') return;

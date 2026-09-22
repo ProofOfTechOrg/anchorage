@@ -1167,7 +1167,7 @@ describe('versioned execution fence persistence', () => {
       } else {
         const error = await fence
           .seed('draining')
-          .catch((error: unknown) => error);
+          .catch((caughtError: unknown) => caughtError);
         expect(error).toBeInstanceOf(ExecutionFenceUnreadableError);
         if (outcome === 'before') expect((error as Error).cause).toBe(failure);
         else
@@ -1441,7 +1441,7 @@ describe('versioned execution fence persistence', () => {
         if (responseLost) {
           const error = await queued
             .recordProofRun('key', 'run', admitted)
-            .catch((error: unknown) => error);
+            .catch((caughtError: unknown) => caughtError);
           expect(error).toBeInstanceOf(ExecutionFenceUnreadableError);
           expect((error as Error).cause).toBe(failure);
         } else {
@@ -2050,7 +2050,7 @@ describe('versioned execution fence persistence', () => {
       );
       const error = await uncertain
         .transition(activation)
-        .catch((error: unknown) => error);
+        .catch((caughtError: unknown) => caughtError);
       expect(error).toBeInstanceOf(ExecutionFenceUnreadableError);
       expect((error as Error).cause).toBe(failure);
     }

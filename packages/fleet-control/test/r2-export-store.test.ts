@@ -17,6 +17,7 @@ import type {
 } from '@cloudflare/workers-types';
 import { describe, expect, it } from 'vitest';
 import type { DurableDatabaseExportStore } from '../src/database-export-store.js';
+import { databaseExportReceiptKey } from '../src/export-file-name.js';
 import { R2DatabaseExportStore } from '../src/r2-export-store.js';
 import type {
   DatabaseExportIntegrity,
@@ -1500,6 +1501,85 @@ describe('R2DatabaseExportStore', () => {
     expect(result.location).toBe('r2://exports/a/b/db/uuid-1-x.db');
   });
 
+  it('preserves receipt key bytes from the former writer and script recipes', () => {
+    const prefix = 'fc0123456789abcdef01234567';
+    const keyPrefix = `${prefix}/`;
+    const identity = {
+      databaseId: RECEIPT_DATABASE_ID,
+      operationId: RECEIPT_OPERATION_ID,
+    };
+    const receipt = identity;
+    const manifest = { resourcePrefix: prefix };
+    const ctx = { config: manifest };
+    const key = databaseExportReceiptKey(prefix, identity);
+    expect(key).toBe(
+      `${keyPrefix}receipts/v1/${identity.databaseId}/${identity.operationId}.sql`,
+    );
+    expect(key).toBe(
+      `${prefix}/receipts/v1/${receipt.databaseId}/${receipt.operationId}.sql`,
+    );
+    expect(key).toBe(
+      `${manifest.resourcePrefix}/receipts/v1/${identity.databaseId}/${identity.operationId}.sql`,
+    );
+    expect(key).toBe(
+      `${ctx.config.resourcePrefix}/receipts/v1/${receipt.databaseId}/${receipt.operationId}.sql`,
+    );
+  });
+
+  it('preserves receipt key bytes for an empty store prefix', () => {
+    const prefix = '';
+    const identity = {
+      databaseId: RECEIPT_DATABASE_ID,
+      operationId: RECEIPT_OPERATION_ID,
+    };
+    expect(databaseExportReceiptKey(prefix, identity)).toBe(
+      `${prefix}receipts/v1/${identity.databaseId}/${identity.operationId}.sql`,
+    );
+  });
+
+  it.each([
+    undefined,
+    '',
+    'fc0123456789abcdef01234567/',
+    'tenant/exports/',
+  ])('preserves stored receipt key bytes, authority, and location for prefix %s', async (keyPrefix) => {
+    const bucket = new FakeR2Bucket();
+    const store = createStore(bucket, { keyPrefix });
+    const identity = receiptIdentity(store);
+    const prefix = keyPrefix ?? '';
+    const key = `${prefix}receipts/v1/${identity.databaseId}/${identity.operationId}.sql`;
+    expect(store.receiptAuthority).toBe(`r2://exports/${prefix}receipts/v1`);
+    const result = await writeReceipt(store, bytes(1, 2), { identity });
+    expect([...bucket.objects.keys()]).toEqual([key]);
+    expect(result.location).toBe(`r2://exports/${key}`);
+  });
+
+  it('accepts a 1024-byte receipt key and refuses a 1025-byte key before R2 access', async () => {
+    const suffix = `receipts/v1/${RECEIPT_DATABASE_ID}/${RECEIPT_OPERATION_ID}.sql`;
+    const keyPrefix = `${'a'.repeat(1_024 - Buffer.byteLength(suffix) - 1)}/`;
+    const key = `${keyPrefix}${suffix}`;
+    expect(Buffer.byteLength(key)).toBe(1_024);
+    const bucket = new FakeR2Bucket();
+    const store = createStore(bucket, { keyPrefix });
+    const result = await writeReceipt(store, bytes(1));
+    expect([...bucket.objects.keys()]).toEqual([key]);
+    expect(result.location).toBe(`r2://exports/${key}`);
+
+    const refusedBucket = new FakeR2Bucket();
+    const refusedPrefix = `a${keyPrefix}`;
+    expect(Buffer.byteLength(`${refusedPrefix}${suffix}`)).toBe(1_025);
+    const refusedStore = createStore(refusedBucket, {
+      keyPrefix: refusedPrefix,
+    });
+    const source = streamFrom(bytes(1), { stayOpen: true });
+    await expect(
+      writeReceipt(refusedStore, bytes(1), { body: source.body }),
+    ).rejects.toThrow('database export receipt key exceeds 1024 UTF-8 bytes');
+    expect(refusedBucket.getCalls).toBe(0);
+    expect(refusedBucket.putCalls).toBe(0);
+    expect(source.cancellations).toHaveLength(1);
+  });
+
   it('uses one canonical receipt key and exact metadata without minting a UUID', async () => {
     const bucket = new FakeR2Bucket();
     const source = bytes(1, 2, 3, 4);
@@ -1675,14 +1755,14 @@ describe('R2DatabaseExportStore', () => {
     }
 
     for (const metadataMutation of [
-      (metadata: Record<string, string>) => {
-        Reflect.deleteProperty(metadata, 'anchorageOperationId');
+      (recordedMetadata: Record<string, string>) => {
+        Reflect.deleteProperty(recordedMetadata, 'anchorageOperationId');
       },
-      (metadata: Record<string, string>) => {
-        metadata.extra = 'no';
+      (recordedMetadata: Record<string, string>) => {
+        recordedMetadata.extra = 'no';
       },
-      (metadata: Record<string, string>) => {
-        metadata.anchorageReceiptAuthority = 'r2://other/receipts/v1';
+      (recordedMetadata: Record<string, string>) => {
+        recordedMetadata.anchorageReceiptAuthority = 'r2://other/receipts/v1';
       },
     ]) {
       const bucket = new FakeR2Bucket();

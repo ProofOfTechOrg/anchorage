@@ -7,6 +7,10 @@ import {
   type DirectReferenceContext,
   type DirectReferenceEnvironment,
 } from './direct-reference-context.js';
+import {
+  dispatchDirectContinuation,
+  migrateDirectContinuation,
+} from './direct-reference-continuation.js';
 import type { DirectReferenceAction } from './direct-reference-contract.mjs';
 import { dispatchDirectFence } from './direct-reference-fence.js';
 import {
@@ -42,6 +46,8 @@ const operationSlots: readonly DirectOperationSlot[] = [
   'decommission-a',
   'decommission-b',
   'decommission-recovery',
+  'cleanup-a-reprovision',
+  'decommission-a-reprovision',
 ];
 
 type TenantProbeContext = Pick<
@@ -133,6 +139,8 @@ async function dispatch(
   action: DirectReferenceAction,
   signal: AbortSignal,
 ): Promise<unknown> {
+  if (action.kind === 'reconcile-invocation')
+    throw new DirectReferenceExecutionError();
   if (action.kind === 'control-read') {
     const operations = await Promise.all(
       operationSlots.map((slot) => context.journal.readOperation(slot)),
@@ -173,6 +181,10 @@ async function dispatch(
     return recoverDirectForceResidual(context);
   if (action.kind === 'tenant-probe')
     return probeDirectTenant(context, manifest, action, signal);
+  if (action.kind === 'tenant-continuation')
+    return dispatchDirectContinuation(context, manifest, action, signal);
+  if (action.kind === 'migration-reprovision-a')
+    return migrateDirectContinuation(context, manifest);
   if (action.kind === 'tenant-fence')
     return dispatchDirectFence(context, manifest, action, signal);
   if (action.kind === 'force-terminal')
@@ -198,27 +210,44 @@ export function createDirectReferenceWorker(
     ): Promise<Response> {
       const startedAt = performance.now();
       let metrics: DirectReferenceTransportSnapshot | undefined;
+      let context: DirectReferenceContext | undefined;
+      let contextPromise: Promise<DirectReferenceContext> | undefined;
+      const referenceContext = (signal: AbortSignal) => {
+        contextPromise ??= createDirectReferenceContext(manifest, environment, {
+          startedAt,
+          signal,
+          fetch: runtime.fetch,
+        }).then((value) => {
+          context = value;
+          return value;
+        });
+        return contextPromise;
+      };
       const response = await handleDirectReferenceHttpRequest(request, {
         invokeSecret: environment.FLEET_DIRECT_CONFORMANCE_INVOKE_SECRET,
         configSha256: manifest.configSha256,
         invocationTimeoutMs: manifest.referenceRuntime.invocationTimeoutMs,
         startedAt,
+        invocationJournal: async (signal) =>
+          (await referenceContext(signal)).journal,
         dispatch: async (action, signal) => {
-          const context = await createDirectReferenceContext(
-            manifest,
-            environment,
-            { startedAt, signal, fetch: runtime.fetch },
-          );
+          const dispatchContext = await referenceContext(signal);
           let result: unknown;
           try {
-            result = await dispatch(context, manifest, action, signal);
+            result = await dispatch(dispatchContext, manifest, action, signal);
+          } catch (error) {
+            if (dispatchContext.transport.snapshot().failure === 'attempts') {
+              dispatchContext.transport.assertWithinBudget();
+            }
+            throw error;
           } finally {
-            metrics = context.transport.snapshot();
+            metrics = dispatchContext.transport.snapshot();
           }
-          context.transport.assertWithinBudget();
+          dispatchContext.transport.assertWithinBudget();
           return result;
         },
       });
+      if (context && !metrics) metrics = context.transport.snapshot();
       if (metrics) {
         response.headers.set(
           'X-Direct-Provider-Attempts',

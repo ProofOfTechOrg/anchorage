@@ -816,13 +816,14 @@ export function createThreadAgentHost(
     if (records.size === 0) return undefined;
     for (const key of records.keys()) {
       const runId = key.slice(AGENT_RUN_STORAGE_KEY_PREFIX.length);
-      const record = await readRun(runId);
-      if (!record) continue;
-      if (executions.has(runId)) return { runId, principal: record.principal };
+      const runRecord = await readRun(runId);
+      if (!runRecord) continue;
+      if (executions.has(runId))
+        return { runId, principal: runRecord.principal };
       const state = await selectedAgentState(
         scope,
         {
-          agentId: record.agentId,
+          agentId: runRecord.agentId,
           resourceId: resourceIdFromKey(scope.threadId),
           runId,
         },
@@ -834,11 +835,12 @@ export function createThreadAgentHost(
         !isTerminalRunStatus(state.summary.status) ||
         (state.kind === 'legacy' && !isTerminalRunStatus(state.snapshot.status))
       )
-        return { runId, principal: record.principal };
+        return { runId, principal: runRecord.principal };
       const recovery = await storage.get(ownerRecoveryKey(runId));
-      if (recovery !== undefined) return { runId, principal: record.principal };
+      if (recovery !== undefined)
+        return { runId, principal: runRecord.principal };
       await withRecoveryLock(() =>
-        finalizeTerminalRecord(scope, runId, record, state),
+        finalizeTerminalRecord(scope, runId, runRecord, state),
       );
     }
     return undefined;
@@ -904,15 +906,15 @@ export function createThreadAgentHost(
       return { owner: principalOwner(scope.principal) };
     }
     if (!threaded) throw new AgentHostRequestError(404, 'run not found');
-    const [threadOwner, resourceOwner] = await Promise.all([
+    const [threadOwner, resolvedResourceOwner] = await Promise.all([
       ownership.owner('thread', ref.threadId),
       ownership.owner('resource', ref.resourceId),
     ]);
     if (
       !threadOwner ||
-      !resourceOwner ||
-      threadOwner.kind !== resourceOwner.kind ||
-      threadOwner.id !== resourceOwner.id
+      !resolvedResourceOwner ||
+      threadOwner.kind !== resolvedResourceOwner.kind ||
+      threadOwner.id !== resolvedResourceOwner.id
     ) {
       throw new AgentHostRequestError(404, 'run not found');
     }
@@ -1558,13 +1560,13 @@ export function createThreadAgentHost(
     const keys = new Set(
       (summary.suspended ?? []).map((path) => path.join('.')),
     );
-    return records.filter((record) => {
-      const key = record.stepPath?.join('.');
+    return records.filter((runRecord) => {
+      const key = runRecord.stepPath?.join('.');
       return (
         key !== undefined &&
         keys.has(key) &&
-        record.suspendedAt === summary.suspendedAt?.[key] &&
-        record.resumeCount === summary.resumeCount?.[key]
+        runRecord.suspendedAt === summary.suspendedAt?.[key] &&
+        runRecord.resumeCount === summary.resumeCount?.[key]
       );
     });
   };
@@ -1805,14 +1807,14 @@ export function createThreadAgentHost(
         }
         const storage = options.stateStorage();
         const binding = await readBinding(),
-          record = await readRun(stored.runId);
+          runRecord = await readRun(stored.runId);
         await assertRecoveryCurrent(stored);
         const matches =
           binding?.agentId === stored.agentId &&
           binding.resourceId === stored.resourceId;
-        if (record && !sameRunRecord(record, stored.runRecord))
+        if (runRecord && !sameRunRecord(runRecord, stored.runRecord))
           throw new Error('agent run record changed');
-        if (record) await deleteAgentRunRecord(storage, stored.runId);
+        if (runRecord) await deleteAgentRunRecord(storage, stored.runId);
         if (!stored.bindingPreexisting && matches)
           await deleteAgentThreadBinding(storage, {
             agentId: stored.agentId,
@@ -2103,7 +2105,7 @@ export function createThreadAgentHost(
                 );
               }
             }
-            const recovery: AgentOwnerRecovery = {
+            const recoveryState: AgentOwnerRecovery = {
               version: 2,
               phase: 'preparing',
               runRecord: stored,
@@ -2131,16 +2133,16 @@ export function createThreadAgentHost(
             ) {
               throw new AgentHostRequestError(404, 'run not found');
             }
-            await armOwnerRecovery(recovery);
+            await armOwnerRecovery(recoveryState);
             if (
               !(await options
                 .resourceAccess()
-                .reserveAll(claims, owner, recovery.token))
+                .reserveAll(claims, owner, recoveryState.token))
             ) {
               await options
                 .resourceAccess()
-                .settleReservation(recovery.token, claims);
-              await clearOwnerRecovery(recovery);
+                .settleReservation(recoveryState.token, claims);
+              await clearOwnerRecovery(recoveryState);
               throw new AgentHostRequestError(404, 'run not found');
             }
             if (threaded && !existing) {
@@ -2155,7 +2157,7 @@ export function createThreadAgentHost(
               ref.runId,
               stored,
             );
-            return recovery;
+            return recoveryState;
           },
         );
         // From here to the finally below, this object IS the run's execution.
@@ -2235,12 +2237,14 @@ export function createThreadAgentHost(
         } catch (error) {
           unwoundExecutions.add(execution);
           try {
-            const current = await options.stateStorage().get(recoveryKey);
-            if (current !== undefined) {
+            const storedRecovery = await options
+              .stateStorage()
+              .get(recoveryKey);
+            if (storedRecovery !== undefined) {
               const latest = validateOwnerRecovery(
                 scope.threadId,
                 recoveryKey,
-                current,
+                storedRecovery,
               );
               if (!sameOwnerRecovery(latest, recovery))
                 throw new Error('agent owner recovery changed');
@@ -2629,7 +2633,7 @@ export function createThreadAgentHost(
           segments[3] === 'terminate' &&
           request.method === 'POST'
         ) {
-          const runtime = scope.init.runtime;
+          const scopedRuntime = scope.init.runtime;
           const replayOnly = url.searchParams.get('replay') === '1';
           const storedRun = await readRun(ref.runId);
           if (storedRun && storedRun.agentId !== ref.agentId) {
@@ -2644,7 +2648,7 @@ export function createThreadAgentHost(
             .resourceAccess()
             .owner('run', ref.runId);
           if (!replayOnly && !preflightedTermination) {
-            await runtime.cancelActiveExecution(
+            await scopedRuntime.cancelActiveExecution(
               await workflowIdFor(scope, ref.agentId),
               ref.runId,
               'cancelled',
@@ -2653,7 +2657,7 @@ export function createThreadAgentHost(
           }
           const owner = await options.resourceAccess().owner('run', ref.runId);
           if (replayOnly) {
-            const existing = await runtime.status(
+            const existing = await scopedRuntime.status(
               await workflowIdFor(scope, ref.agentId),
               ref.runId,
             );
@@ -2664,7 +2668,7 @@ export function createThreadAgentHost(
               throw new AgentHostRequestError(404, 'run not found');
             }
           }
-          const transition = await runtime.terminateAsPrincipal(
+          const transition = await scopedRuntime.terminateAsPrincipal(
             await workflowIdFor(scope, ref.agentId),
             ref.runId,
             scope.principal,
@@ -2734,7 +2738,7 @@ export function createThreadAgentHost(
               : undefined;
             if (guard) await guard();
             if (selected.kind !== 'legacy')
-              await runtime.settleStartExecution(selected);
+              await scopedRuntime.settleStartExecution(selected);
             let summary = legacy?.summary ?? transition.summary;
             if (!cleanup.cleanupCompleted) {
               if (guard) await guard();
@@ -2774,7 +2778,7 @@ export function createThreadAgentHost(
                 }
               }
               if (guard) await guard();
-              summary = await runtime.completeTerminalCleanup(
+              summary = await scopedRuntime.completeTerminalCleanup(
                 workflowId,
                 ref.runId,
                 cleanup.revision,

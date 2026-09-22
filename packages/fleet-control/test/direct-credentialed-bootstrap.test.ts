@@ -208,14 +208,14 @@ async function fixture(
     Response.json(
       status === 200
         ? {
-            contractVersion: 1,
+            contractVersion: 2,
             configSha256: prepared.configSha256,
             action: 'control-read',
             ok: true,
             result,
           }
         : {
-            contractVersion: 1,
+            contractVersion: 2,
             ok: false,
             error: { code: 'budget-exhausted' },
           },
@@ -244,7 +244,7 @@ async function fixture(
         expect(request.method).toBe('POST');
         expect(await request.json()).toEqual({});
         return Response.json(
-          { contractVersion: 1, ok: false, error: { code: 'unauthorized' } },
+          { contractVersion: 2, ok: false, error: { code: 'unauthorized' } },
           {
             status: 401,
             headers: {
@@ -1172,7 +1172,7 @@ describeLinux('SDK direct bootstrap', () => {
       });
     const reservation = await f.journal.reserveInvocation(
       JSON.stringify({
-        contractVersion: 1,
+        contractVersion: 2,
         configSha256: f.prepared.configSha256,
         action: { kind: 'control-read' },
       }),
@@ -1397,7 +1397,10 @@ describeLinux('SDK direct bootstrap', () => {
     await expect(f.run()).rejects.toMatchObject({ code: 'outcome-unknown' });
     expect(f.fetchRequest).toHaveBeenCalledTimes(count);
     expect(probes.generate).toHaveBeenCalledTimes(generated);
-    await expect(f.reopen()).rejects.toMatchObject({ code: 'outcome-unknown' });
+    await f.reopen();
+    await expect(f.run()).rejects.toMatchObject({ code: 'outcome-unknown' });
+    expect(f.fetchRequest).toHaveBeenCalledTimes(count);
+    expect(probes.generate).toHaveBeenCalledTimes(generated);
   });
 
   it('resumes partial confirmed infrastructure before generating secrets', async () => {
@@ -1764,24 +1767,24 @@ describeLinux('SDK direct bootstrap', () => {
         deadlineMs: 4_000,
       }),
     );
-    const probes: Request[] = [];
+    const capturedProbes: Request[] = [];
     const fetchRequest: typeof fetch = async (input, init) => {
       const request = new Request(input, init);
       if (new URL(request.url).hostname.endsWith('.workers.dev'))
-        probes.push(request);
+        capturedProbes.push(request);
       return f.fetchRequest(input, init);
     };
     const result = f
       .run({ fetch: fetchRequest })
       .catch((error: unknown) => error);
-    await vi.waitFor(() => expect(probes).toHaveLength(1));
+    await vi.waitFor(() => expect(capturedProbes).toHaveLength(1));
     await vi.advanceTimersByTimeAsync(4_000);
     await expect(result).resolves.toMatchObject({
       code: 'provider-unavailable',
     });
-    expect(probes).toHaveLength(2);
+    expect(capturedProbes).toHaveLength(2);
     expect(
-      probes.every((request) => !request.headers.has('authorization')),
+      capturedProbes.every((request) => !request.headers.has('authorization')),
     ).toBe(true);
     expect(f.journal.snapshot()).toMatchObject({
       invocationCount: 0,
@@ -1791,12 +1794,12 @@ describeLinux('SDK direct bootstrap', () => {
 
   it('refuses an ingress readiness deadline with provider-unavailable and no invocation reserved', async () => {
     const f = await fixture();
-    let probes = 0;
+    let probeCalls = 0;
     const fetchRequest: typeof fetch = async (input, init) => {
       const request = new Request(input, init);
       if (new URL(request.url).hostname.endsWith('.workers.dev')) {
         expect(request.headers.has('authorization')).toBe(false);
-        probes++;
+        probeCalls++;
         const elapsed = performance.now() + 120_000;
         vi.spyOn(performance, 'now').mockReturnValue(elapsed);
         return new Response('<html>missing</html>', { status: 404 });
@@ -1807,7 +1810,7 @@ describeLinux('SDK direct bootstrap', () => {
       code: 'provider-unavailable',
       message: 'provider-unavailable',
     });
-    expect(probes).toBe(1);
+    expect(probeCalls).toBe(1);
     expect(f.journal.snapshot()).toMatchObject({
       invocationCount: 0,
       lastInvocation: null,

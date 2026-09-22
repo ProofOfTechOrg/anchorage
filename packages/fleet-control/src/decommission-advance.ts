@@ -1246,7 +1246,7 @@ async function advanceR2Transition(
 ): Promise<FleetRecord> {
   const resources = record.applicationResources ?? [];
   const actionableIndex = resources.findIndex(
-    (resource) => resource.state !== 'deleted',
+    (remainingResource) => remainingResource.state !== 'deleted',
   );
   const actionable =
     actionableIndex < 0 ? undefined : resources[actionableIndex];

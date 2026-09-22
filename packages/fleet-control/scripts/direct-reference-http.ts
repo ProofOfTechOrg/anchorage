@@ -4,16 +4,20 @@ import {
   bearerActorAuthenticator,
   staticTokenVerifier,
 } from '@proofoftech/flowsafe/host-kit';
+import { APIConnectionTimeoutError } from 'cloudflare';
 import {
   DIRECT_REFERENCE_PATH,
   type DirectReferenceAction,
   type DirectReferenceErrorCode,
   type DirectReferenceRequest,
   DirectReferenceRequestError,
+  isDirectReferenceReadOnlyAction,
   readDirectReferenceRequest,
 } from './direct-reference-contract.mjs';
 import {
+  type DirectInvocationLedgerState,
   type DirectJournalErrorCode,
+  type DirectReferenceJournal,
   DirectReferenceJournalError,
 } from './direct-reference-journal.js';
 
@@ -42,6 +46,14 @@ export interface DirectReferenceHttpOptions {
     action: DirectReferenceAction,
     signal: AbortSignal,
   ) => Promise<unknown>;
+  readonly invocationJournal: (
+    signal: AbortSignal,
+  ) => Promise<
+    Pick<
+      DirectReferenceJournal,
+      'receiveInvocation' | 'settleReceivedInvocation' | 'reconcileInvocation'
+    >
+  >;
 }
 
 const requestStatus = {
@@ -49,10 +61,12 @@ const requestStatus = {
   'payload-too-large': 413,
   'invalid-utf8': 400,
   'run-binding-mismatch': 409,
+  'request-hash-mismatch': 409,
 } satisfies Record<DirectReferenceErrorCode, number>;
 const journalStatus = {
   'journal-state': 500,
   'run-binding-mismatch': 409,
+  'duplicate-ordinal': 409,
   'operation-mismatch': 409,
   'prerequisite-unavailable': 409,
   'missing-start': 409,
@@ -81,7 +95,7 @@ function failure(
   headers?: ConstructorParameters<typeof Headers>[0],
 ) {
   return response(
-    { contractVersion: 1, ok: false, error: { code } },
+    { contractVersion: 2, ok: false, error: { code } },
     status,
     headers,
   );
@@ -105,8 +119,32 @@ function failureFromException(error: unknown): Response {
       const status = statuses[code];
       if (status !== undefined) return failure(code, status);
     }
+    if (error instanceof Error || error instanceof DOMException) {
+      const name = error.name;
+      const message = error.message;
+      if (
+        error instanceof APIConnectionTimeoutError ||
+        (error instanceof DOMException && name === 'TimeoutError') ||
+        (name === 'CloudflareAttachmentScanDriftError' &&
+          message ===
+            'Cloudflare attachment inventory changed during a resumable scan') ||
+        (name === 'CloudflareAttachmentScanProgressError' &&
+          message === 'Cloudflare attachment scan progress is malformed') ||
+        (name === 'CloudflareProviderRequestNotDispatchedError' &&
+          message === 'Cloudflare provider request was not dispatched') ||
+        (name === 'Error' &&
+          typeof message === 'string' &&
+          (/^R2 returned incomplete metadata for '[a-z0-9][a-z0-9-]{1,61}[a-z0-9]'$(?![\s\S])/u.test(
+            message,
+          ) ||
+            /^R2 bucket '[a-z0-9][a-z0-9-]{1,61}[a-z0-9]' has no valid creation date$(?![\s\S])/u.test(
+              message,
+            )))
+      )
+        return failure('operation-refused', 409);
+    }
   } catch {
-    // Class and code inspection can invoke traps on a foreign rejection.
+    // Error inspection can invoke traps on a foreign rejection.
   }
   return failure('operation-refused', 500);
 }
@@ -190,11 +228,34 @@ export async function handleDirectReferenceHttpRequest(
       signal.removeEventListener('abort', abortRead);
     }
     assertActive();
-    const result = await options.dispatch(input.action, signal);
+    const journal = await options.invocationJournal(signal);
     assertActive();
+    let result: unknown;
+    if (input.action.kind === 'reconcile-invocation') {
+      const state: DirectInvocationLedgerState =
+        await journal.reconcileInvocation(input.action);
+      result = { state };
+    } else {
+      const reservation = input.reservation;
+      if (reservation === null)
+        throw new DirectReferenceRequestError('invalid-request');
+      await journal.receiveInvocation(
+        reservation,
+        isDirectReferenceReadOnlyAction(input.action),
+      );
+      assertActive();
+      try {
+        result = await options.dispatch(input.action, signal);
+      } catch (error) {
+        await journal.settleReceivedInvocation(reservation, 'failed');
+        throw error;
+      }
+      await journal.settleReceivedInvocation(reservation, 'executed');
+      assertActive();
+    }
     const output = response(
       {
-        contractVersion: 1,
+        contractVersion: 2,
         configSha256: options.configSha256,
         action: input.action.kind,
         ok: true,

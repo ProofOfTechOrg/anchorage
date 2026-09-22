@@ -34,8 +34,8 @@ describe('queueAuditSink', () => {
     const queued: AuditEvent[] = [];
     const audit = new AuditLogger({
       sink: queueAuditSink<AuditEvent>({
-        send: async (event) => {
-          queued.push(event);
+        send: async (auditEvent) => {
+          queued.push(auditEvent);
         },
       }),
     });

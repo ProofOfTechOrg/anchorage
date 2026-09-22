@@ -38,6 +38,8 @@ export function command(program, args, options = {}) {
   const result = spawnSync(program, args, {
     cwd: options.cwd ?? ROOT,
     encoding: 'utf8',
+    timeout: options.timeout,
+    killSignal: options.killSignal,
     ...(options.capture ? {} : { stdio: 'inherit' }),
   });
   return {
@@ -118,6 +120,17 @@ export function peerFloorGrammarViolations(manifests) {
 }
 
 /**
+ * Both peer-floor gates iterate the prerequisite peer edges, so an empty edge
+ * set passes each of them having checked nothing. The message is roster-generic
+ * because the manifests say which edges exist, never which ought to.
+ */
+export function missingPeerEdgeViolation(manifests) {
+  const [edge] = prerequisitePeerEdges(manifests);
+  if (edge) return undefined;
+  return 'no prerequisite declares a peer dependency on another prerequisite; the peer-floor gates would verify nothing';
+}
+
+/**
  * Numeric comparison is sufficient after the pinned grammar check and avoids
  * adding a semver package for one release invariant. Flowsafe's packed 0.x peer
  * regex must be revisited with this grammar when Breakwater reaches 1.0.
@@ -129,15 +142,12 @@ function compareVersions(left, right) {
   return 0;
 }
 
-/**
- * Release-only version gate, wired through publishRelease after the Version
- * Packages PR. Between a floor raise and that PR, the source tree legitimately
- * fails it: Flowsafe requires Breakwater >=0.13.0 while the pending changeset
- * `.changeset/silver-hounds-listen.md` still leaves Breakwater at 0.12.0.
- */
+/** Release-only peer-floor gate run after Changesets versions the packages. */
 export function prerequisitePeerFloorViolations(manifests) {
-  const violations = peerFloorGrammarViolations(manifests).map(
-    ({ message }) => message,
+  const missingEdge = missingPeerEdgeViolation(manifests);
+  const violations = missingEdge ? [missingEdge] : [];
+  violations.push(
+    ...peerFloorGrammarViolations(manifests).map(({ message }) => message),
   );
   for (const edge of prerequisitePeerEdges(manifests)) {
     if (edgeGrammarViolations(edge).length > 0) continue;
@@ -156,19 +166,48 @@ export function prerequisitePeerFloorViolations(manifests) {
   return violations;
 }
 
-function published(name, version) {
-  // `--prefer-online` revalidates the cached packument. Without it npm answers
-  // a poll from a cached copy that predates the publish, so the wait below
-  // would read its own stale cache for the whole deadline.
-  const result = command(
-    'npm',
-    ['view', `${name}@${version}`, 'version', '--json', '--prefer-online'],
-    { capture: true },
-  );
+// The process bound survives npm ignoring its own fetch configuration.
+export const PROBE_TIMEOUT_MS = 90_000;
+
+/**
+ * `--prefer-online` revalidates the cached packument: inside npm's cached
+ * packument TTL a poll is otherwise answered from a copy that predates the
+ * publish, so the wait below would read its own stale cache for the whole
+ * deadline. The fetch settings normally end one probe within about a minute.
+ */
+export function viewInvocation(name, version) {
+  return [
+    'view',
+    `${name}@${version}`,
+    'version',
+    '--json',
+    '--prefer-online',
+    '--fetch-timeout=30000',
+    '--fetch-retries=1',
+    '--fetch-retry-mintimeout=1000',
+    '--fetch-retry-maxtimeout=5000',
+  ];
+}
+
+export function published(name, version, run = command) {
+  const result = run('npm', viewInvocation(name, version), {
+    capture: true,
+    killSignal: 'SIGKILL',
+    timeout: PROBE_TIMEOUT_MS,
+  });
+  if (
+    result.error ||
+    result.signal !== null ||
+    !Number.isInteger(result.status)
+  ) {
+    throw new Error(
+      `npm view failed for ${name}@${version}: ${failureReason(result)}: ${result.stdout}\n${result.stderr}`,
+    );
+  }
   if (result.status === 0) {
     return JSON.parse(result.stdout) === version;
   }
-  const diagnostic = `${result.stdout}\n${result.stderr}`;
+  const diagnostic = `${failureReason(result)}: ${result.stdout}\n${result.stderr}`;
   if (/\bE404\b|404 Not Found|No match found/i.test(diagnostic)) return false;
   throw new Error(`npm view failed for ${name}@${version}: ${diagnostic}`);
 }
@@ -214,9 +253,9 @@ function publishPackage(target, version) {
 // npm processes a publish asynchronously: it acknowledges the tarball and
 // serves that version to `npm view` minutes later. The 2026-09-18 release
 // measured 8m32s from acceptance to visibility on the runner, and this deadline
-// is roughly 3.5x that measurement. The poll is spaced because each probe is an
-// uncached registry round trip and the wait it paces is measured in minutes, so
-// detection latency is the cheaper side of the trade.
+// is roughly 3.5x that measurement. The poll is spaced because each probe is a
+// revalidated registry round trip and the wait it paces is measured in minutes,
+// so detection latency is the cheaper side of the trade.
 export const VISIBILITY_DEADLINE_MS = 30 * 60_000;
 export const VISIBILITY_POLL_MS = 15_000;
 
@@ -229,30 +268,41 @@ export const VISIBILITY_POLL_MS = 15_000;
  * not-yet-visible and the deadline still bounds the wait. The pre-publish
  * `published` call in `publishRelease` keeps throwing instead: there, an
  * unreadable registry must not be read as "unpublished" and republish.
+ *
+ * The deadline is tested after a probe rather than before, and the sleep is
+ * clipped to what remains of the budget, so a probe runs at the deadline and
+ * the wait ends within one probe of VISIBILITY_DEADLINE_MS.
+ *
+ * `now` is monotonic because the arithmetic here is relative, and it is called
+ * through an arrow: `performance.now` throws when detached from `performance`.
  */
 export async function waitUntilPublished(
   name,
   version,
   {
-    now = Date.now,
+    now = () => performance.now(),
     sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     isPublished = published,
   } = {},
 ) {
   const deadline = now() + VISIBILITY_DEADLINE_MS;
   let lastProbeError;
-  while (now() < deadline) {
+  for (;;) {
     try {
       if (await isPublished(name, version)) return;
     } catch (error) {
       lastProbeError = error;
     }
-    await sleep(VISIBILITY_POLL_MS);
+    const remaining = deadline - now();
+    if (remaining <= 0) break;
+    await sleep(Math.min(VISIBILITY_POLL_MS, remaining));
   }
   const cause = lastProbeError
-    ? ` (last probe error: ${lastProbeError.message})`
+    ? ` (a probe failed during the wait: ${lastProbeError.message})`
     : '';
-  throw new Error(`${name}@${version} did not become visible on npm${cause}`);
+  throw new Error(`${name}@${version} did not become visible on npm${cause}`, {
+    cause: lastProbeError,
+  });
 }
 
 /**

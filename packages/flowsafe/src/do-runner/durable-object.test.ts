@@ -1604,12 +1604,12 @@ describe('DurableObjectRunner.fetch', () => {
     const start = vi.fn(
       async (
         _workflowId: string,
-        options: Parameters<RunnerRuntime['start']>[1],
+        startOptions: Parameters<RunnerRuntime['start']>[1],
       ) => ({
-        runId: options.runId,
+        runId: startOptions.runId,
         status: 'success' as const,
-        requestedBy: options.requestedBy,
-        requestedByKind: options.requestedByKind,
+        requestedBy: startOptions.requestedBy,
+        requestedByKind: startOptions.requestedByKind,
       }),
     );
     const runtime = {
@@ -2532,16 +2532,19 @@ describe('DurableObjectRunner.fetch', () => {
     // The gate re-suspends on a falsy resume, so snapshot provenance accrues a
     // resume ordinal.
     class ResuspendRunner extends DurableObjectRunner<TestEnv> {
-      protected runOwnership(env: TestEnv): DurableObjectRunOwnershipStore {
-        return env.owners;
+      protected runOwnership(
+        runtimeEnv: TestEnv,
+      ): DurableObjectRunOwnershipStore {
+        return runtimeEnv.owners;
       }
 
-      protected build(env: TestEnv): RunnerRuntime {
+      protected build(runtimeEnv: TestEnv): RunnerRuntime {
         const { createWorkflow, createStep, runtime } = init(
-          { storage: env.storage },
+          { storage: runtimeEnv.storage },
           {
-            executionFence: env.fence ?? newTestExecutionFence(env.storage),
-            startIdempotency: newTestStartIdempotency(env.storage),
+            executionFence:
+              runtimeEnv.fence ?? newTestExecutionFence(runtimeEnv.storage),
+            startIdempotency: newTestStartIdempotency(runtimeEnv.storage),
           },
         );
         const gate = createStep({
@@ -2931,8 +2934,8 @@ describe('DurableObjectRunner.fetch', () => {
     const namespace: RunnerNamespaceLike<string> = {
       idFromName: (name) => name,
       get: () => ({
-        fetch: (url, init) =>
-          evicted.fetch(new Request(url, init as RequestInit)),
+        fetch: (url, requestInit) =>
+          evicted.fetch(new Request(url, requestInit as RequestInit)),
       }),
     };
     const topology = createDoRunTopology(
@@ -4293,10 +4296,8 @@ describe('DurableObjectRunner suspension deadlines', () => {
       }),
     );
 
-    // #then — retryable, and no second run: a 500 (`has no matching committed
-    // owner`) is what this route gives when the same recovery deletes the row
-    // and releases its claim behind the lagging read. The journal survives for
-    // a wake that can read it.
+    // #then — a retryable 503 (`state is not readable`), and no second run.
+    // The journal survives for a wake that can read it.
     expect(response.status).toBe(503);
     await expect(response.json()).resolves.toMatchObject({
       error: expect.stringContaining('state is not readable'),
@@ -4886,8 +4887,8 @@ describe('DurableObjectRunner suspension deadlines', () => {
     const { state, values } = durableKeyValueStorageFixture();
     const env = makeProductionEnv();
     // A deadline request whose compare-and-swap does not match: the route
-    // returns the current terminal summary without finalizing, a terminal path
-    // that can leave the record armed for a run that can never suspend again.
+    // returns the current terminal summary without finalizing. The cleanup
+    // prevents that counterfactual path from retaining an armed record.
     env.runtime = {
       cancelActiveExecution: vi.fn(async () => undefined),
       ...statusStub(async () => ({ runId: 'run-noop', status: 'timed_out' })),
@@ -6029,10 +6030,9 @@ describe('DurableObjectRunner suspension deadlines', () => {
     ['an empty runId', 'timed:'],
     ['an empty workflowId', ':run'],
   ])('never lets an object name with %s steer a status read on a no-record wake', async (_label, name) => {
-    // 'a/b:c' splits into status('a/b', 'c') unless the name is validated:
-    // every other entry point validates with isPathSafeId before touching the
-    // runtime, and a record written from an unvalidated name would discard
-    // itself on read-back. The other four shapes are skipped — regression pins.
+    // 'a/b:c' splits into status('a/b', 'c') unless the name is validated;
+    // a record written from an unvalidated name would discard itself on
+    // read-back. The other four shapes are skipped — regression pins.
     const events: string[] = [];
     const { storage } = durableKeyValueStorageFixture(events);
     const state = { id: { name }, storage } as unknown as DurableObjectState;
@@ -6043,8 +6043,8 @@ describe('DurableObjectRunner suspension deadlines', () => {
 
     await runner.alarm();
 
-    // The wake's own read is authoritativeStatus, so a pin left on `status`
-    // would pass however the name were used.
+    // The doubles expose both read methods, so malformed parsed ids must reach
+    // neither one.
     expect(reads.authoritativeStatus).not.toHaveBeenCalled();
     expect(reads.status).not.toHaveBeenCalled();
     expect(events.at(-1)).toBe('deleteAlarm');

@@ -9,19 +9,20 @@ Repository documentation, architecture, and publication checks. Markdown syntax 
   and external links.
 - `docs-check.test.mjs` — `node:test` fixtures for the documentation checker.
 - `github-yaml-check.mjs` — validates every YAML file under `.github`.
-- `github-yaml-check.test.mjs` — `node:test` fixtures for the GitHub YAML checker, and the cases that pin `ci.yml` rather than the checker.
+- `github-yaml-check.test.mjs` — `node:test` suite for `github-yaml-check.mjs` and for the tracked workflows themselves.
+- `shell-command-analysis.mjs` — parses Bash workflow steps for the pnpm
+  installation-order check.
 - `publish-ordered.mjs` — publishes the `PUBLISH_PREREQUISITES` packages before the Changesets remainder and gates release on prerequisite peer floors.
-- `publish-ordered.test.mjs` — `node:test` fixtures for publish ordering, the
-  publish argv and cwd shape, and the tag line `changesets/action` greps for.
+- `publish-ordered.test.mjs` — `node:test` suite for `publish-ordered.mjs`.
 - `publish-invocation-check.mjs` — dry-runs the real publish command per package and validates peer-floor grammar in CI and the release pre-flight.
 - `conformance-config-check.test.mjs` — `node:test` checks that agent-starter's
   Workers for Platforms operator configuration and harness wrangler configs
   satisfy fleet control's own validators. Lives here because
   `.dependency-cruiser.cjs` forbids anything under `packages/` from importing
   fleet control.
-- `architecture-positive-controls.test.mjs` — `node:test` positive controls for the `.dependency-cruiser.cjs` rules and the root vitest and `tsconfig.harness.json` registries; run with `pnpm architecture:controls`.
+- `architecture-positive-controls.test.mjs` — `node:test` positive controls for the repository's architecture rules and program registries; run with `pnpm architecture:controls`.
 - `entry-point.mjs` — `isInvokedAsEntryPoint(moduleUrl)`, the entry-point predicate the root scripts guard their side effects with. `moduleUrl` is a `file:` URL, as a string or a `URL`. The disposition it carries is documented on the export.
-- `entry-point.test.mjs` — run with `node --test scripts/entry-point.test.mjs`.
+- `entry-point.test.mjs` — requires `pnpm build` before `node --test scripts/entry-point.test.mjs` because the suite's `mint` cases run the agent-starter token script against flowsafe's built `approval-api` entry.
 - `child-process-fixture.mjs` — the `node:test` child-process harness: a temporary repository root, a spawned child under a watchdog, and the reader for the event log that child writes.
 - [`baseline-recorder.mjs`](baseline-recorder.mjs): recorder configuration and supported literal values are documented on `runBaselineRecorder`.
 - [`baseline-recorder.test.mjs`](baseline-recorder.test.mjs): run with `node --test scripts/baseline-recorder.test.mjs`.

@@ -2613,9 +2613,9 @@ describe('createThreadSignalRoutes', () => {
         now: '2026-07-20T12:00:00.000Z',
       }),
       scopeWith(undefined),
-    ).then((response) => {
+    ).then((resolvedResponse) => {
       settled = true;
-      return response;
+      return resolvedResponse;
     });
     await vi.waitFor(() => expect(sendSignal).toHaveBeenCalledTimes(1));
     expect(settled).toBe(false);
@@ -2749,9 +2749,9 @@ describe('createThreadSignalRoutes', () => {
         now: '2026-07-20T12:00:00.000Z',
       }),
       scopeWith(undefined),
-    ).then((response) => {
+    ).then((resolvedResponse) => {
       settled = true;
-      return response;
+      return resolvedResponse;
     });
     await vi.waitFor(() => expect(sendSignal).toHaveBeenCalledTimes(1));
     expect(sendSignal).toHaveBeenCalledWith(
@@ -5008,13 +5008,13 @@ describe('FS8 D3 proof activation signal boundaries', () => {
       return current;
     };
     const contentPolicy = vi.fn(async () => ({ allowed: true as const }));
-    const routes = createThreadSignalRoutes({
+    const signalRoutes = createThreadSignalRoutes({
       resolveAgent: () => h.agent,
       resolveResourceId: () => 'acme_res',
       resolveNotificationsStorage: () => storage,
       contentPolicy,
     });
-    const response = await routes(
+    const response = await signalRoutes(
       post('/signal/notifications/dispatch', {
         agentId: 'agent',
         resourceId: 'acme_res',

@@ -857,8 +857,8 @@ describe('createDemoAuthRouter (fake provider round-trip)', () => {
     const { router } = makeRouter({
       provider: {
         name: 'github',
-        authorizeUrl: ({ state }) =>
-          `https://fake.test/authorize?state=${encodeURIComponent(state)}`,
+        authorizeUrl: ({ state: oauthState }) =>
+          `https://fake.test/authorize?state=${encodeURIComponent(oauthState)}`,
         exchange: async () => {
           throw new Error(`upstream rejected ${leakedSecret}`);
         },

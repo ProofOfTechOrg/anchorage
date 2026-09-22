@@ -717,24 +717,36 @@ describe('createD1Storage table prefix', () => {
     );
   });
 
-  it('preserves inherited and non-enumerable disabled or custom domain overrides', async () => {
+  it('preserves own, inherited and non-enumerable domain overrides', async () => {
     const binding = sqliteUnitDatabase(openSqlite()) as D1DatabaseBinding;
     const custom = new FencedWorkflowsStorageD1({ binding: binding as never });
-    for (const mode of ['inherited', 'non-enumerable']) {
+    // @mastra/cloudflare-d1 backs neither of these domains, so a host-supplied
+    // store is the only value either can resolve to.
+    const definitions = { upsert: async () => undefined };
+    const knowledge = { query: async () => [] };
+    for (const mode of ['own', 'inherited', 'non-enumerable']) {
       for (const workflows of [false, custom]) {
-        const values = { workflows, threadState: false, notifications: false };
+        const values = {
+          workflows,
+          threadState: false,
+          notifications: false,
+          workflowDefinitions: definitions,
+          knowledge,
+        };
         const domains =
-          mode === 'inherited'
-            ? Object.create(values)
-            : Object.defineProperties(
-                {},
-                Object.fromEntries(
-                  Object.entries(values).map(([key, value]) => [
-                    key,
-                    { value },
-                  ]),
-                ),
-              );
+          mode === 'own'
+            ? values
+            : mode === 'inherited'
+              ? Object.create(values)
+              : Object.defineProperties(
+                  {},
+                  Object.fromEntries(
+                    Object.entries(values).map(([key, value]) => [
+                      key,
+                      { value },
+                    ]),
+                  ),
+                );
         Object.defineProperty(domains, 'ignored', {
           enumerable: true,
           get() {
@@ -747,8 +759,21 @@ describe('createD1Storage table prefix', () => {
         );
         expect(await storage.getStore('threadState')).toBeUndefined();
         expect(await storage.getStore('notifications')).toBeUndefined();
+        expect(await storage.getStore('workflowDefinitions')).toBe(definitions);
+        expect(await storage.getStore('knowledge')).toBe(knowledge);
       }
     }
+  });
+
+  it('resolves the domains the D1 adapter does not back to undefined', async () => {
+    const binding = sqliteUnitDatabase(openSqlite()) as D1DatabaseBinding;
+
+    const storage = createD1Storage({ binding });
+
+    // Red if a core release auto-installs a fallback store for either domain,
+    // the way it already does for threadState.
+    expect(await storage.getStore('workflowDefinitions')).toBeUndefined();
+    expect(await storage.getStore('knowledge')).toBeUndefined();
   });
 
   it('captures composition inputs before either storage constructor', async () => {

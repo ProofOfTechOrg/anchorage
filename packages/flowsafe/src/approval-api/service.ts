@@ -759,12 +759,6 @@ export class ApprovalService {
   /**
    * CAS-transitions a stale open record (pending/claimed/escalated, bound to
    * a suspension its step has since moved past) straight to 'rejected'.
-   * host-kit's reconcileApprovalsForSummary calls this before filing a fresh
-   * record for a step whose only open record no longer matches the run's
-   * current (suspendedAt, resumeCount) fingerprint. Without this transition,
-   * every poll would re-list the stale record through the open-step
-   * uniqueness index and file nothing.
-   *
    * Deliberately bypasses decide(): a rejection decision resumes the run
    * with declined semantics via #resume(), and a stale record must die
    * WITHOUT touching a run that is already suspended at a DIFFERENT
@@ -777,9 +771,12 @@ export class ApprovalService {
    *
    * router.ts does not route it. The in-repo reconcile path calls
    * supersedeStaleAsPrincipal instead (host-kit/approval-bridge.ts); this is
-   * the ApprovalActor form of the same transition. Authorized
-   * like create() (CAN_CREATE, not CAN_REVIEW): superseding is the "un-file"
-   * half of the same filing operation, not a reviewer decision.
+   * the host-facing ApprovalActor form of the same transition, exported
+   * through `./approval-api` for hosts that file and un-file approvals under
+   * an actor. It remains public for those hosts even though no in-repo
+   * production path calls it. Authorized like create() (CAN_CREATE, not
+   * CAN_REVIEW): superseding is the "un-file" half of the same filing
+   * operation, not a reviewer decision.
    *
    * Returns null — mirroring the store's own CAS contract, rather than
    * throwing — when the record is unknown or already left the OPEN set (a

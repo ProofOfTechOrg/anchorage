@@ -2069,7 +2069,7 @@ describe('advanceFleetAudit', () => {
     // A store can report done on a following empty page.
     const pageCap = ascending.findings.length + 1;
     let reachedDone = false;
-    for (let page = 0; page < pageCap; page += 1) {
+    for (let pageIndex = 0; pageIndex < pageCap; pageIndex += 1) {
       const next = await readFleetAuditFindingsPage(reversedStore, {
         operationId: orderedOperationId,
         limit: 2,

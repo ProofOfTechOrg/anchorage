@@ -6,19 +6,39 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { createTestHarness, type TestHarness } from 'wrangler';
-import { DIRECT_REFERENCE_PATH } from '../scripts/direct-reference-contract.mjs';
+import {
+  DIRECT_REFERENCE_PATH,
+  directReferenceRequestSha256,
+} from '../scripts/direct-reference-contract.mjs';
 import {
   DirectReferenceExecutionError,
   type DirectReferenceHttpOptions,
   handleDirectReferenceHttpRequest,
 } from '../scripts/direct-reference-http.js';
 import { DirectReferenceJournalError } from '../scripts/direct-reference-journal.js';
+import {
+  providerRefusalCases,
+  undispatchedCause,
+} from './fixtures/direct-provider-errors.js';
 
 const configSha256 = 'a'.repeat(64);
 const invokeSecret = 'direct-test-secret';
 const endpoint = `https://reference.test${DIRECT_REFERENCE_PATH}`;
-const envelope = (action: unknown = { kind: 'control-read' }) =>
-  JSON.stringify({ contractVersion: 1, configSha256, action });
+const envelope = (action: unknown = { kind: 'control-read' }) => {
+  const core = { contractVersion: 2, configSha256, action };
+  return JSON.stringify({
+    ...core,
+    reservation:
+      action !== null &&
+      typeof action === 'object' &&
+      Reflect.get(action, 'kind') === 'reconcile-invocation'
+        ? null
+        : {
+            ordinal: 1,
+            requestSha256: directReferenceRequestSha256(core),
+          },
+  });
+};
 
 function request(body = envelope(), authorization = `Bearer ${invokeSecret}`) {
   return new Request(endpoint, {
@@ -37,6 +57,11 @@ function fixture(overrides: Partial<DirectReferenceHttpOptions> = {}) {
     configSha256,
     invocationTimeoutMs: 5_000,
     dispatch,
+    invocationJournal: vi.fn(async () => ({
+      receiveInvocation: vi.fn(async () => {}),
+      settleReceivedInvocation: vi.fn(async () => {}),
+      reconcileInvocation: vi.fn(async () => 'cancelled' as const),
+    })),
     ...overrides,
   };
   return {
@@ -47,6 +72,201 @@ function fixture(overrides: Partial<DirectReferenceHttpOptions> = {}) {
 }
 
 describe('direct reference HTTP boundary', () => {
+  it('records received before dispatch and terminal state after dispatch', async () => {
+    const events: string[] = [];
+    const invocationJournal = {
+      receiveInvocation: vi.fn(async () => {
+        events.push('received');
+      }),
+      settleReceivedInvocation: vi.fn(
+        async (
+          _reservation: Readonly<{ ordinal: number; requestSha256: string }>,
+          state: 'executed' | 'failed',
+        ) => {
+          events.push(state);
+        },
+      ),
+      reconcileInvocation: vi.fn(async () => 'cancelled' as const),
+    };
+    const { handle } = fixture({
+      invocationJournal: async () => invocationJournal,
+      dispatch: async () => {
+        events.push('dispatch');
+        return { accepted: true };
+      },
+    });
+    expect((await handle(request())).status).toBe(200);
+    expect(events).toEqual(['received', 'dispatch', 'executed']);
+    expect(invocationJournal.receiveInvocation).toHaveBeenCalledWith(
+      expect.objectContaining({ ordinal: 1 }),
+      true,
+    );
+  });
+
+  it('routes reconciliation to the ledger without dispatch', async () => {
+    const invocationJournal = {
+      receiveInvocation: vi.fn(async () => {}),
+      settleReceivedInvocation: vi.fn(async () => {}),
+      reconcileInvocation: vi.fn(async () => 'cancelled' as const),
+    };
+    const { handle, dispatch } = fixture({
+      invocationJournal: async () => invocationJournal,
+    });
+    const response = await handle(
+      request(
+        envelope({
+          kind: 'reconcile-invocation',
+          ordinal: 7,
+          requestSha256: 'f'.repeat(64),
+        }),
+      ),
+    );
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      contractVersion: 2,
+      action: 'reconcile-invocation',
+      result: { state: 'cancelled' },
+    });
+    expect(invocationJournal.reconcileInvocation).toHaveBeenCalledWith({
+      kind: 'reconcile-invocation',
+      ordinal: 7,
+      requestSha256: 'f'.repeat(64),
+    });
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+
+  it.each(
+    providerRefusalCases,
+  )('classifies producer $name without exposing its payload', async ({
+    produce,
+  }) => {
+    const error = await produce();
+    const { handle, dispatch } = fixture();
+    dispatch.mockRejectedValue(error);
+    const response = await handle(request());
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({
+      contractVersion: 2,
+      ok: false,
+      error: { code: 'operation-refused' },
+    });
+    expect(response.headers.get('cache-control')).toBe('no-store');
+  });
+
+  it.each([
+    ['unwrapped cause', undispatchedCause],
+    [
+      'early match invariant',
+      new Error('complete attachment scan returned an early match'),
+    ],
+    [
+      'R2 newline',
+      new Error("R2 returned incomplete metadata for 'fixture-bucket'\n"),
+    ],
+    [
+      'date newline',
+      new Error("R2 bucket 'fixture-bucket' has no valid creation date\n"),
+    ],
+    [
+      'wrong class',
+      new TypeError("R2 returned incomplete metadata for 'fixture-bucket'"),
+    ],
+    [
+      'plain object',
+      {
+        name: 'CloudflareAttachmentScanDriftError',
+        message:
+          'Cloudflare attachment inventory changed during a resumable scan',
+      },
+    ],
+    ...[
+      'CloudflareAttachmentScanDriftError',
+      'CloudflareAttachmentScanProgressError',
+      'CloudflareProviderRequestNotDispatchedError',
+      'APIConnectionTimeoutError',
+      'TimeoutError',
+    ].map((name) => [
+      name,
+      Object.assign(new Error('private-token'), { name }),
+    ]),
+    ...['name', 'message'].map((property) => [
+      `${property} getter`,
+      Object.defineProperty(new Error('private-token'), property, {
+        get() {
+          throw new Error('private getter');
+        },
+      }),
+    ]),
+  ])('keeps foreign provider near miss %s at fixed 500', async (_label, error) => {
+    const { handle, dispatch } = fixture();
+    dispatch.mockRejectedValue(error);
+    const response = await handle(request());
+    expect(response.status).toBe(500);
+    expect(await response.json()).toEqual({
+      contractVersion: 2,
+      ok: false,
+      error: { code: 'operation-refused' },
+    });
+    expect(response.headers.get('cache-control')).toBe('no-store');
+  });
+
+  const r2Messages = [
+    (name: string) => `R2 returned incomplete metadata for '${name}'`,
+    (name: string) => `R2 bucket '${name}' has no valid creation date`,
+  ];
+
+  it.each(
+    r2Messages.flatMap((message) =>
+      ['ab', '-bad', 'bad-', 'a'.repeat(64), 'private/token', 'UPPER'].map(
+        (name) => [message(name), name] as const,
+      ),
+    ),
+  )('keeps malformed R2 bucket %s at fixed 500', async (message) => {
+    const { handle, dispatch } = fixture();
+    dispatch.mockRejectedValue(new Error(message));
+    const response = await handle(request());
+    expect(response.status).toBe(500);
+    expect(await response.json()).toEqual({
+      contractVersion: 2,
+      ok: false,
+      error: { code: 'operation-refused' },
+    });
+    expect(response.headers.get('cache-control')).toBe('no-store');
+  });
+
+  it.each(
+    r2Messages.flatMap((message) =>
+      ['abc', 'a'.repeat(63)].map((name) => [message(name), name] as const),
+    ),
+  )('classifies bounded R2 bucket %s as a fixed 409', async (message) => {
+    const { handle, dispatch } = fixture();
+    dispatch.mockRejectedValue(new Error(message));
+    const response = await handle(request());
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({
+      contractVersion: 2,
+      ok: false,
+      error: { code: 'operation-refused' },
+    });
+    expect(response.headers.get('cache-control')).toBe('no-store');
+  });
+
+  it('snapshots signature properties once', async () => {
+    const error = await providerRefusalCases[2].produce();
+    const name = error.name,
+      message = error.message;
+    const readName = vi.fn(() => name),
+      readMessage = vi.fn(() => message);
+    Object.defineProperties(error, {
+      name: { get: readName },
+      message: { get: readMessage },
+    });
+    const { handle, dispatch } = fixture();
+    dispatch.mockRejectedValue(error);
+    expect((await handle(request())).status).toBe(409);
+    expect(readName).toHaveBeenCalledTimes(1);
+    expect(readMessage).toHaveBeenCalledTimes(1);
+  });
   it('uses a trusted shared start time through response serialization', async () => {
     const now = vi.spyOn(performance, 'now').mockReturnValue(10);
     try {
@@ -110,7 +330,7 @@ describe('direct reference HTTP boundary', () => {
     const response = await handle(request());
     expect(response.status).toBe(500);
     expect(await response.json()).toEqual({
-      contractVersion: 1,
+      contractVersion: 2,
       ok: false,
       error: { code: 'operation-refused' },
     });
@@ -130,7 +350,7 @@ describe('direct reference HTTP boundary', () => {
     expect(response.headers.get('www-authenticate')).toBe('Bearer');
     expect(response.headers.get('cache-control')).toBe('no-store');
     expect(await response.json()).toEqual({
-      contractVersion: 1,
+      contractVersion: 2,
       ok: false,
       error: { code: 'unauthorized' },
     });
@@ -181,7 +401,7 @@ describe('direct reference HTTP boundary', () => {
     const response = await handle(request(body));
     expect(response.status).toBe(status);
     expect(await response.json()).toEqual({
-      contractVersion: 1,
+      contractVersion: 2,
       ok: false,
       error: { code },
     });
@@ -225,7 +445,7 @@ describe('direct reference HTTP boundary', () => {
     expect(dispatch.mock.calls[0]?.[1]).toBeInstanceOf(AbortSignal);
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({
-      contractVersion: 1,
+      contractVersion: 2,
       configSha256,
       action: 'migration-continue',
       ok: true,
@@ -267,7 +487,7 @@ describe('direct reference HTTP boundary', () => {
     const response = await handle(request());
     expect(response.status).toBe(status);
     expect(await response.json()).toEqual({
-      contractVersion: 1,
+      contractVersion: 2,
       ok: false,
       error: { code },
     });
@@ -376,9 +596,9 @@ describe('direct reference HTTP boundary', () => {
       return { status: 'complete' };
     });
     let responseSettled = false;
-    const result = handle(request()).then((response) => {
+    const result = handle(request()).then((resolvedResponse) => {
       responseSettled = true;
-      return response;
+      return resolvedResponse;
     });
     await abortObserved;
     expect(responseSettled).toBe(false);
@@ -398,9 +618,8 @@ describe('direct reference HTTP boundary inside workerd', () => {
   beforeAll(async () => {
     directory = await mkdtemp(join(tmpdir(), 'direct-http-'));
     const main = join(directory, 'worker.ts');
-    // The 100 ms invocation deadline belongs to the probe modes, whose bodies
-    // never settle; a request without a probe carries a deadline wide enough
-    // that the workerd round trip cannot spend it.
+    // Probe modes use a short deadline to bound bodies that do not settle. The
+    // ordinary request uses the production-scale fixture deadline.
     await writeFile(
       main,
       `import {handleDirectReferenceHttpRequest} from ${JSON.stringify(fileURLToPath(new URL('../scripts/direct-reference-http.ts', import.meta.url)))};
@@ -409,7 +628,7 @@ describe('direct reference HTTP boundary inside workerd', () => {
       let calls=0;
       if(mode==='stalled')request=new Request(${JSON.stringify(endpoint)},{method:'POST',headers:{authorization:'Bearer ${invokeSecret}'},body:new ReadableStream({cancel(){return new Promise(()=>{});}})});
       if(mode==='oversize')request=new Request(${JSON.stringify(endpoint)},{method:'POST',headers:{authorization:'Bearer ${invokeSecret}'},body:new ReadableStream({start(c){c.enqueue(new Uint8Array(17000));},cancel(){return new Promise(()=>{});}})});
-      const response=await handleDirectReferenceHttpRequest(request,{invokeSecret:'${invokeSecret}',configSha256:'${configSha256}',invocationTimeoutMs:mode?100:30000,dispatch:async(action)=>{calls++;return {status:'blocked',action};}});
+      const response=await handleDirectReferenceHttpRequest(request,{invokeSecret:'${invokeSecret}',configSha256:'${configSha256}',invocationTimeoutMs:mode?100:30000,invocationJournal:async()=>({receiveInvocation:async()=>{},settleReceivedInvocation:async()=>{},reconcileInvocation:async()=>'cancelled'}),dispatch:async(action)=>{calls++;return {status:'blocked',action};}});
       response.headers.set('x-fixture-dispatches',String(calls));return response;
     }};`,
     );

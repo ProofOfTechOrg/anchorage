@@ -6,10 +6,76 @@ import type { AuditEvent, AuditSink, MetricsRecorder } from './index.js';
 import {
   AGENT_AUDIT_CONTEXT_KEY,
   AuditLogger,
+  agentAuditContextFromRequestContext,
   agentAuditDetail,
   combineAuditSinks,
   metricsAuditSink,
 } from './index.js';
+
+describe('agentAuditContextFromRequestContext', () => {
+  it.each([
+    'agentId',
+    'entryPath',
+  ] as const)('rejects an invalid required %s', (field) => {
+    for (const value of [undefined, null, '', 1, {}]) {
+      const requestContext = new RequestContext();
+      requestContext.set(AGENT_AUDIT_CONTEXT_KEY, {
+        agentId: 'agent-trusted',
+        entryPath: 'approval-resume',
+        [field]: value,
+      });
+      expect(
+        agentAuditContextFromRequestContext(requestContext),
+      ).toBeUndefined();
+    }
+  });
+
+  it.each([
+    ['agentId', 'agent-trusted'],
+    ['entryPath', 'approval-resume'],
+  ] as const)('uses the validated %s value without rereading it', (field, expected) => {
+    const requestContext = new RequestContext();
+    const candidate: Record<string, unknown> = {
+      agentId: 'agent-trusted',
+      entryPath: 'approval-resume',
+    };
+    let reads = 0;
+    Object.defineProperty(candidate, field, {
+      enumerable: true,
+      get() {
+        reads += 1;
+        return reads === 1 ? expected : { invalid: true };
+      },
+    });
+    requestContext.set(AGENT_AUDIT_CONTEXT_KEY, candidate);
+
+    expect(agentAuditContextFromRequestContext(requestContext)).toEqual({
+      agentId: 'agent-trusted',
+      entryPath: 'approval-resume',
+    });
+    expect(reads).toBe(1);
+  });
+
+  it.each([
+    'agentId',
+    'entryPath',
+  ] as const)('rejects a throwing required %s getter', (field) => {
+    const requestContext = new RequestContext();
+    const candidate: Record<string, unknown> = {
+      agentId: 'agent-trusted',
+      entryPath: 'approval-resume',
+    };
+    Object.defineProperty(candidate, field, {
+      enumerable: true,
+      get() {
+        throw new Error('getter failure');
+      },
+    });
+    requestContext.set(AGENT_AUDIT_CONTEXT_KEY, candidate);
+
+    expect(agentAuditContextFromRequestContext(requestContext)).toBeUndefined();
+  });
+});
 
 describe('agentAuditDetail', () => {
   it('keeps trusted correlation authoritative over spoofed boundary detail', () => {

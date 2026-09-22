@@ -1,6 +1,6 @@
 {
   "name": "@proofoftech/fleet-control",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "publishConfig": {
     "access": "public"
   },
@@ -58,7 +58,7 @@
     "test:credentialed": "pnpm build && node scripts/credentialed-conformance.mjs",
     "test:credentialed:direct": "pnpm build && node scripts/direct-credentialed-conformance.mjs",
     "test:packed-consumer": "node scripts/packed-consumer-test.mjs",
-    "test": "vitest run && vitest run --config vitest.direct-scenario.config.ts",
+    "test": "vitest run && vitest run --config vitest.direct-scenario.config.ts && vitest run --config vitest.direct-scenario-seams.config.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.build.json --noEmit && tsc -p scripts/tsconfig.direct-worker.json"
   },
   "dependencies": {
@@ -71,7 +71,8 @@
     "@types/node": "22.20.0",
     "typescript": "^5.6",
     "vitest": "^4.1.8",
-    "wrangler": "4.129.0"
+    "wrangler": "4.129.0",
+    "zod": "4.4.3"
   },
   "license": "Apache-2.0",
   "peerDependencies": {

@@ -610,10 +610,10 @@ describe('D1 execution domains', () => {
               config,
               new DurableObjectWorkflowsStorageD1({ binding }),
             );
-    const read = (domain: ReturnType<typeof construct>) =>
-      domain instanceof BackgroundTasksStorageD1
-        ? domain.getTask('task')
-        : domain.loadWorkflowSnapshot({
+    const read = (storageDomain: ReturnType<typeof construct>) =>
+      storageDomain instanceof BackgroundTasksStorageD1
+        ? storageDomain.getTask('task')
+        : storageDomain.loadWorkflowSnapshot({
             workflowName: 'workflow',
             runId: 'run',
           });
@@ -679,9 +679,11 @@ describe('D1 execution domains', () => {
         mode === 'inherited'
           ? Object.create({ binding })
           : Object.defineProperty({}, 'binding', { value: binding });
-      const domain = construct(config);
-      if (domain instanceof FencedWorkflowsStorageD1)
-        expect(domain[FENCED_WORKFLOW_STORAGE]?.database).toBe(binding);
+      const supportedDomain = construct(config);
+      if (supportedDomain instanceof FencedWorkflowsStorageD1)
+        expect(supportedDomain[FENCED_WORKFLOW_STORAGE]?.database).toBe(
+          binding,
+        );
     }
     let clientReads = 0;
     const capturedClient = construct({

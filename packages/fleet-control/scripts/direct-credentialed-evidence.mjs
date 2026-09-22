@@ -5,7 +5,7 @@ import { constants } from 'node:fs';
 import { open, readFile, rename, unlink } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
-import { DIRECT_INVOCATION_FAILURE_DETAILS } from './direct-credentialed-invocation.mjs';
+import { isDeepStrictEqual } from 'node:util';
 import { DIRECT_RESIDUAL_SURFACES } from './direct-credentialed-reference-vocabulary.mjs';
 import {
   assertPrivate,
@@ -13,6 +13,7 @@ import {
   sweepStagedFiles,
 } from './direct-credentialed-run-state.mjs';
 import { DIRECT_SCENARIO_PHASES } from './direct-credentialed-scenario-budget.mjs';
+import { directDeploymentModules } from './direct-credentialed-spec-modules.mjs';
 import { survivingIdentities } from './direct-credentialed-teardown.mjs';
 
 const { version: packageVersion } = createRequire(import.meta.url)(
@@ -45,8 +46,12 @@ export const DIRECT_CONFORMANCE_COMMANDS = Object.freeze({
 export const DIRECT_EVIDENCE_KEYS = Object.freeze([
   'a',
   'accountIdSha256Suffix',
+  'action',
   'activeVersionId',
   'after',
+  'at',
+  'approvalId',
+  'approvalStatus',
   'application',
   'attempts',
   'b',
@@ -66,11 +71,14 @@ export const DIRECT_EVIDENCE_KEYS = Object.freeze([
   'count',
   'cpuLimitMs',
   'current',
+  'cycle',
   'databaseId',
   'detail',
   'disposableAccount',
   'dispatch',
   'drain',
+  'emptyAfterOrdinal',
+  'emptyBeforeOrdinal',
   'emptyCount',
   'exhaustive',
   'exitCode',
@@ -109,6 +117,7 @@ export const DIRECT_EVIDENCE_KEYS = Object.freeze([
   'providerRequests',
   'quota',
   'quotaUuid',
+  'reconciliations',
   'receipts',
   'recovery',
   'referenceApplication',
@@ -155,6 +164,45 @@ export const DIRECT_EVIDENCE_KEYS = Object.freeze([
   'workCount',
   'worker',
   'zoneIdSha256Suffix',
+  'applicability',
+  'applicationRelease',
+  'challengeSha256',
+  'continuation',
+  'evidenceSha256',
+  'finalVersionId',
+  'finished',
+  'gatewayIdentity',
+  'identities',
+  'identitySha256',
+  'initialVersionId',
+  'locked',
+  'moduleBytes',
+  'namespaceIds',
+  'platformRunTokens',
+  'redecommission',
+  'refusal',
+  'release',
+  'reason',
+  'reopened',
+  'reprovision',
+  'reprovisionExport',
+  'resultSha256',
+  'routeHostname',
+  'role',
+  'roles',
+  'runId',
+  'schemaVersion',
+  'separationOfDuties',
+  'settlementKey',
+  'sourceHashRelationship',
+  'specDigest',
+  'started',
+  'step',
+  'sweep',
+  'suspensionSha256',
+  'tenantModuleSha256',
+  'versionB',
+  'workflowId',
   ...DIRECT_SCENARIO_PHASES,
   ...DIRECT_RESIDUAL_SURFACES,
 ]);
@@ -174,6 +222,15 @@ const members = (value, keys, project) =>
   Object.fromEntries(keys.map((key) => [key, nullable(value[key], project)]));
 const suffix = (value) =>
   createHash('sha256').update(value).digest('hex').slice(-8);
+
+export const directSourceHashRelationship = (initialModules, nextModules) =>
+  isDeepStrictEqual(initialModules, nextModules) ? 'identical' : 'divergent';
+
+function sourceHashRelationship(manifest) {
+  const initialModules = directDeploymentModules(manifest, 'a', 'initial');
+  const nextModules = directDeploymentModules(manifest, 'a', 'next');
+  return directSourceHashRelationship(initialModules, nextModules);
+}
 const reading = (value) =>
   pick(value, [
     'state',
@@ -199,7 +256,6 @@ const settlement = (value) => pick(value, ['settledByReread']);
 
 export function buildDirectEvidence({
   snapshot,
-  invocationFailureDetail,
   prepared,
   mode,
   outcome,
@@ -208,23 +264,28 @@ export function buildDirectEvidence({
 }) {
   const bootstrap = snapshot.bootstrap;
   const scenario = snapshot.scenario;
-  const invocationFailure =
-    snapshot.lastInvocation?.state === 'pending' &&
-    DIRECT_INVOCATION_FAILURE_DETAILS.includes(invocationFailureDetail)
-      ? {
-          code: 'outcome-unknown',
-          ordinal: snapshot.lastInvocation.ordinal,
-          detail: invocationFailureDetail,
-        }
-      : null;
+  const sweepState = snapshot.sweep;
   const teardown = snapshot.teardown;
   const receipts = teardown?.receipts;
   const observation = (value) => pick(value, ['versionId', 'cpuLimitMs']);
+  const replacementObservation = (value) => ({
+    ...pick(value, [
+      'databaseId',
+      'scriptName',
+      'routeHostname',
+      'versionId',
+      'specDigest',
+      'schemaVersion',
+      'applicationRelease',
+      'trafficPercentage',
+    ]),
+    namespaceIds: value.namespaces.map(({ namespaceId }) => namespaceId),
+  });
   const traffic = (value) =>
     pick(value, ['versionId', 'cpuLimitMs', 'trafficPercentage']);
   const scenarioSection = nullable(scenario, (value) => ({
     phase: value.phase,
-    failure: nullable(value.failure ?? invocationFailure, (failure) => ({
+    failure: nullable(value.failure, (failure) => ({
       code: failure.code,
       ordinal: failure.ordinal,
       detail: failure.detail ?? null,
@@ -241,6 +302,76 @@ export function buildDirectEvidence({
     initial: members(value.proofs.initial, ['a', 'b', 'recovery'], observation),
     candidate: members(value.proofs.candidate, ['a', 'b'], traffic),
     final: members(value.proofs.final, ['a', 'b'], traffic),
+    identities: Object.fromEntries(
+      ['a', 'b'].map((role) => {
+        const identity = value.proofs.identities[role];
+        const initial = value.proofs.initial[role];
+        const final = value.proofs.final[role];
+        return [
+          role,
+          identity === null || initial === null || final === null
+            ? null
+            : {
+                ...pick(identity, ['before', 'after']),
+                databaseId: initial.databaseId,
+                scriptName: initial.scriptName,
+                routeHostname: identity.routeHostname,
+                initialVersionId: initial.versionId,
+                finalVersionId: final.versionId,
+                evidenceSha256: identity.evidenceSha256,
+              },
+        ];
+      }),
+    ),
+    reprovision: {
+      initial: nullable(value.proofs.reprovision.a, replacementObservation),
+      final: nullable(value.proofs.reprovisionFinal.a, replacementObservation),
+      settlementKey:
+        value.proofs.reprovisionSettlement.a?.settlementKey ?? null,
+    },
+    continuation: {
+      started: nullable(value.proofs.continuation.started, (proof) =>
+        pick(proof, [
+          'workflowId',
+          'step',
+          'runId',
+          'challengeSha256',
+          'suspensionSha256',
+          'versionId',
+          'approvalId',
+          'emptyBeforeOrdinal',
+        ]),
+      ),
+      locked: nullable(value.proofs.continuation.locked, transition),
+      versionB: nullable(value.proofs.continuation.versionB, (proof) =>
+        pick(proof, ['initialVersionId', 'finalVersionId', 'identitySha256']),
+      ),
+      refusal: nullable(value.proofs.continuation.refused, (proof) =>
+        pick(proof, ['runId', 'status', 'code', 'state', 'suspensionSha256']),
+      ),
+      reopened: nullable(value.proofs.continuation.reopened, transition),
+      finished: nullable(value.proofs.continuation.finished, (proof) =>
+        pick(proof, [
+          'runId',
+          'status',
+          'challengeSha256',
+          'resultSha256',
+          'release',
+          'approvalId',
+          'approvalStatus',
+          'emptyAfterOrdinal',
+        ]),
+      ),
+    },
+    applicability: {
+      platformRunTokens: 'NOT_APPLICABLE_CP30_R1',
+      gatewayIdentity: 'NOT_APPLICABLE_CP30_R1',
+      separationOfDuties: 'self-decision-allowed',
+    },
+    moduleBytes: {
+      sourceHashRelationship: sourceHashRelationship(prepared.manifest),
+      tenantModuleSha256: prepared.manifest.tenantModule.sha256,
+    },
     fence: {
       drain: members(value.proofs.fence.drain, ['a', 'b'], transition),
       sweeps: members(value.proofs.fence.sweeps, ['a', 'b'], (sweeps) => ({
@@ -256,6 +387,12 @@ export function buildDirectEvidence({
     exports: members(value.proofs.exports, ['a', 'b'], (proof) =>
       pick(proof, ['location', 'size', 'sha256']),
     ),
+    reprovisionExport: nullable(value.proofs.reprovisionExports.a, (proof) =>
+      pick(proof, ['location', 'size', 'sha256']),
+    ),
+    redecommission: nullable(value.proofs.redecommission.a, (proof) =>
+      pick(proof, ['databaseId', 'scriptName']),
+    ),
     inventories: members(
       value.proofs.inventories,
       ['before', 'after'],
@@ -265,6 +402,36 @@ export function buildDirectEvidence({
       ...pick(proof, ['databaseId', 'scriptName', 'ordinal']),
       attempts: pick(proof.attempts, TRANSPORTS),
     })),
+  }));
+  const sweepSection = nullable(sweepState, (value) => ({
+    phase: value.phase,
+    roles: Object.fromEntries(
+      ['a', 'b', 'recovery'].map((role) => {
+        const entry = value.roles[role];
+        if (entry === null) return [role, null];
+        if (entry.kind === 'none')
+          return [role, pick(entry, ['kind', 'cycle', 'before'])];
+        if (entry.kind === 'completed')
+          return [
+            role,
+            pick(entry, [
+              'kind',
+              'cycle',
+              'before',
+              'action',
+              'after',
+              'ordinal',
+            ]),
+          ];
+        return [
+          role,
+          pick(entry, ['kind', 'cycle', 'before', 'action', 'reason']),
+        ];
+      }),
+    ),
+    refusal: nullable(value.failure, (failure) =>
+      pick(failure, ['code', 'role', 'reason']),
+    ),
   }));
   const teardownSection = nullable(teardown, (value) => ({
     failure: value.failure,
@@ -335,7 +502,11 @@ export function buildDirectEvidence({
       dispatch: pick(value.context.dispatch, ['kind', 'count']),
       activeVersionId: value.active?.versionId ?? null,
     })),
+    reconciliations: snapshot.reconciliations.map((entry) =>
+      pick(entry, ['ordinal', 'state', 'at']),
+    ),
     scenario: scenarioSection,
+    sweep: sweepSection,
     teardown: teardownSection,
     teardownCall: outcome.teardownCall,
     // The survival rule is teardown's: a receipt for a resource means the

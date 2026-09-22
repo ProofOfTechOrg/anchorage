@@ -33,6 +33,14 @@ export const hash = (value) => createHash('sha256').update(value).digest('hex');
 
 export const jsonHash = (value) => hash(JSON.stringify(value));
 
+export const suspensionSha256 = (value) =>
+  jsonHash({
+    runId: value.runId,
+    status: value.status,
+    suspended: value.suspended,
+    suspendPayload: value.suspendPayload,
+  });
+
 export const zeroAttempts = () => ({
   provider: 0,
   maintenance: 0,
@@ -72,24 +80,39 @@ export function checkInvocationHeadroom(phase, phaseCalls, remaining) {
 
 export function changedBy(action) {
   if (!action) return { slots: [], roles: [] };
-  const { kind, role, slot, release } = action;
+  const { kind, role, slot, release, cycle } = action;
   if (kind === 'provision')
     return {
       slots: [
-        role === 'recovery' && release === 'initial'
-          ? 'cleanup-recovery-initial'
-          : `cleanup-${role}`,
+        cycle === 'reprovision'
+          ? 'cleanup-a-reprovision'
+          : role === 'recovery' && release === 'initial'
+            ? 'cleanup-recovery-initial'
+            : `cleanup-${role}`,
       ],
       roles: [role],
     };
   if (kind.startsWith('inventory-')) return { slots: [slot], roles: [] };
   if (kind.startsWith('audit-')) return { slots: [slot], roles: [] };
+  if (kind === 'migration-reprovision-a') return { slots: [], roles: ['a'] };
   if (kind.startsWith('migration-'))
     return { slots: ['migration-next'], roles: [...NORMAL_ROLES] };
   if (kind.startsWith('cleanup-'))
-    return { slots: [`cleanup-${role}`], roles: [role] };
+    return {
+      slots: [
+        cycle === 'reprovision' ? 'cleanup-a-reprovision' : `cleanup-${role}`,
+      ],
+      roles: [role],
+    };
   if (kind.startsWith('decommission-'))
-    return { slots: [`decommission-${role}`], roles: [role] };
+    return {
+      slots: [
+        cycle === 'reprovision'
+          ? 'decommission-a-reprovision'
+          : `decommission-${role}`,
+      ],
+      roles: [role],
+    };
   if (kind === 'force-terminal') return { slots: [], roles: [role] };
   if (kind === 'force-recovery' || kind === 'recover-force-residual')
     return { slots: [], roles: ['recovery'] };

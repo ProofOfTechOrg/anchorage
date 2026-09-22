@@ -13,9 +13,14 @@ export type DirectInvocationErrorCode =
   | 'reference-refused';
 
 export type DirectReferenceRefusalCode =
+  | 'run-binding-mismatch'
+  | 'operation-mismatch'
+  | 'prerequisite-unavailable'
+  | 'missing-start'
   | 'operation-refused'
   | 'wrong-operation'
   | 'missing-continuation'
+  | 'duplicate-ordinal'
   | 'budget-exhausted';
 
 export const DIRECT_INVOCATION_FAILURE_DETAILS: readonly [
@@ -54,6 +59,39 @@ export interface DirectInvocationResult {
 export interface DirectInvocationClient {
   invoke(action: DirectReferenceAction): Promise<DirectInvocationResult>;
 }
+
+export type DirectInvocationReconciliation =
+  | 'received'
+  | 'executed'
+  | 'failed'
+  | 'cancelled'
+  | 'unreachable';
+
+export const DIRECT_RECONCILIATION_MARGIN_MS: number;
+export const DIRECT_RECONCILIATION_INTERVAL_MS: number;
+export const DIRECT_RECONCILIATION_MAX_INTERVAL_MS: number;
+export const DIRECT_RECONCILIATION_MAX_REQUESTS: number;
+
+export function resolveDirectReferenceEndpoint(
+  prepared: PreparedDirectConformance,
+  accountWorkersDevSubdomain: string,
+): Readonly<{ config: PreparedDirectConformance['config']; endpoint: string }>;
+
+export function reconcileDirectInvocation(
+  input: Readonly<{
+    endpoint: string | URL;
+    secret: string;
+    configSha256: string;
+    ordinal: number;
+    requestSha256: string;
+    workerDeadlineMs: number;
+    deadlineMs?: number;
+    /** Must not exceed `DIRECT_RECONCILIATION_MAX_INTERVAL_MS`. */
+    intervalMs?: number;
+    fetch?: typeof fetch;
+    sleep?: (ms: number) => Promise<void>;
+  }>,
+): Promise<DirectInvocationReconciliation>;
 
 export function createDirectInvocationClient(
   input: Readonly<{

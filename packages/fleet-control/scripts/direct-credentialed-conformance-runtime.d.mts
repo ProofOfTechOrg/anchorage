@@ -6,19 +6,23 @@ import type {
   DirectLiveMode,
   writeDirectEvidence,
 } from './direct-credentialed-evidence.mjs';
+import type { reconcileDirectInvocation } from './direct-credentialed-invocation.mjs';
 import type {
   inspectDirectRunState,
   openDirectRunState,
 } from './direct-credentialed-run-state.mjs';
 import type { runDirectCredentialedScenario } from './direct-credentialed-scenario.mjs';
+import type { runDirectCredentialedSweep } from './direct-credentialed-sweep.mjs';
 import type { teardownDirectReference } from './direct-credentialed-teardown.mjs';
 
 export interface DirectConformanceModules {
   preflight: typeof preflightDirectConformance;
   openRunState: typeof openDirectRunState;
   inspectRunState: typeof inspectDirectRunState;
+  reconcileInvocation: typeof reconcileDirectInvocation;
   bootstrap: typeof bootstrapDirectConformance;
   scenario: typeof runDirectCredentialedScenario;
+  sweep: typeof runDirectCredentialedSweep;
   teardown: typeof teardownDirectReference;
   writeEvidence: typeof writeDirectEvidence;
   distPresent: () => boolean;

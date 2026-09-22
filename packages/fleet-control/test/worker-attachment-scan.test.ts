@@ -125,10 +125,10 @@ function worldHandler(
     }
     if (path.endsWith('/workers/dispatch/namespaces')) {
       return pageArray(
-        world.namespaces.map((namespace, index) => ({
-          namespace_name: namespace.name,
+        world.namespaces.map((namespaceEntry, index) => ({
+          namespace_name: namespaceEntry.name,
           namespace_id: `namespace-${index}`,
-          script_count: namespace.pages.reduce(
+          script_count: namespaceEntry.pages.reduce(
             (count, page) => count + page.scripts.length,
             0,
           ),
@@ -605,7 +605,7 @@ describe('Cloudflare Worker attachment scan', () => {
     );
 
     for (const malformedBindings of ['version', 'settings'] as const) {
-      const fixture = recordingFetch(({ url }) => {
+      const laterFixture = recordingFetch(({ url }) => {
         const target = new URL(url);
         if (target.pathname.endsWith('/workers/scripts')) {
           return pageArray(
@@ -629,7 +629,9 @@ describe('Cloudflare Worker attachment scan', () => {
         if (target.pathname.endsWith('/settings')) return single({});
         throw new Error(`unexpected request ${target.pathname}`);
       });
-      await expect(drain(client(fixture.fetch), D1_TARGET)).rejects.toThrow(
+      await expect(
+        drain(client(laterFixture.fetch), D1_TARGET),
+      ).rejects.toThrow(
         malformedBindings === 'version'
           ? 'Cloudflare ordinary Worker version binding inventory was malformed'
           : 'Cloudflare dispatch Worker binding inventory was malformed',

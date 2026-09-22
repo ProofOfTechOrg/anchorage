@@ -241,30 +241,15 @@ export function starterMaintenanceTick(env: Env): () => Promise<unknown> {
     },
     audit,
   });
-  // Built on first use rather than at wiring time: an unpatched @mastra/core
-  // refuses this construction, and that refusal must fail the notifications
-  // leg of a pass, not the schedule leg that shares this tick nor the wiring
-  // of the maintenance duty. The schedule leg still claims and fires on such a
-  // pass, but reports no result: the aggregate promise rejects before the host
-  // logs schedule-tick, and what fired stays accounted through the audit sink
-  // above. The ??= memo is for a host that retains one built tick and invokes
-  // it again — the () => Promise<unknown> contract permits that; this host
-  // builds a fresh tick per alarm.
-  let notifications:
-    | ReturnType<typeof createNotificationDispatchTick>
-    | undefined;
-  const notificationTick = () => {
-    notifications ??= createNotificationDispatchTick({
-      storage: notificationsStore(env.DB),
-      topology: threadTopology,
-      resolveContext: () => systemContext(env, 'notification-dispatch'),
-      limit: 100,
-      executionFence: fence,
-    });
-    return notifications();
-  };
+  const notifications = createNotificationDispatchTick({
+    storage: notificationsStore(env.DB),
+    topology: threadTopology,
+    resolveContext: () => systemContext(env, 'notification-dispatch'),
+    limit: 100,
+    executionFence: fence,
+  });
   return async () => ({
     schedules: await schedules(),
-    notifications: await notificationTick(),
+    notifications: await notifications(),
   });
 }

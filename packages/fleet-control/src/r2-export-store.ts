@@ -15,7 +15,11 @@ import {
   databaseExportReceiptError,
   databaseExportReceiptIdentityFromUnknown,
 } from './database-export-store.js';
-import { assertFileName, isPortablePathSegment } from './export-file-name.js';
+import {
+  assertFileName,
+  databaseExportReceiptKey,
+  isPortablePathSegment,
+} from './export-file-name.js';
 import type {
   DatabaseExportIntegrity,
   DatabaseExportReceiptIdentity,
@@ -551,7 +555,10 @@ export class R2DatabaseExportStore implements DurableDatabaseExportStore {
     if (locked !== false) {
       throw new Error('database export receipt body is locked or malformed');
     }
-    const key = `${this.#keyPrefix}receipts/v1/${identity.databaseId}/${identity.operationId}.sql`;
+    const key = databaseExportReceiptKey(
+      this.#keyPrefix.slice(0, -1),
+      identity,
+    );
     if (utf8Length(key) > 1_024) {
       throw databaseExportReceiptError('key-too-long');
     }

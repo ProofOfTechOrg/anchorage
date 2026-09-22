@@ -79,8 +79,6 @@ import {
 } from '../schedules/schedules-d1.js';
 import type { AgentScheduleTarget } from '../schedules/tick.js';
 import {
-  assertNotificationDeliveryPolicyPatched,
-  assertNotificationSourceKeysPatched,
   captureNotificationDeliverySelection,
   captureNotificationDeliveryStorage,
   DEFAULT_MAX_NOTIFICATION_DELIVERY_ATTEMPTS,
@@ -1035,7 +1033,6 @@ async function handleNotificationDispatch(options: {
     );
   }
 
-  assertNotificationSourceKeysPatched();
   const deliveryStorage = captureNotificationDeliveryStorage(options.storage);
   const selections: ReturnType<typeof captureNotificationDeliverySelection>[] =
     [];
@@ -1166,7 +1163,7 @@ async function handleNotificationDispatch(options: {
       persistenceAllowed: options.persistenceAllowed,
       memoryAvailable: options.memoryAvailable,
       signal: deliverableSignal,
-      deliverActive: (runId, memoryAvailable) =>
+      deliverActive: (runId, activeMemoryAvailable) =>
         options.agent.sendSignal(deliverableSignal, {
           runId,
           threadId: options.threadId,
@@ -1174,7 +1171,7 @@ async function handleNotificationDispatch(options: {
           ifActive: { behavior: 'deliver' },
           ifIdle: {
             behavior:
-              memoryAvailable && options.persistenceAllowed
+              activeMemoryAvailable && options.persistenceAllowed
                 ? 'persist'
                 : 'discard',
           },
@@ -1527,7 +1524,7 @@ async function handleWake(options: {
    */
   executionFence: ExecutionFenceReading;
   proof?: SignalProofGuard;
-  deliverActive(runId: string, memoryAvailable: boolean): WakeDelivery;
+  deliverActive(runId: string, activeMemoryAvailable: boolean): WakeDelivery;
   persist(): WakeDelivery;
 }): Promise<Response> {
   return options.serializeWake(async () => {
@@ -2047,7 +2044,7 @@ async function handleScheduleSignal(options: {
       dispatchId,
       safeContext: { ...requestContext, ...idleRequestContext },
       activeDiscardAllowed: ifActive.behavior === 'discard',
-      deliverActive: (activeRunId, memoryAvailable) =>
+      deliverActive: (activeRunId, activeMemoryAvailable) =>
         options.agent.sendSignal(deliverableSignal, {
           runId: activeRunId,
           threadId: options.threadId,
@@ -2055,7 +2052,9 @@ async function handleScheduleSignal(options: {
           ifActive,
           ifIdle: {
             behavior:
-              memoryAvailable && persistenceAllowed ? 'persist' : 'discard',
+              activeMemoryAvailable && persistenceAllowed
+                ? 'persist'
+                : 'discard',
           },
         }),
       persist: () =>
@@ -2189,7 +2188,7 @@ async function handleMessage(
       persistenceAllowed: options.persistenceAllowed,
       memoryAvailable: options.memoryAvailable,
       message,
-      deliverActive: (runId, memoryAvailable) =>
+      deliverActive: (runId, activeMemoryAvailable) =>
         agent.sendMessage(message, {
           runId,
           threadId,
@@ -2199,7 +2198,7 @@ async function handleMessage(
           // when both the memory and authorization gates allow the write.
           ifIdle: {
             behavior:
-              memoryAvailable && options.persistenceAllowed
+              activeMemoryAvailable && options.persistenceAllowed
                 ? 'persist'
                 : 'discard',
           },
@@ -2401,7 +2400,7 @@ async function handleSignal(
       memoryAvailable: options.memoryAvailable,
       signal,
       activeDiscardAllowed: activeBehavior === 'discard',
-      deliverActive: (runId, memoryAvailable) =>
+      deliverActive: (runId, activeMemoryAvailable) =>
         agent.sendSignal(signal, {
           runId,
           threadId,
@@ -2409,7 +2408,7 @@ async function handleSignal(
           ifActive: { behavior: deliveredActiveBehavior },
           ifIdle: {
             behavior:
-              memoryAvailable && options.persistenceAllowed
+              activeMemoryAvailable && options.persistenceAllowed
                 ? 'persist'
                 : 'discard',
           },
@@ -2621,17 +2620,6 @@ async function handleNotification(
       409,
     );
   }
-  // Ingestion reaches core's patched functions below — the content-policy gate
-  // renders a prospective summary through summarizeNotifications, and core's
-  // inline sender resolves the configured source delivery policy — so the
-  // refusal sits above the branches rather than beside a single reach. It
-  // refuses the record-only branch as well, which a deployment that ingests
-  // here and delegates dispatch elsewhere pays. The route's catch answers 502
-  // with the message on the server log. Each subject has its own probe: the
-  // synchronous call covers summarizeNotifications, and the awaited one covers
-  // the source delivery policy lookup, which resolves asynchronously.
-  assertNotificationSourceKeysPatched();
-  await assertNotificationDeliveryPolicyPatched();
   // This gate is AUTHORITATIVE, not a preview: core can send an individual or
   // summary signal before the record reaches the dispatcher's second gate.
   // Storage owns the id, timestamps, and coalescing, so inspect a prospective

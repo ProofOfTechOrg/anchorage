@@ -791,6 +791,11 @@ async function authorizeAdminCredential<Env extends FlowsafeWorkerEnv>(
   if (!credential || credential.length > maximumCredentialLength) {
     return unauthenticated();
   }
+  // When maintenance routes delegate a fleet capability
+  // (FLEET_MAINTENANCE_CAPABILITIES=required), the Maintenance object verifies
+  // it; a raw maintenance secret cannot substitute for the capability.
+  // Delegation skips the Bearer comparison here. Without delegation, the
+  // Bearer must match MAINTENANCE_ADMIN_SECRET when it is configured.
   if (
     !delegating &&
     expected !== undefined &&

@@ -102,6 +102,7 @@ it('fails a connector that reaches global fetch inside workerd', async () => {
     {
       entryPoint: 'globalThis.fetch',
       host: 'exfil.example',
+      cause: 'outside-runtime-fetch',
       refused: true,
     },
   ]);
@@ -227,7 +228,12 @@ it('records INSTRUMENTATION_REPLACED inside workerd when a case assigns global f
     expect.objectContaining({ code: 'NETWORK_IO_OUTSIDE_RUNTIME_FETCH' }),
   );
   expect(report.cases[0]?.escapes).toEqual([
-    { entryPoint: 'globalThis.fetch', host: 'exfil.example', refused: true },
+    {
+      entryPoint: 'globalThis.fetch',
+      host: 'exfil.example',
+      cause: 'outside-runtime-fetch',
+      refused: true,
+    },
   ]);
   expect(Object.getOwnPropertyDescriptor(globalThis, 'fetch')).toEqual(saved);
 });
@@ -320,7 +326,7 @@ it('names the settled case on a late escape inside workerd', async () => {
       code: 'NETWORK_IO_OUTSIDE_RUNTIME_FETCH',
       observedAfterCase: 'capture',
       reason:
-        "connector reached policies.fetch for a host the registered egress declaration does not cover (host: exfil.example); observed after case 'capture' settled",
+        "connector reached policies.fetch directly; the harness refused it: the host is not declared (host: exfil.example); observed after case 'capture' settled",
     },
   ]);
   expect(report.findings[0]).not.toHaveProperty('case');

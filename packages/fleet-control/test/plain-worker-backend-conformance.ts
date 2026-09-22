@@ -313,7 +313,7 @@ export function describePlainWorkerConformance(
       );
       expect(harness.world.customDomains).toEqual([
         {
-          id: expect.any(String),
+          id: expect.stringMatching(/.+/u),
           hostname: spec.routeHostname,
           service: spec.scriptName,
         },
@@ -373,8 +373,11 @@ export function describePlainWorkerConformance(
 
       expect(stagedDeployment).toEqual([
         { versionId: initial.record.artifactVersion, percentage: 100 },
-        { versionId: expect.any(String), percentage: 0 },
+        { versionId: expect.stringMatching(/.+/u), percentage: 0 },
       ]);
+      expect(stagedDeployment?.[1]?.versionId).not.toBe(
+        initial.record.artifactVersion,
+      );
       expect(stagedDigest).toBe(deploymentSpecDigest(targetSpec));
       expect(migrated).toMatchObject({
         phase: 'ready',
@@ -423,8 +426,11 @@ export function describePlainWorkerConformance(
         const script = harness.world.scripts.get(targetSpec.scriptName);
         expect(script?.deployment).toEqual([
           { versionId: initial.record.artifactVersion, percentage: 100 },
-          { versionId: expect.any(String), percentage: 0 },
+          { versionId: expect.stringMatching(/.+/u), percentage: 0 },
         ]);
+        expect(script?.deployment?.[1]?.versionId).not.toBe(
+          initial.record.artifactVersion,
+        );
         expect(harness.world.mutationLog).toContain(
           `deploy-candidate:${targetSpec.scriptName}`,
         );
@@ -830,14 +836,14 @@ export function describePlainWorkerConformance(
               fetch: projected.fetch,
               wait,
             });
-        const upload = vi.spyOn(harness.world, 'consumeFailure');
+        const uploadSpy = vi.spyOn(harness.world, 'consumeFailure');
         return {
           ...harness,
           backend,
           wait,
           uploadAttempts: () =>
             harness.exportDirectory
-              ? upload.mock.calls.filter(
+              ? uploadSpy.mock.calls.filter(
                   ([operation]) => operation === 'uploadCandidate',
                 ).length
               : projected.requests.filter(({ method, url }) => {

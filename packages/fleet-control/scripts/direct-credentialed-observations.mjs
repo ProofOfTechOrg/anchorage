@@ -3,7 +3,10 @@
 import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { exactActiveVersionId } from '../src/active-route.ts';
-import { isPortablePathSegment } from '../src/export-file-name.ts';
+import {
+  databaseExportReceiptKey,
+  isPortablePathSegment,
+} from '../src/export-file-name.ts';
 import { providerBindingsToPlainWorkerShape } from '../src/provider-binding-inventory.ts';
 import { cancelBodyWithoutAwait } from './direct-credentialed-body-cancel.mjs';
 import {
@@ -26,6 +29,7 @@ const CODES = new Set([
 ]);
 const SETTLEMENT_SQL =
   "SELECT run_key,observation_kind,observation_key,identity_json,identity_sha256,provenance_json,provenance_sha256 FROM direct_reference_observations WHERE run_key=? AND observation_kind='settlement'";
+const SETTLEMENT_KEY_SQL = `${SETTLEMENT_SQL} AND observation_key=?`;
 const READY_SQL =
   'SELECT tenant_tag,environment,backend,script_name,database_id,schema_version,artifact_version,desired_spec_digest,phase,settled_settlement_key FROM anchorage_fleet_deployments WHERE tenant_tag=? AND environment=?';
 
@@ -279,6 +283,7 @@ function bindings(value, expected, checkRelease) {
     FLEET_SPEC_DIGEST: 'plain-text',
     FLEET_INGRESS_CONTRACT: 'plain-text',
     APPLICATION_RELEASE: 'plain-text',
+    APPROVAL_ALLOW_SELF_DECISION: 'plain-text',
   };
   if (
     indexed.size !== Object.keys(expectedTypes).length ||
@@ -321,13 +326,15 @@ function bindings(value, expected, checkRelease) {
           FLEET_SPEC_DIGEST: expected.specDigest,
           FLEET_SCHEMA_VERSION: String(expected.schemaVersion),
           APPLICATION_RELEASE: expected.applicationRelease,
+          APPROVAL_ALLOW_SELF_DECISION: 'true',
         }
       : {}),
   };
-  for (const [name, value] of Object.entries(vars))
-    if (indexed.get(name).value !== value) refuse();
+  for (const [name, bindingValue] of Object.entries(vars))
+    if (indexed.get(name).value !== bindingValue) refuse();
   if (
     !['1', '2'].includes(indexed.get('APPLICATION_RELEASE').value) ||
+    indexed.get('APPROVAL_ALLOW_SELF_DECISION').value !== 'true' ||
     indexed.get('FLEET_SCHEMA_VERSION').value !==
       indexed.get('APPLICATION_RELEASE').value ||
     typeof indexed.get('FLEET_SPEC_DIGEST').value !== 'string' ||
@@ -349,7 +356,7 @@ export async function observeDirectWorkerVersion(input) {
   } catch {
     refuse('invalid-input');
   }
-  return session(ctx, async ({ sdk, bound }) => {
+  return session(ctx, async ({ sdk, numbered, bound }) => {
     const selectors = { account_id: ctx.accountId };
     const list = await sdk.workers.scripts.deployments.list(
       expected.scriptName,
@@ -413,12 +420,22 @@ export async function observeDirectWorkerVersion(input) {
       !Number.isFinite(Date.parse(bucket.creation_date))
     )
       refuse();
+    const routeHostnames = [];
+    const domainPage = await numbered.workers.domains.list(selectors);
+    for await (const domain of domainPage) {
+      if (domain.service === expected.scriptName) {
+        if (typeof domain.hostname !== 'string') refuse();
+        routeHostnames.push(domain.hostname);
+      }
+    }
+    if (routeHostnames.length !== 1) refuse();
     return {
       role: expected.role,
       accountId: ctx.accountId,
       tenantTag: expected.tenantTag,
       environment: expected.environment,
       scriptName: expected.scriptName,
+      routeHostname: routeHostnames[0],
       versionId: expected.versionId,
       currentDeployment: current,
       trafficPercentage:
@@ -485,6 +502,69 @@ function storedJson(row, field, prefix) {
   return object(JSON.parse(value));
 }
 
+async function settlementEffect(single, ctx, row, match, settlementKey) {
+  if (
+    row.run_key !== ctx.config.resourcePrefix ||
+    row.observation_kind !== 'settlement'
+  )
+    refuse();
+  const key = hash(row.observation_key);
+  const identity = storedJson(row, 'identity', ctx.config.resourcePrefix);
+  const provenance = storedJson(row, 'provenance', ctx.config.resourcePrefix);
+  equal(identity, {
+    version: 1,
+    role: match.role,
+    tenantTag: match.tenantTag,
+    environment: match.environment,
+    target: {
+      physicalScriptName: match.scriptName,
+      specDigest: match.specDigest,
+      artifactVersion: match.versionId,
+    },
+  });
+  if (
+    key !== settlementKey ||
+    typeof provenance.alreadySettled !== 'boolean' ||
+    typeof provenance.observedAt !== 'string' ||
+    !Number.isFinite(Date.parse(provenance.observedAt))
+  )
+    refuse();
+  const ready = await queryRows(
+    single,
+    ctx,
+    READY_SQL,
+    [match.tenantTag, match.environment],
+    1,
+  );
+  equal(ready, [
+    {
+      tenant_tag: match.tenantTag,
+      environment: match.environment,
+      backend: 'plain-worker',
+      script_name: match.scriptName,
+      database_id: match.databaseId,
+      schema_version: match.schemaVersion,
+      artifact_version: match.versionId,
+      desired_spec_digest: match.specDigest,
+      phase: 'ready',
+      settled_settlement_key: key,
+    },
+  ]);
+  return {
+    role: match.role,
+    tenantTag: match.tenantTag,
+    environment: match.environment,
+    scriptName: match.scriptName,
+    databaseId: match.databaseId,
+    versionId: match.versionId,
+    specDigest: match.specDigest,
+    schemaVersion: match.schemaVersion,
+    settlementKey: key,
+    identitySha256: row.identity_sha256,
+    provenanceSha256: row.provenance_sha256,
+  };
+}
+
 export async function readDirectSettlementEffects(input) {
   const ctx = context(input);
   let expected;
@@ -514,82 +594,62 @@ export async function readDirectSettlementEffects(input) {
     const effects = [];
     const seen = new Set();
     for (const row of rows) {
-      if (
-        row.run_key !== ctx.config.resourcePrefix ||
-        row.observation_kind !== 'settlement'
-      )
-        refuse();
       const key = hash(row.observation_key);
       if (seen.has(key)) refuse();
       seen.add(key);
       const identity = storedJson(row, 'identity', ctx.config.resourcePrefix);
-      const provenance = storedJson(
-        row,
-        'provenance',
-        ctx.config.resourcePrefix,
-      );
       const match = expected.find((value) => value.role === identity.role);
       if (!match) refuse();
-      equal(identity, {
-        version: 1,
-        role: match.role,
-        tenantTag: match.tenantTag,
-        environment: match.environment,
-        target: {
-          physicalScriptName: match.scriptName,
-          specDigest: match.specDigest,
-          artifactVersion: match.versionId,
-        },
-      });
-      if (
-        key !==
+      effects.push(
+        await settlementEffect(
+          single,
+          ctx,
+          row,
+          match,
           fleetSettlementKey({
             tenantTag: match.tenantTag,
             environment: match.environment,
             specDigest: match.specDigest,
             artifactVersion: match.versionId,
-          }) ||
-        typeof provenance.alreadySettled !== 'boolean' ||
-        typeof provenance.observedAt !== 'string' ||
-        !Number.isFinite(Date.parse(provenance.observedAt))
-      )
-        refuse();
-      const ready = await queryRows(
-        single,
-        ctx,
-        READY_SQL,
-        [match.tenantTag, match.environment],
-        1,
+          }),
+        ),
       );
-      equal(ready, [
-        {
-          tenant_tag: match.tenantTag,
-          environment: match.environment,
-          backend: 'plain-worker',
-          script_name: match.scriptName,
-          database_id: match.databaseId,
-          schema_version: match.schemaVersion,
-          artifact_version: match.versionId,
-          desired_spec_digest: match.specDigest,
-          phase: 'ready',
-          settled_settlement_key: key,
-        },
-      ]);
-      effects.push({
-        role: match.role,
-        tenantTag: match.tenantTag,
-        environment: match.environment,
-        scriptName: match.scriptName,
-        databaseId: match.databaseId,
-        versionId: match.versionId,
-        specDigest: match.specDigest,
-        schemaVersion: match.schemaVersion,
-        settlementKey: key,
-        identitySha256: row.identity_sha256,
-        provenanceSha256: row.provenance_sha256,
-      });
     }
     return effects.sort((a, b) => a.role.localeCompare(b.role));
+  });
+}
+
+export async function readDirectSettlementEffect(input) {
+  const ctx = context(input);
+  let expected;
+  let settlementKey;
+  try {
+    expected = target(input.expected, ctx);
+    settlementKey = hash(input.settlementKey);
+    const { fleetSettlementKey } = await import('@proofoftech/fleet-control');
+    if (
+      settlementKey !==
+      fleetSettlementKey({
+        tenantTag: expected.tenantTag,
+        environment: expected.environment,
+        specDigest: expected.specDigest,
+        artifactVersion: expected.versionId,
+      })
+    )
+      refuse();
+  } catch {
+    refuse('invalid-input');
+  }
+  return session(ctx, async ({ single }) => {
+    const rows = await queryRows(
+      single,
+      ctx,
+      SETTLEMENT_KEY_SQL,
+      [ctx.config.resourcePrefix, settlementKey],
+      1,
+    );
+    if (rows.length !== 1 || !rows[0]) refuse();
+    return settlementEffect(single, ctx, rows[0], expected, settlementKey);
   });
 }
 
@@ -606,7 +666,17 @@ export async function verifyDirectDecommissionExport(input) {
     const last = ctx.snapshot.lastInvocation;
     if (last.ordinal !== sourceInvocationOrdinal || last.state !== 'settled')
       refuse();
-    equal(last.action, { kind: 'decommission-export', role: selectedRole });
+    const cycle = input.cycle;
+    if (
+      cycle !== undefined &&
+      (cycle !== 'reprovision' || selectedRole !== 'a')
+    )
+      refuse();
+    equal(last.action, {
+      kind: 'decommission-export',
+      role: selectedRole,
+      ...(cycle === undefined ? {} : { cycle }),
+    });
     const receipt = object(metadata.receipt);
     const authority = `r2://${ctx.bootstrap.exports.name}/${ctx.config.resourcePrefix}/receipts/v1`;
     if (
@@ -639,7 +709,7 @@ export async function verifyDirectDecommissionExport(input) {
     integer(metadata.generation);
     integer(metadata.size, 1);
     hash(metadata.sha256);
-    key = `${ctx.config.resourcePrefix}/receipts/v1/${receipt.databaseId}/${receipt.operationId}.sql`;
+    key = databaseExportReceiptKey(ctx.config.resourcePrefix, receipt);
   } catch {
     refuse('invalid-input');
   }

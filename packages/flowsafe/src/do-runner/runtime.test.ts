@@ -3117,7 +3117,7 @@ describe('Runtime checked durable counters', () => {
     'completed-cleanup',
   ])('preserves maximum counters on %s nonincrementing paths', async (variant) => {
     const h = await counterFixture();
-    h.seed((state) => {
+    h.seed((runState) => {
       const terminal = {
         status: 'cancelled',
         error: { code: 'CANCELLED', message: 'run was cancelled' },
@@ -3125,7 +3125,7 @@ describe('Runtime checked durable counters', () => {
         replayPrincipals: [owner],
         ...(variant === 'completed-cleanup' ? { cleanupCompletedAt: 0 } : {}),
       };
-      state.requestContext['flowsafe.runLifecycle'] = {
+      runState.requestContext['flowsafe.runLifecycle'] = {
         version: 1,
         revision: MAX,
         ...(variant === 'matching-intent'
@@ -3141,11 +3141,11 @@ describe('Runtime checked durable counters', () => {
           ? { terminal }
           : {}),
       };
-      state.requestContext['flowsafe.runProvenance'].resumeCounts = [
+      runState.requestContext['flowsafe.runProvenance'].resumeCounts = [
         ['unselected', MAX],
       ];
       if (variant === 'already-terminal' || variant === 'completed-cleanup')
-        state.status = 'cancelled';
+        runState.status = 'cancelled';
     });
     const runtime = h.makeRuntime();
     const before = h.read();
@@ -3193,18 +3193,18 @@ describe('Runtime checked durable counters', () => {
     'resume-revision',
   ])('advances MAX minus one %s exactly once without losing readability', async (variant) => {
     const h = await counterFixture();
-    h.seed((state) => {
-      state.requestContext['flowsafe.runLifecycle'] = {
+    h.seed((runState) => {
+      runState.requestContext['flowsafe.runLifecycle'] = {
         version: 1,
         revision: MAX - 1,
       };
       if (variant === 'resume-count')
-        state.requestContext['flowsafe.runProvenance'].resumeCounts = [
+        runState.requestContext['flowsafe.runProvenance'].resumeCounts = [
           ['gate', MAX - 1],
         ];
       if (variant === 'cleanup') {
-        state.status = 'cancelled';
-        state.requestContext['flowsafe.runLifecycle'] = {
+        runState.status = 'cancelled';
+        runState.requestContext['flowsafe.runLifecycle'] = {
           version: 1,
           revision: MAX - 1,
           terminal: {

@@ -1,3 +1,4 @@
+# Root paths are ignored until the allowlist opts them into source control.
 /*
 
 # --- Tracked top-level directories (their contents track normally) ---

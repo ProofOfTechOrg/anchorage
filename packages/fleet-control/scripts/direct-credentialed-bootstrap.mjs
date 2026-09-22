@@ -11,15 +11,13 @@ import {
   identifier,
   inventory,
   openDirectProviderSession,
+  resolveDirectZone,
 } from './direct-credentialed-provider.mjs';
 import { REFERENCE_SECRET_NAMES } from './direct-credentialed-reference-vocabulary.mjs';
 import {
   DirectRunStateError,
   mutationPending,
 } from './direct-credentialed-run-state.mjs';
-
-// The SDK's repeated type query parameters return no rows from the live API.
-const ZONE_TYPES = Object.freeze(['full', 'partial', 'secondary', 'internal']);
 
 const ERROR_CODES = new Set([
   'invalid-input',
@@ -220,20 +218,6 @@ async function checkedInput(input) {
   }
 }
 
-function zone(row, accountId) {
-  identifier(row.id);
-  identifier(row.type);
-  const name = identifier(row.name, 253);
-  if (
-    row.account?.id !== accountId ||
-    name
-      .split('.')
-      .some((label) => !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u.test(label))
-  )
-    refuse();
-  return [`id:${row.id}`, `name:${row.name}`];
-}
-
 function assertZonePolicy(token, verifiedId, accountId) {
   if (
     token.id !== verifiedId ||
@@ -397,35 +381,13 @@ export async function bootstrapDirectConformance(input) {
     )
       refuse();
     await attestToken(sdk, accountId, APIError);
-    const zones = await inventory(
-      numbered.zones.list({
-        account: { id: accountId },
-        per_page: 50,
-      }),
-      (row) => zone(row, accountId),
+    const selectedZone = await resolveDirectZone({
+      sdk,
+      numbered,
+      accountId,
+      ownedHostname: prepared.config.ownedHostname,
       bound,
-    );
-    const matches = zones
-      .filter((row) => ZONE_TYPES.includes(row.type))
-      .filter(
-        (row) =>
-          prepared.config.ownedHostname === row.name ||
-          prepared.config.ownedHostname.endsWith(`.${row.name}`),
-      )
-      .sort((a, b) => b.name.length - a.name.length);
-    if (
-      !matches[0] ||
-      (matches[1] && matches[0].name.length === matches[1].name.length)
-    )
-      refuse();
-    const selectedZone = await sdk.zones.get({ zone_id: matches[0].id });
-    zone(selectedZone, accountId);
-    if (
-      selectedZone.id !== matches[0].id ||
-      selectedZone.name !== matches[0].name ||
-      !ZONE_TYPES.includes(selectedZone.type)
-    )
-      refuse();
+    });
     const namespaces = await classifyDispatchNamespaces(
       single,
       selectors,

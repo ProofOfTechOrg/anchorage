@@ -27,8 +27,12 @@ const RUNTIME_KEYS = [
   'subrequestLimit',
 ];
 
+function refusal(detail) {
+  return new Error(`direct conformance config has ${detail}`);
+}
+
 function invalid(field) {
-  return new Error(`direct conformance config has invalid ${field}`);
+  return refusal(`invalid ${field}`);
 }
 
 function object(value, keys, field) {
@@ -100,9 +104,9 @@ function artifact(value, field) {
       throw invalid(`${field}.auxiliaryWasm`);
     const names = new Set([mainModule]);
     auxiliaryWasm = Object.freeze(
-      input.auxiliaryWasm.map((value) => {
+      input.auxiliaryWasm.map((auxiliaryArtifact) => {
         const descriptor = object(
-          value,
+          auxiliaryArtifact,
           ['file', 'name', 'sha256'],
           `${field}.auxiliaryWasm`,
         );
@@ -275,6 +279,10 @@ export function validateDirectConformanceConfig(value, options = {}) {
   );
   if (maxProviderRequests < 9)
     throw invalid('referenceWorker.maxProviderRequests');
+  if (maxProviderRequests > referenceRuntime.subrequestLimit)
+    throw refusal(
+      'referenceWorker.maxProviderRequests greater than referenceWorker.subrequestLimit',
+    );
   const deployment = object(
     input.deployment,
     [...RUNTIME_KEYS, 'spec'],

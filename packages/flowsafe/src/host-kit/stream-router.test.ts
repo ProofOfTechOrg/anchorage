@@ -531,8 +531,8 @@ describe('hub fan-out wiring (host-approval-service, tested here — see file he
     const service = buildHostApprovalService(store, {
       systemPrincipalId: 'sys',
       resumeRun: async (record) => ({ runId: record.runId, status: 'success' }),
-      stream: (event) => {
-        pending.push(hubTopology.publish(event));
+      stream: (streamEvent) => {
+        pending.push(hubTopology.publish(streamEvent));
       },
       // In-memory approval store — no database, nothing to fence.
       executionFence: 'none',
@@ -632,7 +632,7 @@ describe('createStreamRouter run-route passthrough', () => {
 
   it('passes a 5xx refusal through with its status and reason intact', async () => {
     // #given — a run-status read refused because the deployment is fenced.
-    // Collapsing every 5xx into a bare 500 leaves a stream caller unable to
+    // Collapsing this refusal into a bare 500 leaves a stream caller unable to
     // tell a migration from a broken deployment.
     const router = routerWith(() =>
       Promise.reject(

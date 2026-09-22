@@ -63,6 +63,7 @@ Start with the task you need to complete. The generated API reference is useful 
 - [Security reporting](../SECURITY.md)
 - [Contributing](../CONTRIBUTING.md)
 - [Maintainer guide](maintainer-guide.md)
+- [Deferred work](deferred.md)
 - [Changelog: breakwater](../packages/breakwater/CHANGELOG.md)
 - [Changelog: flowsafe](../packages/flowsafe/CHANGELOG.md)
 

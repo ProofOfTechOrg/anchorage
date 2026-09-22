@@ -135,7 +135,6 @@ const AUDIT_CONSUMER_SETTINGS = Object.freeze({
 const SDK_TRANSPORT_TIMEOUT_MS = 2_147_483_647;
 /** The single in-memory drain reads one generation that is never persisted. */
 const DRAIN_GENERATION = 1;
-/** The `maxProviderRequests` budget the in-memory drain gives a stage. */
 const DRAIN_PROVIDER_REQUEST_BUDGET = 1_000;
 const R2_INVENTORY_PAGE_SIZE = 1_000;
 const DRAIN_INSPECT_SUFFIX = ' could not be inspected';
@@ -785,11 +784,11 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
                 cursor !== null &&
                 typeof cursor !== 'string') ||
               [totalPages, totalCount, perPage].some(
-                (value) =>
-                  value !== undefined &&
-                  (typeof value !== 'number' ||
-                    !Number.isSafeInteger(value) ||
-                    value < 0),
+                (parsedValue) =>
+                  parsedValue !== undefined &&
+                  (typeof parsedValue !== 'number' ||
+                    !Number.isSafeInteger(parsedValue) ||
+                    parsedValue < 0),
               ) ||
               (rows.length === 0 &&
                 ((typeof cursor === 'string' && cursor.length > 0) ||

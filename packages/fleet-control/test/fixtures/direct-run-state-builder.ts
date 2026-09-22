@@ -6,6 +6,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { preflightDirectConformance } from '../../scripts/direct-credentialed-conformance-preflight.mjs';
 import {
+  DIRECT_RECONCILIATION_MAX,
+  DIRECT_RECONCILIATION_STATES,
   DIRECT_RESIDUAL_SURFACES,
   DIRECT_TEARDOWN_MAXIMA,
 } from '../../scripts/direct-credentialed-reference-vocabulary.mjs';
@@ -16,11 +18,14 @@ import {
   type DirectBootstrapMutationReceipt,
   type DirectResidualObservation,
   type DirectRunJournal,
+  type DirectSweepState,
   type DirectTeardownState,
   openDirectRunState,
 } from '../../scripts/direct-credentialed-run-state.mjs';
 import type { DirectScenarioState } from '../../scripts/direct-credentialed-scenario.mjs';
 import { DIRECT_SCENARIO_PHASES } from '../../scripts/direct-credentialed-scenario-budget.mjs';
+import { serializeDirectReferenceCore } from '../../scripts/direct-reference-contract.mjs';
+import { databaseExportReceiptKey } from '../../src/export-file-name.js';
 
 export const directories: string[] = [];
 export const journals = new Set<DirectRunJournal>();
@@ -32,6 +37,7 @@ export type Mutable<T> = T extends readonly (infer Entry)[]
     ? { -readonly [Key in keyof T]: Mutable<T[Key]> }
     : T;
 export type MutableScenario = Mutable<DirectScenarioState>;
+export type MutableSweep = Mutable<DirectSweepState>;
 
 export function first<Entry>(entries: readonly Entry[]): Entry {
   const [entry] = entries;
@@ -87,7 +93,7 @@ export async function fixture(limit = 3, disposableAccount = true) {
   const input = { configPath, prepared, accountId: 'account' };
   const request = (action: unknown = { kind: 'control-read' }) =>
     JSON.stringify({
-      contractVersion: 1,
+      contractVersion: 2,
       configSha256: prepared.configSha256,
       action,
     });
@@ -209,10 +215,11 @@ export function workerVersion(
   role: 'a' | 'b' | 'recovery',
   applicationRelease: '1' | '2',
   trafficPercentage: number,
+  versionId = MAX_ID,
 ) {
   return {
     role,
-    versionId: MAX_ID,
+    versionId,
     databaseId: MAX_ID,
     specDigest: DIGEST,
     applicationRelease,
@@ -220,11 +227,12 @@ export function workerVersion(
     tenantTag: MAX_ID,
     environment: MAX_ID,
     scriptName: MAX_ID,
+    routeHostname: `${'h'.repeat(63)}.example`,
     currentDeployment: {
       deploymentId: MAX_ID,
-      activeVersionId: MAX_ID,
+      activeVersionId: versionId,
       versions: [
-        { versionId: MAX_ID, percentage: 100 },
+        { versionId, percentage: 100 },
         { versionId: MAX_ID, percentage: 0 },
       ],
     },
@@ -266,6 +274,26 @@ export function exportProof(role: 'a' | 'b') {
     size: MAX_COUNT,
     sha256: DIGEST,
     sourceInvocationOrdinal: 1,
+  };
+}
+
+export function exportReference(
+  role: 'a' | 'b',
+  cycle: 'reprovision' | null = null,
+) {
+  const proof = exportProof(role);
+  return {
+    role,
+    cycle,
+    sourceInvocationOrdinal: proof.sourceInvocationOrdinal,
+    exportSha256: hash(
+      JSON.stringify({
+        receipt: proof.receipt,
+        location: proof.location,
+        size: proof.size,
+        sha256: proof.sha256,
+      }),
+    ),
   };
 }
 
@@ -344,10 +372,13 @@ export function auditProof() {
 /**
  * The largest scenario the journal admits. `callKind` selects the kind of the
  * settled call it carries in `lastCall` and `mutation`; the default is the
- * larger of the two, so a caller that does not choose still bounds the journal.
+ * largest of the three call kinds, so the default still bounds the journal.
  */
 export function maximalScenario(
-  callKind: 'audit-page' | 'force-terminal' = 'force-terminal',
+  callKind:
+    | 'audit-page'
+    | 'force-terminal'
+    | 'migration-reprovision-a' = 'migration-reprovision-a',
 ): MutableScenario {
   const fenceReading = () => ({
     state: 'migration-locked' as const,
@@ -385,9 +416,9 @@ export function maximalScenario(
   const phaseCalls = Object.fromEntries(
     DIRECT_SCENARIO_PHASES.map((phase) => [phase, 0]),
   ) as MutableScenario['phaseCalls'];
-  phaseCalls['provision-a'] = 3;
+  phaseCalls['provision-a'] = 4;
   const settled = {
-    ordinal: 3,
+    ordinal: 4,
     outcome: 'returned' as const,
     attempts: {
       provider: MAX_COUNT,
@@ -395,9 +426,8 @@ export function maximalScenario(
       application: MAX_COUNT,
     },
   };
-  // Each kind carries the largest call of its own shape, built here and
-  // nowhere else: `force-terminal` is the larger of the two, which is why it
-  // is the default the journal-capacity fixtures take.
+  // Each kind carries the largest call of its own shape; the default carries
+  // the largest of the three encodings measured by the capacity fixture.
   const call =
     callKind === 'force-terminal'
       ? {
@@ -406,26 +436,75 @@ export function maximalScenario(
           migration: null,
           before: { databaseId: MAX_ID, scriptName: MAX_ID },
         }
-      : {
-          ...settled,
-          action: {
-            kind: 'audit-page' as const,
-            slot: 'audit-after' as const,
-            limit: 32,
-            afterOrdinal: 1,
-          },
-          migration: {
-            itemOrdinal: 0 as const,
-            cursor: MAX_COUNT,
-            step: MAX_ID,
-            itemsSha256: DIGEST,
-          },
-        };
+      : callKind === 'audit-page'
+        ? {
+            ...settled,
+            action: {
+              kind: 'audit-page' as const,
+              slot: 'audit-after' as const,
+              limit: 32,
+              afterOrdinal: 1,
+            },
+            migration: {
+              itemOrdinal: 0 as const,
+              cursor: MAX_COUNT,
+              step: MAX_ID,
+              itemsSha256: DIGEST,
+            },
+          }
+        : {
+            ...settled,
+            action: { kind: 'migration-reprovision-a' as const },
+            migration: null,
+            witness: {
+              kind: 'migration-reprovision-a' as const,
+              databaseId: MAX_ID,
+              scriptName: MAX_ID,
+              routeHostname: `${'h'.repeat(63)}.example`,
+              initialVersionId: MAX_ID,
+              finalVersionId: MAX_ID,
+              initialSpecDigest: DIGEST,
+              targetSpecDigest: DIGEST,
+              settlementKey: DIGEST,
+            },
+          };
+  const initial = {
+    a: workerVersion('a', '1', 100, 'i'.repeat(128)),
+    b: workerVersion('b', '1', 100, 'j'.repeat(128)),
+    recovery: workerVersion('recovery', '1', 100, 'k'.repeat(128)),
+  };
+  const final = {
+    a: workerVersion('a', '2', 100, 'f'.repeat(128)),
+    b: workerVersion('b', '2', 100, 'g'.repeat(128)),
+  };
+  const reprovision = workerVersion('a', '1', 100, 'r'.repeat(128));
+  const reprovisionFinal = workerVersion('a', '2', 100, 'n'.repeat(128));
+  const identity = (role: 'a' | 'b') => ({
+    before: 'initial' as const,
+    after: 'final' as const,
+    routeHostname: initial[role].routeHostname,
+    evidenceSha256: hash(
+      JSON.stringify({
+        before: {
+          databaseId: initial[role].databaseId,
+          scriptName: initial[role].scriptName,
+          routeHostname: initial[role].routeHostname,
+          versionId: initial[role].versionId,
+        },
+        after: {
+          databaseId: final[role].databaseId,
+          scriptName: final[role].scriptName,
+          routeHostname: final[role].routeHostname,
+          versionId: final[role].versionId,
+        },
+      }),
+    ),
+  });
   return {
     version: 1,
     phase: 'provision-a',
     startedOrdinal: 0,
-    callCount: 3,
+    callCount: 4,
     phaseCalls,
     attempts: {
       provider: MAX_COUNT,
@@ -436,7 +515,7 @@ export function maximalScenario(
     inventoryCalls: { before: MAX_COUNT, after: MAX_COUNT },
     lastCall: call,
     mutation: call,
-    reconciledOrdinal: 3,
+    reconciledOrdinal: 4,
     operations: DIRECT_SCENARIO_OPERATION_SLOTS.map((slot) => ({
       slot,
       operationId: MAX_ID,
@@ -459,18 +538,87 @@ export function maximalScenario(
       detail: 'below-scenario-floor' as const,
     },
     proofs: {
-      initial: {
-        a: workerVersion('a', '1', 100),
-        b: workerVersion('b', '1', 100),
-        recovery: workerVersion('recovery', '1', 100),
-      },
+      initial,
       candidate: {
         a: workerVersion('a', '2', 0),
         b: workerVersion('b', '2', 0),
       },
-      final: {
-        a: workerVersion('a', '2', 100),
-        b: workerVersion('b', '2', 100),
+      final,
+      identities: {
+        a: identity('a'),
+        b: identity('b'),
+      },
+      reprovision: { a: reprovision },
+      reprovisionFinal: { a: reprovisionFinal },
+      reprovisionSettlement: {
+        a: {
+          role: 'a' as const,
+          tenantTag: MAX_ID,
+          environment: MAX_ID,
+          scriptName: MAX_ID,
+          databaseId: MAX_ID,
+          versionId: MAX_ID,
+          specDigest: DIGEST,
+          schemaVersion: 2 as const,
+          settlementKey: DIGEST,
+          identitySha256: DIGEST,
+          provenanceSha256: DIGEST,
+        },
+      },
+      continuation: {
+        started: {
+          sourceInvocationOrdinal: 2,
+          workflowId: MAX_ID,
+          step: MAX_ID,
+          runId: MAX_ID,
+          approvalId: MAX_ID,
+          challengeSha256: DIGEST,
+          suspensionSha256: DIGEST,
+          versionId: MAX_ID,
+          emptyBeforeOrdinal: 1,
+        },
+        locked: {
+          sourceInvocationOrdinal: 3,
+          before: fenceReading(),
+          after: fenceReading(),
+        },
+        versionB: {
+          sourceInvocationOrdinal: 4,
+          initialVersionId: reprovision.versionId,
+          finalVersionId: reprovisionFinal.versionId,
+          identitySha256: hash(
+            JSON.stringify({
+              databaseId: reprovisionFinal.databaseId,
+              scriptName: reprovisionFinal.scriptName,
+              routeHostname: reprovisionFinal.routeHostname,
+              namespaces: reprovisionFinal.namespaces,
+            }),
+          ),
+        },
+        refused: {
+          sourceInvocationOrdinal: 5,
+          runId: MAX_ID,
+          status: 503 as const,
+          code: 'EXECUTION_FENCED' as const,
+          state: 'migration-locked' as const,
+          suspensionSha256: DIGEST,
+        },
+        reopened: {
+          sourceInvocationOrdinal: 6,
+          before: fenceReading(),
+          after: fenceReading(),
+        },
+        finished: {
+          sourceInvocationOrdinal: 7,
+          runId: MAX_ID,
+          approvalId: MAX_ID,
+          status: 'success' as const,
+          challengeSha256: DIGEST,
+          resultSha256: DIGEST,
+          release: '2' as const,
+          approvalStatus: 'approved' as const,
+          emptyAfterOrdinal: 8,
+        },
       },
       objects: {
         a: { size: MAX_COUNT, sha256: DIGEST },
@@ -578,8 +726,25 @@ export function maximalScenario(
         },
         completedAtMs: MAX_COUNT,
       },
-      exports: { a: exportProof('a'), b: exportProof('b') },
-      exportVerifications: Array.from({ length: 16 }, () => exportProof('a')),
+      exports: {
+        a: { ...exportProof('a'), sourceInvocationOrdinal: 8 },
+        b: { ...exportProof('b'), sourceInvocationOrdinal: 8 },
+      },
+      reprovisionExports: {
+        a: { ...exportProof('a'), sourceInvocationOrdinal: 8 },
+      },
+      exportVerifications: (() => {
+        const references = [
+          exportReference('a'),
+          exportReference('b'),
+          exportReference('a', 'reprovision'),
+        ];
+        if (
+          references.length !== DIRECT_SCENARIO_ARRAY_MAXIMA.exportVerifications
+        )
+          throw new Error('export verification fixture does not fit');
+        return references;
+      })(),
       decommission: {
         a: {
           operationId: MAX_ID,
@@ -588,6 +753,14 @@ export function maximalScenario(
           phase: 'decommissioned' as const,
         },
         b: {
+          operationId: MAX_ID,
+          databaseId: MAX_ID,
+          scriptName: MAX_ID,
+          phase: 'decommissioned' as const,
+        },
+      },
+      redecommission: {
+        a: {
           operationId: MAX_ID,
           databaseId: MAX_ID,
           scriptName: MAX_ID,
@@ -614,19 +787,22 @@ export function maximalScenario(
 
 export function scenarioWith(
   mutate: (state: MutableScenario) => unknown,
-  callKind: 'audit-page' | 'force-terminal' = 'force-terminal',
+  callKind:
+    | 'audit-page'
+    | 'force-terminal'
+    | 'migration-reprovision-a' = 'migration-reprovision-a',
 ): MutableScenario {
   const state = maximalScenario(callKind);
   mutate(state);
   return state;
 }
 
-export async function scenarioJournal(limit = 8, disposableAccount = true) {
+export async function scenarioJournal(limit = 16, disposableAccount = true) {
   const f = await fixture(limit, disposableAccount);
   const journal = await opened({ ...f.input, mode: 'run' });
   await confirmedBootstrap(f, journal);
   let ordinal = 0;
-  for (let index = 0; index < 3; index++) {
+  for (let index = 0; index < 8; index++) {
     const reservation = await journal.reserveInvocation(f.request());
     await journal.settleInvocation(reservation);
     ordinal = reservation.ordinal;
@@ -635,14 +811,36 @@ export async function scenarioJournal(limit = 8, disposableAccount = true) {
   return { f, journal };
 }
 
+export async function recordMaximalReconciliations(journal: DirectRunJournal) {
+  const core = serializeDirectReferenceCore({
+    contractVersion: 2,
+    configSha256: journal.snapshot().binding.configSha256,
+    action: { kind: 'control-read' },
+  });
+  for (let index = 0; index < DIRECT_RECONCILIATION_MAX; index++) {
+    const reservation = await journal.reserveInvocation(core);
+    await journal.settleInvocation(reservation, {
+      state: present(
+        DIRECT_RECONCILIATION_STATES[
+          index % DIRECT_RECONCILIATION_STATES.length
+        ],
+      ),
+      at: new Date(Date.UTC(2026, 8, 14, 0, 0, index)).toISOString(),
+    });
+  }
+}
+
 export const EXPORT_IDENTITY = {
   a: { databaseId: 'database-a', operationId: 'operation-a' },
   b: { databaseId: 'database-b', operationId: 'operation-b' },
+  reprovision: {
+    databaseId: 'database-a-reprovision',
+    operationId: 'operation-a-reprovision',
+  },
 } as const;
 
-export function exportKey(prefix: string, role: 'a' | 'b') {
-  const { databaseId, operationId } = EXPORT_IDENTITY[role];
-  return `${prefix}/receipts/v1/${databaseId}/${operationId}.sql`;
+export function exportKey(prefix: string, role: keyof typeof EXPORT_IDENTITY) {
+  return databaseExportReceiptKey(prefix, EXPORT_IDENTITY[role]);
 }
 
 export function completeScenario(): MutableScenario {
@@ -658,15 +856,153 @@ export function completeScenario(): MutableScenario {
       proof.receipt.databaseId = EXPORT_IDENTITY[role].databaseId;
       proof.receipt.operationId = EXPORT_IDENTITY[role].operationId;
     }
+    const replacement = present(state.proofs.reprovisionExports.a);
+    replacement.receipt.databaseId = EXPORT_IDENTITY.reprovision.databaseId;
+    replacement.receipt.operationId = EXPORT_IDENTITY.reprovision.operationId;
     state.proofs.exportVerifications = state.proofs.exportVerifications.map(
-      (_entry, index) =>
-        structuredClone(present(state.proofs.exports[index % 2 ? 'b' : 'a'])),
+      (entry) => {
+        const proof =
+          entry.cycle === 'reprovision'
+            ? replacement
+            : present(state.proofs.exports[entry.role]);
+        return {
+          ...entry,
+          exportSha256: hash(
+            JSON.stringify({
+              receipt: proof.receipt,
+              location: proof.location,
+              size: proof.size,
+              sha256: proof.sha256,
+            }),
+          ),
+        };
+      },
     );
   });
 }
 
+export function abandonedScenario(
+  operation: 'start' | 'migration-reprovision-a' = 'start',
+): MutableScenario {
+  const state = completeScenario();
+  state.phase =
+    operation === 'start' ? 'continuation-start' : 'continuation-migrate';
+  const action =
+    operation === 'start'
+      ? {
+          kind: 'tenant-continuation' as const,
+          operation,
+          challenge: 'a'.repeat(64),
+        }
+      : { kind: operation };
+  const prepared = {
+    ordinal: 9,
+    action,
+    outcome: 'prepared' as const,
+    attempts: null,
+    migration: null,
+  };
+  state.lastCall = prepared;
+  state.mutation = prepared;
+  state.failure = {
+    code: 'proof-unavailable',
+    ordinal: 8,
+    detail:
+      operation === 'start'
+        ? 'lost-run-id-abandoned'
+        : 'prepared-invocation-abandoned',
+  };
+  state.proofs.reprovisionExports.a = null;
+  state.proofs.exportVerifications = state.proofs.exportVerifications.filter(
+    ({ cycle }) => cycle === null,
+  );
+  return state;
+}
+
+export function maximalSweep(): MutableSweep {
+  const attempts = {
+    provider: MAX_COUNT,
+    maintenance: MAX_COUNT,
+    application: MAX_COUNT,
+  };
+  return {
+    phase: 'refused',
+    roles: {
+      a: {
+        kind: 'completed',
+        cycle: 'reprovision',
+        before: 'application-resources-create-authorized',
+        action: 'decommission',
+        after: 'decommissioned',
+        ordinal: 8,
+      },
+      b: {
+        kind: 'completed',
+        cycle: 'original',
+        before: 'application-resources-create-authorized',
+        action: 'decommission',
+        after: 'decommissioned',
+        ordinal: 8,
+      },
+      recovery: {
+        kind: 'refused',
+        cycle: 'original',
+        before: 'application-resources-create-authorized',
+        action: 'cleanup',
+        reason: 'incomplete-application-r2-reservation',
+      },
+    },
+    lastCall: {
+      ordinal: 8,
+      action: 'recover-force-residual',
+      outcome: 'reference-refused',
+      attempts,
+    },
+    failure: {
+      code: 'sweep-refused',
+      role: 'recovery',
+      reason: 'incomplete-application-r2-reservation',
+    },
+  };
+}
+
+export function completeSweep(): MutableSweep {
+  const state = maximalSweep();
+  state.phase = 'complete';
+  state.roles.recovery = {
+    kind: 'completed',
+    cycle: 'original',
+    before: 'force-captured',
+    action: 'force',
+    after: 'absent',
+    ordinal: 8,
+  };
+  state.failure = null;
+  return state;
+}
+
+export async function recordCompleteSweep(journal: DirectRunJournal) {
+  await journal.recordSweep({
+    phase: 'sweeping',
+    roles: { a: null, b: null, recovery: null },
+    lastCall: null,
+    failure: null,
+  });
+  await journal.recordSweep(completeSweep());
+}
+
+export async function recordMaximalSweep(journal: DirectRunJournal) {
+  await journal.recordSweep({
+    phase: 'sweeping',
+    roles: { a: null, b: null, recovery: null },
+    lastCall: null,
+    failure: null,
+  });
+  await journal.recordSweep(maximalSweep());
+}
+
 export async function completeScenarioJournal(
-  limit = 8,
+  limit = 16,
   disposableAccount = true,
 ) {
   const opening = await scenarioJournal(limit, disposableAccount);

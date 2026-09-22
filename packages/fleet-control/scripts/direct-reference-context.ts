@@ -25,6 +25,7 @@ import {
   deploymentSpecDigest,
   type FleetRecord,
 } from '@proofoftech/fleet-control/cloudflare-control-plane';
+import { databaseExportReceiptKey } from '../src/export-file-name.js';
 import type { DirectRunManifest } from './direct-credentialed-conformance-preflight.mjs';
 import {
   type DirectFixtureRelease,
@@ -264,6 +265,7 @@ export async function createDirectReferenceContext(
         .update(rawSecrets)
         .digest('hex'),
     }),
+    manifest.referenceRuntime.maxInvocations,
   );
   await journal.readInterruption();
   transport.assertWithinBudget();
@@ -304,7 +306,8 @@ export async function createDirectReferenceContext(
     )
       refused();
     const role = (['a', 'b', 'recovery'] as const).find(
-      (role) => manifest.names.roles[role].tenantTag === record.tenantTag,
+      (candidateRole) =>
+        manifest.names.roles[candidateRole].tenantTag === record.tenantTag,
     );
     if (!role) refused();
     const names = manifest.names.roles[role];
@@ -372,20 +375,20 @@ export async function createDirectReferenceContext(
         expectedSize < 1
       )
         refused();
-      const key = `${manifest.resourcePrefix}/receipts/v1/${identity.databaseId}/${identity.operationId}.sql`;
+      const key = databaseExportReceiptKey(manifest.resourcePrefix, identity);
       const expected = {
         anchorageReceiptVersion: '1',
         anchorageReceiptAuthority: authority,
         anchorageDatabaseId: identity.databaseId,
         anchorageOperationId: identity.operationId,
       };
-      const object = await environment.EXPORTS.head(key);
+      const exportObject = await environment.EXPORTS.head(key);
       transport.assertWithinBudget();
-      const metadata = object?.customMetadata;
+      const metadata = exportObject?.customMetadata;
       if (
-        !object ||
-        object.key !== key ||
-        object.size !== expectedSize ||
+        !exportObject ||
+        exportObject.key !== key ||
+        exportObject.size !== expectedSize ||
         !metadata ||
         typeof metadata !== 'object' ||
         Array.isArray(metadata) ||
@@ -463,7 +466,9 @@ export async function createDirectReferenceContext(
       const role = roleFor(record);
       let digest =
         record.phase === 'migrating'
-          ? record.pendingSpecDigest
+          ? // A stranded migration is decommissioned from its pending spec by
+            // the cycle-selected decommission-a-reprovision operation.
+            record.pendingSpecDigest
           : record.desiredSpecDigest;
       if (record.cleanupIntent && record.decommissionIntent) refused();
       if (record.cleanupIntent?.authority.kind === 'provisioning-rollback')

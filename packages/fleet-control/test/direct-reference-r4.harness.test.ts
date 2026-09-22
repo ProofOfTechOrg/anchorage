@@ -317,7 +317,8 @@ describe.sequential('reference audit and migration in native control state', {
       expect(record.settledSettlementKey).toBe(key);
       expect(await fixture.journal().readSettlement(key)).toBeDefined();
       const database = fixture.world.databases.find(
-        (database) => database.databaseId === record.databaseId,
+        (candidateDatabase) =>
+          candidateDatabase.databaseId === record.databaseId,
       );
       expect(
         database?.d1.queryDatabase(

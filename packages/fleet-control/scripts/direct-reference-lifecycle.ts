@@ -18,7 +18,7 @@ import type {
   DirectFixtureRole,
 } from './direct-credentialed-spec.js';
 import type { DirectReferenceContext } from './direct-reference-context.js';
-import { directContinuation } from './direct-reference-continuation.js';
+import { directContinuation } from './direct-reference-continuation-token.js';
 import type { DirectReferenceAction } from './direct-reference-contract.mjs';
 import { DirectReferenceExecutionError } from './direct-reference-http.js';
 import {
@@ -32,7 +32,20 @@ type LifecycleAction = Exclude<
   Extract<DirectReferenceAction, { role: DirectFixtureRole }>,
   { kind: 'tenant-probe' | 'tenant-fence' }
 >;
-type CleanupSlot = `cleanup-${DirectFixtureRole}` | 'cleanup-recovery-initial';
+type LifecycleCycle = 'reprovision' | undefined;
+type CleanupSlot =
+  | `cleanup-${DirectFixtureRole}`
+  | 'cleanup-recovery-initial'
+  | 'cleanup-a-reprovision';
+
+function actionCycle(action: LifecycleAction): LifecycleCycle {
+  const cycle = Object.hasOwn(action, 'cycle')
+    ? Reflect.get(action, 'cycle')
+    : undefined;
+  if (cycle !== undefined && (cycle !== 'reprovision' || action.role !== 'a'))
+    throw new DirectReferenceExecutionError();
+  return cycle;
+}
 
 export type DirectDecommissionExportMetadata =
   | Readonly<{
@@ -61,10 +74,14 @@ export type DirectDecommissionExportMetadata =
 async function readDirectDecommissionExport(
   context: DirectReferenceContext,
   manifest: DirectRunManifest,
-  role: DirectFixtureRole,
+  action: LifecycleAction,
 ): Promise<DirectDecommissionExportMetadata> {
   context.transport.assertWithinBudget();
-  const slot: DirectOperationSlot = `decommission-${role}`;
+  const role = action.role;
+  const cycle = actionCycle(action);
+  const slot: DirectOperationSlot = cycle
+    ? 'decommission-a-reprovision'
+    : `decommission-${role}`;
   const stored = await context.journal.readOperation(slot);
   const record = await context.control.getDeployment(
     manifest.names.roles[role].tenantTag,
@@ -157,7 +174,9 @@ async function readDirectDecommissionExport(
 function cleanupSlot(
   role: DirectFixtureRole,
   release: DirectFixtureRelease,
+  cycle: LifecycleCycle,
 ): CleanupSlot {
+  if (cycle === 'reprovision') return 'cleanup-a-reprovision';
   return role === 'recovery' && release === 'initial'
     ? 'cleanup-recovery-initial'
     : `cleanup-${role}`;
@@ -167,15 +186,18 @@ function candidate(
   context: DirectReferenceContext,
   role: DirectFixtureRole,
   release: DirectFixtureRelease,
+  cycle: LifecycleCycle = undefined,
 ) {
+  const input = {
+    version: 1,
+    role,
+    ...(cycle ? { cycle } : {}),
+    release,
+    specDigest: deploymentSpecDigest(context.spec(role, release)),
+  };
   return {
     operationId: null,
-    inputJson: JSON.stringify({
-      version: 1,
-      role,
-      release,
-      specDigest: deploymentSpecDigest(context.spec(role, release)),
-    }),
+    inputJson: JSON.stringify(input),
   };
 }
 
@@ -187,7 +209,7 @@ function recipeForRecord(context: DirectReferenceContext, record: FleetRecord) {
       ? ['initial', 'next', 'failed-recovery']
       : ['initial', 'next'];
   const release = releases.find(
-    (release) => context.spec(role, release) === spec,
+    (candidateRelease) => context.spec(role, candidateRelease) === spec,
   );
   if (!release) throw new DirectReferenceJournalError();
   return { role, release, spec };
@@ -200,15 +222,19 @@ export function readFrozenLifecycleSpec(
 ): CloudflareDeploymentSpec {
   const input = JSON.parse(stored.inputJson) as Record<string, unknown>;
   const release = input.release;
+  const cycle: LifecycleCycle = stored.slot.endsWith('-reprovision')
+    ? 'reprovision'
+    : undefined;
   if (
     input.role !== role ||
+    input.cycle !== cycle ||
     (release !== 'initial' &&
       release !== 'next' &&
       !(role === 'recovery' && release === 'failed-recovery')) ||
     (stored.kind !== 'cleanup' && stored.kind !== 'decommission')
   )
     throw new DirectReferenceJournalError();
-  if (stored.inputJson !== candidate(context, role, release).inputJson)
+  if (stored.inputJson !== candidate(context, role, release, cycle).inputJson)
     throw new DirectReferenceJournalError();
   return context.spec(role, release);
 }
@@ -254,10 +280,11 @@ async function provision(
   action: Extract<LifecycleAction, { kind: 'provision' }>,
 ) {
   const { role, release } = action;
+  const cycle = actionCycle(action);
   if (role === 'recovery' && (await context.journal.readForceBefore()))
     throw new DirectReferenceExecutionError();
   const names = manifest.names.roles[role];
-  const slot = cleanupSlot(role, release);
+  const slot = cleanupSlot(role, release, cycle);
   const stored = await context.journal.freezeStart(slot, async () => {
     if (role === 'recovery' && release === 'initial') {
       await readHistoricalRecoveryReceipt(context);
@@ -269,7 +296,7 @@ async function provision(
       )
         throw new DirectReferenceJournalError('prerequisite-unavailable');
     }
-    return candidate(context, role, release);
+    return candidate(context, role, release, cycle);
   });
   const spec = readFrozenLifecycleSpec(context, stored, role);
   if (spec !== context.spec(role, release) || stored.tokenJson !== null)
@@ -331,9 +358,11 @@ async function selectCleanup(
   action: LifecycleAction,
 ): Promise<DirectStoredOperation> {
   const slots: readonly CleanupSlot[] =
-    action.role === 'recovery'
-      ? ['cleanup-recovery-initial', 'cleanup-recovery']
-      : [`cleanup-${action.role}`];
+    actionCycle(action) === 'reprovision'
+      ? ['cleanup-a-reprovision']
+      : action.role === 'recovery'
+        ? ['cleanup-recovery-initial', 'cleanup-recovery']
+        : [`cleanup-${action.role}`];
   const stored = await Promise.all(
     slots.map((slot) => context.journal.readOperation(slot)),
   );
@@ -368,8 +397,9 @@ async function selectCleanup(
     throw new DirectReferenceJournalError('prerequisite-unavailable');
   const recipe = recipeForRecord(context, record);
   return context.journal.freezeStart(
-    cleanupSlot(action.role, recipe.release),
-    async () => candidate(context, action.role, recipe.release),
+    cleanupSlot(action.role, recipe.release, actionCycle(action)),
+    async () =>
+      candidate(context, action.role, recipe.release, actionCycle(action)),
   );
 }
 
@@ -381,11 +411,14 @@ export async function dispatchDirectLifecycle(
 ): Promise<unknown> {
   if (action.kind === 'provision') return provision(context, manifest, action);
   if (action.kind === 'decommission-export')
-    return readDirectDecommissionExport(context, manifest, action.role);
+    return readDirectDecommissionExport(context, manifest, action);
   const decommission = action.kind.startsWith('decommission-');
   let stored: DirectStoredOperation;
   if (decommission) {
-    const slot: DirectOperationSlot = `decommission-${action.role}`;
+    const slot: DirectOperationSlot =
+      actionCycle(action) === 'reprovision'
+        ? 'decommission-a-reprovision'
+        : `decommission-${action.role}`;
     if (action.kind === 'decommission-start') {
       stored = await context.journal.freezeStart(slot, async () => {
         const record = await context.control.getDeployment(
@@ -395,7 +428,12 @@ export async function dispatchDirectLifecycle(
         if (!record)
           throw new DirectReferenceJournalError('prerequisite-unavailable');
         const recipe = recipeForRecord(context, record);
-        return candidate(context, action.role, recipe.release);
+        return candidate(
+          context,
+          action.role,
+          recipe.release,
+          actionCycle(action),
+        );
       });
     } else {
       const existing = await context.journal.readOperation(slot);

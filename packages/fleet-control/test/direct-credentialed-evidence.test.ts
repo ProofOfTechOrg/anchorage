@@ -9,15 +9,19 @@ import {
   DIRECT_EVIDENCE_IDENTITY_PATHS,
   DIRECT_EVIDENCE_KEYS,
   DIRECT_EVIDENCE_LITERALS,
+  directSourceHashRelationship,
   inspectDirectEvidence,
   writeDirectEvidence,
 } from '../scripts/direct-credentialed-evidence.mjs';
 import { DIRECT_RESIDUAL_SURFACES } from '../scripts/direct-credentialed-reference-vocabulary.mjs';
 import { DIRECT_SCENARIO_PHASES } from '../scripts/direct-credentialed-scenario-budget.mjs';
 import {
+  abandonedScenario,
   cleanupDirectRunState,
   completeScenarioJournal,
+  completeSweep,
   maximalScenario,
+  maximalSweep,
   maximalTeardown,
   present,
 } from './fixtures/direct-run-state-builder.js';
@@ -43,7 +47,9 @@ const topKeys = [
   'referenceUploadBytes',
   'commands',
   'bootstrap',
+  'reconciliations',
   'scenario',
+  'sweep',
   'teardown',
   'teardownCall',
   'retainedIdentities',
@@ -65,8 +71,11 @@ const keys = (value: unknown, expected: readonly string[]) =>
 // same inspection's `hit`.
 const inspected = (
   evidence: object,
-  sentinels: { secrets: readonly string[]; literals: readonly string[] },
-) => inspectDirectEvidence(evidence, sentinels).hit;
+  evidenceSentinels: {
+    secrets: readonly string[];
+    literals: readonly string[];
+  },
+) => inspectDirectEvidence(evidence, evidenceSentinels).hit;
 const leafAt = (document: unknown, keyPath: string) =>
   keyPath
     .split('.')
@@ -78,8 +87,9 @@ const leafAt = (document: unknown, keyPath: string) =>
 async function evidenceFixture() {
   const { f, journal } = await completeScenarioJournal();
   const scenario = maximalScenario();
+  const sweep = maximalSweep();
   const teardown = maximalTeardown();
-  const snapshot = { ...journal.snapshot(), scenario, teardown };
+  const snapshot = { ...journal.snapshot(), scenario, sweep, teardown };
   const evidence = buildDirectEvidence({
     snapshot,
     prepared: f.prepared,
@@ -143,11 +153,43 @@ describe.sequential('direct evidence', () => {
       'initial',
       'candidate',
       'final',
+      'identities',
+      'reprovision',
+      'continuation',
+      'applicability',
+      'moduleBytes',
       'fence',
       'exports',
+      'reprovisionExport',
+      'redecommission',
       'inventories',
       'terminalForce',
     ]);
+    keys(evidence.sweep, ['phase', 'roles', 'refusal']);
+    const sweep = object(evidence.sweep);
+    keys(sweep.roles, ['a', 'b', 'recovery']);
+    for (const role of ['a', 'b'])
+      keys(object(sweep.roles)[role], [
+        'kind',
+        'cycle',
+        'before',
+        'action',
+        'after',
+        'ordinal',
+      ]);
+    keys(object(sweep.roles).recovery, [
+      'kind',
+      'cycle',
+      'before',
+      'action',
+      'reason',
+    ]);
+    keys(sweep.refusal, ['code', 'role', 'reason']);
+    expect(evidence.sweep).toEqual({
+      phase: snapshot.sweep.phase,
+      roles: snapshot.sweep.roles,
+      refusal: snapshot.sweep.failure,
+    });
     keys(evidence.cost, [
       'basis',
       'referenceProvider',
@@ -209,6 +251,73 @@ describe.sequential('direct evidence', () => {
           'trafficPercentage',
         ]);
     }
+    keys(scenario.identities, ['a', 'b']);
+    for (const role of ['a', 'b'])
+      keys(object(scenario.identities)[role], [
+        'before',
+        'after',
+        'databaseId',
+        'scriptName',
+        'routeHostname',
+        'initialVersionId',
+        'finalVersionId',
+        'evidenceSha256',
+      ]);
+    keys(scenario.reprovision, ['initial', 'final', 'settlementKey']);
+    for (const stage of ['initial', 'final'])
+      keys(object(scenario.reprovision)[stage], [
+        'databaseId',
+        'scriptName',
+        'routeHostname',
+        'versionId',
+        'specDigest',
+        'schemaVersion',
+        'applicationRelease',
+        'trafficPercentage',
+        'namespaceIds',
+      ]);
+    keys(scenario.continuation, [
+      'started',
+      'locked',
+      'versionB',
+      'refusal',
+      'reopened',
+      'finished',
+    ]);
+    keys(object(scenario.continuation).started, [
+      'workflowId',
+      'step',
+      'runId',
+      'challengeSha256',
+      'suspensionSha256',
+      'versionId',
+      'approvalId',
+      'emptyBeforeOrdinal',
+    ]);
+    keys(object(scenario.continuation).finished, [
+      'runId',
+      'status',
+      'challengeSha256',
+      'resultSha256',
+      'release',
+      'approvalId',
+      'approvalStatus',
+      'emptyAfterOrdinal',
+    ]);
+    keys(scenario.applicability, [
+      'platformRunTokens',
+      'gatewayIdentity',
+      'separationOfDuties',
+    ]);
+    keys(scenario.moduleBytes, [
+      'sourceHashRelationship',
+      'tenantModuleSha256',
+    ]);
+    expect(scenario.moduleBytes).toMatchObject({
+      sourceHashRelationship: 'identical',
+    });
+    keys(scenario.reprovisionExport, ['location', 'size', 'sha256']);
+    keys(scenario.redecommission, ['databaseId', 'scriptName']);
     keys(scenario.fence, ['drain', 'sweeps', 'reopen', 'probes']);
     const fence = object(scenario.fence);
     for (const group of Object.values(fence)) keys(group, ['a', 'b']);
@@ -324,6 +433,52 @@ describe.sequential('direct evidence', () => {
     ]);
   });
 
+  it('emits divergent when the release module lists differ', () => {
+    const initial = [{ name: 'tenant.js', content: 'a' }];
+    const next = [{ name: 'tenant.js', content: 'b' }];
+    expect(directSourceHashRelationship(initial, next)).toBe('divergent');
+  });
+
+  it('projects an abandoned scenario failure beside its cleaned teardown', async () => {
+    const { f, snapshot } = await evidenceFixture();
+    const scenario = abandonedScenario();
+    const evidence = buildDirectEvidence({
+      snapshot: {
+        ...snapshot,
+        scenario,
+        sweep: completeSweep(),
+        teardown: { ...snapshot.teardown, failure: null },
+      },
+      prepared: f.prepared,
+      mode: 'resume',
+      outcome: {
+        status: 'failed',
+        exitCode: 1,
+        teardownCall: {
+          status: 'cleaned',
+          failure: null,
+          providerRequests: 12,
+        },
+      },
+      times: { finishedAt: '2026-09-13T00:00:00.000Z' },
+      commit: 'a'.repeat(40),
+    });
+    expect(object(evidence.scenario).failure).toEqual({
+      code: 'proof-unavailable',
+      ordinal: snapshot.invocationCount,
+      detail: 'lost-run-id-abandoned',
+    });
+    expect(evidence.teardown).toMatchObject({
+      phase: 'complete',
+      failure: null,
+    });
+    expect(evidence.teardownCall).toEqual({
+      status: 'cleaned',
+      failure: null,
+      providerRequests: 12,
+    });
+  });
+
   it.each([
     'platform-page',
     'transport-failure',
@@ -352,53 +507,31 @@ describe.sequential('direct evidence', () => {
     ).toEqual({ written: true });
   });
 
-  it.each([
-    'platform-page',
-    'transport-failure',
-    'non-contract-answer',
-    'delivery-window-expired',
-  ] as const)('projects pending invocation detail %s without changing the journal snapshot', async (detail) => {
+  it('projects bounded invocation reconciliations without changing the journal snapshot', async () => {
     const { f, snapshot } = await evidenceFixture();
-    const scenario = maximalScenario();
-    scenario.failure = null;
-    const pending = {
+    const reconciled = {
       ...snapshot,
-      scenario,
-      lastInvocation: {
-        ordinal: snapshot.invocationCount,
-        action: { kind: 'control-read' as const },
-        state: 'pending' as const,
-        requestSha256: 'a'.repeat(64),
-      },
+      reconciliations: [
+        {
+          ordinal: snapshot.invocationCount,
+          state: 'executed' as const,
+          at: '2026-09-14T00:00:00.000Z',
+        },
+      ],
     };
-    const before = structuredClone(pending);
+    const before = structuredClone(reconciled);
     const input = {
-      snapshot: pending,
+      snapshot: reconciled,
       prepared: f.prepared,
       mode: 'run' as const,
       outcome: { status: 'failed' as const, exitCode: 1, teardownCall: null },
       times: { finishedAt: '2026-09-13T00:00:00.000Z' },
       commit: null,
     };
-    expect(
-      object(
-        buildDirectEvidence({ ...input, invocationFailureDetail: detail })
-          .scenario,
-      ).failure,
-    ).toEqual({
-      code: 'outcome-unknown',
-      ordinal: pending.lastInvocation.ordinal,
-      detail,
-    });
-    expect(
-      object(
-        buildDirectEvidence({
-          ...input,
-          invocationFailureDetail: 'raw-provider-error' as typeof detail,
-        }).scenario,
-      ).failure,
-    ).toBeNull();
-    expect(pending).toEqual(before);
+    expect(buildDirectEvidence(input).reconciliations).toEqual(
+      reconciled.reconciliations,
+    );
+    expect(reconciled).toEqual(before);
   });
 
   it('preserves null observations, absent proofs and failure detail', async () => {
@@ -588,9 +721,9 @@ describe.sequential('direct evidence', () => {
 
   it('publishes the scanned bytes including the newline observed during read-back', async () => {
     const { f, evidence } = await evidenceFixture();
-    const inspected = inspectDirectEvidence(evidence, sentinels);
-    expect(inspected.hit).toBeNull();
-    const scanned = Buffer.from(inspected.serialized);
+    const inspectionResult = inspectDirectEvidence(evidence, sentinels);
+    expect(inspectionResult.hit).toBeNull();
+    const scanned = Buffer.from(inspectionResult.serialized);
     let received: Buffer | undefined;
     expect(
       await writeDirectEvidence({
@@ -794,9 +927,9 @@ describe.sequential('direct evidence', () => {
       string,
       unknown
     >;
-    const keys = keyPath.split('.');
-    const leaf = keys.pop() as string;
-    object(leafAt(carried, keys.join('.')))[leaf] = 'a:b';
+    const pathKeys = keyPath.split('.');
+    const leaf = pathKeys.pop() as string;
+    object(leafAt(carried, pathKeys.join('.')))[leaf] = 'a:b';
     expect(inspected(carried, sentinels)).toBeNull();
     expect(
       await writeDirectEvidence({

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
-// The maintenance tick against a mocked `createNotificationDispatchTick`:
-// refusing the way an unpatched @mastra/core does, and constructing where a
-// case overrides it. The mocks are file-scoped, so these cases live apart from
-// the rest of the starter's tick coverage.
+// The maintenance tick against mocked leg factories: the notification tick is
+// constructed once, at wiring time, and each pass invokes both legs and returns
+// both results. The mocks are file-scoped, so these cases live apart from the
+// rest of the starter's tick coverage.
 
 import type {
   ScheduleTickOptions,
@@ -15,8 +15,6 @@ import type {
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { starterMaintenanceTick } from '../src/maintenance.js';
-
-const PATCH_MESSAGE = /Apply the flowsafe patch to @mastra\/core/;
 
 // Hoisted with the `vi.mock` factories that reference them: a factory runs
 // above module-scope bindings, so one closing over a plain `const` throws
@@ -56,13 +54,7 @@ const mocks = vi.hoisted(() => {
     createNotificationDispatchTick: vi.fn(
       (
         _options: NotificationDispatchTickOptions,
-      ): (() => Promise<NotificationDispatchTickResult>) => {
-        // Stands in for an unpatched core's refusal. It does not copy the
-        // sentence flowsafe emits; PATCH_MESSAGE is what the cases match.
-        throw new TypeError(
-          'mocked unpatched core: Apply the flowsafe patch to @mastra/core',
-        );
-      },
+      ): (() => Promise<NotificationDispatchTickResult>) => notificationTick,
     ),
   };
 });
@@ -119,50 +111,26 @@ beforeEach(() => {
   mocks.notificationTick.mockClear();
 });
 
-describe('starter maintenance tick against an unpatched core', () => {
-  it('wires the duty without constructing the notification tick', () => {
-    expect(() => starterMaintenanceTick(starterEnv())).not.toThrow();
-    expect(mocks.createNotificationDispatchTick).not.toHaveBeenCalled();
-  });
-
-  it('fails the notifications leg after the schedule leg has run', async () => {
+describe('starter maintenance tick composition', () => {
+  it('constructs the notification tick at wiring time and invokes it per pass', async () => {
     const tick = starterMaintenanceTick(starterEnv());
 
-    await expect(tick()).rejects.toThrow(PATCH_MESSAGE);
-
-    expect(mocks.scheduleTick).toHaveBeenCalledTimes(1);
+    // Wiring builds the tick; it does not run it.
     expect(mocks.createNotificationDispatchTick).toHaveBeenCalledTimes(1);
-  });
-
-  it('retries the refused construction on the next pass', async () => {
-    const tick = starterMaintenanceTick(starterEnv());
-
-    await expect(tick()).rejects.toThrow(PATCH_MESSAGE);
-    await expect(tick()).rejects.toThrow(PATCH_MESSAGE);
-
-    expect(mocks.scheduleTick).toHaveBeenCalledTimes(2);
-    expect(mocks.createNotificationDispatchTick).toHaveBeenCalledTimes(2);
-  });
-});
-
-describe('starter maintenance tick with a constructing factory', () => {
-  it('invokes the constructed tick on each pass and constructs it once', async () => {
-    mocks.createNotificationDispatchTick.mockImplementationOnce(
-      () => mocks.notificationTick,
-    );
-    const tick = starterMaintenanceTick(starterEnv());
+    expect(mocks.notificationTick).not.toHaveBeenCalled();
 
     const first = await tick();
     const second = await tick();
 
-    // Both legs' results reach the caller, so a notificationTick that returned
-    // the constructed tick instead of calling it goes red here.
+    // Both legs' results reach the caller, so a leg that returned its
+    // constructed tick instead of calling it goes red here.
     const composed = {
       schedules: mocks.scheduleResult,
       notifications: mocks.notificationResult,
     };
     expect(first).toEqual(composed);
     expect(second).toEqual(composed);
+    expect(mocks.scheduleTick).toHaveBeenCalledTimes(2);
     expect(mocks.notificationTick).toHaveBeenCalledTimes(2);
     expect(mocks.createNotificationDispatchTick).toHaveBeenCalledTimes(1);
   });

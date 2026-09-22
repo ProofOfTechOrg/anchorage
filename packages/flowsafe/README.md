@@ -9,7 +9,7 @@ Flowsafe runs Mastra workflows and agents through Cloudflare Durable Objects, st
 ## Install
 
 ```bash
-npm install @mastra/core@1.53.0 @proofoftech/flowsafe
+npm install @mastra/core@1.67.0 @proofoftech/flowsafe
 ```
 
 Install `@proofoftech/breakwater` when resumed steps call approval-protected connectors:
@@ -25,9 +25,9 @@ Compatibility:
 - Node.js 22.13.0 or later (engine range `>=22.13.0`)
 - ESM only
 - TypeScript `moduleResolution: "NodeNext"`, `"Node16"`, or `"Bundler"`
-- `@mastra/core` `1.53.0`, with the patch this package ships under `patches/` applied at your application root — see [Apply the flowsafe patch to @mastra/core](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/getting-started.md#apply-the-flowsafe-patch-to-mastracore)
+- `@mastra/core` `1.67.0`
 - `react` and `react-dom` `>=18 <20` (React 18 or 19) for the optional approval UI
-- `@proofoftech/breakwater` `>=0.13.0 <1.0.0` when used
+- `@proofoftech/breakwater` `>=0.15.0 <1.0.0` when used
 - host-provided Wrangler `>=4.118 <5` for the optional `flowsafe-provision` CLI
 
 ## Choose an export
@@ -103,7 +103,7 @@ export class AppRunner extends DurableObjectRunner<Env> {
 }
 ```
 
-`init()` creates D1-backed Mastra storage from the conventional `DB` binding unless you inject storage. Workflow definitions use the same `createWorkflow()` and `createStep()` shape as Mastra. Flowsafe pins `@mastra/cloudflare-d1` 1.1.1 because the shipped D1 storage is written against that release's domain surface: it subclasses the adapter's background-tasks domain to apply the `TaskFilter.resourceId` predicate the adapter declares but omits from its SQL builder, and hand-writes the schedules, notifications, and thread-state domains the adapter does not ship at all. The pin also holds the adapter on its `@cloudflare/workers-types` v4 peer, which is the major Flowsafe still builds against.
+`init()` creates D1-backed Mastra storage from the conventional `DB` binding unless you inject storage. Workflow definitions use the same `createWorkflow()` and `createStep()` shape as Mastra. Flowsafe pins `@mastra/cloudflare-d1` 1.3.2 because the shipped D1 storage is written against that release's domain surface: it subclasses the adapter's background-tasks domain to apply the `TaskFilter.resourceId` predicate the adapter accepts but omits from its SQL builder, and hand-writes the schedules, notifications, and thread-state domains the adapter does not ship at all. `D1StorageOptions.domains` accepts host-supplied `workflowDefinitions` and `knowledge` domains, which have no D1-backed defaults. The pin also holds the adapter on its `@cloudflare/workers-types` v4 peer, which is the major Flowsafe still builds against.
 
 If the deployment uses a table prefix, pass one shared constant to storage and host maintenance:
 
@@ -451,9 +451,9 @@ A policy failure is opaque: direct delivery returns 503, schedule state is left 
 
 Configure the same positive safe-integer `maxDeliveryAttempts` on `createNotificationDispatchTick()` and `createThreadSignalRoutes()`. Both default to `DEFAULT_MAX_NOTIFICATION_DELIVERY_ATTEMPTS`. A recorded failure at the bound discards the notification with `deliveryReason: "delivery-attempts-exhausted"`, retaining its count and last error. An already-exhausted row is never sent; its discard is conditional on the observed record remaining current. Below the bound, existing retry delays apply.
 
-Dispatch requires `NotificationDeliveryStorage`; `D1NotificationsStorage` implements it. A custom store's `updateNotificationDeliveryIfUnchanged()` must compare the captured observation and apply the failure patch atomically against its other writers. Ordinary Core storage still serves notification ingestion; the `@mastra/core` patch is required for either path. See the [delivery and receipt guide](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/durable-agents.md#bound-notification-delivery) for custom-store migration, lost responses and receipt retention.
+Dispatch requires `NotificationDeliveryStorage`; `D1NotificationsStorage` implements it. A custom store's `updateNotificationDeliveryIfUnchanged()` must compare the captured observation and apply the failure patch atomically against its other writers. Ordinary Core storage still serves notification ingestion. See the [delivery and receipt guide](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/durable-agents.md#bound-notification-delivery) for custom-store migration, lost responses and receipt retention.
 
-Summary source counts and a configured source delivery policy read own properties only where the shipped `@mastra/core` patch is applied; without it a source named after an `Object.prototype` member is miscounted in the summary core renders and selects an inherited policy entry instead of the configured priority or default action. Flowsafe refuses notification ingestion and dispatch on an unpatched install, and refuses to construct a notification dispatch tick that does delivery work.
+Summary source counts and a configured source delivery policy read own properties: the declared `@mastra/core` peer guards both lookups, so a source named after an `Object.prototype` member is counted under its own key and resolves the configured priority or default action. A core outside the declared peer range that predates [mastra-ai/mastra#23693](https://github.com/mastra-ai/mastra/issues/23693) and [mastra-ai/mastra#23694](https://github.com/mastra-ai/mastra/issues/23694) miscounts such a source and selects the inherited policy entry instead.
 
 Adapt Breakwater without adding a FlowSafe runtime dependency on it:
 
@@ -589,5 +589,3 @@ pnpm --filter @proofoftech/flowsafe spike:verify:llm
 ## License
 
 Apache-2.0.
-
-`patches/@mastra__core@1.53.0.patch` is a modification of `@mastra/core` `1.53.0`, which is licensed under Apache-2.0 and copyright its authors. It changes that package's published runtime chunks to correct the two defects reported as mastra-ai/mastra#23693 and mastra-ai/mastra#23694.

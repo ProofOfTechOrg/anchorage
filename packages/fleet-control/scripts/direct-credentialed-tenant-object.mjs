@@ -2,6 +2,8 @@
 
 export const DIRECT_TENANT_OBJECT_KEY = 'direct-conformance-fixture';
 export const DIRECT_TENANT_OBJECT_BODY = 'direct-conformance-fixture-data';
+export const DIRECT_CONTINUATION_WORKFLOW = 'direct-continuation-proof';
+export const DIRECT_CONTINUATION_STEP = 'hold';
 
 // The `/__direct/*` routes the tenant Worker answers. The router and the
 // reference clients import these values, so a rename is one edit for them.

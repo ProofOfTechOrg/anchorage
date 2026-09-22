@@ -5,7 +5,7 @@
 // same "prefer pure extraction over a renderer" convention the flowsafe
 // approval-ui package documents (use-approval-dashboard.render.test.ts).
 
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { type RunSummary, TERMINAL_RUN_STATUSES } from '@/run-client';
 import {
   allRunsSettled,
@@ -23,6 +23,11 @@ function run(runId: string, workflowId = 'gtm-outbound'): RunEntry {
 function summaryResult(status: string): RunResult {
   return { summary: { runId: 'x', status } as RunSummary };
 }
+
+afterEach(() => {
+  vi.clearAllTimers();
+  vi.useRealTimers();
+});
 
 describe('pollableRuns', () => {
   it('returns every run when nothing is stream-healthy (poll-only, unchanged behavior)', () => {
@@ -81,15 +86,16 @@ describe('mergeRunResults', () => {
     };
     const runs = [run('a')];
 
-    // A transient failure keeps the last summary visible under the error.
+    // An empty hard failure keeps the last summary visible under the error.
     const failed = mergeRunResults(previous, runs, [
-      ['a', { error: 'network blip', stopped: undefined }],
+      ['a', { error: '', stopped: 'hard' }],
     ]);
     expect(failed.a).toEqual({
       summary: previous.a?.summary,
-      error: 'network blip',
-      stopped: undefined,
+      error: '',
+      stopped: 'hard',
     });
+    expect(failed.a?.summary).toBe(previous.a?.summary);
 
     // A subsequent success entry (no `error`) replaces the errored entry
     // wholesale — the merge does not carry the error forward once cleared.
@@ -170,7 +176,7 @@ describe('startPollingLoop', () => {
     const poll = vi
       .fn<() => Promise<boolean>>()
       .mockImplementationOnce(() => first)
-      .mockResolvedValue(true);
+      .mockResolvedValue(false);
 
     const stop = startPollingLoop(poll, 100);
     expect(poll).toHaveBeenCalledTimes(1);
@@ -187,6 +193,41 @@ describe('startPollingLoop', () => {
     stop();
     await vi.advanceTimersByTimeAsync(1_000);
     expect(poll).toHaveBeenCalledTimes(2);
-    vi.useRealTimers();
+  });
+
+  it('does not poll after cleanup clears a pending timer', async () => {
+    vi.useFakeTimers();
+    const poll = vi.fn<() => Promise<boolean>>().mockResolvedValue(false);
+    const stop = startPollingLoop(poll, 100);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(poll).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(1);
+
+    stop();
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(500);
+    expect(poll).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not schedule after cleanup while a poll is unresolved', async () => {
+    vi.useFakeTimers();
+    let resolvePoll!: (done: boolean) => void;
+    const unresolved = new Promise<boolean>((resolve) => {
+      resolvePoll = resolve;
+    });
+    const poll = vi
+      .fn<() => Promise<boolean>>()
+      .mockImplementationOnce(() => unresolved)
+      .mockResolvedValue(false);
+    const stop = startPollingLoop(poll, 100);
+    expect(poll).toHaveBeenCalledTimes(1);
+
+    stop();
+    resolvePoll(false);
+    await unresolved;
+    await Promise.resolve();
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(500);
+    expect(poll).toHaveBeenCalledTimes(1);
   });
 });

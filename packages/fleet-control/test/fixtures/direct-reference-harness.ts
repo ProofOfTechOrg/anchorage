@@ -26,8 +26,13 @@ import {
 import { expect } from 'vitest';
 import { createTestHarness, type TestHarness } from 'wrangler';
 import type { DirectRunManifest } from '../../scripts/direct-credentialed-conformance-preflight.mjs';
-import { directDeploymentSpec } from '../../scripts/direct-credentialed-spec.js';
 import {
+  type DirectFixtureRole,
+  directDeploymentSpec,
+} from '../../scripts/direct-credentialed-spec.js';
+import {
+  DIRECT_CONTINUATION_STEP,
+  DIRECT_CONTINUATION_WORKFLOW,
   DIRECT_TENANT_OBJECT_BODY,
   DIRECT_TENANT_OBJECT_KEY,
   DIRECT_TENANT_ROUTES,
@@ -38,6 +43,7 @@ import type { DirectRunBinding } from '../../scripts/direct-reference-context.js
 import {
   DIRECT_REFERENCE_PATH,
   type DirectReferenceAction,
+  directReferenceRequestSha256,
 } from '../../scripts/direct-reference-contract.mjs';
 import { DirectReferenceJournal } from '../../scripts/direct-reference-journal.js';
 import { D1FleetStateDatabase } from '../../src/d1-fleet-state-database.js';
@@ -50,6 +56,11 @@ import {
   single,
 } from './cloudflare-fetch-fixture.js';
 import { directFixtureManifest } from './direct-credentialed-config.js';
+import type {
+  directForceBudgetProbe,
+  ForceBudgetStage,
+} from './direct-force-budget-probe.js';
+import { recoveryApplicationSpec } from './direct-reference-context-harness.js';
 import {
   type D1State,
   deploymentIdentity,
@@ -74,6 +85,30 @@ const TENANT_ROUTES: readonly string[] = Object.freeze([
   ...APPLICATION_ROUTES,
   ...ADMIN_ROUTES,
 ]);
+
+function nativeTenantRoute(request: CloudflareFixtureRequest, url: URL) {
+  if (TENANT_ROUTES.includes(url.pathname)) return true;
+  if (request.method === 'POST' && url.pathname === '/runs') return true;
+  if (
+    request.method === 'POST' &&
+    /^\/api\/approvals\/[A-Za-z0-9_-]{1,128}\/decide$/u.test(url.pathname)
+  )
+    return true;
+  const segments = url.pathname.split('/').filter(Boolean);
+  if (
+    segments[0] !== 'runs' ||
+    segments[1] !== DIRECT_CONTINUATION_WORKFLOW ||
+    !segments[2] ||
+    !/^[A-Za-z0-9_-]{1,128}$/u.test(segments[2])
+  )
+    return false;
+  return (
+    (request.method === 'GET' && segments.length === 3) ||
+    (request.method === 'POST' &&
+      segments.length === 4 &&
+      segments[3] === 'resume')
+  );
+}
 
 /** Projects a do-runner fault onto the status response the tenant returns. */
 function doStatusResponse(error: unknown): Response {
@@ -234,14 +269,20 @@ export async function createDirectReferenceHarness(
     maintenanceNow?: () => number;
     manifest?: DirectRunManifest;
     binding?: DirectRunBinding;
+    recoveryApplicationR2Bucket?: string;
     applicationProbes?: boolean;
     nodeProviderRest?: boolean;
     nodeResponse?: (request: Request, response: Response) => Promise<Response>;
     applicationFetch?: (request: CloudflareFixtureRequest) => Promise<Response>;
+    applicationFetchRole?: DirectFixtureRole;
+    applicationFetchActive?: () => boolean;
     providerResponse?: (
       request: CloudflareFixtureRequest,
       response: Response,
     ) => Promise<Response>;
+    providerRequest?: (
+      request: CloudflareFixtureRequest,
+    ) => Promise<Response | undefined>;
   }> = {},
 ) {
   const manifest = policy.manifest ?? directFixtureManifest();
@@ -267,9 +308,18 @@ export async function createDirectReferenceHarness(
     referenceModuleSetSha256: 'c'.repeat(64),
     accountWorkersDevSubdomain: 'direct-fixture',
   };
-  const specs = roles.map((role) =>
-    directDeploymentSpec(manifest, role, 'initial', secrets[role], binding),
-  );
+  const specs = roles.map((role) => {
+    const spec = directDeploymentSpec(
+      manifest,
+      role,
+      'initial',
+      secrets[role],
+      binding,
+    );
+    return role === 'recovery'
+      ? recoveryApplicationSpec(spec, policy.recoveryApplicationR2Bucket)
+      : spec;
+  });
   /** True for the run's own export bucket, false for a tenant's. */
   const isExportBucket = (name: string | undefined) =>
     name === binding.exportBucketName;
@@ -295,6 +345,10 @@ export async function createDirectReferenceHarness(
   >();
   const rest = restProjection(world);
   const versionRuntime = new Map<string, unknown>();
+  const continuationRuns = new Map<
+    string,
+    { challenge: string; approvalId: string; status: 'suspended' | 'success' }
+  >();
   const activeVersion = (script: ReturnType<typeof world.scripts.get>) =>
     script?.versions.find((version) =>
       script.deployment?.some(
@@ -304,8 +358,8 @@ export async function createDirectReferenceHarness(
     );
   /**
    * Answers the export bucket's per-key object routes out of `exportBytes`.
-   * Its one caller is `observedProviderRest`, so `policy.nodeProviderRest`
-   * decides whether these answer or the plain projection does.
+   * `policy.nodeProviderRest` decides whether these answer or the plain
+   * projection does.
    */
   async function exportObjectResponse(
     request: CloudflareFixtureRequest,
@@ -423,9 +477,12 @@ export async function createDirectReferenceHarness(
     request: CloudflareFixtureRequest,
   ): Promise<Response> {
     try {
-      const response = policy.nodeProviderRest
-        ? await observedProviderRest(request)
-        : await rest(request);
+      const supplied = await policy.providerRequest?.(request);
+      const response =
+        supplied ??
+        (policy.nodeProviderRest
+          ? await observedProviderRest(request)
+          : await rest(request));
       return policy.providerResponse
         ? await policy.providerResponse(request, response)
         : response;
@@ -453,7 +510,8 @@ export async function createDirectReferenceHarness(
   ): Promise<Response> {
     const url = new URL(request.url);
     const role = roles.find(
-      (role) => url.hostname === manifest.names.roles[role].routeHostname,
+      (candidateRole) =>
+        url.hostname === manifest.names.roles[candidateRole].routeHostname,
     );
     if (!role) throw new Error('unknown fixture application role');
     const adminRoute = ADMIN_ROUTES.includes(url.pathname);
@@ -474,16 +532,16 @@ export async function createDirectReferenceHarness(
     );
     if (!record) throw new Error('missing fixture application record');
     const database = world.databases.find(
-      (database) => database.databaseId === record.databaseId,
+      (candidateDatabase) => candidateDatabase.databaseId === record.databaseId,
     );
     const active = activeVersion(world.scripts.get(record.scriptName));
     if (!database || !active)
       throw new Error('missing active fixture application');
     const releaseBinding = active.bindings.find(
-      (binding) =>
-        binding &&
-        typeof binding === 'object' &&
-        Reflect.get(binding, 'name') === 'APPLICATION_RELEASE',
+      (candidateBinding) =>
+        candidateBinding &&
+        typeof candidateBinding === 'object' &&
+        Reflect.get(candidateBinding, 'name') === 'APPLICATION_RELEASE',
     );
     const release =
       releaseBinding && typeof releaseBinding === 'object'
@@ -515,6 +573,106 @@ export async function createDirectReferenceHarness(
       request.method === 'POST'
     )
       return fixtureFenceProbe(request, database.d1, release);
+    if (url.pathname === '/runs' && request.method === 'POST') {
+      const body = request.body as {
+        workflowId?: unknown;
+        inputData?: { challenge?: unknown };
+      };
+      const challenge = body.inputData?.challenge;
+      if (
+        body.workflowId !== DIRECT_CONTINUATION_WORKFLOW ||
+        typeof challenge !== 'string' ||
+        !/^[a-f0-9]{64}$/u.test(challenge)
+      )
+        return Response.json(
+          { error: 'invalid continuation input' },
+          { status: 400 },
+        );
+      const runId = crypto.randomUUID();
+      const approvalId = crypto.randomUUID();
+      continuationRuns.set(runId, {
+        challenge,
+        approvalId,
+        status: 'suspended',
+      });
+      return Response.json({
+        runId,
+        status: 'suspended',
+        suspended: [[DIRECT_CONTINUATION_STEP]],
+        suspendPayload: {
+          [DIRECT_CONTINUATION_STEP]: { reason: 'awaiting-resume' },
+        },
+        approval: { id: approvalId },
+      });
+    }
+    const continuation = url.pathname.match(
+      new RegExp(
+        `^/runs/${DIRECT_CONTINUATION_WORKFLOW}/([A-Za-z0-9_-]{1,128})(/resume)?$`,
+        'u',
+      ),
+    );
+    if (continuation?.[1]) {
+      const run = continuationRuns.get(continuation[1]);
+      if (!run)
+        return Response.json({ error: 'run not found' }, { status: 404 });
+      if (request.method === 'GET' && !continuation[2])
+        return Response.json(
+          run.status === 'suspended'
+            ? {
+                runId: continuation[1],
+                status: 'suspended',
+                suspended: [[DIRECT_CONTINUATION_STEP]],
+                suspendPayload: {
+                  [DIRECT_CONTINUATION_STEP]: { reason: 'awaiting-resume' },
+                },
+              }
+            : {
+                runId: continuation[1],
+                status: 'success',
+                result: { challenge: run.challenge, release },
+              },
+        );
+      if (request.method === 'POST' && continuation[2]) {
+        const reading = await new ExecutionFenceStore(
+          fixtureFenceDatabase(database.d1),
+        ).read();
+        if (reading.state === 'migration-locked')
+          return Response.json(
+            {
+              error: 'execution fenced',
+              reason: {
+                code: 'EXECUTION_FENCED',
+                state: 'migration-locked',
+              },
+            },
+            { status: 503 },
+          );
+        run.status = 'success';
+        return Response.json({
+          runId: continuation[1],
+          status: 'success',
+          result: { challenge: run.challenge, release },
+        });
+      }
+    }
+    const decision = url.pathname.match(
+      /^\/api\/approvals\/([A-Za-z0-9_-]{1,128})\/decide$/u,
+    );
+    if (request.method === 'POST' && decision?.[1]) {
+      const found = [...continuationRuns.entries()].find(
+        ([, run]) => run.approvalId === decision[1],
+      );
+      if (!found)
+        return Response.json({ error: 'approval not found' }, { status: 404 });
+      return Response.json({
+        record: {
+          id: decision[1],
+          runId: found[0],
+          status: 'approved',
+        },
+        resume: { attempted: true, ok: false },
+      });
+    }
     const bucket = record.applicationResources?.find(
       (resource) => resource.name === 'PROBE_BUCKET',
     );
@@ -545,16 +703,25 @@ export async function createDirectReferenceHarness(
   const projection = recordingFetch(async (request) => {
     const url = new URL(request.url);
     const application = specs.some(
-      (spec) => url.origin === `https://${spec.routeHostname}`,
+      (candidateSpec) =>
+        url.origin === `https://${candidateSpec.routeHostname}`,
     );
-    if (application && policy.applicationProbes)
-      return applicationProbe(request);
+    const applicationRole = roles.find(
+      (candidateRole) =>
+        url.origin ===
+        `https://${manifest.names.roles[candidateRole].routeHostname}`,
+    );
     if (
       application &&
       policy.applicationFetch &&
-      TENANT_ROUTES.includes(url.pathname)
+      (policy.applicationFetchRole === undefined ||
+        applicationRole === policy.applicationFetchRole) &&
+      (policy.applicationFetchActive?.() ?? true) &&
+      nativeTenantRoute(request, url)
     )
       return policy.applicationFetch(request);
+    if (application && policy.applicationProbes)
+      return applicationProbe(request);
     const spec = specs.find(
       (candidate) => candidate.maintenanceBaseUrl === url.origin,
     );
@@ -572,12 +739,14 @@ export async function createDirectReferenceHarness(
           return new Response('invalid fixture version', { status: 409 });
       }
       const view = new Proxy(world, {
-        get(target, key) {
-          if (key === 'maintenanceOrigin') return spec.maintenanceBaseUrl;
-          if (key === 'routeOrigin') return `https://${spec.routeHostname}`;
-          if (key === 'scripts')
+        get(target, propertyKey) {
+          if (propertyKey === 'maintenanceOrigin')
+            return spec.maintenanceBaseUrl;
+          if (propertyKey === 'routeOrigin')
+            return `https://${spec.routeHostname}`;
+          if (propertyKey === 'scripts')
             return new Map(script ? [[spec.scriptName, script]] : []);
-          const value = Reflect.get(target, key);
+          const value = Reflect.get(target, propertyKey);
           return typeof value === 'function' ? value.bind(target) : value;
         },
       });
@@ -601,6 +770,8 @@ export async function createDirectReferenceHarness(
     if (url.origin !== 'https://api.cloudflare.com')
       throw new Error('unexpected fixture origin');
     if (url.pathname.includes(exportObjectsPath)) return providerRest(request);
+    const supplied = await policy.providerRequest?.(request);
+    if (supplied) return supplied;
     const match = url.pathname.match(
       /^\/client\/v4\/accounts\/account\/r2\/buckets(?:\/([^/]+)(\/objects)?)?$/u,
     );
@@ -610,7 +781,9 @@ export async function createDirectReferenceHarness(
     if (!name && request.method === 'POST') {
       const requested = (request.body as { name?: unknown }).name;
       const records = await Promise.all(
-        specs.map((spec) => fleetStore.get(spec.tenantTag, spec.environment)),
+        specs.map((deploymentSpec) =>
+          fleetStore.get(deploymentSpec.tenantTag, deploymentSpec.environment),
+        ),
       );
       // `scripts/direct-credentialed-bootstrap.mjs` creates the export bucket
       // in the `default` jurisdiction, and the first arm answers that create.
@@ -674,7 +847,9 @@ export async function createDirectReferenceHarness(
       const objects = await exportBytes.list({
         prefix: url.searchParams.get('prefix') ?? '',
       });
-      return single(objects.objects.map(({ key }) => ({ key })));
+      return single(
+        objects.objects.map(({ key: objectKey }) => ({ key: objectKey })),
+      );
     }
     if (match[2] && request.method === 'GET') {
       expect(url.searchParams.get('per_page')).toBe('1');
@@ -857,11 +1032,23 @@ export async function createDirectReferenceHarness(
     const workerSource = fileURLToPath(
       new URL('../../scripts/direct-reference-worker.ts', import.meta.url),
     );
+    const contextHarnessSource = fileURLToPath(
+      new URL('./direct-reference-context-harness.ts', import.meta.url),
+    );
+    const budgetProbeSource = fileURLToPath(
+      new URL('./direct-force-budget-probe.ts', import.meta.url),
+    );
+    const recoveryEnvironment = policy.recoveryApplicationR2Bucket
+      ? `,DIRECT_RECOVERY_R2_BUCKET:${JSON.stringify(policy.recoveryApplicationR2Bucket)}`
+      : '';
     await writeFile(
       main,
       `import {createDirectReferenceWorker} from ${JSON.stringify(workerSource)};
-const worker=createDirectReferenceWorker(${JSON.stringify(manifest)},{fetch:async(input,init)=>{const request=new Request(input,init);if(request.url==='data:,')return fetch(request);const headers=new Headers(request.headers);headers.set('X-Direct-Fixture-Url',request.url);return fetch('http://127.0.0.1:${address.port}/',{method:request.method,headers,body:request.body,signal:request.signal,redirect:'manual'});}});
-let instance; export default {async fetch(request,env){instance??=crypto.randomUUID();const response=await worker.fetch(request,{...env,CLOUDFLARE_API_TOKEN:'inert-provider-token',FLEET_DIRECT_CONFORMANCE_INVOKE_SECRET:'inert-invoke',DIRECT_RUN_BINDING:${JSON.stringify(JSON.stringify(binding))},DIRECT_DEPLOYMENT_SECRETS:${JSON.stringify(JSON.stringify(secrets))}});response.headers.set('X-Fixture-Instance',instance);return response;}};`,
+import {directForceBudgetProbe} from ${JSON.stringify(budgetProbeSource)};
+const manifest=${JSON.stringify(manifest)};
+const providerFetch=async(input,init)=>{const request=new Request(input,init);if(request.url==='data:,')return fetch(request);const headers=new Headers(request.headers);headers.set('X-Direct-Fixture-Url',request.url);return fetch('http://127.0.0.1:${address.port}/',{method:request.method,headers,body:request.body,signal:request.signal,redirect:'manual'});};
+const worker=createDirectReferenceWorker(manifest,{fetch:providerFetch});
+let instance; export default {async fetch(request,env){instance??=crypto.randomUUID();const current={...env,CLOUDFLARE_API_TOKEN:'inert-provider-token',FLEET_DIRECT_CONFORMANCE_INVOKE_SECRET:'inert-invoke',DIRECT_RUN_BINDING:${JSON.stringify(JSON.stringify(binding))},DIRECT_DEPLOYMENT_SECRETS:${JSON.stringify(JSON.stringify(secrets))}${recoveryEnvironment}};const response=new URL(request.url).pathname==='/__fixture/force-budget'?Response.json(await directForceBudgetProbe(manifest,current,(await request.json()).stage,providerFetch,request.signal)):await worker.fetch(request,current);response.headers.set('X-Fixture-Instance',instance);return response;}};`,
     );
     const options = {
       root: directory,
@@ -875,6 +1062,13 @@ let instance; export default {async fetch(request,env){instance??=crypto.randomU
               'nodejs_compat',
               'global_fetch_strictly_public',
             ],
+            ...(policy.recoveryApplicationR2Bucket
+              ? {
+                  alias: {
+                    './direct-reference-context.js': contextHarnessSource,
+                  },
+                }
+              : {}),
             d1_databases: [
               {
                 binding: 'FLEET_DB',
@@ -926,16 +1120,36 @@ let instance; export default {async fetch(request,env){instance??=crypto.randomU
     }
     throw error;
   }
-  async function call(action: DirectReferenceAction) {
+  let fixtureOrdinal = manifest.referenceRuntime.maxInvocations;
+  async function call(
+    action: DirectReferenceAction,
+    suppliedReservation?: Readonly<{
+      ordinal: number;
+      requestSha256: string;
+    }>,
+  ) {
+    const core = {
+      contractVersion: 2,
+      configSha256: manifest.configSha256,
+      action,
+    };
+    const reservation =
+      action.kind === 'reconcile-invocation'
+        ? null
+        : (suppliedReservation ?? {
+            ordinal: fixtureOrdinal--,
+            requestSha256: directReferenceRequestSha256(core),
+          });
+    if (reservation && reservation.ordinal < 1)
+      throw new Error('direct reference fixture invocation budget exhausted');
     const response = await server
       .getWorker()
       .fetch(`https://reference.test${DIRECT_REFERENCE_PATH}`, {
         method: 'POST',
         headers: { authorization: 'Bearer inert-invoke' },
         body: JSON.stringify({
-          contractVersion: 1,
-          configSha256: manifest.configSha256,
-          action,
+          ...core,
+          reservation,
         }),
       });
     return {
@@ -970,6 +1184,7 @@ let instance; export default {async fetch(request,env){instance??=crypto.randomU
           .update(JSON.stringify(secrets))
           .digest('hex'),
       }),
+      manifest.referenceRuntime.maxInvocations,
     );
   }
 
@@ -1011,6 +1226,20 @@ let instance; export default {async fetch(request,env){instance??=crypto.randomU
       } as RequestInit);
     }) as typeof fetch,
     call,
+    async forceBudgetProbe(stage: ForceBudgetStage) {
+      const response = await server
+        .getWorker()
+        .fetch('https://reference.test/__fixture/force-budget', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ stage }),
+        });
+      if (!response.ok)
+        throw new Error(`force budget probe failed: ${await response.text()}`);
+      return response.json() as Promise<
+        Awaited<ReturnType<typeof directForceBudgetProbe>>
+      >;
+    },
     success,
     journal,
     reload,

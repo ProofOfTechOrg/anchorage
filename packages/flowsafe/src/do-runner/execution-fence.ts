@@ -1423,8 +1423,8 @@ export class ExecutionFenceStore {
       ];
       const expectedTime =
         reading.proofRunId === undefined ? now : observed.raw.updated_at;
-      const validateReturned = (result: unknown): boolean => {
-        const returned = this.#decodeReturned(result);
+      const validateReturned = (returnedResult: unknown): boolean => {
+        const returned = this.#decodeReturned(returnedResult);
         if (returned === undefined) return false;
         const next = returned.reading;
         if (

@@ -38,6 +38,7 @@ export interface DirectWorkerVersionObservation
   readonly tenantTag: string;
   readonly environment: string;
   readonly scriptName: string;
+  readonly routeHostname: string;
   readonly currentDeployment: Readonly<{
     deploymentId: string;
     activeVersionId: string;
@@ -98,10 +99,19 @@ export function readDirectSettlementEffects(
     Readonly<{ expected: readonly DirectExpectedWorkerVersion[] }>,
 ): Promise<readonly DirectSettlementEffect[]>;
 
+export function readDirectSettlementEffect(
+  input: DirectObservationContext &
+    Readonly<{
+      expected: DirectExpectedWorkerVersion;
+      settlementKey: string;
+    }>,
+): Promise<DirectSettlementEffect>;
+
 export function verifyDirectDecommissionExport(
   input: DirectObservationContext &
     Readonly<{
       role: DirectFixtureRole;
+      cycle?: 'reprovision';
       sourceInvocationOrdinal: number;
       metadata: DirectDecommissionExportMetadata;
     }>,

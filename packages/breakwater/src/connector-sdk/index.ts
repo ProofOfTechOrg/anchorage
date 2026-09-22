@@ -871,8 +871,8 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
       `connector ${id}: permissions.idempotencyKey requires policies.idempotencyStore (InMemoryIdempotencyStore works for dev/tests)`,
     );
   }
-  // Sampled once here; the execute path and the legacy migrator read it again
-  // per call, which is why this read is not shared with them.
+  // Construction validates this sample. Executes that reach the absent-legacy
+  // gate and validated ambiguous migrations read the live property there.
   const declaredKeyMigration = policies.idempotencyKeyMigration;
   if (
     declaredKeyMigration !== undefined &&
@@ -1494,9 +1494,9 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
               inspectionOperation = 'inspect';
               legacy = await store.inspect(legacyKey);
             } else {
-              const record = await store.get(legacyKey);
-              legacy = record
-                ? { state: 'replay', record }
+              const legacyRecord = await store.get(legacyKey);
+              legacy = legacyRecord
+                ? { state: 'replay', record: legacyRecord }
                 : { state: 'absent' };
             }
           } catch (error) {

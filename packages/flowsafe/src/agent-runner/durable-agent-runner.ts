@@ -201,34 +201,31 @@
 // sendToolApproval, which it files `intentionallyUnavailable`
 // (packages/breakwater/src/agent/agent.test.ts). It diverges on
 // listSuspendedRuns, which it files under `explicitlyNonExecution` — the same
-// divergence as listActiveRuns, and for the same reason: a
-// narrowed HANDLE can only omit, so a data-returning member is harmless there,
-// while an INSTANCE Mastra calls in-process must throw. The two members
-// blocked below for newer cores diverge the same way; each entry records it.
+// divergence as listActiveRuns, and for the same reason: a narrowed HANDLE can
+// only omit, so a data-returning member is harmless there, while an INSTANCE
+// Mastra calls in-process must throw. The two members blocked below diverge the
+// same way; each entry records it.
 //
-// Two more Agent-level members are blocked for cores NEWER than the pin. Read
-// from the @mastra/core 1.67.0 dist, which the mastra-compat canary installs;
-// offsets here are 1.67.0-vintage, in agent-Dk0N0Nlg.js unless another file is
-// named, and the 1.53.0 offsets above are left as the provenance of that read.
-// The pinned peer exposes neither member, so on 1.53.0 each refusal stands
-// where the base would have raised a TypeError, and shadows a real
-// implementation only once the peer moves.
+// Two more Agent-level members are blocked. Read from the @mastra/core 1.67.0
+// dist, the declared peer; offsets here are 1.67.0-vintage, in
+// agent-Dk0N0Nlg.js unless another file is named, and the 1.53.0 offsets above
+// are left as the provenance of that read. The peer carries both members, so
+// each refusal shadows a real implementation.
 //
 //   - listActiveThreadRuns() (:38214) is the discovery ground one scope wider
 //     than listActiveRuns. It takes no arguments and returns `{ runId,
-//     resourceId, threadId }` for every thread on the pubsub instance with a
-//     run in flight (storage-MbGlKLkB.js:1011-1023), and that state is keyed
-//     by pubsub instance rather than by agent (`#statesByPubSub`, :150, read
-//     through #getState :294), so it narrows by neither principal nor agent
-//     where the two listings above at least narrow by agentId. The in-process
-//     sibling getActiveThreadRunId() stays non-execution because it makes the
-//     caller name the (resourceId, threadId) pair: it confirms where this
-//     enumerates. Breakwater files it `explicitlyNonExecution`
-//     (agent.test.ts) for the reason it files listActiveRuns there: a
-//     narrowed HANDLE can only omit, so a data-returning member is harmless
-//     there, while an INSTANCE Mastra calls in-process must throw. Cost, stated
-//     rather than left to be rediscovered: core's AgentController aggregates
-//     this member across its backing agents
+//     resourceId, threadId }` for every thread on the pubsub instance with a run
+//     in flight (storage-MbGlKLkB.js:1011-1023), and that state is keyed by
+//     pubsub instance rather than by agent (`#statesByPubSub`, :150, read through
+//     #getState :294), so it narrows by neither principal nor agent where the two
+//     listings above at least narrow by agentId. The in-process sibling
+//     getActiveThreadRunId() stays non-execution because it makes the caller name
+//     the (resourceId, threadId) pair: it confirms where this enumerates.
+//     Breakwater files it `explicitlyNonExecution` (agent.test.ts) for the reason
+//     it files listActiveRuns there: a narrowed HANDLE can only omit, so a
+//     data-returning member is harmless there, while an INSTANCE Mastra calls
+//     in-process must throw. Cost, stated rather than left to be rediscovered:
+//     core's AgentController aggregates this member across its backing agents
 //     (agent-controller-CKgKFyMR.js:5722-5725), so that aggregation now throws.
 //     It is already unusable over this class — the same controller calls the
 //     blocked sendToolApproval() at :4089 and :4118.
@@ -240,25 +237,20 @@
 //     the containment those inherited members rely on IS virtual dispatch on
 //     `this`, so one call moves every run those paths start onto an agent
 //     carrying none of these overrides — no caller-minted runId assertion, no
-//     executeWorkflow, no #startRequesters backstop. subscribeToThread drives
-//     no run of its own; the field moves its replay target all the same. It is
-//     public in the type surface (agent.d.ts:229 declares it with no
-//     modifier), so unlike getLegacyHandler it takes no private cast.
+//     executeWorkflow, no #startRequesters backstop. subscribeToThread drives no
+//     run of its own; the field moves its replay target all the same. It is
+//     public in the type surface (agent.d.ts:229 declares it with no modifier),
+//     so unlike getLegacyHandler it takes no private cast.
 //     Breakwater files it `explicitlyNonExecution` (agent.test.ts) for the
 //     reason it files the listings there: a narrowed HANDLE can only omit, so
 //     a setter is harmless there, while an INSTANCE Mastra calls in-process
 //     must throw.
 //
-// Neither carries the `override` keyword, and that is load-bearing rather than
-// an oversight: TypeScript rejects `override` on a member the base does not
-// declare, and 1.53.0 declares neither, so the keyword would fail the pinned
-// typecheck that gates every merge. Each signature must still satisfy the base
-// it acquires on newest; the caveat on each member says how. Both re-checks
-// come due together, when the declared peer reaches a core that carries either
-// member: the VERSION_SKEW expiry assertion in durable-agent-surface.test.ts
-// goes red there, because each member's row claims the installed core carries
-// it on neither prototype. That message speaks about the row alone; these two
-// members' keyword and signature move with it.
+// Both carry the `override` keyword, like every other refusal in this class:
+// the declared peer declares both members, so the keyword holds each refusal to
+// a base that exists and fails the typecheck if a future core drops one. Each
+// signature satisfies the base it shadows on that base's own terms; the caveat
+// on each member says how.
 //
 // Blocking them keeps the single-resume and no-capability guarantees true by
 // construction: resumeViaRuntime() is the ONLY way a run resumes.
@@ -269,7 +261,7 @@
 // generic resumer; grants are derived on the (suspendedAt, resumeCount)
 // fingerprint there. Blocking does not un-brand the agent — DurableAgentLike
 // duck-types on `recover`/`recoverActiveRuns` merely BEING functions
-// (chunk-3S5BFAEP.js:204), which the overrides still are. The surface tripwire in
+// (agent-Dk0N0Nlg.js:272), which the overrides still are. The surface tripwire in
 // durable-agent-surface.test.ts requires every DurableAgent prototype member to
 // stay classified, so a future peer bump surfaces whatever it adds.
 //
@@ -833,12 +825,12 @@ export class FlowsafeDurableAgent<
    * Host-owned run-ID enforcement at the public boundary. The durable-agent entry points (stream /
    * generate / prepare) take an OPTIONAL runId, and when it is omitted core's
    * `prepareForDurableExecution` mints `crypto.randomUUID()`
-   * (agent/durable/index.js:589 — a 1.50.0-vintage offset, since that file is a
-   * re-export shim from 1.53.0) — the exact unowned fallback this wrapper forbids —
-   * and hands it to `executeWorkflow` BELOW this class's own guard, where a bare
-   * UUID is already indistinguishable from a legitimately caller-minted one. So
-   * the guard must ALSO fire HERE, before `super.stream()/generate()/prepare()`,
-   * while "absent" is still visible. Same posture as `RunnerRuntime.start`
+   * (create-durable-agent-DFHwqN2K.js:1211) — the exact unowned fallback this
+   * wrapper forbids — and hands it to `executeWorkflow` BELOW this class's own
+   * guard, where a bare UUID is already indistinguishable from a legitimately
+   * caller-minted one. So the guard must ALSO fire HERE, before
+   * `super.stream()/generate()/prepare()`, while "absent" is still visible. Same
+   * posture as `RunnerRuntime.start`
    * (typeof + PATH_SAFE_ID_PATTERN, NO generation fallback); the `typeof` check
    * is load-bearing because `RegExp.test` coerces its argument to a string, so a
    * numeric runId would pass the pattern yet key a run by the number. Homed once
@@ -1098,11 +1090,10 @@ export class FlowsafeDurableAgent<
    * The same host-owned run-ID guard as {@link FlowsafeDurableAgent.stream}.
    * `prepare()`
    * is the third inherited minting entry point: it forwards `options?.runId` into
-   * core's `prepareForDurableExecution` (agent/durable/index.js:5980), which mints
-   * an unowned `crypto.randomUUID()` when it is absent
-   * (agent/durable/index.js:589) AND REGISTERS a run under that id
-   * (agent/durable/index.js:5984 — all three are 1.50.0-vintage offsets, since
-   * that file is a re-export shim from 1.53.0) — so a later
+   * core's `prepareForDurableExecution` (create-durable-agent-DFHwqN2K.js:7882),
+   * which mints an unowned `crypto.randomUUID()` when it is absent
+   * (create-durable-agent-DFHwqN2K.js:1211) AND REGISTERS a run under that id
+   * (create-durable-agent-DFHwqN2K.js:7890) — so a later
    * `resume(runId)`/`executeWorkflow` sees a bare UUID `PATH_SAFE_ID_PATTERN`
    * already accepts, past every downstream guard. Enforce the caller-minted ID
    * here, while "absent" is still visible. A prepared id remains live until core
@@ -1206,11 +1197,11 @@ export class FlowsafeDurableAgent<
   }
 
   /**
-   * Refuse the thread-level run enumerator newer cores add.
+   * Refuse the thread-level run enumerator.
    * `listActiveThreadRuns()` takes no arguments and returns a runId plus the
-   * resourceId and threadId parsed out of the key for every thread on the
-   * pubsub instance with a run in flight, and core keys that state by pubsub
-   * instance rather than by agent — so it is the same discovery ground as
+   * resourceId and threadId parsed out of the key for every thread on the pubsub
+   * instance with a run in flight, and core keys that state by pubsub instance
+   * rather than by agent — so it is the same discovery ground as
    * {@link FlowsafeDurableAgent.listActiveRuns} with the last scoping gone.
    * The in-process sibling `getActiveThreadRunId()` stays inherited because it
    * makes the caller name the (resourceId, threadId) pair it confirms.
@@ -1218,11 +1209,9 @@ export class FlowsafeDurableAgent<
    * Signature caveat, and the reason this one is not `async`: the base declares
    * it SYNCHRONOUS (`listActiveThreadRuns(): ActiveThreadRun[]`), so the
    * `async … Promise<never>` shape every other refusal here carries would not
-   * be assignable to it. No `override` keyword either — the pinned 1.53.0
-   * declares no such member, and `override` on a member the base lacks is a
-   * type error. Both are re-checks for a peer bump.
+   * be assignable to it. A re-check for a peer bump.
    */
-  listActiveThreadRuns(): never {
+  override listActiveThreadRuns(): never {
     throw unavailableRunEntry(
       'listActiveThreadRuns',
       BLOCKED_RUN_ENTRIES.listActiveThreadRuns,
@@ -1344,8 +1333,7 @@ export class FlowsafeDurableAgent<
    * Signature caveat: the base method is generic in OUTPUT, which
    * `Parameters<>` instantiates to its `undefined` default and so types too
    * narrowly to satisfy the base. The options parameter is widened to
-   * `unknown` — the one supertype that fits every instantiation. Re-check on
-   * every peer bump.
+   * `unknown` so it fits each instantiation. Re-check on a peer bump.
    */
   override async sendToolApproval(_options: unknown): Promise<never> {
     throw unavailableRunEntry(
@@ -1355,25 +1343,20 @@ export class FlowsafeDurableAgent<
   }
 
   /**
-   * Refuse the thread-runtime target swap newer cores add. It sets one private
-   * field that the thread-runtime paths resolve their target through, falling
-   * back to `this`; the refusal in `BLOCKED_RUN_ENTRIES` names those paths,
-   * for the core it is written against. So the containment those inherited
-   * members rely on is virtual dispatch on `this`, and one call to this setter
-   * moves every run they start, and their replay targets with them, onto an
-   * agent with none of these overrides in the chain. That is the fourth ground
-   * reached by installing a second execution surface rather than by calling
-   * one.
+   * Refuse the thread-runtime target swap. It sets one private field that the
+   * thread-runtime paths resolve their target through, falling back to `this`;
+   * the refusal in `BLOCKED_RUN_ENTRIES` names those paths, for the core it is
+   * written against. So the containment those inherited members rely on is
+   * virtual dispatch on `this`, and one call to this setter moves every run they
+   * start, and their replay targets with them, onto an agent with none of these
+   * overrides in the chain. That is the fourth ground reached by installing a
+   * second execution surface rather than by calling one.
    *
    * Signature caveat: the parameter is `unknown` rather than core's
-   * `Agent<any, any, any, any>` because the pinned 1.53.0 declares no such
-   * member at all, while newest 1.x does — `unknown` is the one supertype of
-   * core's parameter, so it satisfies that base without depending on method
-   * bivariance, and it constrains nothing on the pin, where there is no base
-   * member to satisfy. No `override` keyword, for the same reason as
-   * {@link FlowsafeDurableAgent.listActiveThreadRuns}.
+   * `Agent<any, any, any, any>`. `unknown` satisfies that base without
+   * depending on method bivariance.
    */
-  __setThreadRuntimeAgent(_agent: unknown): never {
+  override __setThreadRuntimeAgent(_agent: unknown): never {
     throw unavailableRunEntry(
       '__setThreadRuntimeAgent',
       BLOCKED_RUN_ENTRIES.__setThreadRuntimeAgent,
@@ -1391,7 +1374,7 @@ export class FlowsafeDurableAgent<
    * inventory in durable-agent-surface.test.ts sees a NEW member, never a new
    * core call site on an EXISTING one. So the override is the standing guard —
    * it converts core's best-effort cleanup into a throw the moment a future
-   * release calls it on a path FlowSafe drives. None does at 1.53.0.
+   * release calls it on a path FlowSafe drives. None does at 1.67.0.
    */
   protected override async deleteRunSnapshots(_runId: string): Promise<never> {
     throw unavailableRunEntry(

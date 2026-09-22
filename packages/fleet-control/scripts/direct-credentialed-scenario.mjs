@@ -5,6 +5,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { DirectInvocationError } from './direct-credentialed-invocation.mjs';
 import {
   observeDirectWorkerVersion,
+  readDirectSettlementEffect,
   readDirectSettlementEffects,
   verifyDirectDecommissionExport,
 } from './direct-credentialed-observations.mjs';
@@ -41,6 +42,7 @@ import {
   recordFacts,
   requireFact,
   SCENARIO_ROLES,
+  suspensionSha256,
   zeroAttempts,
 } from './direct-credentialed-scenario-checks.mjs';
 import { DIRECT_TENANT_OBJECT_BODY } from './direct-credentialed-tenant-object.mjs';
@@ -50,6 +52,36 @@ const objectDigest = hash(DIRECT_TENANT_OBJECT_BODY);
 const objectSize = Buffer.byteLength(DIRECT_TENANT_OBJECT_BODY);
 const failureCodes = new Set(DIRECT_SCENARIO_FAILURES);
 const failureDetails = new Set(DIRECT_SCENARIO_FAILURE_DETAILS);
+const continuationWorkflow = 'direct-continuation-proof';
+const continuationStep = 'hold';
+
+function exportProofDigest(proof) {
+  return jsonHash({
+    receipt: proof.receipt,
+    location: proof.location,
+    size: proof.size,
+    sha256: proof.sha256,
+  });
+}
+
+function suspendedSummary(value) {
+  requireFact(
+    value?.status === 'suspended' &&
+      typeof value.runId === 'string' &&
+      /^[A-Za-z0-9_-]{1,128}$/u.test(value.runId),
+  );
+  equal(value.suspended, [[continuationStep]]);
+  equal(value.suspendPayload, {
+    [continuationStep]: { reason: 'awaiting-resume' },
+  });
+  return value;
+}
+
+function successfulSummary(value, runId, challenge) {
+  requireFact(value?.status === 'success' && value.runId === runId);
+  equal(value.result, { challenge, release: '2' });
+  return value;
+}
 
 async function processIdentity() {
   const stat = await readFile('/proc/self/stat', 'utf8');
@@ -81,6 +113,18 @@ function initialState(ordinal) {
       initial: { a: null, b: null, recovery: null },
       candidate: { a: null, b: null },
       final: { a: null, b: null },
+      identities: { a: null, b: null },
+      reprovision: { a: null },
+      reprovisionFinal: { a: null },
+      reprovisionSettlement: { a: null },
+      continuation: {
+        started: null,
+        locked: null,
+        versionB: null,
+        refused: null,
+        reopened: null,
+        finished: null,
+      },
       objects: { a: null, b: null },
       objectDeletions: { a: null, b: null },
       recoveryExportAbsent: { beforeOrdinal: null, afterOrdinal: null },
@@ -98,8 +142,10 @@ function initialState(ordinal) {
       effects: [],
       cleanup: null,
       exports: { a: null, b: null },
+      reprovisionExports: { a: null },
       exportVerifications: [],
       decommission: { a: null, b: null },
+      redecommission: { a: null },
       terminalForce: { a: null },
       force: null,
       residual: null,
@@ -122,7 +168,12 @@ export async function runDirectCredentialedScenario(input) {
     state.mutation = null;
     await persist();
   };
-  const invoke = async (action, mutates = false, migration = null) => {
+  const invoke = async (
+    action,
+    mutates = false,
+    migrationInvocation = null,
+    witnessFromResult,
+  ) => {
     const snapshot = journal.snapshot();
     requireFact(!mutationPending(snapshot), 'outcome-unknown');
     const remaining =
@@ -133,7 +184,7 @@ export async function runDirectCredentialedScenario(input) {
       action: actionSummary(action),
       outcome: 'prepared',
       attempts: null,
-      migration,
+      migration: migrationInvocation,
     };
     state.lastCall = call;
     if (mutates) state.mutation = call;
@@ -170,6 +221,11 @@ export async function runDirectCredentialedScenario(input) {
       outcome: error ? error.code : 'returned',
       attempts,
     };
+    if (witnessFromResult) {
+      requireFact(!error, 'proof-unavailable');
+      settled.witness = witnessFromResult(response.result);
+      requireFact(settled.witness, 'observation-mismatch');
+    }
     if (action.kind === 'force-terminal') {
       const before = error ? null : response.result?.before;
       requireFact(isForceIdentity(before), 'observation-mismatch');
@@ -235,11 +291,13 @@ export async function runDirectCredentialedScenario(input) {
       );
     const records = fresh.records.map(recordFacts);
     equal(
-      records.map((record) => record.role),
+      records.map((remoteRecord) => remoteRecord.role),
       [...SCENARIO_ROLES],
     );
     for (const remote of records) {
-      const known = state.records.find((record) => record.role === remote.role);
+      const known = state.records.find(
+        (knownRecord) => knownRecord.role === remote.role,
+      );
       if (!known)
         requireFact(!remote.present || allowed.roles.includes(remote.role));
       else if (!allowed.roles.includes(remote.role)) equal(remote, known);
@@ -263,9 +321,13 @@ export async function runDirectCredentialedScenario(input) {
     control = fresh;
     return fresh;
   };
-  const mutate = async (action, migration = null) => {
+  const mutate = async (
+    action,
+    migrationInvocation = null,
+    witnessFromResult,
+  ) => {
     await sync();
-    return invoke(action, true, migration);
+    return invoke(action, true, migrationInvocation, witnessFromResult);
   };
   const fenceTransition = async (role, operation) => {
     const before = state.proofs.fence[operation][role].before;
@@ -391,33 +453,55 @@ export async function runDirectCredentialedScenario(input) {
     });
     return present ? { size: result.size, sha256: result.sha256 } : null;
   };
-  const provision = async (role) => {
+  const provision = async (role, cycle) => {
+    const replacement = cycle === 'reprovision';
+    requireFact(!cycle || (replacement && role === 'a'));
+    const cleanupSlot = replacement
+      ? 'cleanup-a-reprovision'
+      : role === 'recovery'
+        ? 'cleanup-recovery-initial'
+        : `cleanup-${role}`;
     await sync();
     if (!record(role).present) {
-      requireFact(
-        !slot(
-          role === 'recovery' ? 'cleanup-recovery-initial' : `cleanup-${role}`,
-        ),
-        'proof-unavailable',
-      );
+      requireFact(!slot(cleanupSlot), 'proof-unavailable');
       const result = await mutate({
         kind: 'provision',
         role,
         release: 'initial',
+        ...(replacement ? { cycle } : {}),
       });
       requireFact(result.status === 'ready');
       await sync();
     }
     equal(record(role).phase, 'ready');
-    if (!state.proofs.initial[role]) {
+    const observed = replacement
+      ? state.proofs.reprovision.a
+      : state.proofs.initial[role];
+    if (!observed) {
       const observation = await observe(role, '1');
       equal(observation.trafficPercentage, 100);
       requireFact(
         observation.currentDeployment.versions.length <=
           DIRECT_SCENARIO_ARRAY_MAXIMA.deploymentVersions,
       );
-      state.proofs.initial[role] = observation;
+      if (replacement) state.proofs.reprovision.a = observation;
+      else state.proofs.initial[role] = observation;
       await persist();
+    }
+    if (replacement) {
+      const result = await invoke({
+        kind: 'tenant-probe',
+        role: 'a',
+        operation: 'health',
+      });
+      equal(result, {
+        role: 'a',
+        operation: 'health',
+        release: '1',
+        marker: 'initial',
+      });
+      await advancePhase();
+      return;
     }
     await health(role, '1', 'initial');
     if (role !== 'recovery' && !state.proofs.objects[role]) {
@@ -506,6 +590,37 @@ export async function runDirectCredentialedScenario(input) {
         proof.routeHostnames,
         state.proofs.inventories.before.routeHostnames,
       );
+      for (const [index, role] of NORMAL_ROLES.entries()) {
+        const before = state.proofs.initial[role];
+        const after = state.proofs.final[role];
+        const [route] = routes[index];
+        requireFact(before && after && route);
+        equal(before.databaseId, after.databaseId);
+        equal(before.scriptName, after.scriptName);
+        equal(before.routeHostname, after.routeHostname);
+        equal(before.routeHostname, route.hostname);
+        requireFact(before.versionId !== after.versionId);
+        const routeHostname = before.routeHostname;
+        state.proofs.identities[role] = {
+          before: 'initial',
+          after: 'final',
+          routeHostname,
+          evidenceSha256: jsonHash({
+            before: {
+              databaseId: before.databaseId,
+              scriptName: before.scriptName,
+              routeHostname,
+              versionId: before.versionId,
+            },
+            after: {
+              databaseId: after.databaseId,
+              scriptName: after.scriptName,
+              routeHostname,
+              versionId: after.versionId,
+            },
+          }),
+        };
+      }
     }
     state.proofs.inventories[when] = proof;
     await persist();
@@ -713,18 +828,111 @@ export async function runDirectCredentialedScenario(input) {
       requireFact(result.status === 'pending' || result.status === 'complete');
     }
   };
-  const decommission = async (role) => {
+  const decommission = async (role, cycle) => {
+    const replacement = cycle === 'reprovision';
+    requireFact(!cycle || (replacement && role === 'a'));
+    const operationSlot = replacement
+      ? 'decommission-a-reprovision'
+      : `decommission-${role}`;
+    const exportProof = () =>
+      replacement
+        ? state.proofs.reprovisionExports.a
+        : state.proofs.exports[role];
+    const setExportProof = (exportValue) => {
+      if (replacement) state.proofs.reprovisionExports.a = exportValue;
+      else state.proofs.exports[role] = exportValue;
+    };
+    const decommissionProof = () =>
+      replacement
+        ? state.proofs.redecommission.a
+        : state.proofs.decommission[role];
+    const setDecommissionProof = (decommissionValue) => {
+      if (replacement) state.proofs.redecommission.a = decommissionValue;
+      else state.proofs.decommission[role] = decommissionValue;
+    };
+    const recordExportVerification = (verified) => {
+      const exportSha256 = exportProofDigest(verified);
+      const current = state.proofs.exportVerifications.find(
+        (entry) => entry.role === role && entry.cycle === (cycle ?? null),
+      );
+      if (current?.exportSha256 === exportSha256) return;
+      // This guard records proof-unavailable before a decoder refusal can
+      // strand the journal as journal-failed.
+      requireFact(
+        state.proofs.exportVerifications.length <
+          DIRECT_SCENARIO_ARRAY_MAXIMA.exportVerifications,
+        'proof-unavailable',
+      );
+      state.proofs.exportVerifications.push({
+        role,
+        cycle: cycle ?? null,
+        sourceInvocationOrdinal: verified.sourceInvocationOrdinal,
+        exportSha256,
+      });
+    };
     await sync();
+    if (decommissionProof()) {
+      await advancePhase();
+      return;
+    }
     let result;
-    if (!slot(`decommission-${role}`))
-      result = await mutate({ kind: 'decommission-start', role });
+    if (!slot(operationSlot))
+      result = await mutate({
+        kind: 'decommission-start',
+        role,
+        ...(replacement ? { cycle } : {}),
+      });
+    if (
+      replacement &&
+      slot(operationSlot)?.operationId &&
+      record(role)?.phase === 'decommissioned'
+    ) {
+      const metadata = await invoke({
+        kind: 'decommission-export',
+        role,
+        cycle,
+      });
+      const verified = await verifyDirectDecommissionExport({
+        ...observer,
+        role,
+        cycle,
+        metadata,
+        sourceInvocationOrdinal: journal.snapshot().invocationCount,
+      });
+      if (exportProof()) {
+        const { receipt, location, size, sha256 } = exportProof();
+        equal(
+          {
+            receipt: verified.receipt,
+            location: verified.location,
+            size: verified.size,
+            sha256: verified.sha256,
+          },
+          { receipt, location, size, sha256 },
+        );
+      }
+      setExportProof(verified);
+      recordExportVerification(verified);
+      setDecommissionProof({
+        operationId: verified.receipt.operationId,
+        databaseId: verified.receipt.databaseId,
+        scriptName: prepared.names.roles[role].scriptName,
+        phase: 'decommissioned',
+      });
+      await persist();
+      await advancePhase();
+      return;
+    }
     while (result?.status !== 'complete') {
       await sync();
-      const metadata = await invoke({ kind: 'decommission-export', role });
+      const metadata = await invoke({
+        kind: 'decommission-export',
+        role,
+        ...(replacement ? { cycle } : {}),
+      });
       if (metadata.available) {
-        if (state.proofs.exports[role]) {
-          const { receipt, location, size, sha256 } =
-            state.proofs.exports[role];
+        if (exportProof()) {
+          const { receipt, location, size, sha256 } = exportProof();
           equal(
             {
               receipt: metadata.receipt,
@@ -743,24 +951,27 @@ export async function runDirectCredentialedScenario(input) {
         const verified = await verifyDirectDecommissionExport({
           ...observer,
           role,
+          ...(replacement ? { cycle } : {}),
           metadata,
           sourceInvocationOrdinal: journal.snapshot().invocationCount,
         });
-        requireFact(
-          state.proofs.exportVerifications.length <
-            DIRECT_SCENARIO_ARRAY_MAXIMA.exportVerifications,
-          'proof-unavailable',
-        );
-        state.proofs.exports[role] = verified;
-        state.proofs.exportVerifications.push(verified);
+        setExportProof(verified);
+        recordExportVerification(verified);
         await persist();
-      } else requireFact(!state.proofs.exports[role]);
-      result = await invoke({ kind: 'decommission-continue', role }, true);
+      } else requireFact(!exportProof());
+      result = await invoke(
+        {
+          kind: 'decommission-continue',
+          role,
+          ...(replacement ? { cycle } : {}),
+        },
+        true,
+      );
       requireFact(result.status !== 'blocked', 'blocked');
       requireFact(result.status === 'pending' || result.status === 'complete');
     }
     const terminal = result.result.record;
-    const proof = state.proofs.exports[role];
+    const proof = exportProof();
     requireFact(proof);
     equal(terminal.phase, 'decommissioned');
     equal(terminal.databaseId, proof.receipt.databaseId);
@@ -773,13 +984,372 @@ export async function runDirectCredentialedScenario(input) {
       size: proof.size,
       sha256: proof.sha256,
     });
-    state.proofs.decommission[role] = {
+    setDecommissionProof({
       operationId: proof.receipt.operationId,
       databaseId: terminal.databaseId,
       scriptName: terminal.scriptName,
       phase: terminal.phase,
+    });
+    await persist();
+    await advancePhase();
+  };
+  const emptyWork = async () => {
+    const result = await invoke({
+      kind: 'tenant-fence',
+      role: 'a',
+      operation: 'inventory',
+    });
+    requireFact(
+      result.categories.every(
+        (category) => category.class !== 'work' || category.empty,
+      ),
+    );
+    return state.lastCall.ordinal;
+  };
+  const startContinuation = async () => {
+    if (state.proofs.continuation.started) {
+      await advancePhase();
+      return;
+    }
+    const challenge = hash(
+      `${prepared.config.resourcePrefix}:direct-continuation-proof`,
+    );
+    let witness =
+      state.mutation?.action.kind === 'tenant-continuation' &&
+      state.mutation.action.operation === 'start' &&
+      state.mutation.outcome === 'returned'
+        ? state.mutation.witness
+        : null;
+    if (!witness) {
+      const emptyBeforeOrdinal = await emptyWork();
+      await mutate(
+        {
+          kind: 'tenant-continuation',
+          operation: 'start',
+          challenge,
+        },
+        null,
+        (result) => {
+          const summary = suspendedSummary(result.summary);
+          const approvalId = summary.approval?.id;
+          requireFact(
+            typeof approvalId === 'string' &&
+              /^[A-Za-z0-9_-]{1,128}$/u.test(approvalId),
+          );
+          return {
+            kind: 'start',
+            workflowId: continuationWorkflow,
+            step: continuationStep,
+            runId: summary.runId,
+            approvalId,
+            status: 'suspended',
+            challengeSha256: hash(challenge),
+            suspensionSha256: suspensionSha256(summary),
+            versionId: state.proofs.reprovision.a.versionId,
+            emptyBeforeOrdinal,
+          };
+        },
+      );
+      witness = state.mutation.witness;
+    }
+    requireFact(witness.kind === 'start');
+    equal(witness.challengeSha256, hash(challenge));
+    equal(witness.versionId, state.proofs.reprovision.a.versionId);
+    state.proofs.continuation.started = {
+      sourceInvocationOrdinal: state.mutation.ordinal,
+      workflowId: witness.workflowId,
+      step: witness.step,
+      runId: witness.runId,
+      approvalId: witness.approvalId,
+      challengeSha256: witness.challengeSha256,
+      suspensionSha256: witness.suspensionSha256,
+      versionId: witness.versionId,
+      emptyBeforeOrdinal: witness.emptyBeforeOrdinal,
     };
     await persist();
+    await advancePhase();
+  };
+  const lockContinuation = async () => {
+    if (state.proofs.continuation.locked) {
+      await advancePhase();
+      return;
+    }
+    let witness =
+      state.mutation?.action.kind === 'tenant-fence' &&
+      state.mutation.action.operation === 'lock' &&
+      state.mutation.outcome === 'returned'
+        ? state.mutation.witness
+        : null;
+    if (!witness) {
+      const before = await invoke({
+        kind: 'tenant-fence',
+        role: 'a',
+        operation: 'read',
+      });
+      await mutate(
+        {
+          kind: 'tenant-fence',
+          role: 'a',
+          operation: 'lock',
+          expectedMutationEpoch: before.mutationEpoch,
+          expectedRevision: before.transitionRevision,
+        },
+        null,
+        (result) => {
+          requireFact(result.ok === true);
+          return { kind: 'lock', before, after: result.after };
+        },
+      );
+      witness = state.mutation.witness;
+    }
+    requireFact(
+      witness.kind === 'lock' &&
+        witness.before.state === 'open' &&
+        witness.after.state === 'migration-locked' &&
+        witness.after.mutationEpoch === witness.before.mutationEpoch + 1 &&
+        witness.after.transitionRevision ===
+          witness.before.transitionRevision + 1,
+    );
+    state.proofs.continuation.locked = {
+      sourceInvocationOrdinal: state.mutation.ordinal,
+      before: witness.before,
+      after: witness.after,
+    };
+    await persist();
+    await advancePhase();
+  };
+  const migrateContinuation = async () => {
+    if (state.proofs.continuation.versionB) {
+      await advancePhase();
+      return;
+    }
+    let witness =
+      state.mutation?.action.kind === 'migration-reprovision-a' &&
+      state.mutation.outcome === 'returned'
+        ? state.mutation.witness
+        : null;
+    if (!witness) {
+      await mutate({ kind: 'migration-reprovision-a' }, null, (result) => ({
+        kind: 'migration-reprovision-a',
+        ...result,
+      }));
+      witness = state.mutation.witness;
+    }
+    requireFact(
+      witness.kind === 'migration-reprovision-a' &&
+        witness.initialVersionId !== witness.finalVersionId,
+    );
+    await sync();
+    const expected = expectedVersion(record('a'), '2');
+    const observation = await observeDirectWorkerVersion({
+      ...observer,
+      ...expected,
+    });
+    equal(observation.trafficPercentage, 100);
+    equal(observation.currentDeployment.versions, [
+      { versionId: witness.finalVersionId, percentage: 100 },
+    ]);
+    const before = state.proofs.reprovision.a;
+    equal(observation.databaseId, before.databaseId);
+    equal(observation.scriptName, before.scriptName);
+    equal(observation.routeHostname, before.routeHostname);
+    equal(observation.namespaces, before.namespaces);
+    const effect = await readDirectSettlementEffect({
+      ...observer,
+      expected,
+      settlementKey: witness.settlementKey,
+    });
+    equal(effect.settlementKey, witness.settlementKey);
+    state.proofs.reprovisionFinal.a = observation;
+    state.proofs.reprovisionSettlement.a = effect;
+    state.proofs.continuation.versionB = {
+      sourceInvocationOrdinal: state.mutation.ordinal,
+      initialVersionId: witness.initialVersionId,
+      finalVersionId: witness.finalVersionId,
+      identitySha256: jsonHash({
+        databaseId: observation.databaseId,
+        scriptName: observation.scriptName,
+        routeHostname: observation.routeHostname,
+        namespaces: observation.namespaces,
+      }),
+    };
+    await persist();
+    await advancePhase();
+  };
+  const refuseContinuation = async () => {
+    if (state.proofs.continuation.refused) {
+      await advancePhase();
+      return;
+    }
+    const started = state.proofs.continuation.started;
+    const before = suspendedSummary(
+      (
+        await invoke({
+          kind: 'tenant-continuation',
+          operation: 'status',
+          runId: started.runId,
+        })
+      ).summary,
+    );
+    let witness =
+      state.mutation?.action.kind === 'tenant-continuation' &&
+      state.mutation.action.operation === 'resume-locked' &&
+      state.mutation.outcome === 'returned'
+        ? state.mutation.witness
+        : null;
+    if (!witness) {
+      await mutate(
+        {
+          kind: 'tenant-continuation',
+          operation: 'resume-locked',
+          runId: started.runId,
+        },
+        null,
+        (result) => ({
+          kind: 'resume-locked',
+          runId: result.runId,
+          status: result.status,
+          code: result.reason?.code,
+          state: result.reason?.state,
+        }),
+      );
+      witness = state.mutation.witness;
+    }
+    equal(witness, {
+      kind: 'resume-locked',
+      runId: started.runId,
+      status: 503,
+      code: 'EXECUTION_FENCED',
+      state: 'migration-locked',
+    });
+    const after = suspendedSummary(
+      (
+        await invoke({
+          kind: 'tenant-continuation',
+          operation: 'status',
+          runId: started.runId,
+        })
+      ).summary,
+    );
+    equal(after.runId, before.runId);
+    const beforeSuspensionSha256 = suspensionSha256(before);
+    const afterSuspensionSha256 = suspensionSha256(after);
+    equal(afterSuspensionSha256, beforeSuspensionSha256);
+    equal(afterSuspensionSha256, started.suspensionSha256);
+    state.proofs.continuation.refused = {
+      sourceInvocationOrdinal: state.mutation.ordinal,
+      runId: witness.runId,
+      status: witness.status,
+      code: witness.code,
+      state: witness.state,
+      suspensionSha256: afterSuspensionSha256,
+    };
+    await persist();
+    await advancePhase();
+  };
+  const finishContinuation = async () => {
+    const started = state.proofs.continuation.started;
+    if (!state.proofs.continuation.reopened) {
+      let witness =
+        state.mutation?.action.kind === 'tenant-fence' &&
+        state.mutation.action.operation === 'unlock' &&
+        state.mutation.outcome === 'returned'
+          ? state.mutation.witness
+          : null;
+      if (!witness) {
+        const before = await invoke({
+          kind: 'tenant-fence',
+          role: 'a',
+          operation: 'read',
+        });
+        await mutate(
+          {
+            kind: 'tenant-fence',
+            role: 'a',
+            operation: 'unlock',
+            expectedMutationEpoch: before.mutationEpoch,
+            expectedRevision: before.transitionRevision,
+          },
+          null,
+          (result) => {
+            requireFact(result.ok === true);
+            return { kind: 'unlock', before, after: result.after };
+          },
+        );
+        witness = state.mutation.witness;
+      }
+      requireFact(
+        witness.kind === 'unlock' &&
+          witness.before.state === 'migration-locked' &&
+          witness.after.state === 'open' &&
+          witness.after.mutationEpoch === witness.before.mutationEpoch &&
+          witness.after.transitionRevision ===
+            witness.before.transitionRevision + 1,
+      );
+      state.proofs.continuation.reopened = {
+        sourceInvocationOrdinal: state.mutation.ordinal,
+        before: witness.before,
+        after: witness.after,
+      };
+      await persist();
+    }
+    if (!state.proofs.continuation.finished) {
+      const challenge = hash(
+        `${prepared.config.resourcePrefix}:direct-continuation-proof`,
+      );
+      let witness =
+        state.mutation?.action.kind === 'tenant-continuation' &&
+        state.mutation.action.operation === 'resume' &&
+        state.mutation.outcome === 'returned'
+          ? state.mutation.witness
+          : null;
+      if (!witness) {
+        await mutate(
+          {
+            kind: 'tenant-continuation',
+            operation: 'resume',
+            runId: started.runId,
+            approvalId: started.approvalId,
+          },
+          null,
+          (result) => {
+            const summary = successfulSummary(
+              result.summary,
+              started.runId,
+              challenge,
+            );
+            return {
+              kind: 'resume',
+              runId: summary.runId,
+              approvalId: result.approval?.id,
+              status: 'success',
+              challengeSha256: hash(summary.result.challenge),
+              resultSha256: jsonHash(summary.result),
+              release: summary.result.release,
+              approvalStatus: result.approval?.status,
+            };
+          },
+        );
+        witness = state.mutation.witness;
+      }
+      equal(witness.runId, started.runId);
+      equal(witness.approvalId, started.approvalId);
+      equal(witness.approvalStatus, 'approved');
+      equal(witness.challengeSha256, started.challengeSha256);
+      const emptyAfterOrdinal = await emptyWork();
+      state.proofs.continuation.finished = {
+        sourceInvocationOrdinal: state.mutation.ordinal,
+        runId: witness.runId,
+        approvalId: witness.approvalId,
+        status: witness.status,
+        challengeSha256: witness.challengeSha256,
+        resultSha256: witness.resultSha256,
+        release: witness.release,
+        approvalStatus: witness.approvalStatus,
+        emptyAfterOrdinal,
+      };
+      await persist();
+    }
     await advancePhase();
   };
   const footprintExpectation = (retained) => ({
@@ -819,8 +1389,19 @@ export async function runDirectCredentialedScenario(input) {
     if (
       state.lastCall?.outcome === 'prepared' ||
       state.mutation?.outcome === 'prepared'
-    )
-      requireFact(false, 'proof-unavailable');
+    ) {
+      const lostRunId =
+        state.mutation?.action.kind === 'tenant-continuation' &&
+        state.mutation.action.operation === 'start';
+      // The lifecycle sweep removes an abandoned run's tenant deployments
+      // before teardown removes the reference control plane. A prepared start
+      // has also lost its server-assigned run id and is never replayed.
+      requireFact(
+        false,
+        'proof-unavailable',
+        lostRunId ? 'lost-run-id-abandoned' : 'prepared-invocation-abandoned',
+      );
+    }
     requireFact(
       snapshot.binding.maxInvocations >= DIRECT_SCENARIO_MIN_INVOCATIONS,
       'budget-exhausted',
@@ -1124,6 +1705,27 @@ export async function runDirectCredentialedScenario(input) {
           await advancePhase();
           break;
         }
+        case 'reprovision-a':
+          await provision('a', 'reprovision');
+          break;
+        case 'continuation-start':
+          await startContinuation();
+          break;
+        case 'continuation-lock':
+          await lockContinuation();
+          break;
+        case 'continuation-migrate':
+          await migrateContinuation();
+          break;
+        case 'continuation-refuse':
+          await refuseContinuation();
+          break;
+        case 'continuation-finish':
+          await finishContinuation();
+          break;
+        case 'decommission-reprovisioned-a':
+          await decommission('a', 'reprovision');
+          break;
         case 'force-recovery': {
           await sync();
           if (control.forceBefore) {
@@ -1197,6 +1799,14 @@ export async function runDirectCredentialedScenario(input) {
               state.proofs.effects.length === 2 &&
               state.proofs.decommission.a &&
               state.proofs.decommission.b &&
+              state.proofs.identities.a &&
+              state.proofs.identities.b &&
+              state.proofs.reprovision.a &&
+              state.proofs.reprovisionFinal.a &&
+              state.proofs.reprovisionSettlement.a &&
+              Object.values(state.proofs.continuation).every(Boolean) &&
+              state.proofs.reprovisionExports.a &&
+              state.proofs.redecommission.a &&
               state.proofs.terminalForce.a &&
               state.proofs.force &&
               state.proofs.residual,

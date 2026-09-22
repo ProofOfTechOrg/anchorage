@@ -1670,9 +1670,9 @@ describe('CloudflareProvisioningClient plain-worker plane', () => {
       { type: 'secret_text', name: 'SECRET' },
     ]);
     for (const binding of viewed.bindings.filter(
-      (binding) =>
-        binding.type === 'unsupported' &&
-        binding.issue === 'malformed-supported-binding',
+      (returnedBinding) =>
+        returnedBinding.type === 'unsupported' &&
+        returnedBinding.issue === 'malformed-supported-binding',
     )) {
       expect(() =>
         assertSupportedPlainWorkerBindings([binding], 'pending version'),

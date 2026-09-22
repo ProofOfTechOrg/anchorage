@@ -1,12 +1,8 @@
-// Packs flowsafe and breakwater and proves the published surface against clean
-// consumers. It installs an ordinary consumer that keeps the unpatched
-// @mastra/core and a consumer that applies the patch this package ships
-// through pnpm patchedDependencies.
+// Packs flowsafe and breakwater and proves the published surface against a
+// clean consumer installed from the packed tarballs.
 import assert from 'node:assert/strict';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import {
-  copyFileSync,
-  cpSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -38,258 +34,6 @@ function run(command, args, cwd = packageRoot) {
   });
 }
 
-// Both consumers run this identical script, so their probe results are
-// comparable: the ordinary one keeps @mastra/core's inherited-source-key
-// defect, the patched one does not.
-const SOURCE_KEY_PROBE = `import {
-  resolveNotificationDeliveryDecision,
-  summarizeNotifications,
-} from '@mastra/core/notifications';
-
-const record = (source) => ({
-  id: 'n',
-  threadId: 't',
-  source,
-  kind: 'k',
-  priority: 'low',
-  status: 'pending',
-  summary: 's',
-  createdAt: new Date(0),
-  updatedAt: new Date(0),
-});
-const config = { sources: {}, default: 'discard' };
-const decide = (source) =>
-  resolveNotificationDeliveryDecision({
-    config,
-    record: record(source),
-    threadState: 'idle',
-    now: new Date(0),
-  });
-
-console.log(
-  JSON.stringify({
-    bySourceType: typeof summarizeNotifications([record('constructor')])
-      .bySource.constructor,
-    ordinary: (await decide('ordinary')).action ?? null,
-    colliding: (await decide('constructor')).action ?? null,
-  }),
-);
-`;
-
-/** The ordinary consumer keeps @mastra/core's inherited-source-key defect. */
-function assertUnpatchedConsumerDefect(consumer) {
-  writeFileSync(join(consumer, 'source-key-probe.mjs'), SOURCE_KEY_PROBE);
-  const unpatchedProbe = JSON.parse(
-    execFileSync(process.execPath, ['source-key-probe.mjs'], {
-      cwd: consumer,
-      encoding: 'utf8',
-      stdio: 'pipe',
-    }),
-  );
-  // Unpatched, the source map resolves Object.prototype.constructor, and
-  // normalizeDecision hands that function back as the decision, so it carries
-  // no action at all.
-  assert.deepEqual(unpatchedProbe, {
-    bySourceType: 'string',
-    ordinary: 'discard',
-    colliding: null,
-  });
-}
-
-/**
- * A consumer that records the shipped patch through pnpm installs it patched,
- * and proves notification delivery bookkeeping there, which only a patched core
- * runs.
- */
-function assertPatchedConsumerInstall(consumer, patchName, shippedPatch) {
-  const patchedConsumer = join(temporary, 'consumer-patched');
-  mkdirSync(patchedConsumer);
-  mkdirSync(join(patchedConsumer, 'patches'));
-  copyFileSync(shippedPatch, join(patchedConsumer, 'patches', patchName));
-  const patchedConsumerManifest = JSON.parse(
-    readFileSync(join(consumer, 'package.json'), 'utf8'),
-  );
-  patchedConsumerManifest.name = 'flowsafe-agent-host-patched-consumer';
-  patchedConsumerManifest.pnpm = {
-    patchedDependencies: { '@mastra/core@1.53.0': `patches/${patchName}` },
-  };
-  writeFileSync(
-    join(patchedConsumer, 'package.json'),
-    `${JSON.stringify(patchedConsumerManifest, null, 2)}\n`,
-  );
-  copyFileSync(
-    join(consumer, 'pnpm-workspace.yaml'),
-    join(patchedConsumer, 'pnpm-workspace.yaml'),
-  );
-  copyFileSync(join(consumer, '.npmrc'), join(patchedConsumer, '.npmrc'));
-  writeFileSync(
-    join(patchedConsumer, 'source-key-probe.mjs'),
-    SOURCE_KEY_PROBE,
-  );
-  // notification-runtime.mjs imports sqlite-fixture.mjs from its own directory,
-  // and its package specifiers resolve here because this manifest clones the
-  // ordinary consumer's dependencies.
-  copyFileSync(
-    join(consumer, 'sqlite-fixture.mjs'),
-    join(patchedConsumer, 'sqlite-fixture.mjs'),
-  );
-  run('pnpm', ['install', '--ignore-scripts'], patchedConsumer);
-  const patchedProbe = JSON.parse(
-    execFileSync(process.execPath, ['source-key-probe.mjs'], {
-      cwd: patchedConsumer,
-      encoding: 'utf8',
-      stdio: 'pipe',
-    }),
-  );
-  assert.deepEqual(patchedProbe, {
-    bySourceType: 'number',
-    ordinary: 'discard',
-    colliding: 'discard',
-  });
-  // Notification delivery bookkeeping runs only against a patched core, so its
-  // receipts are proved in this consumer rather than in the ordinary one.
-  writeFileSync(
-    join(patchedConsumer, 'notification-runtime.mjs'),
-    `import assert from 'node:assert/strict';
-import * as approvals from '@proofoftech/flowsafe/approval-api';
-import * as doRunner from '@proofoftech/flowsafe/do-runner';
-import * as signals from '@proofoftech/flowsafe/signals';
-import { InMemoryStore } from '@mastra/core/storage';
-import { openSqlite, sqliteUnitDatabase } from './sqlite-fixture.mjs';
-const notificationSql = openSqlite();
-const notificationStore = new signals.D1NotificationsStorage(sqliteUnitDatabase(notificationSql));
-const notificationNow = new Date();
-await notificationStore.createNotification({
-  id: 'packed-notification', threadId: 'notification-thread', resourceId: 'notification-thread', agentId: 'writer',
-  source: 'packed', kind: 'changed', summary: 'delivery receipt', deliverAt: notificationNow,
-});
-const notificationContext = approvals.createPrincipalActorContext({
-  principal: approvals.trustAutomationPrincipal({ kind: 'system', id: 'notification-dispatch', purpose: 'notification.dispatch' }),
-  storeFactory: new approvals.InMemoryApprovalStoreFactory(),
-  buildService: () => { throw new Error('notification receipt does not use approval service'); },
-});
-const notificationTickOptions = {
-  storage: notificationStore,
-  topology: { send: async () => new Response(null, { status: 404 }) },
-  resolveContext: () => notificationContext,
-  now: () => notificationNow,
-  executionFence: 'none',
-  maxDeliveryAttempts: 1,
-};
-const notificationTick = signals.createNotificationDispatchTick(notificationTickOptions);
-assert.deepEqual(await notificationTick(), { due: 1, delivered: 0, failed: 0, discarded: 1 });
-const notificationReceipt = await notificationStore.getNotification({ threadId: 'notification-thread', id: 'packed-notification' });
-assert.equal(notificationReceipt.status, 'discarded');
-assert.equal(notificationReceipt.deliveryAttempts, 1);
-assert.equal(notificationReceipt.deliveryReason, 'delivery-attempts-exhausted');
-assert.match(notificationReceipt.lastDeliveryError, /404/);
-assert.equal(notificationReceipt.lastDeliveryAttemptAt.toISOString(), notificationNow.toISOString());
-assert.equal(notificationReceipt.discardedAt instanceof Date, true);
-assert.equal(notificationReceipt.deliverAt, undefined);
-assert.equal(notificationReceipt.summaryAt, undefined);
-assert.deepEqual(await notificationStore.listDueNotifications({ now: new Date(notificationNow.getTime() + 60000) }), []);
-const coreNotificationStore = await new InMemoryStore().getStore('notifications');
-assert.ok(coreNotificationStore);
-assert.equal(typeof coreNotificationStore.getNotification, 'function');
-assert.throws(() => signals.createNotificationDispatchTick({ ...notificationTickOptions, storage: coreNotificationStore }), TypeError);
-let unsupportedNotificationReads = 0;
-const unsupportedNotificationRoutes = signals.createThreadSignalRoutes({
-  resolveAgent: () => ({ id: 'writer' }),
-  resolveResourceId: () => 'notification-thread',
-  resolveNotificationsStorage: () => ({
-    getNotification: async () => { unsupportedNotificationReads++; return null; },
-  }),
-});
-const notificationLog = console.error;
-let unsupportedNotificationResponse;
-try {
-  console.error = () => {};
-  unsupportedNotificationResponse = await unsupportedNotificationRoutes(new Request('https://thread/signal/notifications/dispatch', {
-    method: 'POST', body: JSON.stringify({ notificationIds: ['packed-notification'], resourceId: 'notification-thread', agentId: 'writer', now: notificationNow.toISOString() }),
-  }), { threadId: 'notification-thread', principal: notificationContext.principal, init: doRunner.init({ storage: new InMemoryStore() }, { executionFence: 'none', startIdempotency: 'none' }) });
-} finally {
-  console.error = notificationLog;
-}
-assert.equal(unsupportedNotificationResponse.status, 502);
-assert.deepEqual(await unsupportedNotificationResponse.json(), { error: 'internal error' });
-assert.equal(unsupportedNotificationReads, 0);
-notificationSql.close();
-`,
-  );
-  run(process.execPath, ['notification-runtime.mjs'], patchedConsumer);
-}
-
-/** The postinstall command the guide documents applies the shipped bytes once. */
-function assertToolNeutralPatchRoute(consumer, patchName, shippedPatch) {
-  const coreChunks = [
-    'chunk-P4Y2BJL7.js',
-    'chunk-XAQAI6CU.cjs',
-    'chunk-3S5BFAEP.js',
-    'chunk-ODHD3TLJ.cjs',
-  ];
-  const appRoot = join(temporary, 'app-root');
-  const scratchCore = join(appRoot, 'node_modules', '@mastra', 'core');
-  // A plain content copy, never a hard-link clone: the installed chunk files
-  // are hard links into the pnpm store.
-  cpSync(
-    join(consumer, 'node_modules', '@mastra', 'core', 'dist'),
-    join(scratchCore, 'dist'),
-    { recursive: true, dereference: true },
-  );
-  mkdirSync(join(appRoot, 'patches'), { recursive: true });
-  copyFileSync(shippedPatch, join(appRoot, 'patches', patchName));
-  const guide = readFileSync(
-    join(repositoryRoot, 'docs', 'getting-started.md'),
-    'utf8',
-  );
-  const documented = [...guide.matchAll(/"postinstall": "([^"]*)"/g)];
-  assert.equal(
-    documented.length,
-    1,
-    'the getting-started guide must document one postinstall command',
-  );
-  // The guide's block is JSON source text; a consumer's manifest is parsed
-  // before the shell sees the value, so parse it the same way.
-  const command = JSON.parse(`"${documented[0][1]}"`);
-  // This site departs from the file's argv-only convention because the
-  // documented command is a shell string carrying redirection and ||, and
-  // running what the guide prints is what makes the guide's verification
-  // sentence true.
-  const firstLeg = spawnSync('sh', ['-c', command], {
-    cwd: appRoot,
-    stdio: 'pipe',
-  });
-  assert.equal(firstLeg.status, 0, 'the documented command must apply cleanly');
-  for (const chunk of coreChunks) {
-    assert.deepEqual(
-      readFileSync(join(scratchCore, 'dist', chunk)),
-      readFileSync(
-        join(packageRoot, 'node_modules', '@mastra', 'core', 'dist', chunk),
-      ),
-      `${chunk} must match the workspace's patched chunk`,
-    );
-  }
-  const secondLeg = spawnSync('sh', ['-c', command], {
-    cwd: appRoot,
-    stdio: 'pipe',
-  });
-  assert.equal(secondLeg.status, 0, 'the documented command must re-run clean');
-  for (const chunk of coreChunks) {
-    assert.deepEqual(
-      readFileSync(join(scratchCore, 'dist', chunk)),
-      readFileSync(
-        join(packageRoot, 'node_modules', '@mastra', 'core', 'dist', chunk),
-      ),
-      `${chunk} must be unchanged by a second run`,
-    );
-  }
-  assert.deepEqual(
-    readdirSync(join(scratchCore, 'dist')).filter(
-      (name) => name.endsWith('.rej') || name.endsWith('.orig'),
-    ),
-    [],
-  );
-}
 try {
   const packed = join(temporary, 'packed');
   const breakwaterPacked = join(temporary, 'breakwater-packed');
@@ -572,17 +316,6 @@ register('./graph-loader.mjs', import.meta.url);
     join(consumer, '.npmrc'),
     'ignore-scripts=true\nengine-strict=true\nauto-install-peers=false\n',
   );
-  // GNU patch applies the shipped patch in the tool-neutral proof below.
-  // Probing before the consumer installs keeps a missing tool from costing
-  // several minutes of installing first.
-  try {
-    execFileSync('patch', ['--version'], { encoding: 'utf8', stdio: 'pipe' });
-  } catch (error) {
-    throw new Error(
-      'GNU patch is required on PATH for the packed agent-host proof',
-      { cause: error },
-    );
-  }
   run('pnpm', ['install', '--ignore-scripts'], consumer);
 
   const installedFlowsafeRoot = join(
@@ -1366,7 +1099,7 @@ for (const name of ['claim', 'release', 'settleRun']) {
 }
 for (const api of [flowsafe, doRunner, hostKit]) assert.equal('rollbackFencedStart' in api, false);
 for (const api of [flowsafe, approvals, doRunner, hostKit, host, agentRunner, schedules, signals]) {
-  for (const name of ['captureActorContext', 'captureAgentStartAuthority', 'captureStartRunOptions', 'startAuthorities', 'AgentStartAuthority', 'executionFenceAdmissionValues', 'captureExecutionFenceAdmissionSchema', 'executionFenceAdmissionSql', 'AgentRunSelectorMismatchError', 'assertNotificationSourceKeysPatched', 'assertNotificationDeliveryPolicyPatched', 'captureNotificationDeliveryObservation', 'captureNotificationDeliverySelection', 'captureNotificationDeliveryStorage', 'recordNotificationDeliveryFailure']) {
+  for (const name of ['captureActorContext', 'captureAgentStartAuthority', 'captureStartRunOptions', 'startAuthorities', 'AgentStartAuthority', 'executionFenceAdmissionValues', 'captureExecutionFenceAdmissionSchema', 'executionFenceAdmissionSql', 'AgentRunSelectorMismatchError', 'captureNotificationDeliveryObservation', 'captureNotificationDeliverySelection', 'captureNotificationDeliveryStorage', 'recordNotificationDeliveryFailure']) {
     assert.equal(name in api, false, name);
   }
 }
@@ -1387,7 +1120,28 @@ const notificationTickOptions = {
   executionFence: 'none',
   maxDeliveryAttempts: 1,
 };
-assert.throws(() => signals.createNotificationDispatchTick(notificationTickOptions), { name: 'TypeError', message: /Apply the flowsafe patch to @mastra\\/core/ });
+await notificationStore.createNotification({
+  id: 'packed-notification', threadId: 'notification-thread', resourceId: 'notification-thread', agentId: 'writer',
+  source: 'packed', kind: 'changed', summary: 'delivery receipt', deliverAt: notificationNow,
+});
+const notificationTick = signals.createNotificationDispatchTick(notificationTickOptions);
+assert.deepEqual(await notificationTick(), { due: 1, delivered: 0, failed: 0, discarded: 1 });
+const notificationReceipt = await notificationStore.getNotification({ threadId: 'notification-thread', id: 'packed-notification' });
+assert.equal(notificationReceipt.status, 'discarded');
+assert.equal(notificationReceipt.deliveryAttempts, 1);
+assert.equal(notificationReceipt.deliveryReason, 'delivery-attempts-exhausted');
+assert.match(notificationReceipt.lastDeliveryError, /404/);
+assert.equal(notificationReceipt.lastDeliveryAttemptAt.toISOString(), notificationNow.toISOString());
+assert.equal(notificationReceipt.discardedAt instanceof Date, true);
+assert.equal(notificationReceipt.deliverAt, undefined);
+assert.equal(notificationReceipt.summaryAt, undefined);
+assert.deepEqual(await notificationStore.listDueNotifications({ now: new Date(notificationNow.getTime() + 60000) }), []);
+// Core's own notifications domain carries no conditional-delivery update, which
+// is the surviving construction refusal.
+const coreNotificationStore = await new InMemoryStore().getStore('notifications');
+assert.ok(coreNotificationStore);
+assert.equal(typeof coreNotificationStore.getNotification, 'function');
+assert.throws(() => signals.createNotificationDispatchTick({ ...notificationTickOptions, storage: coreNotificationStore }), { name: 'TypeError', message: /notification dispatch requires conditional delivery storage/ });
 let unsupportedNotificationReads = 0;
 let notificationSends = 0;
 const unsupportedNotificationRoutes = signals.createThreadSignalRoutes({
@@ -1397,34 +1151,31 @@ const unsupportedNotificationRoutes = signals.createThreadSignalRoutes({
     getNotification: async () => { unsupportedNotificationReads++; return null; },
   }),
 });
-async function withCapturedErrors(run) {
-  const logged = [];
+async function withSuppressedErrors(run) {
   const consoleError = console.error;
-  let response;
   try {
-    console.error = (...args) => { logged.push(args.map(String).join(' ')); };
-    response = await run();
+    console.error = () => undefined;
+    return await run();
   } finally {
     console.error = consoleError;
   }
-  return { response, logged };
 }
-const { response: unsupportedNotificationResponse, logged: notificationRefusals } = await withCapturedErrors(() => unsupportedNotificationRoutes(new Request('https://thread/signal/notifications/dispatch', {
+const unsupportedNotificationResponse = await withSuppressedErrors(() => unsupportedNotificationRoutes(new Request('https://thread/signal/notifications/dispatch', {
   method: 'POST', body: JSON.stringify({ notificationIds: ['packed-notification'], resourceId: 'notification-thread', agentId: 'writer', now: notificationNow.toISOString() }),
 }), { threadId: 'notification-thread', principal: notificationContext.principal, init: doRunner.init({ storage: new InMemoryStore() }, { executionFence: 'none', startIdempotency: 'none' }) }));
 assert.equal(unsupportedNotificationResponse.status, 502);
 assert.deepEqual(await unsupportedNotificationResponse.json(), { error: 'internal error' });
 assert.equal(unsupportedNotificationReads, 0);
-assert.equal(notificationRefusals.some((line) => line.includes('Apply the flowsafe patch to @mastra/core')), true, 'the refusal naming the patch must reach console.error');
-const { response: ingestionResponse, logged: ingestionRefusals } = await withCapturedErrors(() => unsupportedNotificationRoutes(new Request('https://thread/signal/notification', {
-  method: 'POST', body: JSON.stringify({ source: 'constructor', kind: 'changed', summary: 'ingested' }),
-}), { threadId: 'notification-thread', principal: notificationContext.principal, init: doRunner.init({ storage: new InMemoryStore() }, { executionFence: 'none', startIdempotency: 'none' }) }));
-assert.equal(ingestionResponse.status, 502);
-assert.deepEqual(await ingestionResponse.json(), { error: 'internal error' });
-// The stub carries sendNotificationSignal, so an uncalled sender is what tells
-// the patch refusal from a missing-method TypeError on the same route catch.
-assert.equal(notificationSends, 0);
-assert.equal(ingestionRefusals.some((line) => line.includes('Apply the flowsafe patch to @mastra/core')), true, 'the ingestion refusal naming the patch must reach console.error');
+// Ingestion needs no storage method the dispatch route above is missing: it
+// hands the record to the fixture's sender, and the non-runtime-driven agent
+// is what the degraded field reports. The send count separates a real delivery
+// from a route that answered without reaching the sender.
+const ingestionResponse = await unsupportedNotificationRoutes(new Request('https://thread/signal/notification', {
+  method: 'POST', body: JSON.stringify({ source: 'packed', kind: 'changed', summary: 'ingested' }),
+}), { threadId: 'notification-thread', principal: notificationContext.principal, init: doRunner.init({ storage: new InMemoryStore() }, { executionFence: 'none', startIdempotency: 'none' }) });
+assert.equal(ingestionResponse.status, 200);
+assert.deepEqual(await ingestionResponse.json(), { record: { id: 'sent' }, degraded: 'not-runtime-driven' });
+assert.equal(notificationSends, 1);
 notificationSql.close();
 for (const api of [flowsafe, doRunner, hostKit]) {
   for (const name of ['FENCED_SCHEDULE_STORAGE', 'ScheduleMutationConflictError', 'ScheduleMutationOutcomeUnknownError']) {
@@ -1816,37 +1567,6 @@ export default {
     ],
     consumer,
   );
-  // The @mastra/core patch this package ships. A consumer applies it at its own
-  // root; installing flowsafe does not. The ordinary consumer above therefore
-  // keeps the defect, which is the publication limit the checks below pin.
-  const patchName = '@mastra__core@1.53.0.patch';
-  const shippedPatch = join(packageDirectory, 'patches', patchName);
-  assert.equal(
-    existsSync(shippedPatch),
-    true,
-    'the packed package must ship the @mastra/core patch',
-  );
-  // The manifest entry pins what npm-packlist may take; comparing the source
-  // directory with the shipped one pins that the published set equals the set
-  // this repository holds, and fails in both directions.
-  for (const entry of manifest.files ?? []) {
-    if (!entry.startsWith('patches/')) continue;
-    assert.equal(
-      existsSync(join(packageRoot, entry)),
-      true,
-      `${entry} is published but has no source file`,
-    );
-  }
-  assert.deepEqual(
-    readdirSync(join(packageRoot, 'patches')).sort(),
-    readdirSync(join(packageDirectory, 'patches')).sort(),
-  );
-  assertUnpatchedConsumerDefect(consumer);
-
-  assertPatchedConsumerInstall(consumer, patchName, shippedPatch);
-
-  assertToolNeutralPatchRoute(consumer, patchName, shippedPatch);
-
   console.log(
     `packed agent-host clean core-${corePeer} import and bundle passed`,
   );

@@ -1,8 +1,18 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, globSync, readdirSync, readFileSync } from 'node:fs';
+import {
+  existsSync,
+  globSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { builtinModules, createRequire, isBuiltin } from 'node:module';
-import { dirname, join, relative } from 'node:path';
+import { tmpdir } from 'node:os';
+import { basename, dirname, join, relative } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
@@ -40,17 +50,26 @@ const fleetRequire = createRequire(
 );
 const ts = fleetRequire('typescript');
 const root = fileURLToPath(new URL('..', import.meta.url));
-const directScenarioProject =
-  'packages/fleet-control/vitest.direct-scenario.config.ts';
+const directScenarioProjects = [
+  'packages/fleet-control/vitest.direct-scenario.config.ts',
+  'packages/fleet-control/vitest.direct-scenario-seams.config.ts',
+];
 const fleetControlProject = 'packages/fleet-control/vitest.config.ts';
 const rootProjectPaths = [
   ...globSync('vitest.*.config.*', { cwd: root }).map((match) =>
     match.split('\\').join('/'),
   ),
-  directScenarioProject,
+  ...directScenarioProjects,
 ];
+const packageProjectPaths = readdirSync(join(root, 'packages'), {
+  withFileTypes: true,
+})
+  .filter((entry) => entry.isDirectory())
+  .map((entry) => `packages/${entry.name}/vitest.config.ts`)
+  .filter((projectPath) => existsSync(join(root, projectPath)));
 const rootProjectNames = {
-  [directScenarioProject]: 'fleet-control-direct-scenario',
+  [directScenarioProjects[0]]: 'fleet-control-direct-scenario',
+  [directScenarioProjects[1]]: 'fleet-control-direct-scenario-seams',
   'vitest.breakwater-workers.config.mts': 'breakwater-workers',
   'vitest.flowsafe-harness.config.ts': 'flowsafe-harness',
   'vitest.flowsafe-workers.config.ts': 'flowsafe-workers',
@@ -414,9 +433,13 @@ const parse = (projectPath) => {
     true,
   );
 };
-const initializerOf = (source, property) => {
+const initializerOf = (
+  source,
+  property,
+  { recursive = true, required = true, label } = {},
+) => {
   const found = [];
-  const visit = (node) => {
+  const collect = (node) => {
     if (
       ts.isPropertyAssignment(node) &&
       ts.isIdentifier(node.name) &&
@@ -424,14 +447,23 @@ const initializerOf = (source, property) => {
     ) {
       found.push(node.initializer);
     }
+  };
+  const visit = (node) => {
+    collect(node);
     ts.forEachChild(node, visit);
   };
-  visit(source);
-  assert.equal(
-    found.length,
-    1,
-    `${relative(root, source.fileName)} sets '${property}' once`,
-  );
+  if (recursive) visit(source);
+  else ts.forEachChild(source, collect);
+  const sourceLabel =
+    label ??
+    relative(root, source.getSourceFile?.().fileName ?? source.fileName);
+  if (required)
+    assert.equal(found.length, 1, `${sourceLabel} sets '${property}' once`);
+  else
+    assert.ok(
+      found.length <= 1,
+      `${sourceLabel} sets '${property}' at most once`,
+    );
   return found[0];
 };
 // The array element that is not a string literal and still leaves the parse
@@ -497,15 +529,9 @@ test('the root vitest projects resolve to exactly the config files the repositor
       resolved.add(match.split('\\').join('/'));
     }
   }
-  const packageProjects = readdirSync(join(root, 'packages'), {
-    withFileTypes: true,
-  })
-    .filter((entry) => entry.isDirectory())
-    .map((entry) => `packages/${entry.name}/vitest.config.ts`)
-    .filter((projectPath) => existsSync(join(root, projectPath)));
   assert.deepEqual(
     [...resolved].sort(),
-    [...packageProjects, ...rootProjectPaths].sort(),
+    [...packageProjectPaths, ...rootProjectPaths].sort(),
   );
 });
 
@@ -515,28 +541,38 @@ test('every root vitest project declares its expected name', () => {
     [...rootProjectPaths].sort(),
   );
   for (const projectPath of rootProjectPaths) {
-    const projectName = initializerOf(parse(projectPath), 'name');
-    assert.ok(
-      ts.isStringLiteralLike(projectName),
-      `${projectPath} names its project with a string literal`,
+    assert.equal(
+      explicitProjectName(projectPath),
+      rootProjectNames[projectPath],
+      projectPath,
     );
-    assert.equal(projectName.text, rootProjectNames[projectPath], projectPath);
   }
 });
 
-test('the direct-scenario suites are declared by that project and excluded from the package project', () => {
-  const expectedInclude = [
-    'test/direct-credentialed-scenario.test.ts',
-    'test/direct-reference-fence.harness.test.ts',
-  ];
-  const directInclude = stringsOf(parse(directScenarioProject), 'include');
+test('the direct-scenario suites are declared by their projects and excluded from the package project', () => {
+  const expectedIncludes = new Map([
+    [
+      directScenarioProjects[0],
+      [
+        'test/direct-credentialed-scenario.test.ts',
+        'test/direct-reference-fence.harness.test.ts',
+      ],
+    ],
+    [
+      directScenarioProjects[1],
+      ['test/direct-credentialed-scenario.seams.test.ts'],
+    ],
+  ]);
   const packageExclude = stringsOf(parse(fleetControlProject), 'exclude');
-  assert.deepEqual([...directInclude].sort(), [...expectedInclude].sort());
-  for (const entry of directInclude) {
-    assert.ok(
-      packageExclude.includes(entry),
-      `the package project does not exclude '${entry}'`,
-    );
+  for (const [project, expectedInclude] of expectedIncludes) {
+    const directInclude = stringsOf(parse(project), 'include');
+    assert.deepEqual([...directInclude].sort(), [...expectedInclude].sort());
+    for (const entry of directInclude) {
+      assert.ok(
+        packageExclude.includes(entry),
+        `the package project does not exclude '${entry}'`,
+      );
+    }
   }
 });
 
@@ -574,52 +610,463 @@ test('every tsconfig.harness.json include entry resolves to a file', () => {
   }
 });
 
-const projectSelector = /--project\s+'?([^'\s]+)'?/gu;
+const noShadowProbe = `const value = 1;
+function probe() {
+  const value = 2;
+  return value;
+}
+console.log(value, probe());
+`;
 
-test('every vitest project a root script selects is declared', () => {
-  const { scripts } = JSON.parse(
-    readFileSync(join(root, 'package.json'), 'utf8'),
+const trackedJavaScriptPaths = spawnSync(
+  'git',
+  [
+    'ls-files',
+    '-z',
+    '--',
+    '*.ts',
+    '*.tsx',
+    '*.mts',
+    '*.cts',
+    '*.mjs',
+    '*.cjs',
+    '*.js',
+    '*.jsx',
+  ],
+  { cwd: root, encoding: 'utf8' },
+)
+  .stdout.split('\0')
+  .filter(Boolean);
+
+const trackedBiomeConfigs = spawnSync(
+  'git',
+  [
+    'ls-files',
+    '-z',
+    '--',
+    'biome.json',
+    'biome.jsonc',
+    '.biome.json',
+    '.biome.jsonc',
+    ':(glob)**/biome.json',
+    ':(glob)**/biome.jsonc',
+    ':(glob)**/.biome.json',
+    ':(glob)**/.biome.jsonc',
+  ],
+  { cwd: root, encoding: 'utf8' },
+)
+  .stdout.split('\0')
+  .filter((path) => path !== '' && path !== 'biome.json');
+
+function assertNoShadowEnforced(
+  biomeConfig,
+  { extraConfigs = new Map(), label = 'repository config' } = {},
+) {
+  assert.equal(
+    biomeConfig.linter?.enabled,
+    true,
+    `${label}: root linter.enabled is true`,
   );
-  const declared = new Set(Object.values(rootProjectNames));
-  const selections = [];
-  for (const [script, command] of Object.entries(scripts)) {
-    for (const [, selector] of command.matchAll(projectSelector)) {
-      selections.push([script, selector.replace(/^!/u, '')]);
-    }
+  assert.equal(
+    biomeConfig.linter?.rules?.suspicious?.noShadow,
+    'error',
+    `${label}: root suspicious.noShadow is error`,
+  );
+  assert.equal(
+    biomeConfig.files?.maxSize,
+    undefined,
+    `${label}: root files.maxSize is absent`,
+  );
+  for (const [index, override] of (biomeConfig.overrides ?? []).entries()) {
+    assert.equal(
+      override.files?.maxSize,
+      undefined,
+      `${label}: override ${index} files.maxSize is absent`,
+    );
   }
-  assert.ok(
-    selections.length > 0,
-    'no root script selects a vitest project by name',
+
+  const scratch = mkdtempSync(join(tmpdir(), 'anchorage-noshadow-'));
+  try {
+    writeFileSync(
+      join(scratch, 'biome.json'),
+      `${JSON.stringify(biomeConfig, null, 2)}\n`,
+    );
+    writeFileSync(
+      join(scratch, '.gitignore'),
+      readFileSync(join(root, '.gitignore')),
+    );
+    for (const trackedConfigPath of trackedBiomeConfigs) {
+      const target = join(scratch, trackedConfigPath);
+      mkdirSync(dirname(target), { recursive: true });
+      writeFileSync(target, readFileSync(join(root, trackedConfigPath)));
+    }
+    for (const [customConfigPath, contents] of extraConfigs) {
+      const target = join(scratch, customConfigPath);
+      mkdirSync(dirname(target), { recursive: true });
+      writeFileSync(target, `${JSON.stringify(contents, null, 2)}\n`);
+    }
+    for (const sourcePath of trackedJavaScriptPaths) {
+      const target = join(scratch, sourcePath);
+      mkdirSync(dirname(target), { recursive: true });
+      writeFileSync(target, noShadowProbe);
+    }
+
+    const biomeArguments = [
+      'lint',
+      '--reporter=json',
+      '--max-diagnostics=none',
+    ];
+    biomeArguments.push('.');
+    const run = spawnSync(
+      join(root, 'node_modules/.bin/biome'),
+      biomeArguments,
+      { cwd: scratch, encoding: 'utf8' },
+    );
+    assert.equal(run.error, undefined, `${label}: Biome starts`);
+    let report;
+    assert.doesNotThrow(() => {
+      report = JSON.parse(run.stdout);
+    }, `${label}: Biome emits its JSON report`);
+    const errorPaths = new Set(
+      report.diagnostics
+        .filter(
+          (diagnostic) =>
+            diagnostic.category === 'lint/suspicious/noShadow' &&
+            diagnostic.severity === 'error',
+        )
+        .map((diagnostic) => diagnostic.location.path),
+    );
+    for (const sourcePath of trackedJavaScriptPaths) {
+      assert.ok(
+        errorPaths.has(sourcePath),
+        `${label}: noShadow is an error for ${sourcePath}`,
+      );
+    }
+  } finally {
+    rmSync(scratch, { force: true, recursive: true });
+  }
+}
+
+test('Biome enforces noShadow without an override bypass', () => {
+  const biomeConfig = JSON.parse(
+    readFileSync(join(root, 'biome.json'), 'utf8'),
   );
-  for (const [script, projectName] of selections) {
-    assert.ok(
-      declared.has(projectName),
-      `script '${script}' selects '${projectName}', which no root vitest project config declares`,
+  assertNoShadowEnforced(biomeConfig);
+
+  const exactPath = trackedJavaScriptPaths[0];
+  const nestedDirectory = dirname(
+    trackedJavaScriptPaths.find((path) => path.includes('/')),
+  );
+  for (const configName of [
+    'biome.json',
+    'biome.jsonc',
+    '.biome.json',
+    '.biome.jsonc',
+  ]) {
+    assertNoShadowEnforced(biomeConfig, {
+      extraConfigs: new Map([
+        [
+          `${nestedDirectory}/${configName}`,
+          {
+            root: false,
+            linter: { rules: { suspicious: { noShadow: 'off' } } },
+          },
+        ],
+      ]),
+      label: `root lint ignores nested ${configName} downgrade`,
+    });
+  }
+  const bypasses = [
+    {
+      label: 'root linter disabled',
+      mutate: (candidate) => {
+        candidate.linter.enabled = false;
+      },
+      message: /root linter disabled: root linter\.enabled is true/u,
+    },
+    {
+      label: 'root noShadow warning',
+      mutate: (candidate) => {
+        candidate.linter.rules.suspicious.noShadow = 'warn';
+      },
+      message: /root noShadow warning: root suspicious\.noShadow is error/u,
+    },
+    ...['on', 'warn', 'info', 'off'].map((severity) => ({
+      label: `override suspicious ${severity}`,
+      mutate: (candidate) => {
+        candidate.overrides = [
+          ...(candidate.overrides ?? []),
+          {
+            includes: ['**'],
+            linter: { rules: { suspicious: severity } },
+          },
+        ];
+      },
+      message: new RegExp(
+        `override suspicious ${severity}: noShadow is an error for`,
+        'u',
+      ),
+    })),
+    {
+      label: 'override noShadow replaced',
+      mutate: (candidate) => {
+        candidate.overrides = [
+          ...(candidate.overrides ?? []),
+          {
+            includes: ['**'],
+            linter: { rules: { suspicious: { noShadow: 'off' } } },
+          },
+        ];
+      },
+      message: /override noShadow replaced: noShadow is an error for/u,
+    },
+    {
+      label: 'override linter disabled',
+      mutate: (candidate) => {
+        candidate.overrides = [
+          ...(candidate.overrides ?? []),
+          { includes: ['**'], linter: { enabled: false } },
+        ];
+      },
+      message: /override linter disabled: noShadow is an error for/u,
+    },
+    {
+      label: 'override JavaScript linter disabled',
+      mutate: (candidate) => {
+        candidate.overrides = [
+          ...(candidate.overrides ?? []),
+          { includes: ['**'], javascript: { linter: { enabled: false } } },
+        ];
+      },
+      message: /override JavaScript linter disabled: noShadow is an error for/u,
+    },
+    {
+      label: 'exact filename override',
+      mutate: (candidate) => {
+        candidate.overrides = [
+          ...(candidate.overrides ?? []),
+          {
+            includes: [exactPath],
+            linter: { rules: { suspicious: { noShadow: 'off' } } },
+          },
+        ];
+      },
+      message: new RegExp(
+        `exact filename override: noShadow is an error for ${exactPath.replaceAll('.', '\\.')}`,
+        'u',
+      ),
+    },
+    {
+      label: 'root files includes narrowed',
+      mutate: (candidate) => {
+        candidate.files.includes = ['packages/**'];
+      },
+      message: /root files includes narrowed: noShadow is an error for/u,
+    },
+    {
+      label: 'root linter includes narrowed',
+      mutate: (candidate) => {
+        candidate.linter.includes = ['packages/**'];
+      },
+      message: /root linter includes narrowed: noShadow is an error for/u,
+    },
+    {
+      label: 'root files maxSize',
+      mutate: (candidate) => {
+        candidate.files.maxSize = 1;
+      },
+      message: /root files maxSize: root files\.maxSize is absent/u,
+    },
+    {
+      label: 'override files maxSize',
+      mutate: (candidate) => {
+        candidate.overrides = [
+          ...(candidate.overrides ?? []),
+          { includes: ['**'], files: { maxSize: 1 } },
+        ];
+      },
+      message: /override files maxSize: override \d+ files\.maxSize is absent/u,
+    },
+  ];
+  assert.deepEqual(
+    bypasses.map(({ label }) => label).sort(),
+    [
+      'exact filename override',
+      'override JavaScript linter disabled',
+      'override files maxSize',
+      'override linter disabled',
+      'override noShadow replaced',
+      'override suspicious info',
+      'override suspicious off',
+      'override suspicious on',
+      'override suspicious warn',
+      'root files includes narrowed',
+      'root files maxSize',
+      'root linter disabled',
+      'root linter includes narrowed',
+      'root noShadow warning',
+    ],
+    'the noShadow bypass set is complete',
+  );
+  for (const { extraConfigs, label, message, mutate } of bypasses) {
+    const candidateConfig = structuredClone(biomeConfig);
+    mutate(candidateConfig);
+    let bypassError;
+    try {
+      assertNoShadowEnforced(candidateConfig, {
+        extraConfigs,
+        label,
+      });
+    } catch (error) {
+      bypassError = error;
+    }
+    assert.ok(bypassError, `${label}: bypass is rejected`);
+    assert.match(
+      bypassError.message,
+      message,
+      `${label}: bypass reports its probe failure`,
     );
   }
 });
 
-test('the scripts index lists exactly the files beside it', () => {
-  const indexPath = 'scripts/CLAUDE.md';
-  const lines = readFileSync(join(root, indexPath), 'utf8').split('\n');
-  const heading = lines.indexOf('## Contents');
-  assert.notEqual(heading, -1, `${indexPath} holds no '## Contents' section`);
-  const rest = lines.slice(heading + 1);
-  const next = rest.findIndex((line) => line.startsWith('## '));
-  const listed = rest
-    .slice(0, next === -1 ? rest.length : next)
-    .filter((line) => line.startsWith('- '))
-    .map((line) => {
-      const named = /^- \[?`([^`]+)`/u.exec(line);
-      assert.ok(named, `${indexPath} lists an entry without a name: ${line}`);
-      return named[1];
-    });
-  // The list names files. A directory under `scripts/` is outside its claim.
-  const present = readdirSync(join(root, 'scripts'), { withFileTypes: true })
-    .filter((entry) => entry.isFile() && entry.name !== 'CLAUDE.md')
-    .map((entry) => entry.name);
-  assert.deepEqual([...listed].sort(), [...present].sort());
+function explicitProjectName(projectPath, source = parse(projectPath)) {
+  const project = initializerOf(source, 'test');
+  assert.ok(
+    ts.isObjectLiteralExpression(project),
+    `${projectPath} sets 'test' to an object literal`,
+  );
+  const name = initializerOf(project, 'name', {
+    label: projectPath,
+    recursive: false,
+    required: false,
+  });
+  if (name === undefined) return undefined;
+  assert.ok(
+    ts.isStringLiteralLike(name),
+    `${projectPath} names its project with a string literal`,
+  );
+  return name.text;
+}
+
+function resolvedProjectName(projectPath) {
+  const explicit = explicitProjectName(projectPath);
+  if (explicit !== undefined) return explicit;
+  const projectDirectory = dirname(join(root, projectPath));
+  const manifestPath = join(projectDirectory, 'package.json');
+  if (existsSync(manifestPath)) {
+    const manifestName = JSON.parse(readFileSync(manifestPath, 'utf8')).name;
+    if (typeof manifestName === 'string' && manifestName.length > 0) {
+      return manifestName;
+    }
+  }
+  return basename(projectDirectory);
+}
+
+const projectSelector =
+  /(?:^|\s)--project(?:=|\s+)(?:"([^"]+)"|'([^']+)'|([^\s]+))/gu;
+
+function selectedProjects(scripts) {
+  const selections = [];
+  for (const [script, command] of Object.entries(scripts)) {
+    for (const match of command.matchAll(projectSelector)) {
+      const selector = match
+        .slice(1)
+        .find((candidate) => candidate !== undefined);
+      selections.push([script, selector.replace(/^!/u, '')]);
+    }
+  }
+  return selections;
+}
+
+function assertProjectSelections(scripts, declared) {
+  const selections = selectedProjects(scripts);
+  assert.ok(
+    selections.length > 0,
+    'no root script selects a vitest project by name',
+  );
+  for (const [script, selectedProject] of selections) {
+    const selected = selectedProject.endsWith('*')
+      ? [...declared].some((project) =>
+          project.startsWith(selectedProject.slice(0, -1)),
+        )
+      : declared.has(selectedProject);
+    assert.ok(
+      selected,
+      `script '${script}' selects '${selectedProject}', absent from the discovered Vitest projects`,
+    );
+  }
+  return selections;
+}
+
+test('root --project selections name discovered vitest projects', () => {
+  const { scripts } = JSON.parse(
+    readFileSync(join(root, 'package.json'), 'utf8'),
+  );
+  const declared = new Set(
+    [...packageProjectPaths, ...rootProjectPaths].map(resolvedProjectName),
+  );
+  const fixtures = {
+    double: 'vitest run --project="flowsafe-harness"',
+    equals: 'vitest run --project=fleet-control-direct-scenario',
+    negated: "vitest run --project '!fleet-control-direct-scenario'",
+    package: "vitest run --project '@proofoftech/breakwater'",
+  };
+  const synthetic = ts.createSourceFile(
+    join(root, 'vitest.synthetic.config.ts'),
+    "export default { test: { plugins: [{ name: 'not-a-project' }] } };",
+    ts.ScriptTarget.Latest,
+    true,
+  );
+  assert.equal(
+    explicitProjectName('vitest.synthetic.config.ts', synthetic),
+    undefined,
+  );
+
+  assert.deepEqual(assertProjectSelections(fixtures, declared), [
+    ['double', 'flowsafe-harness'],
+    ['equals', 'fleet-control-direct-scenario'],
+    ['negated', 'fleet-control-direct-scenario'],
+    ['package', '@proofoftech/breakwater'],
+  ]);
+  assertProjectSelections(scripts, declared);
+  for (const command of [
+    'vitest run --project=missing-project',
+    "vitest run --project '@proofoftech/missing'",
+  ]) {
+    assert.throws(
+      () => assertProjectSelections({ invalid: command }, declared),
+      /absent from the discovered Vitest projects/u,
+    );
+  }
 });
+
+for (const [directory, section] of [
+  ['scripts', '## Contents'],
+  ['packages/breakwater/src/agent', '# Guarded agent navigation'],
+  ['packages/breakwater/src/audit', '# Audit navigation'],
+]) {
+  test(`the ${directory} index lists exactly the files beside it`, () => {
+    const indexPath = `${directory}/CLAUDE.md`;
+    const lines = readFileSync(join(root, indexPath), 'utf8').split('\n');
+    const heading = lines.indexOf(section);
+    assert.notEqual(heading, -1, `${indexPath} holds no '${section}' section`);
+    const rest = lines.slice(heading + 1);
+    const next = rest.findIndex((line) => line.startsWith('## '));
+    const listed = rest
+      .slice(0, next === -1 ? rest.length : next)
+      .filter((line) => line.startsWith('- '))
+      .map((line) => {
+        const named = /^- \[?`([^`]+)`/u.exec(line);
+        assert.ok(named, `${indexPath} lists an entry without a name: ${line}`);
+        return named[1];
+      });
+    // The index covers files beside it, excluding subdirectories.
+    const present = readdirSync(join(root, directory), { withFileTypes: true })
+      .filter((entry) => entry.isFile() && entry.name !== 'CLAUDE.md')
+      .map((entry) => entry.name);
+    assert.deepEqual([...listed].sort(), [...present].sort());
+  });
+}
 
 for (const [ruleName, fixture] of Object.entries(controls)) {
   test(`${ruleName} rejects its positive control`, () => {

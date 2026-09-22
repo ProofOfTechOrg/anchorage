@@ -22,7 +22,10 @@ import {
   buildDirectConformanceArtifacts,
 } from '../scripts/direct-credentialed-artifacts.mjs';
 import { preflightDirectConformance } from '../scripts/direct-credentialed-conformance-preflight.mjs';
-import { DIRECT_REFERENCE_PATH } from '../scripts/direct-reference-contract.mjs';
+import {
+  DIRECT_REFERENCE_PATH,
+  directReferenceRequestSha256,
+} from '../scripts/direct-reference-contract.mjs';
 
 const NOW = Date.parse('2026-09-10T12:00:00Z');
 
@@ -241,10 +244,17 @@ describe.sequential('default direct conformance artifacts', {
     await server.listen();
     const worker = server.getWorker<{ FLEET_DB: D1Database }>();
     const url = `https://reference.example.test${DIRECT_REFERENCE_PATH}`;
-    const body = JSON.stringify({
-      contractVersion: 1,
+    const core = {
+      contractVersion: 2,
       configSha256: prepared.configSha256,
       action: { kind: 'control-read' },
+    };
+    const body = JSON.stringify({
+      ...core,
+      reservation: {
+        ordinal: 1,
+        requestSha256: directReferenceRequestSha256(core),
+      },
     });
     expect((await worker.fetch(url, { method: 'POST', body })).status).toBe(
       401,

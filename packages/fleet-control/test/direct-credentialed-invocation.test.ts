@@ -12,7 +12,11 @@ import {
   awaitReferenceIngress,
   createDirectInvocationClient,
   DIRECT_INVOCATION_FAILURE_DETAILS,
+  DIRECT_RECONCILIATION_INTERVAL_MS,
+  DIRECT_RECONCILIATION_MAX_INTERVAL_MS,
+  DIRECT_RECONCILIATION_MAX_REQUESTS,
   DirectInvocationError,
+  reconcileDirectInvocation,
 } from '../scripts/direct-credentialed-invocation.mjs';
 import {
   type DirectRunJournal,
@@ -21,6 +25,8 @@ import {
 import {
   DIRECT_REFERENCE_PATH,
   type DirectReferenceAction,
+  directReferenceRequestSha256,
+  serializeDirectReferenceCore,
 } from '../scripts/direct-reference-contract.mjs';
 import { handleDirectReferenceHttpRequest } from '../scripts/direct-reference-http.js';
 
@@ -39,6 +45,11 @@ const responseHeaders = {
   'X-Direct-Maintenance-Attempts': '2',
   'X-Direct-Application-Attempts': '3',
 };
+const invocationJournal = () => ({
+  receiveInvocation: vi.fn(async () => {}),
+  settleReceivedInvocation: vi.fn(async () => {}),
+  reconcileInvocation: vi.fn(async () => 'cancelled' as const),
+});
 
 async function fixture(limit = 3, timeoutMs = 1000) {
   const directory = await mkdtemp(join(tmpdir(), 'direct-invocation-'));
@@ -85,7 +96,7 @@ async function fixture(limit = 3, timeoutMs = 1000) {
     action = 'control-read',
     result: unknown = { token: CLAIM },
   ) => ({
-    contractVersion: 1,
+    contractVersion: 2,
     configSha256: prepared.configSha256,
     action,
     ok: true,
@@ -144,7 +155,9 @@ async function expectUnknown(
     ...f.options,
     fetch: fetchMock,
   });
-  const error = await client.invoke(action).catch((error: unknown) => error);
+  const error = await client
+    .invoke(action)
+    .catch((failure: unknown) => failure);
   expect(error).toBeInstanceOf(DirectInvocationError);
   expect(error).toMatchObject({ code: 'outcome-unknown' });
   expect(String(error)).not.toContain(SECRET);
@@ -194,7 +207,7 @@ const describeLinux =
 
 function ingressRefusal() {
   return Response.json(
-    { contractVersion: 1, ok: false, error: { code: 'unauthorized' } },
+    { contractVersion: 2, ok: false, error: { code: 'unauthorized' } },
     {
       status: 401,
       headers: { 'Cache-Control': 'no-store', 'WWW-Authenticate': 'Bearer' },
@@ -202,7 +215,266 @@ function ingressRefusal() {
   );
 }
 
+function reconciliationResponse(
+  configSha256: string,
+  state: 'received' | 'executed',
+) {
+  return Response.json(
+    {
+      contractVersion: 2,
+      configSha256,
+      action: 'reconcile-invocation',
+      ok: true,
+      result: { state },
+    },
+    { headers: { 'Cache-Control': 'no-store' } },
+  );
+}
+
 describeLinux('Node authenticated direct invocation', () => {
+  it.each([
+    'cancelled',
+    'executed',
+    'failed',
+  ] as const)('returns terminal invocation reconciliation %s without a local reservation', async (state) => {
+    const f = await fixture();
+    const fetchRequest = vi.fn<typeof fetch>(async (_input, init) => {
+      expect(JSON.parse(init?.body as string)).toMatchObject({
+        contractVersion: 2,
+        configSha256: f.prepared.configSha256,
+        action: {
+          kind: 'reconcile-invocation',
+          ordinal: 1,
+          requestSha256: 'a'.repeat(64),
+        },
+        reservation: null,
+      });
+      return Response.json(
+        {
+          contractVersion: 2,
+          configSha256: f.prepared.configSha256,
+          action: 'reconcile-invocation',
+          ok: true,
+          result: { state },
+        },
+        { headers: { 'Cache-Control': 'no-store' } },
+      );
+    });
+    await expect(
+      reconcileDirectInvocation({
+        endpoint: `https://${f.prepared.names.referenceWorker}.attested-account.workers.dev${DIRECT_REFERENCE_PATH}`,
+        secret: SECRET,
+        configSha256: f.prepared.configSha256,
+        ordinal: 1,
+        requestSha256: 'a'.repeat(64),
+        workerDeadlineMs: 1000,
+        fetch: fetchRequest,
+      }),
+    ).resolves.toBe(state);
+    expect(f.journal.snapshot().invocationCount).toBe(0);
+  });
+
+  it('bounds persistent received reconciliation and backs off to the interval ceiling', async () => {
+    const f = await fixture();
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
+    const waits: number[] = [];
+    const sleep = vi.fn(async (ms: number) => {
+      waits.push(ms);
+      await vi.advanceTimersByTimeAsync(ms);
+    });
+    const fetchRequest = vi.fn<typeof fetch>(async () =>
+      reconciliationResponse(f.prepared.configSha256, 'received'),
+    );
+    await expect(
+      reconcileDirectInvocation({
+        endpoint: `https://${f.prepared.names.referenceWorker}.attested-account.workers.dev${DIRECT_REFERENCE_PATH}`,
+        secret: SECRET,
+        configSha256: f.prepared.configSha256,
+        ordinal: 1,
+        requestSha256: 'a'.repeat(64),
+        // This deadline keeps the time bound beyond the capped schedule.
+        workerDeadlineMs: 2_147_483_647,
+        deadlineMs: 2_147_483_647,
+        intervalMs: 1,
+        fetch: fetchRequest,
+        sleep,
+      }),
+    ).resolves.toBe('unreachable');
+    const expectedWaits = Array.from(
+      { length: DIRECT_RECONCILIATION_MAX_REQUESTS - 1 },
+      (_, index) => Math.min(2 ** index, DIRECT_RECONCILIATION_MAX_INTERVAL_MS),
+    );
+    expect(fetchRequest).toHaveBeenCalledTimes(
+      DIRECT_RECONCILIATION_MAX_REQUESTS,
+    );
+    expect(waits).toEqual(expectedWaits);
+  });
+
+  it('polls production settings through the Worker deadline before the request cap', async () => {
+    const f = await fixture();
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
+    const requestTimes: number[] = [];
+    const fetchRequest = vi.fn<typeof fetch>(async () => {
+      requestTimes.push(performance.now());
+      return reconciliationResponse(f.prepared.configSha256, 'received');
+    });
+    const sleep = async (ms: number) => {
+      await vi.advanceTimersByTimeAsync(ms);
+    };
+
+    await expect(
+      reconcileDirectInvocation({
+        endpoint: `https://${f.prepared.names.referenceWorker}.attested-account.workers.dev${DIRECT_REFERENCE_PATH}`,
+        secret: SECRET,
+        configSha256: f.prepared.configSha256,
+        ordinal: 1,
+        requestSha256: 'a'.repeat(64),
+        workerDeadlineMs: 600_000,
+        fetch: fetchRequest,
+        sleep,
+      }),
+    ).resolves.toBe('unreachable');
+    expect(fetchRequest).toHaveBeenCalledTimes(26);
+    expect(requestTimes).toHaveLength(26);
+    expect(requestTimes.at(-1)).toBe(600_000);
+    expect(requestTimes.length).toBeLessThan(
+      DIRECT_RECONCILIATION_MAX_REQUESTS,
+    );
+  });
+
+  it('observes a terminal answer at the Worker deadline', async () => {
+    const f = await fixture();
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
+    const requestTimes: number[] = [];
+    const fetchRequest = vi.fn<typeof fetch>(async () => {
+      requestTimes.push(performance.now());
+      return reconciliationResponse(
+        f.prepared.configSha256,
+        performance.now() === 600_000 ? 'executed' : 'received',
+      );
+    });
+    const sleep = async (ms: number) => {
+      await vi.advanceTimersByTimeAsync(ms);
+    };
+
+    await expect(
+      reconcileDirectInvocation({
+        endpoint: `https://${f.prepared.names.referenceWorker}.attested-account.workers.dev${DIRECT_REFERENCE_PATH}`,
+        secret: SECRET,
+        configSha256: f.prepared.configSha256,
+        ordinal: 1,
+        requestSha256: 'a'.repeat(64),
+        workerDeadlineMs: 600_000,
+        fetch: fetchRequest,
+        sleep,
+      }),
+    ).resolves.toBe('executed');
+    expect(fetchRequest).toHaveBeenCalledTimes(26);
+    expect(requestTimes.at(-1)).toBe(600_000);
+  });
+
+  it('returns a terminal answer after received reconciliation with exponential waits', async () => {
+    const f = await fixture();
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
+    const waits: number[] = [];
+    const sleep = vi.fn(async (ms: number) => {
+      waits.push(ms);
+      await vi.advanceTimersByTimeAsync(ms);
+    });
+    let requestCount = 0;
+    const fetchRequest = vi.fn<typeof fetch>(async () => {
+      requestCount += 1;
+      return reconciliationResponse(
+        f.prepared.configSha256,
+        requestCount < 3 ? 'received' : 'executed',
+      );
+    });
+    await expect(
+      reconcileDirectInvocation({
+        endpoint: `https://${f.prepared.names.referenceWorker}.attested-account.workers.dev${DIRECT_REFERENCE_PATH}`,
+        secret: SECRET,
+        configSha256: f.prepared.configSha256,
+        ordinal: 1,
+        requestSha256: 'a'.repeat(64),
+        workerDeadlineMs: 1000,
+        fetch: fetchRequest,
+        sleep,
+      }),
+    ).resolves.toBe('executed');
+    expect(fetchRequest).toHaveBeenCalledTimes(3);
+    expect(waits).toEqual([
+      DIRECT_RECONCILIATION_INTERVAL_MS,
+      DIRECT_RECONCILIATION_INTERVAL_MS * 2,
+    ]);
+  });
+
+  it('ends received reconciliation at a shorter time bound', async () => {
+    const f = await fixture();
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
+    const waits: number[] = [];
+    const sleep = vi.fn(async (ms: number) => {
+      waits.push(ms);
+      await vi.advanceTimersByTimeAsync(ms);
+    });
+    const fetchRequest = vi.fn<typeof fetch>(async () =>
+      reconciliationResponse(f.prepared.configSha256, 'received'),
+    );
+    await expect(
+      reconcileDirectInvocation({
+        endpoint: `https://${f.prepared.names.referenceWorker}.attested-account.workers.dev${DIRECT_REFERENCE_PATH}`,
+        secret: SECRET,
+        configSha256: f.prepared.configSha256,
+        ordinal: 1,
+        requestSha256: 'a'.repeat(64),
+        workerDeadlineMs: 1,
+        deadlineMs: 100,
+        intervalMs: 1,
+        fetch: fetchRequest,
+        sleep,
+      }),
+    ).resolves.toBe('unreachable');
+    expect(fetchRequest).toHaveBeenCalledTimes(2);
+    expect(waits).toEqual([1]);
+  });
+
+  it('rejects a reconciliation interval above its ceiling', async () => {
+    const f = await fixture();
+    const fetchRequest = vi.fn<typeof fetch>();
+
+    await expect(
+      reconcileDirectInvocation({
+        endpoint: `https://${f.prepared.names.referenceWorker}.attested-account.workers.dev${DIRECT_REFERENCE_PATH}`,
+        secret: SECRET,
+        configSha256: f.prepared.configSha256,
+        ordinal: 1,
+        requestSha256: 'a'.repeat(64),
+        workerDeadlineMs: 600_000,
+        intervalMs: DIRECT_RECONCILIATION_MAX_INTERVAL_MS + 1,
+        fetch: fetchRequest,
+      }),
+    ).rejects.toMatchObject({ code: 'invalid-input' });
+    expect(fetchRequest).not.toHaveBeenCalled();
+  });
+
+  it('maps reconciliation transport failure to unreachable', async () => {
+    const f = await fixture();
+    await expect(
+      reconcileDirectInvocation({
+        endpoint: `https://${f.prepared.names.referenceWorker}.attested-account.workers.dev${DIRECT_REFERENCE_PATH}`,
+        secret: SECRET,
+        configSha256: f.prepared.configSha256,
+        ordinal: 1,
+        requestSha256: 'a'.repeat(64),
+        workerDeadlineMs: 1,
+        deadlineMs: 100,
+        intervalMs: 1,
+        fetch: async () => {
+          throw new Error(SECRET);
+        },
+      }),
+    ).resolves.toBe('unreachable');
+  });
+
   it.each([
     'an unmarked platform 500 page',
     'a thrown fetch',
@@ -479,9 +751,16 @@ describeLinux('Node authenticated direct invocation', () => {
     expect(reserveInvocation).toHaveBeenCalledTimes(1);
     expect(fetchRequest).toHaveBeenCalledTimes(2);
     expect(fetchRequest.mock.calls[1]).toEqual(fetchRequest.mock.calls[0]);
-    expect(fetchRequest.mock.calls[1]?.[1]?.body).toBe(
-      reserveInvocation.mock.calls[0]?.[0],
+    const reservedCore = reserveInvocation.mock.calls[0]?.[0];
+    const transmitted = JSON.parse(
+      fetchRequest.mock.calls[1]?.[1]?.body as string,
     );
+    const { reservation, ...transmittedCore } = transmitted;
+    expect(serializeDirectReferenceCore(transmittedCore)).toBe(reservedCore);
+    expect(reservation).toMatchObject({
+      ordinal: 1,
+      requestSha256: hash(reservedCore as string),
+    });
     expect(f.journal.snapshot()).toMatchObject({
       invocationCount: 1,
       lastInvocation: { state: 'settled' },
@@ -580,7 +859,7 @@ describeLinux('Node authenticated direct invocation', () => {
       async () =>
         new Response(
           JSON.stringify({
-            contractVersion: 1,
+            contractVersion: 2,
             ok: false,
             error: { code: status === 404 ? 'not-found' : 'operation-refused' },
           }),
@@ -625,11 +904,19 @@ describeLinux('Node authenticated direct invocation', () => {
         accept: 'application/json',
         'cache-control': 'no-store',
       },
-      body: JSON.stringify({
-        contractVersion: 1,
-        configSha256: f.prepared.configSha256,
-        action: { kind: 'control-read' },
-      }),
+    });
+    const body = JSON.parse((received as { body: string }).body);
+    const core = {
+      contractVersion: 2,
+      configSha256: f.prepared.configSha256,
+      action: { kind: 'control-read' },
+    };
+    expect(body).toEqual({
+      ...core,
+      reservation: {
+        ordinal: 1,
+        requestSha256: directReferenceRequestSha256(core),
+      },
     });
     expect(request).toHaveBeenCalledTimes(1);
     expect(fetchRequest).not.toHaveBeenCalled();
@@ -642,8 +929,8 @@ describeLinux('Node authenticated direct invocation', () => {
     const received = new Promise<http.ServerResponse>((resolve) => {
       receive = resolve;
     });
-    const request = await localReference((_incoming, outgoing) => {
-      receive(outgoing);
+    const request = await localReference((_incoming, outgoingResponse) => {
+      receive(outgoingResponse);
     });
     vi.useFakeTimers();
     const client = createDirectInvocationClient(f.options);
@@ -677,8 +964,8 @@ describeLinux('Node authenticated direct invocation', () => {
     const received = new Promise<http.ServerResponse>((resolve) => {
       receive = resolve;
     });
-    const request = await localReference((_incoming, outgoing) => {
-      receive(outgoing);
+    const request = await localReference((_incoming, outgoingResponse) => {
+      receive(outgoingResponse);
     });
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
     const invocation = createDirectInvocationClient(f.options).invoke({
@@ -708,7 +995,7 @@ describeLinux('Node authenticated direct invocation', () => {
     const received = new Promise<http.ServerResponse>((resolve) => {
       receive = resolve;
     });
-    const request = await localReference((incoming, outgoing) => {
+    const request = await localReference((incoming, outgoingResponse) => {
       let body = '';
       incoming.setEncoding('utf8');
       incoming.on('data', (chunk) => {
@@ -717,16 +1004,16 @@ describeLinux('Node authenticated direct invocation', () => {
       incoming.on('end', () => {
         bodies.push(body);
         if (bodies.length === 1) {
-          if (action.kind === 'control-read') outgoing.destroy();
+          if (action.kind === 'control-read') outgoingResponse.destroy();
           else {
-            outgoing.writeHead(404, { 'content-type': 'text/html' });
-            outgoing.end('<html>not ready</html>');
+            outgoingResponse.writeHead(404, { 'content-type': 'text/html' });
+            outgoingResponse.end('<html>not ready</html>');
           }
           return;
         }
-        outgoing.writeHead(200, responseHeaders);
-        outgoing.write('{');
-        receive(outgoing);
+        outgoingResponse.writeHead(200, responseHeaders);
+        outgoingResponse.write('{');
+        receive(outgoingResponse);
       });
     });
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
@@ -747,10 +1034,16 @@ describeLinux('Node authenticated direct invocation', () => {
     await accepted;
     expect(request).toHaveBeenCalledTimes(2);
     expect(reserveInvocation).toHaveBeenCalledTimes(1);
-    expect(bodies).toEqual([
+    expect(bodies).toHaveLength(2);
+    expect(bodies[1]).toBe(bodies[0]);
+    const transmitted = JSON.parse(bodies[0] as string);
+    const { reservation, ...core } = transmitted;
+    expect(serializeDirectReferenceCore(core)).toBe(
       reserveInvocation.mock.calls[0]?.[0],
-      reserveInvocation.mock.calls[0]?.[0],
-    ]);
+    );
+    expect(reservation.requestSha256).toBe(
+      hash(reserveInvocation.mock.calls[0]?.[0] as string),
+    );
     expect(f.journal.snapshot().lastInvocation?.state).toBe('settled');
   });
 
@@ -864,6 +1157,7 @@ describeLinux('Node authenticated direct invocation', () => {
         configSha256: f.prepared.configSha256,
         invokeSecret: SECRET,
         invocationTimeoutMs: 1000,
+        invocationJournal: async () => invocationJournal(),
         dispatch,
       });
     });
@@ -955,7 +1249,7 @@ describeLinux('Node authenticated direct invocation', () => {
       kind === 'error-code' || kind === 'extra-field'
         ? new Response(
             JSON.stringify({
-              contractVersion: 1,
+              contractVersion: 2,
               ok: false,
               error: { code: kind === 'error-code' ? SECRET : 'unauthorized' },
               ...(kind === 'extra-field' ? { extra: true } : {}),
@@ -1021,6 +1315,7 @@ describeLinux('Node authenticated direct invocation', () => {
             configSha256: f.prepared.configSha256,
             invokeSecret,
             invocationTimeoutMs: 1000,
+            invocationJournal: async () => invocationJournal(),
             dispatch: async () => ({ accepted: true }),
           },
         );
@@ -1074,19 +1369,28 @@ describeLinux('Node authenticated direct invocation', () => {
       expect(request.headers.get('cache-control')).toBe('no-store');
       expect(request.headers.get('accept')).toBe('application/json');
       expect(typeof init?.body).toBe('string');
+      const transmitted = JSON.parse(init?.body as string);
       const pending = JSON.parse(await disk(f.journal));
       expect(pending).toMatchObject({
         invocationCount: 1,
         lastInvocation: {
           state: 'pending',
           action: { kind: 'migration-continue' },
-          requestSha256: hash(init?.body as string),
+          requestSha256: transmitted.reservation.requestSha256,
         },
       });
+      expect(transmitted.reservation.requestSha256).toBe(
+        directReferenceRequestSha256({
+          contractVersion: transmitted.contractVersion,
+          configSha256: transmitted.configSha256,
+          action: transmitted.action,
+        }),
+      );
       const response = await handleDirectReferenceHttpRequest(request, {
         configSha256: f.prepared.configSha256,
         invokeSecret: SECRET,
         invocationTimeoutMs: 1000,
+        invocationJournal: async () => invocationJournal(),
         dispatch: async (action) => {
           expect(action).toEqual({
             kind: 'migration-continue',
@@ -1158,7 +1462,7 @@ describeLinux('Node authenticated direct invocation', () => {
     const fetchRequest = vi.fn<typeof fetch>(async () =>
       f.response(
         {
-          contractVersion: 1,
+          contractVersion: 2,
           ok: false,
           error: { code: 'injected-response-loss' },
         },
@@ -1369,7 +1673,7 @@ describeLinux('Node authenticated direct invocation', () => {
     let response: Response;
     if (kind.includes('503')) {
       const value: Record<string, unknown> = {
-        contractVersion: 1,
+        contractVersion: 2,
         ok: false,
         error: {
           code:
@@ -1386,7 +1690,7 @@ describeLinux('Node authenticated direct invocation', () => {
     } else if (kind === 'generic-500' || kind === 'unknown-409')
       response = f.response(
         {
-          contractVersion: 1,
+          contractVersion: 2,
           ok: false,
           error: {
             code: kind === 'generic-500' ? 'operation-refused' : SECRET,
@@ -1422,7 +1726,7 @@ describeLinux('Node authenticated direct invocation', () => {
     else {
       if (kind === 'wrong-run') body.configSha256 = 'f'.repeat(64);
       if (kind === 'wrong-action') body.action = 'force-recovery';
-      if (kind === 'wrong-version') body.contractVersion = 2;
+      if (kind === 'wrong-version') body.contractVersion = 1;
       if (kind === 'extra-field') Object.assign(body, { secret: SECRET });
       if (kind === 'missing-result') Reflect.deleteProperty(body, 'result');
       response = f.response(body);
@@ -1500,7 +1804,7 @@ describeLinux('Node authenticated direct invocation', () => {
   ] as const)('settles the exact execution refusal %s/%s before permitting another budgeted call', async (code, status) => {
     const f = await fixture(2);
     const fetchRequest = vi.fn<typeof fetch>(async () =>
-      f.response({ contractVersion: 1, ok: false, error: { code } }, status),
+      f.response({ contractVersion: 2, ok: false, error: { code } }, status),
     );
     const client = createDirectInvocationClient({
       ...f.options,

@@ -1,17 +1,158 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { createHash } from 'node:crypto';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import {
+  createDirectInvocationClient,
+  DirectInvocationError,
+} from '../scripts/direct-credentialed-invocation.mjs';
+import {
+  type DirectRunJournal,
+  openDirectRunState,
+} from '../scripts/direct-credentialed-run-state.mjs';
 import { directDeploymentSpec } from '../scripts/direct-credentialed-spec.js';
 import type { DirectDecommissionExportMetadata } from '../scripts/direct-reference-lifecycle.js';
 import type { CleanupAdvanceResult } from '../src/cleanup-advance.js';
 import type { DecommissionAdvanceResult } from '../src/decommission-advance.js';
 import { deploymentSpecDigest } from '../src/spec-digest.js';
+import { closeFixtures } from './fixtures/cleanup.js';
 import { directFixtureManifest } from './fixtures/direct-credentialed-config.js';
+import { directObservationFixture } from './fixtures/direct-observations.js';
 import {
   createDirectReferenceHarness,
   type DirectReferenceHarness,
 } from './fixtures/direct-reference-harness.js';
+
+async function settleWithin<T>(
+  operation: Promise<T>,
+  label: string,
+  timeoutMs = 10_000,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(
+          () =>
+            reject(new Error(`${label} did not settle within ${timeoutMs}ms`)),
+          timeoutMs,
+        );
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+async function finishNativeRefusalCleanup(options: {
+  bodyFailure?: unknown;
+  closers: readonly (() => Promise<void>)[];
+  settled: readonly PromiseSettledResult<unknown>[];
+  postCheck: () => void;
+}): Promise<void> {
+  await closeFixtures(
+    [
+      ...(options.bodyFailure === undefined
+        ? []
+        : [async () => Promise.reject(options.bodyFailure)]),
+      ...options.closers,
+    ],
+    [
+      ...options.settled.map((result) => async () => {
+        expect(result.status).toBe('fulfilled');
+      }),
+      async () => options.postCheck(),
+    ],
+    'native refusal cleanup failed',
+  );
+}
+
+it('settles closers before running post-checks', async () => {
+  const state: string[] = [];
+  await closeFixtures(
+    [
+      async () => {
+        await Promise.resolve();
+        state.push('closed');
+      },
+    ],
+    [() => expect(state).toEqual(['closed'])],
+    'ordered cleanup failed',
+  );
+});
+
+it('decommission-a-reprovision completes a replacement stranded in migrating', async () => {
+  const fixture = await createDirectReferenceHarness();
+  try {
+    await fixture.success({
+      kind: 'provision',
+      role: 'a',
+      release: 'initial',
+      cycle: 'reprovision',
+    });
+    fixture.world.failNext('uploadCandidate', { dispatched: false });
+    expect(
+      (await fixture.call({ kind: 'migration-reprovision-a' })).response.status,
+    ).toBe(500);
+    const names = fixture.manifest.names.roles.a;
+    expect(
+      await fixture.fleetStore.get(
+        names.tenantTag,
+        fixture.manifest.environment,
+      ),
+    ).toMatchObject({ phase: 'migrating' });
+    let advance = await fixture.success<DecommissionAdvanceResult>({
+      kind: 'decommission-start',
+      role: 'a',
+      cycle: 'reprovision',
+    });
+    for (let calls = 0; advance.status !== 'complete' && calls < 150; calls++) {
+      expect(advance.status).toBe('pending');
+      advance = await fixture.success<DecommissionAdvanceResult>({
+        kind: 'decommission-continue',
+        role: 'a',
+        cycle: 'reprovision',
+        token: advance.token,
+      });
+    }
+    expect(advance.status).toBe('complete');
+    expect(
+      await fixture.journal().readOperation('decommission-a-reprovision'),
+    ).toMatchObject({ kind: 'decommission' });
+    expect(
+      await fixture.fleetStore.get(
+        names.tenantTag,
+        fixture.manifest.environment,
+      ),
+    ).toMatchObject({ phase: 'decommissioned' });
+  } finally {
+    await fixture.close();
+  }
+}, 180_000);
+
+it('runs later closers after a synchronous throw', async () => {
+  const calls: string[] = [];
+  const sentinel = new Error('first-close-sentinel');
+  const failure = closeFixtures(
+    [
+      () => {
+        calls.push('first-close');
+        throw sentinel;
+      },
+      () => {
+        calls.push('second-close');
+      },
+    ],
+    [],
+    'synchronous cleanup failed',
+  ).catch((error: unknown) => error);
+
+  expect(calls).toEqual(['first-close', 'second-close']);
+  await expect(failure).resolves.toMatchObject({ errors: [sentinel] });
+});
 
 describe.sequential('direct lifecycle through native control state', {
   timeout: 180_000,
@@ -300,7 +441,7 @@ describe.sequential('direct lifecycle through native control state', {
             ]) {
               await fixture.exportBytes.put(key, bytes, { customMetadata });
               expect((await fixture.call(metadataAction)).value).toEqual({
-                contractVersion: 1,
+                contractVersion: 2,
                 ok: false,
                 error: { code: 'operation-refused' },
               });
@@ -340,8 +481,8 @@ describe.sequential('direct lifecycle through native control state', {
             customMetadata: originalMetadata,
           }),
         ]);
-        const errors = [...failures, ...restored].flatMap((result) =>
-          result.status === 'rejected' ? [result.reason] : [],
+        const errors = [...failures, ...restored].flatMap((settledResult) =>
+          settledResult.status === 'rejected' ? [settledResult.reason] : [],
         );
         if (errors.length)
           throw new AggregateError(
@@ -553,6 +694,303 @@ describe.sequential('private force through native control state', {
     return { ready, receipt };
   }
 
+  it.each([
+    'metadata',
+    'SDK timeout',
+  ] as const)('settles a native %s refusal through the real client', async (kind) => {
+    const local = await directObservationFixture(1000, 'absent', {
+      invocationTimeoutMs: 600_000,
+    });
+    let fixture: DirectReferenceHarness | undefined;
+    let restore: (() => void) | undefined;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const held: Promise<Response>[] = [];
+    const responses: Response[] = [];
+    let intercepted = 0;
+    let bodyFailure: unknown;
+    try {
+      fixture = await createDirectReferenceHarness({
+        manifest: local.prepared.manifest,
+        binding: {
+          version: 1,
+          accountId: 'account',
+          fleetDatabaseId: '00000000-0000-0000-0000-000000000011',
+          quotaDatabaseId: '00000000-0000-0000-0000-000000000012',
+          exportBucketName: local.prepared.names.exportBucket,
+          referenceModuleSetSha256: local.prepared.referenceModuleSetSha256,
+          accountWorkersDevSubdomain: 'direct-fixture',
+        },
+      });
+      const { ready } = await readyRecovery(fixture);
+      await fixture.success({ kind: 'force-recovery' });
+      await fixture.success({ kind: 'force-observe' });
+      const resource = ready.applicationResources?.[0];
+      if (!resource)
+        throw new Error('native refusal needs an application bucket');
+      const original = fixture.projection.fetch;
+      const spy = vi
+        .spyOn(fixture.projection, 'fetch')
+        .mockImplementation(async (input, init) => {
+          const request = new Request(input, init);
+          const response = await original(input, init);
+          const url = new URL(request.url);
+          if (
+            request.method !== 'GET' ||
+            url.origin !== 'https://api.cloudflare.com' ||
+            url.pathname !==
+              `/client/v4/accounts/account/r2/buckets/${resource.bucketName}` ||
+            request.headers.get('cf-r2-jurisdiction') !== resource.jurisdiction
+          )
+            return response;
+          intercepted++;
+          if (kind === 'metadata') {
+            const body = (await response.json()) as {
+              result: Record<string, unknown>;
+            };
+            body.result.creation_date = 'invalid';
+            const headers = new Headers(response.headers);
+            headers.delete('content-length');
+            return Response.json(body, { status: response.status, headers });
+          }
+          const pending = gate.then(() => response);
+          held.push(pending);
+          void pending.catch(() => {});
+          return pending;
+        });
+      restore = () => spy.mockRestore();
+      const nativeFetch = fixture.fetch;
+      const client = createDirectInvocationClient({
+        prepared: local.prepared,
+        journal: local.journal,
+        accountWorkersDevSubdomain: 'direct-fixture',
+        invokeSecret: 'inert-invoke',
+        fetch: (async (input, init) => {
+          const response = await nativeFetch(input, init);
+          responses.push(response.clone());
+          return response;
+        }) as typeof fetch,
+      });
+      const error = await client
+        .invoke({ kind: 'recover-force-residual' })
+        .catch((value: unknown) => value);
+      expect(intercepted).toBeGreaterThan(0);
+      expect(error).toMatchObject({
+        code: 'reference-refused',
+        referenceCode: 'operation-refused',
+      });
+      expect(responses).toHaveLength(1);
+      expect(responses[0]?.status).toBe(409);
+      expect(await responses[0]?.json()).toEqual({
+        contractVersion: 2,
+        ok: false,
+        error: { code: 'operation-refused' },
+      });
+      expect(
+        JSON.parse(
+          await readFile(join(local.journal.directory, 'journal.json'), 'utf8'),
+        ).lastInvocation.state,
+      ).toBe('settled');
+      expect(fixture.bridgeErrors).toEqual([]);
+    } catch (error) {
+      bodyFailure = error;
+    }
+    restore?.();
+    release();
+    const settled = await Promise.allSettled(held);
+    await finishNativeRefusalCleanup({
+      bodyFailure,
+      closers: [
+        () => local.close(),
+        () => fixture?.close() ?? Promise.resolve(),
+      ],
+      settled,
+      postCheck: () => expect(fixture?.bridgeErrors ?? []).toEqual([]),
+    });
+  });
+
+  it.each([
+    'fence',
+    'empty',
+    'bucket',
+  ] as const)('keeps the %s post-settle budget assertion ahead of a raw rejection', async (stage) => {
+    const fixture = await createDirectReferenceHarness({
+      manifest: directFixtureManifest({
+        maxProviderRequests: 400,
+        invocationTimeoutMs: 600_000,
+      }),
+    });
+    try {
+      const { ready } = await readyRecovery(fixture);
+      await fixture.success({ kind: 'force-recovery' });
+      await fixture.success({ kind: 'force-observe' });
+      const resources = ready.applicationResources ?? [];
+      expect(resources.length).toBeGreaterThan(0);
+      for (const resource of resources) {
+        expect(
+          fixture.buckets.has(
+            `${resource.jurisdiction}:${resource.bucketName}`,
+          ),
+        ).toBe(true);
+      }
+      const before = await fixture.journal().readForceBefore();
+      const after = await fixture.journal().readForceAfter();
+      expect(before).toBeDefined();
+      expect(after).toBeDefined();
+      const deletes = fixture.projection.requests.filter(
+        (request) => request.method === 'DELETE',
+      );
+      const result = await fixture.forceBudgetProbe(stage);
+      expect(result).toMatchObject({
+        stage,
+        selected: true,
+        typed: true,
+        code: 'budget-exhausted',
+        rawSentinel: false,
+        overflowRefused: true,
+        snapshot: { failure: 'attempts' },
+      });
+      expect(result.nativeFillers).toBe(result.expectedFillers);
+      expect(result.expectedFillers).toBeGreaterThan(0);
+      expect(
+        result.snapshot.providerAttempts +
+          result.snapshot.maintenanceAttempts +
+          result.snapshot.applicationAttempts,
+      ).toBe(fixture.manifest.referenceRuntime.maxProviderRequests);
+      expect(fixture.world.scripts.get(ready.scriptName)?.present).toBe(
+        stage !== 'bucket',
+      );
+      if (stage !== 'bucket') {
+        expect(
+          fixture.projection.requests.filter(
+            (request) => request.method === 'DELETE',
+          ),
+        ).toEqual(deletes);
+      }
+      for (const resource of resources) {
+        expect(
+          fixture.buckets.has(
+            `${resource.jurisdiction}:${resource.bucketName}`,
+          ),
+        ).toBe(true);
+      }
+      expect(await fixture.journal().readForceBefore()).toEqual(before);
+      expect(await fixture.journal().readForceAfter()).toEqual(after);
+      expect(fixture.bridgeErrors).toEqual([]);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it('settles the empty-stage budget refusal when one retained bucket is absent from current state', async () => {
+    const fixture = await createDirectReferenceHarness({
+      manifest: directFixtureManifest({
+        maxProviderRequests: 400,
+        invocationTimeoutMs: 600_000,
+      }),
+      recoveryApplicationR2Bucket: 'SECONDARY_PROBE_BUCKET',
+    });
+    let removed:
+      | readonly [
+          string,
+          { name: string; jurisdiction: string; creation_date: string },
+        ]
+      | undefined;
+    let restoreCurrentWorker: (() => void) | undefined;
+    try {
+      const { ready } = await readyRecovery(fixture);
+      await fixture.success({ kind: 'force-recovery' });
+      await fixture.success({ kind: 'force-observe' });
+      const script = fixture.world.scripts.get(ready.scriptName);
+      if (!script) throw new Error('retained recovery Worker is missing');
+      const scriptState = {
+        present: script.present,
+        versions: script.versions,
+        deployment: script.deployment,
+      };
+      const namespaces = fixture.world.durableObjectNamespaces.filter(
+        (namespace) => namespace.script === ready.scriptName,
+      );
+      script.present = false;
+      script.versions = [];
+      script.deployment = undefined;
+      for (
+        let index = fixture.world.durableObjectNamespaces.length - 1;
+        index >= 0;
+        index--
+      ) {
+        if (
+          fixture.world.durableObjectNamespaces[index]?.script ===
+          ready.scriptName
+        )
+          fixture.world.durableObjectNamespaces.splice(index, 1);
+      }
+      restoreCurrentWorker = () => {
+        script.present = scriptState.present;
+        script.versions = scriptState.versions;
+        script.deployment = scriptState.deployment;
+        fixture.world.durableObjectNamespaces.push(...namespaces);
+      };
+      const resources = ready.applicationResources ?? [];
+      expect(resources).toHaveLength(2);
+      const missing = resources[1];
+      if (!missing) throw new Error('secondary recovery bucket is missing');
+      const key = `${missing.jurisdiction}:${missing.bucketName}`;
+      const descriptor = fixture.buckets.get(key);
+      if (!descriptor)
+        throw new Error('secondary recovery bucket was not created');
+      removed = [key, descriptor];
+      fixture.buckets.delete(key);
+      expect(
+        resources.filter((resource) =>
+          fixture.buckets.has(
+            `${resource.jurisdiction}:${resource.bucketName}`,
+          ),
+        ),
+      ).toHaveLength(1);
+      const before = await fixture.journal().readForceBefore();
+      const after = await fixture.journal().readForceAfter();
+      const deletes = fixture.projection.requests.filter(
+        (request) => request.method === 'DELETE',
+      );
+
+      const result = await settleWithin(
+        fixture.forceBudgetProbe('empty'),
+        'empty-stage budget probe',
+      );
+      expect(result).toMatchObject({
+        stage: 'empty',
+        selected: true,
+        typed: true,
+        code: 'budget-exhausted',
+        rawSentinel: false,
+        overflowRefused: true,
+        snapshot: { failure: 'attempts' },
+      });
+      expect(result.nativeFillers).toBe(result.expectedFillers);
+      expect(result.expectedFillers).toBeGreaterThan(0);
+      expect(
+        result.snapshot.providerAttempts +
+          result.snapshot.maintenanceAttempts +
+          result.snapshot.applicationAttempts,
+      ).toBe(fixture.manifest.referenceRuntime.maxProviderRequests);
+      expect(await fixture.journal().readForceBefore()).toEqual(before);
+      expect(await fixture.journal().readForceAfter()).toEqual(after);
+      expect(
+        fixture.projection.requests.filter(
+          (request) => request.method === 'DELETE',
+        ),
+      ).toEqual(deletes);
+      expect(fixture.bridgeErrors).toEqual([]);
+    } finally {
+      if (removed) fixture.buckets.set(removed[0], removed[1]);
+      restoreCurrentWorker?.();
+      await fixture.close();
+    }
+  });
+
   it('force terminal guards the leased identity and clears a terminal row without provider requests', async () => {
     const fixture = await createDirectReferenceHarness();
     try {
@@ -642,18 +1080,25 @@ describe.sequential('private force through native control state', {
   });
 
   it('preserves force witnesses and resumes settled residual cleanup after exhausting the provider budget', async () => {
-    const base = directFixtureManifest();
-    // The residual recovery runs out of this budget mid-invocation.
-    const fixture = await createDirectReferenceHarness({
-      manifest: {
-        ...base,
-        referenceRuntime: {
-          ...base.referenceRuntime,
-          maxProviderRequests: 100,
-        },
-      },
+    const local = await directObservationFixture(30_000, 'absent', {
+      invocationTimeoutMs: 600_000,
+      maxProviderRequests: 100,
     });
+    let fixture: DirectReferenceHarness | undefined;
+    let resumedJournal: DirectRunJournal | undefined;
     try {
+      fixture = await createDirectReferenceHarness({
+        manifest: local.prepared.manifest,
+        binding: {
+          version: 1,
+          accountId: 'account',
+          fleetDatabaseId: '00000000-0000-0000-0000-000000000011',
+          quotaDatabaseId: '00000000-0000-0000-0000-000000000012',
+          exportBucketName: local.prepared.names.exportBucket,
+          referenceModuleSetSha256: local.prepared.referenceModuleSetSha256,
+          accountWorkersDevSubdomain: 'direct-fixture',
+        },
+      });
       const names = fixture.manifest.names.roles.recovery;
       const environment = fixture.manifest.environment;
       const absent = await fixture.call({ kind: 'force-recovery' });
@@ -824,7 +1269,35 @@ describe.sequential('private force through native control state', {
         .prepare('SELECT * FROM direct_reference_operations ORDER BY slot')
         .all();
       const exports = await fixture.exportBytes.list();
-      const exhausted = await fixture.call({ kind: 'recover-force-residual' });
+      const responses: Response[] = [];
+      const nativeFetch = fixture.fetch;
+      const clientOptions = {
+        prepared: local.prepared,
+        accountWorkersDevSubdomain: fixture.binding.accountWorkersDevSubdomain,
+        invokeSecret: 'inert-invoke',
+        fetch: (async (input, init) => {
+          const response = await nativeFetch(input, init);
+          responses.push(response.clone());
+          return response;
+        }) as typeof fetch,
+      };
+      const client = createDirectInvocationClient({
+        ...clientOptions,
+        journal: local.journal,
+      });
+      const refused = await client
+        .invoke({ kind: 'recover-force-residual' })
+        .catch((error: unknown) => error);
+      expect(refused).toBeInstanceOf(DirectInvocationError);
+      expect(refused).toMatchObject({
+        code: 'reference-refused',
+        referenceCode: 'budget-exhausted',
+        attempts: { provider: 100, maintenance: 0, application: 0 },
+      });
+      expect(responses).toHaveLength(1);
+      const response = responses[0];
+      if (!response) throw new Error('reference response is absent');
+      const exhausted = { response, value: await response.json() };
       expect(exhausted.response.status).toBe(503);
       expect(exhausted.value).toMatchObject({
         ok: false,
@@ -833,6 +1306,20 @@ describe.sequential('private force through native control state', {
       expect(exhausted.response.headers.get('X-Direct-Provider-Attempts')).toBe(
         '100',
       );
+      expect(
+        exhausted.response.headers.get('X-Direct-Maintenance-Attempts'),
+      ).toBe('0');
+      expect(
+        exhausted.response.headers.get('X-Direct-Application-Attempts'),
+      ).toBe('0');
+      const journalPath = join(local.journal.directory, 'journal.json');
+      expect(JSON.parse(await readFile(journalPath, 'utf8'))).toMatchObject({
+        invocationCount: 1,
+        lastInvocation: {
+          action: { kind: 'recover-force-residual' },
+          state: 'settled',
+        },
+      });
       expect(retainedScript.present).toBe(false);
       expect(retainedScript.versions).toEqual([]);
       for (const resource of ready.applicationResources ?? [])
@@ -855,11 +1342,31 @@ describe.sequential('private force through native control state', {
             .all()
         ).results,
       ).toEqual(operations.results);
+      await local.journal.close();
       await fixture.reload();
-      const recovered = await fixture.success<{
+      resumedJournal = await openDirectRunState({
+        configPath: local.configPath,
+        prepared: local.prepared,
+        accountId: 'account',
+        mode: 'resume',
+      });
+      const resumedClient = createDirectInvocationClient({
+        ...clientOptions,
+        journal: resumedJournal,
+      });
+      const recovered = (
+        await resumedClient.invoke({ kind: 'recover-force-residual' })
+      ).result as {
         returned: true;
         observation: Record<string, unknown>;
-      }>({ kind: 'recover-force-residual' });
+      };
+      expect(JSON.parse(await readFile(journalPath, 'utf8'))).toMatchObject({
+        invocationCount: 2,
+        lastInvocation: {
+          action: { kind: 'recover-force-residual' },
+          state: 'settled',
+        },
+      });
       expect(
         fixture.projection.requests.filter(
           (request) => request.method === 'DELETE',
@@ -944,7 +1451,15 @@ describe.sequential('private force through native control state', {
       );
       expect(fixture.world.exports.size).toBe(exportCount);
     } finally {
-      await fixture.close();
+      try {
+        await resumedJournal?.close();
+      } finally {
+        try {
+          await fixture?.close();
+        } finally {
+          await local.close();
+        }
+      }
     }
   });
 
@@ -1088,10 +1603,12 @@ describe.sequential('private force through native control state', {
         },
         {
           ...original,
-          buckets: original.buckets.map((bucket: Record<string, unknown>) => ({
-            ...bucket,
-            observedCreationDate: null,
-          })),
+          buckets: original.buckets.map(
+            (bucketRecord: Record<string, unknown>) => ({
+              ...bucketRecord,
+              observedCreationDate: null,
+            }),
+          ),
         },
         {
           ...original,

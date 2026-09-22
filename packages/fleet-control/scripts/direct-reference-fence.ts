@@ -34,6 +34,13 @@ const PROBE_EPOCHS = Object.freeze({
 /** Membership in `PROBE_EPOCHS`, and the narrowing its index needs. */
 const isProbeOperation = (value: string): value is keyof typeof PROBE_EPOCHS =>
   Object.hasOwn(PROBE_EPOCHS, value);
+const isVersionedOperation = (
+  value: string,
+): value is 'drain' | 'reopen' | 'lock' | 'unlock' =>
+  value === 'drain' ||
+  value === 'reopen' ||
+  value === 'lock' ||
+  value === 'unlock';
 
 type FenceTransitionResult =
   | { ok: true; after: DirectFenceReading }
@@ -157,8 +164,7 @@ export async function dispatchDirectFence(
       method: body === undefined ? 'GET' : 'POST',
       token,
       body,
-      acceptStatuses:
-        operation === 'drain' || operation === 'reopen' ? [200, 409] : [200],
+      acceptStatuses: isVersionedOperation(operation) ? [200, 409] : [200],
       mediaType: 'application/json',
       byteLimit: operation === 'inventory' ? 65536 : 4096,
       invocationSignal,
@@ -169,20 +175,22 @@ export async function dispatchDirectFence(
 
   if (operation === 'read')
     return reading((await request('/admin/execution-fence')).value);
-  if (operation === 'drain' || operation === 'reopen') {
+  if (isVersionedOperation(operation)) {
+    if (!('expectedMutationEpoch' in action))
+      throw new DirectReferenceExecutionError();
     const { expectedMutationEpoch, expectedRevision } = action;
     const result = await request(
       '/admin/execution-fence',
-      operation === 'drain'
+      operation === 'drain' || operation === 'lock'
         ? {
             expected: 'open',
-            next: 'draining',
+            next: operation === 'drain' ? 'draining' : 'migration-locked',
             expectedMutationEpoch,
             expectedRevision,
             advanceMutationEpoch: true,
           }
         : {
-            expected: 'draining',
+            expected: operation === 'reopen' ? 'draining' : 'migration-locked',
             next: 'open',
             expectedMutationEpoch,
             expectedRevision,

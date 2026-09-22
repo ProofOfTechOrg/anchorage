@@ -199,7 +199,7 @@ export class DurableObjectBackgroundTasksStorageD1 extends BackgroundTasksStorag
 
   override async listTasks(filter: TaskFilter): Promise<TaskListResult> {
     if (filter.resourceId === undefined) return super.listTasks(filter);
-    // @mastra/cloudflare-d1 1.1.1 declares TaskFilter.resourceId but omits the
+    // @mastra/cloudflare-d1 1.3.2 accepts TaskFilter.resourceId but omits the
     // predicate in its SQL builder. Apply that documented filter before
     // pagination so both `total` and page boundaries remain truthful.
     const { page, perPage, resourceId, ...unpaged } = filter;

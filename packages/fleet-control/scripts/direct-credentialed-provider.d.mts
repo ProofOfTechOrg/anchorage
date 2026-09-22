@@ -14,6 +14,8 @@ export class DirectProviderError extends Error {
   constructor(code?: DirectProviderErrorCode);
 }
 
+export const DIRECT_PROVIDER_MAX_REQUESTS: 512;
+
 export interface DirectProviderTransport {
   assertBudget(): void;
   failure(): DirectProviderErrorCode | undefined;
@@ -66,6 +68,16 @@ export function inventory<Row>(
   identity: (row: Row) => readonly string[],
   bound: number,
 ): Promise<Row[]>;
+
+export function resolveDirectZone(
+  input: Readonly<{
+    sdk: Cloudflare;
+    numbered: Cloudflare;
+    accountId: string;
+    ownedHostname: string;
+    bound: number;
+  }>,
+): Promise<Readonly<{ id: string; name: string; type: string }>>;
 
 export function classifyDispatchNamespaces(
   single: Cloudflare,
