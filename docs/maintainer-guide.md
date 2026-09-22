@@ -63,6 +63,22 @@ unpinned `pnpm dlx` command or treat an incomplete report as a passing scan.
 
 `spike:verify:llm` is a credentialed manual proof, not a merge requirement.
 
+### Direct scenario project
+
+`pnpm test:direct-scenario` runs the vitest project `fleet-control-direct-scenario` from `packages/fleet-control/vitest.direct-scenario.config.ts`: the direct credentialed scenario and the offline fence suite, driving the reference and tenant Workers through full runs on local workerd with native D1, R2 and Durable Object bindings. It needs the breakwater, flowsafe and fleet-control dists (`pnpm build` first), reaches no network, and takes about ninety minutes on a workstation because three of its titles lose the child process mid-run on purpose and reconstruct from the journal — each of those runs for fifteen to twenty minutes with long quiet gaps, so a silent log is not a hung run. `pnpm test:without-direct-scenario` runs everything else.
+
+To run one title, select it through the project's own config so its timeout and includes apply:
+
+```bash
+pnpm --filter @proofoftech/fleet-control exec vitest run \
+  --config vitest.direct-scenario.config.ts \
+  test/direct-credentialed-scenario.test.ts -t '<title>'
+```
+
+Put `--reporter=verbose` directly after `run` when you want the per-title lines; the project prints nothing between titles otherwise. Send the output to a file rather than through a pager or `tail`: a killed run then keeps what it printed.
+
+`pnpm test:packed-fleet-control` builds the package, packs it, installs the tarball into a temporary consumer under `$TMPDIR` and drives the packed dist through workerd, so it needs a writable pnpm store and about two minutes; a sandbox that mounts the store read-only cannot run it, and the failure reads as an `EROFS` on the store, not as a test failure.
+
 ## Tooling conventions
 
 - Root `pnpm lint` runs one Biome pass.
