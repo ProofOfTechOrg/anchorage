@@ -330,9 +330,6 @@ export async function teardownDirectReference(input) {
         bound,
         disposable,
       });
-      // Both listings are scoped to the zone the bootstrap recorded, so the
-      // `globalCount` each contributes below covers that zone and not the
-      // account — the scope `bucketJurisdictions` records for the bucket count.
       const dispatch = Object.freeze({
         kind: listings.dispatch.kind,
         count: listings.dispatch.count,
@@ -374,6 +371,9 @@ export async function teardownDirectReference(input) {
             listings.buckets.exhaustive,
             listings.buckets.rows.length,
           ),
+          // Both listings are scoped to the zone the bootstrap recorded, so the
+          // `globalCount` each contributes below covers that zone and not the
+          // account. `bucketJurisdictions` records the bucket count's scope.
           domains: listed(listings.domains, 'service'),
           routes: listed(listings.routes, 'script'),
           queues: listed(listings.queues, 'queue_name'),

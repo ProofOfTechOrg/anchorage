@@ -15,8 +15,15 @@ import { listDirectCredentialedResiduals } from './direct-credentialed-residual-
 
 export const DIRECT_PURGE_OUTPUT_PREFIX = 'DIRECT_PURGE ';
 export const DIRECT_PURGE_USAGE =
-  'Usage: node packages/fleet-control/scripts/direct-credentialed-purge.mjs [--list|--delete <resourcePrefix>|--help]';
+  'Usage: node packages/fleet-control/scripts/direct-credentialed-purge.mjs [--list|--delete <resourcePrefix>|--help]. Exit codes: 0 success, 1 residual, 2 invalid input, 3 provider failure, 4 internal error.';
 export const DIRECT_PURGE_MAX_REQUESTS = DIRECT_PROVIDER_MAX_REQUESTS;
+export const DIRECT_PURGE_EXIT_CODES = Object.freeze({
+  success: 0,
+  residual: 1,
+  invalidInput: 2,
+  providerFailed: 3,
+  internalError: 4,
+});
 
 const DELETE_OPTIONS = Object.freeze({ maxRetries: 0 });
 const SETTLE_DELAY_MS = 3_000;
@@ -69,6 +76,7 @@ function providerId(value, surface) {
 function matches(rows, field, prefix, surface) {
   return rows.filter((row) => {
     const value = row?.[field];
+    // A row without a usable classifying field is not evidence of absence.
     if (typeof value !== 'string')
       throw new PurgeFailure('provider-failed', surface, 'classify');
     return value.startsWith(prefix);
@@ -88,6 +96,8 @@ function summarize(listing, prefix) {
     buckets: matches(listing.buckets.rows, 'name', prefix, 'buckets'),
     domains: matches(listing.domains.rows, 'service', prefix, 'domains'),
     routes: matches(listing.routes.rows, 'script', prefix, 'routes'),
+    // Queues and dispatch namespaces are reported but never deleted because the
+    // lane creates neither and its token carries no permission to remove them.
     queues: matches(listing.queues.rows, 'queue_name', prefix, 'queues'),
     dispatch:
       listing.dispatch.kind === 'fail-closed'
@@ -107,6 +117,16 @@ function summarize(listing, prefix) {
     routes: 'script',
     queues: 'queue_name',
   };
+  const exhaustive = {
+    databases: listing.databases.exhaustive,
+    durableObjectNamespaces: listing.namespaces.exhaustive,
+    scripts: listing.scripts.exhaustive,
+    buckets: listing.buckets.exhaustive,
+    domains: listing.domains.exhaustive,
+    routes: listing.routes.exhaustive,
+    queues: listing.queues.exhaustive,
+    dispatch: listing.dispatch.kind !== 'fail-closed',
+  };
   const surfaces = Object.fromEntries(
     Object.entries(selections).map(([surface, rows]) => {
       const names =
@@ -118,11 +138,15 @@ function summarize(listing, prefix) {
           names: names
             .filter(recordableName)
             .slice(0, DIRECT_TEARDOWN_MAXIMA.prefixNames),
+          exhaustive: exhaustive[surface],
         },
       ];
     }),
   );
-  return { selections, surfaces };
+  const uncorroborated = Object.entries(surfaces)
+    .filter(([, summary]) => !summary.exhaustive)
+    .map(([surface]) => surface);
+  return { selections, surfaces, uncorroborated };
 }
 
 function residualOf(listing, surfaces) {
@@ -261,6 +285,7 @@ export async function runDirectCredentialedPurge(input) {
         after: before,
         requestCount,
         maxRequestCount: DIRECT_PURGE_MAX_REQUESTS,
+        uncorroborated: initial.uncorroborated,
         residual,
       });
     }
@@ -358,7 +383,8 @@ export async function runDirectCredentialedPurge(input) {
     surface = 'inventory';
     step = 'after';
     const finalListing = await list();
-    const after = summarize(finalListing, prefix).surfaces;
+    const final = summarize(finalListing, prefix);
+    const after = final.surfaces;
     const residual = residualOf(finalListing, after);
     return result(residual === 'none' ? 0 : 1, {
       mode: 'delete',
@@ -368,6 +394,7 @@ export async function runDirectCredentialedPurge(input) {
       after,
       requestCount,
       maxRequestCount: DIRECT_PURGE_MAX_REQUESTS,
+      uncorroborated: final.uncorroborated,
       residual,
     });
   } catch (error) {

@@ -103,6 +103,50 @@ function readVerifyCoreJob() {
   return job;
 }
 
+const projectSelector =
+  /(?:^|\s)--project(?:=|\s+)(?:"([^"]+)"|'([^']+)'|([^\s]+))/gu;
+
+function projectSelectors(command) {
+  return [...command.matchAll(projectSelector)].map((match) =>
+    match.slice(1).find((candidate) => candidate !== undefined),
+  );
+}
+
+function invokedRootScript(run) {
+  const match = /^pnpm(?:\s+run)?\s+([^\s]+)\s*$/u.exec(run);
+  return match?.[1];
+}
+
+function assertDirectScenarioJobs(manifest, workflow) {
+  const selected = projectSelectors(
+    manifest.scripts['test:direct-scenario'] ?? '',
+  );
+  assert.ok(selected.length > 0, 'test:direct-scenario selects no project');
+  const needs = new Set(workflow.jobs.verify?.needs ?? []);
+  for (const project of selected) {
+    const jobs = Object.entries(workflow.jobs)
+      .filter(([, job]) =>
+        (job.steps ?? []).some((step) => {
+          if (typeof step.run !== 'string') return false;
+          const script = invokedRootScript(step.run);
+          if (!script) return false;
+          const jobProjects = projectSelectors(manifest.scripts[script] ?? '');
+          return jobProjects.length === 1 && jobProjects[0] === project;
+        }),
+      )
+      .map(([name]) => name);
+    assert.ok(
+      jobs.length > 0,
+      `project '${project}' has no CI job whose root script selects it alone`,
+    );
+    for (const job of jobs)
+      assert.ok(
+        needs.has(job),
+        `project '${project}' runs in '${job}', which verify.needs omits`,
+      );
+  }
+}
+
 function bashFenceAfter(path, marker) {
   const lines = readFileSync(join(repositoryRoot, path), 'utf8').split('\n');
   const markerIndex = lines.findIndex((line) => line.includes(marker));
@@ -3175,6 +3219,23 @@ test('the ci.yml gate job stays reachable and depends on its required jobs', () 
   assert.ok(
     !job.needs.includes('mastra-compat'),
     'the compat canary reports an upstream release, so naming it here would block merges on an upstream red',
+  );
+});
+
+test('each direct-scenario project has its own gating CI job', () => {
+  const manifest = JSON.parse(
+    readFileSync(join(repositoryRoot, 'package.json'), 'utf8'),
+  );
+  const workflow = readWorkflow();
+  assertDirectScenarioJobs(manifest, workflow);
+
+  const missingNeed = structuredClone(workflow);
+  missingNeed.jobs.verify.needs = missingNeed.jobs.verify.needs.filter(
+    (job) => job !== 'direct-scenario-seams',
+  );
+  assert.throws(
+    () => assertDirectScenarioJobs(manifest, missingNeed),
+    /verify\.needs omits/u,
   );
 });
 

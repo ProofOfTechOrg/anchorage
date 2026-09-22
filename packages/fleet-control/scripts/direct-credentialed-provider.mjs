@@ -7,6 +7,7 @@ const API_BASE = 'https://api.cloudflare.com/client/v4';
 export const DIRECT_PROVIDER_MAX_REQUESTS = 512;
 const MAX_DURATION_MS = 300_000;
 const MAX_JSON_BYTES = 8 * 1024 * 1024;
+// The SDK's repeated type query parameters return no rows from the live API.
 const ZONE_TYPES = Object.freeze(['full', 'partial', 'secondary', 'internal']);
 const ERROR_CODES = new Set([
   'invalid-input',

@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import { writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  DIRECT_PURGE_MAX_REQUESTS,
   DIRECT_PURGE_OUTPUT_PREFIX,
   parseDirectPurgeArgs,
   runDirectCredentialedPurge,
@@ -58,6 +61,20 @@ async function purge(
   });
 }
 
+function expectSummaryTarget(
+  summary: Readonly<Record<string, unknown>>,
+  prefix: string,
+) {
+  expect(summary).toMatchObject({
+    accountId: ACCOUNT,
+    prefix,
+    maxRequestCount: DIRECT_PURGE_MAX_REQUESTS,
+  });
+  expect(summary.requestCount).toEqual(expect.any(Number));
+  expect(summary.requestCount).toBeGreaterThan(0);
+  expect(summary.requestCount).toBeLessThanOrEqual(DIRECT_PURGE_MAX_REQUESTS);
+}
+
 describe('direct credentialed purge', () => {
   it('lists without issuing a mutation', async () => {
     const world = await providerWorld({ tenants: true });
@@ -74,6 +91,7 @@ describe('direct credentialed purge', () => {
       exitCode: 0,
       summary: { mode: 'list', residual: 'present' },
     });
+    expectSummaryTarget(result.summary, world.prefix);
     expect(
       world.requests.some((request) => request.startsWith('DELETE ')),
     ).toBe(false);
@@ -97,6 +115,7 @@ describe('direct credentialed purge', () => {
       exitCode: 0,
       summary: { mode: 'delete', residual: 'none' },
     });
+    expectSummaryTarget(result.summary, world.prefix);
     expect(
       world.requests.filter((request) => request.startsWith('DELETE ')),
     ).toEqual([
@@ -216,11 +235,12 @@ describe('direct credentialed purge', () => {
       summary: {
         residual: 'present',
         after: {
-          queues: { count: 1 },
-          dispatch: { count: 1 },
+          queues: { count: 1, names: [`${world.prefix}-queue`] },
+          dispatch: { count: 1, names: [`${world.prefix}-dispatch`] },
         },
       },
     });
+    expectSummaryTarget(result.summary, world.prefix);
     expect(world.state.scriptPresent).toBe(false);
     expect(world.state.databases.size).toBe(0);
   });
@@ -311,6 +331,90 @@ describe('direct credentialed purge', () => {
     expect(help.stdout + usage.stdout + invalid.stdout).not.toContain(
       API_TOKEN,
     );
+  });
+
+  it('traps an injected rejection behind the fixed internal-error line', async () => {
+    const world = await providerWorld({ tenants: true });
+    const preload = join(world.f.directory, 'purge-rejection.mjs');
+    await writeFile(
+      preload,
+      `const write = process.stdout.write.bind(process.stdout);
+let injected = false;
+process.stdout.write = (...args) => {
+  const result = write(...args);
+  if (!injected) {
+    injected = true;
+    setTimeout(() => Promise.reject(new Error(process.env.CLOUDFLARE_API_TOKEN)), 0);
+  }
+  return result;
+};
+`,
+    );
+    const entry = new URL(directModuleUrl('direct-credentialed-purge'))
+      .pathname;
+    const result = await spawnDirectChild([entry, '--delete', 'wrong'], {
+      timeoutMs: 10_000,
+      env: {
+        NODE_OPTIONS: `--import=${preload}`,
+        FLEET_DIRECT_CONFORMANCE_CONFIG: world.f.configPath,
+        CLOUDFLARE_ACCOUNT_ID: ACCOUNT,
+        CLOUDFLARE_API_TOKEN: API_TOKEN,
+      },
+    });
+
+    expect(result).toMatchObject({ status: 4, stderr: '' });
+    expect(result.stdout).toContain(
+      `${DIRECT_PURGE_OUTPUT_PREFIX}{"code":"internal-error"}\n`,
+    );
+    expect(result.stdout).not.toContain(API_TOKEN);
+  });
+
+  it.each([
+    [
+      false,
+      ['scripts', 'domains', 'routes', 'queues'],
+      {
+        databases: true,
+        durableObjectNamespaces: true,
+        scripts: false,
+        buckets: true,
+        domains: false,
+        routes: false,
+        queues: false,
+        dispatch: true,
+      },
+    ],
+    [
+      true,
+      [],
+      {
+        databases: true,
+        durableObjectNamespaces: true,
+        scripts: true,
+        buckets: true,
+        domains: true,
+        routes: true,
+        queues: true,
+        dispatch: true,
+      },
+    ],
+  ] as const)('reports provider corroboration on every summary surface (corroborate=%s)', async (corroborate, uncorroborated, exhaustive) => {
+    const world = await providerWorld({ corroborate, tenants: true });
+    const result = await purge(world, []);
+    const before = result.summary.before as Record<
+      string,
+      { exhaustive: boolean }
+    >;
+
+    expect(result.summary.uncorroborated).toEqual(uncorroborated);
+    expect(
+      Object.fromEntries(
+        Object.entries(before).map(([surface, summary]) => [
+          surface,
+          summary.exhaustive,
+        ]),
+      ),
+    ).toEqual(exhaustive);
   });
 });
 

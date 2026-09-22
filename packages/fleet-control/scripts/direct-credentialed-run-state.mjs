@@ -1004,6 +1004,7 @@ const fenceTransitionShape = {
   after: nullable(fenceReadingShape),
   ordinal: nullable(scenarioNumber),
 };
+const fenceTransitionShapeFor = (role) => ({ ...fenceTransitionShape, role });
 const fenceSweepShape = {
   fence: fenceReadingShape,
   categories: sweepCategoriesShape,
@@ -1015,6 +1016,7 @@ const fenceSweepsShape = {
   second: nullable(fenceSweepShape),
   intervalMs: nullable(scenarioNumber),
 };
+const fenceSweepsShapeFor = (role) => ({ ...fenceSweepsShape, role });
 const fenceProbesShape = {
   current: 'accepted',
   missing: 'missing',
@@ -1023,6 +1025,7 @@ const fenceProbesShape = {
   mutationEpoch: scenarioNumber,
   ordinal: scenarioNumber,
 };
+const fenceProbesShapeFor = (role) => ({ ...fenceProbesShape, role });
 const continuationProofShape = {
   started: nullable({
     sourceInvocationOrdinal: scenarioNumber,
@@ -1072,10 +1075,10 @@ const continuationProofShape = {
   }),
 };
 const fenceGroupShape = Object.freeze({
-  drain: fenceTransitionShape,
-  sweeps: fenceSweepsShape,
-  reopen: fenceTransitionShape,
-  probes: fenceProbesShape,
+  drain: fenceTransitionShapeFor,
+  sweeps: fenceSweepsShapeFor,
+  reopen: fenceTransitionShapeFor,
+  probes: fenceProbesShapeFor,
 });
 // One schema, built once: `decodeScenario` reads it on every call rather
 // than rebuilding the nested literal, so the module carries one shape idiom.
@@ -1119,6 +1122,9 @@ const scenarioSchema = {
     reprovisionFinal: { a: nullable(roleAWorkerVersionShape) },
     reprovisionSettlement: { a: nullable(roleASettlementShape) },
     continuation: continuationProofShape,
+    // A keyed group binds its role where evidence publishes it by key.
+    // `objects`, `objectDeletions`, and `decommission` are not projected there
+    // and remain unbound.
     objects: {
       a: nullable({ size: scenarioNumber, sha256: digest }),
       b: nullable({ size: scenarioNumber, sha256: digest }),
@@ -1138,9 +1144,9 @@ const scenarioSchema = {
     },
     audits: { before: nullable(auditShape), after: nullable(auditShape) },
     fence: Object.fromEntries(
-      Object.entries(fenceGroupShape).map(([group, shape]) => [
+      Object.entries(fenceGroupShape).map(([group, shapeFor]) => [
         group,
-        { a: nullable(shape), b: nullable(shape) },
+        { a: nullable(shapeFor('a')), b: nullable(shapeFor('b')) },
       ]),
     ),
     restart: nullable({
@@ -2295,9 +2301,9 @@ function runJournal(directory, directoryHandle, base, lock, initial) {
           // Which members may still arrive is the decode shape's own
           // statement: a member it admits as null is one a later record may
           // fill, and every other member is preserved as recorded.
-          for (const [group, shape] of Object.entries(fenceGroupShape)) {
-            const later = nullableKeys(shape);
+          for (const [group, shapeFor] of Object.entries(fenceGroupShape)) {
             for (const role of ['a', 'b']) {
+              const later = nullableKeys(shapeFor(role));
               const entry = previous.proofs.fence[group][role];
               if (entry === null) continue;
               const fresh = scenario.proofs.fence[group][role];

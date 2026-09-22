@@ -11,6 +11,7 @@ import { DirectBootstrapError } from '../scripts/direct-credentialed-bootstrap.m
 import * as directRuntime from '../scripts/direct-credentialed-conformance-runtime.mjs';
 import {
   DIRECT_ADMISSION_VARIABLES,
+  DIRECT_CONFORMANCE_CODES,
   DIRECT_CONFORMANCE_USAGE,
   DIRECT_CREDENTIAL_VARIABLES,
   DIRECT_FIXED_OUTPUT,
@@ -19,6 +20,7 @@ import {
   DIRECT_USAGE_DIAGNOSTIC,
   type DirectConformanceMode,
   type DirectConformanceModules,
+  type DirectConformanceSummary,
   directStdoutOf,
   directWritesStderr,
   parseDirectConformanceArgs,
@@ -69,6 +71,31 @@ const env = {
   FLEET_DIRECT_CONFORMANCE_INVOKE_SECRET: 'private-invoke-seed',
 };
 const now = () => Date.parse('2026-09-13T00:00:00.000Z');
+
+it('binds conformance summary declarations to runtime vocabularies', () => {
+  const codes: readonly NonNullable<DirectConformanceSummary['code']>[] = [
+    ...Object.values(DIRECT_CONFORMANCE_CODES),
+    new DirectRunStateError().code,
+    new DirectBootstrapError().code,
+  ];
+  const variables: readonly NonNullable<
+    DirectConformanceSummary['variable']
+  >[] = ['FLEET_DIRECT_CONFORMANCE_CONFIG', ...DIRECT_ADMISSION_VARIABLES];
+  expect(codes).toContain('invalid-input');
+  expect(variables).toEqual([
+    'FLEET_DIRECT_CONFORMANCE_CONFIG',
+    'CLOUDFLARE_ACCOUNT_ID',
+    'CLOUDFLARE_API_TOKEN',
+    'FLEET_DIRECT_CONFORMANCE_INVOKE_SECRET',
+  ]);
+  // @ts-expect-error The summary code is the union of its runtime producers.
+  const invalidCode: DirectConformanceSummary['code'] = 'not-a-code';
+  // @ts-expect-error The summary variable is one of the inspected variables.
+  const invalidVariable: DirectConformanceSummary['variable'] =
+    'NOT_A_VARIABLE';
+  void invalidCode;
+  void invalidVariable;
+});
 /** The bytes the entry writes to each descriptor for an in-process result. */
 function streamsOf(result: Awaited<ReturnType<typeof runDirectConformance>>) {
   return {
@@ -774,7 +801,7 @@ process.stderr.write = (...args) => {
       { ...env, FLEET_DIRECT_CONFORMANCE_CONFIG: f.configPath },
       {
         get(target, key) {
-          if (DIRECT_CREDENTIAL_VARIABLES.includes(key as string))
+          if (DIRECT_CREDENTIAL_VARIABLES.some((variable) => variable === key))
             reads.push(key as string);
           return Reflect.get(target, key);
         },

@@ -965,17 +965,44 @@ function resolvedProjectName(projectPath) {
 const projectSelector =
   /(?:^|\s)--project(?:=|\s+)(?:"([^"]+)"|'([^']+)'|([^\s]+))/gu;
 
+function projectSelectors(command) {
+  return [...command.matchAll(projectSelector)].map((match) =>
+    match.slice(1).find((candidate) => candidate !== undefined),
+  );
+}
+
 function selectedProjects(scripts) {
   const selections = [];
   for (const [script, command] of Object.entries(scripts)) {
-    for (const match of command.matchAll(projectSelector)) {
-      const selector = match
-        .slice(1)
-        .find((candidate) => candidate !== undefined);
+    for (const selector of projectSelectors(command)) {
       selections.push([script, selector.replace(/^!/u, '')]);
     }
   }
   return selections;
+}
+
+function assertNegatedWildcardCoverage(scripts, declared) {
+  const direct = new Set(
+    projectSelectors(scripts['test:direct-scenario'] ?? '').filter(
+      (selector) => !selector.startsWith('!') && !selector.includes('*'),
+    ),
+  );
+  for (const selector of projectSelectors(
+    scripts['test:without-direct-scenario'] ?? '',
+  )) {
+    if (!selector.startsWith('!') || !selector.endsWith('*')) continue;
+    const stem = selector.slice(1, -1);
+    const matches = [...declared].filter((project) => project.startsWith(stem));
+    assert.ok(
+      matches.length > 0,
+      `negated wildcard '${selector}' matches no discovered Vitest project`,
+    );
+    for (const project of matches)
+      assert.ok(
+        direct.has(project),
+        `project '${project}' matches '${selector}' but test:direct-scenario does not select it`,
+      );
+  }
 }
 
 function assertProjectSelections(scripts, declared) {
@@ -1010,6 +1037,7 @@ test('root --project selections name discovered vitest projects', () => {
     equals: 'vitest run --project=fleet-control-direct-scenario',
     negated: "vitest run --project '!fleet-control-direct-scenario'",
     package: "vitest run --project '@proofoftech/breakwater'",
+    wildcard: "vitest run --project='!fleet-control-direct-scenario*'",
   };
   const synthetic = ts.createSourceFile(
     join(root, 'vitest.synthetic.config.ts'),
@@ -1027,11 +1055,25 @@ test('root --project selections name discovered vitest projects', () => {
     ['equals', 'fleet-control-direct-scenario'],
     ['negated', 'fleet-control-direct-scenario'],
     ['package', '@proofoftech/breakwater'],
+    ['wildcard', 'fleet-control-direct-scenario*'],
   ]);
   assertProjectSelections(scripts, declared);
+  assertNegatedWildcardCoverage(scripts, declared);
+  const projectManifest = { declared: [...declared] };
+  const withUnselectedMatch = structuredClone(projectManifest);
+  withUnselectedMatch.declared.push('fleet-control-direct-scenario-unselected');
+  assert.throws(
+    () =>
+      assertNegatedWildcardCoverage(
+        scripts,
+        new Set(withUnselectedMatch.declared),
+      ),
+    /test:direct-scenario does not select it/u,
+  );
   for (const command of [
     'vitest run --project=missing-project',
     "vitest run --project '@proofoftech/missing'",
+    "vitest run --project='!missing-project*'",
   ]) {
     assert.throws(
       () => assertProjectSelections({ invalid: command }, declared),

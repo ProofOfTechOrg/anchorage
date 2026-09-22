@@ -148,6 +148,18 @@ it.each([
       ];
     },
   ],
+  [
+    'fence proof groups',
+    (state: ReturnType<typeof completeScenario>) => {
+      for (const group of ['drain', 'sweeps', 'reopen', 'probes'] as const) {
+        const pair = state.proofs.fence[group] as unknown as {
+          a: unknown;
+          b: unknown;
+        };
+        [pair.a, pair.b] = [pair.b, pair.a];
+      }
+    },
+  ],
 ] as const)('rejects swapped keyed %s in the stored journal', async (_name, swap) => {
   const { journal } = await scenarioJournal();
   const state = completeScenario();

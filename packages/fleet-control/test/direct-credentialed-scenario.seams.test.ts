@@ -423,6 +423,7 @@ describe.sequential('fixed Node scenario through native reference dispatch', {
           ).toBe(true);
         }
         expect(fence.probes[role]).toEqual({
+          role,
           current: 'accepted',
           missing: 'missing',
           stale: 'stale',

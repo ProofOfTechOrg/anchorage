@@ -59,6 +59,10 @@ export async function listDirectCredentialedResiduals({
     queues = await singlePage(single.queues.list(selectors));
   } catch (error) {
     if (!(error instanceof APIError) || error.status !== 404) throw error;
+    // A 404 is read as an account that carries no queue collection. No provider
+    // capture in this repository attests that reading, so the empty page it
+    // stands in for is recorded `exhaustive: false` and the counts below are
+    // this reading rather than a page the provider sent.
     queues = { rows: [], exhaustive: false };
   }
   let dispatch;

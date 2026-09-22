@@ -8,14 +8,13 @@ import { defineConfig } from 'vitest/config';
 // project of their own so CI can run them in the `direct-scenario` job beside
 // `verify-core`, while `pnpm test` at the root and the package `test` script
 // still run them with everything else. The package project (vitest.config.ts)
-// excludes the same two files. This configuration sits in the package rather
-// than at the root because its include paths resolve against this directory
-// and the package `test` script runs it by that path.
-// The project name below is the one the root scripts
-// `test:without-direct-scenario` and `test:direct-scenario` select. The root
-// control in `scripts/architecture-positive-controls.test.mjs` pins the same
-// literal, and `test:without-direct-scenario` runs that control through
-// `pnpm run architecture:check`, so a name that drifts fails there.
+// uses its own exclude list. This configuration sits in the package because
+// its include paths resolve against this directory and the package `test`
+// script runs it by that path.
+// The project name below is the literal selected by `test:direct-scenario` and
+// `test:direct-scenario:fast`; `test:without-direct-scenario` negates their
+// shared stem. The root architecture control binds those selectors to the
+// declared projects, so a name that drifts fails there.
 export default defineConfig({
   test: {
     name: 'fleet-control-direct-scenario',

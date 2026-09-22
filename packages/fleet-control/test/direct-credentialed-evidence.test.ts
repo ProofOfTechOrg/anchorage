@@ -9,11 +9,14 @@ import {
   DIRECT_EVIDENCE_IDENTITY_PATHS,
   DIRECT_EVIDENCE_KEYS,
   DIRECT_EVIDENCE_LITERALS,
+  type DirectEvidenceScenario,
+  type DirectEvidenceScenarioFailure,
   directSourceHashRelationship,
   inspectDirectEvidence,
   writeDirectEvidence,
 } from '../scripts/direct-credentialed-evidence.mjs';
 import { DIRECT_RESIDUAL_SURFACES } from '../scripts/direct-credentialed-reference-vocabulary.mjs';
+import { DIRECT_SCENARIO_FAILURES } from '../scripts/direct-credentialed-run-state.mjs';
 import { DIRECT_SCENARIO_PHASES } from '../scripts/direct-credentialed-scenario-budget.mjs';
 import {
   abandonedScenario,
@@ -60,6 +63,21 @@ const sentinels = {
   literals: DIRECT_EVIDENCE_LITERALS,
 };
 afterEach(cleanupDirectRunState);
+
+it('binds evidence scenario declarations to the runtime vocabularies', () => {
+  const phases: readonly DirectEvidenceScenario['phase'][] =
+    DIRECT_SCENARIO_PHASES;
+  const failures: readonly DirectEvidenceScenarioFailure['code'][] =
+    DIRECT_SCENARIO_FAILURES;
+  expect(phases).toEqual(DIRECT_SCENARIO_PHASES);
+  expect(failures).toEqual(DIRECT_SCENARIO_FAILURES);
+  // @ts-expect-error The evidence phase is the runtime scenario vocabulary.
+  const invalidPhase: DirectEvidenceScenario['phase'] = 'not-a-phase';
+  // @ts-expect-error The evidence failure is the runtime failure vocabulary.
+  const invalidFailure: DirectEvidenceScenarioFailure['code'] = 'not-a-failure';
+  void invalidPhase;
+  void invalidFailure;
+});
 const object = (value: unknown): Record<string, unknown> => {
   expect(value).toBeTypeOf('object');
   expect(value).not.toBeNull();

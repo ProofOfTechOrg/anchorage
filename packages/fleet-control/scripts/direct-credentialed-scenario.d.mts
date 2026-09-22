@@ -101,7 +101,8 @@ interface ScenarioFenceReading {
   readonly requireMutationEpoch: boolean;
   readonly transitionRevision: number;
 }
-interface ScenarioFenceTransition {
+interface ScenarioFenceTransition<FenceRole extends NormalRole> {
+  readonly role: FenceRole;
   readonly before: ScenarioFenceReading;
   readonly after: ScenarioFenceReading | null;
   readonly ordinal: number | null;
@@ -116,32 +117,34 @@ interface ScenarioFenceSweep {
   readonly observedAt: number;
   readonly ordinal: number;
 }
+interface ScenarioFenceSweeps<FenceRole extends NormalRole> {
+  readonly role: FenceRole;
+  readonly first: ScenarioFenceSweep;
+  readonly second: ScenarioFenceSweep | null;
+  readonly intervalMs: number | null;
+}
+interface ScenarioFenceProbes<FenceRole extends NormalRole> {
+  readonly role: FenceRole;
+  readonly current: 'accepted';
+  readonly missing: 'missing';
+  readonly stale: 'stale';
+  readonly future: 'future';
+  readonly mutationEpoch: number;
+  readonly ordinal: number;
+}
 export interface DirectScenarioFenceProofs {
-  readonly drain: Readonly<Record<NormalRole, ScenarioFenceTransition | null>>;
-  readonly sweeps: Readonly<
-    Record<
-      NormalRole,
-      Readonly<{
-        first: ScenarioFenceSweep;
-        second: ScenarioFenceSweep | null;
-        intervalMs: number | null;
-      }> | null
-    >
-  >;
-  readonly reopen: Readonly<Record<NormalRole, ScenarioFenceTransition | null>>;
-  readonly probes: Readonly<
-    Record<
-      NormalRole,
-      Readonly<{
-        current: 'accepted';
-        missing: 'missing';
-        stale: 'stale';
-        future: 'future';
-        mutationEpoch: number;
-        ordinal: number;
-      }> | null
-    >
-  >;
+  readonly drain: Readonly<{
+    [FenceRole in NormalRole]: ScenarioFenceTransition<FenceRole> | null;
+  }>;
+  readonly sweeps: Readonly<{
+    [FenceRole in NormalRole]: ScenarioFenceSweeps<FenceRole> | null;
+  }>;
+  readonly reopen: Readonly<{
+    [FenceRole in NormalRole]: ScenarioFenceTransition<FenceRole> | null;
+  }>;
+  readonly probes: Readonly<{
+    [FenceRole in NormalRole]: ScenarioFenceProbes<FenceRole> | null;
+  }>;
 }
 export interface DirectScenarioProofs {
   readonly initial: Readonly<
