@@ -5,39 +5,38 @@ import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DirectProviderError } from '../scripts/direct-credentialed-provider.mjs';
-import {
-  DIRECT_TEARDOWN_MAXIMA,
-  REFERENCE_SECRET_NAMES,
-} from '../scripts/direct-credentialed-reference-vocabulary.mjs';
+import { DIRECT_TEARDOWN_MAXIMA } from '../scripts/direct-credentialed-reference-vocabulary.mjs';
 import type { DirectRunJournal } from '../scripts/direct-credentialed-run-state.mjs';
 import type { DirectTeardownOutcome } from '../scripts/direct-credentialed-teardown.mjs';
 import { teardownDirectReference } from '../scripts/direct-credentialed-teardown.mjs';
 import { CLOUDFLARE_INVENTORY_BOUND } from '../src/cloudflare-client-config.js';
 import { providerJson as json } from './fixtures/direct-observations.js';
 import {
+  API_TOKEN,
+  absent,
+  deployments,
+  forbid,
+  type ListedSurface,
+  ROOT,
+  ROUTES,
+  type Row,
+  SECRET_NAMES,
+  unexpectedRequests,
+  providerWorld as world,
+} from './fixtures/direct-provider-world.js';
+import {
   abandonedScenario,
   bootstrapContext,
   cleanupDirectRunState,
   closed,
   completeScenario,
-  completeScenarioJournal,
-  exportKey,
   fixture,
   opened,
   present,
   recordCompleteSweep,
-  scenarioJournal,
   teardownWith,
 } from './fixtures/direct-run-state-builder.js';
 
-const API_TOKEN = 'teardown/provider-token+sentinel==';
-const ACCOUNT = 'account';
-const ROOT = `/client/v4/accounts/${ACCOUNT}`;
-const ROUTES = '/client/v4/zones/zone/workers/routes';
-// The listing answers in the provider's order, which teardown sorts before it
-// compares; the names themselves are the upload's own list.
-const SECRET_NAMES = [...REFERENCE_SECRET_NAMES].sort();
-const unexpectedRequests: string[] = [];
 const exportSha256 = (proof: {
   receipt: unknown;
   location: string;
@@ -55,30 +54,6 @@ const exportSha256 = (proof: {
     )
     .digest('hex');
 
-type Hook = (
-  request: Request,
-  url: URL,
-) => Promise<Response | undefined> | Response | undefined;
-type Row = Record<string, unknown>;
-// The world collections whose rows the residual scan classifies by one field.
-type ListedSurface = 'scripts' | 'routes' | 'domains' | 'queues' | 'namespaces';
-
-const absent = (status = 404) =>
-  Response.json(
-    { success: false, errors: [{ code: 10000, message: 'synthetic absence' }] },
-    { status },
-  );
-const forbid = () => absent(403);
-const deployments = (versionId: string) =>
-  json({
-    deployments: [
-      {
-        id: 'deployment',
-        strategy: 'percentage',
-        versions: [{ version_id: versionId, percentage: 100 }],
-      },
-    ],
-  });
 // The bucket read the identity check refuses: the run's own name carrying a
 // creation date that is not the one the bootstrap recorded.
 const changedBucket = (w: { names: { exportBucket: string } }) =>
@@ -86,8 +61,6 @@ const changedBucket = (w: { names: { exportBucket: string } }) =>
     name: w.names.exportBucket,
     creation_date: '2020-01-01T00:00:00.000Z',
   });
-const paged = (url: URL, rows: Row[]) =>
-  json(url.searchParams.has('page') ? [] : rows);
 const never = () =>
   vi.fn<typeof fetch>(() => {
     unexpectedRequests.push('provider call on a refused precondition');
@@ -104,232 +77,6 @@ async function diskState(journal: DirectRunJournal) {
   return JSON.parse(
     await readFile(join(journal.directory, 'journal.json'), 'utf8'),
   ) as { teardown?: Record<string, unknown> };
-}
-
-async function world(
-  options: {
-    limit?: number;
-    disposableAccount?: boolean;
-    complete?: boolean;
-    corroborate?: boolean;
-    tenants?: boolean;
-  } = {},
-) {
-  const limit = options.limit ?? 16;
-  const disposable = options.disposableAccount ?? true;
-  const { f, journal } =
-    options.complete === false
-      ? await scenarioJournal(limit, disposable)
-      : await completeScenarioJournal(limit, disposable);
-  const names = f.prepared.names;
-  const prefix = f.prepared.config.resourcePrefix;
-  const script = `${ROOT}/workers/scripts/${names.referenceWorker}`;
-  const bucketPath = `${ROOT}/r2/buckets/${names.exportBucket}`;
-  const keys = [
-    exportKey(prefix, 'a'),
-    exportKey(prefix, 'b'),
-    exportKey(prefix, 'reprovision'),
-  ];
-  const state = {
-    ingress: true,
-    scriptPresent: true,
-    bucketPresent: true,
-    secretNames: [...SECRET_NAMES],
-    versions: [{ id: 'version' }] as Row[],
-    databases: new Map<string, Row>([
-      ['fleet-uuid', { uuid: 'fleet-uuid', name: names.fleetDatabase }],
-      ['quota-uuid', { uuid: 'quota-uuid', name: names.quotaDatabase }],
-    ]),
-    objects: new Set(keys),
-    extraDatabases: [] as Row[],
-    extraBuckets: [] as Row[],
-    namespaces: [] as Row[],
-    scripts: [] as Row[],
-    domains: [] as Row[],
-    routes: [] as Row[],
-    queues: [] as Row[],
-    dispatch: [] as Row[],
-  };
-  if (options.tenants) {
-    for (const [role, tenant] of Object.entries(names.roles)) {
-      state.databases.set(`tenant-${role}-uuid`, {
-        uuid: `tenant-${role}-uuid`,
-        name: tenant.databaseName,
-      });
-      state.scripts.push({ id: tenant.scriptName });
-      state.namespaces.push(
-        { id: `${role}-maintenance`, script: tenant.scriptName },
-        { id: `${role}-runner`, script: tenant.scriptName },
-      );
-      state.domains.push({
-        id: `${role}-domain`,
-        hostname: tenant.routeHostname,
-        service: tenant.scriptName,
-      });
-      state.routes.push({
-        id: `${role}-route`,
-        pattern: `${tenant.routeHostname}/*`,
-        script: tenant.scriptName,
-      });
-      state.extraBuckets.push({ name: `${tenant.scriptName}-application` });
-    }
-  }
-  let hook: Hook | undefined;
-  const requests: string[] = [];
-  const residualDatabases = (): Row[] => [
-    ...state.databases.values(),
-    ...state.extraDatabases,
-  ];
-  const residualBuckets = (): Row[] => [
-    ...(state.bucketPresent ? [{ name: names.exportBucket }] : []),
-    ...state.extraBuckets,
-  ];
-  const residualScripts = (): Row[] => [
-    ...(state.scriptPresent ? [{ id: names.referenceWorker }] : []),
-    ...state.scripts,
-  ];
-  // The default world sends no `result_info` on any listing: the live shape for
-  // scripts and routes, and the uncorroborated case for the rest.
-  // `corroborate` opts into the attested shape.
-  const listing = (rows: Row[]) =>
-    options.corroborate === true
-      ? json(rows, { total_count: rows.length })
-      : json(rows);
-  const fetchRequest = vi.fn<typeof fetch>(async (input, init) => {
-    const request = new Request(input, init);
-    const url = new URL(request.url);
-    const path = decodeURIComponent(url.pathname);
-    requests.push(`${request.method} ${path}`);
-    if (url.origin !== 'https://api.cloudflare.com') {
-      unexpectedRequests.push('unexpected origin');
-      throw new Error('Unexpected synthetic origin');
-    }
-    expect(request.headers.get('authorization')).toBe(`Bearer ${API_TOKEN}`);
-    const intercepted = await hook?.(request, url);
-    if (intercepted) return intercepted;
-    if (request.method === 'GET') {
-      if (path === `${script}/subdomain`)
-        return json({ enabled: state.ingress, previews_enabled: false });
-      if (path === `${script}/secrets`)
-        return json(state.secretNames.map((name) => ({ name })));
-      if (path === `${script}/deployments`) return deployments('version');
-      if (path === `${script}/versions`)
-        return state.scriptPresent ? json({ items: state.versions }) : absent();
-      if (path === script)
-        return state.scriptPresent
-          ? new Response('synthetic worker bytes', {
-              headers: { 'Content-Type': 'application/javascript' },
-            })
-          : absent();
-      if (path === `${ROOT}/workers/scripts`) return listing(residualScripts());
-      if (path.startsWith(`${ROOT}/d1/database/`)) {
-        const row = state.databases.get(
-          path.slice(`${ROOT}/d1/database/`.length),
-        );
-        return row ? json(row) : absent();
-      }
-      if (path === `${ROOT}/d1/database`) {
-        const name = url.searchParams.get('name');
-        return paged(
-          url,
-          residualDatabases().filter(
-            (row) =>
-              name === null ||
-              (typeof row.name === 'string' && row.name.includes(name)),
-          ),
-        );
-      }
-      if (path === `${ROOT}/workers/durable_objects/namespaces`)
-        return paged(url, state.namespaces);
-      if (path === `${ROOT}/r2/buckets`) {
-        const after = url.searchParams.get('start_after');
-        return json({
-          buckets: residualBuckets().filter(
-            (row) =>
-              after === null ||
-              (typeof row.name === 'string' && row.name > after),
-          ),
-        });
-      }
-      if (path === `${bucketPath}/objects`) {
-        const scoped = url.searchParams.get('prefix');
-        return json(
-          [...state.objects]
-            .filter((key) => scoped === null || key.startsWith(scoped))
-            .map((key) => ({ key })),
-        );
-      }
-      if (path.startsWith(`${bucketPath}/objects/`))
-        return state.objects.has(path.slice(`${bucketPath}/objects/`.length))
-          ? new Response('synthetic export bytes')
-          : absent();
-      if (path === bucketPath)
-        return state.bucketPresent
-          ? json({
-              name: names.exportBucket,
-              creation_date: '2026-09-10T00:00:00.000Z',
-            })
-          : absent();
-      if (path === `${ROOT}/workers/domains`) return listing(state.domains);
-      if (path === ROUTES) return listing(state.routes);
-      if (path === `${ROOT}/queues`) return listing(state.queues);
-      if (path === `${ROOT}/workers/dispatch/namespaces`)
-        return json(state.dispatch);
-    }
-    if (request.method === 'POST' && path === `${script}/subdomain`) {
-      expect(await request.json()).toEqual({
-        enabled: false,
-        previews_enabled: false,
-      });
-      state.ingress = false;
-      return json({ enabled: false, previews_enabled: false });
-    }
-    if (request.method === 'DELETE') {
-      if (path === script) {
-        state.scriptPresent = false;
-        return json(null);
-      }
-      if (path.startsWith(`${ROOT}/d1/database/`)) {
-        state.databases.delete(path.slice(`${ROOT}/d1/database/`.length));
-        return json(null);
-      }
-      if (path.startsWith(`${bucketPath}/objects/`)) {
-        state.objects.delete(path.slice(`${bucketPath}/objects/`.length));
-        return json({});
-      }
-      if (path === bucketPath) {
-        state.bucketPresent = false;
-        return json({});
-      }
-    }
-    unexpectedRequests.push(`${request.method} ${path}`);
-    throw new Error(`Unexpected synthetic request: ${request.method} ${path}`);
-  });
-  return {
-    f,
-    names,
-    prefix,
-    script,
-    bucketPath,
-    keyA: present(keys[0]),
-    keyB: present(keys[1]),
-    keyC: present(keys[2]),
-    state,
-    requests,
-    journal,
-    setHook(value: Hook | undefined) {
-      hook = value;
-    },
-    run() {
-      return teardownDirectReference({
-        prepared: f.prepared,
-        journal,
-        apiToken: API_TOKEN,
-        fetch: fetchRequest,
-        delay: async () => {},
-      });
-    },
-  };
 }
 
 beforeEach(() => {

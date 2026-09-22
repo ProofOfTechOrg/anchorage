@@ -5,10 +5,6 @@ import { isDeepStrictEqual } from 'node:util';
 import { databaseExportReceiptKey } from '../src/export-file-name.ts';
 import { validateDirectConformanceConfig } from './direct-credentialed-conformance-config.mjs';
 import {
-  bucketPages,
-  classifyDispatchNamespaces,
-  identifier,
-  inventory,
   openDirectProviderSession,
   probeAbsent,
   providerErrorFrom,
@@ -22,6 +18,7 @@ import {
   DIRECT_TEARDOWN_RECOVERABLE_FAILURES,
   REFERENCE_SECRET_NAMES,
 } from './direct-credentialed-reference-vocabulary.mjs';
+import { listDirectCredentialedResiduals } from './direct-credentialed-residual-listing.mjs';
 import {
   DirectRunStateError,
   isAbandonedDirectScenario,
@@ -322,79 +319,28 @@ export async function teardownDirectReference(input) {
           .filter((value) => value.startsWith(prefix));
       const listed = (page, field) =>
         surface(matching(page.rows, field), page.exhaustive, page.rows.length);
-      const databaseRowKeys = (row) => {
-        identifier(row.name);
-        return [identifier(row.uuid)];
-      };
-      const databases = await inventory(
-        numbered.d1.database.list({ ...selectors, name: prefix }),
-        databaseRowKeys,
-        bound,
-      );
-      const allDatabases = disposable
-        ? await inventory(
-            numbered.d1.database.list(selectors),
-            databaseRowKeys,
-            bound,
-          )
-        : [];
-      const namespaces = await inventory(
-        numbered.durableObjects.namespaces.list(selectors),
-        (row) => [`id:${identifier(row.id)}`],
-        bound,
-      );
-      const scripts = await singlePage(single.workers.scripts.list(selectors));
-      const buckets = await bucketPages({
+      const listings = await listDirectCredentialedResiduals({
         sdk,
+        numbered,
+        single,
+        APIError,
         selectors,
-        jurisdiction: 'default',
+        zoneId,
+        prefix,
         bound,
+        disposable,
       });
       // Both listings are scoped to the zone the bootstrap recorded, so the
       // `globalCount` each contributes below covers that zone and not the
       // account — the scope `bucketJurisdictions` records for the bucket count.
-      const domains = await singlePage(
-        single.workers.domains.list({ ...selectors, zone_id: zoneId }),
-      );
-      const routes = await singlePage(
-        single.workers.routes.list({ zone_id: zoneId }),
-      );
-      let queues;
-      try {
-        queues = await singlePage(single.queues.list(selectors));
-      } catch (error) {
-        // A 404 is read as an account that carries no queue collection. No
-        // provider capture in this repository attests that reading, so the
-        // empty page it stands in for is recorded `exhaustive: false` and the
-        // counts below are this reading rather than a page the provider sent.
-        if (!(error instanceof APIError) || error.status !== 404) throw error;
-        queues = { rows: [], exhaustive: false };
-      }
-      let dispatch;
-      try {
-        const classified = await classifyDispatchNamespaces(
-          single,
-          selectors,
-          bound,
-        );
-        dispatch = Object.freeze({
-          kind: classified.kind,
-          count: classified.count,
-          status: null,
-          prefixCount: classified.names.filter(
-            (name) => typeof name === 'string' && name.startsWith(prefix),
-          ).length,
-        });
-      } catch (error) {
-        if (!(error instanceof APIError) || providerErrorFrom(error))
-          throw error;
-        dispatch = Object.freeze({
-          kind: 'fail-closed',
-          count: 0,
-          status: error.status ?? null,
-          prefixCount: 0,
-        });
-      }
+      const dispatch = Object.freeze({
+        kind: listings.dispatch.kind,
+        count: listings.dispatch.count,
+        status: listings.dispatch.status,
+        prefixCount: listings.dispatch.names.filter(
+          (name) => typeof name === 'string' && name.startsWith(prefix),
+        ).length,
+      });
       let versionsGone = null;
       if (receipts.worker) {
         let page;
@@ -413,20 +359,24 @@ export async function teardownDirectReference(input) {
         version: 1,
         surfaces: {
           databases: surface(
-            matching(databases, 'name'),
-            true,
-            allDatabases.length,
+            matching(listings.databases.rows, 'name'),
+            listings.databases.exhaustive,
+            listings.allDatabases.rows.length,
           ),
           durableObjectNamespaces: surface(
-            matching(namespaces, 'script'),
-            true,
-            namespaces.length,
+            matching(listings.namespaces.rows, 'script'),
+            listings.namespaces.exhaustive,
+            listings.namespaces.rows.length,
           ),
-          scripts: listed(scripts, 'id'),
-          buckets: surface(matching(buckets, 'name'), true, buckets.length),
-          domains: listed(domains, 'service'),
-          routes: listed(routes, 'script'),
-          queues: listed(queues, 'queue_name'),
+          scripts: listed(listings.scripts, 'id'),
+          buckets: surface(
+            matching(listings.buckets.rows, 'name'),
+            listings.buckets.exhaustive,
+            listings.buckets.rows.length,
+          ),
+          domains: listed(listings.domains, 'service'),
+          routes: listed(listings.routes, 'script'),
+          queues: listed(listings.queues, 'queue_name'),
         },
         bucketJurisdictions: ['default'],
         dispatch,

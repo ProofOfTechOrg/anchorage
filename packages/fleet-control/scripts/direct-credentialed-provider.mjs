@@ -4,9 +4,10 @@ import { validateHeaderValue } from 'node:http';
 import { cancelBodyWithoutAwait } from './direct-credentialed-body-cancel.mjs';
 
 const API_BASE = 'https://api.cloudflare.com/client/v4';
-const MAX_ATTEMPTS = 512;
+export const DIRECT_PROVIDER_MAX_REQUESTS = 512;
 const MAX_DURATION_MS = 300_000;
 const MAX_JSON_BYTES = 8 * 1024 * 1024;
+const ZONE_TYPES = Object.freeze(['full', 'partial', 'secondary', 'internal']);
 const ERROR_CODES = new Set([
   'invalid-input',
   'provider-unavailable',
@@ -62,7 +63,10 @@ function providerTransport(fetchRequest, timeoutMs) {
   let attempts = 0;
   let failure;
   const assertBudget = () => {
-    if (performance.now() >= expiresAt || attempts >= MAX_ATTEMPTS) {
+    if (
+      performance.now() >= expiresAt ||
+      attempts >= DIRECT_PROVIDER_MAX_REQUESTS
+    ) {
       failure = 'budget-exhausted';
       refuse(failure);
     }
@@ -364,6 +368,55 @@ export async function inventory(pages, identity, bound) {
   if (rows.length < expectedCount || pageCount < expectedPages)
     refuse('provider-unavailable');
   return rows;
+}
+
+function zoneKeys(row, accountId) {
+  identifier(row.id);
+  identifier(row.type);
+  const name = identifier(row.name, 253);
+  if (
+    row.account?.id !== accountId ||
+    name
+      .split('.')
+      .some((label) => !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u.test(label))
+  )
+    refuse();
+  return [`id:${row.id}`, `name:${row.name}`];
+}
+
+export async function resolveDirectZone({
+  sdk,
+  numbered,
+  accountId,
+  ownedHostname,
+  bound,
+}) {
+  const zones = await inventory(
+    numbered.zones.list({ account: { id: accountId }, per_page: 50 }),
+    (row) => zoneKeys(row, accountId),
+    bound,
+  );
+  const matches = zones
+    .filter((row) => ZONE_TYPES.includes(row.type))
+    .filter(
+      (row) =>
+        ownedHostname === row.name || ownedHostname.endsWith(`.${row.name}`),
+    )
+    .sort((a, b) => b.name.length - a.name.length);
+  if (
+    !matches[0] ||
+    (matches[1] && matches[0].name.length === matches[1].name.length)
+  )
+    refuse();
+  const selected = await sdk.zones.get({ zone_id: matches[0].id });
+  zoneKeys(selected, accountId);
+  if (
+    selected.id !== matches[0].id ||
+    selected.name !== matches[0].name ||
+    !ZONE_TYPES.includes(selected.type)
+  )
+    refuse();
+  return selected;
 }
 
 export async function classifyDispatchNamespaces(single, selectors, bound) {

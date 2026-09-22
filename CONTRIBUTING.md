@@ -38,8 +38,8 @@ cd anchorage
 ```
 
 The verification list below mirrors the CI `verify-core` job in order;
-`pnpm test` also covers the direct scenario project that CI runs in its own
-`direct-scenario` job:
+`pnpm test` also covers the direct scenario projects that CI runs in the
+`direct-scenario` and `direct-scenario-seams` jobs:
 
 ```bash
 pnpm install --frozen-lockfile
@@ -76,7 +76,8 @@ pre-push runs react-doctor on the branch's changed files
 non-blocking compatibility probe against the newest `@mastra/core` 1.x release.
 The `protect main` ruleset requires the status check named `verify`, the gate
 job in `ci.yml`; `verify-core` and `direct-scenario` are in that job's `needs`
-list. Read the job for the rule it applies to that list.
+list, along with `direct-scenario-seams`. Read the job for the rule it applies
+to that list.
 
 The showcase app uses mandatory absolute imports — `@/*` for `src`,
 `#worker/*` for worker modules, `@flowsafe/*` for deep flowsafe source

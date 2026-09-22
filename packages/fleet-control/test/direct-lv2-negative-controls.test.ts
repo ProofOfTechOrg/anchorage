@@ -112,6 +112,54 @@ it.each([
   });
 });
 
+it.each([
+  [
+    'worker-version and identity proofs',
+    (state: ReturnType<typeof completeScenario>) => {
+      for (const group of [
+        state.proofs.initial,
+        state.proofs.candidate,
+        state.proofs.final,
+        state.proofs.identities,
+      ])
+        [group.a, group.b] = [group.b, group.a];
+    },
+  ],
+  [
+    'export proofs and their history digests',
+    (state: ReturnType<typeof completeScenario>) => {
+      [state.proofs.exports.a, state.proofs.exports.b] = [
+        state.proofs.exports.b,
+        state.proofs.exports.a,
+      ];
+      const originalA = present(
+        state.proofs.exportVerifications.find(
+          ({ cycle, role }) => cycle === null && role === 'a',
+        ),
+      );
+      const originalB = present(
+        state.proofs.exportVerifications.find(
+          ({ cycle, role }) => cycle === null && role === 'b',
+        ),
+      );
+      [originalA.exportSha256, originalB.exportSha256] = [
+        originalB.exportSha256,
+        originalA.exportSha256,
+      ];
+    },
+  ],
+] as const)('rejects swapped keyed %s in the stored journal', async (_name, swap) => {
+  const { journal } = await scenarioJournal();
+  const state = completeScenario();
+  const before = JSON.stringify(state);
+  swap(state);
+  const after = JSON.stringify(state);
+  mutation('keyed-proof-role', before, after);
+  await expect(journal.recordScenario(state)).rejects.toMatchObject({
+    code: 'invalid-state',
+  });
+});
+
 it('rejects a new run id in the finished continuation proof', async () => {
   const { journal } = await scenarioJournal();
   const state = completeScenario();

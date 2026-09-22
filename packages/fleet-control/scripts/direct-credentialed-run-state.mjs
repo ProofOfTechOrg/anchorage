@@ -635,7 +635,8 @@ const workerVersionShape = {
     creationDate: scenarioDate,
   },
 };
-const roleAWorkerVersionShape = { ...workerVersionShape, role: 'a' };
+const workerVersionShapeFor = (role) => ({ ...workerVersionShape, role });
+const roleAWorkerVersionShape = workerVersionShapeFor('a');
 const receiptShape = {
   version: 1,
   authority: scenarioLocation,
@@ -651,7 +652,8 @@ const exportShape = {
   sha256: digest,
   sourceInvocationOrdinal: scenarioNumber,
 };
-const roleAExportShape = { ...exportShape, role: 'a' };
+const exportShapeFor = (role) => ({ ...exportShape, role });
+const roleAExportShape = exportShapeFor('a');
 const exportReferenceShape = (value) => {
   const reference = scenarioShape(value, {
     role: normalRole,
@@ -1100,17 +1102,17 @@ const scenarioSchema = {
   }),
   proofs: {
     initial: {
-      a: nullable(workerVersionShape),
-      b: nullable(workerVersionShape),
-      recovery: nullable(workerVersionShape),
+      a: nullable(workerVersionShapeFor('a')),
+      b: nullable(workerVersionShapeFor('b')),
+      recovery: nullable(workerVersionShapeFor('recovery')),
     },
     candidate: {
-      a: nullable(workerVersionShape),
-      b: nullable(workerVersionShape),
+      a: nullable(workerVersionShapeFor('a')),
+      b: nullable(workerVersionShapeFor('b')),
     },
     final: {
-      a: nullable(workerVersionShape),
-      b: nullable(workerVersionShape),
+      a: nullable(workerVersionShapeFor('a')),
+      b: nullable(workerVersionShapeFor('b')),
     },
     identities: { a: nullable(identityShape), b: nullable(identityShape) },
     reprovision: { a: nullable(roleAWorkerVersionShape) },
@@ -1155,7 +1157,10 @@ const scenarioSchema = {
     steps: stepsShape,
     effects: effectsShape,
     cleanup: nullable(cleanupShape),
-    exports: { a: nullable(exportShape), b: nullable(exportShape) },
+    exports: {
+      a: nullable(exportShapeFor('a')),
+      b: nullable(exportShapeFor('b')),
+    },
     reprovisionExports: { a: nullable(roleAExportShape) },
     exportVerifications: exportVerificationsShape,
     decommission: {

@@ -3167,7 +3167,11 @@ test('the ci.yml gate job stays reachable and depends on its required jobs', () 
     'always()',
     'without `if: always()` a failed dependency skips the gate job, and GitHub reports a skipped required check as success',
   );
-  assert.deepEqual(job.needs, ['verify-core', 'direct-scenario']);
+  assert.deepEqual(job.needs, [
+    'verify-core',
+    'direct-scenario',
+    'direct-scenario-seams',
+  ]);
   assert.ok(
     !job.needs.includes('mastra-compat'),
     'the compat canary reports an upstream release, so naming it here would block merges on an upstream red',
@@ -3451,16 +3455,24 @@ test('the ci.yml gate rejects an empty or non-success needs context', (t) => {
       needs: {
         'verify-core': { result: 'success' },
         'direct-scenario': { result: 'success' },
+        'direct-scenario-seams': { result: 'success' },
       },
       succeeds: true,
     },
-    ...['failure', 'cancelled', 'skipped'].map((result) => ({
-      needs: {
-        'verify-core': { result: 'success' },
-        'direct-scenario': { result },
-      },
-      succeeds: false,
-    })),
+    ...['direct-scenario', 'direct-scenario-seams'].flatMap((failedJob) =>
+      ['failure', 'cancelled', 'skipped'].map((result) => ({
+        needs: {
+          'verify-core': { result: 'success' },
+          'direct-scenario': {
+            result: failedJob === 'direct-scenario' ? result : 'success',
+          },
+          'direct-scenario-seams': {
+            result: failedJob === 'direct-scenario-seams' ? result : 'success',
+          },
+        },
+        succeeds: false,
+      })),
+    ),
   ];
 
   for (const { needs, succeeds } of cases) {

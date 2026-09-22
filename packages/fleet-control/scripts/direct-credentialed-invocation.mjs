@@ -31,9 +31,8 @@ const INGRESS_STABLE_PROBES = 3;
 export const DIRECT_RECONCILIATION_MARGIN_MS = 5_000;
 export const DIRECT_RECONCILIATION_INTERVAL_MS = 250;
 export const DIRECT_RECONCILIATION_MAX_INTERVAL_MS = 32_000;
-// The schedule from 250 ms to 32 s reaches the 605,000 ms production window in
-// about 26 requests. The 32-request cap guards a shorter interval override;
-// normal polling reaches its time bound first.
+// The cap guards a shorter interval override. At the production interval the
+// time bound ends polling first.
 export const DIRECT_RECONCILIATION_MAX_REQUESTS = 32;
 export const DIRECT_INVOCATION_FAILURE_DETAILS = Object.freeze([
   'platform-page',
@@ -295,6 +294,7 @@ export async function reconcileDirectInvocation(input) {
   let configSha256;
   let ordinal;
   let requestSha256;
+  let workerDeadlineMs;
   let deadlineMs;
   let intervalMs;
   let fetchRequest;
@@ -305,7 +305,7 @@ export async function reconcileDirectInvocation(input) {
     configSha256 = input.configSha256;
     ordinal = input.ordinal;
     requestSha256 = input.requestSha256;
-    const workerDeadlineMs = input.workerDeadlineMs;
+    workerDeadlineMs = input.workerDeadlineMs;
     deadlineMs =
       input.deadlineMs ?? workerDeadlineMs + DIRECT_RECONCILIATION_MARGIN_MS;
     intervalMs = input.intervalMs ?? DIRECT_RECONCILIATION_INTERVAL_MS;
@@ -336,6 +336,7 @@ export async function reconcileDirectInvocation(input) {
       deadlineMs > 2_147_483_647 ||
       !Number.isSafeInteger(intervalMs) ||
       intervalMs < 1 ||
+      intervalMs > DIRECT_RECONCILIATION_MAX_INTERVAL_MS ||
       intervalMs >= deadlineMs ||
       typeof fetchRequest !== 'function' ||
       typeof sleep !== 'function'
@@ -354,6 +355,7 @@ export async function reconcileDirectInvocation(input) {
   const deadline = new AbortController();
   const signal = deadline.signal;
   const expiresAt = performance.now() + deadlineMs;
+  const pollBy = expiresAt - (deadlineMs - workerDeadlineMs);
   const timer = setTimeout(() => deadline.abort(), deadlineMs);
   let requestsSent = 0;
   let waitMs = intervalMs;
@@ -425,13 +427,14 @@ export async function reconcileDirectInvocation(input) {
       }
       if (requestsSent >= DIRECT_RECONCILIATION_MAX_REQUESTS)
         return 'unreachable';
-      const remaining = expiresAt - performance.now();
-      if (remaining <= waitMs) return 'unreachable';
+      const remaining = pollBy - performance.now();
+      if (remaining <= 0) return 'unreachable';
+      const sleepMs = Math.min(waitMs, remaining);
       try {
         await new Promise((resolve, reject) => {
           const abort = () => reject(signal.reason);
           signal.addEventListener('abort', abort, { once: true });
-          Promise.resolve(sleep(waitMs)).then(
+          Promise.resolve(sleep(sleepMs)).then(
             (value) => {
               signal.removeEventListener('abort', abort);
               resolve(value);

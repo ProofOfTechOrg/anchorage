@@ -58,7 +58,7 @@
     "test:credentialed": "pnpm build && node scripts/credentialed-conformance.mjs",
     "test:credentialed:direct": "pnpm build && node scripts/direct-credentialed-conformance.mjs",
     "test:packed-consumer": "node scripts/packed-consumer-test.mjs",
-    "test": "vitest run && vitest run --config vitest.direct-scenario.config.ts",
+    "test": "vitest run && vitest run --config vitest.direct-scenario.config.ts && vitest run --config vitest.direct-scenario-seams.config.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.build.json --noEmit && tsc -p scripts/tsconfig.direct-worker.json"
   },
   "dependencies": {

@@ -86,6 +86,7 @@ export function reconcileDirectInvocation(
     requestSha256: string;
     workerDeadlineMs: number;
     deadlineMs?: number;
+    /** Must not exceed `DIRECT_RECONCILIATION_MAX_INTERVAL_MS`. */
     intervalMs?: number;
     fetch?: typeof fetch;
     sleep?: (ms: number) => Promise<void>;

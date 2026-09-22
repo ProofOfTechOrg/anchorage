@@ -58,7 +58,7 @@ jobs:
         run: pnpm typecheck
 
       # Root vitest workspace: every package's suite in one process, minus the
-      # direct scenario project, which the `direct-scenario` job below runs at
+      # direct scenario projects, which the jobs below run at
       # the same time. The Typecheck step above produces the fleet-control dist
       # this step consumes: fleet-control's `pretypecheck` runs its `prebuild`
       # and `build`. The cap is about 1.8x the slowest measured run of this step
@@ -166,12 +166,11 @@ jobs:
       - name: Conformance artifacts verify (workerd)
         run: pnpm conformance:verify
 
-  # The direct credentialed scenario and the offline fence suite: full
-  # scenario runs against the reference and tenant Workers on local workerd,
-  # about 35 minutes, independent of every `verify-core` step. The suites
-  # import @proofoftech/flowsafe subpaths and the fleet-control package from
-  # their dists, so the job builds fleet-control (whose prebuild builds
-  # breakwater and flowsafe) before running them.
+  # The direct credentialed scenario and offline fence suites run against the
+  # reference and tenant Workers on local workerd in about 35 minutes,
+  # independent of every `verify-core` step. They import flowsafe subpaths and
+  # fleet-control from their dists, so this job builds fleet-control and its
+  # prerequisites before running them.
   direct-scenario:
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -193,22 +192,48 @@ jobs:
         run: pnpm --filter @proofoftech/fleet-control build
 
       - name: Direct scenario suites (workerd)
-        run: pnpm test:direct-scenario
+        run: pnpm test:direct-scenario:fast
+
+  # The process-loss direct scenario suites run in their own project. They
+  # import flowsafe subpaths and fleet-control from their dists, so this job
+  # builds fleet-control and its prerequisites before running them.
+  direct-scenario-seams:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      # Reads the pnpm version from package.json "packageManager".
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+
+      - name: Build fleet-control and its prerequisites
+        run: pnpm --filter @proofoftech/fleet-control build
+
+      - name: Direct scenario process-loss suites (workerd)
+        run: pnpm test:direct-scenario:seams
 
   # The `protect main` ruleset requires the status check named `verify`. This
   # job is that check: it depends on the gating jobs and fails unless `needs`
   # carries at least one entry and every entry reports success, so a red or
-  # cancelled `direct-scenario` blocks a merge to main exactly as a red
-  # `verify-core` does, a job added to `needs` is gating without a further edit
-  # (the assertion reads the whole `needs` context), and an emptied `needs`
-  # list fails the check instead of passing it with nothing verified.
+  # cancelled direct-scenario job blocks a merge to main exactly as a red
+  # `verify-core` does. A job added to `needs` is gating without a further edit
+  # because the assertion reads the whole context, and an emptied `needs` list
+  # fails the check instead of passing it with nothing verified.
   # `if: always()` makes the job run when a dependency fails or is cancelled;
   # without it the job would be skipped, and GitHub reports a skipped job as
   # success for a required check.
   verify:
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    needs: [verify-core, direct-scenario]
+    needs: [verify-core, direct-scenario, direct-scenario-seams]
     if: always()
     steps:
       - name: Require a non-empty needs context in which every job succeeded

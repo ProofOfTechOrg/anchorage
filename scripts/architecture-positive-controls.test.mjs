@@ -50,14 +50,16 @@ const fleetRequire = createRequire(
 );
 const ts = fleetRequire('typescript');
 const root = fileURLToPath(new URL('..', import.meta.url));
-const directScenarioProject =
-  'packages/fleet-control/vitest.direct-scenario.config.ts';
+const directScenarioProjects = [
+  'packages/fleet-control/vitest.direct-scenario.config.ts',
+  'packages/fleet-control/vitest.direct-scenario-seams.config.ts',
+];
 const fleetControlProject = 'packages/fleet-control/vitest.config.ts';
 const rootProjectPaths = [
   ...globSync('vitest.*.config.*', { cwd: root }).map((match) =>
     match.split('\\').join('/'),
   ),
-  directScenarioProject,
+  ...directScenarioProjects,
 ];
 const packageProjectPaths = readdirSync(join(root, 'packages'), {
   withFileTypes: true,
@@ -66,7 +68,8 @@ const packageProjectPaths = readdirSync(join(root, 'packages'), {
   .map((entry) => `packages/${entry.name}/vitest.config.ts`)
   .filter((projectPath) => existsSync(join(root, projectPath)));
 const rootProjectNames = {
-  [directScenarioProject]: 'fleet-control-direct-scenario',
+  [directScenarioProjects[0]]: 'fleet-control-direct-scenario',
+  [directScenarioProjects[1]]: 'fleet-control-direct-scenario-seams',
   'vitest.breakwater-workers.config.mts': 'breakwater-workers',
   'vitest.flowsafe-harness.config.ts': 'flowsafe-harness',
   'vitest.flowsafe-workers.config.ts': 'flowsafe-workers',
@@ -546,19 +549,30 @@ test('every root vitest project declares its expected name', () => {
   }
 });
 
-test('the direct-scenario suites are declared by that project and excluded from the package project', () => {
-  const expectedInclude = [
-    'test/direct-credentialed-scenario.test.ts',
-    'test/direct-reference-fence.harness.test.ts',
-  ];
-  const directInclude = stringsOf(parse(directScenarioProject), 'include');
+test('the direct-scenario suites are declared by their projects and excluded from the package project', () => {
+  const expectedIncludes = new Map([
+    [
+      directScenarioProjects[0],
+      [
+        'test/direct-credentialed-scenario.test.ts',
+        'test/direct-reference-fence.harness.test.ts',
+      ],
+    ],
+    [
+      directScenarioProjects[1],
+      ['test/direct-credentialed-scenario.seams.test.ts'],
+    ],
+  ]);
   const packageExclude = stringsOf(parse(fleetControlProject), 'exclude');
-  assert.deepEqual([...directInclude].sort(), [...expectedInclude].sort());
-  for (const entry of directInclude) {
-    assert.ok(
-      packageExclude.includes(entry),
-      `the package project does not exclude '${entry}'`,
-    );
+  for (const [project, expectedInclude] of expectedIncludes) {
+    const directInclude = stringsOf(parse(project), 'include');
+    assert.deepEqual([...directInclude].sort(), [...expectedInclude].sort());
+    for (const entry of directInclude) {
+      assert.ok(
+        packageExclude.includes(entry),
+        `the package project does not exclude '${entry}'`,
+      );
+    }
   }
 });
 
@@ -971,8 +985,13 @@ function assertProjectSelections(scripts, declared) {
     'no root script selects a vitest project by name',
   );
   for (const [script, selectedProject] of selections) {
+    const selected = selectedProject.endsWith('*')
+      ? [...declared].some((project) =>
+          project.startsWith(selectedProject.slice(0, -1)),
+        )
+      : declared.has(selectedProject);
     assert.ok(
-      declared.has(selectedProject),
+      selected,
       `script '${script}' selects '${selectedProject}', absent from the discovered Vitest projects`,
     );
   }
