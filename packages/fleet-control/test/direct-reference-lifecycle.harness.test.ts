@@ -84,6 +84,55 @@ it('settles closers before running post-checks', async () => {
   );
 });
 
+it('decommission-a-reprovision completes a replacement stranded in migrating', async () => {
+  const fixture = await createDirectReferenceHarness();
+  try {
+    await fixture.success({
+      kind: 'provision',
+      role: 'a',
+      release: 'initial',
+      cycle: 'reprovision',
+    });
+    fixture.world.failNext('uploadCandidate', { dispatched: false });
+    expect(
+      (await fixture.call({ kind: 'migration-reprovision-a' })).response.status,
+    ).toBe(500);
+    const names = fixture.manifest.names.roles.a;
+    expect(
+      await fixture.fleetStore.get(
+        names.tenantTag,
+        fixture.manifest.environment,
+      ),
+    ).toMatchObject({ phase: 'migrating' });
+    let advance = await fixture.success<DecommissionAdvanceResult>({
+      kind: 'decommission-start',
+      role: 'a',
+      cycle: 'reprovision',
+    });
+    for (let calls = 0; advance.status !== 'complete' && calls < 150; calls++) {
+      expect(advance.status).toBe('pending');
+      advance = await fixture.success<DecommissionAdvanceResult>({
+        kind: 'decommission-continue',
+        role: 'a',
+        cycle: 'reprovision',
+        token: advance.token,
+      });
+    }
+    expect(advance.status).toBe('complete');
+    expect(
+      await fixture.journal().readOperation('decommission-a-reprovision'),
+    ).toMatchObject({ kind: 'decommission' });
+    expect(
+      await fixture.fleetStore.get(
+        names.tenantTag,
+        fixture.manifest.environment,
+      ),
+    ).toMatchObject({ phase: 'decommissioned' });
+  } finally {
+    await fixture.close();
+  }
+}, 180_000);
+
 it('runs later closers after a synchronous throw', async () => {
   const calls: string[] = [];
   const sentinel = new Error('first-close-sentinel');
@@ -392,7 +441,7 @@ describe.sequential('direct lifecycle through native control state', {
             ]) {
               await fixture.exportBytes.put(key, bytes, { customMetadata });
               expect((await fixture.call(metadataAction)).value).toEqual({
-                contractVersion: 1,
+                contractVersion: 2,
                 ok: false,
                 error: { code: 'operation-refused' },
               });
@@ -735,7 +784,7 @@ describe.sequential('private force through native control state', {
       expect(responses).toHaveLength(1);
       expect(responses[0]?.status).toBe(409);
       expect(await responses[0]?.json()).toEqual({
-        contractVersion: 1,
+        contractVersion: 2,
         ok: false,
         error: { code: 'operation-refused' },
       });

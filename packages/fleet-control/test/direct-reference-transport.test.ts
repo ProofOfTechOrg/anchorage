@@ -11,7 +11,10 @@ import {
   directDeploymentSpec,
   generateDirectDeploymentSecrets,
 } from '../scripts/direct-credentialed-spec.js';
-import { DIRECT_REFERENCE_PATH } from '../scripts/direct-reference-contract.mjs';
+import {
+  DIRECT_REFERENCE_PATH,
+  directReferenceRequestSha256,
+} from '../scripts/direct-reference-contract.mjs';
 import { handleDirectReferenceHttpRequest } from '../scripts/direct-reference-http.js';
 import {
   DIRECT_REFERENCE_LEASE,
@@ -313,10 +316,17 @@ describe('direct reference transport', () => {
     const nativeFetch = vi.fn<typeof fetch>(
       async () => new Response('fixture'),
     );
-    const body = JSON.stringify({
-      contractVersion: 1,
+    const core = {
+      contractVersion: 2,
       configSha256: 'a'.repeat(64),
       action: { kind: 'control-read' },
+    };
+    const body = JSON.stringify({
+      ...core,
+      reservation: {
+        ordinal: 1,
+        requestSha256: directReferenceRequestSha256(core),
+      },
     });
     const response = await handleDirectReferenceHttpRequest(
       new Request(`https://fixture.test${DIRECT_REFERENCE_PATH}`, {
@@ -328,6 +338,11 @@ describe('direct reference transport', () => {
         invokeSecret: 'test',
         configSha256: 'a'.repeat(64),
         invocationTimeoutMs: 5000,
+        invocationJournal: async () => ({
+          receiveInvocation: async () => {},
+          settleReceivedInvocation: async () => {},
+          reconcileInvocation: async () => 'cancelled',
+        }),
         dispatch: async (_action, signal) => {
           const transport = new DirectReferenceTransport({
             runtime,

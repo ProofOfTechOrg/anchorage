@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import type { PreparedDirectConformance } from './direct-credentialed-conformance-preflight.mjs';
-import type { DirectInvocationFailureDetail } from './direct-credentialed-invocation.mjs';
 import type {
   DirectRunSnapshot,
   DirectTeardownFailure,
@@ -56,6 +55,10 @@ export const DIRECT_CONFORMANCE_COMMANDS: Readonly<{
  * keyed by index instead, which admission answers with its digits-only rule.
  */
 export const DIRECT_EVIDENCE_KEYS: readonly string[];
+export function directSourceHashRelationship(
+  initialModules: readonly unknown[],
+  nextModules: readonly unknown[],
+): 'identical' | 'divergent';
 /**
  * The dotted paths of the projected provider strings the journal decodes with
  * `identifier`, each guarded against the identity shape. A prefix-derived name
@@ -87,8 +90,15 @@ export type DirectEvidenceScenario = Readonly<{
   initial: Readonly<Record<string, unknown>>;
   candidate: Readonly<Record<string, unknown>>;
   final: Readonly<Record<string, unknown>>;
+  identities: Readonly<Record<string, unknown>>;
+  reprovision: Readonly<Record<string, unknown>>;
+  continuation: Readonly<Record<string, unknown>>;
+  applicability: Readonly<Record<string, string>>;
+  moduleBytes: Readonly<Record<string, string>>;
   fence: Readonly<Record<string, unknown>>;
   exports: Readonly<Record<string, unknown>>;
+  reprovisionExport: Readonly<Record<string, unknown>> | null;
+  redecommission: Readonly<Record<string, unknown>> | null;
   inventories: Readonly<Record<string, unknown>>;
   terminalForce: Readonly<Record<string, unknown>>;
 }>;
@@ -101,6 +111,15 @@ export type DirectEvidenceCost = Readonly<{
   referenceInvocations: number;
   teardownProvider: number | null;
   billed: null;
+}>;
+export type DirectEvidenceSweep = Readonly<{
+  phase: string;
+  roles: Readonly<Record<'a' | 'b' | 'recovery', unknown>>;
+  refusal: Readonly<{
+    code: string;
+    role: 'a' | 'b' | 'recovery';
+    reason: string;
+  }> | null;
 }>;
 /**
  * The evidence artifact, in the member order `writeDirectEvidence` serializes
@@ -128,7 +147,13 @@ export type DirectEvidenceArtifact = Readonly<{
   referenceUploadBytes: number;
   commands: readonly string[];
   bootstrap: Readonly<Record<string, unknown>> | null;
+  reconciliations: readonly Readonly<{
+    ordinal: number;
+    state: string;
+    at: string;
+  }>[];
   scenario: DirectEvidenceScenario | null;
+  sweep: DirectEvidenceSweep | null;
   teardown: Readonly<Record<string, unknown>> | null;
   teardownCall: DirectEvidenceTeardownCall | null;
   retainedIdentities: Readonly<Record<string, string | null>>;
@@ -137,7 +162,6 @@ export type DirectEvidenceArtifact = Readonly<{
 export function buildDirectEvidence(
   input: Readonly<{
     snapshot: DirectRunSnapshot;
-    invocationFailureDetail?: DirectInvocationFailureDetail;
     prepared: PreparedDirectConformance;
     mode: DirectLiveMode;
     outcome: Readonly<{

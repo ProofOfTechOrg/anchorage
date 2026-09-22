@@ -265,6 +265,7 @@ export async function createDirectReferenceContext(
         .update(rawSecrets)
         .digest('hex'),
     }),
+    manifest.referenceRuntime.maxInvocations,
   );
   await journal.readInterruption();
   transport.assertWithinBudget();
@@ -465,7 +466,9 @@ export async function createDirectReferenceContext(
       const role = roleFor(record);
       let digest =
         record.phase === 'migrating'
-          ? record.pendingSpecDigest
+          ? // A stranded migration is decommissioned from its pending spec by
+            // the cycle-selected decommission-a-reprovision operation.
+            record.pendingSpecDigest
           : record.desiredSpecDigest;
       if (record.cleanupIntent && record.decommissionIntent) refused();
       if (record.cleanupIntent?.authority.kind === 'provisioning-rollback')

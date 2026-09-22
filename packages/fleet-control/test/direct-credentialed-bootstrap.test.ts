@@ -208,14 +208,14 @@ async function fixture(
     Response.json(
       status === 200
         ? {
-            contractVersion: 1,
+            contractVersion: 2,
             configSha256: prepared.configSha256,
             action: 'control-read',
             ok: true,
             result,
           }
         : {
-            contractVersion: 1,
+            contractVersion: 2,
             ok: false,
             error: { code: 'budget-exhausted' },
           },
@@ -244,7 +244,7 @@ async function fixture(
         expect(request.method).toBe('POST');
         expect(await request.json()).toEqual({});
         return Response.json(
-          { contractVersion: 1, ok: false, error: { code: 'unauthorized' } },
+          { contractVersion: 2, ok: false, error: { code: 'unauthorized' } },
           {
             status: 401,
             headers: {
@@ -1172,7 +1172,7 @@ describeLinux('SDK direct bootstrap', () => {
       });
     const reservation = await f.journal.reserveInvocation(
       JSON.stringify({
-        contractVersion: 1,
+        contractVersion: 2,
         configSha256: f.prepared.configSha256,
         action: { kind: 'control-read' },
       }),
@@ -1397,7 +1397,10 @@ describeLinux('SDK direct bootstrap', () => {
     await expect(f.run()).rejects.toMatchObject({ code: 'outcome-unknown' });
     expect(f.fetchRequest).toHaveBeenCalledTimes(count);
     expect(probes.generate).toHaveBeenCalledTimes(generated);
-    await expect(f.reopen()).rejects.toMatchObject({ code: 'outcome-unknown' });
+    await f.reopen();
+    await expect(f.run()).rejects.toMatchObject({ code: 'outcome-unknown' });
+    expect(f.fetchRequest).toHaveBeenCalledTimes(count);
+    expect(probes.generate).toHaveBeenCalledTimes(generated);
   });
 
   it('resumes partial confirmed infrastructure before generating secrets', async () => {

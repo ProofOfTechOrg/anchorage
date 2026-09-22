@@ -139,7 +139,7 @@ export async function verifyDirectArtifactsPacked({
       join(directory, 'src', name),
     );
   }
-  for (const tool of ['wrangler', 'typescript']) {
+  for (const tool of ['wrangler', 'typescript', 'zod']) {
     await symlink(
       await realpath(join(packageRoot, 'node_modules', tool)),
       join(directory, 'node_modules', tool),

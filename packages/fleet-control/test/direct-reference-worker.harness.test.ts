@@ -7,7 +7,10 @@ import { fileURLToPath } from 'node:url';
 import type { D1Database } from '@cloudflare/workers-types';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createTestHarness, type TestHarness } from 'wrangler';
-import { DIRECT_REFERENCE_PATH } from '../scripts/direct-reference-contract.mjs';
+import {
+  DIRECT_REFERENCE_PATH,
+  directReferenceRequestSha256,
+} from '../scripts/direct-reference-contract.mjs';
 import { directFixtureManifest } from './fixtures/direct-credentialed-config.js';
 
 const manifest = directFixtureManifest();
@@ -42,6 +45,7 @@ describe.sequential('real direct reference context and inventory', {
   let server: TestHarness;
   let db: D1Database;
   let reload: () => Promise<void>;
+  let invocationOrdinal = 0;
   beforeAll(async () => {
     directory = await mkdtemp(join(tmpdir(), 'direct-reference-'));
     const main = join(directory, 'worker.ts');
@@ -218,21 +222,132 @@ export default {async fetch(request,env){
     mode = '',
     authorization = 'Bearer test-invoke',
   ) {
+    const configSha256 =
+      mode === 'deadline'
+        ? deadlineManifest.configSha256
+        : manifest.configSha256;
+    const core = { contractVersion: 2, configSha256, action };
+    return raw(
+      {
+        ...core,
+        reservation:
+          Reflect.get(action as object, 'kind') === 'reconcile-invocation'
+            ? null
+            : {
+                ordinal: ++invocationOrdinal,
+                requestSha256: directReferenceRequestSha256(core),
+              },
+      },
+      mode,
+      authorization,
+    );
+  }
+
+  function raw(body: unknown, mode = '', authorization = 'Bearer test-invoke') {
     return server
       .getWorker()
       .fetch(`https://reference.test${DIRECT_REFERENCE_PATH}?mode=${mode}`, {
         method: 'POST',
         headers: { authorization },
-        body: JSON.stringify({
-          contractVersion: 1,
-          configSha256:
-            mode === 'deadline'
-              ? deadlineManifest.configSha256
-              : manifest.configSha256,
-          action,
-        }),
+        body: JSON.stringify(body),
       });
   }
+
+  it('enforces the v2 hash-bound ledger, terminal reconciliation and cancellation tombstone', async () => {
+    const configSha256 = manifest.configSha256;
+    const core = {
+      contractVersion: 2,
+      configSha256,
+      action: { kind: 'control-read' },
+    };
+    const requestSha256 = directReferenceRequestSha256(core);
+    expect(
+      await (
+        await raw({
+          contractVersion: 1,
+          configSha256,
+          action: core.action,
+        })
+      ).json(),
+    ).toMatchObject({ error: { code: 'invalid-request' } });
+    expect(
+      await (
+        await raw({
+          ...core,
+          reservation: { ordinal: 900, requestSha256: 'a'.repeat(64) },
+        })
+      ).json(),
+    ).toMatchObject({ error: { code: 'request-hash-mismatch' } });
+
+    const reconcile = async (ordinal: number, targetHash: string) =>
+      (
+        await call({
+          kind: 'reconcile-invocation',
+          ordinal,
+          requestSha256: targetHash,
+        })
+      ).json() as Promise<{
+        result?: { state?: string };
+        error?: { code?: string };
+      }>;
+    const executedReservation = { ordinal: 901, requestSha256 };
+    expect(
+      await (await raw({ ...core, reservation: executedReservation })).json(),
+    ).toMatchObject({ ok: true });
+    expect(await reconcile(901, requestSha256)).toMatchObject({
+      result: { state: 'executed' },
+    });
+    const mutationCore = {
+      contractVersion: 2,
+      configSha256,
+      action: { kind: 'force-observe' },
+    };
+    const mutationReservation = {
+      ordinal: 902,
+      requestSha256: directReferenceRequestSha256(mutationCore),
+    };
+    await raw({ ...mutationCore, reservation: mutationReservation });
+    expect(
+      await (
+        await raw({ ...mutationCore, reservation: mutationReservation })
+      ).json(),
+    ).toMatchObject({ error: { code: 'duplicate-ordinal' } });
+
+    expect(
+      await reconcile(902, mutationReservation.requestSha256),
+    ).toMatchObject({
+      result: { state: 'failed' },
+    });
+    await db
+      .prepare(
+        "INSERT INTO direct_reference_invocations (run_key,ordinal,request_sha256,state) VALUES (?,?,?,'received')",
+      )
+      .bind(manifest.resourcePrefix, 903, 'c'.repeat(64))
+      .run();
+    expect(await reconcile(903, 'c'.repeat(64))).toMatchObject({
+      result: { state: 'received' },
+    });
+    const lateCore = {
+      contractVersion: 2,
+      configSha256,
+      action: { kind: 'control-read' },
+    };
+    const cancelledHash = directReferenceRequestSha256(lateCore);
+    expect(await reconcile(904, cancelledHash)).toMatchObject({
+      result: { state: 'cancelled' },
+    });
+    expect(
+      await (
+        await raw({
+          ...lateCore,
+          reservation: { ordinal: 904, requestSha256: cancelledHash },
+        })
+      ).json(),
+    ).toMatchObject({ error: { code: 'duplicate-ordinal' } });
+    expect(await reconcile(901, 'e'.repeat(64))).toMatchObject({
+      error: { code: 'duplicate-ordinal' },
+    });
+  });
 
   it('authenticates before binding access', async () => {
     const response = await call(

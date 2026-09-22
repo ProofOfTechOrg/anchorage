@@ -24,6 +24,7 @@ import {
   createFlowsafeWorker,
   type FlowsafeWorkerConfig,
   type FlowsafeWorkerEnv,
+  RunRouteError,
   readBoundedBody,
   staticTokenVerifier,
 } from '@proofoftech/flowsafe/host-kit';
@@ -32,13 +33,22 @@ import {
   createScheduleTargetPolicy,
   D1SchedulesStorage,
 } from '@proofoftech/flowsafe/schedules';
+import { z } from 'zod';
 import {
+  DIRECT_CONTINUATION_STEP,
+  DIRECT_CONTINUATION_WORKFLOW,
   DIRECT_TENANT_OBJECT_BODY,
   DIRECT_TENANT_OBJECT_KEY,
   DIRECT_TENANT_ROUTES,
   directTenantMutationEpoch,
   directTenantProbeEpoch,
 } from './direct-credentialed-tenant-object.mjs';
+import {
+  continuationInputSchema,
+  continuationOutputSchema,
+  continuationResumeSchema,
+  continuationSuspendSchema,
+} from './direct-credentialed-tenant-schemas.mjs';
 
 export interface DirectTenantEnv extends FlowsafeWorkerEnv {
   DB: D1Database;
@@ -50,6 +60,32 @@ export interface DirectTenantEnv extends FlowsafeWorkerEnv {
 }
 
 const DIRECT_FENCE_WORKFLOW = 'direct-fence-probe';
+function continuationRuntime(env: DirectTenantEnv): RunnerRuntime {
+  const app = init(env);
+  const step = app.createStep({
+    id: DIRECT_CONTINUATION_STEP,
+    inputSchema: continuationInputSchema,
+    outputSchema: continuationOutputSchema,
+    resumeSchema: continuationResumeSchema,
+    suspendSchema: continuationSuspendSchema,
+    execute: async ({ inputData, resumeData, suspend }) => {
+      if (!resumeData) return suspend({ reason: 'awaiting-resume' });
+      return {
+        challenge: inputData.challenge,
+        release: env.APPLICATION_RELEASE as '1' | '2',
+      };
+    },
+  });
+  app
+    .createWorkflow({
+      id: DIRECT_CONTINUATION_WORKFLOW,
+      inputSchema: continuationInputSchema,
+      outputSchema: continuationOutputSchema,
+    })
+    .then(step)
+    .commit();
+  return app.runtime;
+}
 
 interface FenceOutcome {
   response: Response;
@@ -247,7 +283,14 @@ async function handleFenceMutate(
 }
 
 const config: FlowsafeWorkerConfig<DirectTenantEnv> = {
-  workflows: [],
+  workflows: [
+    {
+      id: DIRECT_CONTINUATION_WORKFLOW,
+      title: 'Direct continuation proof',
+      description: 'Suspends under release A and resumes under release B.',
+      sampleInput: { challenge: '0'.repeat(64) },
+    },
+  ],
   systemPrincipalId: 'direct-conformance',
   mutationEpoch: (env) => directTenantMutationEpoch(env.APPLICATION_RELEASE),
   buildVerifier(env) {
@@ -262,6 +305,25 @@ const config: FlowsafeWorkerConfig<DirectTenantEnv> = {
   maintenance: {
     sweepIntervalMs: 60 * 60_000,
     purgeIntervalMs: 60 * 60_000,
+  },
+  async beforeStart(_context, _env, workflowId, inputData) {
+    if (
+      workflowId === DIRECT_CONTINUATION_WORKFLOW &&
+      !continuationInputSchema.safeParse(inputData).success
+    )
+      throw new RunRouteError(400, 'invalid continuation input');
+  },
+  async beforeResume(_context, _env, workflowId, _runId, body) {
+    if (workflowId !== DIRECT_CONTINUATION_WORKFLOW) return;
+    const parsed = z
+      .object({
+        step: z.literal(DIRECT_CONTINUATION_STEP),
+        resumeData: continuationResumeSchema,
+      })
+      .strict()
+      .safeParse(body);
+    if (!parsed.success)
+      throw new RunRouteError(400, 'invalid continuation resume');
   },
   async preRoutes(request, env, _ctx, kit) {
     const path = new URL(request.url).pathname;
@@ -322,7 +384,7 @@ const config: FlowsafeWorkerConfig<DirectTenantEnv> = {
 
 export class Runner extends DurableObjectRunner<DirectTenantEnv> {
   protected build(env: DirectTenantEnv): RunnerRuntime {
-    return init(env).runtime;
+    return continuationRuntime(env);
   }
 
   protected runOwnership(env: DirectTenantEnv) {

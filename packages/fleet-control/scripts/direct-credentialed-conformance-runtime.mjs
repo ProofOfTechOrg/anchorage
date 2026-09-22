@@ -18,15 +18,21 @@ import {
   inspectDirectEvidence,
   writeDirectEvidence,
 } from './direct-credentialed-evidence.mjs';
+import {
+  reconcileDirectInvocation,
+  resolveDirectReferenceEndpoint,
+} from './direct-credentialed-invocation.mjs';
 import { validateProviderAuth } from './direct-credentialed-provider.mjs';
 import {
   DIRECT_RUN_TIMESTAMP,
   DirectRunStateError,
   inspectDirectRunState,
+  isAbandonedDirectScenario,
   openDirectRunState,
 } from './direct-credentialed-run-state.mjs';
 import { runDirectCredentialedScenario } from './direct-credentialed-scenario.mjs';
 import { DIRECT_SCENARIO_MIN_INVOCATIONS } from './direct-credentialed-scenario-budget.mjs';
+import { runDirectCredentialedSweep } from './direct-credentialed-sweep.mjs';
 import { teardownDirectReference } from './direct-credentialed-teardown.mjs';
 
 const packageDirectory = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -226,8 +232,10 @@ export async function runDirectConformance(input) {
     preflight: preflightDirectConformance,
     openRunState: openDirectRunState,
     inspectRunState: inspectDirectRunState,
+    reconcileInvocation: reconcileDirectInvocation,
     bootstrap: bootstrapDirectConformance,
     scenario: runDirectCredentialedScenario,
+    sweep: runDirectCredentialedSweep,
     teardown: teardownDirectReference,
     writeEvidence: writeDirectEvidence,
     distPresent: () => existsSync(join(packageDirectory, 'dist', 'index.js')),
@@ -382,7 +390,6 @@ export async function runDirectConformance(input) {
   };
   let code;
   let detail;
-  let invocationFailureDetail;
   let summary;
   try {
     if (!modules.distPresent())
@@ -405,6 +412,27 @@ export async function runDirectConformance(input) {
         ...stateInput,
         mode: input.mode,
         now: now(),
+        reprobe: async ({ lastInvocation, bootstrap }) => {
+          if (!bootstrap) return 'unreachable';
+          try {
+            const { endpoint } = resolveDirectReferenceEndpoint(
+              prepared,
+              bootstrap.context.accountWorkersDevSubdomain,
+            );
+            return await modules.reconcileInvocation({
+              endpoint,
+              secret: input.env.FLEET_DIRECT_CONFORMANCE_INVOKE_SECRET,
+              configSha256: prepared.configSha256,
+              ordinal: lastInvocation.ordinal,
+              requestSha256: lastInvocation.requestSha256,
+              workerDeadlineMs:
+                prepared.config.referenceWorker.invocationTimeoutMs,
+              ...(input.fetch ? { fetch: input.fetch } : {}),
+            });
+          } catch {
+            return 'unreachable';
+          }
+        },
       });
     } catch (error) {
       if (
@@ -433,10 +461,17 @@ export async function runDirectConformance(input) {
         snapshot.teardown?.phase === 'complete' &&
         snapshot.teardown.failure === null
       ) {
+        const abandoned = isAbandonedDirectScenario(snapshot.scenario);
         outcome = {
-          status: 'cleaned',
-          exitCode: exits.success,
-          teardownCall: null,
+          status: abandoned ? 'failed' : 'cleaned',
+          exitCode: abandoned ? exits.failed : exits.success,
+          teardownCall: abandoned
+            ? {
+                status: 'cleaned',
+                failure: null,
+                providerRequests: snapshot.teardown.providerRequests,
+              }
+            : null,
         };
       } else {
         const networkInput = {
@@ -446,16 +481,35 @@ export async function runDirectConformance(input) {
           ...(input.fetch ? { fetch: input.fetch } : {}),
         };
         let restart = false;
+        let invocation;
+        const abandoned = isAbandonedDirectScenario(snapshot.scenario);
+        if (abandoned && !journal.teardownStarted()) {
+          try {
+            invocation = await modules.bootstrap({
+              ...networkInput,
+              invokeSecret: input.env.FLEET_DIRECT_CONFORMANCE_INVOKE_SECRET,
+            });
+            await modules.sweep({
+              ...networkInput,
+              invocation,
+            });
+          } catch {
+            // A bootstrap refusal leaves no invocation client. Teardown reads
+            // the missing complete sweep and records a refusal before any
+            // control-plane deletion.
+          }
+        }
         // No recorded teardown and no settled scenario. This predicate's
         // complement — a recorded teardown, a failed scenario, a complete
         // scenario — skips straight to teardown on the journal's own record.
         if (
+          !abandoned &&
           snapshot.teardown === undefined &&
           (snapshot.scenario === undefined ||
             (snapshot.scenario.failure === null &&
               snapshot.scenario.phase !== 'complete'))
         ) {
-          const invocation = await modules.bootstrap({
+          invocation = await modules.bootstrap({
             ...networkInput,
             invokeSecret: input.env.FLEET_DIRECT_CONFORMANCE_INVOKE_SECRET,
           });
@@ -463,12 +517,22 @@ export async function runDirectConformance(input) {
             ...networkInput,
             invocation,
           });
-          if (
-            scenario.status === 'failed' &&
-            scenario.reason === 'outcome-unknown'
-          )
-            invocationFailureDetail = scenario.detail;
           restart = scenario.status === 'restart-required';
+          if (
+            !restart &&
+            invocation &&
+            isAbandonedDirectScenario(journal.snapshot().scenario) &&
+            !journal.teardownStarted()
+          ) {
+            try {
+              await modules.sweep({
+                ...networkInput,
+                invocation,
+              });
+            } catch {
+              // Teardown records the missing complete sweep before deletion.
+            }
+          }
         }
         if (restart) {
           outcome = {
@@ -482,12 +546,17 @@ export async function runDirectConformance(input) {
             ...networkInput,
             ...(input.delay ? { delay: input.delay } : {}),
           });
+          const postTeardownAbandoned = isAbandonedDirectScenario(
+            journal.snapshot().scenario,
+          );
           const status =
-            teardown.status === 'cleaned'
-              ? 'cleaned'
-              : journal.snapshot().teardown?.phase === 'refused'
-                ? 'failed'
-                : 'retained';
+            teardown.status === 'cleaned' && postTeardownAbandoned
+              ? 'failed'
+              : teardown.status === 'cleaned'
+                ? 'cleaned'
+                : journal.snapshot().teardown?.phase === 'refused'
+                  ? 'failed'
+                  : 'retained';
           outcome = {
             status,
             exitCode:
@@ -534,7 +603,6 @@ export async function runDirectConformance(input) {
         const snapshot = journal ? journal.snapshot() : inspection.snapshot;
         evidence = buildDirectEvidence({
           snapshot,
-          invocationFailureDetail,
           prepared,
           mode: input.mode,
           outcome,

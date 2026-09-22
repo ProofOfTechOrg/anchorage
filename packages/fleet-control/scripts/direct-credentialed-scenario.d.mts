@@ -29,6 +29,15 @@ import type { DirectFixtureRole } from './direct-credentialed-spec.js';
 
 type Role = DirectFixtureRole;
 type NormalRole = DirectScenarioNormalRole;
+type RoleAWorkerVersionObservation = Omit<
+  DirectWorkerVersionObservation,
+  'role'
+> &
+  Readonly<{ role: 'a' }>;
+type RoleASettlementEffect = Omit<DirectSettlementEffect, 'role'> &
+  Readonly<{ role: 'a' }>;
+type RoleAVerifiedExport = Omit<DirectVerifiedExport, 'role'> &
+  Readonly<{ role: 'a' }>;
 
 export type { DirectScenarioOperationSlot } from './direct-credentialed-scenario-checks.mjs';
 export type { DirectScenarioPhase };
@@ -55,6 +64,7 @@ interface ScenarioCall {
    * and other calls omit it. Declared last, as `callShape` persists it.
    */
   readonly before?: Readonly<{ databaseId: string; scriptName: string }> | null;
+  readonly witness?: Readonly<Record<string, unknown>>;
 }
 interface ScenarioProcess {
   readonly pid: number;
@@ -143,6 +153,22 @@ export interface DirectScenarioProofs {
   readonly final: Readonly<
     Record<NormalRole, DirectWorkerVersionObservation | null>
   >;
+  readonly identities: Readonly<Record<NormalRole, unknown | null>>;
+  readonly reprovision: Readonly<
+    Record<'a', RoleAWorkerVersionObservation | null>
+  >;
+  readonly reprovisionFinal: Readonly<
+    Record<'a', RoleAWorkerVersionObservation | null>
+  >;
+  readonly reprovisionSettlement: Readonly<
+    Record<'a', RoleASettlementEffect | null>
+  >;
+  readonly continuation: Readonly<
+    Record<
+      'started' | 'locked' | 'versionB' | 'refused' | 'reopened' | 'finished',
+      Readonly<Record<string, unknown>> | null
+    >
+  >;
   readonly objects: Readonly<
     Record<NormalRole, Readonly<{ size: number; sha256: string }> | null>
   >;
@@ -185,10 +211,37 @@ export interface DirectScenarioProofs {
   readonly effects: readonly DirectSettlementEffect[];
   readonly cleanup: CleanupTerminalReceipt | null;
   readonly exports: Readonly<Record<NormalRole, DirectVerifiedExport | null>>;
-  readonly exportVerifications: readonly DirectVerifiedExport[];
+  readonly reprovisionExports: Readonly<
+    Record<'a', RoleAVerifiedExport | null>
+  >;
+  readonly exportVerifications: readonly (
+    | Readonly<{
+        role: NormalRole;
+        cycle: null;
+        sourceInvocationOrdinal: number;
+        exportSha256: string;
+      }>
+    | Readonly<{
+        role: 'a';
+        cycle: 'reprovision';
+        sourceInvocationOrdinal: number;
+        exportSha256: string;
+      }>
+  )[];
   readonly decommission: Readonly<
     Record<
       NormalRole,
+      Readonly<{
+        operationId: string;
+        databaseId: string;
+        scriptName: string;
+        phase: 'decommissioned';
+      }> | null
+    >
+  >;
+  readonly redecommission: Readonly<
+    Record<
+      'a',
       Readonly<{
         operationId: string;
         databaseId: string;

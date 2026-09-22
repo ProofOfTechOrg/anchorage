@@ -15,6 +15,7 @@ import {
 import type { DirectConformanceNames } from './direct-credentialed-conformance-config.mjs';
 import { DIRECT_MAX_UPLOAD_BYTES } from './direct-credentialed-conformance-limits.mjs';
 import type { DirectRunManifest } from './direct-credentialed-conformance-preflight.mjs';
+import { directDeploymentModules } from './direct-credentialed-spec-modules.mjs';
 
 export type DirectFixtureRole = keyof DirectConformanceNames['roles'];
 export type DirectFixtureRelease = 'initial' | 'next' | 'failed-recovery';
@@ -39,12 +40,6 @@ export function directDeploymentSpec(
   secrets: DeploymentSecrets,
   provider: DirectProviderContext,
 ): CloudflareDeploymentSpec {
-  if (
-    !['a', 'b', 'recovery'].includes(role) ||
-    !['initial', 'next', 'failed-recovery'].includes(release) ||
-    (release === 'failed-recovery' && role !== 'recovery')
-  )
-    throw new Error('invalid direct fixture selection');
   if (manifest.contractVersion !== 1 || manifest.fixtureVersion !== 1)
     throw new Error('invalid direct fixture version');
   const subdomain = provider?.accountWorkersDevSubdomain;
@@ -53,23 +48,7 @@ export function directDeploymentSpec(
     !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u.test(subdomain)
   )
     throw new Error('invalid direct fixture account Workers.dev subdomain');
-  const artifact = manifest.tenantModule;
-  if (
-    new TextEncoder().encode(artifact.source).byteLength !==
-      artifact.byteLength ||
-    createHash('sha256').update(artifact.source).digest('hex') !==
-      artifact.sha256
-  )
-    throw new Error('invalid direct fixture artifact');
-  const wasm = manifest.tenantWasm.map((module) => {
-    const content = new Uint8Array(Buffer.from(module.base64, 'base64'));
-    if (
-      content.byteLength !== module.byteLength ||
-      createHash('sha256').update(content).digest('hex') !== module.sha256
-    )
-      throw new Error('invalid direct fixture Wasm artifact');
-    return { name: module.name, content, contentType: module.contentType };
-  });
+  const tenantModules = directDeploymentModules(manifest, role, release);
   const token = secrets.application?.APP_PROBE_TOKEN;
   if (typeof token !== 'string' || token.length === 0)
     throw new Error('missing direct fixture application secret');
@@ -88,15 +67,8 @@ export function directDeploymentSpec(
     databaseName: names.databaseName,
     ...manifest.deploymentRuntime,
     compatibilityFlags: [...manifest.deploymentRuntime.compatibilityFlags],
-    mainModule: artifact.name,
-    modules: [
-      {
-        name: artifact.name,
-        content: artifact.source,
-        contentType: artifact.contentType,
-      },
-      ...wasm,
-    ],
+    mainModule: manifest.tenantModule.name,
+    modules: tenantModules,
     authoredBy: 'platform',
     schemaVersion: next || failed ? 2 : 1,
     migrations: [
@@ -132,7 +104,10 @@ export function directDeploymentSpec(
     maintenanceBaseUrl: `https://${maintenanceHostname}`,
     routeHostname: names.routeHostname,
     application: {
-      vars: [{ name: 'APPLICATION_RELEASE', value: next ? '2' : '1' }],
+      vars: [
+        { name: 'APPLICATION_RELEASE', value: next ? '2' : '1' },
+        { name: 'APPROVAL_ALLOW_SELF_DECISION', value: 'true' },
+      ],
       secrets: [
         {
           name: 'APP_PROBE_TOKEN',
@@ -144,8 +119,8 @@ export function directDeploymentSpec(
   };
   validateDeploymentSpec(spec);
   validateDeploymentSecrets(spec, secrets);
-  const modules = [...spec.modules, plainWorkerIngressModule(spec)];
-  const uploadBytes = modules.reduce(
+  const uploadModules = [...spec.modules, plainWorkerIngressModule(spec)];
+  const uploadBytes = uploadModules.reduce(
     (sum, module) => sum + Buffer.byteLength(module.content),
     0,
   );

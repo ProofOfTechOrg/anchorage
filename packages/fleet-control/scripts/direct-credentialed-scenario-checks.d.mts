@@ -165,6 +165,14 @@ export function equal(actual: unknown, expected: unknown): void;
 export function parse(value: unknown): unknown;
 export function hash(value: string): string;
 export function jsonHash(value: unknown): string;
+export function suspensionSha256(
+  value: Readonly<{
+    runId: string;
+    status: string;
+    suspended: readonly (readonly string[])[];
+    suspendPayload: Readonly<Record<string, unknown>>;
+  }>,
+): string;
 export function zeroAttempts(): DirectInvocationAttempts;
 export function phaseInvocationReserve(phase: DirectScenarioPhase): number;
 export function checkInvocationHeadroom(

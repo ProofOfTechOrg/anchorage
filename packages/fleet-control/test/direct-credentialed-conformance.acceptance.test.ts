@@ -18,6 +18,7 @@ import {
   REFERENCE_SECRET_NAMES,
 } from '../scripts/direct-credentialed-reference-vocabulary.mjs';
 import { openDirectRunState } from '../scripts/direct-credentialed-run-state.mjs';
+import { databaseExportReceiptKey } from '../src/export-file-name.js';
 import { expectBuiltDist } from './fixtures/built-dist.js';
 import {
   directBridgePreamble,
@@ -89,6 +90,11 @@ async function fixture() {
     name: local.prepared.config.ownedHostname,
   });
   const exportedDatabases = [bootstrap.fleet, bootstrap.quota];
+  const expectedExportReceipts = [
+    { name: 'original-a', role: 'a', cycle: null },
+    { name: 'original-b', role: 'b', cycle: null },
+    { name: 'reprovisioned-a', role: 'a', cycle: 'reprovision' },
+  ] as const;
   for (const receipt of exportedDatabases)
     native.world.seedDatabase(receipt.name, { databaseId: receipt.uuid });
   native.buckets.set(
@@ -137,7 +143,8 @@ async function fixture() {
   return {
     local,
     native,
-    exportedDatabaseCount: exportedDatabases.length,
+    expectedExportReceipts,
+    exportedDatabaseCount: expectedExportReceipts.length,
     seededSecretCount: bindings.filter(
       (binding) => binding.type === 'secret_text',
     ).length,
@@ -250,10 +257,47 @@ describe.sequential('direct credentialed CLI native offline acceptance', {
       settledByReread: false,
       secretNameCount: f.seededSecretCount,
     });
+    const settledJournal = await openDirectRunState({
+      configPath: f.local.configPath,
+      prepared: f.local.prepared,
+      accountId: 'account',
+      mode: 'resume',
+    });
+    const settledSnapshot = settledJournal.snapshot();
+    await settledJournal.close();
+    const settledScenario = settledSnapshot.scenario;
+    if (!settledScenario) throw new Error('settled scenario absent');
+    expect(settledScenario).toMatchObject({
+      phase: 'complete',
+      failure: null,
+      proofs: {
+        exports: { a: expect.any(Object), b: expect.any(Object) },
+        reprovisionExports: { a: expect.any(Object) },
+      },
+    });
+    const expectedExportObjects = f.expectedExportReceipts.map((slot) => {
+      const proof =
+        slot.cycle === 'reprovision'
+          ? settledScenario.proofs.reprovisionExports.a
+          : settledScenario.proofs.exports[slot.role];
+      if (!proof) throw new Error(`${slot.name} export proof absent`);
+      return {
+        name: slot.name,
+        key: databaseExportReceiptKey(
+          f.local.prepared.config.resourcePrefix,
+          proof.receipt,
+        ),
+      };
+    });
     expect(cleaned.teardown.receipts.exportObjects).toMatchObject({
       count: f.exportedDatabaseCount,
       settledByReread: 0,
     });
+    const settledTeardown = settledSnapshot.teardown;
+    if (!settledTeardown) throw new Error('settled teardown absent');
+    expect(
+      settledTeardown.receipts.exportObjects.map(({ key }) => key).sort(),
+    ).toEqual(expectedExportObjects.map(({ key }) => key).sort());
     const residual = cleaned.teardown.residual;
     expect(residual).toMatchObject({
       bucketJurisdictions: ['default'],

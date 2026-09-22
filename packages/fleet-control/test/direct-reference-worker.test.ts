@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterEach, expect, it, vi } from 'vitest';
@@ -13,7 +14,11 @@ import {
   type DirectReferenceContext,
   type DirectReferenceEnvironment,
 } from '../scripts/direct-reference-context.js';
-import { DIRECT_REFERENCE_PATH } from '../scripts/direct-reference-contract.mjs';
+import { dispatchDirectContinuation } from '../scripts/direct-reference-continuation.js';
+import {
+  DIRECT_REFERENCE_PATH,
+  directReferenceRequestSha256,
+} from '../scripts/direct-reference-contract.mjs';
 import { DirectReferenceExecutionError } from '../scripts/direct-reference-http.js';
 import { DirectReferenceJournalError } from '../scripts/direct-reference-journal.js';
 import { DirectReferenceTransport } from '../scripts/direct-reference-transport.js';
@@ -28,6 +33,55 @@ vi.mock('../scripts/direct-reference-context.js', () => ({
 }));
 
 afterEach(() => vi.clearAllMocks());
+
+it.each([
+  409, 500,
+])('refuses a locked-resume HTTP %i instead of accepting it as fence evidence', async (status) => {
+  const manifest = directFixtureManifest({ maxProviderRequests: 400 });
+  const transport = new DirectReferenceTransport({
+    runtime: manifest.referenceRuntime,
+    startedAt: performance.now(),
+    signal: AbortSignal.timeout(5_000),
+    fetch: async () =>
+      Response.json(
+        {
+          error: 'wrong refusal',
+          reason: { code: 'EXECUTION_FENCED', state: 'migration-locked' },
+        },
+        { status },
+      ),
+  });
+  const record = { tenantTag: manifest.names.roles.a.tenantTag };
+  const context = {
+    control: { getDeployment: async () => record },
+    roleFor: () => 'a',
+    specFor: () => ({ routeHostname: manifest.names.roles.a.routeHostname }),
+    secrets: () => ({ application: { APP_PROBE_TOKEN: 'probe-token' } }),
+    transport,
+  } as unknown as DirectReferenceContext;
+  await expect(
+    dispatchDirectContinuation(
+      context,
+      manifest,
+      {
+        kind: 'tenant-continuation',
+        operation: 'resume-locked',
+        runId: 'run-id',
+      },
+      AbortSignal.timeout(5_000),
+    ),
+  ).rejects.toBeInstanceOf(DirectReferenceExecutionError);
+  const digest = (value: string) =>
+    createHash('sha256').update(value).digest('hex');
+  console.log(
+    'LV2_NEGATIVE locked-refusal',
+    JSON.stringify({
+      status,
+      before: digest('503:EXECUTION_FENCED:migration-locked'),
+      after: digest(`${status}:EXECUTION_FENCED:migration-locked`),
+    }),
+  );
+});
 
 async function closeWorkerFixtures(
   resumed: Pick<DirectRunJournal, 'close'> | undefined,
@@ -68,6 +122,11 @@ it.each([
         binding: { version: 1 },
         control: { getDeployment: async () => undefined },
         journal: {
+          receiveInvocation: async () => {
+            if (name === 'journal corruption') throw error;
+          },
+          settleReceivedInvocation: async () => {},
+          reconcileInvocation: async () => 'cancelled',
           readOperation: async () => {
             failures.push(transport.snapshot().failure);
             if (refusal) throw error;
@@ -115,7 +174,7 @@ it.each([
     for (const response of responses) {
       expect(response.status).toBe(corrupt ? 500 : 409);
       expect(await response.json()).toEqual({
-        contractVersion: 1,
+        contractVersion: 2,
         ok: false,
         error: { code: corrupt ? 'journal-state' : 'operation-refused' },
       });
@@ -200,6 +259,9 @@ it('classifies a raw Promise.all dispatch rejection after attempts exhaust', asy
         transport: current,
         control: { getDeployment: deployments },
         journal: {
+          receiveInvocation: async () => {},
+          settleReceivedInvocation: async () => {},
+          reconcileInvocation: async () => 'cancelled',
           readOperation() {
             const peer = Promise.resolve(undefined);
             peers.push(peer);
@@ -232,14 +294,21 @@ it('classifies a raw Promise.all dispatch rejection after attempts exhaust', asy
       } as unknown as DirectReferenceContext;
     },
   );
+  const core = {
+    contractVersion: 2,
+    configSha256: manifest.configSha256,
+    action: { kind: 'control-read' as const },
+  };
   const response = await createDirectReferenceWorker(manifest).fetch(
     new Request(`https://reference.test${DIRECT_REFERENCE_PATH}`, {
       method: 'POST',
       headers: { authorization: 'Bearer test-invoke' },
       body: JSON.stringify({
-        contractVersion: 1,
-        configSha256: manifest.configSha256,
-        action: { kind: 'control-read' },
+        ...core,
+        reservation: {
+          ordinal: 1,
+          requestSha256: directReferenceRequestSha256(core),
+        },
       }),
     }),
     {

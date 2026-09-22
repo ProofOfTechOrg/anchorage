@@ -353,7 +353,7 @@ describe.sequential('reference fence composition at release 1', {
         expect({ index, value }).toEqual({
           index,
           value: {
-            contractVersion: 1,
+            contractVersion: 2,
             ok: false,
             error: { code: 'operation-refused' },
           },

@@ -4,7 +4,16 @@ import type { Stats } from 'node:fs';
 import type { DirectConformanceNames } from './direct-credentialed-conformance-config.mjs';
 import type { PreparedDirectConformance } from './direct-credentialed-conformance-preflight.mjs';
 import type {
+  DirectReconciliationState,
   DirectResidualSurface,
+  DirectSweepAction,
+  DirectSweepBeforePhase,
+  DirectSweepCallAction,
+  DirectSweepCallOutcome,
+  DirectSweepCycle,
+  DirectSweepFailure,
+  DirectSweepFailureCode,
+  DirectSweepPhase,
   DirectTeardownFailure,
   DirectTeardownMutation,
   DirectTeardownPhase,
@@ -58,9 +67,17 @@ export interface DirectRunSnapshot {
           state: 'pending' | 'settled';
         }>)
     | null;
+  readonly reconciliations: readonly DirectInvocationReconciliation[];
   readonly bootstrap: DirectBootstrapState | null;
   readonly scenario?: DirectScenarioState;
+  readonly sweep?: DirectSweepState;
   readonly teardown?: DirectTeardownState;
+}
+
+export interface DirectInvocationReconciliation {
+  readonly ordinal: number;
+  readonly state: DirectReconciliationState;
+  readonly at: string;
 }
 
 export interface DirectBootstrapContext {
@@ -131,10 +148,62 @@ export interface DirectBootstrapState {
 
 export type {
   DirectResidualSurface,
+  DirectSweepAction,
+  DirectSweepBeforePhase,
+  DirectSweepCallAction,
+  DirectSweepCallOutcome,
+  DirectSweepCycle,
+  DirectSweepFailure,
+  DirectSweepFailureCode,
+  DirectSweepPhase,
   DirectTeardownFailure,
   DirectTeardownMutation,
   DirectTeardownPhase,
 } from './direct-credentialed-reference-vocabulary.mjs';
+
+export type DirectSweepRoleEntry =
+  | Readonly<{
+      kind: 'none';
+      cycle: DirectSweepCycle;
+      before: DirectSweepBeforePhase;
+    }>
+  | Readonly<{
+      kind: 'completed';
+      cycle: DirectSweepCycle;
+      before: DirectSweepBeforePhase;
+      action: Exclude<DirectSweepAction, 'none'>;
+      after: 'absent' | 'decommissioned';
+      ordinal: number;
+    }>
+  | Readonly<{
+      kind: 'refused';
+      cycle: DirectSweepCycle;
+      before: DirectSweepBeforePhase;
+      action: DirectSweepAction;
+      reason: DirectSweepFailure;
+    }>;
+
+export interface DirectSweepState {
+  readonly phase: DirectSweepPhase;
+  readonly roles: Readonly<
+    Record<'a' | 'b' | 'recovery', DirectSweepRoleEntry | null>
+  >;
+  readonly lastCall: Readonly<{
+    ordinal: number;
+    action: DirectSweepCallAction;
+    outcome: DirectSweepCallOutcome;
+    attempts: Readonly<{
+      provider: number;
+      maintenance: number;
+      application: number;
+    }> | null;
+  }> | null;
+  readonly failure: Readonly<{
+    code: DirectSweepFailureCode;
+    role: 'a' | 'b' | 'recovery';
+    reason: DirectSweepFailure;
+  }> | null;
+}
 
 export interface DirectResidualObservation {
   /**
@@ -215,9 +284,12 @@ export interface DirectRunJournal {
   readonly directory: string;
   snapshot(): DirectRunSnapshot;
   recordScenario(state: DirectScenarioState): Promise<void>;
+  recordSweep(state: DirectSweepState): Promise<void>;
   recordResume(): Promise<void>;
   recordTeardown(state: DirectTeardownState): Promise<void>;
   assertTeardownCapacity(worstCase: DirectTeardownState): Promise<void>;
+  assertSweepCapacity(worstCase: DirectSweepState): Promise<void>;
+  teardownStarted(): boolean;
   bindBootstrapContext(context: DirectBootstrapContext): Promise<void>;
   beginBootstrapMutation(kind: DirectBootstrapMutation): Promise<void>;
   confirmBootstrapMutation(
@@ -229,7 +301,13 @@ export interface DirectRunJournal {
   reserveInvocation(
     serializedRequest: string,
   ): Promise<DirectInvocationReservation>;
-  settleInvocation(reservation: DirectInvocationReservation): Promise<void>;
+  settleInvocation(
+    reservation: DirectInvocationReservation,
+    reconciliation?: Readonly<{
+      state: DirectReconciliationState;
+      at: string;
+    }>,
+  ): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -254,6 +332,8 @@ export const DIRECT_SCENARIO_FAILURE_DETAILS: readonly [
   'phase-ceiling',
   'run-reserve',
   'below-scenario-floor',
+  'lost-run-id-abandoned',
+  'prepared-invocation-abandoned',
 ];
 
 export const DIRECT_SCENARIO_OPERATION_SLOTS: readonly [
@@ -269,6 +349,8 @@ export const DIRECT_SCENARIO_OPERATION_SLOTS: readonly [
   'decommission-a',
   'decommission-b',
   'decommission-recovery',
+  'cleanup-a-reprovision',
+  'decommission-a-reprovision',
 ];
 
 export const DIRECT_RUN_MAX_JOURNAL_BYTES: number;
@@ -303,6 +385,10 @@ export function actionSummary(
  */
 export function isForceIdentity(value: unknown): boolean;
 
+export function isAbandonedDirectScenario(
+  scenario: DirectScenarioState | undefined,
+): boolean;
+
 export function openDirectRunState(
   input: Readonly<{
     configPath: string;
@@ -310,6 +396,16 @@ export function openDirectRunState(
     accountId: string;
     mode: 'run' | 'resume';
     now?: number;
+    reprobe?: (
+      input: Readonly<{
+        lastInvocation: DirectInvocationReservation &
+          Readonly<{
+            action: DirectRunActionSummary;
+            state: 'pending';
+          }>;
+        bootstrap: DirectBootstrapState | null;
+      }>,
+    ) => Promise<DirectReconciliationState | 'received' | 'unreachable'>;
   }>,
 ): Promise<DirectRunJournal>;
 

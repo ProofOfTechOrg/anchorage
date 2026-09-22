@@ -24,6 +24,7 @@ import {
 } from './direct-credentialed-reference-vocabulary.mjs';
 import {
   DirectRunStateError,
+  isAbandonedDirectScenario,
   mutationPending,
 } from './direct-credentialed-run-state.mjs';
 
@@ -42,10 +43,10 @@ const OBJECT_SETTLE_DELAY_MS = 2_000;
 // binds, sorted because a listing's order is the provider's. Reading the
 // upload's own list makes a bootstrap-side change visible here.
 const EXPECTED_SECRET_NAMES = Object.freeze([...REFERENCE_SECRET_NAMES].sort());
-// Exactly the two receipt objects a complete scenario exports; the journal's
+// Exactly the three receipt objects a complete scenario exports; the journal's
 // `exportObjects` maximum bounds what a record may carry and is not this
 // expectation.
-const CONFIRMED_EXPORT_KEYS = 2;
+const CONFIRMED_EXPORT_KEYS = 3;
 const BOOTSTRAP_RECEIPTS = Object.freeze([
   'fleet',
   'quota',
@@ -171,18 +172,22 @@ export function survivingIdentities(bootstrap, receipts) {
   });
 }
 
-function confirmedExportKeys(scenario, prefix) {
+function confirmedExportKeys(scenario, prefix, allowPartial) {
   const keys = [];
   const add = (proof) => {
     const receipt = proof?.receipt;
-    if (!receipt) refuse('invalid-state');
+    if (!receipt) {
+      if (allowPartial) return;
+      refuse('invalid-state');
+    }
     const key = databaseExportReceiptKey(prefix, receipt);
     if (!keys.includes(key)) keys.push(key);
   };
   add(scenario?.proofs.exports.a);
   add(scenario?.proofs.exports.b);
-  for (const proof of scenario?.proofs.exportVerifications ?? []) add(proof);
-  if (keys.length !== CONFIRMED_EXPORT_KEYS) refuse('invalid-state');
+  add(scenario?.proofs.reprovisionExports.a);
+  if (!allowPartial && keys.length !== CONFIRMED_EXPORT_KEYS)
+    refuse('invalid-state');
   return keys;
 }
 
@@ -261,22 +266,24 @@ export async function teardownDirectReference(input) {
     const names = bootstrap.context.names;
     const script = names.referenceWorker;
     const bucket = bootstrap.exports.name;
+    const receiptsPrefix = `${prefix}/receipts/v1/`;
     const zoneId = bootstrap.context.zoneId;
     // A recorded refusal is terminal for automation unless its reason is one a
-    // later run clears: an incomplete scenario, or an invocation, bootstrap or
-    // teardown mutation whose outcome was unknown. Each of those reasons is
-    // re-checked by the guard that raises it — the scenario operands in this
-    // expression, `mutationPending` above, and `mutate`'s own re-probe for the
-    // refusal it records; an identity mismatch, a forbidden answer and an
-    // exhausted budget stay terminal.
+    // later run clears. Teardown does not reconcile an invocation-level
+    // outcome-unknown; it only resumes its own pending provider mutation.
+    const abandoned = isAbandonedDirectScenario(snapshot.scenario);
+    const sweptAbandoned = abandoned && snapshot.sweep?.phase === 'complete';
     const refusing =
       (teardown?.phase === 'refused' &&
         !DIRECT_TEARDOWN_RECOVERABLE_FAILURES.includes(teardown.failure)) ||
-      snapshot.scenario?.phase !== 'complete' ||
-      snapshot.scenario.failure !== null;
+      // D-CC-24/25 permit an incomplete abandoned scenario to delete only
+      // after its lifecycle sweep has removed the tenant deployments.
+      (!sweptAbandoned &&
+        (snapshot.scenario?.phase !== 'complete' ||
+          snapshot.scenario.failure !== null));
     const confirmed = refusing
       ? []
-      : confirmedExportKeys(snapshot.scenario, prefix);
+      : confirmedExportKeys(snapshot.scenario, prefix, sweptAbandoned);
     const session = await openDirectProviderSession({
       apiToken,
       fetchRequest: (target, init) => {
@@ -617,7 +624,13 @@ export async function teardownDirectReference(input) {
               ordinal: ceiling,
               settledByReread: true,
             },
-            exportObjects: confirmed.map((key) => ({
+            exportObjects: (sweptAbandoned
+              ? Array.from(
+                  { length: DIRECT_TEARDOWN_MAXIMA.exportObjects },
+                  (_entry, index) => `${receiptsPrefix}capacity-${index}`,
+                )
+              : confirmed
+            ).map((key) => ({
               key,
               ordinal: ceiling,
               settledByReread: true,
@@ -734,7 +747,7 @@ export async function teardownDirectReference(input) {
           single.r2.buckets.objects.list(bucket, {
             ...selectors,
             jurisdiction: 'default',
-            ...(scoped ? { prefix: `${prefix}/receipts/v1/` } : {}),
+            ...(scoped ? { prefix: receiptsPrefix } : {}),
           }),
         )
       ).rows;
@@ -744,17 +757,38 @@ export async function teardownDirectReference(input) {
           refuse('unexpected-object');
       return rows;
     };
+    const admitAbandonedKeys = (rows) => {
+      for (const row of rows) {
+        const key = row?.key;
+        if (typeof key !== 'string' || !key.startsWith(receiptsPrefix))
+          refuse('unexpected-object');
+        if (!confirmed.includes(key)) confirmed.push(key);
+      }
+      if (
+        new Set([
+          ...confirmed,
+          ...receipts.exportObjects.map((entry) => entry.key),
+        ]).size > DIRECT_TEARDOWN_MAXIMA.exportObjects
+      )
+        refuse('unexpected-object');
+      return rows;
+    };
     // One attestation for the whole bucket sequence: the first call proves the
     // bucket, and each delete's `identity` reads that same proof.
     let attested;
     const attestBucket = () => (attested ??= bucketIdentity());
-    if (receipts.exportObjects.length < confirmed.length) {
+    if (
+      !receipts.exports &&
+      (sweptAbandoned || receipts.exportObjects.length < confirmed.length)
+    ) {
       // Ownership is attested before the content checks, so an unexpected
       // object cannot pre-empt the proof that this is the run's own bucket.
       // An absent bucket refuses as `provider-unavailable` here exactly as it
       // does from the listings.
       await attestBucket();
-      inspect(await listObjects(true));
+      const scoped = await listObjects(true);
+      if (sweptAbandoned) admitAbandonedKeys(scoped);
+      else inspect(scoped);
       inspect(await listObjects(false));
       for (const key of confirmed) {
         if (receipts.exportObjects.some((entry) => entry.key === key)) continue;

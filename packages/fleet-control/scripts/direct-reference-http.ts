@@ -11,10 +11,13 @@ import {
   type DirectReferenceErrorCode,
   type DirectReferenceRequest,
   DirectReferenceRequestError,
+  isDirectReferenceReadOnlyAction,
   readDirectReferenceRequest,
 } from './direct-reference-contract.mjs';
 import {
+  type DirectInvocationLedgerState,
   type DirectJournalErrorCode,
+  type DirectReferenceJournal,
   DirectReferenceJournalError,
 } from './direct-reference-journal.js';
 
@@ -43,6 +46,14 @@ export interface DirectReferenceHttpOptions {
     action: DirectReferenceAction,
     signal: AbortSignal,
   ) => Promise<unknown>;
+  readonly invocationJournal: (
+    signal: AbortSignal,
+  ) => Promise<
+    Pick<
+      DirectReferenceJournal,
+      'receiveInvocation' | 'settleReceivedInvocation' | 'reconcileInvocation'
+    >
+  >;
 }
 
 const requestStatus = {
@@ -50,10 +61,12 @@ const requestStatus = {
   'payload-too-large': 413,
   'invalid-utf8': 400,
   'run-binding-mismatch': 409,
+  'request-hash-mismatch': 409,
 } satisfies Record<DirectReferenceErrorCode, number>;
 const journalStatus = {
   'journal-state': 500,
   'run-binding-mismatch': 409,
+  'duplicate-ordinal': 409,
   'operation-mismatch': 409,
   'prerequisite-unavailable': 409,
   'missing-start': 409,
@@ -82,7 +95,7 @@ function failure(
   headers?: ConstructorParameters<typeof Headers>[0],
 ) {
   return response(
-    { contractVersion: 1, ok: false, error: { code } },
+    { contractVersion: 2, ok: false, error: { code } },
     status,
     headers,
   );
@@ -215,11 +228,34 @@ export async function handleDirectReferenceHttpRequest(
       signal.removeEventListener('abort', abortRead);
     }
     assertActive();
-    const result = await options.dispatch(input.action, signal);
+    const journal = await options.invocationJournal(signal);
     assertActive();
+    let result: unknown;
+    if (input.action.kind === 'reconcile-invocation') {
+      const state: DirectInvocationLedgerState =
+        await journal.reconcileInvocation(input.action);
+      result = { state };
+    } else {
+      const reservation = input.reservation;
+      if (reservation === null)
+        throw new DirectReferenceRequestError('invalid-request');
+      await journal.receiveInvocation(
+        reservation,
+        isDirectReferenceReadOnlyAction(input.action),
+      );
+      assertActive();
+      try {
+        result = await options.dispatch(input.action, signal);
+      } catch (error) {
+        await journal.settleReceivedInvocation(reservation, 'failed');
+        throw error;
+      }
+      await journal.settleReceivedInvocation(reservation, 'executed');
+      assertActive();
+    }
     const output = response(
       {
-        contractVersion: 1,
+        contractVersion: 2,
         configSha256: options.configSha256,
         action: input.action.kind,
         ok: true,

@@ -28,6 +28,7 @@ import {
   generateDirectDeploymentSecrets,
 } from '../scripts/direct-credentialed-spec.js';
 import {
+  DIRECT_CONTINUATION_WORKFLOW,
   DIRECT_TENANT_OBJECT_BODY,
   DIRECT_TENANT_OBJECT_KEY,
 } from '../scripts/direct-credentialed-tenant-object.mjs';
@@ -75,6 +76,7 @@ let entrypoint: string | undefined;
 function options(
   release: '1' | '2',
   token = secrets.application?.APP_PROBE_TOKEN ?? '',
+  allowSelfDecision = true,
 ) {
   if (!entrypoint) throw new Error('test ingress is not prepared');
   return {
@@ -90,6 +92,9 @@ function options(
             DEPLOYMENT_IDENTITY_SECRET: secrets.deploymentIdentity,
             MAINTENANCE_ADMIN_SECRET: secrets.maintenanceAdmin,
             APP_PROBE_TOKEN: token,
+            ...(allowSelfDecision
+              ? { APPROVAL_ALLOW_SELF_DECISION: 'true' }
+              : {}),
             APPLICATION_RELEASE: release,
             FLEET_SPEC_DIGEST: deploymentSpecDigest(
               release === '1' ? initial : next,
@@ -284,6 +289,104 @@ describe.sequential('direct tenant fixture in workerd', {
     expect(await response.json()).toEqual({ live: false });
   });
 
+  it('suspends the strict Zod continuation in the native Runner', async () => {
+    for (const inputData of [
+      {},
+      { challenge: 'a'.repeat(63) },
+      { challenge: 'A'.repeat(64) },
+      { challenge: 'a'.repeat(64), extra: true },
+    ]) {
+      const invalid = await appFetch('/runs', {
+        method: 'POST',
+        headers: applicationHeaders,
+        body: JSON.stringify({
+          workflowId: DIRECT_CONTINUATION_WORKFLOW,
+          inputData,
+        }),
+      });
+      expect(invalid.status).toBe(400);
+    }
+    const response = await appFetch('/runs', {
+      method: 'POST',
+      headers: applicationHeaders,
+      body: JSON.stringify({
+        workflowId: DIRECT_CONTINUATION_WORKFLOW,
+        inputData: { challenge: 'a'.repeat(64) },
+      }),
+    });
+    expect(response.status).toBe(200);
+    const summary = (await response.json()) as {
+      runId: string;
+      status: string;
+    };
+    expect(summary).toMatchObject({
+      runId: expect.any(String),
+      status: 'suspended',
+    });
+    for (const resumeData of [
+      { proceed: false },
+      { proceed: true, extra: true },
+    ]) {
+      const invalidResume = await appFetch(
+        `/runs/${DIRECT_CONTINUATION_WORKFLOW}/${summary.runId}/resume`,
+        {
+          method: 'POST',
+          headers: applicationHeaders,
+          body: JSON.stringify({ step: 'hold', resumeData }),
+        },
+      );
+      expect(invalidResume.status).toBe(400);
+    }
+    const status = await appFetch(
+      `/runs/${DIRECT_CONTINUATION_WORKFLOW}/${summary.runId}`,
+      { headers: applicationHeaders },
+    );
+    expect(await status.json()).toMatchObject({
+      runId: summary.runId,
+      status: 'suspended',
+    });
+  });
+
+  it('allows the single static-token actor to decide its approval only with the live self-decision binding', async () => {
+    try {
+      await server.update(options('1', undefined, false));
+      worker = server.getWorker<HarnessBindings>();
+      const started = await appFetch('/runs', {
+        method: 'POST',
+        headers: applicationHeaders,
+        body: JSON.stringify({
+          workflowId: DIRECT_CONTINUATION_WORKFLOW,
+          inputData: { challenge: 'b'.repeat(64) },
+        }),
+      });
+      expect(started.status).toBe(200);
+      const summary = (await started.json()) as {
+        runId?: string;
+        approval?: { id?: string };
+      };
+      const approvalId = summary.approval?.id;
+      if (!summary.runId || !approvalId)
+        throw new Error('native approval identity is missing');
+      const decide = () =>
+        appFetch(`/api/approvals/${approvalId}/decide`, {
+          method: 'POST',
+          headers: applicationHeaders,
+          body: JSON.stringify({ decision: 'approve' }),
+        });
+      expect((await decide()).status).toBe(403);
+      await server.update(options('1'));
+      worker = server.getWorker<HarnessBindings>();
+      const allowed = await decide();
+      expect(allowed.status).toBe(200);
+      expect(await allowed.json()).toMatchObject({
+        record: { id: approvalId, runId: summary.runId, status: 'approved' },
+      });
+    } finally {
+      await server.update(options('1'));
+      worker = server.getWorker<HarnessBindings>();
+    }
+  }, 30_000);
+
   it('runs retained-token reference probes through the native tenant across reloads', async () => {
     const forwarded: {
       url: string;
@@ -353,7 +456,7 @@ describe.sequential('direct tenant fixture in workerd', {
         const put = await reference.call(action('object-put'));
         expect(reference.bridgeErrors).toEqual([]);
         expect(put.value).toEqual({
-          contractVersion: 1,
+          contractVersion: 2,
           configSha256: reference.manifest.configSha256,
           action: 'tenant-probe',
           ok: true,
@@ -406,7 +509,7 @@ describe.sequential('direct tenant fixture in workerd', {
         await server.update(options('1', 'wrong-token'));
         worker = server.getWorker<HarnessBindings>();
         expect((await reference.call(action('health'))).value).toEqual({
-          contractVersion: 1,
+          contractVersion: 2,
           ok: false,
           error: { code: 'operation-refused' },
         });

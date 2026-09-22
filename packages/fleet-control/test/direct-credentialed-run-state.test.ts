@@ -30,17 +30,20 @@ import {
   type DirectBootstrapMutationReceipt,
   type DirectRunJournal,
   inspectDirectRunState,
+  isAbandonedDirectScenario,
   isForceIdentity,
   openDirectRunState,
 } from '../scripts/direct-credentialed-run-state.mjs';
 import { requireFact } from '../scripts/direct-credentialed-scenario-checks.mjs';
 import type { DirectOperationSlot } from '../scripts/direct-reference-journal.js';
 import {
+  abandonedScenario,
   bootstrapContext,
   cleanupDirectRunState,
   closed,
   completeScenario,
   completeScenarioJournal,
+  completeSweep,
   confirmedBootstrap,
   DIGEST,
   first,
@@ -52,12 +55,15 @@ import {
   type MutableScenario,
   type MutableTeardown,
   maximalScenario,
+  maximalSweep,
   maximalTeardown,
   opened,
   PROCESS,
   present,
   RESUMED,
   receipts,
+  recordMaximalReconciliations,
+  recordMaximalSweep,
   residualObservation,
   scenarioJournal,
   scenarioWith,
@@ -220,6 +226,7 @@ describeLinux('durable bootstrap state', () => {
     const original = JSON.parse(await readFile(path, 'utf8'));
     delete original.bootstrap;
     delete original.createdAt;
+    delete original.reconciliations;
     original.version = 1;
     await writeFile(path, JSON.stringify(original));
     const resumed = await opened({ ...f.input, mode: 'resume' });
@@ -315,10 +322,122 @@ describeLinux('durable bootstrap state', () => {
       expect(resumed.snapshot().bootstrap?.fleet).toEqual(
         receipts(f)[0].receipt,
       );
-    } else
-      await expect(
-        openDirectRunState({ ...f.input, mode: 'resume' }),
-      ).rejects.toMatchObject({ code: 'outcome-unknown' });
+    } else {
+      const resumed = await opened({ ...f.input, mode: 'resume' });
+      expect(resumed.snapshot().bootstrap?.pending).toBe('create-fleet-d1');
+      await expect(resumed.recordResume()).rejects.toMatchObject({
+        code: 'outcome-unknown',
+      });
+      await closed(resumed);
+    }
+  });
+
+  it.each([
+    {
+      kind: 'tenant-continuation' as const,
+      operation: 'start' as const,
+      challenge: 'a'.repeat(64),
+    },
+    {
+      kind: 'tenant-fence' as const,
+      role: 'a' as const,
+      operation: 'lock' as const,
+      expectedMutationEpoch: 0,
+      expectedRevision: 1,
+    },
+    { kind: 'migration-reprovision-a' as const },
+    {
+      kind: 'tenant-continuation' as const,
+      operation: 'resume-locked' as const,
+      runId: 'run-id',
+    },
+    {
+      kind: 'tenant-fence' as const,
+      role: 'a' as const,
+      operation: 'unlock' as const,
+      expectedMutationEpoch: 1,
+      expectedRevision: 2,
+    },
+    {
+      kind: 'tenant-continuation' as const,
+      operation: 'resume' as const,
+      runId: 'run-id',
+      approvalId: 'approval-id',
+    },
+  ])('refuses a settled $kind/$operation mutation without its witness', async (action) => {
+    const reading = {
+      state: 'migration-locked' as const,
+      mutationEpoch: 1,
+      requireMutationEpoch: true,
+      transitionRevision: 2,
+    };
+    const witness = (() => {
+      if (action.kind === 'migration-reprovision-a')
+        return {
+          kind: action.kind,
+          databaseId: 'database-id',
+          scriptName: 'script-name',
+          routeHostname: 'route.example.test',
+          initialVersionId: 'version-a',
+          finalVersionId: 'version-b',
+          initialSpecDigest: DIGEST,
+          targetSpecDigest: DIGEST,
+          settlementKey: DIGEST,
+        };
+      if (action.kind === 'tenant-fence')
+        return { kind: action.operation, before: reading, after: reading };
+      if (action.operation === 'start')
+        return {
+          kind: 'start' as const,
+          workflowId: 'workflow-id',
+          step: 'hold',
+          runId: 'run-id',
+          approvalId: 'approval-id',
+          status: 'suspended' as const,
+          challengeSha256: DIGEST,
+          suspensionSha256: DIGEST,
+          versionId: 'version-a',
+          emptyBeforeOrdinal: 1,
+        };
+      if (action.operation === 'resume-locked')
+        return {
+          kind: 'resume-locked' as const,
+          runId: action.runId,
+          status: 503 as const,
+          code: 'EXECUTION_FENCED' as const,
+          state: 'migration-locked' as const,
+        };
+      return {
+        kind: 'resume' as const,
+        runId: action.runId,
+        approvalId: action.approvalId,
+        status: 'success' as const,
+        challengeSha256: DIGEST,
+        resultSha256: DIGEST,
+        release: '2' as const,
+        approvalStatus: 'approved' as const,
+      };
+    })();
+    const { journal } = await scenarioJournal();
+    await refuses(
+      journal,
+      scenarioWith((state) => {
+        for (const call of [present(state.lastCall), present(state.mutation)]) {
+          call.action = action;
+          call.witness = structuredClone(witness);
+          const before = JSON.stringify(call);
+          delete call.witness;
+          console.log(
+            'LV2_NEGATIVE witness-gate',
+            JSON.stringify({
+              action: `${action.kind}:${'operation' in action ? action.operation : action.kind}`,
+              before: hash(before),
+              after: hash(JSON.stringify(call)),
+            }),
+          );
+        }
+      }, 'audit-page'),
+    );
   });
 
   it('rejects malformed context, extra receipt fields, missing prerequisites and invalid historical ordinals on resume', async () => {
@@ -490,6 +609,85 @@ describeLinux('durable direct invocation state', () => {
       JSON.parse(await readFile(join(f.runDirectory, 'journal.json'), 'utf8'))
         .invocationCount,
     ).toBe(1);
+  });
+
+  it.each([
+    'cancelled',
+    'executed',
+    'failed',
+  ] as const)('settles a pending reservation from terminal reconciliation %s while holding the run lock', async (state) => {
+    const f = await fixture();
+    const journal = await opened({ ...f.input, mode: 'run' });
+    const reservation = await journal.reserveInvocation(f.request());
+    await closed(journal);
+    const reprobe = vi.fn(async () => state);
+    const resumed = await opened({
+      ...f.input,
+      mode: 'resume',
+      now: Date.parse('2026-09-14T00:00:00.000Z'),
+      reprobe,
+    });
+    expect(reprobe).toHaveBeenCalledWith({
+      lastInvocation: expect.objectContaining({
+        ...reservation,
+        state: 'pending',
+      }),
+      bootstrap: null,
+    });
+    expect(resumed.snapshot()).toMatchObject({
+      lastInvocation: { ...reservation, state: 'settled' },
+      reconciliations: [
+        {
+          ordinal: reservation.ordinal,
+          state,
+          at: '2026-09-14T00:00:00.000Z',
+        },
+      ],
+    });
+  });
+
+  it.each([
+    'received',
+    'unreachable',
+  ] as const)('retains a pending reservation when reconciliation is %s', async (state) => {
+    const f = await fixture();
+    const journal = await opened({ ...f.input, mode: 'run' });
+    await journal.reserveInvocation(f.request());
+    await closed(journal);
+    const before = await readFile(join(f.runDirectory, 'journal.json'));
+    await expect(
+      openDirectRunState({
+        ...f.input,
+        mode: 'resume',
+        reprobe: async () => state,
+      }),
+    ).rejects.toMatchObject({ code: 'outcome-unknown' });
+    expect(await readFile(join(f.runDirectory, 'journal.json'))).toEqual(
+      before,
+    );
+  });
+
+  it('bounds reconciliation history and validates settlement evidence', async () => {
+    const f = await fixture(9);
+    const journal = await opened({ ...f.input, mode: 'run' });
+    for (let ordinal = 1; ordinal <= 9; ordinal++) {
+      const reservation = await journal.reserveInvocation(f.request());
+      if (ordinal === 9)
+        await expect(
+          journal.settleInvocation(reservation, {
+            state: 'received',
+            at: '2026-09-14T00:01:00.000Z',
+          } as never),
+        ).rejects.toMatchObject({ code: 'invalid-state' });
+      await journal.settleInvocation(reservation, {
+        state: ordinal % 2 === 0 ? 'executed' : 'failed',
+        at: new Date(Date.UTC(2026, 8, 14, 0, 0, ordinal)).toISOString(),
+      });
+    }
+    expect(journal.snapshot().reconciliations).toHaveLength(8);
+    expect(
+      journal.snapshot().reconciliations.map(({ ordinal }) => ordinal),
+    ).toEqual([2, 3, 4, 5, 6, 7, 8, 9]);
   });
 
   it('serializes concurrent reservations and waits for queued writes before close', async () => {
@@ -1250,18 +1448,20 @@ describeLinux('durable scenario state', () => {
     'b',
   ] as const)('refuses fence ordinals above invocationCount for role %s', async (role) => {
     const { journal } = await scenarioJournal();
+    const overflow = journal.snapshot().invocationCount + 1;
     for (const group of ['drain', 'reopen', 'probes'] as const)
       await refuses(
         journal,
         scenarioWith((state) => {
-          present(state.proofs.fence[group][role]).ordinal = 4;
+          present(state.proofs.fence[group][role]).ordinal = overflow;
         }),
       );
     for (const member of ['first', 'second'] as const)
       await refuses(
         journal,
         scenarioWith((state) => {
-          present(present(state.proofs.fence.sweeps[role])[member]).ordinal = 4;
+          present(present(state.proofs.fence.sweeps[role])[member]).ordinal =
+            overflow;
         }),
       );
   });
@@ -1420,9 +1620,10 @@ describeLinux('durable scenario state', () => {
       await refuses(journal, state);
     }
     const fresh = await scenarioJournal();
+    const overflow = fresh.journal.snapshot().invocationCount + 1;
     for (const malformed of [
       { ...proof, ordinal: -1 },
-      { ...proof, ordinal: 4 },
+      { ...proof, ordinal: overflow },
       { ...proof, attempts: { provider: -1, maintenance: 0, application: 0 } },
     ]) {
       state.proofs.terminalForce.a = malformed;
@@ -1478,7 +1679,9 @@ describeLinux('durable scenario state', () => {
 
   it('publishes a maximal scenario inside the journal byte bound', async () => {
     const { f, journal } = await scenarioJournal();
+    await recordMaximalReconciliations(journal);
     await journal.recordScenario(maximalScenario('audit-page'));
+    await recordMaximalSweep(journal);
     const migrationBytes = Buffer.byteLength(
       await readFile(join(f.runDirectory, 'journal.json'), 'utf8'),
     );
@@ -1495,6 +1698,15 @@ describeLinux('durable scenario state', () => {
       discover: { evidenceSha256: DIGEST, evidenceCount: MAX_COUNT },
       verify: { evidenceSha256: DIGEST, evidenceCount: MAX_COUNT },
     });
+  });
+
+  it('measures maximal sweep capacity against a live abandoned journal', async () => {
+    const { journal } = await scenarioJournal(1000);
+    await journal.recordScenario(abandonedScenario());
+    await expect(
+      journal.assertSweepCapacity(maximalSweep()),
+    ).resolves.toBeUndefined();
+    expect(journal.snapshot().sweep).toBeUndefined();
   });
 
   it('pins the scenario failure vocabularies its producers are typed against', () => {
@@ -1521,6 +1733,8 @@ describeLinux('durable scenario state', () => {
       'phase-ceiling',
       'run-reserve',
       'below-scenario-floor',
+      'lost-run-id-abandoned',
+      'prepared-invocation-abandoned',
     ]);
     for (const vocabulary of [
       DIRECT_SCENARIO_FAILURES,
@@ -1538,6 +1752,27 @@ describeLinux('durable scenario state', () => {
     ).toThrowError(code);
   });
 
+  it('classifies only explicit abandoned failure details', () => {
+    const scenario = completeScenario();
+    scenario.lastCall = {
+      ordinal: 9,
+      action: { kind: 'control-read' },
+      outcome: 'prepared',
+      attempts: null,
+      migration: null,
+    };
+    scenario.mutation = null;
+    scenario.failure = { code: 'proof-unavailable', ordinal: 8 };
+    expect(isAbandonedDirectScenario(scenario)).toBe(false);
+    for (const detail of [
+      'lost-run-id-abandoned',
+      'prepared-invocation-abandoned',
+    ] as const) {
+      scenario.failure = { code: 'proof-unavailable', ordinal: 8, detail };
+      expect(isAbandonedDirectScenario(scenario)).toBe(true);
+    }
+  });
+
   it('publishes the journal fields in the order the decoder establishes', async () => {
     const { f, journal } = await scenarioJournal();
     await journal.recordScenario(maximalScenario());
@@ -1551,6 +1786,7 @@ describeLinux('durable scenario state', () => {
       'binding',
       'invocationCount',
       'lastInvocation',
+      'reconciliations',
       'bootstrap',
       'scenario',
     ]);
@@ -1578,33 +1814,34 @@ describeLinux('durable scenario state', () => {
 
   it('refuses ordinals the durable invocation count cannot account for', async () => {
     const { journal } = await scenarioJournal();
+    const overflow = journal.snapshot().invocationCount + 1;
     for (const mutate of [
       (state: MutableScenario) => {
-        state.startedOrdinal = 4;
+        state.startedOrdinal = overflow;
       },
       (state: MutableScenario) => {
-        state.callCount = 4;
+        state.callCount = 5;
       },
       (state: MutableScenario) => {
         state.callCount = 2;
       },
       (state: MutableScenario) => {
-        state.reconciledOrdinal = 4;
+        state.reconciledOrdinal = overflow;
       },
       (state: MutableScenario) => {
         state.phaseCalls['provision-a'] = 2;
       },
       (state: MutableScenario) => {
-        present(state.lastCall).ordinal = 4;
+        present(state.lastCall).ordinal = overflow;
       },
       (state: MutableScenario) => {
         present(state.lastCall).attempts = null;
       },
       (state: MutableScenario) => {
-        present(state.proofs.exports.a).sourceInvocationOrdinal = 4;
+        present(state.proofs.exports.a).sourceInvocationOrdinal = overflow;
       },
       (state: MutableScenario) => {
-        first(state.proofs.health).ordinal = 4;
+        first(state.proofs.health).ordinal = overflow;
       },
       (state: MutableScenario) => {
         present(state.proofs.restart).replayOrdinal = 1;
@@ -1691,7 +1928,7 @@ describeLinux('durable scenario state', () => {
       ? true
       : false = true;
     expect({ count: slots.length, unlisted }).toEqual({
-      count: 12,
+      count: 14,
       unlisted: true,
     });
   });
@@ -1880,8 +2117,73 @@ describeLinux('durable scenario state', () => {
     });
   });
 
+  it.each([
+    [
+      'finished empty-work ordinal beyond the invocation count',
+      (state: MutableScenario) => {
+        present(state.proofs.continuation.finished).emptyAfterOrdinal = 9;
+      },
+    ],
+    [
+      'unordered continuation source ordinals',
+      (state: MutableScenario) => {
+        for (const proof of Object.values(state.proofs.continuation))
+          present(proof).sourceInvocationOrdinal = 2;
+      },
+    ],
+    [
+      'role b reprovision export',
+      (state: MutableScenario) => {
+        const proof = present(state.proofs.reprovisionExports.a) as unknown as {
+          role: string;
+        };
+        proof.role = 'b';
+      },
+    ],
+    [
+      'role b reprovision settlement',
+      (state: MutableScenario) => {
+        const proof = present(
+          state.proofs.reprovisionSettlement.a,
+        ) as unknown as { role: string };
+        proof.role = 'b';
+      },
+    ],
+    [
+      'role b reprovision history reference',
+      (state: MutableScenario) => {
+        const reference = present(
+          state.proofs.exportVerifications.find(
+            ({ cycle }) => cycle === 'reprovision',
+          ),
+        ) as unknown as { role: string };
+        reference.role = 'b';
+      },
+    ],
+    [
+      'finished approval from another start',
+      (state: MutableScenario) => {
+        present(state.proofs.continuation.finished).approvalId =
+          'different-approval';
+      },
+    ],
+    [
+      'empty-before ordinal at the start invocation',
+      (state: MutableScenario) => {
+        const started = present(state.proofs.continuation.started);
+        started.emptyBeforeOrdinal = started.sourceInvocationOrdinal;
+      },
+    ],
+  ] as const)('refuses %s', async (_name, mutate) => {
+    const { journal } = await scenarioJournal();
+    const state = completeScenario();
+    mutate(state);
+    await refuses(journal, state);
+  });
+
   it('refuses a phase regression, a phase skip and a weakened proof after publication', async () => {
     const { journal } = await scenarioJournal();
+    const overflow = journal.snapshot().invocationCount + 1;
     await journal.recordScenario(maximalScenario());
     await refuses(
       journal,
@@ -1897,7 +2199,7 @@ describeLinux('durable scenario state', () => {
     await refuses(journal, maximalScenario());
     for (const mutate of [
       (state: MutableScenario) => {
-        state.startedOrdinal = 1;
+        state.startedOrdinal = overflow;
       },
       (state: MutableScenario) => {
         state.attempts.provider = 0;
@@ -1922,12 +2224,17 @@ describeLinux('durable scenario state', () => {
         present(state.proofs.exports.a).sourceInvocationOrdinal = 0;
       },
       (state: MutableScenario) => {
+        state.proofs.exportVerifications[1] = {
+          ...present(state.proofs.exportVerifications[0]),
+        };
+      },
+      (state: MutableScenario) => {
         present(state.proofs.restart).resumedProcess = { ...RESUMED, pid: 3 };
       },
       (state: MutableScenario) => {
         present(state.failure).code = 'proof-unavailable';
       },
-    ])
+    ]) {
       await refuses(
         journal,
         scenarioWith((state) => {
@@ -1935,6 +2242,7 @@ describeLinux('durable scenario state', () => {
           mutate(state);
         }),
       );
+    }
   });
 });
 
@@ -1951,6 +2259,101 @@ function filledReceipts(state: MutableTeardown) {
   state.receipts.quota = { uuid: 'quota-uuid', ...settlement() };
 }
 
+describeLinux('durable sweep state', () => {
+  const sweeping = () => ({
+    phase: 'sweeping' as const,
+    roles: { a: null, b: null, recovery: null },
+    lastCall: null,
+    failure: null,
+  });
+
+  it('records monotonic sweep transitions and preserves settled roles', async () => {
+    const { journal } = await scenarioJournal();
+    await journal.recordSweep(sweeping());
+    const complete = completeSweep();
+    await journal.recordSweep(complete);
+    expect(journal.snapshot().sweep).toEqual(complete);
+    await expect(journal.recordSweep(sweeping())).rejects.toMatchObject({
+      code: 'invalid-state',
+    });
+  });
+
+  it('settles a prepared sweep call at the same invocation ordinal', async () => {
+    const { f, journal } = await scenarioJournal();
+    const ordinal = journal.snapshot().invocationCount + 1;
+    await journal.recordSweep({
+      ...sweeping(),
+      lastCall: {
+        ordinal,
+        action: 'control-read',
+        outcome: 'prepared',
+        attempts: null,
+      },
+    });
+    const reservation = await journal.reserveInvocation(f.request());
+    await journal.settleInvocation(reservation);
+    await journal.recordSweep({
+      ...sweeping(),
+      lastCall: {
+        ordinal,
+        action: 'control-read',
+        outcome: 'returned',
+        attempts: { provider: 0, maintenance: 0, application: 0 },
+      },
+    });
+    expect(journal.snapshot().sweep?.lastCall).toMatchObject({
+      ordinal,
+      outcome: 'returned',
+    });
+    const refused = {
+      ...sweeping(),
+      phase: 'refused' as const,
+      roles: {
+        a: null,
+        b: null,
+        recovery: {
+          kind: 'refused' as const,
+          cycle: 'original' as const,
+          before: 'ready' as const,
+          action: 'force' as const,
+          reason: 'unrecognized-answer' as const,
+        },
+      },
+      lastCall: journal.snapshot().sweep?.lastCall ?? null,
+      failure: {
+        code: 'sweep-refused' as const,
+        role: 'recovery' as const,
+        reason: 'unrecognized-answer' as const,
+      },
+    };
+    await journal.recordSweep(refused);
+    expect(journal.snapshot().sweep).toEqual(refused);
+  });
+
+  it('admits a refused teardown with no receipts and blocks after a destructive receipt', async () => {
+    const firstRun = await completeScenarioJournal();
+    await firstRun.journal.recordTeardown(
+      teardownWith((state) => {
+        state.phase = 'refused';
+        state.failure = 'scenario-incomplete';
+      }),
+    );
+    await firstRun.journal.recordSweep(sweeping());
+    expect(firstRun.journal.snapshot().sweep?.phase).toBe('sweeping');
+
+    const second = await completeScenarioJournal();
+    await second.journal.recordTeardown(
+      teardownWith((state) => {
+        state.phase = 'ingress';
+        state.receipts.ingress = { ordinal: 1, settledByReread: false };
+      }),
+    );
+    await expect(second.journal.recordSweep(sweeping())).rejects.toMatchObject({
+      code: 'invalid-state',
+    });
+  });
+});
+
 describeLinux('durable teardown state', () => {
   it('publishes teardown after scenario and leaves the earlier bytes unchanged', async () => {
     const { f, journal } = await completeScenarioJournal();
@@ -1965,6 +2368,7 @@ describeLinux('durable teardown state', () => {
       'binding',
       'invocationCount',
       'lastInvocation',
+      'reconciliations',
       'bootstrap',
       'scenario',
       'teardown',
@@ -2027,10 +2431,12 @@ describeLinux('durable teardown state', () => {
       (state) => {
         filledReceipts(state);
         state.phase = 'export-objects';
-        state.receipts.exportObjects = ['one', 'two', 'three'].map((key) => ({
-          key,
-          ...settlement(),
-        }));
+        state.receipts.exportObjects = ['one', 'two', 'three', 'four'].map(
+          (key) => ({
+            key,
+            ...settlement(),
+          }),
+        );
       },
       (state) => {
         filledReceipts(state);
@@ -2199,6 +2605,9 @@ describeLinux('durable teardown state', () => {
   it('accepts the worst-case teardown inside the byte bound and refuses an undecodable one without poisoning', async () => {
     const { f, journal } = await completeScenarioJournal();
     const path = join(f.runDirectory, 'journal.json');
+    await recordMaximalReconciliations(journal);
+    await recordMaximalSweep(journal);
+    expect(journal.snapshot().sweep).toEqual(maximalSweep());
     await journal.assertTeardownCapacity(maximalTeardown());
     expect(journal.snapshot().teardown).toBeUndefined();
     const stored = await readFile(path, 'utf8');
@@ -2314,9 +2723,23 @@ describeLinux('CLI metadata and inspection', () => {
     await closed(journal);
     const path = join(f.runDirectory, 'journal.json');
     const before = await readFile(path);
-    await expect(
-      openDirectRunState({ ...f.input, mode: 'resume' }),
-    ).rejects.toMatchObject({ code: 'outcome-unknown' });
+    if (pending === 'invocation')
+      await expect(
+        openDirectRunState({ ...f.input, mode: 'resume' }),
+      ).rejects.toMatchObject({ code: 'outcome-unknown' });
+    else {
+      const reprobe = vi.fn(async () => 'executed' as const);
+      const resumed = await opened({
+        ...f.input,
+        mode: 'resume',
+        reprobe,
+      });
+      expect(reprobe).not.toHaveBeenCalled();
+      await expect(resumed.recordResume()).rejects.toMatchObject({
+        code: 'outcome-unknown',
+      });
+      await closed(resumed);
+    }
     const inspection = await inspectDirectRunState({
       ...f.input,
       mode: 'inspect',

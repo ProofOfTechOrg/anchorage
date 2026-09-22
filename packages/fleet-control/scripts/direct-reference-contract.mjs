@@ -1,10 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import { createHash } from 'node:crypto';
 import { readBoundedBody } from '@proofoftech/flowsafe/host-kit';
 
+// The path identifies the authenticated transport; the envelope version
+// identifies the request and response body contract carried over it.
 export const DIRECT_REFERENCE_PATH =
   '/.well-known/anchorage/direct-conformance/v1/actions';
 export const DIRECT_REFERENCE_BODY_LIMIT = 16 * 1024;
+
+const READ_ONLY_ACTIONS = new Map([
+  ['control-read', null],
+  ['inventory-read', null],
+  ['audit-page', null],
+  ['migration-page', null],
+  ['cleanup-receipt', null],
+  ['decommission-export', null],
+  ['tenant-probe', new Set(['health', 'object-read'])],
+  ['tenant-fence', new Set(['read', 'inventory'])],
+  ['tenant-continuation', new Set(['status'])],
+]);
 
 export class DirectReferenceRequestError extends Error {
   constructor(code = 'invalid-request') {
@@ -27,6 +42,41 @@ function keys(value, required, optional = []) {
 
 function member(value, values) {
   if (!values.includes(value)) invalid();
+}
+
+function ordinal(value) {
+  if (!Number.isSafeInteger(value) || value < 1) invalid();
+  return value;
+}
+
+function sha256(value) {
+  if (typeof value !== 'string' || !/^[a-f0-9]{64}$/u.test(value)) invalid();
+  return value;
+}
+
+function canonicalJson(value) {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value))
+    return `[${value.map((entry) => canonicalJson(entry)).join(',')}]`;
+  return `{${Object.keys(value)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
+    .join(',')}}`;
+}
+
+export function serializeDirectReferenceCore(value) {
+  return canonicalJson(JSON.parse(JSON.stringify(value)));
+}
+
+export function directReferenceRequestSha256(value) {
+  return createHash('sha256')
+    .update(serializeDirectReferenceCore(value))
+    .digest('hex');
+}
+
+export function isDirectReferenceReadOnlyAction(action) {
+  const operations = READ_ONLY_ACTIONS.get(action.kind);
+  return operations === null || operations?.has(action.operation) === true;
 }
 
 function page(action) {
@@ -61,11 +111,17 @@ function actionFromParsed(value) {
   switch (kind) {
     case 'control-read':
     case 'migration-start':
+    case 'migration-reprovision-a':
     case 'migration-abandon':
     case 'force-recovery':
     case 'force-observe':
     case 'recover-force-residual':
       keys(value, ['kind']);
+      break;
+    case 'reconcile-invocation':
+      keys(value, ['kind', 'ordinal', 'requestSha256']);
+      ordinal(value.ordinal);
+      sha256(value.requestSha256);
       break;
     case 'force-terminal':
       keys(value, ['kind', 'role']);
@@ -81,11 +137,40 @@ function actionFromParsed(value) {
         'object-delete',
       ]);
       break;
+    case 'tenant-continuation':
+      member(value.operation, ['start', 'status', 'resume-locked', 'resume']);
+      if (value.operation === 'start') {
+        keys(value, ['kind', 'operation', 'challenge']);
+        if (
+          typeof value.challenge !== 'string' ||
+          !/^[a-f0-9]{64}$/u.test(value.challenge)
+        )
+          invalid();
+      } else if (value.operation === 'resume') {
+        keys(value, ['kind', 'operation', 'runId', 'approvalId']);
+        if (
+          typeof value.runId !== 'string' ||
+          !/^[A-Za-z0-9_-]{1,128}$/u.test(value.runId) ||
+          typeof value.approvalId !== 'string' ||
+          !/^[A-Za-z0-9_-]{1,128}$/u.test(value.approvalId)
+        )
+          invalid();
+      } else {
+        keys(value, ['kind', 'operation', 'runId']);
+        if (
+          typeof value.runId !== 'string' ||
+          !/^[A-Za-z0-9_-]{1,128}$/u.test(value.runId)
+        )
+          invalid();
+      }
+      break;
     case 'tenant-fence': {
       member(value.operation, [
         'read',
         'drain',
         'reopen',
+        'lock',
+        'unlock',
         'inventory',
         'mutate-current',
         'probe-missing',
@@ -93,7 +178,10 @@ function actionFromParsed(value) {
         'probe-future',
       ]);
       const versioned =
-        value.operation === 'drain' || value.operation === 'reopen';
+        value.operation === 'drain' ||
+        value.operation === 'reopen' ||
+        value.operation === 'lock' ||
+        value.operation === 'unlock';
       keys(
         value,
         versioned
@@ -111,10 +199,17 @@ function actionFromParsed(value) {
       break;
     }
     case 'provision':
-      keys(value, ['kind', 'role', 'release']);
+      keys(value, ['kind', 'role', 'release'], ['cycle']);
       member(value.role, ['a', 'b', 'recovery']);
       member(value.release, ['initial', 'failed-recovery']);
       if (value.release === 'failed-recovery' && value.role !== 'recovery')
+        invalid();
+      if (
+        Object.hasOwn(value, 'cycle') &&
+        (value.cycle !== 'reprovision' ||
+          value.role !== 'a' ||
+          value.release !== 'initial')
+      )
         invalid();
       break;
     case 'inventory-start':
@@ -149,18 +244,33 @@ function actionFromParsed(value) {
     case 'cleanup-receipt':
     case 'decommission-start':
     case 'decommission-export':
-      keys(value, ['kind', 'role']);
+      keys(value, ['kind', 'role'], ['cycle']);
       member(value.role, ['a', 'b', 'recovery']);
+      if (
+        Object.hasOwn(value, 'cycle') &&
+        (value.cycle !== 'reprovision' || value.role !== 'a')
+      )
+        invalid();
       break;
     case 'cleanup-continue':
     case 'decommission-continue':
-      keys(value, ['kind', 'role'], ['token']);
+      keys(value, ['kind', 'role'], ['token', 'cycle']);
       member(value.role, ['a', 'b', 'recovery']);
+      if (
+        Object.hasOwn(value, 'cycle') &&
+        (value.cycle !== 'reprovision' || value.role !== 'a')
+      )
+        invalid();
       break;
     case 'cleanup-restart-blocked':
     case 'decommission-restart-blocked':
-      keys(value, ['kind', 'role', 'token']);
+      keys(value, ['kind', 'role', 'token'], ['cycle']);
       member(value.role, ['a', 'b', 'recovery']);
+      if (
+        Object.hasOwn(value, 'cycle') &&
+        (value.cycle !== 'reprovision' || value.role !== 'a')
+      )
+        invalid();
       break;
     default:
       invalid();
@@ -185,18 +295,38 @@ export async function readDirectReferenceRequest(
   } catch {
     invalid();
   }
-  keys(value, ['contractVersion', 'configSha256', 'action']);
+  keys(value, ['contractVersion', 'configSha256', 'action', 'reservation']);
   if (
-    value.contractVersion !== 1 ||
+    value.contractVersion !== 2 ||
     typeof value.configSha256 !== 'string' ||
     !/^[a-f0-9]{64}$/u.test(value.configSha256)
   )
     invalid();
   if (value.configSha256 !== expectedConfigSha256)
     throw new DirectReferenceRequestError('run-binding-mismatch');
+  const action = actionFromParsed(value.action);
+  let reservation = null;
+  if (action.kind === 'reconcile-invocation') {
+    if (value.reservation !== null) invalid();
+  } else {
+    keys(value.reservation, ['ordinal', 'requestSha256']);
+    const candidate = value.reservation;
+    reservation = Object.freeze({
+      ordinal: ordinal(candidate.ordinal),
+      requestSha256: sha256(candidate.requestSha256),
+    });
+    const core = {
+      contractVersion: 2,
+      configSha256: value.configSha256,
+      action,
+    };
+    if (directReferenceRequestSha256(core) !== reservation.requestSha256)
+      throw new DirectReferenceRequestError('request-hash-mismatch');
+  }
   return Object.freeze({
-    contractVersion: 1,
+    contractVersion: 2,
     configSha256: value.configSha256,
-    action: actionFromParsed(value.action),
+    action,
+    reservation,
   });
 }

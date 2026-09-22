@@ -10,7 +10,11 @@ import {
   validateDirectConformanceConfig,
 } from './direct-credentialed-conformance-config.mjs';
 import { DirectRunStateError } from './direct-credentialed-run-state.mjs';
-import { DIRECT_REFERENCE_PATH } from './direct-reference-contract.mjs';
+import {
+  DIRECT_REFERENCE_PATH,
+  isDirectReferenceReadOnlyAction,
+  serializeDirectReferenceCore,
+} from './direct-reference-contract.mjs';
 
 const RESPONSE_BYTE_LIMIT = 4 * 1024 * 1024;
 const JSON_CONTENT_TYPE = /^application\/json(?:;\s*charset=utf-8)?$/iu;
@@ -22,17 +26,15 @@ const INGRESS_INTERVAL_MS = 2_000;
  * first contract answer; consecutive probes span the latter window.
  */
 const INGRESS_STABLE_PROBES = 3;
-// These handlers neither write the reference journal nor dispatch mutations.
-const READ_ONLY_ACTIONS = new Map([
-  ['control-read', null],
-  ['inventory-read', null],
-  ['audit-page', null],
-  ['migration-page', null],
-  ['cleanup-receipt', null],
-  ['decommission-export', null],
-  ['tenant-probe', new Set(['health', 'object-read'])],
-  ['tenant-fence', new Set(['read', 'inventory'])],
-]);
+// The Worker aborts each request at invocationTimeoutMs. This margin lets its
+// terminal ledger write and response reach the client before polling expires.
+export const DIRECT_RECONCILIATION_MARGIN_MS = 5_000;
+export const DIRECT_RECONCILIATION_INTERVAL_MS = 250;
+export const DIRECT_RECONCILIATION_MAX_INTERVAL_MS = 32_000;
+// The schedule from 250 ms to 32 s reaches the 605,000 ms production window in
+// about 26 requests. The 32-request cap guards a shorter interval override;
+// normal polling reaches its time bound first.
+export const DIRECT_RECONCILIATION_MAX_REQUESTS = 32;
 export const DIRECT_INVOCATION_FAILURE_DETAILS = Object.freeze([
   'platform-page',
   'transport-failure',
@@ -48,9 +50,14 @@ const ERROR_CODES = new Set([
   'reference-refused',
 ]);
 const REFERENCE_REFUSAL_STATUS = {
+  'run-binding-mismatch': 409,
+  'operation-mismatch': 409,
+  'prerequisite-unavailable': 409,
+  'missing-start': 409,
   'operation-refused': 409,
   'wrong-operation': 409,
   'missing-continuation': 409,
+  'duplicate-ordinal': 409,
   'budget-exhausted': 503,
 };
 
@@ -124,7 +131,7 @@ function readAttempts(headers, maxAttempts) {
   return Object.freeze(attempts);
 }
 
-function referenceEndpoint(prepared, subdomain) {
+export function resolveDirectReferenceEndpoint(prepared, subdomain) {
   const config = validateDirectConformanceConfig(prepared.config);
   const names = deriveDirectConformanceNames(config);
   if (
@@ -146,7 +153,7 @@ export async function awaitReferenceIngress(input) {
   let intervalMs;
   let sleep;
   try {
-    ({ endpoint } = referenceEndpoint(
+    ({ endpoint } = resolveDirectReferenceEndpoint(
       input.prepared,
       input.accountWorkersDevSubdomain,
     ));
@@ -226,7 +233,7 @@ export async function awaitReferenceIngress(input) {
             active() &&
             bounded.ok &&
             bounded.text ===
-              '{"contractVersion":1,"ok":false,"error":{"code":"unauthorized"}}'
+              '{"contractVersion":2,"ok":false,"error":{"code":"unauthorized"}}'
           );
         } catch {
           return false;
@@ -282,6 +289,170 @@ function requestReference(endpoint, { method, headers, body, signal }) {
   });
 }
 
+export async function reconcileDirectInvocation(input) {
+  let endpoint;
+  let authorization;
+  let configSha256;
+  let ordinal;
+  let requestSha256;
+  let deadlineMs;
+  let intervalMs;
+  let fetchRequest;
+  let sleep;
+  try {
+    endpoint = new URL(input.endpoint);
+    authorization = `Bearer ${input.secret}`;
+    configSha256 = input.configSha256;
+    ordinal = input.ordinal;
+    requestSha256 = input.requestSha256;
+    const workerDeadlineMs = input.workerDeadlineMs;
+    deadlineMs =
+      input.deadlineMs ?? workerDeadlineMs + DIRECT_RECONCILIATION_MARGIN_MS;
+    intervalMs = input.intervalMs ?? DIRECT_RECONCILIATION_INTERVAL_MS;
+    fetchRequest = input.fetch ?? requestReference;
+    sleep =
+      input.sleep ??
+      ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+    if (
+      endpoint.protocol !== 'https:' ||
+      endpoint.username ||
+      endpoint.password ||
+      endpoint.pathname !== DIRECT_REFERENCE_PATH ||
+      endpoint.search ||
+      endpoint.hash ||
+      typeof input.secret !== 'string' ||
+      !input.secret ||
+      input.secret !== input.secret.trim() ||
+      typeof configSha256 !== 'string' ||
+      !/^[a-f0-9]{64}$/u.test(configSha256) ||
+      !Number.isSafeInteger(ordinal) ||
+      ordinal < 1 ||
+      typeof requestSha256 !== 'string' ||
+      !/^[a-f0-9]{64}$/u.test(requestSha256) ||
+      !Number.isSafeInteger(workerDeadlineMs) ||
+      workerDeadlineMs < 1 ||
+      !Number.isSafeInteger(deadlineMs) ||
+      deadlineMs < workerDeadlineMs ||
+      deadlineMs > 2_147_483_647 ||
+      !Number.isSafeInteger(intervalMs) ||
+      intervalMs < 1 ||
+      intervalMs >= deadlineMs ||
+      typeof fetchRequest !== 'function' ||
+      typeof sleep !== 'function'
+    )
+      invalid();
+    validateHeaderValue('Authorization', authorization);
+  } catch {
+    invalid();
+  }
+  const core = {
+    contractVersion: 2,
+    configSha256,
+    action: { kind: 'reconcile-invocation', ordinal, requestSha256 },
+  };
+  const serialized = JSON.stringify({ ...core, reservation: null });
+  const deadline = new AbortController();
+  const signal = deadline.signal;
+  const expiresAt = performance.now() + deadlineMs;
+  const timer = setTimeout(() => deadline.abort(), deadlineMs);
+  let requestsSent = 0;
+  let waitMs = intervalMs;
+  try {
+    for (;;) {
+      if (signal.aborted || performance.now() >= expiresAt)
+        return 'unreachable';
+      let response;
+      try {
+        requestsSent += 1;
+        response = await fetchRequest(endpoint, {
+          method: 'POST',
+          headers: {
+            Authorization: authorization,
+            'Content-Type': 'application/json',
+            Accept: 'application/json',
+            'Cache-Control': 'no-store',
+          },
+          body: serialized,
+          cache: 'no-store',
+          redirect: 'manual',
+          signal,
+        });
+        if (
+          response.redirected ||
+          response.status !== 200 ||
+          response.headers.get('cache-control') !== 'no-store' ||
+          !JSON_CONTENT_TYPE.test(response.headers.get('content-type') ?? '')
+        )
+          return 'unreachable';
+        const body = response.body?.pipeThrough(new TransformStream(), {
+          signal,
+        });
+        const bounded = await readBoundedBody(
+          new Request(endpoint, {
+            method: 'POST',
+            headers: response.headers,
+            body,
+            signal,
+            duplex: 'half',
+          }),
+          RESPONSE_BYTE_LIMIT,
+        );
+        if (!bounded.ok) return 'unreachable';
+        const value = JSON.parse(bounded.text);
+        if (
+          !exactKeys(value, [
+            'contractVersion',
+            'configSha256',
+            'action',
+            'ok',
+            'result',
+          ]) ||
+          value.contractVersion !== 2 ||
+          value.configSha256 !== configSha256 ||
+          value.action !== 'reconcile-invocation' ||
+          value.ok !== true ||
+          !exactKeys(value.result, ['state']) ||
+          !['received', 'executed', 'failed', 'cancelled'].includes(
+            value.result.state,
+          )
+        )
+          return 'unreachable';
+        if (value.result.state !== 'received') return value.result.state;
+      } catch {
+        return 'unreachable';
+      } finally {
+        cancelBodyWithoutAwait(response?.body);
+      }
+      if (requestsSent >= DIRECT_RECONCILIATION_MAX_REQUESTS)
+        return 'unreachable';
+      const remaining = expiresAt - performance.now();
+      if (remaining <= waitMs) return 'unreachable';
+      try {
+        await new Promise((resolve, reject) => {
+          const abort = () => reject(signal.reason);
+          signal.addEventListener('abort', abort, { once: true });
+          Promise.resolve(sleep(waitMs)).then(
+            (value) => {
+              signal.removeEventListener('abort', abort);
+              resolve(value);
+            },
+            (error) => {
+              signal.removeEventListener('abort', abort);
+              reject(error);
+            },
+          );
+        });
+      } catch {
+        return 'unreachable';
+      }
+      waitMs = Math.min(waitMs * 2, DIRECT_RECONCILIATION_MAX_INTERVAL_MS);
+    }
+  } finally {
+    clearTimeout(timer);
+    deadline.abort();
+  }
+}
+
 export function createDirectInvocationClient(input) {
   let endpoint;
   let configSha256;
@@ -292,7 +463,7 @@ export function createDirectInvocationClient(input) {
   let authorization;
   try {
     const prepared = input.prepared;
-    const resolved = referenceEndpoint(
+    const resolved = resolveDirectReferenceEndpoint(
       prepared,
       input.accountWorkersDevSubdomain,
     );
@@ -354,21 +525,23 @@ export function createDirectInvocationClient(input) {
         let serialized;
         let reservation;
         try {
-          serialized = JSON.stringify({
-            contractVersion: 1,
+          const core = {
+            contractVersion: 2,
             configSha256,
             action,
-          });
+          };
+          serialized = serializeDirectReferenceCore(core);
           reservation = await journal.reserveInvocation(serialized);
         } catch (error) {
           throw reservationError(error);
         }
         uncertain = true;
         const serializedAction = JSON.parse(serialized).action;
-        const operations = READ_ONLY_ACTIONS.get(serializedAction.kind);
-        const readOnly =
-          operations === null ||
-          operations?.has(serializedAction.operation) === true;
+        const readOnly = isDirectReferenceReadOnlyAction(serializedAction);
+        const transmitted = JSON.stringify({
+          ...JSON.parse(serialized),
+          reservation,
+        });
         let deliveryPending = true;
         let redelivering = false;
         let answerDetail = 'transport-failure';
@@ -419,7 +592,7 @@ export function createDirectInvocationClient(input) {
                   Accept: 'application/json',
                   'Cache-Control': 'no-store',
                 },
-                body: serialized,
+                body: transmitted,
                 cache: 'no-store',
                 redirect: 'manual',
                 signal,
@@ -490,7 +663,7 @@ export function createDirectInvocationClient(input) {
                         'ok',
                         'result',
                       ]) ||
-                      value.contractVersion !== 1 ||
+                      value.contractVersion !== 2 ||
                       value.configSha256 !== configSha256 ||
                       value.action !== actionKind ||
                       value.ok !== true
@@ -499,7 +672,7 @@ export function createDirectInvocationClient(input) {
                   } else {
                     if (
                       !exactKeys(value, ['contractVersion', 'ok', 'error']) ||
-                      value.contractVersion !== 1 ||
+                      value.contractVersion !== 2 ||
                       value.ok !== false ||
                       !exactKeys(value.error, ['code'])
                     )

@@ -6,11 +6,17 @@ import {
   DIRECT_REFERENCE_PATH,
   type DirectReferenceAction,
   DirectReferenceRequestError,
+  directReferenceRequestSha256,
   readDirectReferenceRequest,
 } from '../scripts/direct-reference-contract.mjs';
 
 const CONFIG = 'a'.repeat(64);
 const actions: readonly DirectReferenceAction[] = [
+  {
+    kind: 'reconcile-invocation',
+    ordinal: 1,
+    requestSha256: 'b'.repeat(64),
+  },
   { kind: 'tenant-fence', role: 'a', operation: 'read' },
   { kind: 'tenant-fence', role: 'b', operation: 'inventory' },
   { kind: 'tenant-fence', role: 'a', operation: 'mutate-current' },
@@ -80,7 +86,16 @@ function request(body: NonNullable<RequestInit['body']>) {
 }
 
 function envelope(action: unknown) {
-  return { contractVersion: 1, configSha256: CONFIG, action };
+  const core = { contractVersion: 2, configSha256: CONFIG, action };
+  return {
+    ...core,
+    reservation:
+      action !== null &&
+      typeof action === 'object' &&
+      Reflect.get(action, 'kind') === 'reconcile-invocation'
+        ? null
+        : { ordinal: 1, requestSha256: directReferenceRequestSha256(core) },
+  };
 }
 
 async function read(action: unknown) {
@@ -234,7 +249,7 @@ describe('direct reference request contract', () => {
     const valid = envelope({ kind: 'control-read' });
     for (const body of [
       { ...valid, extra: 'secret-sentinel' },
-      { ...valid, contractVersion: 2 },
+      { ...valid, contractVersion: 1 },
       { ...valid, configSha256: 'bad' },
       { action: valid.action },
     ])
@@ -253,6 +268,46 @@ describe('direct reference request contract', () => {
     await expect(read(proto)).rejects.toMatchObject({
       code: 'invalid-request',
     });
+  });
+
+  it('requires a hash-bound reservation except for reconciliation', async () => {
+    const valid = envelope({ kind: 'control-read' });
+    await expect(
+      readDirectReferenceRequest(
+        request(JSON.stringify({ ...valid, reservation: null })),
+        CONFIG,
+      ),
+    ).rejects.toMatchObject({ code: 'invalid-request' });
+    await expect(
+      readDirectReferenceRequest(
+        request(
+          JSON.stringify({
+            ...valid,
+            reservation: {
+              ordinal: 1,
+              requestSha256: 'c'.repeat(64),
+            },
+          }),
+        ),
+        CONFIG,
+      ),
+    ).rejects.toMatchObject({ code: 'request-hash-mismatch' });
+    const reconciliation = envelope({
+      kind: 'reconcile-invocation',
+      ordinal: 1,
+      requestSha256: 'd'.repeat(64),
+    });
+    await expect(
+      readDirectReferenceRequest(
+        request(
+          JSON.stringify({
+            ...reconciliation,
+            reservation: { ordinal: 1, requestSha256: 'e'.repeat(64) },
+          }),
+        ),
+        CONFIG,
+      ),
+    ).rejects.toMatchObject({ code: 'invalid-request' });
   });
 
   it('accepts the body-byte boundary and refuses one extra byte', async () => {

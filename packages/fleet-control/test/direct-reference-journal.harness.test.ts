@@ -81,6 +81,63 @@ describe.sequential('direct reference journal in native D1', {
     return { runKey, journal: new DirectReferenceJournal(db, runKey, binding) };
   }
 
+  it('records invocation receipt states and permits only read-only redelivery', async () => {
+    const runKey = randomUUID();
+    const journal = new DirectReferenceJournal(db, runKey, binding, 2);
+    const reservation = { ordinal: 1, requestSha256: 'b'.repeat(64) };
+    await journal.receiveInvocation(reservation, false);
+    expect(
+      await db
+        .prepare(
+          'SELECT ordinal,request_sha256,state FROM direct_reference_invocations WHERE run_key=?',
+        )
+        .bind(runKey)
+        .all(),
+    ).toMatchObject({
+      results: [
+        { ordinal: 1, request_sha256: 'b'.repeat(64), state: 'received' },
+      ],
+    });
+    await journal.settleReceivedInvocation(reservation, 'executed');
+    await expect(journal.reconcileInvocation(reservation)).resolves.toBe(
+      'executed',
+    );
+    await expect(
+      journal.receiveInvocation(reservation, false),
+    ).rejects.toMatchObject({ code: 'duplicate-ordinal' });
+    await journal.receiveInvocation(reservation, true);
+    await journal.settleReceivedInvocation(reservation, 'failed');
+    await expect(journal.reconcileInvocation(reservation)).resolves.toBe(
+      'failed',
+    );
+    await expect(
+      journal.reconcileInvocation({
+        ...reservation,
+        requestSha256: 'c'.repeat(64),
+      }),
+    ).rejects.toMatchObject({ code: 'duplicate-ordinal' });
+    await expect(
+      journal.receiveInvocation(
+        { ordinal: 3, requestSha256: 'd'.repeat(64) },
+        false,
+      ),
+    ).rejects.toMatchObject({ code: 'journal-state' });
+  });
+
+  it('atomically tombstones an absent ordinal and blocks every late original', async () => {
+    const journal = new DirectReferenceJournal(db, randomUUID(), binding, 2);
+    const reservation = { ordinal: 2, requestSha256: 'e'.repeat(64) };
+    await expect(journal.reconcileInvocation(reservation)).resolves.toBe(
+      'cancelled',
+    );
+    await expect(
+      journal.receiveInvocation(reservation, false),
+    ).rejects.toMatchObject({ code: 'duplicate-ordinal' });
+    await expect(
+      journal.receiveInvocation(reservation, true),
+    ).rejects.toMatchObject({ code: 'duplicate-ordinal' });
+  });
+
   it.each([
     'before',
     'after',

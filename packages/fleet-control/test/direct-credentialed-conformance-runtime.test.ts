@@ -38,9 +38,11 @@ import {
   type DirectTeardownFailure,
 } from '../scripts/direct-credentialed-run-state.mjs';
 import {
+  abandonedScenario,
   cleanupDirectRunState,
   closed,
   completeScenario,
+  completeSweep,
   fixture,
   maximalTeardown,
   opened,
@@ -141,6 +143,24 @@ function armGuard(input: { env: Record<string, string | undefined> }) {
 async function world(fleetUuid?: string) {
   const f = await fixture(1000);
   const actual = await opened({ ...f.input, mode: 'run' });
+  const tenantState = {
+    scripts: [] as string[],
+    databases: [] as string[],
+    namespaces: [] as string[],
+    domains: [] as string[],
+    routes: [] as string[],
+    buckets: [] as string[],
+  };
+  const seedTenants = () => {
+    for (const [role, names] of Object.entries(f.prepared.names.roles)) {
+      tenantState.scripts.push(names.scriptName);
+      tenantState.databases.push(names.databaseName);
+      tenantState.namespaces.push(`${role}-maintenance`, `${role}-runner`);
+      tenantState.domains.push(names.routeHostname);
+      tenantState.routes.push(`${names.routeHostname}/*`);
+      tenantState.buckets.push(`${names.scriptName}-application`);
+    }
+  };
   let snapshot: DirectRunSnapshot = actual.snapshot();
   if (fleetUuid !== undefined)
     snapshot = {
@@ -179,28 +199,53 @@ async function world(fleetUuid?: string) {
   };
   const modules = {
     preflight: vi.fn(async () => f.prepared),
-    openRunState: vi.fn(async () => journal),
+    openRunState: vi.fn<DirectConformanceModules['openRunState']>(
+      async () => journal,
+    ),
     inspectRunState: vi.fn(async () => ({
       directory: actual.directory,
       snapshot,
       close: journal.close,
     })),
+    reconcileInvocation: vi.fn<DirectConformanceModules['reconcileInvocation']>(
+      async () => 'executed' as const,
+    ),
     bootstrap: vi.fn<DirectConformanceModules['bootstrap']>(
       async () => ({}) as DirectInvocationClient,
     ),
     scenario: vi.fn<DirectConformanceModules['scenario']>(async () => ({
       status: 'restart-required',
     })),
-    teardown: vi.fn<DirectConformanceModules['teardown']>(async () => ({
-      status: 'cleaned',
-      facts: {
-        retainedIdentities: NO_RETAINED_IDENTITIES,
-        receipts: maximalTeardown().receipts,
-        residual: null,
-        providerRequests: 7,
-        failure: null,
-      },
-    })),
+    sweep: vi.fn<DirectConformanceModules['sweep']>(async () => {
+      for (const resources of Object.values(tenantState)) resources.length = 0;
+      snapshot = { ...snapshot, sweep: completeSweep() };
+      return { status: 'complete' };
+    }),
+    teardown: vi.fn<DirectConformanceModules['teardown']>(async () => {
+      if (Object.values(tenantState).some((resources) => resources.length > 0))
+        return {
+          status: 'retained',
+          reason: 'residual-present',
+          phase: 'complete',
+          facts: {
+            retainedIdentities: NO_RETAINED_IDENTITIES,
+            receipts: maximalTeardown().receipts,
+            residual: maximalTeardown().residual,
+            providerRequests: 7,
+            failure: 'residual-present',
+          },
+        };
+      return {
+        status: 'cleaned',
+        facts: {
+          retainedIdentities: NO_RETAINED_IDENTITIES,
+          receipts: maximalTeardown().receipts,
+          residual: null,
+          providerRequests: 7,
+          failure: null,
+        },
+      };
+    }),
     distPresent: vi.fn(() => true),
   };
   const set = (fields: Partial<DirectRunSnapshot>) => {
@@ -218,7 +263,16 @@ async function world(fleetUuid?: string) {
     expectCredentialSafeOutput(result);
     return result;
   };
-  return { f, journal, modules, set, run, snapshot: () => snapshot };
+  return {
+    f,
+    journal,
+    modules,
+    seedTenants,
+    tenantState,
+    set,
+    run,
+    snapshot: () => snapshot,
+  };
 }
 
 function retained(
@@ -1119,6 +1173,103 @@ process.on('exit', () => writeFileSync(${path}, JSON.stringify(reads)));\n`;
     });
   });
 
+  it('exits failed when driving teardown cleans an abandoned scenario', async () => {
+    const w = await world();
+    w.seedTenants();
+    w.set({ scenario: abandonedScenario() });
+    const result = await w.run();
+    expect(result).toMatchObject({
+      exitCode: 1,
+      summary: {
+        status: 'failed',
+        scenario: {
+          failure: {
+            code: 'proof-unavailable',
+            detail: 'lost-run-id-abandoned',
+          },
+        },
+        teardownCall: {
+          status: 'cleaned',
+          failure: null,
+          providerRequests: 7,
+        },
+      },
+    });
+    expect(w.modules.bootstrap).toHaveBeenCalledOnce();
+    expect(w.modules.scenario).not.toHaveBeenCalled();
+    expect(w.modules.sweep).toHaveBeenCalledOnce();
+    expect(w.modules.teardown).toHaveBeenCalledOnce();
+    expect(w.tenantState).toEqual({
+      scripts: [],
+      databases: [],
+      namespaces: [],
+      domains: [],
+      routes: [],
+      buckets: [],
+    });
+  });
+
+  it('exits failed on evidence-only resume of an abandoned cleaned scenario', async () => {
+    const w = await world();
+    w.set({
+      scenario: abandonedScenario(),
+      teardown: { ...maximalTeardown(), phase: 'complete', failure: null },
+    });
+    const result = await w.run();
+    expect(result).toMatchObject({
+      exitCode: 1,
+      summary: {
+        status: 'failed',
+        teardownCall: {
+          status: 'cleaned',
+          failure: null,
+          providerRequests: maximalTeardown().providerRequests,
+        },
+      },
+    });
+    expect(w.modules.bootstrap).not.toHaveBeenCalled();
+    expect(w.modules.scenario).not.toHaveBeenCalled();
+    expect(w.modules.sweep).not.toHaveBeenCalled();
+    expect(w.modules.teardown).not.toHaveBeenCalled();
+  });
+
+  it('exits retained when provider residuals remain after a complete sweep', async () => {
+    const w = await world();
+    w.set({ scenario: abandonedScenario(), sweep: completeSweep() });
+    w.modules.teardown.mockImplementation(async () => {
+      w.set({
+        teardown: {
+          ...maximalTeardown(),
+          phase: 'complete',
+          failure: 'residual-present',
+        },
+      });
+      return {
+        status: 'retained',
+        reason: 'residual-present',
+        phase: 'complete',
+        facts: {
+          retainedIdentities: NO_RETAINED_IDENTITIES,
+          receipts: maximalTeardown().receipts,
+          residual: maximalTeardown().residual,
+          providerRequests: 11,
+          failure: 'residual-present',
+        },
+      };
+    });
+    const result = await w.run();
+    expect(result).toMatchObject({
+      exitCode: 4,
+      summary: {
+        status: 'retained',
+        teardownCall: {
+          status: 'retained',
+          failure: { code: 'residual-present' },
+        },
+      },
+    });
+  });
+
   it.each([
     'refused',
     'ingress',
@@ -1252,12 +1403,7 @@ process.on('exit', () => writeFileSync(${path}, JSON.stringify(reads)));\n`;
     expectCredentialSafeOutput(result);
   });
 
-  it.each([
-    'platform-page',
-    'transport-failure',
-    'non-contract-answer',
-    'delivery-window-expired',
-  ] as const)('prints pending scenario failure detail %s without journal settlement', async (detail) => {
+  it('does not synthesize scenario failure evidence from a pending reservation', async () => {
     const w = await world();
     const scenario = completeScenario();
     const pending = {
@@ -1271,25 +1417,39 @@ process.on('exit', () => writeFileSync(${path}, JSON.stringify(reads)));\n`;
       return {
         status: 'failed',
         reason: 'outcome-unknown',
-        detail,
+        detail: 'transport-failure',
         phase: scenario.phase,
         invocationCount: 1,
       };
     });
     const result = await w.run('run');
     expect(result.summary).toMatchObject({
-      scenario: { failure: { code: 'outcome-unknown', ordinal: 1, detail } },
+      scenario: { failure: null },
     });
     expect(w.snapshot().lastInvocation).toEqual(pending);
     expect(w.snapshot().scenario?.failure).toBeNull();
     expectCredentialSafeOutput(result);
   });
 
-  it('uses inspection on outcome-unknown without recording a resume', async () => {
-    const w = await world();
-    w.modules.openRunState.mockRejectedValue(
-      new DirectRunStateError('outcome-unknown'),
-    );
+  it('uses inspection after unreachable reconciliation without recording a resume', async () => {
+    const w = await world('fleet-uuid');
+    const pending = {
+      ordinal: 1,
+      action: { kind: 'control-read' as const },
+      state: 'pending' as const,
+      requestSha256: 'a'.repeat(64),
+    };
+    w.set({ invocationCount: 1, lastInvocation: pending });
+    w.modules.reconcileInvocation.mockResolvedValue('unreachable');
+    w.modules.openRunState.mockImplementation(async (input) => {
+      expect(
+        await input.reprobe?.({
+          lastInvocation: pending,
+          bootstrap: w.snapshot().bootstrap,
+        }),
+      ).toBe('unreachable');
+      throw new DirectRunStateError('outcome-unknown');
+    });
     const before = JSON.stringify(w.snapshot());
     const result = await w.run();
     expect(result.exitCode).toBe(1);
@@ -1302,6 +1462,82 @@ process.on('exit', () => writeFileSync(${path}, JSON.stringify(reads)));\n`;
     expect(w.modules.inspectRunState).toHaveBeenCalledOnce();
     expect(w.modules.teardown).not.toHaveBeenCalled();
     expect(w.journal.close).toHaveBeenCalledOnce();
+  });
+
+  it('reconciles a pending abandoned invocation before sweep and teardown', async () => {
+    const w = await world('fleet-uuid');
+    w.seedTenants();
+    const scenario = abandonedScenario('migration-reprovision-a');
+    scenario.failure = null;
+    const pending = {
+      ordinal: 9,
+      action: { kind: 'migration-reprovision-a' as const },
+      state: 'pending' as const,
+      requestSha256: 'b'.repeat(64),
+    };
+    w.set({ invocationCount: 9, lastInvocation: pending, scenario });
+    const order: string[] = [];
+    w.modules.reconcileInvocation.mockImplementation(async () => {
+      order.push('reconcile');
+      return 'executed';
+    });
+    w.modules.openRunState.mockImplementation(async (input) => {
+      const state = await input.reprobe?.({
+        lastInvocation: pending,
+        bootstrap: w.snapshot().bootstrap,
+      });
+      expect(state).toBe('executed');
+      w.set({
+        lastInvocation: { ...pending, state: 'settled' },
+        reconciliations: [
+          {
+            ordinal: pending.ordinal,
+            state: 'executed',
+            at: '2026-09-13T00:00:00.000Z',
+          },
+        ],
+      });
+      return w.journal;
+    });
+    const bootstrap = w.modules.bootstrap.getMockImplementation();
+    w.modules.scenario.mockImplementation(async () => {
+      order.push('scenario');
+      const abandoned = abandonedScenario('migration-reprovision-a');
+      w.set({ scenario: abandoned });
+      return {
+        status: 'failed',
+        reason: 'proof-unavailable',
+        phase: abandoned.phase,
+        invocationCount: 9,
+      };
+    });
+    const sweep = w.modules.sweep.getMockImplementation();
+    const teardown = w.modules.teardown.getMockImplementation();
+    w.modules.bootstrap.mockImplementation(async (input) => {
+      order.push('bootstrap');
+      return bootstrap?.(input) as Promise<DirectInvocationClient>;
+    });
+    w.modules.sweep.mockImplementation(async (input) => {
+      order.push('sweep');
+      return sweep?.(input) as ReturnType<DirectConformanceModules['sweep']>;
+    });
+    w.modules.teardown.mockImplementation(async (input) => {
+      order.push('teardown');
+      return teardown?.(input) as ReturnType<
+        DirectConformanceModules['teardown']
+      >;
+    });
+    const result = await w.run('resume');
+    expect(result.exitCode).toBe(1);
+    expect(order).toEqual([
+      'reconcile',
+      'bootstrap',
+      'scenario',
+      'sweep',
+      'teardown',
+    ]);
+    expect(w.modules.scenario).toHaveBeenCalledOnce();
+    expect(w.snapshot().sweep?.phase).toBe('complete');
   });
 
   it.each([

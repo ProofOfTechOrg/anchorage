@@ -8,7 +8,8 @@ export type DirectReferenceErrorCode =
   | 'invalid-request'
   | 'payload-too-large'
   | 'invalid-utf8'
-  | 'run-binding-mismatch';
+  | 'run-binding-mismatch'
+  | 'request-hash-mismatch';
 
 export class DirectReferenceRequestError extends Error {
   readonly code: DirectReferenceErrorCode;
@@ -18,11 +19,16 @@ export class DirectReferenceRequestError extends Error {
 export type DirectInventorySlot = 'inventory-before' | 'inventory-after';
 export type DirectAuditSlot = 'audit-before' | 'audit-after';
 export type DirectReferenceAction =
+  | Readonly<{
+      kind: 'reconcile-invocation';
+      ordinal: number;
+      requestSha256: string;
+    }>
   | Readonly<{ kind: 'force-terminal'; role: 'a' }>
   | Readonly<{
       kind: 'tenant-fence';
       role: 'a' | 'b';
-      operation: 'drain' | 'reopen';
+      operation: 'drain' | 'reopen' | 'lock' | 'unlock';
       expectedMutationEpoch: number;
       expectedRevision: number;
     }>
@@ -43,15 +49,37 @@ export type DirectReferenceAction =
       operation: 'health' | 'object-put' | 'object-read' | 'object-delete';
     }>
   | Readonly<{
+      kind: 'tenant-continuation';
+      operation: 'start';
+      challenge: string;
+    }>
+  | Readonly<{
+      kind: 'tenant-continuation';
+      operation: 'status' | 'resume-locked';
+      runId: string;
+    }>
+  | Readonly<{
+      kind: 'tenant-continuation';
+      operation: 'resume';
+      runId: string;
+      approvalId: string;
+    }>
+  | Readonly<{
       kind:
         | 'control-read'
         | 'migration-start'
+        | 'migration-reprovision-a'
         | 'migration-abandon'
         | 'force-recovery'
         | 'force-observe'
         | 'recover-force-residual';
     }>
-  | Readonly<{ kind: 'provision'; role: DirectFixtureRole; release: 'initial' }>
+  | Readonly<{
+      kind: 'provision';
+      role: DirectFixtureRole;
+      release: 'initial';
+      cycle?: 'reprovision';
+    }>
   | Readonly<{
       kind: 'provision';
       role: 'recovery';
@@ -83,23 +111,36 @@ export type DirectReferenceAction =
         | 'decommission-start'
         | 'decommission-export';
       role: DirectFixtureRole;
+      cycle?: 'reprovision';
     }>
   | Readonly<{
       kind: 'cleanup-continue' | 'decommission-continue';
       role: DirectFixtureRole;
       token?: unknown;
+      cycle?: 'reprovision';
     }>
   | Readonly<{
       kind: 'cleanup-restart-blocked' | 'decommission-restart-blocked';
       role: DirectFixtureRole;
       token: unknown;
+      cycle?: 'reprovision';
     }>;
 
 export interface DirectReferenceRequest {
-  readonly contractVersion: 1;
+  readonly contractVersion: 2;
   readonly configSha256: string;
   readonly action: DirectReferenceAction;
+  readonly reservation: Readonly<{
+    ordinal: number;
+    requestSha256: string;
+  }> | null;
 }
+
+export function serializeDirectReferenceCore(value: unknown): string;
+export function directReferenceRequestSha256(value: unknown): string;
+export function isDirectReferenceReadOnlyAction(
+  action: DirectReferenceAction,
+): boolean;
 
 export function readDirectReferenceRequest(
   request: Request,

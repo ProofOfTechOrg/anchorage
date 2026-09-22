@@ -342,9 +342,11 @@ describe('direct fixture specifications', () => {
     );
     expect(initial.application?.vars).toEqual([
       { name: 'APPLICATION_RELEASE', value: '1' },
+      { name: 'APPROVAL_ALLOW_SELF_DECISION', value: 'true' },
     ]);
     expect(next.application?.vars).toEqual([
       { name: 'APPLICATION_RELEASE', value: '2' },
+      { name: 'APPROVAL_ALLOW_SELF_DECISION', value: 'true' },
     ]);
     expect(deploymentSpecDigest(next)).not.toBe(deploymentSpecDigest(initial));
     expect(

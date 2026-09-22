@@ -157,6 +157,9 @@ importers:
       wrangler:
         specifier: 4.129.0
         version: 4.129.0(@cloudflare/workers-types@5.20260905.1)
+      zod:
+        specifier: 4.4.3
+        version: 4.4.3
 
   packages/flowsafe:
     dependencies:

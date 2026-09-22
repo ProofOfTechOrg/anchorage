@@ -15,6 +15,8 @@ export type DirectOperationSlot =
   | DirectAuditSlot
   | 'migration-next'
   | 'cleanup-recovery-initial'
+  | 'cleanup-a-reprovision'
+  | 'decommission-a-reprovision'
   | `cleanup-${DirectFixtureRole}`
   | `decommission-${DirectFixtureRole}`;
 export type DirectOperationKind =
@@ -26,6 +28,7 @@ export type DirectOperationKind =
 export type DirectJournalErrorCode =
   | 'journal-state'
   | 'run-binding-mismatch'
+  | 'duplicate-ordinal'
   | 'operation-mismatch'
   | 'prerequisite-unavailable'
   | 'missing-start';
@@ -62,6 +65,18 @@ export interface DirectStoredObservation {
 
 export interface DirectStoredResource extends DirectStoredObservation {
   readonly identitySha256: string;
+}
+
+export type DirectInvocationLedgerState =
+  | 'received'
+  | 'executed'
+  | 'failed'
+  | 'cancelled';
+
+export interface DirectStoredInvocation {
+  readonly ordinal: number;
+  readonly requestSha256: string;
+  readonly state: DirectInvocationLedgerState;
 }
 
 type ObservationKind =
@@ -104,6 +119,13 @@ const schema = [
     provenance_sha256 TEXT NOT NULL,
     PRIMARY KEY (run_key, observation_kind, observation_key)
   )`,
+  `CREATE TABLE IF NOT EXISTS direct_reference_invocations (
+    run_key TEXT NOT NULL REFERENCES direct_reference_run(run_key),
+    ordinal INTEGER NOT NULL,
+    request_sha256 TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('received','executed','failed','cancelled')),
+    PRIMARY KEY (run_key, ordinal)
+  )`,
 ];
 
 function stateError(): never {
@@ -131,6 +153,8 @@ function kindFor(slot: string): DirectOperationKind {
   if (slot === 'audit-before' || slot === 'audit-after') return 'audit';
   if (slot === 'migration-next') return 'migration';
   if (slot === 'cleanup-recovery-initial') return 'cleanup';
+  if (slot === 'cleanup-a-reprovision') return 'cleanup';
+  if (slot === 'decommission-a-reprovision') return 'decommission';
   for (const kind of ['cleanup', 'decommission'] as const)
     if (
       ['a', 'b', 'recovery'].some(
@@ -194,9 +218,15 @@ export class DirectReferenceJournal {
   readonly #runKey: string;
   readonly #binding: ReturnType<typeof jsonObject>;
   readonly #bindingHash: string;
+  readonly #maxInvocations: number;
   #ready?: Promise<void>;
 
-  constructor(database: D1Database, runKey: string, bindingJson: string) {
+  constructor(
+    database: D1Database,
+    runKey: string,
+    bindingJson: string,
+    maxInvocations = 1_000,
+  ) {
     this.#database = new D1FleetStateDatabase(database);
     this.#runKey = text(runKey);
     this.#binding = jsonObject(bindingJson);
@@ -204,6 +234,9 @@ export class DirectReferenceJournal {
       ['binding', this.#runKey],
       this.#binding.text,
     );
+    if (!Number.isSafeInteger(maxInvocations) || maxInvocations < 1)
+      stateError();
+    this.#maxInvocations = maxInvocations;
   }
 
   async #initialize(): Promise<void> {
@@ -242,6 +275,7 @@ export class DirectReferenceJournal {
           if (
             candidate === 'journal-state' ||
             candidate === 'run-binding-mismatch' ||
+            candidate === 'duplicate-ordinal' ||
             candidate === 'operation-mismatch' ||
             candidate === 'prerequisite-unavailable' ||
             candidate === 'missing-start'
@@ -253,6 +287,136 @@ export class DirectReferenceJournal {
       }
       throw new DirectReferenceJournalError(code);
     }
+  }
+
+  #invocationReservation(
+    reservation: Readonly<{
+      ordinal: number;
+      requestSha256: string;
+    }>,
+  ) {
+    if (
+      !Number.isSafeInteger(reservation.ordinal) ||
+      reservation.ordinal < 1 ||
+      reservation.ordinal > this.#maxInvocations
+    )
+      stateError();
+    return {
+      ordinal: reservation.ordinal,
+      requestSha256: sha256(reservation.requestSha256),
+    };
+  }
+
+  #storedInvocation(row: Readonly<Record<string, unknown>> | undefined) {
+    if (!row) stateError();
+    const ordinal = row.ordinal;
+    const state = row.state;
+    if (
+      typeof ordinal !== 'number' ||
+      !Number.isSafeInteger(ordinal) ||
+      ordinal < 1 ||
+      ordinal > this.#maxInvocations ||
+      !['received', 'executed', 'failed', 'cancelled'].includes(state as string)
+    )
+      stateError();
+    return Object.freeze({
+      ordinal,
+      requestSha256: sha256(row.request_sha256 as string),
+      state: state as DirectInvocationLedgerState,
+    });
+  }
+
+  receiveInvocation(
+    reservation: Readonly<{ ordinal: number; requestSha256: string }>,
+    readOnly: boolean,
+  ): Promise<void> {
+    return this.#withState(async () => {
+      const checked = this.#invocationReservation(reservation);
+      if (typeof readOnly !== 'boolean') stateError();
+      // `received` precedes dispatch, which is not a D1 statement. The state
+      // therefore covers never-started, in-flight and completed-unrecorded work.
+      const results = await this.#database.batch([
+        {
+          sql: "INSERT INTO direct_reference_invocations (run_key,ordinal,request_sha256,state) VALUES (?,?,?,'received') ON CONFLICT DO NOTHING RETURNING ordinal",
+          bindings: [this.#runKey, checked.ordinal, checked.requestSha256],
+        },
+        ...(readOnly
+          ? [
+              {
+                sql: "UPDATE direct_reference_invocations SET state='received' WHERE run_key=? AND ordinal=? AND request_sha256=? AND state!='cancelled' RETURNING ordinal",
+                bindings: [
+                  this.#runKey,
+                  checked.ordinal,
+                  checked.requestSha256,
+                ],
+              },
+            ]
+          : []),
+        {
+          sql: 'SELECT ordinal,request_sha256,state FROM direct_reference_invocations WHERE run_key=? AND ordinal=?',
+          bindings: [this.#runKey, checked.ordinal],
+        },
+      ]);
+      const inserted = results[0] ?? [];
+      const updated = readOnly ? (results[1] ?? []) : inserted;
+      const selected = results[readOnly ? 2 : 1] ?? [];
+      if (inserted.length > 1 || updated.length > 1 || selected.length !== 1)
+        stateError();
+      const stored = this.#storedInvocation(selected[0]);
+      if (
+        stored.requestSha256 !== checked.requestSha256 ||
+        stored.state === 'cancelled' ||
+        (inserted.length === 0 && !readOnly) ||
+        (readOnly && updated.length !== 1)
+      )
+        throw new DirectReferenceJournalError('duplicate-ordinal');
+    });
+  }
+
+  settleReceivedInvocation(
+    reservation: Readonly<{ ordinal: number; requestSha256: string }>,
+    state: 'executed' | 'failed',
+  ): Promise<void> {
+    return this.#withState(async () => {
+      const checked = this.#invocationReservation(reservation);
+      if (state !== 'executed' && state !== 'failed') stateError();
+      const rows = await this.#database.query(
+        "UPDATE direct_reference_invocations SET state=? WHERE run_key=? AND ordinal=? AND request_sha256=? AND state!='cancelled' RETURNING ordinal,request_sha256,state",
+        [state, this.#runKey, checked.ordinal, checked.requestSha256],
+      );
+      if (rows.length !== 1) stateError();
+      const stored = this.#storedInvocation(rows[0]);
+      if (
+        stored.ordinal !== checked.ordinal ||
+        stored.requestSha256 !== checked.requestSha256 ||
+        stored.state !== state
+      )
+        stateError();
+    });
+  }
+
+  reconcileInvocation(
+    reservation: Readonly<{ ordinal: number; requestSha256: string }>,
+  ): Promise<DirectInvocationLedgerState> {
+    return this.#withState(async () => {
+      const checked = this.#invocationReservation(reservation);
+      const results = await this.#database.batch([
+        {
+          sql: "INSERT INTO direct_reference_invocations (run_key,ordinal,request_sha256,state) VALUES (?,?,?,'cancelled') ON CONFLICT DO NOTHING RETURNING ordinal",
+          bindings: [this.#runKey, checked.ordinal, checked.requestSha256],
+        },
+        {
+          sql: 'SELECT ordinal,request_sha256,state FROM direct_reference_invocations WHERE run_key=? AND ordinal=?',
+          bindings: [this.#runKey, checked.ordinal],
+        },
+      ]);
+      if ((results[0]?.length ?? 0) > 1 || results[1]?.length !== 1)
+        stateError();
+      const stored = this.#storedInvocation(results[1]?.[0]);
+      if (stored.requestSha256 !== checked.requestSha256)
+        throw new DirectReferenceJournalError('duplicate-ordinal');
+      return stored.state;
+    });
   }
 
   async #operation(

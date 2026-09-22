@@ -14,6 +14,7 @@ import {
 } from 'vitest';
 import {
   observeDirectWorkerVersion,
+  readDirectSettlementEffect,
   readDirectSettlementEffects,
   verifyDirectDecommissionExport,
 } from '../scripts/direct-credentialed-observations.mjs';
@@ -256,11 +257,13 @@ describe('fixed Worker observations through the native SDK', () => {
     });
     expect(Object.isFrozen(output)).toBe(true);
     expect(Object.isFrozen(output.currentDeployment.versions[0])).toBe(true);
-    expect(f.requests).toHaveLength(5);
+    expect(f.requests).toHaveLength(6);
     expect(f.requests.every((request) => request.method === 'GET')).toBe(true);
-    expect(f.requests.at(-1)?.headers.get('cf-r2-jurisdiction')).toBe(
-      'default',
-    );
+    expect(
+      f.requests
+        .find((request) => request.url.includes('/r2/buckets/'))
+        ?.headers.get('cf-r2-jurisdiction'),
+    ).toBe('default');
     expect(f.journal.snapshot()).toEqual(before);
     expect(JSON.stringify(output)).not.toContain(OBSERVATION_TOKEN);
   });
@@ -335,7 +338,7 @@ describe('fixed Worker observations through the native SDK', () => {
     expect((await observeDirectWorkerVersion(selected(f))).versionId).toBe(
       'version-a',
     );
-    expect(f.requests).toHaveLength(10);
+    expect(f.requests).toHaveLength(12);
   });
 
   it.each([
@@ -517,6 +520,7 @@ describe('fixed Worker observations through the native SDK', () => {
     ['FLEET_SCHEMA_VERSION', 'text', '1'],
     ['FLEET_SPEC_DIGEST', 'text', 'f'.repeat(64)],
     ['APPLICATION_RELEASE', 'text', '1'],
+    ['APPROVAL_ALLOW_SELF_DECISION', 'text', 'false'],
     ['APP_PROBE_TOKEN', 'text', OBSERVATION_TOKEN],
   ])('rejects binding drift %s.%s', async (name, field, value) => {
     const f = await fixture();
@@ -529,6 +533,30 @@ describe('fixed Worker observations through the native SDK', () => {
     });
     await expect(observeDirectWorkerVersion(selected(f))).rejects.toMatchObject(
       errorShape,
+    );
+  });
+
+  it('rejects a deployment missing the self-decision binding', async () => {
+    const f = await fixture();
+    f.hook(async (request, fallback) => {
+      const response = fallback();
+      const pathname = new URL(request.url).pathname;
+      const current = pathname.endsWith('/settings');
+      if (!current && !pathname.endsWith('/versions/version-a'))
+        return response;
+      const value = (await response.json()) as Record<string, unknown>;
+      const list = recordAt(value, current ? 'result' : 'result.resources')
+        .bindings as Record<string, unknown>[];
+      list.splice(
+        list.findIndex(
+          (binding) => binding.name === 'APPROVAL_ALLOW_SELF_DECISION',
+        ),
+        1,
+      );
+      return Response.json(value);
+    });
+    await expect(observeDirectWorkerVersion(selected(f))).rejects.toMatchObject(
+      { code: 'observation-mismatch' },
     );
   });
 
@@ -595,7 +623,7 @@ describe('confirmed context before provider work', () => {
     if (kind === 'invocation-pending')
       await f.journal.reserveInvocation(
         JSON.stringify({
-          contractVersion: 1,
+          contractVersion: 2,
           configSha256: f.prepared.configSha256,
           action: { kind: 'control-read' },
         }),
@@ -657,6 +685,39 @@ describe('confirmed context before provider work', () => {
 });
 
 describe('fixed settlement query and ready-row correlation', () => {
+  it('selects one replacement settlement by its independently derived key', async () => {
+    const f = await fixture();
+    const expected = f.expected[0];
+    const settlementKey = f.effects[0]?.observation_key;
+    if (!expected || !settlementKey)
+      throw new Error('settlement fixture is incomplete');
+    await expect(
+      readDirectSettlementEffect({
+        ...f.input,
+        expected,
+        settlementKey,
+      }),
+    ).resolves.toMatchObject({
+      role: 'a',
+      settlementKey,
+      versionId: expected.versionId,
+    });
+    await expect(
+      readDirectSettlementEffect({
+        ...f.input,
+        expected,
+        settlementKey: 'f'.repeat(64),
+      }),
+    ).rejects.toMatchObject({ code: 'invalid-input' });
+    console.log(
+      'LV2_NEGATIVE settlement-key',
+      JSON.stringify({
+        before: observationHash(settlementKey),
+        after: observationHash('f'.repeat(64)),
+      }),
+    );
+  });
+
   it('accepts null errors and messages on successful D1 statements', async () => {
     const f = await fixture();
     await mutateResponse(f, '/query', (body) => {
