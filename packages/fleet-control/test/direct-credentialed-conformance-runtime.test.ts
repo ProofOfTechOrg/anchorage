@@ -11,7 +11,7 @@ import { DirectBootstrapError } from '../scripts/direct-credentialed-bootstrap.m
 import * as directRuntime from '../scripts/direct-credentialed-conformance-runtime.mjs';
 import {
   DIRECT_ADMISSION_VARIABLES,
-  DIRECT_CONFORMANCE_CODES,
+  type DIRECT_CONFORMANCE_CODES,
   DIRECT_CONFORMANCE_USAGE,
   DIRECT_CREDENTIAL_VARIABLES,
   DIRECT_FIXED_OUTPUT,
@@ -71,31 +71,6 @@ const env = {
   FLEET_DIRECT_CONFORMANCE_INVOKE_SECRET: 'private-invoke-seed',
 };
 const now = () => Date.parse('2026-09-13T00:00:00.000Z');
-
-it('binds conformance summary declarations to runtime vocabularies', () => {
-  const codes: readonly NonNullable<DirectConformanceSummary['code']>[] = [
-    ...Object.values(DIRECT_CONFORMANCE_CODES),
-    new DirectRunStateError().code,
-    new DirectBootstrapError().code,
-  ];
-  const variables: readonly NonNullable<
-    DirectConformanceSummary['variable']
-  >[] = ['FLEET_DIRECT_CONFORMANCE_CONFIG', ...DIRECT_ADMISSION_VARIABLES];
-  expect(codes).toContain('invalid-input');
-  expect(variables).toEqual([
-    'FLEET_DIRECT_CONFORMANCE_CONFIG',
-    'CLOUDFLARE_ACCOUNT_ID',
-    'CLOUDFLARE_API_TOKEN',
-    'FLEET_DIRECT_CONFORMANCE_INVOKE_SECRET',
-  ]);
-  // @ts-expect-error The summary code is the union of its runtime producers.
-  const invalidCode: DirectConformanceSummary['code'] = 'not-a-code';
-  // @ts-expect-error The summary variable is one of the inspected variables.
-  const invalidVariable: DirectConformanceSummary['variable'] =
-    'NOT_A_VARIABLE';
-  void invalidCode;
-  void invalidVariable;
-});
 /** The bytes the entry writes to each descriptor for an in-process result. */
 function streamsOf(result: Awaited<ReturnType<typeof runDirectConformance>>) {
   return {
@@ -130,13 +105,11 @@ function expectCredentialSafeOutput(
         expect(DIRECT_FIXED_OUTPUT).toContain(result.stderrLine);
     }
   }
-  // One discriminant for the whole helper, and one check per descriptor.
   const { stdout, stderr } =
     'stdoutLine' in result ? streamsOf(result) : result;
   for (const variable of DIRECT_CREDENTIAL_VARIABLES) {
     const credential = credentials[variable];
     if (typeof credential !== 'string' || credential.length === 0) continue;
-    // Either descriptor order, because a reader interleaves two pipes.
     expect((stdout + stderr).includes(credential)).toBe(false);
     expect((stderr + stdout).includes(credential)).toBe(false);
   }
@@ -156,8 +129,8 @@ const NO_RETAINED_IDENTITIES = {
 };
 /**
  * The invalid-input diagnostic for `variable`, in one place rather than per
- * test. `freezes complete fixed output lines from the emitted constants` checks
- * it against the CLI's own list for every admission variable.
+ * test. `freezes complete fixed output lines from the emitted constants`
+ * checks it.
  */
 function invalidInputLine(variable: string) {
   return `${JSON.stringify({ code: 'invalid-input', variable })}\n`;
@@ -425,6 +398,30 @@ async function entryWithRuntime(
 }
 
 describe.sequential('direct CLI runtime', () => {
+  it('binds conformance summary declarations to runtime vocabularies', () => {
+    // Typecheck carries this case.
+    type Equal<Left, Right> =
+      (<Value>() => Value extends Left ? 1 : 2) extends <
+        Value,
+      >() => Value extends Right ? 1 : 2
+        ? true
+        : false;
+    const bound: [
+      Equal<
+        NonNullable<DirectConformanceSummary['code']>,
+        | (typeof DIRECT_CONFORMANCE_CODES)[keyof typeof DIRECT_CONFORMANCE_CODES]
+        | DirectRunStateError['code']
+        | DirectBootstrapError['code']
+      >,
+      Equal<
+        NonNullable<DirectConformanceSummary['variable']>,
+        | 'FLEET_DIRECT_CONFORMANCE_CONFIG'
+        | (typeof DIRECT_ADMISSION_VARIABLES)[number]
+      >,
+    ] = [true, true];
+    void bound;
+  });
+
   it('freezes complete fixed output lines from the emitted constants', () => {
     expect(Object.isFrozen(DIRECT_FIXED_OUTPUT)).toBe(true);
     expect(DIRECT_FIXED_OUTPUT).toEqual([
@@ -440,8 +437,7 @@ describe.sequential('direct CLI runtime', () => {
     ]);
     expect(DIRECT_FIXED_OUTPUT).toContain(DIRECT_USAGE_DIAGNOSTIC);
     expect(DIRECT_FIXED_OUTPUT).toContain(DIRECT_INTERNAL_ERROR_DIAGNOSTIC);
-    // Membership derived from the emitted constants rather than copied: every
-    // admission variable contributes its diagnostic, and nothing else does.
+    // Membership derived from the emitted constants rather than copied.
     for (const variable of DIRECT_ADMISSION_VARIABLES)
       expect(DIRECT_FIXED_OUTPUT).toContain(invalidInputLine(variable));
     expect(
@@ -465,7 +461,7 @@ describe.sequential('direct CLI runtime', () => {
   ])('refuses a fixed-output credential with a safe fixed diagnostic or silence (%s)', async (secret) => {
     const f = await fixture(680);
     // The refusal under test is the fixed-output collision, not the guard
-    // beside it: every table value is a token this row's sibling admits.
+    // beside it.
     expect(() => validateProviderAuth(secret)).not.toThrow();
     expect(DIRECT_FIXED_OUTPUT.some((line) => line.includes(secret))).toBe(
       true,
@@ -710,8 +706,6 @@ process.stderr.write = (...args) => {
     const stderrLine = '{"a":"Y"}\n';
     const stdoutLine = `${DIRECT_OUTPUT_PREFIX}{"a":"X"}\n`;
     const secret = 'Y"}\nDIRECT';
-    // The credential spans only the reverse boundary: a reader that takes
-    // stderr before stdout sees it, the writer's own order never does.
     expect(stdoutLine + stderrLine).not.toContain(secret);
     expect(stderrLine + stdoutLine).toContain(secret);
     const result = await entryWithRuntime(
@@ -731,7 +725,6 @@ process.stderr.write = (...args) => {
   });
 
   it.each([
-    // A key name the projection writes, and the index an array element carries.
     'retainedIdentities',
     '1',
   ])('refuses the evidence artifact key %s as a credential before the run starts', async (secret) => {
@@ -761,9 +754,9 @@ process.stderr.write = (...args) => {
     }
   });
 
-  // This case asserts the vocabulary's character shape only. Membership of the
-  // individual keys is carried by `test/direct-credentialed-evidence.test.ts`'s
-  // "covers every projected key with the admission vocabulary".
+  // Membership of the individual keys is carried by
+  // `test/direct-credentialed-evidence.test.ts`'s "covers every projected key
+  // with the admission vocabulary".
   it('admits only word, dot and dash characters in the evidence key vocabulary', () => {
     expect(DIRECT_EVIDENCE_KEYS.every((key) => /^[\w.-]+$/u.test(key))).toBe(
       true,
@@ -807,7 +800,7 @@ process.stderr.write = (...args) => {
         },
       },
     );
-    // The two observations the entry's own callbacks would swallow are
+    // The observations the entry's own callbacks would swallow are
     // captured here and asserted after the call completes.
     let readsAtPreflight: string[] | undefined;
     let readsAfterRun: string[] | undefined;
@@ -869,8 +862,6 @@ process.stderr.write = (...args) => {
       env: { ...env, [variable]: '' },
       modules: { preflight: async () => f.prepared },
     });
-    // The line travels with the refusal, so it names the variable the loop
-    // refused whatever a decoded summary says.
     expect(result).toEqual({
       exitCode: 2,
       summary: { code: 'invalid-input', variable },
@@ -1009,8 +1000,6 @@ process.on('exit', () => writeFileSync(${path}, JSON.stringify(reads)));\n`;
     );
     const stdout = `${DIRECT_OUTPUT_PREFIX}${JSON.stringify({ usage: DIRECT_CONFORMANCE_USAGE })}\n`;
     expect(result).toEqual({ code: 0, stdout, stderr: '' });
-    // Help is exempt from both reads in the same expression: the credentials
-    // and the configuration path.
     expect(JSON.parse(await readFile(readsPath, 'utf8'))).toEqual([]);
     expect(existsSync(f.base)).toBe(false);
   });
@@ -1874,7 +1863,6 @@ process.on('exit', () => writeFileSync(${path}, JSON.stringify(reads)));\n`;
       },
     });
     expectCredentialSafeOutput(result, {});
-    // The oversized line is replaced; the preflight keeps the code it resolved.
     expect(result.exitCode).toBe(0);
     expect(result.stdoutLine).toBe(
       bytes === 4096
@@ -2139,8 +2127,6 @@ process.on('exit', () => writeFileSync(${path}, JSON.stringify(reads)));\n`;
     expectCredentialSafeOutput(result);
     expect(result).toMatchObject({
       exitCode: 5,
-      // The artifact replaced its predecessor before the fault, so the run
-      // names the file it published.
       evidencePath: join(w.journal.directory, 'evidence.json'),
       summary: { code: 'evidence-failed', evidenceWritten: true },
     });

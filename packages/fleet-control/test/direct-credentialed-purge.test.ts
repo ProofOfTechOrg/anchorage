@@ -33,6 +33,9 @@ const env = {
   CLOUDFLARE_API_TOKEN: API_TOKEN,
 };
 const roles = ['a', 'b', 'recovery'] as const;
+const purgeEntry = new URL(directModuleUrl('direct-credentialed-purge'))
+  .pathname;
+const internalErrorLine = `${DIRECT_PURGE_OUTPUT_PREFIX}{"code":"internal-error"}\n`;
 
 beforeEach(() => {
   vi.stubGlobal(
@@ -345,21 +348,15 @@ describe('direct credentialed purge', () => {
     expect(runtime.stdoutLine).toContain(DIRECT_PURGE_OUTPUT_PREFIX);
     expect(runtime.stdoutLine).not.toContain(API_TOKEN);
 
-    const entry = new URL(directModuleUrl('direct-credentialed-purge'))
-      .pathname;
-    const help = await spawnDirectChild([entry, '--help'], {
+    const help = await spawnDirectChild([purgeEntry, '--help'], {
       timeoutMs: 10_000,
     });
-    const usage = await spawnDirectChild([entry, '--unknown'], {
+    const usage = await spawnDirectChild([purgeEntry, '--unknown'], {
       timeoutMs: 10_000,
     });
-    const invalid = await spawnDirectChild([entry, '--delete', 'wrong'], {
+    const invalid = await spawnDirectChild([purgeEntry, '--delete', 'wrong'], {
       timeoutMs: 10_000,
-      env: {
-        FLEET_DIRECT_CONFORMANCE_CONFIG: world.f.configPath,
-        CLOUDFLARE_ACCOUNT_ID: ACCOUNT,
-        CLOUDFLARE_API_TOKEN: API_TOKEN,
-      },
+      env: { ...env, FLEET_DIRECT_CONFORMANCE_CONFIG: world.f.configPath },
     });
 
     expect(help).toMatchObject({ status: 0, stderr: '' });
@@ -372,6 +369,20 @@ describe('direct credentialed purge', () => {
     expect(help.stdout + usage.stdout + invalid.stdout).not.toContain(
       API_TOKEN,
     );
+  });
+
+  it('withholds a summary that carries the token and exits 3', async () => {
+    const world = await providerWorld({ tenants: true });
+    const result = await spawnDirectChild([purgeEntry, '--delete', 'wrong'], {
+      timeoutMs: 10_000,
+      env: {
+        ...env,
+        FLEET_DIRECT_CONFORMANCE_CONFIG: world.f.configPath,
+        CLOUDFLARE_ACCOUNT_ID: `account-${API_TOKEN}`,
+      },
+    });
+
+    expect(result).toMatchObject({ status: 3, stdout: '', stderr: '' });
   });
 
   it.each([
@@ -400,29 +411,22 @@ process.stdout.write = (...args) => {
 };
 `,
     );
-    const entry = new URL(directModuleUrl('direct-credentialed-purge'))
-      .pathname;
-    const result = await spawnDirectChild([entry, '--delete', 'wrong'], {
+    const result = await spawnDirectChild([purgeEntry, '--delete', 'wrong'], {
       timeoutMs: 10_000,
       env: {
+        ...env,
         NODE_OPTIONS: `--import=${preload}`,
         FLEET_DIRECT_CONFORMANCE_CONFIG: world.f.configPath,
-        CLOUDFLARE_ACCOUNT_ID: ACCOUNT,
-        CLOUDFLARE_API_TOKEN: API_TOKEN,
       },
     });
 
     expect(result).toMatchObject({ status: 4, stderr: '' });
-    expect(result.stdout).toContain(
-      `${DIRECT_PURGE_OUTPUT_PREFIX}{"code":"internal-error"}\n`,
-    );
+    expect(result.stdout).toContain(internalErrorLine);
     expect(result.stdout).not.toContain(API_TOKEN);
   });
 
   it('keeps exit 4 when the runtime settles after a trapped rejection', async () => {
     const world = await providerWorld({ tenants: true });
-    const entry = new URL(directModuleUrl('direct-credentialed-purge'))
-      .pathname;
     const preload = join(world.f.directory, 'purge-pending-rejection.mjs');
     await writeFile(
       preload,
@@ -440,20 +444,18 @@ globalThis.fetch = async () => {
 };
 `,
     );
-    const result = await spawnDirectChild([entry, '--list'], {
+    const result = await spawnDirectChild([purgeEntry, '--list'], {
       timeoutMs: 10_000,
       env: {
+        ...env,
         NODE_OPTIONS: `--import=${preload}`,
         FLEET_DIRECT_CONFORMANCE_CONFIG: world.f.configPath,
-        CLOUDFLARE_ACCOUNT_ID: ACCOUNT,
-        CLOUDFLARE_API_TOKEN: API_TOKEN,
       },
     });
-    const internal = `${DIRECT_PURGE_OUTPUT_PREFIX}{"code":"internal-error"}\n`;
 
     expect(result).toMatchObject({ status: 4, stderr: '' });
-    expect(result.stdout.startsWith(internal)).toBe(true);
-    expect(result.stdout.slice(internal.length)).toContain(
+    expect(result.stdout.startsWith(internalErrorLine)).toBe(true);
+    expect(result.stdout.slice(internalErrorLine.length)).toContain(
       '"residual":"unverified"',
     );
     expect(result.stdout).not.toContain(API_TOKEN);
@@ -528,16 +530,16 @@ globalThis.fetch = async () => {
       ),
     ).toEqual(exhaustive);
   });
-});
 
-it('parses the destructive confirmation as an exact second argument', () => {
-  expect(parseDirectPurgeArgs([])).toEqual({
-    mode: 'list',
-    confirmation: null,
+  it('parses the destructive confirmation as an exact second argument', () => {
+    expect(parseDirectPurgeArgs([])).toEqual({
+      mode: 'list',
+      confirmation: null,
+    });
+    expect(parseDirectPurgeArgs(['--delete', 'prefix'])).toEqual({
+      mode: 'delete',
+      confirmation: 'prefix',
+    });
+    expect(parseDirectPurgeArgs(['--delete'])).toBeNull();
   });
-  expect(parseDirectPurgeArgs(['--delete', 'prefix'])).toEqual({
-    mode: 'delete',
-    confirmation: 'prefix',
-  });
-  expect(parseDirectPurgeArgs(['--delete'])).toBeNull();
 });

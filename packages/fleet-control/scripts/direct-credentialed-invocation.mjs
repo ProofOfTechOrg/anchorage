@@ -26,16 +26,17 @@ const INGRESS_INTERVAL_MS = 2_000;
  * first contract answer; consecutive probes span the latter window.
  */
 const INGRESS_STABLE_PROBES = 3;
-// Polling reaches the Worker deadline at `pollBy`; the margin is the response
-// budget for that request, enforced by the abort timer at `deadlineMs`. Restart
-// latency covers the terminal write, and fixed-interval tail polls cover a write
-// that settles just after `pollBy`.
+// The margin is the response budget for a request sent at `pollBy`, enforced
+// by the abort timer at `deadlineMs`. Restart latency covers the terminal
+// write, and any fixed-interval tail polls, up to the request cap, cover a
+// write that settles just after `pollBy`.
 export const DIRECT_RECONCILIATION_MARGIN_MS = 5_000;
 export const DIRECT_RECONCILIATION_INTERVAL_MS = 250;
 export const DIRECT_RECONCILIATION_MAX_INTERVAL_MS = 32_000;
 // The cap bounds the requests one reconciliation sends. The poll ends at the
-// cap or at the time bound, whichever it reaches first; a longer Worker
-// deadline reaches the cap earlier in its window.
+// cap or at the time bound, whichever it reaches first. With a long enough
+// Worker deadline the cap leaves no tail poll, and with a longer one it ends
+// the poll before `pollBy`.
 export const DIRECT_RECONCILIATION_MAX_REQUESTS = 32;
 export const DIRECT_INVOCATION_FAILURE_DETAILS = Object.freeze([
   'platform-page',

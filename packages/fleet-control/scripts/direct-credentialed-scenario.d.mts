@@ -31,12 +31,9 @@ type Role = DirectFixtureRole;
 type NormalRole = DirectScenarioNormalRole;
 type RoleBound<Value, Key extends Role> = Omit<Value, 'role'> &
   Readonly<{ role: Key }>;
-type RoleAWorkerVersionObservation = RoleBound<
-  DirectWorkerVersionObservation,
-  'a'
->;
-type RoleASettlementEffect = RoleBound<DirectSettlementEffect, 'a'>;
-type RoleAVerifiedExport = RoleBound<DirectVerifiedExport, 'a'>;
+type RoleKeyed<Value, Keys extends Role> = Readonly<{
+  [Key in Keys]: RoleBound<Value, Key> | null;
+}>;
 
 export type { DirectScenarioOperationSlot } from './direct-credentialed-scenario-checks.mjs';
 export type { DirectScenarioPhase };
@@ -58,10 +55,6 @@ interface ScenarioCall {
     step: string;
     itemsSha256: string;
   }> | null;
-  /**
-   * Settled force-terminal calls require a nullable before identity; prepared
-   * and other calls omit it. Declared last, as `callShape` persists it.
-   */
   readonly before?: Readonly<{ databaseId: string; scriptName: string }> | null;
   readonly witness?: Readonly<Record<string, unknown>>;
 }
@@ -146,25 +139,13 @@ export interface DirectScenarioFenceProofs {
   }>;
 }
 export interface DirectScenarioProofs {
-  readonly initial: Readonly<{
-    [Key in Role]: RoleBound<DirectWorkerVersionObservation, Key> | null;
-  }>;
-  readonly candidate: Readonly<{
-    [Key in NormalRole]: RoleBound<DirectWorkerVersionObservation, Key> | null;
-  }>;
-  readonly final: Readonly<{
-    [Key in NormalRole]: RoleBound<DirectWorkerVersionObservation, Key> | null;
-  }>;
+  readonly initial: RoleKeyed<DirectWorkerVersionObservation, Role>;
+  readonly candidate: RoleKeyed<DirectWorkerVersionObservation, NormalRole>;
+  readonly final: RoleKeyed<DirectWorkerVersionObservation, NormalRole>;
   readonly identities: Readonly<Record<NormalRole, unknown | null>>;
-  readonly reprovision: Readonly<
-    Record<'a', RoleAWorkerVersionObservation | null>
-  >;
-  readonly reprovisionFinal: Readonly<
-    Record<'a', RoleAWorkerVersionObservation | null>
-  >;
-  readonly reprovisionSettlement: Readonly<
-    Record<'a', RoleASettlementEffect | null>
-  >;
+  readonly reprovision: RoleKeyed<DirectWorkerVersionObservation, 'a'>;
+  readonly reprovisionFinal: RoleKeyed<DirectWorkerVersionObservation, 'a'>;
+  readonly reprovisionSettlement: RoleKeyed<DirectSettlementEffect, 'a'>;
   readonly continuation: Readonly<
     Record<
       'started' | 'locked' | 'versionB' | 'refused' | 'reopened' | 'finished',
@@ -212,12 +193,8 @@ export interface DirectScenarioProofs {
   >[];
   readonly effects: readonly DirectSettlementEffect[];
   readonly cleanup: CleanupTerminalReceipt | null;
-  readonly exports: Readonly<{
-    [Key in NormalRole]: RoleBound<DirectVerifiedExport, Key> | null;
-  }>;
-  readonly reprovisionExports: Readonly<
-    Record<'a', RoleAVerifiedExport | null>
-  >;
+  readonly exports: RoleKeyed<DirectVerifiedExport, NormalRole>;
+  readonly reprovisionExports: RoleKeyed<DirectVerifiedExport, 'a'>;
   readonly exportVerifications: readonly (
     | Readonly<{
         role: NormalRole;
