@@ -440,17 +440,37 @@ describeLinux('Node authenticated direct invocation', () => {
     expect(waits).toEqual([250, 500]);
   });
 
-  it('ends received reconciliation at a shorter time bound', async () => {
+  it.each([
+    [
+      'after a wait clamped to it',
+      (_sentAt: number): number => 0,
+      [
+        1_000, 2_000, 4_000, 8_000, 16_000, 29_000, 1_000, 1_000, 1_000, 1_000,
+        1_000,
+      ],
+    ],
+    [
+      'when a response lands at it',
+      (sentAt: number): number => (sentAt === 64_000 ? 1_000 : 0),
+      [1_000, 2_000, 4_000, 8_000, 16_000, 29_000, 1_000, 1_000, 1_000, 1_000],
+    ],
+  ] as const)('ends received reconciliation at the time bound before the request cap %s', async (_name, latencyMs, expectedWaits) => {
     const f = await fixture();
-    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
+    // Only `performance` is fake: the abort timer runs on the real clock and
+    // cannot fire while the poll runs, so the loop's own time checks end it.
+    vi.useFakeTimers({ toFake: ['performance'] });
+    const requestTimes: number[] = [];
     const waits: number[] = [];
-    const sleep = vi.fn(async (ms: number) => {
-      waits.push(ms);
-      await vi.advanceTimersByTimeAsync(ms);
+    const fetchRequest = vi.fn<typeof fetch>(async () => {
+      const sentAt = performance.now();
+      requestTimes.push(sentAt);
+      vi.advanceTimersByTime(latencyMs(sentAt));
+      return reconciliationResponse(f.prepared.configSha256, 'received');
     });
-    const fetchRequest = vi.fn<typeof fetch>(async () =>
-      reconciliationResponse(f.prepared.configSha256, 'received'),
-    );
+    const sleep = async (ms: number) => {
+      waits.push(ms);
+      vi.advanceTimersByTime(ms);
+    };
     await expect(
       reconcileDirectInvocation({
         endpoint: `https://${f.prepared.names.referenceWorker}.attested-account.workers.dev${DIRECT_REFERENCE_PATH}`,
@@ -458,15 +478,21 @@ describeLinux('Node authenticated direct invocation', () => {
         configSha256: f.prepared.configSha256,
         ordinal: 1,
         requestSha256: 'a'.repeat(64),
-        workerDeadlineMs: 1,
-        deadlineMs: 100,
-        intervalMs: 1,
+        workerDeadlineMs: 60_000,
+        deadlineMs: 65_000,
+        intervalMs: 1_000,
         fetch: fetchRequest,
         sleep,
       }),
     ).resolves.toBe('unreachable');
-    expect(fetchRequest).toHaveBeenCalledTimes(32);
-    expect(waits).toEqual(Array.from({ length: 31 }, () => 1));
+    expect(requestTimes).toEqual([
+      0, 1_000, 3_000, 7_000, 15_000, 31_000, 60_000, 61_000, 62_000, 63_000,
+      64_000,
+    ]);
+    expect(requestTimes.length).toBeLessThan(
+      DIRECT_RECONCILIATION_MAX_REQUESTS,
+    );
+    expect(waits).toEqual(expectedWaits);
   });
 
   it('rejects a reconciliation interval above its ceiling', async () => {

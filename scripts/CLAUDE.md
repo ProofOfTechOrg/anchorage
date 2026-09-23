@@ -24,6 +24,7 @@ Repository documentation, architecture, and publication checks. Markdown syntax 
 - `entry-point.mjs` — `isInvokedAsEntryPoint(moduleUrl)`, the entry-point predicate the root scripts guard their side effects with. `moduleUrl` is a `file:` URL, as a string or a `URL`. The disposition it carries is documented on the export.
 - `entry-point.test.mjs` — requires `pnpm build` before `node --test scripts/entry-point.test.mjs` because the suite's `mint` cases run the agent-starter token script against flowsafe's built `approval-api` entry.
 - `child-process-fixture.mjs` — the `node:test` child-process harness: a temporary repository root, a spawned child under a watchdog, and the reader for the event log that child writes.
+- `vitest-project-selectors.mjs` — parses the `--project` selectors of a root script's Vitest command.
 - [`baseline-recorder.mjs`](baseline-recorder.mjs): recorder configuration and supported literal values are documented on `runBaselineRecorder`.
 - [`baseline-recorder.test.mjs`](baseline-recorder.test.mjs): run with `node --test scripts/baseline-recorder.test.mjs`.
 - [`record-drain-baseline.mjs`](record-drain-baseline.mjs): inventory recorder. Golden assertions live in [`cloudflare-client.test.ts`](../packages/fleet-control/test/cloudflare-client.test.ts).

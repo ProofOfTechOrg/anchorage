@@ -29,15 +29,14 @@ import type { DirectFixtureRole } from './direct-credentialed-spec.js';
 
 type Role = DirectFixtureRole;
 type NormalRole = DirectScenarioNormalRole;
-type RoleAWorkerVersionObservation = Omit<
+type RoleBound<Value, Key extends Role> = Omit<Value, 'role'> &
+  Readonly<{ role: Key }>;
+type RoleAWorkerVersionObservation = RoleBound<
   DirectWorkerVersionObservation,
-  'role'
-> &
-  Readonly<{ role: 'a' }>;
-type RoleASettlementEffect = Omit<DirectSettlementEffect, 'role'> &
-  Readonly<{ role: 'a' }>;
-type RoleAVerifiedExport = Omit<DirectVerifiedExport, 'role'> &
-  Readonly<{ role: 'a' }>;
+  'a'
+>;
+type RoleASettlementEffect = RoleBound<DirectSettlementEffect, 'a'>;
+type RoleAVerifiedExport = RoleBound<DirectVerifiedExport, 'a'>;
 
 export type { DirectScenarioOperationSlot } from './direct-credentialed-scenario-checks.mjs';
 export type { DirectScenarioPhase };
@@ -147,15 +146,15 @@ export interface DirectScenarioFenceProofs {
   }>;
 }
 export interface DirectScenarioProofs {
-  readonly initial: Readonly<
-    Record<Role, DirectWorkerVersionObservation | null>
-  >;
-  readonly candidate: Readonly<
-    Record<NormalRole, DirectWorkerVersionObservation | null>
-  >;
-  readonly final: Readonly<
-    Record<NormalRole, DirectWorkerVersionObservation | null>
-  >;
+  readonly initial: Readonly<{
+    [Key in Role]: RoleBound<DirectWorkerVersionObservation, Key> | null;
+  }>;
+  readonly candidate: Readonly<{
+    [Key in NormalRole]: RoleBound<DirectWorkerVersionObservation, Key> | null;
+  }>;
+  readonly final: Readonly<{
+    [Key in NormalRole]: RoleBound<DirectWorkerVersionObservation, Key> | null;
+  }>;
   readonly identities: Readonly<Record<NormalRole, unknown | null>>;
   readonly reprovision: Readonly<
     Record<'a', RoleAWorkerVersionObservation | null>
@@ -213,7 +212,9 @@ export interface DirectScenarioProofs {
   >[];
   readonly effects: readonly DirectSettlementEffect[];
   readonly cleanup: CleanupTerminalReceipt | null;
-  readonly exports: Readonly<Record<NormalRole, DirectVerifiedExport | null>>;
+  readonly exports: Readonly<{
+    [Key in NormalRole]: RoleBound<DirectVerifiedExport, Key> | null;
+  }>;
   readonly reprovisionExports: Readonly<
     Record<'a', RoleAVerifiedExport | null>
   >;

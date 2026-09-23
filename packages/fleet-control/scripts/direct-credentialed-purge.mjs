@@ -5,6 +5,7 @@ import {
   DIRECT_PURGE_EXIT_CODES,
   DIRECT_PURGE_OUTPUT_PREFIX,
   parseDirectPurgeArgs,
+  resolveDirectPurgeExitCode,
   runDirectCredentialedPurge,
 } from './direct-credentialed-purge-runtime.mjs';
 
@@ -13,7 +14,7 @@ let terminal = null;
 let credentials = [];
 let transcript = '';
 function setExitCode(next) {
-  if (terminal !== exits.internalError) terminal = next;
+  terminal = resolveDirectPurgeExitCode(terminal, next);
   process.exitCode = terminal;
 }
 function write(stream, line) {

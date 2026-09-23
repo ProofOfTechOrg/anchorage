@@ -33,8 +33,9 @@ const INGRESS_STABLE_PROBES = 3;
 export const DIRECT_RECONCILIATION_MARGIN_MS = 5_000;
 export const DIRECT_RECONCILIATION_INTERVAL_MS = 250;
 export const DIRECT_RECONCILIATION_MAX_INTERVAL_MS = 32_000;
-// The cap guards a shorter interval override. At the production interval the
-// time bound ends polling first.
+// The cap bounds the requests one reconciliation sends. The poll ends at the
+// cap or at the time bound, whichever it reaches first; a longer Worker
+// deadline reaches the cap earlier in its window.
 export const DIRECT_RECONCILIATION_MAX_REQUESTS = 32;
 export const DIRECT_INVOCATION_FAILURE_DETAILS = Object.freeze([
   'platform-page',

@@ -55,6 +55,8 @@ export type DirectDispatchClassification = Readonly<{
   kind: 'first-page-404' | 'empty' | 'enumerated';
   count: number;
   names: readonly string[];
+  /** Whether the page's `result_info` corroborated it; `false` for a 404. */
+  exhaustive: boolean;
 }>;
 
 export function validateProviderAuth(value: unknown): void;

@@ -258,7 +258,7 @@ export async function providerWorld(
       if (path === ROUTES) return listing(state.routes);
       if (path === `${ROOT}/queues`) return listing(state.queues);
       if (path === `${ROOT}/workers/dispatch/namespaces`)
-        return json(state.dispatch);
+        return listing(state.dispatch);
     }
     if (request.method === 'POST' && path === `${script}/subdomain`) {
       expect(await request.json()).toEqual({

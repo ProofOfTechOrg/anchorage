@@ -4,9 +4,12 @@ import { writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  DIRECT_PURGE_EXIT_CODES,
   DIRECT_PURGE_MAX_REQUESTS,
   DIRECT_PURGE_OUTPUT_PREFIX,
+  type DirectPurgeResult,
   parseDirectPurgeArgs,
+  resolveDirectPurgeExitCode,
   runDirectCredentialedPurge,
 } from '../scripts/direct-credentialed-purge-runtime.mjs';
 import {
@@ -177,6 +180,9 @@ describe('direct credentialed purge', () => {
     expect(result).toMatchObject({
       exitCode: 3,
       summary: {
+        before: null,
+        after: null,
+        uncorroborated: null,
         residual: 'unverified',
         failure: { surface: 'domains', step: 'classify' },
       },
@@ -246,7 +252,7 @@ describe('direct credentialed purge', () => {
   });
 
   it('reports a fail-closed dispatch read as unverified', async () => {
-    const world = await providerWorld({ tenants: true });
+    const world = await providerWorld({ corroborate: true, tenants: true });
     world.setHook((request, url) =>
       request.method === 'GET' &&
       url.pathname === `${ROOT}/workers/dispatch/namespaces`
@@ -257,7 +263,38 @@ describe('direct credentialed purge', () => {
 
     expect(result).toMatchObject({
       exitCode: 1,
-      summary: { residual: 'unverified' },
+      summary: {
+        residual: 'unverified',
+        after: { dispatch: { count: 0, exhaustive: false } },
+        uncorroborated: ['dispatch'],
+      },
+    });
+  });
+
+  it("names the rescan's uncorroborated surfaces after a delete", async () => {
+    const world = await providerWorld({ corroborate: true, tenants: true });
+    let dispatchReads = 0;
+    world.setHook((request, url) => {
+      if (
+        request.method !== 'GET' ||
+        url.pathname !== `${ROOT}/workers/dispatch/namespaces`
+      )
+        return undefined;
+      dispatchReads += 1;
+      return dispatchReads === 2 ? absent() : undefined;
+    });
+    const result = await purge(world);
+
+    expect(dispatchReads).toBe(2);
+    expect(result).toMatchObject({
+      exitCode: 0,
+      summary: {
+        mode: 'delete',
+        residual: 'none',
+        before: { dispatch: { exhaustive: true } },
+        after: { dispatch: { count: 0, names: [], exhaustive: false } },
+        uncorroborated: ['dispatch'],
+      },
     });
   });
 
@@ -290,7 +327,10 @@ describe('direct credentialed purge', () => {
 
     expect(result).toMatchObject({
       exitCode: 3,
-      summary: { failure: { surface: 'routes', step: 'delete' } },
+      summary: {
+        failure: { surface: 'routes', step: 'delete' },
+        uncorroborated: ['scripts', 'domains', 'routes', 'queues', 'dispatch'],
+      },
     });
     expect(
       world.requests.some((request) =>
@@ -324,6 +364,7 @@ describe('direct credentialed purge', () => {
 
     expect(help).toMatchObject({ status: 0, stderr: '' });
     expect(help.stdout).toContain('"mode":"help"');
+    expect(help.stdout).toContain('4 internal error');
     expect(usage).toMatchObject({ status: 2, stderr: '' });
     expect(usage.stdout).toContain('"code":"usage"');
     expect(invalid).toMatchObject({ status: 2, stderr: '' });
@@ -333,9 +374,18 @@ describe('direct credentialed purge', () => {
     );
   });
 
-  it('traps an injected rejection behind the fixed internal-error line', async () => {
+  it.each([
+    [
+      'rejection',
+      'setTimeout(() => Promise.reject(new Error(process.env.CLOUDFLARE_API_TOKEN)), 0);',
+    ],
+    [
+      'exception',
+      'setTimeout(() => { throw new Error(process.env.CLOUDFLARE_API_TOKEN); }, 0);',
+    ],
+  ] as const)('traps an injected %s behind the fixed internal-error line', async (name, injection) => {
     const world = await providerWorld({ tenants: true });
-    const preload = join(world.f.directory, 'purge-rejection.mjs');
+    const preload = join(world.f.directory, `purge-${name}.mjs`);
     await writeFile(
       preload,
       `const write = process.stdout.write.bind(process.stdout);
@@ -344,7 +394,7 @@ process.stdout.write = (...args) => {
   const result = write(...args);
   if (!injected) {
     injected = true;
-    setTimeout(() => Promise.reject(new Error(process.env.CLOUDFLARE_API_TOKEN)), 0);
+    ${injection}
   }
   return result;
 };
@@ -369,10 +419,72 @@ process.stdout.write = (...args) => {
     expect(result.stdout).not.toContain(API_TOKEN);
   });
 
+  it('keeps exit 4 when the runtime settles after a trapped rejection', async () => {
+    const world = await providerWorld({ tenants: true });
+    const entry = new URL(directModuleUrl('direct-credentialed-purge'))
+      .pathname;
+    const preload = join(world.f.directory, 'purge-pending-rejection.mjs');
+    await writeFile(
+      preload,
+      `let injected = false;
+globalThis.fetch = async () => {
+  if (!injected) {
+    injected = true;
+    Promise.reject(new Error(process.env.CLOUDFLARE_API_TOKEN));
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  return Response.json(
+    { success: false, errors: [{ code: 10000, message: 'synthetic refusal' }] },
+    { status: 403 },
+  );
+};
+`,
+    );
+    const result = await spawnDirectChild([entry, '--list'], {
+      timeoutMs: 10_000,
+      env: {
+        NODE_OPTIONS: `--import=${preload}`,
+        FLEET_DIRECT_CONFORMANCE_CONFIG: world.f.configPath,
+        CLOUDFLARE_ACCOUNT_ID: ACCOUNT,
+        CLOUDFLARE_API_TOKEN: API_TOKEN,
+      },
+    });
+    const internal = `${DIRECT_PURGE_OUTPUT_PREFIX}{"code":"internal-error"}\n`;
+
+    expect(result).toMatchObject({ status: 4, stderr: '' });
+    expect(result.stdout.startsWith(internal)).toBe(true);
+    expect(result.stdout.slice(internal.length)).toContain(
+      '"residual":"unverified"',
+    );
+    expect(result.stdout).not.toContain(API_TOKEN);
+  });
+
+  it('keeps an internal error over every later exit code', () => {
+    const { internalError, ...results } = DIRECT_PURGE_EXIT_CODES;
+    const codes: readonly DirectPurgeResult['exitCode'][] =
+      Object.values(results);
+    // @ts-expect-error The runtime result never carries the entry's internal-error code.
+    const entryOnly: DirectPurgeResult['exitCode'] = internalError;
+    void entryOnly;
+    expect(codes).toEqual([0, 1, 2, 3]);
+    for (const code of codes) {
+      expect(resolveDirectPurgeExitCode(null, code)).toBe(code);
+      expect(resolveDirectPurgeExitCode(code, internalError)).toBe(
+        internalError,
+      );
+      expect(resolveDirectPurgeExitCode(internalError, code)).toBe(
+        internalError,
+      );
+    }
+    expect(
+      resolveDirectPurgeExitCode(results.success, results.providerFailed),
+    ).toBe(results.providerFailed);
+  });
+
   it.each([
     [
       false,
-      ['scripts', 'domains', 'routes', 'queues'],
+      ['scripts', 'domains', 'routes', 'queues', 'dispatch'],
       {
         databases: true,
         durableObjectNamespaces: true,
@@ -381,7 +493,7 @@ process.stdout.write = (...args) => {
         domains: false,
         routes: false,
         queues: false,
-        dispatch: true,
+        dispatch: false,
       },
     ],
     [

@@ -4,6 +4,10 @@ import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { afterEach, expect, it } from 'vitest';
 import { z } from 'zod';
+import type {
+  DirectScenarioFenceProofs,
+  DirectScenarioProofs,
+} from '../scripts/direct-credentialed-scenario.mjs';
 import {
   DIRECT_SCENARIO_INVOCATION_BUDGET,
   DIRECT_SCENARIO_PHASES,
@@ -128,10 +132,11 @@ it.each([
   [
     'export proofs and their history digests',
     (state: ReturnType<typeof completeScenario>) => {
-      [state.proofs.exports.a, state.proofs.exports.b] = [
-        state.proofs.exports.b,
-        state.proofs.exports.a,
-      ];
+      const exports = state.proofs.exports as unknown as {
+        a: unknown;
+        b: unknown;
+      };
+      [exports.a, exports.b] = [exports.b, exports.a];
       const originalA = present(
         state.proofs.exportVerifications.find(
           ({ cycle, role }) => cycle === null && role === 'a',
@@ -170,6 +175,24 @@ it.each([
   await expect(journal.recordScenario(state)).rejects.toMatchObject({
     code: 'invalid-state',
   });
+});
+
+it('declares each keyed proof bound to the role of its key', () => {
+  // Typecheck carries this case: `KeyBound` is `false` for a group whose
+  // declaration accepts its `b` entry under `a`.
+  type KeyBound<Group extends Readonly<{ a: unknown; b: unknown }>> =
+    NonNullable<Group['b']> extends Group['a'] ? false : true;
+  const bound: [
+    KeyBound<DirectScenarioProofs['initial']>,
+    KeyBound<DirectScenarioProofs['candidate']>,
+    KeyBound<DirectScenarioProofs['final']>,
+    KeyBound<DirectScenarioProofs['exports']>,
+    KeyBound<DirectScenarioFenceProofs['drain']>,
+    KeyBound<DirectScenarioFenceProofs['sweeps']>,
+    KeyBound<DirectScenarioFenceProofs['reopen']>,
+    KeyBound<DirectScenarioFenceProofs['probes']>,
+  ] = [true, true, true, true, true, true, true, true];
+  void bound;
 });
 
 it('rejects a new run id in the finished continuation proof', async () => {

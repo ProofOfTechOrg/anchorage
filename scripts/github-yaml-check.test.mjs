@@ -28,6 +28,10 @@ import {
   PNPM_OPTION_POLICIES,
   UNMODELLED_NODE_TYPES,
 } from './shell-command-analysis.mjs';
+import {
+  explicitProjects,
+  projectSelectors,
+} from './vitest-project-selectors.mjs';
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const require = createRequire(import.meta.url);
@@ -103,22 +107,13 @@ function readVerifyCoreJob() {
   return job;
 }
 
-const projectSelector =
-  /(?:^|\s)--project(?:=|\s+)(?:"([^"]+)"|'([^']+)'|([^\s]+))/gu;
-
-function projectSelectors(command) {
-  return [...command.matchAll(projectSelector)].map((match) =>
-    match.slice(1).find((candidate) => candidate !== undefined),
-  );
-}
-
 function invokedRootScript(run) {
   const match = /^pnpm(?:\s+run)?\s+([^\s]+)\s*$/u.exec(run);
   return match?.[1];
 }
 
 function assertDirectScenarioJobs(manifest, workflow) {
-  const selected = projectSelectors(
+  const selected = explicitProjects(
     manifest.scripts['test:direct-scenario'] ?? '',
   );
   assert.ok(selected.length > 0, 'test:direct-scenario selects no project');
@@ -3236,6 +3231,18 @@ test('each direct-scenario project has its own gating CI job', () => {
   assert.throws(
     () => assertDirectScenarioJobs(manifest, missingNeed),
     /verify\.needs omits/u,
+  );
+
+  const unmatched = {
+    ...manifest,
+    scripts: {
+      ...manifest.scripts,
+      'test:direct-scenario': `${manifest.scripts['test:direct-scenario']} --project=fleet-control-direct-scenario-unmatched`,
+    },
+  };
+  assert.throws(
+    () => assertDirectScenarioJobs(unmatched, workflow),
+    /has no CI job whose root script selects it alone/u,
   );
 });
 

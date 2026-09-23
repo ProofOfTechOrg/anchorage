@@ -5,8 +5,14 @@ export interface DirectPurgeArguments {
   readonly mode: DirectPurgeMode;
   readonly confirmation: string | null;
 }
+export type DirectPurgeExitCode =
+  (typeof DIRECT_PURGE_EXIT_CODES)[keyof typeof DIRECT_PURGE_EXIT_CODES];
 export interface DirectPurgeResult {
-  readonly exitCode: 0 | 1 | 2 | 3 | 4;
+  /** `internalError` is the entry's own code; the runtime never returns it. */
+  readonly exitCode: Exclude<
+    DirectPurgeExitCode,
+    (typeof DIRECT_PURGE_EXIT_CODES)['internalError']
+  >;
   readonly summary: Readonly<Record<string, unknown>>;
   readonly stdoutLine: string;
   readonly stderrLine: null;
@@ -21,6 +27,14 @@ export const DIRECT_PURGE_EXIT_CODES: Readonly<{
   providerFailed: 3;
   internalError: 4;
 }>;
+/**
+ * Resolves one process exit code from several. `internalError` outranks every
+ * other code, so a result that settles after a trapped fault cannot replace it.
+ */
+export function resolveDirectPurgeExitCode(
+  current: DirectPurgeExitCode | null,
+  next: DirectPurgeExitCode,
+): DirectPurgeExitCode;
 export function parseDirectPurgeArgs(
   argv: readonly string[],
 ): DirectPurgeArguments | null;

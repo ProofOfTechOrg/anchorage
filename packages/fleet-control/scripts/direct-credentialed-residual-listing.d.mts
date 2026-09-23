@@ -20,6 +20,7 @@ export interface DirectResidualListing {
     kind: 'first-page-404' | 'empty' | 'enumerated' | 'fail-closed';
     count: number;
     names: readonly string[];
+    exhaustive: boolean;
     status: number | null;
   }>;
 }

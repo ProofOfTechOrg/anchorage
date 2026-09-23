@@ -15,6 +15,10 @@ import { tmpdir } from 'node:os';
 import { basename, dirname, join, relative } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import {
+  explicitProjects,
+  projectSelectors,
+} from './vitest-project-selectors.mjs';
 
 const require = createRequire(import.meta.url);
 const config = require('../.dependency-cruiser.cjs');
@@ -962,15 +966,6 @@ function resolvedProjectName(projectPath) {
   return basename(projectDirectory);
 }
 
-const projectSelector =
-  /(?:^|\s)--project(?:=|\s+)(?:"([^"]+)"|'([^']+)'|([^\s]+))/gu;
-
-function projectSelectors(command) {
-  return [...command.matchAll(projectSelector)].map((match) =>
-    match.slice(1).find((candidate) => candidate !== undefined),
-  );
-}
-
 function selectedProjects(scripts) {
   const selections = [];
   for (const [script, command] of Object.entries(scripts)) {
@@ -983,21 +978,18 @@ function selectedProjects(scripts) {
 
 function assertNegatedWildcardCoverage(scripts, declared) {
   const direct = new Set(
-    projectSelectors(scripts['test:direct-scenario'] ?? '').filter(
-      (selector) => !selector.startsWith('!') && !selector.includes('*'),
-    ),
+    explicitProjects(scripts['test:direct-scenario'] ?? ''),
   );
-  for (const selector of projectSelectors(
+  const negatedWildcards = projectSelectors(
     scripts['test:without-direct-scenario'] ?? '',
-  )) {
-    if (!selector.startsWith('!') || !selector.endsWith('*')) continue;
+  ).filter((selector) => selector.startsWith('!') && selector.endsWith('*'));
+  assert.ok(
+    negatedWildcards.length > 0,
+    'test:without-direct-scenario negates no project wildcard',
+  );
+  for (const selector of negatedWildcards) {
     const stem = selector.slice(1, -1);
-    const matches = [...declared].filter((project) => project.startsWith(stem));
-    assert.ok(
-      matches.length > 0,
-      `negated wildcard '${selector}' matches no discovered Vitest project`,
-    );
-    for (const project of matches)
+    for (const project of [...declared].filter((name) => name.startsWith(stem)))
       assert.ok(
         direct.has(project),
         `project '${project}' matches '${selector}' but test:direct-scenario does not select it`,
@@ -1059,16 +1051,21 @@ test('root --project selections name discovered vitest projects', () => {
   ]);
   assertProjectSelections(scripts, declared);
   assertNegatedWildcardCoverage(scripts, declared);
-  const projectManifest = { declared: [...declared] };
-  const withUnselectedMatch = structuredClone(projectManifest);
-  withUnselectedMatch.declared.push('fleet-control-direct-scenario-unselected');
   assert.throws(
     () =>
       assertNegatedWildcardCoverage(
         scripts,
-        new Set(withUnselectedMatch.declared),
+        new Set([...declared, 'fleet-control-direct-scenario-unselected']),
       ),
     /test:direct-scenario does not select it/u,
+  );
+  assert.throws(
+    () =>
+      assertNegatedWildcardCoverage(
+        { 'test:direct-scenario': scripts['test:direct-scenario'] },
+        declared,
+      ),
+    /negates no project wildcard/u,
   );
   for (const command of [
     'vitest run --project=missing-project',

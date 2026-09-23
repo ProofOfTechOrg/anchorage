@@ -63,21 +63,6 @@ const sentinels = {
   literals: DIRECT_EVIDENCE_LITERALS,
 };
 afterEach(cleanupDirectRunState);
-
-it('binds evidence scenario declarations to the runtime vocabularies', () => {
-  const phases: readonly DirectEvidenceScenario['phase'][] =
-    DIRECT_SCENARIO_PHASES;
-  const failures: readonly DirectEvidenceScenarioFailure['code'][] =
-    DIRECT_SCENARIO_FAILURES;
-  expect(phases).toEqual(DIRECT_SCENARIO_PHASES);
-  expect(failures).toEqual(DIRECT_SCENARIO_FAILURES);
-  // @ts-expect-error The evidence phase is the runtime scenario vocabulary.
-  const invalidPhase: DirectEvidenceScenario['phase'] = 'not-a-phase';
-  // @ts-expect-error The evidence failure is the runtime failure vocabulary.
-  const invalidFailure: DirectEvidenceScenarioFailure['code'] = 'not-a-failure';
-  void invalidPhase;
-  void invalidFailure;
-});
 const object = (value: unknown): Record<string, unknown> => {
   expect(value).toBeTypeOf('object');
   expect(value).not.toBeNull();
@@ -124,6 +109,24 @@ async function evidenceFixture() {
 }
 
 describe.sequential('direct evidence', () => {
+  it('binds evidence scenario declarations to the runtime vocabularies', () => {
+    // Typecheck carries this case: a binding below fails when a declaration
+    // admits less than the runtime vocabulary, a directive when it admits more.
+    const phases: readonly DirectEvidenceScenario['phase'][] =
+      DIRECT_SCENARIO_PHASES;
+    const failures: readonly DirectEvidenceScenarioFailure['code'][] =
+      DIRECT_SCENARIO_FAILURES;
+    // @ts-expect-error The evidence phase is the runtime scenario vocabulary.
+    const invalidPhase: DirectEvidenceScenario['phase'] = 'not-a-phase';
+    // @ts-expect-error The evidence failure is the runtime failure vocabulary.
+    const invalidFailure: DirectEvidenceScenarioFailure['code'] =
+      'not-a-failure';
+    void phases;
+    void failures;
+    void invalidPhase;
+    void invalidFailure;
+  });
+
   it('covers every projected key with the admission vocabulary', async () => {
     const { evidence } = await evidenceFixture();
     const vocabulary = new Set(DIRECT_EVIDENCE_KEYS);
