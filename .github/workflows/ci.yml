@@ -59,11 +59,10 @@ jobs:
 
       # Root vitest workspace in one process, minus the direct scenario
       # projects, which the jobs below run at the same time. The Typecheck step
-      # above produces the fleet-control dist this step consumes:
-      # fleet-control's `pretypecheck` runs its `prebuild` and `build`. The cap
-      # is about 1.8x the slowest measured run of this step (968 s), so it
-      # clears a slow run; it is the cap that fires first only while the job's
-      # other steps leave the 45-minute job budget unspent.
+      # above produces the fleet-control dist this step consumes. The cap is
+      # about 1.8x the slowest measured run of this step (968 s), so it clears a
+      # slow run; it is the cap that fires first only while the job's other
+      # steps leave the job budget unspent.
       - name: Test
         timeout-minutes: 30
         run: pnpm test:without-direct-scenario
@@ -90,34 +89,32 @@ jobs:
         run: pnpm test:release-order
 
       # Catches a malformed publish command on the PR that introduces it, rather
-      # than on main where the only symptom is a failed release. release.yml
-      # repeats it as a pre-flight; see the script header for what it covers.
+      # than on main where the only symptom is a failed release. See the script
+      # header for what it covers.
       - name: Verify release publish invocation
         run: pnpm test:release-invocation
 
       # Build and install the actual tarball in an offline consumer. Keep this
-      # after Build so manifest exports, declarations, docs, and runtime imports
-      # are verified against the publish surface rather than workspace source.
+      # after Build so the tarball is verified against the publish surface
+      # rather than workspace source.
       - name: Verify packed breakwater surface
         run: pnpm test:packed-breakwater
 
       # fleet-control's `./workers/*` export entries are Workers entry points.
       # `packages/fleet-control/scripts/packed-consumer-test.mjs` packs and
       # consumes the tarball, resolving those entries through the package
-      # boundary and asserting the trusted-configuration constructor still
-      # fails closed in the published artifact.
+      # boundary.
       - name: Verify packed fleet-control surface
         run: pnpm test:packed-fleet-control
 
       # The guarded host is subpath-only and carries an optional Breakwater
-      # peer. Compile and import the packed tarball so the export, declarations,
-      # peer floor, and runtime graph are checked as a consumer sees them.
+      # peer. Compile and import the packed tarball so the package is checked
+      # as a consumer sees it.
       - name: Verify packed flowsafe agent-host surface
         run: pnpm test:packed-flowsafe-agent-host
 
-      # Invoke the installed-bin shape from the packed tarball so symlinked npm
-      # executables, Wrangler peer resolution, and CLI argument handling are
-      # verified as a consumer sees them.
+      # Invoke the installed-bin shape from the packed tarball so the CLI is
+      # verified as a consumer runs it.
       - name: Verify packed flowsafe provisioning CLI
         run: pnpm test:packed-flowsafe-provisioning
 
@@ -129,47 +126,37 @@ jobs:
 
       # Peer-floor probe: the approval-ui d.ts is EMITTED under
       # @types/react@19; this compiles the built dist against aliased
-      # @types/react@18 (skipLibCheck OFF), proving the React >=18 peer range
-      # the package declares. Needs the Build step's dist.
+      # @types/react@18, proving the React peer range the package declares.
+      # Needs the Build step's dist.
       - name: Typecheck approval-ui at the react-18 peer floor
         run: pnpm --filter @proofoftech/flowsafe typecheck:react18
 
       # React quality gate: the FULL react-doctor scan over the showcase app
-      # (pre-push runs the fast changed-files subset; this is the
-      # authoritative pass, incl. dead-code rules that only run at full scope).
-      # The wrapper pins the audited analyzer commit and rejects skipped or
-      # incomplete checks even if the analyzer process itself exits zero.
+      # (this is the authoritative pass, incl. dead-code rules that only run at
+      # full scope).
       - name: React Doctor (full gate)
         timeout-minutes: 10
         run: pnpm --filter showcase run react-doctor
 
       # End-to-end durability proof on real workerd (local mode, no
-      # Cloudflare credentials): suspend -> process kill -> restart on
-      # persisted D1 state -> approval-decided resume -> forged-resume
-      # fails closed. Exits non-zero on any broken link in that chain.
+      # Cloudflare credentials).
       - name: Spike verify (workerd suspend/resume)
         run: pnpm --filter @proofoftech/flowsafe spike:verify
 
       # The Workers for Platforms artifact contract. The paid gate
       # (pnpm fleet-control:credentialed) needs a scratch account with a
       # subscription, so the steps below are what stands between a contract
-      # change and finding out on a billed run: `test:conformance-config`
-      # proves the shipped operator configuration still satisfies fleet
-      # control's own validators and matches the harness wrangler configs, and
-      # `conformance:verify` builds the artifacts `build-conformance.mjs`'s
-      # `ARTIFACTS` list declares and drives their locally provable actions on
-      # real workerd.
+      # change and finding out on a billed run.
       - name: Verify the conformance operator configuration
         run: pnpm test:conformance-config
 
       - name: Conformance artifacts verify (workerd)
         run: pnpm conformance:verify
 
-  # The direct credentialed scenario and offline fence suites run against the
-  # reference and tenant Workers on local workerd in about 35 minutes,
-  # independent of every `verify-core` step. They import flowsafe subpaths and
-  # fleet-control from their dists, so this job builds fleet-control and its
-  # prerequisites before running them.
+  # The direct scenario suites run against the reference and tenant Workers
+  # on local workerd in about 35 minutes, independent of every `verify-core`
+  # step. They import flowsafe subpaths and fleet-control from their dists, so
+  # this job builds fleet-control and its prerequisites before running them.
   direct-scenario:
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -243,17 +230,10 @@ jobs:
           printf '%s' "$NEEDS" | jq -e 'to_entries | length > 0 and all(.value.result == "success")' > /dev/null
 
   # Mastra compat matrix: the libraries pin behavioral contracts to
-  # @mastra/core internals (resume-context merge-over semantics, snapshot
-  # shape, the reprocess-part key, the adapter's table inventory). Beyond the
-  # exact supported peer, run the library suites against the newest published
-  # 1.x as a signal for a deliberate future compatibility update.
-  # Tripwires the job exercises include the runtime.test.ts merge pin, the
-  # ProcessorRunner reprocess-key probe, mastra-schema-guard, the
-  # durable-agent-surface inventory, breakwater's own agent.test.ts
-  # Agent.prototype inventory (whose forwardClassified allowlist is asserted
-  # against THIS job's newer core, not just the pin), and, through flowsafe's
-  # typecheck step, d1-storage.ts's storage-domain capture. See the maintainer
-  # guide's Mastra compatibility section for why bundling needs its own step.
+  # @mastra/core internals. Beyond the exact supported peer, run the library
+  # suites against the newest published 1.x as a signal for a deliberate
+  # future compatibility update. See the maintainer guide's Mastra
+  # compatibility section for why bundling needs its own step.
   mastra-compat:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -278,19 +258,10 @@ jobs:
       # then run the library suites against it. The update runs with the
       # release-age gate OFF (--config.minimum-release-age=0): the newest
       # core routinely pins TRANSITIVE deps younger than the workspace's
-      # 7-day buffer (1.51.0 -> @a2a-js/sdk ~0.3.14 at 6 days), which the
-      # @mastra/* exclude does not cover and which would wedge the probe on
-      # ERR_PNPM_NO_MATURE_MATCHING_VERSION. Scoped to this one resolution;
-      # every real install keeps the workspace gate.
-      # What the run reports includes: each package's typecheck below, whose
-      # red names a type the newest core changed, such as a storage domain that
-      # packages/flowsafe/src/do-runner/d1-storage.ts's exhaustive capture does
-      # not name; each package's surface inventory, whose red names either the
-      # member nobody has read yet or the skew row that stopped being true, in
-      # its own message; and notification-source-keys.test.ts, whose cases
-      # hold the newest core to the own-key behaviour mastra-ai/mastra#23693
-      # and #23694 fixed. See the maintainer guide's Mastra compatibility
-      # section.
+      # release-age buffer (1.51.0 -> @a2a-js/sdk ~0.3.14 at 6 days), which
+      # the @mastra/* exclude does not cover and which would wedge the probe
+      # on ERR_PNPM_NO_MATURE_MATCHING_VERSION. Scoped to this one resolution.
+      # See the maintainer guide's Mastra compatibility section.
       - name: Bump @mastra/core to newest 1.x
         id: mastra_versions
         run: |
@@ -359,26 +330,59 @@ jobs:
           test "$EXPECTED_CORE" = "$INSTALLED_CORE"
           test "$EXPECTED_D1" = "$INSTALLED_D1"
 
-      # Each probe step runs one package's check under its own
-      # continue-on-error, so one package's red, or an expected upstream red,
-      # skips no probe after it; the final step is what carries the outcomes to
-      # the job status.
-      - name: Typecheck breakwater against newest core
-        id: typecheck_breakwater
+      # Each probe step runs under its own continue-on-error, so one probe's
+      # red, or an expected upstream red, skips no probe after it. A typecheck
+      # probe runs one script that a package's `typecheck` chains, so a red tsc
+      # program hides none after it.
+      - name: Typecheck breakwater src against newest core
+        id: typecheck_breakwater_src
         continue-on-error: true
-        run: pnpm --filter @proofoftech/breakwater typecheck
+        run: pnpm --filter @proofoftech/breakwater typecheck:src
 
-      - name: Typecheck flowsafe against newest core
-        id: typecheck_flowsafe
+      - name: Typecheck breakwater test against newest core
+        id: typecheck_breakwater_test
         continue-on-error: true
-        run: pnpm --filter @proofoftech/flowsafe typecheck
+        run: pnpm --filter @proofoftech/breakwater typecheck:test
+
+      - name: Typecheck flowsafe test against newest core
+        id: typecheck_flowsafe_test
+        continue-on-error: true
+        run: pnpm --filter @proofoftech/flowsafe typecheck:test
+
+      - name: Typecheck flowsafe approval-ui against newest core
+        id: typecheck_flowsafe_approval_ui
+        continue-on-error: true
+        run: pnpm --filter @proofoftech/flowsafe typecheck:approval-ui
+
+      - name: Typecheck flowsafe approval-ui-test against newest core
+        id: typecheck_flowsafe_approval_ui_test
+        continue-on-error: true
+        run: pnpm --filter @proofoftech/flowsafe typecheck:approval-ui-test
+
+      - name: Typecheck flowsafe spike against newest core
+        id: typecheck_flowsafe_spike
+        continue-on-error: true
+        run: pnpm --filter @proofoftech/flowsafe typecheck:spike
+
+      - name: Typecheck flowsafe deploy against newest core
+        id: typecheck_flowsafe_deploy
+        continue-on-error: true
+        run: pnpm --filter @proofoftech/flowsafe typecheck:deploy
+
+      # tsc writes Breakwater's dist even when it reports a type error, and the
+      # spike bundles that dist, so the bundle probe below still reports its
+      # own result when this step reds.
+      - name: Build breakwater against newest core
+        id: build_breakwater
+        continue-on-error: true
+        run: pnpm --filter @proofoftech/breakwater build
 
       # Bundles the flowsafe spike Worker so this job can see a published-dist
       # bundling regression that typecheck and test structurally cannot.
       - name: Bundle the flowsafe spike Worker against newest core
         id: bundle
         continue-on-error: true
-        run: pnpm --filter @proofoftech/flowsafe spike:bundle-check
+        run: pnpm --filter @proofoftech/flowsafe spike:bundle
 
       - name: Test breakwater against newest core
         id: tests_breakwater
@@ -394,7 +398,9 @@ jobs:
       # a red probe to the job status. The summary lines report a flip
       # (upstream fix, or a new regression) without opening the log, and the
       # condition writes them after an earlier step failed without running
-      # after cancellation.
+      # after cancellation. A probe whose outcome is anything but success reds
+      # the job, because a probe that did not run proves nothing against the
+      # newest core.
       - name: Fail the job on a red probe
         id: probe_outcome
         if: ${{ !cancelled() }}
@@ -402,12 +408,18 @@ jobs:
           red=0
           report() {
             echo "$1 against newest core: $2" >> "$GITHUB_STEP_SUMMARY"
-            if [ "$2" = failure ]; then
+            if [ "$2" != success ]; then
               red=1
             fi
           }
-          report "breakwater typecheck" "${{ steps.typecheck_breakwater.outcome }}"
-          report "flowsafe typecheck" "${{ steps.typecheck_flowsafe.outcome }}"
+          report "breakwater typecheck:src" "${{ steps.typecheck_breakwater_src.outcome }}"
+          report "breakwater typecheck:test" "${{ steps.typecheck_breakwater_test.outcome }}"
+          report "flowsafe typecheck:test" "${{ steps.typecheck_flowsafe_test.outcome }}"
+          report "flowsafe typecheck:approval-ui" "${{ steps.typecheck_flowsafe_approval_ui.outcome }}"
+          report "flowsafe typecheck:approval-ui-test" "${{ steps.typecheck_flowsafe_approval_ui_test.outcome }}"
+          report "flowsafe typecheck:spike" "${{ steps.typecheck_flowsafe_spike.outcome }}"
+          report "flowsafe typecheck:deploy" "${{ steps.typecheck_flowsafe_deploy.outcome }}"
+          report "breakwater build" "${{ steps.build_breakwater.outcome }}"
           report "spike bundle" "${{ steps.bundle.outcome }}"
           report "breakwater suite" "${{ steps.tests_breakwater.outcome }}"
           report "flowsafe suite" "${{ steps.tests_flowsafe.outcome }}"

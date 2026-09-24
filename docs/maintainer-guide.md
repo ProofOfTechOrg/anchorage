@@ -16,7 +16,7 @@ corepack enable
 pnpm install --frozen-lockfile
 ```
 
-The workspace requires Node 22.22.0 or later and pnpm 10.16 or later. `packageManager` pins the expected pnpm version. `pnpm-workspace.yaml` applies a seven-day minimum package release age with documented exceptions for lockstep or tool-imposed dependencies. The major-scoped (`name@major`) overrides in the root `package.json` pin each legacy line forward until a maintainer bumps it by hand.
+The root `package.json` `engines` field sets the Node and pnpm versions the workspace requires, and `packageManager` pins the expected pnpm version. `pnpm-workspace.yaml` applies a minimum package release age with documented exceptions. The major-scoped (`name@major`) overrides in the root `package.json` pin each legacy line forward until a maintainer bumps it by hand.
 
 ## Verification
 
@@ -57,15 +57,15 @@ pnpm --filter showcase test
 pnpm --filter showcase build
 ```
 
-The React Doctor wrapper pins an audited commit, blocks on warnings, and
-rejects reports with skipped or incomplete checks. Do not replace it with an
-unpinned `pnpm dlx` command or treat an incomplete report as a passing scan.
+Do not replace the React Doctor wrapper with an unpinned `pnpm dlx` command,
+move its pin to an unaudited commit, or treat an incomplete report as a
+passing scan.
 
 `spike:verify:llm` is a credentialed manual proof, not a merge requirement.
 
 ### Direct scenario projects
 
-`pnpm test:direct-scenario` runs the direct scenario Vitest projects. `fleet-control-direct-scenario` contains the direct credentialed scenario and offline fence suites and takes about thirty-five minutes on a workstation. `fleet-control-direct-scenario-seams` contains the process-loss titles and takes about fifty-five minutes, with fifteen-to-twenty-minute quiet gaps. The projects drive the reference and tenant Workers through full runs on local workerd with native D1, R2, and Durable Object bindings. They need the breakwater, flowsafe, and fleet-control dists, so run `pnpm build` first. They reach no network. `pnpm test:direct-scenario:fast` and `pnpm test:direct-scenario:seams` run the projects separately. `pnpm test:without-direct-scenario` runs the root workspace without them.
+`pnpm test:direct-scenario` runs the direct scenario Vitest projects. `fleet-control-direct-scenario` takes about thirty-five minutes on a workstation. `fleet-control-direct-scenario-seams` contains the process-loss titles and takes about fifty-five minutes, with fifteen-to-twenty-minute quiet gaps. The projects drive the reference and tenant Workers through full runs on local workerd with native bindings. They need the package dists, so run `pnpm build` first. They reach no network. `pnpm test:direct-scenario:fast` and `pnpm test:direct-scenario:seams` run the projects separately. `pnpm test:without-direct-scenario` runs the root workspace without them.
 
 To run one title, select it through the project's own config so its timeout and includes apply:
 
@@ -77,7 +77,7 @@ pnpm --filter @proofoftech/fleet-control exec vitest run \
 
 Put `--reporter=verbose` directly after `run` when you want the per-title lines; the project prints nothing between titles otherwise. Send the output to a file rather than through a pager or `tail`: a killed run then keeps what it printed.
 
-`pnpm test:packed-fleet-control` builds the package, packs it, installs the tarball into a temporary consumer under `$TMPDIR` and drives the packed dist through workerd, so it needs a writable pnpm store and about two minutes; a sandbox that mounts the store read-only cannot run it, and the failure reads as an `EROFS` on the store, not as a test failure.
+`pnpm test:packed-fleet-control` installs the packed tarball into a temporary consumer under `$TMPDIR`, so it needs a writable pnpm store and about two minutes; a sandbox that mounts the store read-only cannot run it, and the failure reads as an `EROFS` on the store, not as a test failure.
 
 ## Tooling conventions
 
@@ -121,9 +121,9 @@ CI tests the declared supported peer version as part of the normal gate. A separ
 
 Treat a red canary as a release investigation even though it does not block a merge. Update the declared peer range only after tests, workerd proofs, package tarball probes, and migration notes pass.
 
-The canary's typecheck and test steps cannot see a published-dist bundling regression: they do not link Mastra's shipped output through a bundler. `pnpm --filter @proofoftech/flowsafe spike:bundle-check` is the canary's bundling proof, and against the pinned peer that role belongs to `spike:verify` and the showcase build inside `verify-core`. Note that its `--outdir .wrangler/bundle-check` resolves relative to the wrangler CONFIG directory, not the working directory, so the output lands in `packages/flowsafe/spike/.wrangler/bundle-check`; a working-directory-relative path silently writes one level deeper, outside the ignored path. Each newest-core typecheck, bundle, and test step checks one package and carries its own `continue-on-error`, so one package's red, or an expected upstream failure, still lets the steps after it run. A final step carries their outcomes to the job status, so an expected upstream red reds the `mastra-compat` job, the CI run, and the README badge; it gates no merge, because the required check `verify` does not list that job.
+The canary's typecheck and test steps cannot see a published-dist bundling regression: they do not link Mastra's shipped output through a bundler. `pnpm --filter @proofoftech/flowsafe spike:bundle` is the canary's bundling proof; against the pinned peer, `verify-core` carries that role. `spike:bundle-check` runs the Breakwater build and then `spike:bundle`, stopping at a build red; run `spike:bundle` after a build to see the bundle's own result. Note that the `--outdir .wrangler/bundle-check` in `spike:bundle` resolves relative to the wrangler CONFIG directory, not the working directory, so the output lands in `packages/flowsafe/spike/.wrangler/bundle-check`; a working-directory-relative path silently writes one level deeper, outside the ignored path. Each newest-core probe step carries its own `continue-on-error`, so one probe's red, or an expected upstream failure, still lets the steps after it run. A final step carries their outcomes to the job status, so an expected upstream red reds the `mastra-compat` job, the CI run, and the README badge; it gates no merge, because the required check `verify` does not list that job.
 
-The durable agent surface has its own tripwire. `packages/flowsafe/src/agent-runner/durable-agent-surface.test.ts` classifies every own member of Mastra's `DurableAgent.prototype`, and fails on any member the file does not classify. On a core upgrade it therefore demands reading the new member's implementation in the installed dist before classifying it — as a guarded entry point, a delegator, a refusal, or something that cannot drive a run. Never satisfy it by widening the non-execution list without that read. It pins the inherited `Agent.prototype` members the same way, since Mastra calls the agent instance and the instance inherits both surfaces. Breakwater carries its own inventory of `Agent.prototype` in `packages/breakwater/src/agent/agent.test.ts`, classifying the same surface for what a narrowed guarded handle may expose.
+The durable agent surface has its own tripwire. `packages/flowsafe/src/agent-runner/durable-agent-surface.test.ts` classifies every own member of Mastra's `DurableAgent.prototype`, and fails on any member the file does not classify. On a core upgrade it therefore demands reading the new member's implementation in the installed dist before classifying it. Never satisfy it by widening the non-execution list without that read. It pins the inherited `Agent.prototype` members the same way, since Mastra calls the agent instance and the instance inherits both surfaces. Breakwater carries its own inventory of `Agent.prototype` in `packages/breakwater/src/agent/agent.test.ts`, classifying the same surface for what a narrowed guarded handle may expose.
 
 Per-suspension deadlines couple to one undocumented Mastra behavior: a step arms a deadline through a reserved key in the payload it hands `suspend()`, which only reaches flowsafe because Mastra substitutes the schema-parsed suspend payload into the run summary (verified in the declared peer). A change there — a different substitution, a different key for a nested suspension, or resume-data validation moving — silently disarms every deadline. Tripwire tests in `packages/flowsafe/src/do-runner/runtime.test.ts` pin the observed behavior. Check them on every Mastra upgrade and treat a failure as a behavior change to document, never as a test to relax.
 
@@ -136,7 +136,7 @@ A `@mastra/core` bump carries these obligations:
 - The reason table in `durable-agent-runner.ts` is authoritative, and `durable-agent-surface.test.ts` is what forces the read.
 - The runner's module comment and [Durable agents](durable-agents.md) mirror the table, and are updated from it in the same commit — never left to drift behind it. The surface test fails when a mirror stops naming a blocked entry.
 - Check Breakwater's `forwardClassified` and the surface test's `VERSION_SKEW` before moving the pin. Their expiry and staleness assertions identify entries whose version claims need updating.
-- `packages/flowsafe/src/do-runner/d1-storage.ts`'s exhaustive storage-domain capture is re-read: its `satisfies Record<keyof MastraStorageDomains, unknown>` stops compiling when the new core adds a domain, which is what the canary's `Typecheck flowsafe against newest core` step reports. Naming a new domain in that capture does not compile against the pinned core, so new domains are classified when the pin moves.
+- `packages/flowsafe/src/do-runner/d1-storage.ts`'s exhaustive storage-domain capture is re-read: its `satisfies Record<keyof MastraStorageDomains, unknown>` stops compiling when the new core adds a domain, which the canary's FlowSafe typecheck probes report for each program that compiles it. While it is red, those probes read `failure`, and a step's log, not its summary line, shows whether its program has errors of its own. Naming a new domain in that capture does not compile against the pinned core, so new domains are classified when the pin moves.
 
 ## Public documentation
 

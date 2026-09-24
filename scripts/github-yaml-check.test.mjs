@@ -183,12 +183,11 @@ function canaryStep(id) {
   return step;
 }
 
-// The lookup retry is shell, and its properties — a retried blip, a permanent
-// E404, a refused body, npm's stderr staying out of the payload — are shell
-// semantics only a run settles. Both the function and the assignment that
-// consumes it come out of the tracked step, because the assignment is where
-// the function's contract is observed: errexit does not reach inside `$( )`,
-// so a lookup that reports success with nothing to say is visible only there.
+// The lookup retry is shell, and its properties are shell semantics only a run
+// settles. Both the function and the assignment that consumes it come out of
+// the tracked step, because the assignment is where the function's contract is
+// observed: errexit does not reach inside `$( )`, so a lookup that reports
+// success with nothing to say is visible only there.
 function newestVersionScript() {
   const { run } = canaryStep('mastra_versions');
   const start = run.indexOf('newest_version() {');
@@ -3061,7 +3060,7 @@ test('the verify-core job declares every run command in order', () => {
   );
 });
 
-test('the node-tools script names both root Node suites', () => {
+test('the node-tools script names the entry-point and baseline-recorder suites', () => {
   const { scripts } = JSON.parse(
     readFileSync(join(repositoryRoot, 'package.json'), 'utf8'),
   );
@@ -3246,10 +3245,8 @@ test('each direct-scenario project has its own gating CI job', () => {
   );
 });
 
-// The canary's probe steps each carry a step-level `continue-on-error`, so one
-// package's red, or an expected upstream red, skips no probe after it, and the
-// final step is where those outcomes reach the job status. This case runs that
-// step's own body.
+// Which label a summary line carries and whether the step exits non-zero are
+// settled only by running the outcome step's own body.
 test('the ci.yml canary reds the job from a final outcome step that reads the ids it pins', () => {
   const job = readCompatCanaryJob();
 
@@ -3260,11 +3257,57 @@ test('the ci.yml canary reds the job from a final outcome step that reads the id
 
   const steps = job.steps ?? [];
   const probes = [
-    ['Typecheck breakwater against newest core', 'typecheck_breakwater'],
-    ['Typecheck flowsafe against newest core', 'typecheck_flowsafe'],
-    ['Bundle the flowsafe spike Worker against newest core', 'bundle'],
-    ['Test breakwater against newest core', 'tests_breakwater'],
-    ['Test flowsafe against newest core', 'tests_flowsafe'],
+    [
+      'Typecheck breakwater src against newest core',
+      'typecheck_breakwater_src',
+      'breakwater typecheck:src',
+    ],
+    [
+      'Typecheck breakwater test against newest core',
+      'typecheck_breakwater_test',
+      'breakwater typecheck:test',
+    ],
+    [
+      'Typecheck flowsafe test against newest core',
+      'typecheck_flowsafe_test',
+      'flowsafe typecheck:test',
+    ],
+    [
+      'Typecheck flowsafe approval-ui against newest core',
+      'typecheck_flowsafe_approval_ui',
+      'flowsafe typecheck:approval-ui',
+    ],
+    [
+      'Typecheck flowsafe approval-ui-test against newest core',
+      'typecheck_flowsafe_approval_ui_test',
+      'flowsafe typecheck:approval-ui-test',
+    ],
+    [
+      'Typecheck flowsafe spike against newest core',
+      'typecheck_flowsafe_spike',
+      'flowsafe typecheck:spike',
+    ],
+    [
+      'Typecheck flowsafe deploy against newest core',
+      'typecheck_flowsafe_deploy',
+      'flowsafe typecheck:deploy',
+    ],
+    [
+      'Build breakwater against newest core',
+      'build_breakwater',
+      'breakwater build',
+    ],
+    [
+      'Bundle the flowsafe spike Worker against newest core',
+      'bundle',
+      'spike bundle',
+    ],
+    [
+      'Test breakwater against newest core',
+      'tests_breakwater',
+      'breakwater suite',
+    ],
+    ['Test flowsafe against newest core', 'tests_flowsafe', 'flowsafe suite'],
   ];
   for (const [name, id] of probes) {
     const step = steps.find((candidate) => candidate.name === name);
@@ -3273,7 +3316,7 @@ test('the ci.yml canary reds the job from a final outcome step that reads the id
     assert.equal(
       step['continue-on-error'],
       true,
-      `without the step-level key on "${name}" its red skips the probes after it`,
+      `a probe carries a step-level continue-on-error, so a red on "${name}" skips no later probe and reaches the job status only through the outcome step`,
     );
     assert.equal(
       step.id,
@@ -3295,8 +3338,9 @@ test('the ci.yml canary reds the job from a final outcome step that reads the id
     '$' + '{{ !cancelled() }}',
     'the outcome step reports completed probes without running after cancellation',
   );
+  const reported = new Set(outcomeReferences(outcome));
   assert.deepEqual(
-    [...new Set(outcomeReferences(outcome))].sort(),
+    [...reported].sort(),
     steps
       .filter((step) => step['continue-on-error'] === true)
       .map((step) => step.id)
@@ -3304,11 +3348,36 @@ test('the ci.yml canary reds the job from a final outcome step that reads the id
     'the outcome step reports the continue-on-error probes',
   );
 
+  const assertionIndex = steps.findIndex(
+    ({ name }) => name === 'Assert the newest 1.x packages are installed',
+  );
+  assert.ok(
+    assertionIndex >= 0 && assertionIndex < outcomeIndex,
+    'the version assertion precedes the outcome step',
+  );
+  for (const step of steps.slice(assertionIndex + 1, outcomeIndex)) {
+    const subject = step.name ?? step.id ?? step.run;
+    assert.equal(
+      step['continue-on-error'],
+      true,
+      `a step between the version assertion and the outcome step is a probe, so it carries a step-level continue-on-error: ${subject}`,
+    );
+    assert.ok(
+      reported.has(step.id),
+      `a step between the version assertion and the outcome step is a probe, so the outcome step reports its id: ${subject}`,
+    );
+    assert.ok(
+      !('if' in step),
+      `a probe runs whatever the probes before it reported, so it carries no \`if\` condition: ${subject}`,
+    );
+  }
+
   const probeIds = probes.map(([, id]) => id);
   const passing = Object.fromEntries(probeIds.map((id) => [id, 'success']));
   for (const [outcomes, succeeds] of [
     [passing, true],
     ...probeIds.map((id) => [{ ...passing, [id]: 'failure' }, false]),
+    ...probeIds.map((id) => [{ ...passing, [id]: 'skipped' }, false]),
   ]) {
     const label = JSON.stringify(outcomes);
     const { run, summary } = runProbeOutcome(outcome, outcomes);
@@ -3320,13 +3389,47 @@ test('the ci.yml canary reds the job from a final outcome step that reads the id
       assert.ok(run.status > 0, label);
     }
     assert.deepEqual(
-      summary
-        .split('\n')
-        .filter((line) => line !== '')
-        .map((line) => line.split(': ').at(-1)),
-      probeIds.map((id) => outcomes[id]),
+      summary.split('\n').filter((line) => line !== ''),
+      probes.map(
+        ([, id, probe]) => `${probe} against newest core: ${outcomes[id]}`,
+      ),
       label,
     );
+  }
+});
+
+// A package's `typecheck` stops at its first red tsc program, so the canary
+// runs each chained script as its own probe; a program chained without a probe
+// of its own is hidden again behind an earlier red.
+test('the ci.yml canary probes each tsc program a library typecheck chains', () => {
+  const steps = readCompatCanaryJob().steps ?? [];
+
+  for (const directory of ['packages/breakwater', 'packages/flowsafe']) {
+    const { name, scripts } = JSON.parse(
+      readFileSync(join(repositoryRoot, directory, 'package.json'), 'utf8'),
+    );
+    for (const segment of scripts.typecheck.split('&&')) {
+      const script = /^\s*pnpm run (\S+)\s*$/u.exec(segment)?.[1];
+      assert.ok(
+        script,
+        `each segment of ${name}'s typecheck is \`pnpm run <script>\`, so a canary probe can run it on its own: ${segment.trim()}`,
+      );
+      const body = scripts[script];
+      assert.equal(
+        typeof body,
+        'string',
+        `${name}'s typecheck chains ${script}, which the package defines`,
+      );
+      assert.ok(
+        !/&&|;|\|\|/u.test(body) && body.match(/\btsc\b/gu)?.length === 1,
+        `${name}'s ${script} is one tsc invocation, so its probe's red hides no other program: ${body}`,
+      );
+      const command = `pnpm --filter ${name} ${script}`;
+      assert.ok(
+        steps.some((step) => step.run === command),
+        `each script ${name}'s typecheck chains has its own canary probe: no step runs \`${command}\``,
+      );
+    }
   }
 });
 
