@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// This module imports only types from ./contracts.js; runtime collaborators arrive as parameters.
-// Nothing at module scope calls an imported binding.
+// Runtime collaborators arrive as parameters.
 
 import { z } from 'zod';
 import { type AuditEvent, AuditLogger } from '../audit/index.js';
@@ -96,9 +95,8 @@ export interface ConnectorConformanceFinding {
 export interface ConnectorConformanceCaseResult {
   readonly name: string;
   /**
-   * What this case proved. `'nothing'` indicates incomplete evidence; inspect
-   * the findings for a refusal, timeout, instrumentation replacement, or
-   * invocation failure, including a failure during invocation setup.
+   * What this case proved. `'nothing'` indicates incomplete evidence; the
+   * case's findings say why.
    */
   readonly proved:
     | 'guarded-request'
@@ -109,8 +107,8 @@ export interface ConnectorConformanceCaseResult {
   /**
    * Hosts this case reached THROUGH the guard: the hostnames of the calls the
    * harness-owned base transport allowed, de-duplicated in first-call order.
-   * Filled when the case was invoked, did not time out, and verified its
-   * instrumentation intact at settlement; empty otherwise.
+   * Filled for a case eligible under the eligibility rule in CONNECTORS.md;
+   * empty otherwise.
    * A measurement, never a copy of the case's own `expect.hosts`.
    */
   readonly guardedHosts: readonly string[];
@@ -120,8 +118,8 @@ export interface ConnectorConformanceCaseResult {
    * The `decisionCode` of every event this case's AuditLogger recorded inside
    * the invocation window, in record order; `undefined` for an event from an
    * emitter that stamps none, so a foreign boundary writing to the same logger
-   * stays visible rather than being filtered away. Filled under the
-   * same condition as `guardedHosts`; empty otherwise.
+   * stays visible rather than being filtered away. Filled for a case
+   * eligible under the eligibility rule in CONNECTORS.md; empty otherwise.
    */
   readonly decisionCodes: readonly (ConnectorDecisionCode | undefined)[];
   /**
@@ -151,11 +149,7 @@ export interface ConnectorConformanceReport {
   readonly posture?: ConnectorEgressPosture;
   /**
    * Entry points that completed a case's install. A case contributes NONE
-   * unless every entry's transaction completed: a failure at ANY entry rolls back
-   * the whole stack, including the failing entry on a (d) write or (e) verification
-   * failure; an (a) validation or descriptor-read failure precedes capture and push,
-   * so the stack holds only entries attempted before it, and neither failure
-   * path verifies the entry afterwards.
+   * unless every entry's transaction completed.
    * Labels are unique per run. Empty when no case ran.
    */
   readonly instrumented: readonly string[];
@@ -166,12 +160,12 @@ export interface ConnectorConformanceReport {
    * objects is on its ConnectorConformanceCaseResult.
    */
   readonly findings: readonly ConnectorConformanceFinding[];
-  /** The finite-case limitation this report does not exceed. The module constant, on every report a run produces, refusals included — `refuseRun` sets it too. */
+  /** The finite-case limitation this report does not exceed. The module constant, on every report a run produces, refusals included. */
   readonly limit: string;
 }
 
 export interface ConnectorConformanceRuntime {
-  /** Wire both members into the connector's policies; the harness owns both. */
+  /** Wire every member into the connector's policies; the harness owns them. */
   readonly policies: {
     readonly fetch: EgressFetchBase;
     readonly audit: AuditLogger;
@@ -239,10 +233,8 @@ const DEFAULT_CASE_TIMEOUT_MS = 2000;
 /**
  * The run holding this module instance; undefined while it accepts one. This
  * guard and `poisonedByCase` are scoped to this module instance, so a second
- * copy of this module carries its own pair and neither sees the other's runs.
- * The package's `.` and `./connector-sdk` entry points resolve to one copy;
- * `scripts/packed-consumer-test.mjs` asserts that identity against the packed
- * tarball.
+ * copy of this module carries its own and neither sees the other's runs; see
+ * `scripts/packed-consumer-test.mjs`.
  */
 let activeRun: symbol | undefined;
 /** The case whose timeout poisoned this isolate; undefined while it accepts runs. */
@@ -260,9 +252,8 @@ const refuseRun = (findings: readonly ConnectorConformanceFinding[]): never => {
 };
 
 /**
- * A destination that changes when the phase it belongs to ends. The transport
- * and the traps a phase hands to connector code hold this object, so where a
- * call arriving after that phase is recorded is a property of the object
+ * A destination that changes when the phase it belongs to ends, so where a
+ * value arriving after that phase is recorded is a property of the object
  * rather than of a variable every recorder has to consult.
  */
 interface PhaseSink<T> {
@@ -465,9 +456,8 @@ function validateOptions<TInput>(
     isConnectorDecisionCode,
     'must be a connector decision code',
   );
-  // `connector-decision.ts` publishes the denial-code set through this
-  // `@internal` capture function's throw path and through no guard of its own,
-  // so a code it rejects is one this schema rejects.
+  // The denial-code set is read through this `@internal` capture function's
+  // throw path, so a code it rejects is one this schema rejects.
   const denialCode = z.custom<ConnectorDenialCode>((value) => {
     try {
       captureConnectorDenialMetadata({ code: value });
@@ -543,6 +533,7 @@ function validateOptions<TInput>(
   result.data.cases.forEach((c, index) => {
     if (c.expect.outcome === 'guarded-request') {
       assertEgressHostList(
+        `assertConnectorConformance: cases.${index}.expect.hosts`,
         c.expect.hosts,
         (entry) =>
           `assertConnectorConformance: invalid cases.${index}.expect.hosts: '${entry}' must be a bare hostname ('api.example.com') or wildcard ('*.example.com')`,
@@ -665,7 +656,6 @@ function describeDescriptor(d: PropertyDescriptor | undefined): string {
  * where it reads as one, otherwise what `CONNECTORS.md` records under
  * `FACTORY_FAILED`. A function is described by type, because its string form is
  * its source text.
- * `describeValue` is the other vocabulary, for a value the subject threw.
  */
 function errorMessage(error: unknown): string {
   try {
@@ -774,9 +764,8 @@ function verifyEntries(
     const { target, property, label, trap: installedTrap } = entry;
     let shape: string;
     let difference = 'descriptor differs from the one the harness installed';
-    // Empty where a data property still holds the installed trap, so calls
-    // kept reaching it, and on the catch arm, where the descriptor or the
-    // effective value could not be read.
+    // Empty when calls kept reaching the trap or nothing about them could be
+    // read.
     let calls = '';
     try {
       const descriptor = Object.getOwnPropertyDescriptor(target, property);
@@ -1014,7 +1003,7 @@ function escapeFinding(
  * it arrived. A finding recorded here belongs to no case: the case result it
  * would have joined is already on the report. `settledCase` carries that case's
  * name as a field beside the reason, for a caller reading the report by machine;
- * the probe phase ends under no case name and passes none.
+ * a phase that ends under no case name passes none.
  */
 function observedAfter(
   finding: ConnectorConformanceFinding,
@@ -1029,9 +1018,8 @@ function observedAfter(
 }
 
 /**
- * A value a connector registry can hold as a key. `createConnector()`
- * registers the tool it returns, so a value that cannot be a key is one no
- * registry answers for.
+ * A value a connector registry can hold as a key; a value that cannot be a key
+ * is one no registry answers for.
  */
 function registrySubject(value: unknown): object | undefined {
   return (typeof value === 'object' && value !== null) ||
@@ -1049,7 +1037,7 @@ interface CaseObservation {
 /** Everything an eligible case measured, as the classification reads it. */
 interface CaseEvidence {
   readonly expect: ConnectorConformanceCase['expect'];
-  /** The registered egress declaration, read once for the run. */
+  /** The registered egress declaration. */
   readonly declaredEgress: readonly string[];
   readonly escapes: readonly ConnectorConformanceEscape[];
   readonly witnesses: readonly AuditEvent[];
@@ -1069,8 +1057,6 @@ function observeCase(
   record: RecordFinding,
 ): CaseObservation {
   const guardedHosts = [...new Set(evidence.transportHosts)];
-  // A value whose classification cannot be read is by definition none of the
-  // three known kinds, so it takes the foreign branch.
   const invocationKind = classifyInvocationError(evidence.invocation?.thrown);
   const boundaryError = invocationKind === 'boundary';
   if (evidence.invocation !== undefined && invocationKind === 'foreign') {
@@ -1211,8 +1197,7 @@ export function createConformanceAssertion(collaborators: {
     let runClosed = false;
     const recordRun: RecordFinding = (finding) => {
       // The run is closed and the report the caller holds is fixed, so this
-      // finding is recorded nowhere: CONFORMANCE_LIMIT covers a run for the
-      // duration of its own cases.
+      // finding is recorded nowhere; see CONFORMANCE_LIMIT.
       if (runClosed) return;
       findings.push(finding);
     };
@@ -1387,9 +1372,8 @@ export function createConformanceAssertion(collaborators: {
                       // event, never the object the connector still holds.
                       caseAuditEvents.push({ event: { ...event }, inWindow });
                     } catch {
-                      // An event that cannot be copied leaves no witness, so
-                      // the case reports absent wiring rather than accepting
-                      // evidence the harness could not read.
+                      // An event that cannot be copied leaves no witness
+                      // rather than evidence the harness could not read.
                     }
                   },
                 });
@@ -1441,7 +1425,7 @@ export function createConformanceAssertion(collaborators: {
                     });
                   } else {
                     // The registry answered for this subject, so it is a
-                    // connector createConnector() built.
+                    // registered connector.
                     const connector = caseSubject as Connector<TInput, TOutput>;
                     caseTransport.bind(connector);
                     subjectId = connector.id;
@@ -1492,8 +1476,7 @@ export function createConformanceAssertion(collaborators: {
               invocation !== undefined &&
               // A refusal is the harness's own throw: the attempt behind it is
               // already a NETWORK_IO_OUTSIDE_RUNTIME_FETCH finding, and the
-              // sentinel names a class no consumer can see. The invoked path
-              // excludes it through the same classification.
+              // sentinel names a class no consumer can see.
               classifyInvocationError(invocation.thrown) !== 'refusal'
             ) {
               recordCase({
@@ -1508,10 +1491,9 @@ export function createConformanceAssertion(collaborators: {
               .filter((e) => e.inWindow)
               .map((e) => e.event.decisionCode);
             const transportCalls = caseTransport?.calls() ?? 0;
-            // An invocation failure under a replaced instrument or a timeout
-            // raises no CASE_INVOCATION_FAILED of its own: the case is
-            // ineligible, and the INSTRUMENTATION_REPLACED or CASE_TIMEOUT
-            // finding beside it is why it proves nothing.
+            // An invocation failure in an invoked but ineligible case raises no
+            // CASE_INVOCATION_FAILED of its own: the finding that made it
+            // ineligible is why it proves nothing.
             const eligible = invoked && !timedOut && instrumentationIntact;
             const observation: CaseObservation = eligible
               ? observeCase(

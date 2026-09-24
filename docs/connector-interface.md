@@ -284,7 +284,7 @@ Import `CONNECTOR_DECISIONS`, `isConnectorDecisionCode`, `connectorDecisionRetry
 | `PERMISSION_GRANTED` | existing connector.authorize allow event | false |
 | `APPROVAL_GRANTED` | existing connector.approval allow event | false |
 | `IDEMPOTENCY_TAKEOVER` | existing separate stale-reservation takeover event; no new takeover behavior | false |
-| `EGRESS_INPUT_INVALID` | standalone guard received neither supported URL string nor URL-like object | false |
+| `EGRESS_INPUT_INVALID` | guard received neither a supported URL string nor a URL-like object, or an `init.redirect` other than `'follow'`, `'manual'` or `'error'` | false |
 | `EGRESS_URL_INVALID` | initial URL parsing refusal | false |
 | `EGRESS_SCHEME_NOT_ALLOWED` | initial non-http(s) scheme | false |
 | `EGRESS_HOST_NOT_DECLARED` | initial actual request host outside manifest | false |
@@ -356,6 +356,7 @@ Omit the policy when the deployment intentionally does not restrict declarations
 
 - accepts HTTP and HTTPS only;
 - rejects invalid URLs;
+- refuses an `init.redirect` other than `'follow'`, `'manual'` or `'error'` before any request;
 - checks the initial request and every redirect hop;
 - follows redirects manually;
 - strips authorization, cookie, and proxy credential headers on a cross-origin redirect;

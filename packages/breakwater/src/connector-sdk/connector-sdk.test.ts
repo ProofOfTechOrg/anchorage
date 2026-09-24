@@ -52,9 +52,9 @@ import {
 } from './index.js';
 import { replaceConnectorInvocation } from './invocation-registry.js';
 
-// Most tests exercise post-migration behavior. Migration-boundary tests call
-// createConnectorBase directly so absence of the explicit acknowledgement and
-// atomic inspect() capability remain visible.
+// Builds a connector in the post-migration state; call createConnectorBase
+// directly where absence of the explicit acknowledgement and atomic inspect()
+// capability must remain visible.
 function createConnector<TInput = unknown, TOutput = unknown>(
   config: ConnectorConfig<TInput, TOutput>,
 ) {
@@ -329,6 +329,49 @@ function makeConnector(
   return { tool, execute };
 }
 
+const matchesEveryHost = {
+  startsWith: () => true,
+  slice: () => '',
+  toString: () => 'x',
+};
+const stringMethodsEntry = {
+  toString: () => 'api.vendor.example',
+  toLowerCase: () => ({ replace: () => matchesEveryHost }),
+};
+
+function egressWith(entry: unknown): unknown[] {
+  return ['api.vendor.example', entry];
+}
+
+function egressWithHole(): unknown[] {
+  const egress: unknown[] = ['api.vendor.example'];
+  egress.length = 2;
+  return egress;
+}
+
+const nonStringEgressEntries: [string, () => unknown[], string][] = [
+  ['null', () => egressWith(null), 'null'],
+  ['undefined', () => egressWith(undefined), 'undefined'],
+  ['a hole', egressWithHole, 'undefined'],
+  ['a number', () => egressWith(123), 'number'],
+  ['a Symbol', () => egressWith(Symbol('api.vendor.example')), 'symbol'],
+  [
+    'a String object',
+    () => egressWith(new String('api.vendor.example')),
+    'object',
+  ],
+  [
+    'a plain object with toString',
+    () => egressWith({ toString: () => 'api.vendor.example' }),
+    'object',
+  ],
+  [
+    'an object with its own string methods',
+    () => egressWith(stringMethodsEntry),
+    'object',
+  ],
+];
+
 describe('connector egress posture', () => {
   it('carries a declared egressEnforcement onto the frozen manifest', () => {
     // #given
@@ -368,6 +411,35 @@ describe('connector egress posture', () => {
     );
   });
 
+  it('registers a null egress as a frozen empty list', () => {
+    // #given
+    const permissions = {
+      sideEffect: 'read',
+      egress: null,
+    } as unknown as ConnectorConfig['permissions'];
+    // #when
+    const { tool } = makeConnector({ permissions });
+    // #then
+    expect(connectorManifest(tool)).toEqual({ sideEffect: 'read', egress: [] });
+    expect(Object.isFrozen(connectorManifest(tool)?.egress)).toBe(true);
+  });
+
+  it.each(
+    nonStringEgressEntries,
+  )('refuses %s as an egress entry at construction', (_label, egress, got) => {
+    // #given
+    const permissions = {
+      sideEffect: 'read',
+      egress: egress(),
+    } as unknown as ConnectorConfig['permissions'];
+    // #when / #then
+    expect(() => makeConnector({ permissions })).toThrow(
+      new TypeError(
+        `connector salesforce.createContact: permissions.egress entry 1 must be a string (got ${got})`,
+      ),
+    );
+  });
+
   it('resolves an undeclared posture to declaration-only', () => {
     // #given / #when
     const { tool } = makeConnector({ permissions: { sideEffect: 'read' } });
@@ -396,7 +468,7 @@ describe('connector egress posture', () => {
     expect(connectorEgressPosture({})).toBeUndefined();
   });
 
-  it('refuses an egressEnforcement value outside the two literals at construction', () => {
+  it('refuses an egressEnforcement value outside the posture literals at construction', () => {
     // #given
     for (const value of ['Enforced', '', null, true, false, 0, {}, []]) {
       const permissions = {
@@ -503,7 +575,7 @@ describe('connector egress posture', () => {
       });
       // #when
       await expect(run(tool, input)).resolves.toEqual({ ok: true });
-      // #then — one resolution serves the readback and the audit detail.
+      // #then
       expect(audit.events()[0]?.detail).toMatchObject({
         egressEnforcement: connectorEgressPosture(tool),
       });
@@ -597,9 +669,8 @@ describe('connector egress posture', () => {
 });
 
 describe('connector id validation', () => {
-  it("rejects an id containing ':' because the unchanged rate-budget tuple needs a colon-free final component", () => {
-    // #given / #when — active rate-limit windows retain the legacy
-    // `[scope:]connector` key across the idempotency-only migration.
+  it("rejects an id containing ':' because the rate-budget tuple needs a colon-free final component", () => {
+    // #given / #when
     let error: unknown;
     try {
       makeConnector({ id: 'tenant:createContact' });
@@ -614,8 +685,8 @@ describe('connector id validation', () => {
     expect(message).toContain('rate-limit');
   });
 
-  it('constructs shipped id shapes that are colon-free (camelCase and dotted agent-cli)', () => {
-    // #when / #then — the guard rejects nothing shipped
+  it('constructs colon-free camelCase and dotted ids', () => {
+    // #when / #then
     expect(() => makeConnector({ id: 'createContact' })).not.toThrow();
     expect(() => makeConnector({ id: 'agent-cli.claude-code' })).not.toThrow();
   });
@@ -703,12 +774,10 @@ const POLICY_READ_CASES: Record<
   networkEgress: {
     policies: { networkEgress: { allowedDomains: ['api.salesforce.com'] } },
   },
-  // These members stay inline because construction reads them once.
   fetch: null,
   requireEgressEnforcement: null,
   evaluators: null,
   writePermissions: null,
-  // The preset validator captures the audit binding.
   audit: null,
 };
 
@@ -716,7 +785,6 @@ describe('caller-supplied member reads', () => {
   // The rule is "the members createConnectorBase hoists into a local before
   // using them more than once". A further hoist needs a fixture in the records
   // above; their keys require classification when the public interfaces grow.
-  // invokeConnector's toolCallId case covers its check and call-identity local.
   for (const [field, overrides] of Object.entries(CONFIG_READ_CASES)) {
     if (overrides === null) continue;
     it(`reads config.${field} once`, () => {
@@ -832,9 +900,8 @@ describe('createConnector classification', () => {
     }).tool.requireApproval as ApprovalPredicate;
 
     // #when / #then — a normal call requires approval; a dry-run request
-    // skips the agent pause (the wrapper's dry-run branch never reaches a
-    // side effect); a ctx-less evaluation stays fail-closed (Mastra's
-    // network/durable paths omit the context)
+    // skips the agent pause; a ctx-less evaluation stays fail-closed
+    // (Mastra's network/durable paths omit the context)
     for (const predicate of [destructive, orgGated]) {
       expect(typeof predicate).toBe('function');
       expect(predicate(input, { requestContext: {} })).toBe(true);
@@ -1857,8 +1924,7 @@ describe('custom tool-boundary evaluators', () => {
   });
 
   it('enforces crossWorkflowIsolation end-to-end through policies.evaluators', async () => {
-    // #given — the isolation evaluator registered in the reserved slot; the
-    // caller's scope is runtime-minted into requestContext
+    // #given — the caller's scope is runtime-minted into requestContext
     const audit = new AuditLogger();
     const { tool, execute } = makeConnector({
       inputSchema: z.object({ workflowId: z.string().optional() }),
@@ -2119,7 +2185,7 @@ describe('write permission gate', () => {
   it('requires a grant even under an agent-run context', async () => {
     // #given — an agent-shaped context is forwardable into nested and
     // direct calls, so it is no proof that Mastra's native approval ran for
-    // THIS call; the grant is the only approval token
+    // THIS call
     const { tool, execute } = makeConnector({
       permissions: { sideEffect: 'destructive' },
     });
@@ -2343,7 +2409,7 @@ describe('required-permissions gate', () => {
       { permissions: [...REQUIRED], policyVersion: '\n' },
     ],
     [
-      'a policy version over the 200-character bound',
+      'a policy version over the length bound',
       { permissions: [...REQUIRED], policyVersion: 'v'.repeat(201) },
     ],
     ['a missing policy version', { permissions: [...REQUIRED] }],
@@ -3096,7 +3162,7 @@ describe('idempotency', () => {
   });
 
   it('treats an empty-string isolation scope as absent (unscoped key)', async () => {
-    // #given — isolationScopeOf's length > 0 guard must fold '' to undefined
+    // #given — '' must fold to undefined
     const get = vi.fn(() => undefined);
     const put = vi.fn();
     const { tool } = makeConnector({
@@ -3148,7 +3214,7 @@ describe('idempotency composite-key migration', () => {
     return { tool, execute };
   }
 
-  it('keeps the reported legacy collision distinct under v2', async () => {
+  it('keeps a legacy collision distinct under v2', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     try {
       const store = new InMemoryIdempotencyStore();
@@ -3736,8 +3802,7 @@ describe('atomic idempotency (reserve path)', () => {
   });
 
   it('audits a keyed rate-limit store PRIMITIVE throw exactly once (wrapped, audit-once holds)', async () => {
-    // #given — nothing in the RateLimitStore contract requires Error
-    // instances; a primitive throw must not defeat the audit-once WeakSet
+    // #given — a primitive throw must not defeat the audit-once WeakSet
     const audit = new AuditLogger();
     const store = spyAtomicStore();
     const { tool, execute } = makeConnector({
@@ -4003,8 +4068,7 @@ describe('atomic idempotency (reserve path)', () => {
     failExecute(new Error('salesforce 500'));
     const outcomes = await calls;
     // #then — both callers reject; the reservation is released exactly
-    // once; each caller records its own execute failure (audit-once covers
-    // store errors and denials, not shared execute outcomes)
+    // once; each caller records its own execute failure
     for (const outcome of outcomes) {
       expect(outcome.status).toBe('rejected');
     }
@@ -4273,7 +4337,7 @@ describe('rate limit', () => {
   });
 
   it('does not consume budget on an idempotent replay', async () => {
-    // #given — budget 1; the same key runs then replays twice
+    // #given — budget 1; the same key runs then replays
     const { tool, execute } = makeConnector({
       permissions: {
         sideEffect: 'write',
@@ -4292,7 +4356,7 @@ describe('rate limit', () => {
       input,
       makeContext({ idempotencyKey: 'k1' }),
     );
-    // #then — replays served from the store, budget untouched
+    // #then — replay served from the store, budget untouched
     expect(replayed).toEqual({ ok: true });
     expect(execute).toHaveBeenCalledTimes(1);
   });
@@ -4501,8 +4565,7 @@ describe('Mastra integration edges', () => {
       permissions: { sideEffect: 'read' },
     });
 
-    // #when / #then — ordinary values still delegate to the host schema;
-    // the private carrier optimization applies only to wrapper execution
+    // #when / #then — ordinary values still delegate to the host schema
     const validation = await tool.outputSchema?.['~standard'].validate('raw');
     expect(validation).toEqual({ value: 'raw!' });
   });
@@ -4723,7 +4786,7 @@ describe('isolation scope (multi-tenant key segmentation)', () => {
     ).resolves.toEqual({ ok: true });
   });
 
-  it('absent scope preserves the single-tenant keys exactly (no flag to forget)', async () => {
+  it('absent scope replays a same-key call (no flag to forget)', async () => {
     // #given — no scope anywhere: the OSS default
     const { tool, execute } = makeConnector({
       permissions: { sideEffect: 'write', idempotencyKey: true },
@@ -4734,14 +4797,13 @@ describe('isolation scope (multi-tenant key segmentation)', () => {
     await run(tool, input, scopedContext({ idempotencyKey: 'k1' }));
     await run(tool, input, scopedContext({ idempotencyKey: 'k1' }));
 
-    // #then — replayed, exactly as before the scope feature existed
+    // #then — replayed
     expect(execute).toHaveBeenCalledTimes(1);
   });
 
   it('a tenantIsolation-policied connector denies a scope-less call INCLUDING dry-run', async () => {
     // #given — the platform's policy set includes the evaluator; the dry-run
-    // branch returns before idempotency/rate-limit, so only a gates-loop
-    // evaluator can bind simulations
+    // branch returns before idempotency/rate-limit
     const dryRunExecute = vi.fn(async () => ({ ok: true }));
     const { tool, execute } = makeConnector({
       permissions: { sideEffect: 'write', dryRun: true },
@@ -4772,7 +4834,7 @@ describe('isolation scope (multi-tenant key segmentation)', () => {
   });
 });
 
-describe('in-memory store under a minted isolation scope (D5)', () => {
+describe('in-memory store under a minted isolation scope', () => {
   it('warns once per idempotency store instance when a scope is present', async () => {
     // #given
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
@@ -4859,7 +4921,7 @@ describe('in-memory store under a minted isolation scope (D5)', () => {
 
 describe('createConnector egress-fetch runtime', () => {
   // The third execute argument: a fetch bound to the manifest's declared
-  // egress. Structural response mock (test tsconfig is lib-ES2022-only).
+  // egress.
   function vendorFetch(status = 200) {
     const calls: { url: string; init: Record<string, unknown> | undefined }[] =
       [];
@@ -4929,8 +4991,8 @@ describe('createConnector egress-fetch runtime', () => {
     ]);
   });
 
-  it('audits the guard-boundary denial even when execute swallows it (DL-002)', async () => {
-    // #given — DL-002 records the egress denial at the guard boundary, not
+  it('audits the guard-boundary denial even when execute swallows it', async () => {
+    // #given — the egress denial is recorded at the guard boundary, not
     // where execute chooses to handle it. A connector that catches its own
     // runtime.fetch rejection would otherwise suppress the record; this pins
     // that it cannot. execute swallows the ConnectorPolicyError and returns a
@@ -4957,8 +5019,7 @@ describe('createConnector egress-fetch runtime', () => {
     expect(result).toEqual({ ok: true });
     expect(vendor.calls).toHaveLength(0);
     // ...yet the guard-boundary 'denied' audit survived the swallow: exactly
-    // one, carrying the undeclared host and hop (a later 'allowed' record from
-    // the normal return is expected and not asserted here).
+    // one, carrying the undeclared host and hop.
     const denials = audit
       .events()
       .filter((event) => event.decision === 'denied');
@@ -5036,10 +5097,7 @@ describe('createConnector egress-fetch runtime', () => {
 
 describe('_background model-override defense (DL-005)', () => {
   // These connectors declare NO stripping inputSchema, so a `_background` arg
-  // reaches gatedExecute — the paths this check has teeth on (a schema'd
-  // connector on the agent path already has `_background` stripped by core's
-  // cleanedArgs and by Mastra's schema validation; the check is belt-and-braces
-  // there and the real guard on no-schema / passthrough / direct calls).
+  // reaches gatedExecute.
   function bgWriteConnector(audit?: AuditLogger) {
     const execute = vi.fn(async () => ({ ok: true }));
     const tool = createConnector({
@@ -5181,25 +5239,22 @@ describe('_background model-override defense (DL-005)', () => {
     expect(execute).toHaveBeenCalledTimes(1);
   });
 
-  // HONESTY (QA): on the DIRECT/nested path args flow straight into
-  // gatedExecute, where the presence check has teeth. The AGENT path is
-  // different: core deletes `_background` from the tool-call args before
-  // dispatch AND resolves eligibility itself. So the breakwater `_background`
-  // reads catch nothing on the agent path; this test pins the mechanism that
-  // makes it core's responsibility, against core's REAL resolver, so the suite
-  // does not manufacture false confidence.
-  it("is INERT on the agent path: core's resolveBackgroundConfig keeps a no-background-config connector foreground even under an LLM _background:enabled override (baseEnabled gate)", () => {
-    // #given — a breakwater connector sets NO tool background config, so
-    // core's baseEnabled (agent/tool `enabled`) resolves false
+  // On the DIRECT/nested path args flow straight into gatedExecute. On the
+  // AGENT path core deletes `_background` from the tool-call args before
+  // dispatch AND resolves eligibility itself; this test pins the mechanism
+  // that makes it core's responsibility, against core's REAL resolver, so the
+  // suite does not manufacture false confidence.
+  it("core's resolveBackgroundConfig keeps a no-background-config connector foreground even under an LLM _background:enabled override (baseEnabled gate)", () => {
+    // #given — with NO tool background config, core's baseEnabled
+    // (agent/tool `enabled`) resolves false
     // #when — the model asks for background via the LLM override
     const resolved = resolveBackgroundConfig({
       llmBgOverrides: { enabled: true },
       toolName: 'crm.assign',
-      // toolConfig/agentConfig omitted — exactly what createConnector produces
+      // toolConfig/agentConfig omitted
     });
     // #then — core refuses to background an ineligible tool regardless of the
-    // override, so the breakwater _background presence check is defense-in-depth
-    // for direct/nested calls only (the grant is the real agent-path boundary)
+    // override
     expect(resolved.runInBackground).toBe(false);
   });
 });
@@ -6211,6 +6266,46 @@ describe('runtime fetch decision projection', () => {
         policyKind: 'egress-fetch',
         retryable: false,
         detail: { host, hop },
+      },
+    ]);
+  });
+
+  it('refuses a redirect mode from JSON before the base fetch and audits the denial', async () => {
+    // #given
+    const audit = new AuditLogger();
+    const fetch = vi.fn(async () => ({
+      status: 302,
+      headers: { get: () => 'http://169.254.169.254/latest/meta-data/' },
+    }));
+    const tool = createConnector({
+      id: 'taxonomy.redirect',
+      description: 'Forward fetch options from data',
+      permissions: { sideEffect: 'read', egress: ['api.example.com'] },
+      policies: { audit, fetch },
+      execute: async (_input, _context, runtime) =>
+        runtime.fetch(
+          'https://api.example.com/start',
+          JSON.parse('{"redirect":["follow"]}'),
+        ),
+    });
+    // #when
+    const error = await run(tool, {}).catch((failure: unknown) => failure);
+    // #then
+    expect(error).toBeInstanceOf(ConnectorPolicyError);
+    expect(error).toMatchObject({
+      code: 'EGRESS_INPUT_INVALID',
+      policyKind: 'egress-fetch',
+      retryable: false,
+      details: { host: 'api.example.com', hop: 0 },
+    });
+    expect(fetch).not.toHaveBeenCalled();
+    expect(audit.events()).toMatchObject([
+      {
+        decision: 'denied',
+        decisionCode: 'EGRESS_INPUT_INVALID',
+        policyKind: 'egress-fetch',
+        retryable: false,
+        detail: { host: 'api.example.com', hop: 0 },
       },
     ]);
   });

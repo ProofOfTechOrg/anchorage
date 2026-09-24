@@ -463,7 +463,8 @@ before enabling real execution.
 ## Know the egress boundary
 
 `runtime.fetch` accepts an absolute HTTP(S) URL string or URL object, not a
-`Request`. It checks the initial host and every followed redirect. It strips
+`Request`. It refuses an `init.redirect` other than `'follow'`, `'manual'` or
+`'error'`. It checks the initial host and every followed redirect. It strips
 `authorization`, `cookie`, and `proxy-authorization` on a cross-origin
 redirect, rewrites methods according to fetch redirect rules, refuses to
 replay one-shot bodies across 307 or 308 redirects, and defaults to 20 hops.

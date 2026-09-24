@@ -10,6 +10,7 @@ import {
   approvalRequired,
   backgroundExecution,
   crossWorkflowIsolation,
+  egressDomainAllowed,
   ISOLATION_SCOPE_CONTEXT_KEY,
   networkEgress,
   type SideEffect,
@@ -23,6 +24,72 @@ function call(
   sideEffect: SideEffect = 'read',
 ): ToolCallContext {
   return { connectorId: 'salesforce.export', sideEffect, egress, input: {} };
+}
+
+const matchesEveryHost = {
+  startsWith: () => true,
+  slice: () => '',
+  toString: () => 'x',
+};
+const stringMethodsEntry = {
+  toString: () => 'api.example.com',
+  toLowerCase: () => ({ replace: () => matchesEveryHost }),
+};
+
+function hostsWith(entry: unknown): unknown[] {
+  return ['api.example.com', entry];
+}
+
+function hostsWithHole(): unknown[] {
+  const hosts: unknown[] = ['api.example.com'];
+  hosts.length = 2;
+  return hosts;
+}
+
+const nonStringHostEntries: [string, () => unknown[], string][] = [
+  ['null', () => hostsWith(null), 'null'],
+  ['undefined', () => hostsWith(undefined), 'undefined'],
+  ['a hole', hostsWithHole, 'undefined'],
+  ['a number', () => hostsWith(123), 'number'],
+  ['a Symbol', () => hostsWith(Symbol('api.example.com')), 'symbol'],
+  ['a String object', () => hostsWith(new String('api.example.com')), 'object'],
+  [
+    'a plain object with toString',
+    () => hostsWith({ toString: () => 'api.example.com' }),
+    'object',
+  ],
+  [
+    'an object with its own string methods',
+    () => hostsWith(stringMethodsEntry),
+    'object',
+  ],
+];
+
+function driftingHostList(): {
+  list: readonly string[];
+  reads: () => number;
+} {
+  let reads = 0;
+  const list = new Proxy(['api.example.com'], {
+    get(target, key, receiver) {
+      if (key === '0') {
+        reads += 1;
+        return reads === 1 ? 'api.example.com' : stringMethodsEntry;
+      }
+      return Reflect.get(target, key, receiver);
+    },
+  });
+  return { list, reads: () => reads };
+}
+
+class ExfilMatchingList extends Array<unknown> {
+  filter(): never[] {
+    return ['exfil.example'] as never[];
+  }
+
+  map(): never[] {
+    return ['exfil.example'] as never[];
+  }
 }
 
 describe('tool policy decision metadata', () => {
@@ -172,9 +239,7 @@ describe('networkEgress', () => {
   });
 
   it('rejects malformed allowlist entries at construction', () => {
-    // #given — entries that could never match a declared hostname and would
-    // otherwise sit in the config as silently dead lines ('*' is not an
-    // allow-all; omitting the policy is)
+    // #given
     const invalid = ['*', '', 'https://api.example.com', 'münchen.de'];
     // #when / #then
     for (const entry of invalid) {
@@ -184,12 +249,120 @@ describe('networkEgress', () => {
     }
   });
 
+  it.each(
+    nonStringHostEntries,
+  )('refuses %s as an allowlist entry at construction', (_label, allowedDomains, got) => {
+    // #when / #then
+    expect(() =>
+      networkEgress({
+        allowedDomains: allowedDomains() as unknown as readonly string[],
+      }),
+    ).toThrow(
+      new TypeError(
+        `networkEgress: allowedDomains entry 1 must be a string (got ${got})`,
+      ),
+    );
+  });
+
+  it('refuses an allowlist that is not an array', () => {
+    // #when / #then
+    expect(() =>
+      networkEgress({
+        allowedDomains: 'api.example.com' as unknown as readonly string[],
+      }),
+    ).toThrow(new TypeError('networkEgress: allowedDomains must be an array'));
+  });
+
+  it('matches against the allowlist entries it validated', async () => {
+    // #given
+    const { list, reads } = driftingHostList();
+    const policy = networkEgress({ allowedDomains: list });
+    // #when / #then
+    expect(await policy.evaluate(call(['exfil.example']))).toMatchObject({
+      allowed: false,
+      code: 'EGRESS_HOST_NOT_ALLOWED_BY_ORG',
+    });
+    expect(await policy.evaluate(call(['api.example.com']))).toEqual({
+      allowed: true,
+    });
+    expect(reads()).toBe(1);
+  });
+
   it('is named network-egress unless overridden', () => {
     // #when / #then
     expect(networkEgress({ allowedDomains: [] }).name).toBe('network-egress');
     expect(
       networkEgress({ allowedDomains: [], name: 'egress-prod' }).name,
     ).toBe('egress-prod');
+  });
+});
+
+describe('egressDomainAllowed', () => {
+  it.each([
+    ['an object with its own string methods', stringMethodsEntry],
+    ['a String object', new String('exfil.example')],
+    ['null', null],
+  ])('matches nothing through %s in allowedDomains', (_label, entry) => {
+    // #given
+    const allowedDomains = [entry] as unknown as readonly string[];
+    // #when / #then
+    expect(egressDomainAllowed('exfil.example', allowedDomains)).toBe(false);
+    expect(
+      egressDomainAllowed('api.example.com', [
+        ...allowedDomains,
+        'api.example.com',
+      ]),
+    ).toBe(true);
+  });
+
+  it.each<[string, () => readonly string[]]>([
+    [
+      'a plain array with its own filter',
+      () =>
+        Object.assign(['api.vendor.example'], {
+          filter: () => ['exfil.example'],
+        }),
+    ],
+    [
+      'a plain array whose own constructor overrides map',
+      () =>
+        Object.assign(['api.vendor.example'], {
+          constructor: ExfilMatchingList,
+        }),
+    ],
+    [
+      'an Array subclass overriding filter and map',
+      () => ExfilMatchingList.from(['api.vendor.example']),
+    ],
+  ])('matches no unlisted host through %s', (_label, list) => {
+    // #given
+    const allowedDomains = list();
+    // #when / #then
+    expect(egressDomainAllowed('exfil.example', allowedDomains)).toBe(false);
+    expect(egressDomainAllowed('api.vendor.example', allowedDomains)).toBe(
+      true,
+    );
+  });
+
+  it('matches nothing through a list that is not an array', () => {
+    // #given
+    const allowedDomains = {
+      length: 1,
+      0: 'exfil.example',
+    } as unknown as readonly string[];
+    // #when / #then
+    expect(egressDomainAllowed('exfil.example', allowedDomains)).toBe(false);
+  });
+
+  it('matches nothing through a domain that is not a string', () => {
+    // #given
+    const domain = {
+      toLowerCase: () => ({
+        replace: () => ({ length: 1e9, endsWith: () => true }),
+      }),
+    } as unknown as string;
+    // #when / #then
+    expect(egressDomainAllowed(domain, ['*.vendor.example'])).toBe(false);
   });
 });
 
@@ -262,7 +435,7 @@ describe('approvalRequired', () => {
   });
 
   it('escapes regex metacharacters in patterns', () => {
-    // #given — '(', ')', '+' must match literally; only '*' is a glob token
+    // #given — '(', ')', '+' must match literally
     const policy = { requireApproval: ['api(v2)+.*'] };
     // #when / #then
     expect(
@@ -414,19 +587,16 @@ describe('tenantIsolation', () => {
     ['absent scope', undefined],
     ['empty scope', ''],
     ['non-string scope', 42],
-  ])('denies on %s — a scoped deployment must never run scope-less', async (_label, scope) => {
-    // #when / #then — the evaluator runs in the PRE-EXECUTE gates loop, so
-    // this denial binds dry-run requests too (the dry-run branch returns
-    // before the idempotency/rate-limit machinery, where a key-side check
-    // could never reach it)
+  ])('denies on %s', async (_label, scope) => {
+    // #when / #then
     expect(await policy.evaluate(scopedCall(scope))).toMatchObject({
       allowed: false,
       code: 'ISOLATION_SCOPE_MISSING',
     });
   });
 
-  it('never parses the scope — any non-empty string is opaque and valid', async () => {
-    // #when / #then — breakwater stays tenant-agnostic; the host owns the format
+  it('treats a non-empty scope string as opaque and valid', async () => {
+    // #when / #then
     expect(await policy.evaluate(scopedCall('anything:at all'))).toEqual({
       allowed: true,
     });
@@ -452,8 +622,7 @@ describe('backgroundExecution', () => {
     ['destructive', 'destructive' as SideEffect],
     ['idempotent', 'idempotent' as SideEffect],
   ])('denies a %s call whose _background override would enable background', async (_label, sideEffect) => {
-    // #when / #then — the model trying to flip an approval-carrying call off
-    // the foreground path
+    // #when / #then — the model trying to flip a call off the foreground path
     expect(
       await policy.evaluate(
         bgCall(sideEffect, { topic: 'x', _background: { enabled: true } }),
@@ -485,7 +654,7 @@ describe('backgroundExecution', () => {
     ).toEqual({ allowed: true });
   });
 
-  it('ignores a non-object _background arg (only a real override shape denies)', async () => {
+  it('ignores a non-object _background arg', async () => {
     // #when / #then — a scalar `_background` is not the LLMBackgroundOverride shape
     expect(
       await policy.evaluate(bgCall('write', { _background: 'true' })),

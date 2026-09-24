@@ -483,7 +483,8 @@ models only common response methods.
 
 If `redirect` is `manual`, the caller receives the 3xx and any follow-up fetch
 must go through the guard again. If it is `error`, the base fetch owns the
-redirect failure.
+redirect failure. A value other than `follow`, `manual` or `error` is refused
+with `EGRESS_INPUT_INVALID` before any request.
 
 The guard cannot see global `fetch`, a vendor SDK with its own transport, a raw
 socket, or child-process traffic. Pass `runtime.fetch` into SDKs that support a

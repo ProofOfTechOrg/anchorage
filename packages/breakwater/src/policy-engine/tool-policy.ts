@@ -11,9 +11,8 @@ import type { RequestContext } from '@mastra/core/request-context';
 import type { ConnectorDenialMetadata } from '../connector-decision.js';
 
 /**
- * Decision shape shared by both policy seams (agent-boundary evaluators in
- * index.ts and the tool-boundary evaluators below). Defined here — the leaf
- * module — so neither seam imports the other for it.
+ * Decision shape a policy evaluator returns. Defined here — the leaf module —
+ * so a seam that uses it imports no other seam for it.
  */
 export type PolicyDecision =
   | {
@@ -65,11 +64,9 @@ export interface NetworkEgressOptions {
   name?: string;
 }
 
-// Bare hostname or leading '*.' wildcard — no scheme, path, port, or space.
-// Shared by the manifest side (connector egress declarations) and the org
-// side (allowlist entries): a malformed entry on either side could never
-// match and would read as a silent permanent deny (manifest) or a dead
-// allowlist line an admin believes is live (org), so both fail fast instead.
+// Bare hostname or leading '*.' wildcard. A malformed entry could never match
+// and would read as a silent permanent deny or as a dead allowlist line an
+// admin believes is live, so it fails fast instead.
 export const EGRESS_HOSTNAME_PATTERN = /^(\*\.)?[a-z0-9][a-z0-9.-]*$/i;
 
 /**
@@ -83,10 +80,8 @@ export function normalizeDomain(domain: string): string {
 /**
  * Lower-level host match: exact hostname or a leading-'*.' wildcard on a label
  * boundary (apex excluded). PRECONDITION: `domain` and every entry in
- * `allowed` are ALREADY normalized (see normalizeDomain) — networkEgress and
- * egressFetch normalize their allowlist ONCE at construction and call this per
- * hop; egressDomainAllowed is the one-shot matcher that normalizes both sides
- * for external callers.
+ * `allowed` are ALREADY normalized (see normalizeDomain), so a caller can
+ * normalize a fixed allowlist once instead of on every match.
  */
 export function domainAllowed(
   domain: string,
@@ -109,39 +104,65 @@ export function domainAllowed(
 }
 
 /**
- * One-shot public wrapper: normalizes `domain` and every entry in
+ * One-shot public wrapper: normalizes `domain` and each string entry in
  * `allowedDomains` (case/trailing-dot) then delegates to `domainAllowed` for
- * the match. `networkEgress` and `egressFetch` call `domainAllowed` directly
- * instead, each normalizing its own allowlist ONCE at construction; this
- * wrapper is for barrel/external callers that just want a single normalized
- * comparison without owning that memoization.
+ * the match, for a single normalized comparison without keeping a normalized
+ * allowlist. A non-string `domain` or entry, or a list that is not an array,
+ * matches nothing: this wrapper validates no list, and an object could answer
+ * the matcher's string methods itself. The list is read by index into a fresh
+ * array, so a method of the caller's container cannot answer for it.
  */
 export function egressDomainAllowed(
   domain: string,
   allowedDomains: readonly string[],
 ): boolean {
-  return domainAllowed(
-    normalizeDomain(domain),
-    allowedDomains.map(normalizeDomain),
-  );
+  if (typeof domain !== 'string' || !Array.isArray(allowedDomains)) {
+    return false;
+  }
+  const length = allowedDomains.length;
+  const normalizedAllowed: string[] = [];
+  for (let index = 0; index < length; index += 1) {
+    const entry: unknown = allowedDomains[index];
+    if (typeof entry === 'string') {
+      normalizedAllowed.push(normalizeDomain(entry));
+    }
+  }
+  return domainAllowed(normalizeDomain(domain), normalizedAllowed);
 }
 
 /**
- * Validate an egress host list against EGRESS_HOSTNAME_PATTERN, throwing a
- * TypeError for the first entry that is not a bare hostname or '*.' wildcard.
- * `describe` builds each call site's exact message — networkEgress,
- * egressFetch, and createConnector share one pattern but keep their own
- * wording.
+ * Read an egress host list once into a frozen snapshot, validate it against
+ * EGRESS_HOSTNAME_PATTERN, and return it. A caller normalizes the snapshot,
+ * never its input, so a list whose reads change cannot pass with one entry
+ * and register another. A string container would be read by index as
+ * one-character hosts, and a non-string entry could pass the pattern through
+ * its `toString` and then answer the matcher's string methods itself, so both
+ * are refused without coercion. `subject` names the caller's field; `describe`
+ * builds each call site's exact message for a string the pattern refuses.
  */
 export function assertEgressHostList(
-  hosts: readonly string[],
+  subject: string,
+  hosts: unknown,
   describe: (entry: string) => string,
-): void {
-  for (const entry of hosts) {
+): readonly string[] {
+  if (!Array.isArray(hosts)) {
+    throw new TypeError(`${subject} must be an array`);
+  }
+  const length = hosts.length;
+  const snapshot: string[] = [];
+  for (let index = 0; index < length; index += 1) {
+    const entry: unknown = hosts[index];
+    if (typeof entry !== 'string') {
+      throw new TypeError(
+        `${subject} entry ${index} must be a string (got ${entry === null ? 'null' : typeof entry})`,
+      );
+    }
     if (!EGRESS_HOSTNAME_PATTERN.test(entry)) {
       throw new TypeError(describe(entry));
     }
+    snapshot.push(entry);
   }
+  return Object.freeze(snapshot);
 }
 
 /**
@@ -150,23 +171,20 @@ export function assertEgressHostList(
  * Enforcement is declaration-based: it gates the egress surface the manifest
  * claims, guarding against misconfiguration and org-policy drift — not
  * against a connector that lies about what it calls. The runtime half is
- * `egressFetch` (connector SDK): every actual request a connector makes
- * through its `ConnectorRuntime.fetch` is checked against the manifest's
- * declared hosts, so actual ⊆ declared ⊆ this allowlist.
+ * `egressFetch` (connector SDK).
  */
 export function networkEgress(
   options: NetworkEgressOptions,
 ): ToolPolicyEvaluator {
-  assertEgressHostList(
+  const allowedDomains = assertEgressHostList(
+    'networkEgress: allowedDomains',
     options.allowedDomains,
     (entry) =>
       `networkEgress: allowed domain '${entry}' must be a bare hostname ('api.example.com') or wildcard ('*.example.com'); there is no allow-all entry — omit the policy instead`,
   );
-  // Normalize the allowlist ONCE at construction and match the incoming value
-  // per call through the SAME lower-level matcher the runtime guard
-  // (egressFetch) uses — declared and enforced semantics cannot drift, and no
-  // allowlist re-normalization happens per call.
-  const normalizedAllow = options.allowedDomains.map(normalizeDomain);
+  // Normalize the allowlist ONCE at construction, so a call normalizes only
+  // its declared hosts.
+  const normalizedAllow = allowedDomains.map(normalizeDomain);
   return {
     name: options.name ?? 'network-egress',
     evaluate({ egress }): PolicyDecision {
@@ -188,9 +206,9 @@ export function networkEgress(
 
 /**
  * requestContext key: the calling workflow's scope (its workflowId). Minted
- * by the trusted runtime (flowsafe's RunnerRuntime) on every leg — trust
- * boundary 6 applies: never populate it from client input, model output, or
- * tool results (security-threat-model.md).
+ * by the trusted runtime (flowsafe's RunnerRuntime) — trust boundary 6
+ * applies: never populate it from client input, model output, or tool
+ * results (security-threat-model.md).
  */
 export const WORKFLOW_SCOPE_CONTEXT_KEY = 'breakwater.workflowScope';
 
@@ -243,11 +261,9 @@ export function crossWorkflowIsolation(
 
 /**
  * requestContext key: the caller's OPAQUE isolation scope (a multi-tenant
- * host mints its tenant id here). breakwater never parses the value — it
- * segments the connector SDK's idempotency and rate-limit keys and feeds the
- * tenantIsolation evaluator. Minted by the trusted runtime on every leg,
- * mirroring WORKFLOW_SCOPE_CONTEXT_KEY — trust boundary 6 applies: never
- * populate it from client input, model output, or tool results.
+ * host mints its tenant id here); breakwater never parses the value. Minted
+ * by the trusted runtime — trust boundary 6 applies: never populate it from
+ * client input, model output, or tool results.
  */
 export const ISOLATION_SCOPE_CONTEXT_KEY = 'breakwater.isolationScope';
 
@@ -259,9 +275,8 @@ const tenantIsolationEvaluators = new WeakSet<object>();
  * set, turning "the scope is absent" from silently-shared-keys into a denial.
  * It runs in the PRE-EXECUTE gates loop — which matters because the dry-run
  * branch returns before the idempotency and rate-limit machinery, and a
- * constraint that must bind simulations cannot live on those paths. The
- * single-tenant OSS default simply omits this evaluator: absent scope then
- * preserves unsegmented keys exactly.
+ * constraint that must bind simulations cannot live on those paths. Without
+ * this evaluator, a call with no scope uses the unscoped keys.
  */
 export function tenantIsolation(
   options: { name?: string } = {},
@@ -294,10 +309,9 @@ export function isTenantIsolationEvaluator(
 
 /**
  * The field the LLM can include in tool-call args to override background
- * behavior per call (core `LLMBackgroundOverride` — `{ enabled?, timeoutMs?,
- * maxRetries? }`, background-tasks/types.d.ts). Shared by the connector SDK's
- * hard rejection and the `backgroundExecution` evaluator below so the one name
- * the model would smuggle lives in one place.
+ * behavior per call (core `LLMBackgroundOverride`,
+ * background-tasks/types.d.ts). Defined here so the name the model would
+ * smuggle lives in one place.
  */
 export const LLM_BACKGROUND_OVERRIDE_KEY = '_background';
 
@@ -321,10 +335,9 @@ function backgroundOverrideOf(
 export interface BackgroundExecutionOptions {
   /**
    * Side effects treated as write-class — background execution denied for
-   * these. A write / destructive / idempotent connector carries a side effect
-   * whose approval topology and timing the background flip would move off the
-   * foreground path, so v1 keeps them foreground-only. Default: everything but
-   * 'read'.
+   * these. A write-class connector carries a side effect whose approval
+   * topology and timing the background flip would move off the foreground
+   * path, so v1 keeps them foreground-only. Default: everything but 'read'.
    */
   writeClass?: readonly SideEffect[];
   /** Policy name used in denials and audit records. */
@@ -343,9 +356,8 @@ const backgroundExecutionEvaluators = new WeakSet<object>();
  * check primarily protects direct and nested programmatic calls. Breakwater
  * connectors do not enable Mastra background execution by default, which
  * prevents an agent override from opting them in upstream. Read-only calls and
- * explicit `{ enabled: false }` overrides pass. Approval grants in the trusted
- * request context remain the final write boundary on every execution path.
- * Register the evaluator through `ConnectorPolicies.evaluators`.
+ * explicit `{ enabled: false }` overrides pass. Register the evaluator through
+ * `ConnectorPolicies.evaluators`.
  */
 export function backgroundExecution(
   options: BackgroundExecutionOptions = {},
@@ -403,9 +415,7 @@ function matchesConnectorId(pattern: string, connectorId: string): boolean {
 
 /**
  * Whether a call to this connector needs human approval — the single source
- * of truth the connector SDK compiles into both enforcement paths: Mastra's
- * native `requireApproval` for agent runs, and the execute wrapper's hard
- * gate for workflow steps and direct calls.
+ * of truth the connector SDK compiles into its approval enforcement.
  */
 export function approvalRequired(
   connectorId: string,

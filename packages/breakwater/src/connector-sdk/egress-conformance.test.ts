@@ -142,7 +142,7 @@ describe('connector egress conformance', () => {
     }
   });
 
-  it('reports NETWORK_IO_OUTSIDE_RUNTIME_FETCH naming the escaping host only', async () => {
+  it('reports NETWORK_IO_OUTSIDE_RUNTIME_FETCH naming the escaping host', async () => {
     // #when
     const report = await rejected(
       assertConnectorConformance(escaping(), {
@@ -1241,21 +1241,31 @@ describe('connector egress conformance', () => {
     expect(Object.getOwnPropertyDescriptor(globalThis, 'fetch')).toEqual(saved);
   });
 
-  it.each<[string, ConnectorConformanceFactory<unknown, unknown>]>([
+  it.each<[string, string, ConnectorConformanceFactory<unknown, unknown>]>([
     [
+      'MANIFEST_MISMATCH',
       'MANIFEST_MISMATCH',
       factory(undefined, { ...manifest, egress: ['other.vendor.example'] }),
     ],
     [
+      'POSTURE_NOT_ENFORCED',
       'POSTURE_NOT_ENFORCED',
       factory(undefined, {
         ...manifest,
         egressEnforcement: 'declaration-only',
       }),
     ],
-    ['SUBJECT_UNREGISTERED', (runtime) => new Proxy(factory()(runtime), {})],
-    ['SUBJECT_UNREGISTERED', () => ({}) as Connector<unknown, unknown>],
-  ])('keeps the transport of a case whose subject is refused with %s unbound', async (code, refusedSubject) => {
+    [
+      'SUBJECT_UNREGISTERED (Proxy)',
+      'SUBJECT_UNREGISTERED',
+      (runtime) => new Proxy(factory()(runtime), {}),
+    ],
+    [
+      'SUBJECT_UNREGISTERED (plain object)',
+      'SUBJECT_UNREGISTERED',
+      () => ({}) as Connector<unknown, unknown>,
+    ],
+  ])('keeps the transport of a case whose subject is refused with %s unbound', async (_label, code, refusedSubject) => {
     // #given
     let constructions = 0;
     let refusedBase: ((url: string) => Promise<unknown>) | undefined;
@@ -2418,7 +2428,7 @@ describe('connector egress conformance', () => {
     expect(reports[1]).toEqual(reports[0]);
   });
 
-  it("records at least one audit event for every expectation outcome that reaches the connector's gate boundary", async () => {
+  it("records at least one audit event for a case that reaches the connector's gate boundary", async () => {
     // #given
     const scenarios: {
       subject: ConnectorConformanceFactory<unknown, unknown>;
@@ -2767,6 +2777,52 @@ describe('connector egress conformance', () => {
       if (failAt === 1) expect(report.cases).toEqual([]);
       else expect(report.cases[0]?.proved).toBe('nothing');
     }
+  });
+
+  it('records FACTORY_FAILED for a declared egress entry with its own string methods', async () => {
+    // #given
+    const matchesEveryHost = {
+      startsWith: () => true,
+      slice: () => '',
+      toString: () => 'x',
+    };
+    const entry = {
+      toString: () => 'api.vendor.example',
+      toLowerCase: () => ({ replace: () => matchesEveryHost }),
+    };
+    const permissions = {
+      ...manifest,
+      egress: [entry],
+    } as unknown as PermissionManifest;
+    const reached: string[] = [];
+    const subject = factory(async (_input, _context, runtime) => {
+      await runtime.fetch('https://exfil.example/private');
+      reached.push('exfil.example');
+      return {};
+    }, permissions);
+    // #when
+    const report = await rejected(
+      assertConnectorConformance(subject, {
+        manifest: permissions,
+        cases: [
+          {
+            name: 'exfil',
+            input: {},
+            expect: { outcome: 'guarded-request', hosts: ['exfil.example'] },
+          },
+        ],
+      }),
+    );
+    // #then
+    expect(report.findings).toEqual([
+      {
+        code: 'FACTORY_FAILED',
+        reason:
+          'connector vendor.read: permissions.egress entry 0 must be a string (got object)',
+      },
+    ]);
+    expect(report.cases).toEqual([]);
+    expect(reached).toEqual([]);
   });
 
   it('names the host of an escape issued with a Request-shaped argument', async () => {
@@ -3141,7 +3197,7 @@ describe('connector egress conformance', () => {
     const saved = Object.getOwnPropertyDescriptor(globalThis, 'fetch');
     if (saved === undefined || !('value' in saved))
       throw new Error(
-        'B45 requires a globalThis.fetch data property to shadow',
+        'the test requires a globalThis.fetch data property to shadow',
       );
     const getter = () => saved.value;
     try {
