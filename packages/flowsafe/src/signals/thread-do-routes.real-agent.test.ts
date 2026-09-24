@@ -19,7 +19,10 @@ import {
 } from '@proofoftech/breakwater';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
-import { FLOWSAFE_PERSISTENCE_FORBIDDEN } from '../agent-runner/durable-agent-runner.js';
+import {
+  BLOCKED_RUN_ENTRIES,
+  FLOWSAFE_PERSISTENCE_FORBIDDEN,
+} from '../agent-runner/durable-agent-runner.js';
 import {
   createFlowsafeDurableAgent,
   type FlowsafeDurableAgent,
@@ -1143,9 +1146,8 @@ describe('thread signal routes with a real durable agent', () => {
     expect(unhandled).toEqual([]);
   });
 
-  // A non-owner notification is recorded with a due time and no summary time,
-  // so the dispatcher delivers each row as its own signal, low priority
-  // included. The source strings here name Object.prototype members.
+  // The dispatcher delivers each row as its own signal, low priority included.
+  // The source strings here name Object.prototype members.
   it('delivers prototype-colliding non-owner notifications through the dispatcher', async () => {
     // #given — deferred non-owner notifications with colliding source names
     const harness = await createHarness();
@@ -1230,6 +1232,46 @@ describe('thread signal routes with a real durable agent', () => {
       });
     }
     expect(harness.start).not.toHaveBeenCalled();
+    expect(unhandled).toEqual([]);
+  });
+
+  it('keeps the wrapper off every Mastra, so a direct notification send starts nothing', async () => {
+    // #given the thread host composition, whose host Mastra holds the
+    // notifications store
+    const harness = await createHarness();
+    const threadId = crypto.randomUUID();
+    await seedThread(harness.memory, threadId);
+    const refusal = `FlowsafeDurableAgent.__setMastra() is unavailable: ${BLOCKED_RUN_ENTRIES.__setMastra}`;
+
+    // #when / #then neither registration route binds the wrapper to a Mastra
+    expect(() =>
+      harness.mastra.addAgent(harness.agent as unknown as Agent, 'wrapper'),
+    ).toThrow(refusal);
+    expect(
+      () =>
+        new Mastra({
+          storage: new InMemoryStore(),
+          logger: false,
+          agents: { wrapper: harness.agent as unknown as Agent },
+        }),
+    ).toThrow(refusal);
+    expect(harness.agent.getMastraInstance()).toBeUndefined();
+
+    // #then so core's own notification send finds no notifications store and
+    // rejects before it records a row or starts a run
+    await expect(
+      harness.agent.sendNotificationSignal(
+        { source: 'provider', kind: 'changed', summary: 'direct notification' },
+        { threadId, resourceId: RESOURCE_ID },
+      ),
+    ).rejects.toThrow(
+      'sendNotificationSignal requires a notifications storage domain',
+    );
+    expect(await harness.notifications.listNotifications({ threadId })).toEqual(
+      [],
+    );
+    expect(harness.start).not.toHaveBeenCalled();
+    expect(harness.startIdleRun).not.toHaveBeenCalled();
     expect(unhandled).toEqual([]);
   });
 

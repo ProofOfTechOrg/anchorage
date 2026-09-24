@@ -437,6 +437,7 @@ describe('guarded construction and processor validation', () => {
     'defaultStreamOptionsLegacy',
     'defaultNetworkOptions',
     'backgroundTasks',
+    'channels',
     'durable',
     'goal',
     'signals',
@@ -1029,9 +1030,8 @@ describe('Mastra Agent execution-entry inventory', () => {
       'wrapToolWithHooks',
     ];
     // Names classified above but absent from Agent.prototype at the pinned
-    // core, while present on newest 1.x. The mastra-compat canary job bumps
-    // core to newest 1.x and runs this suite, and a name here keeps it fully
-    // classified there. A name belongs here only while the two cores disagree
+    // core, while present on newest 1.x. A name here keeps it fully classified
+    // there. A name belongs here only while the two cores disagree
     // about it: it goes once the pin catches up, and a name on NEITHER version
     // is dead and belongs in no list at all.
     const forwardClassified: readonly string[] = [

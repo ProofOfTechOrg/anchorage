@@ -34,6 +34,8 @@ function handle(
     allowedRoles,
     allowedPrincipalKinds,
     maxSteps: 1,
+    getChannels: () => null,
+    getDeclaredSchedules: () => [],
   } as unknown as GuardedAgentHandle;
 }
 
@@ -133,6 +135,39 @@ describe('agent catalog', () => {
       ]),
     ).toThrow(/malformed Breakwater guarded-agent host protocol/);
   });
+
+  it.each([
+    [
+      'channels configured',
+      { getChannels: () => ({}) },
+      'has channels configured: ',
+    ],
+    ["the 'durable' option", { durable: true }, "sets the 'durable' option: "],
+    [
+      'a durable agent',
+      {
+        name: 'Writer',
+        agent: { id: 'raw' },
+        stream: () => undefined,
+        recover: () => undefined,
+        recoverActiveRuns: () => undefined,
+      },
+      'is already a durable agent: ',
+    ],
+    [
+      'declared schedules',
+      { getDeclaredSchedules: () => [{}] },
+      'declares schedules: ',
+    ],
+  ])('refuses a guarded agent with %s that the runner cannot wrap', (_label, carried, reason) => {
+    // #given a guarded handle carrying configuration the runner refuses
+    const agent = { ...handle(), ...carried } as unknown as GuardedAgentHandle;
+
+    // #when / #then the catalog refuses it before any Mastra registers it
+    expect(() => createAgentModuleCatalog([{ meta, agent }])).toThrow(
+      `agent catalog: agent 'writer' ${reason}`,
+    );
+  });
 });
 
 describe('agent permission declaration', () => {
@@ -188,7 +223,7 @@ describe('agent automation declaration', () => {
   };
 
   it('denies every automated entry when nothing is declared', () => {
-    // #given — the shape every agent written before principals had.
+    // #given — no allowedAutomation declared.
     const catalog = createAgentCatalog([meta]);
 
     // #when / #then
@@ -271,8 +306,7 @@ describe('agent automation declaration', () => {
   });
 
   it('refuses a module whose declaration disagrees with its guarded agent', () => {
-    // #given — the two halves of one decision must not drift: flowsafe routes
-    // the entry, breakwater decides whether the kind may execute at all.
+    // #given — the declaration and the guarded agent must not drift.
     expect(() =>
       createAgentModuleCatalog([{ meta: automated, agent: handle() }]),
     ).toThrow(/allowedAutomation kinds \[system\] must exactly match/);

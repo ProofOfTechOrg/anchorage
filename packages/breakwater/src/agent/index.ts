@@ -68,6 +68,7 @@ const UNSAFE_CONSTRUCTION_KEYS = new Set([
   'defaultOptions',
   'defaultNetworkOptions',
   'backgroundTasks',
+  'channels',
   'durable',
   'goal',
   'signals',
@@ -228,6 +229,7 @@ export type GuardedAgentConfig<
   | 'defaultOptions'
   | 'defaultNetworkOptions'
   | 'backgroundTasks'
+  | 'channels'
   | 'durable'
   | 'goal'
   | 'signals'

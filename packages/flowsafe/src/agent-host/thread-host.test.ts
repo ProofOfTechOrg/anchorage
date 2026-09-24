@@ -231,6 +231,8 @@ function guarded(
     allowedRoles: ['operator'],
     allowedPrincipalKinds: ['human', ...automationKinds],
     maxSteps: 1,
+    getChannels: () => null,
+    getDeclaredSchedules: () => [],
   } as unknown as GuardedAgentHandle;
 }
 
@@ -1575,9 +1577,6 @@ describe('createThreadAgentHost owner recovery', () => {
     const { host, scope, state, resources, resourceAccess, alarmAt } = harness(
       ['writer'],
       {
-        // The runner-side guard reaches here: recoverStartAttempt refuses a
-        // read that did not reach storage rather than reporting the fabricated
-        // 'pending' shell it would otherwise see.
         runtime: {
           recoverStartAttempt: vi.fn(async () => {
             throw new RunStateUnreadableError(
@@ -2569,8 +2568,8 @@ describe('createThreadAgentHost', () => {
       'operator-1',
       'human',
       expect.any(String),
-      // The schedule dispatch and the reserved idempotency key: passed
-      // positionally on every start, and undefined on one that has neither.
+      // The schedule dispatch and the reserved idempotency key: undefined on a
+      // start that has neither.
       undefined,
       undefined,
       {
@@ -2642,8 +2641,6 @@ describe('createThreadAgentHost', () => {
     );
 
     expect(response?.status).toBe(200);
-    // Five host arguments, two undefined optionals (schedule dispatch and
-    // reserved idempotency key), then the required captured authority.
     expect(mocked.stream.mock.calls.at(-1)).toHaveLength(8);
     expect(discardScheduleDispatch).not.toHaveBeenCalled();
     await expect(
@@ -3280,9 +3277,9 @@ describe('createThreadAgentHost', () => {
       )
       .catch((error: unknown) => error);
 
-    // #then — the route escapes to the Durable Object shell, which answers the
-    // retryable 503 this release documents rather than a 200 assembled from a
-    // read that never happened. The recovery stays owed: journal, run record
+    // #then — the route escapes to the Durable Object shell, which answers a
+    // retryable 503 rather than a 200 assembled from a read that never
+    // happened. The recovery stays owed: journal, run record
     // and reservation all survive for a wake that can read.
     expect(raised).toBeInstanceOf(RunStateUnreadableError);
     expect(doErrorResponse(raised).status).toBe(503);
@@ -3483,7 +3480,7 @@ describe('createThreadAgentHost', () => {
       ),
       // #then — this route forwards client resume data verbatim as a human
       // requester, so without the guard a caller could drive a step's timeout
-      // branch. Only a run object's alarm mints that envelope.
+      // branch.
     ).rejects.toMatchObject({
       status: 400,
       message: expect.stringContaining(SUSPENSION_TIMEOUT_RESUME_KEY),
@@ -4370,8 +4367,7 @@ describe('createThreadAgentHost automated entry', () => {
     // #when
     await host.start(scope, scheduledStart());
 
-    // #then — kind is what breakwater's mandatory gate authorizes on, and the
-    // projected role is the least-privileged one, never 'operator'.
+    // #then — the projected role is never 'operator'.
     const options = mocked.stream.mock.calls[0]?.[1];
     expect(options?.requestContext.get('breakwater.actor')).toEqual({
       id: 'flowsafe-scheduler',

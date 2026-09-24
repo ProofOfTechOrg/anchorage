@@ -1,0 +1,9 @@
+---
+"@proofoftech/flowsafe": minor
+---
+
+`FlowsafeDurableAgent` now refuses `setChannels()`, `__setDeclaredSchedules()`, `__setMastra()` and `__registerMastra()`, so the wrapper cannot be registered on a Mastra: `Mastra.addAgent()`, constructing a `Mastra` or an `MCPServer` with the wrapper in `agents`, and `AgentController.init()` throw. Its constructor throws a `TypeError`, and the guarded agent catalog refuses the module, when the wrapped agent has channels configured, declares schedules, sets the `durable` option, or is already a durable agent. `RunnerRuntime` refuses a workflow object that another Mastra has registered.
+
+Security: channels on the wrapped agent, or bound through the wrapper, dispatched inbound messages and tool approvals to the wrapped agent outside `RunnerRuntime`, and a Mastra schedule worker fired its declared schedules the same way. A wrapped agent with the `durable` option, or a Mastra `DurableAgent` passed as the wrapped agent, was registered on the runtime's Mastra as a durable agent whose recovery and run listing the runner does not guard. Registering the wrapper on a Mastra bound every later leg to that Mastra, and once the runtime had built its own Mastra it also repointed the runtime's loop workflow to the other Mastra's storage, where `status()` read a stored run as absent. A runtime workflow added to another Mastra did the same.
+
+Migration: pass `createFlowsafeDurableAgent()` and the agent catalog a plain `Agent` without `channels`, declared schedules or the `durable` option. Do not register the wrapper on a Mastra, pass it to an `AgentController` or an `MCPServer`, or configure it as a sub-agent: every run of a parent agent registered on a Mastra fails when the parent converts its tools. Register each workflow object on one runtime, and do not add a runtime's workflows, or the wrapper's `getWorkflow()`, to another Mastra.

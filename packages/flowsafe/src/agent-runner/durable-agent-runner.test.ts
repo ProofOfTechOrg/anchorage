@@ -1,9 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-// FlowsafeDurableAgent pins the host-seam requester passed to runtime.start;
-// terminal refusal for an unregistered run; bounded, best-effort input
-// preservation plus its missing-thread and read-only-memory branches; live-id
-// refusal; and generate() rewrapping the core-reconstructed terminal refusal.
-//
 // The engine-leg-context-to-tool grant round-trip is proven end to end against
 // the real runtime, connector, and grant provider in
 // agent-gate-round-trip.test.ts.
@@ -26,6 +21,7 @@ import {
 } from '@mastra/core/agent/message-list';
 import { EventEmitterPubSub } from '@mastra/core/events';
 import type { MastraModelConfig } from '@mastra/core/llm';
+import { Mastra } from '@mastra/core/mastra';
 import { MockMemory } from '@mastra/core/memory';
 import {
   type OutputResult,
@@ -33,6 +29,8 @@ import {
   ProcessorRunner,
 } from '@mastra/core/processors';
 import { RequestContext } from '@mastra/core/request-context';
+import { InMemoryStore } from '@mastra/core/storage';
+import type { AnyWorkflow } from '@mastra/core/workflows';
 import {
   ACTOR_CONTEXT_KEY,
   AuditLogger,
@@ -83,7 +81,7 @@ import {
   type AuthoritativeAgentStartState,
   createFlowsafeDurableAgent,
   DURABLE_AGENTIC_LOOP_WORKFLOW_ID,
-  type FlowsafeDurableAgent,
+  FlowsafeDurableAgent,
   isRuntimeDrivenAgent,
   type LegacyAgentRunState,
 } from './durable-agent-runner.js';
@@ -265,8 +263,8 @@ async function runOutputResultProcessors(
   }
 }
 
-// executeWorkflow is protected — the durable loop calls it, and no route ever
-// does. Reach it through a cast for the drive/guard assertions.
+// executeWorkflow is protected. Reach it through a cast for the drive/guard
+// assertions.
 function drive(
   agent: FlowsafeDurableAgent,
   runId: unknown,
@@ -1489,6 +1487,101 @@ describe('createFlowsafeDurableAgent', () => {
     expect(isRuntimeDrivenAgent(undefined)).toBe(false);
   });
 
+  it.each([
+    [
+      'channels configured',
+      () => {
+        const agent = testAgent();
+        agent.setChannels({ __setAgent() {}, __setLogger() {} } as never);
+        return agent;
+      },
+      'FlowsafeDurableAgent: the wrapped agent has channels configured: ',
+    ],
+    [
+      "the 'durable' option",
+      () =>
+        new Agent({
+          id: 'writer',
+          name: 'writer',
+          instructions: 'You are a test agent.',
+          model: 'openai/gpt-4o-mini',
+          durable: true,
+        }),
+      "FlowsafeDurableAgent: the wrapped agent sets the 'durable' option: ",
+    ],
+    [
+      'a Mastra DurableAgent',
+      () => new DurableAgent({ agent: testAgent() }) as unknown as Agent,
+      'FlowsafeDurableAgent: the wrapped agent is already a durable agent: ',
+    ],
+    [
+      'a FlowsafeDurableAgent',
+      () =>
+        createFlowsafeDurableAgent({
+          agent: testAgent(),
+          runtime: fakeRuntime().runtime,
+        }) as unknown as Agent,
+      'FlowsafeDurableAgent: the wrapped agent is already a durable agent: ',
+    ],
+    [
+      'declared schedules',
+      () => {
+        const agent = testAgent();
+        agent.__setDeclaredSchedules([{} as never]);
+        return agent;
+      },
+      'FlowsafeDurableAgent: the wrapped agent declares schedules: ',
+    ],
+  ])('refuses to wrap an agent with %s before registering anything', (_label, wrapped, message) => {
+    // #given a runtime with nothing registered
+    const { runtime, register, registerAgent } = fakeRuntime();
+    const viaFactory = () =>
+      createFlowsafeDurableAgent({ agent: wrapped(), runtime });
+    const direct = () =>
+      new FlowsafeDurableAgent({ agent: wrapped(), runtime });
+
+    // #when / #then the factory and direct construction both refuse with a
+    // TypeError naming what the agent carries, and the runtime registers
+    // nothing
+    expect(viaFactory).toThrow(TypeError);
+    expect(viaFactory).toThrow(message);
+    expect(direct).toThrow(TypeError);
+    expect(direct).toThrow(message);
+    expect(registerAgent).not.toHaveBeenCalled();
+    expect(register).not.toHaveBeenCalled();
+  });
+
+  it('refuses status and start once the loop is added to another Mastra', async () => {
+    // #given a wrapper on a real runtime whose first operation built its Mastra
+    const { runtime } = init(
+      { storage: new InMemoryStore() },
+      { executionFence: 'none', startIdempotency: 'none' },
+    );
+    const durable = createFlowsafeDurableAgent({ agent: testAgent(), runtime });
+    await expect(
+      runtime.status(DURABLE_AGENTIC_LOOP_WORKFLOW_ID, 'first-read'),
+    ).resolves.toBeNull();
+
+    // #when the loop the wrapper hands out is added to another Mastra
+    new Mastra({
+      storage: new InMemoryStore(),
+      logger: false,
+      workflows: { loop: durable.getWorkflow() as unknown as AnyWorkflow },
+    });
+
+    // #then the runtime refuses the loop rather than read that Mastra's storage
+    const refusal = `RunnerRuntime: workflow '${DURABLE_AGENTIC_LOOP_WORKFLOW_ID}' is not registered on this runtime's Mastra`;
+    await expect(
+      runtime.status(DURABLE_AGENTIC_LOOP_WORKFLOW_ID, 'first-read'),
+    ).rejects.toThrow(refusal);
+    await expect(
+      runtime.start(DURABLE_AGENTIC_LOOP_WORKFLOW_ID, {
+        runId: 'after-repoint',
+        inputData: {},
+      } as StartRunOptions),
+    ).rejects.toThrow(refusal);
+  });
+
   it('rejects structured durable methods for a guarded agent before core dispatch', async () => {
     const { runtime } = fakeRuntime();
     const durable = createFlowsafeDurableAgent({
@@ -1809,7 +1902,7 @@ describe('FlowsafeDurableAgent.executeWorkflow', () => {
     expect(start).not.toHaveBeenCalled();
   });
 
-  it('rejects a non-path-safe runId (INV-1 posture identical to RunnerRuntime.start)', async () => {
+  it('rejects a non-path-safe runId (INV-1)', async () => {
     // #given
     const { runtime, start } = fakeRuntime();
     const agent = createFlowsafeDurableAgent({ agent: testAgent(), runtime });
@@ -2223,8 +2316,8 @@ describe('FlowsafeDurableAgent INV-1 boundary (stream/generate)', () => {
   });
 });
 
-// prepare() is the THIRD inherited minting entry point (stream/generate are the
-// other two): it forwards options?.runId into core's prepareForDurableExecution,
+// prepare() is an inherited minting entry point: it forwards options?.runId
+// into core's prepareForDurableExecution,
 // which mints an unowned crypto.randomUUID() AND registers a run under it when
 // runId is absent (@mastra/core 1.50.0 agent/durable/index.js:5980 -> :589 ->
 // :5984). PATH_SAFE_ID_PATTERN accepts a bare UUID, so no downstream guard
