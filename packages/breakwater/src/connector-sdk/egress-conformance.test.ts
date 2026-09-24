@@ -1083,7 +1083,7 @@ describe('connector egress conformance', () => {
     const saved = Object.getOwnPropertyDescriptor(globalThis, 'fetch');
     const hostile = unreadablePrototype();
     const thenable = {
-      // biome-ignore lint/suspicious/noThenProperty: the fixture is a thenable on purpose — the harness must survive the throw that promise adoption raises when it reads `then`.
+      // biome-ignore lint/suspicious/noThenProperty: the fixture is a thenable, and the harness must survive the throw that promise adoption raises when it reads `then`.
       get then(): never {
         throw hostile;
       },
@@ -1239,6 +1239,80 @@ describe('connector egress conformance', () => {
     expect(report.cases[0]?.escapes).toEqual([]);
     expect(refusal).toBeInstanceOf(Error);
     expect(Object.getOwnPropertyDescriptor(globalThis, 'fetch')).toEqual(saved);
+  });
+
+  it.each<[string, ConnectorConformanceFactory<unknown, unknown>]>([
+    [
+      'MANIFEST_MISMATCH',
+      factory(undefined, { ...manifest, egress: ['other.vendor.example'] }),
+    ],
+    [
+      'POSTURE_NOT_ENFORCED',
+      factory(undefined, {
+        ...manifest,
+        egressEnforcement: 'declaration-only',
+      }),
+    ],
+    ['SUBJECT_UNREGISTERED', (runtime) => new Proxy(factory()(runtime), {})],
+    ['SUBJECT_UNREGISTERED', () => ({}) as Connector<unknown, unknown>],
+  ])('keeps the transport of a case whose subject is refused with %s unbound', async (code, refusedSubject) => {
+    // #given
+    let constructions = 0;
+    let refusedBase: ((url: string) => Promise<unknown>) | undefined;
+    const refusals: string[] = [];
+    const subject: ConnectorConformanceFactory<unknown, unknown> = (
+      runtime,
+    ) => {
+      constructions += 1;
+      if (constructions === 2) {
+        refusedBase = runtime.policies.fetch as (
+          url: string,
+        ) => Promise<unknown>;
+        return refusedSubject(runtime);
+      }
+      const late = constructions >= 3;
+      return factory(async () => {
+        if (late) {
+          for (const host of ['api.vendor.example', 'other.vendor.example']) {
+            try {
+              await refusedBase?.(`https://${host}/late`);
+              refusals.push('resolved');
+            } catch (error) {
+              refusals.push(
+                error instanceof Error ? error.message : String(error),
+              );
+            }
+          }
+        }
+        return {};
+      })(runtime);
+    };
+    // #when
+    const report = await rejected(
+      assertConnectorConformance(subject, {
+        manifest,
+        cases: [
+          { ...quietCase, name: 'one' },
+          { ...quietCase, name: 'two' },
+        ],
+      }),
+    );
+    // #then
+    expect(report.cases[0]?.findings.map((finding) => finding.code)).toContain(
+      code,
+    );
+    expect(report.cases[0]?.transportCalls).toBe(0);
+    expect(refusals).toEqual([
+      'connector called the supplied base transport directly',
+      'connector called the supplied base transport directly',
+    ]);
+    for (const host of ['api.vendor.example', 'other.vendor.example']) {
+      expect(report.findings).toContainEqual({
+        code: 'NETWORK_IO_OUTSIDE_RUNTIME_FETCH',
+        observedAfterCase: 'one',
+        reason: `connector reached policies.fetch directly; the harness refused it: no egress declaration is bound (host: ${host}); observed after case 'one' settled`,
+      });
+    }
   });
 
   it('records an instrumentation setter called after its case settled as a run-level finding', async () => {

@@ -732,19 +732,19 @@ describe('createGuardedAgent principal kinds', () => {
     return context;
   }
 
-  it('defaults to humans only, so an existing agent denies automation', async () => {
-    // #given — `guarded()` names allowedRoles and nothing else, exactly as
-    // every agent written before principal kinds existed.
+  it('defaults to humans only, so an agent that names no kinds denies automation', async () => {
+    // #given — `guarded()` passes no `allowedPrincipalKinds`.
     const modelCall = vi.fn();
     const agent = guarded({ model: testModel('generated', modelCall) });
 
-    // #when / #then — 'operator' IS an allowed role; only the kind stops it.
+    // #when / #then
     await expect(
       agent.generate('hello', { requestContext: automatedContext('system') }),
     ).rejects.toThrow(
       /principal kind 'system' is not in allowed kinds \[human\]/,
     );
     expect(modelCall).not.toHaveBeenCalled();
+    expect(agent.allowedRoles).toContain('operator');
     expect(agent.allowedPrincipalKinds).toEqual(['human']);
   });
 
@@ -768,9 +768,9 @@ describe('createGuardedAgent principal kinds', () => {
   });
 
   it('runs an automated principal whose kind is named, ignoring its role', async () => {
-    // #given — 'viewer' is deliberately outside allowedRoles: an automated
-    // principal must not need a human role to be admitted, because needing one
-    // would also admit the humans who hold it.
+    // #given — 'viewer' is outside allowedRoles: an automated principal
+    // must not need a human role to be admitted, because needing one would
+    // also admit the humans who hold it.
     const modelCall = vi.fn();
     const agent = guarded({
       model: testModel('generated', modelCall),
@@ -894,7 +894,7 @@ describe('Mastra Agent execution-entry inventory', () => {
       '__registerMastra',
       '__registerPrimitives',
       '__resetToOriginalModel',
-      // Declarative schedule metadata accessors; neither starts a scheduled run.
+      // Writes declarative schedule metadata; it starts no scheduled run.
       '__setDeclaredSchedules',
       '__setMemory',
       '__setPubSub',
@@ -1020,8 +1020,9 @@ describe('Mastra Agent execution-entry inventory', () => {
       'subscribeToThread',
       'updateModelInModelList',
       'updateObjectiveOptions',
-      // Edits label, title and metadata of an advertisement an existing claim
-      // holds; it cannot re-address the claim, and no run path reads them.
+      // Edits the label, title and metadata of the advertisement an existing
+      // claim holds; it cannot change the advertisement's id or sourceId, so it
+      // cannot re-address the claim, and no run path reads the fields it edits.
       'updateThreadPeerAdvertisement',
       'voice',
       'wrapToolsWithHooks',
@@ -1061,16 +1062,12 @@ describe('Mastra Agent execution-entry inventory', () => {
     // And the allowlist cannot drift away from the lists it excuses.
     expect(
       forwardClassified.filter((name) => !classified.includes(name)),
-      'every forwardClassified name must also appear in one of the three lists above — it excuses a name from the stale check, it does not classify it',
+      'every forwardClassified name must also appear in one of the lists `classified` spreads — it excuses a name from the stale check, it does not classify it',
     ).toEqual([]);
 
-    // forwardClassified must expire, or it becomes the listChannelTools trap
-    // again: a permanent exemption that hides both a caught-up pin and a name
-    // dead at BOTH versions. Which direction bites depends on which core is
-    // installed, so key on that. On the PINNED run every forward name must
-    // still be absent (present means the pin caught up — drop it); on the
-    // canary run against newest 1.x every one must be present (absent there
-    // too means it exists in neither version and is simply dead).
+    // forwardClassified must expire: a permanent exemption hides both a
+    // caught-up pin and a name dead at BOTH versions. Which direction applies
+    // depends on which core is installed, so key on that.
     const require_ = createRequire(import.meta.url);
     const installedCore = (
       require_('@mastra/core/package.json') as { version: string }
@@ -1145,18 +1142,18 @@ function compileTimeSurface(
     const options: GuardedAgentCallOptions = { requestContext };
     void handle.generate('hello', options);
     void handle.stream('hello', options);
-    // @ts-expect-error Structured output is intentionally unavailable.
+    // @ts-expect-error Structured output is unavailable on the handle.
     void handle.generate('hello', { requestContext, structuredOutput: {} });
-    // @ts-expect-error Structured output is intentionally unavailable.
+    // @ts-expect-error Structured output is unavailable on the handle.
     void handle.stream('hello', { requestContext, structuredOutput: {} });
     void handle[GUARDED_AGENT_HOST_PROTOCOL].supportsDurableStructuredOutput;
-    // @ts-expect-error Raw resume is intentionally unavailable.
+    // @ts-expect-error Raw resume is unavailable on the handle.
     void handle.resumeStream({}, { requestContext });
-    // @ts-expect-error Standalone durable resume is intentionally unavailable.
+    // @ts-expect-error Standalone durable resume is unavailable on the handle.
     void handle.resume('run-1', {});
-    // @ts-expect-error Legacy execution is intentionally unavailable.
+    // @ts-expect-error Legacy execution is unavailable on the handle.
     void handle.generateLegacy('hello');
-    // @ts-expect-error Network execution is intentionally unavailable.
+    // @ts-expect-error Network execution is unavailable on the handle.
     void handle.network('hello');
   }
 }
@@ -1165,7 +1162,7 @@ function compileTimeConstructionSurface(
   config: GuardedAgentConfig,
 ): GuardedAgentConfig {
   if (Date.now() < 0) {
-    // @ts-expect-error Goal-driven continuation is intentionally unavailable.
+    // @ts-expect-error Goal-driven continuation is unavailable in the config.
     return { ...config, goal: undefined };
   }
   return config;

@@ -803,6 +803,19 @@ function normalizedRequiredPermissions(
   return Object.freeze([...permissions]);
 }
 
+function normalizedEgress(
+  connectorId: string,
+  egress: readonly string[] | undefined,
+): readonly string[] {
+  if (egress == null) return Object.freeze([]);
+  if (!Array.isArray(egress)) {
+    throw new TypeError(
+      `connector ${connectorId}: permissions.egress must be an array`,
+    );
+  }
+  return Object.freeze([...egress]);
+}
+
 /**
  * Compile a connector: a real Mastra createTool() call whose execute is
  * wrapped with the manifest's enforcement. `requiresApproval` (and the org
@@ -833,7 +846,7 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
   );
   const manifest: PermissionManifest = Object.freeze({
     ...permissions,
-    egress: Object.freeze([...(permissions.egress ?? [])]),
+    egress: normalizedEgress(id, permissions.egress),
     ...(requiredPermissions !== undefined ? { requiredPermissions } : {}),
   });
   assertEgressHostList(
@@ -1243,8 +1256,8 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
 
   // Takes unknown because createTool's inference degrades over an abstract
   // PublicSchema<TInput>; Mastra's Tool wrapper validates inputData against
-  // inputSchema before this runs, so the one cast at the user-execute
-  // boundary is checked at runtime whenever a schema is declared.
+  // inputSchema before this runs, so the cast at the user-execute boundary
+  // is checked at runtime whenever a schema is declared.
   async function gatedExecute(
     inputData: unknown,
     context: ToolExecutionContext,

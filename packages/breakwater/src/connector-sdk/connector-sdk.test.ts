@@ -270,8 +270,8 @@ function makeToolCallGrantContext(
   } as unknown as ToolExecutionContext;
 }
 
-// Structural on purpose: connectors infer different TOutput per test, and
-// Tool<...> instantiations don't cross-assign cleanly.
+// Structural: connectors infer different TOutput per test, and Tool<...>
+// instantiations don't cross-assign cleanly.
 async function run<TInput>(
   tool: {
     execute?: (
@@ -350,6 +350,22 @@ describe('connector egress posture', () => {
     // #then
     expect(connectorManifest(tool)).toEqual({ sideEffect: 'read', egress: [] });
     expect(connectorManifest(tool)).not.toHaveProperty('egressEnforcement');
+  });
+
+  it.each([
+    ['a string', 'localhost'],
+    ['a Set', new Set(['api.vendor.example'])],
+  ])('refuses %s as egress at construction', (_label, egress) => {
+    // #given
+    const permissions = {
+      sideEffect: 'read',
+      egress,
+    } as unknown as ConnectorConfig['permissions'];
+    // #when / #then
+    expect(() => makeConnector({ permissions })).toThrow(TypeError);
+    expect(() => makeConnector({ permissions })).toThrow(
+      'connector salesforce.createContact: permissions.egress must be an array',
+    );
   });
 
   it('resolves an undeclared posture to declaration-only', () => {
@@ -3653,7 +3669,7 @@ describe('atomic idempotency (reserve path)', () => {
     });
 
     // #when — the call succeeds (the side effect already happened) and the
-    // reservation is deliberately NOT released...
+    // reservation is NOT released...
     expect(
       await run(tool, input, makeContext({ idempotencyKey: 'k1' })),
     ).toEqual({ ok: true });
@@ -3735,7 +3751,7 @@ describe('atomic idempotency (reserve path)', () => {
         idempotencyStore: store,
         rateLimitStore: {
           increment: () => {
-            // deliberately a bare string throw
+            // a bare string throw
             throw 'counter backend down (primitive)';
           },
         },
@@ -4942,7 +4958,7 @@ describe('createConnector egress-fetch runtime', () => {
     expect(vendor.calls).toHaveLength(0);
     // ...yet the guard-boundary 'denied' audit survived the swallow: exactly
     // one, carrying the undeclared host and hop (a later 'allowed' record from
-    // the normal return is expected and deliberately not asserted here).
+    // the normal return is expected and not asserted here).
     const denials = audit
       .events()
       .filter((event) => event.decision === 'denied');
@@ -5121,7 +5137,7 @@ describe('_background model-override defense (DL-005)', () => {
   });
 
   it('lets a read-only connector that OPTS IN receive _background args', async () => {
-    // #given — a read-only tool that deliberately supports background
+    // #given — a read-only tool that supports background
     const execute = vi.fn(async () => ({ ok: true }));
     const tool = createConnector({
       id: 'search.web',
@@ -5165,13 +5181,13 @@ describe('_background model-override defense (DL-005)', () => {
     expect(execute).toHaveBeenCalledTimes(1);
   });
 
-  // HONESTY (QA): every test above exercises the DIRECT/nested path — args flow
-  // straight into gatedExecute, where the presence check has teeth. The AGENT
-  // path is different, and NOT what these tests cover: core deletes `_background`
-  // from the tool-call args before dispatch AND resolves eligibility itself. So
-  // the breakwater `_background` reads catch nothing on the agent path; this test
-  // pins the mechanism that makes it core's responsibility, against core's REAL
-  // resolver, so the suite does not manufacture false confidence.
+  // HONESTY (QA): on the DIRECT/nested path args flow straight into
+  // gatedExecute, where the presence check has teeth. The AGENT path is
+  // different: core deletes `_background` from the tool-call args before
+  // dispatch AND resolves eligibility itself. So the breakwater `_background`
+  // reads catch nothing on the agent path; this test pins the mechanism that
+  // makes it core's responsibility, against core's REAL resolver, so the suite
+  // does not manufacture false confidence.
   it("is INERT on the agent path: core's resolveBackgroundConfig keeps a no-background-config connector foreground even under an LLM _background:enabled override (baseEnabled gate)", () => {
     // #given — a breakwater connector sets NO tool background config, so
     // core's baseEnabled (agent/tool `enabled`) resolves false

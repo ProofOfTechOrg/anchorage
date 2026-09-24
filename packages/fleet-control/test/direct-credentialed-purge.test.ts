@@ -380,12 +380,18 @@ describe('direct credentialed purge', () => {
     };
     const premise = await purge(world, ['--delete', 'wrong'], credentials);
     expect(
-      premise.exitCode,
-      'premise: the runtime refuses the mismatched confirmation with exit 2',
-    ).toBe(2);
+      premise,
+      'premise: the runtime refuses the mismatched confirmation with exit 2 and a prefix-mismatch summary that echoes CLOUDFLARE_ACCOUNT_ID',
+    ).toMatchObject({
+      exitCode: 2,
+      summary: {
+        code: 'prefix-mismatch',
+        accountId: credentials.CLOUDFLARE_ACCOUNT_ID,
+      },
+    });
     expect(
       premise.stdoutLine,
-      'premise: the prefix-mismatch summary echoes CLOUDFLARE_ACCOUNT_ID, so it carries the token',
+      "premise: the runtime's line carries the token",
     ).toContain(API_TOKEN);
 
     const result = await spawnDirectChild([purgeEntry, '--delete', 'wrong'], {
@@ -404,11 +410,13 @@ describe('direct credentialed purge', () => {
       'rejection',
       'setTimeout(() => Promise.reject(new Error(process.env.CLOUDFLARE_API_TOKEN)), 0);',
     ],
-    // Without an `unhandledRejection` listener, Node's default mode raises a
-    // real rejection as an uncaught exception, which the other trap catches;
-    // the emitted event reaches the `unhandledRejection` trap directly.
+    // The real rejection above cannot pin the `unhandledRejection` trap:
+    // without that listener, Node's default `--unhandled-rejections=throw`
+    // mode raises it as an uncaught exception, which the `uncaughtException`
+    // trap also answers. An emitted `unhandledRejection` event has no such
+    // fallback.
     [
-      'unhandledRejection',
+      'unhandledRejection event',
       "setTimeout(() => process.emit('unhandledRejection', new Error(process.env.CLOUDFLARE_API_TOKEN), Promise.resolve()), 0);",
     ],
     [
@@ -432,14 +440,13 @@ process.stdout.write = (...args) => {
 };
 `,
     );
-    const result = await spawnDirectChild([purgeEntry, '--delete', 'wrong'], {
-      timeoutMs: 10_000,
-      env: {
-        ...env,
-        NODE_OPTIONS: `--import=${preload}`,
-        FLEET_DIRECT_CONFORMANCE_CONFIG: world.f.configPath,
+    const result = await spawnDirectChild(
+      ['--import', preload, purgeEntry, '--delete', 'wrong'],
+      {
+        timeoutMs: 10_000,
+        env: { ...env, FLEET_DIRECT_CONFORMANCE_CONFIG: world.f.configPath },
       },
-    });
+    );
 
     expect(result).toMatchObject({ status: 4, stderr: '' });
     expect(result.stdout).toContain(internalErrorLine);
@@ -465,14 +472,13 @@ globalThis.fetch = async () => {
 };
 `,
     );
-    const result = await spawnDirectChild([purgeEntry, '--list'], {
-      timeoutMs: 10_000,
-      env: {
-        ...env,
-        NODE_OPTIONS: `--import=${preload}`,
-        FLEET_DIRECT_CONFORMANCE_CONFIG: world.f.configPath,
+    const result = await spawnDirectChild(
+      ['--import', preload, purgeEntry, '--list'],
+      {
+        timeoutMs: 10_000,
+        env: { ...env, FLEET_DIRECT_CONFORMANCE_CONFIG: world.f.configPath },
       },
-    });
+    );
 
     expect(result).toMatchObject({ status: 4, stderr: '' });
     expect(result.stdout.startsWith(internalErrorLine)).toBe(true);

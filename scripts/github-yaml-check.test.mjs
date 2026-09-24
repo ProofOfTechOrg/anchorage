@@ -3013,7 +3013,7 @@ ${jobs.join('\n')}
 });
 
 // The cases below pin the tracked workflows rather than the checker. They live
-// here because the checker already parses every .github workflow, and a suite
+// here because the checker already parses the .github workflows, and a suite
 // of their own would add a verify-core step to run it.
 test('every tracked workflow installs before it invokes pnpm', () => {
   const result = checkGithubYamlFiles(join(repositoryRoot, '.github'));
@@ -3246,9 +3246,10 @@ test('each direct-scenario project has its own gating CI job', () => {
   );
 });
 
-// The canary's step-level `continue-on-error` keys keep an expected upstream
-// red from skipping the tripwire suites after them, so the final step is where
-// those outcomes reach the job status. This case runs that step's own body.
+// The canary's probe steps each carry a step-level `continue-on-error`, so one
+// package's red, or an expected upstream red, skips no probe after it, and the
+// final step is where those outcomes reach the job status. This case runs that
+// step's own body.
 test('the ci.yml canary reds the job from a final outcome step that reads the ids it pins', () => {
   const job = readCompatCanaryJob();
 
@@ -3258,17 +3259,21 @@ test('the ci.yml canary reds the job from a final outcome step that reads the id
   );
 
   const steps = job.steps ?? [];
-  for (const [name, id] of [
-    ['Typecheck libraries against newest core', 'typecheck'],
+  const probes = [
+    ['Typecheck breakwater against newest core', 'typecheck_breakwater'],
+    ['Typecheck flowsafe against newest core', 'typecheck_flowsafe'],
     ['Bundle the flowsafe spike Worker against newest core', 'bundle'],
-  ]) {
+    ['Test breakwater against newest core', 'tests_breakwater'],
+    ['Test flowsafe against newest core', 'tests_flowsafe'],
+  ];
+  for (const [name, id] of probes) {
     const step = steps.find((candidate) => candidate.name === name);
 
     assert.ok(step, `the canary runs a step named "${name}"`);
     assert.equal(
       step['continue-on-error'],
       true,
-      `without the step-level key on "${name}" its expected red skips the tripwire suites after it`,
+      `without the step-level key on "${name}" its red skips the probes after it`,
     );
     assert.equal(
       step.id,
@@ -3277,21 +3282,11 @@ test('the ci.yml canary reds the job from a final outcome step that reads the id
     );
   }
 
-  const testIndex = steps.findIndex((step) => step.id === 'tests');
-  assert.ok(
-    testIndex >= 0,
-    'the canary runs its tripwire suites in a step with the id `tests`',
-  );
-
   const outcomeIndex = steps.findIndex((step) => step.id === 'probe_outcome');
   assert.equal(
     outcomeIndex,
     steps.length - 1,
     'a step after the outcome step leaves its own red unreported',
-  );
-  assert.ok(
-    outcomeIndex > testIndex,
-    'the outcome step runs after the tripwire suites',
   );
 
   const outcome = steps[outcomeIndex];
@@ -3300,23 +3295,20 @@ test('the ci.yml canary reds the job from a final outcome step that reads the id
     '$' + '{{ !cancelled() }}',
     'the outcome step reports completed probes without running after cancellation',
   );
-  const expectedOutcomes = [
-    ...steps
-      .filter((step) => step['continue-on-error'] === true)
-      .map((step) => step.id),
-    steps[testIndex].id,
-  ].sort();
   assert.deepEqual(
     [...new Set(outcomeReferences(outcome))].sort(),
-    expectedOutcomes,
-    'the outcome step reports the continue-on-error probes and the tripwire suites',
+    steps
+      .filter((step) => step['continue-on-error'] === true)
+      .map((step) => step.id)
+      .sort(),
+    'the outcome step reports the continue-on-error probes',
   );
 
+  const probeIds = probes.map(([, id]) => id);
+  const passing = Object.fromEntries(probeIds.map((id) => [id, 'success']));
   for (const [outcomes, succeeds] of [
-    [{ typecheck: 'failure', bundle: 'success', tests: 'success' }, false],
-    [{ typecheck: 'success', bundle: 'failure', tests: 'success' }, false],
-    [{ typecheck: 'success', bundle: 'success', tests: 'failure' }, true],
-    [{ typecheck: 'success', bundle: 'success', tests: 'success' }, true],
+    [passing, true],
+    ...probeIds.map((id) => [{ ...passing, [id]: 'failure' }, false]),
   ]) {
     const label = JSON.stringify(outcomes);
     const { run, summary } = runProbeOutcome(outcome, outcomes);
@@ -3332,7 +3324,7 @@ test('the ci.yml canary reds the job from a final outcome step that reads the id
         .split('\n')
         .filter((line) => line !== '')
         .map((line) => line.split(': ').at(-1)),
-      [outcomes.typecheck, outcomes.bundle, outcomes.tests],
+      probeIds.map((id) => outcomes[id]),
       label,
     );
   }
@@ -3485,9 +3477,9 @@ test("the ci.yml canary lookup bounds npm's own fetch retries", () => {
   }
 });
 
-// At the current prerequisite count of two, the allocation keeps nine minutes
-// beyond the wait, probe, and policy reserve. A third prerequisite forces a
-// timeout-minutes decision.
+// The assertions below fix the prerequisite count and the release job's
+// margin over the wait, probe, and policy reserve, so a new prerequisite forces
+// a timeout-minutes decision.
 test('the release job budget outlasts every prerequisite visibility wait', () => {
   const release = parse(
     readFileSync(join(repositoryRoot, '.github/workflows/release.yml'), 'utf8'),
