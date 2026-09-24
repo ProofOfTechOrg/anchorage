@@ -224,6 +224,7 @@ const nonExecution = [
   // Memoized accessor for the compiled loop; the factory registers its id.
   'getWorkflow',
   'getWorkspace',
+  'guardrailLogger',
   'hasOwnBrowser',
   'hasOwnMemory',
   'hasOwnPubSub',
@@ -251,11 +252,19 @@ const nonExecution = [
   // :7796).
   'requestRemoteAbort',
   'resolveProcessorById',
+  // Returns the snapshot-persistence predicate createWorkflow compiles into the
+  // loop (1.69.0, create-durable-agent-B36Fu53G.js:6734, read at :6723); it
+  // writes and deletes no snapshot row.
+  'resolveShouldPersistSnapshot',
   'runRegistry',
   'runRegistryInternal',
   'setBrowser',
   'setChannels',
   'voice',
+  // Calls the configured shouldPersistSnapshot predicate with synthetic
+  // statuses and logs warnings (1.69.0, create-durable-agent-B36Fu53G.js:8090);
+  // it persists nothing and starts no run.
+  'warnOnRiskyPersistencePolicy',
 ] as const;
 
 const classified: readonly string[] = [
@@ -333,6 +342,7 @@ const delegatingToGuard = [
  */
 const agentNonExecution = [
   '__getDrainPendingSignals',
+  '__getLogger',
   '__listLLMRequestProcessors',
   // Sets the flag core's __fork path reads (:35357).
   '__markStoredVersionApplied',
@@ -439,6 +449,10 @@ const agentNonExecution = [
   'subscribeToThread',
   'updateModelInModelList',
   'updateObjectiveOptions',
+  // Edits the label, title and metadata of the advertisement an existing claim
+  // holds (1.69.0, storage-BkPsrBDT.js:645); it cannot touch the claim's id or
+  // sourceId, so it cannot re-address the claim, and no run path reads them.
+  'updateThreadPeerAdvertisement',
   'wrapToolWithHooks',
   'wrapToolsWithHooks',
 ] as const;
@@ -479,7 +493,13 @@ interface SkewRow {
   newest: SkewLevel;
 }
 
-const VERSION_SKEW: Readonly<Record<string, Readonly<SkewRow>>> = {};
+const VERSION_SKEW: Readonly<Record<string, Readonly<SkewRow>>> = {
+  __getLogger: { pin: null, newest: 'agent' },
+  guardrailLogger: { pin: null, newest: 'durable' },
+  resolveShouldPersistSnapshot: { pin: null, newest: 'durable' },
+  updateThreadPeerAdvertisement: { pin: null, newest: 'agent' },
+  warnOnRiskyPersistencePolicy: { pin: null, newest: 'durable' },
+};
 
 // Rows are read as entries, never indexed by name: the name and its row travel
 // together, so every read below is total whatever the table holds.

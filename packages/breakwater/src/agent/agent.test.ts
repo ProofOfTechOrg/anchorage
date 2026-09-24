@@ -885,6 +885,7 @@ describe('Mastra Agent execution-entry inventory', () => {
       '__getDrainPendingSignals',
       '__getEditorConfig',
       '__getGoalConfig',
+      '__getLogger',
       '__getOverridableFields',
       '__getStaticAgents',
       '__hasSubAgentsConfigured',
@@ -1019,6 +1020,9 @@ describe('Mastra Agent execution-entry inventory', () => {
       'subscribeToThread',
       'updateModelInModelList',
       'updateObjectiveOptions',
+      // Edits label, title and metadata of an advertisement an existing claim
+      // holds; it cannot re-address the claim, and no run path reads them.
+      'updateThreadPeerAdvertisement',
       'voice',
       'wrapToolsWithHooks',
       'wrapToolWithHooks',
@@ -1029,7 +1033,10 @@ describe('Mastra Agent execution-entry inventory', () => {
     // classified there. A name belongs here only while the two cores disagree
     // about it: it goes once the pin catches up, and a name on NEITHER version
     // is dead and belongs in no list at all.
-    const forwardClassified: readonly string[] = [];
+    const forwardClassified: readonly string[] = [
+      '__getLogger',
+      'updateThreadPeerAdvertisement',
+    ];
     const classified = [
       ...wrapped,
       ...intentionallyUnavailable,
