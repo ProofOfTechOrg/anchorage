@@ -3664,6 +3664,71 @@ describe('createThreadAgentHost', () => {
   });
 });
 
+describe('createThreadAgentHost blocking run status', () => {
+  it.each([
+    'suspended',
+    'running',
+  ] as const)('reports the stored status of a %s run', async (status) => {
+    // #given — a stored nonterminal run and no operation executing on it
+    const fixture = harness();
+    fixture.setSummary({ runId: 'acme_run', status });
+    fixture.state.set(THREAD_BINDING_KEY, {
+      version: 1,
+      agentId: 'writer',
+      resourceId: RESOURCE_ID,
+    });
+    fixture.state.set(TEST_RUN_RECORD_KEY, {
+      version: 2,
+      agentId: 'writer',
+      principal: fixture.scope.principal,
+      originEntryPath: 'http.start',
+    });
+
+    // #when
+    const blocking = await fixture.host.blockingRun(fixture.scope);
+
+    // #then
+    expect(blocking).toEqual({
+      runId: 'acme_run',
+      principal: fixture.scope.principal,
+      status,
+    });
+  });
+
+  it('reports no status for a run with an operation executing in the isolate', async () => {
+    // #given — a start whose stream has not returned
+    const { host, scope } = harness();
+    let release: (() => void) | undefined;
+    mocked.stream.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          release = () => resolve({});
+        }),
+    );
+    const started = host.start(scope, {
+      agentId: 'writer',
+      threadId: 'acme_thread',
+      resourceId: RESOURCE_ID,
+      runId: 'acme_run',
+      prompt: 'go',
+      entryPath: 'http.start',
+    });
+    await vi.waitFor(() => expect(mocked.stream).toHaveBeenCalledOnce());
+
+    // #when
+    const blocking = await host.blockingRun(scope);
+
+    // #then — the run blocks the thread, and its status is left unreported
+    expect(blocking).toMatchObject({
+      runId: 'acme_run',
+      principal: scope.principal,
+    });
+    expect(blocking).not.toHaveProperty('status');
+    release?.();
+    await started;
+  });
+});
+
 describe('createThreadAgentHost permission authorization', () => {
   const requiredPermissions = ['agents.run', 'reports.read'] as const;
   const startInput = {

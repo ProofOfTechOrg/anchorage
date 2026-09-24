@@ -117,7 +117,7 @@ const worker = createFlowsafeWorker({
 });
 ```
 
-The prefix may be empty or must start with an ASCII letter or underscore and continue with ASCII letters, numbers, or underscores. It can contain at most 39 characters because Mastra limits final table identifiers to 63 characters and `mastra_workflow_snapshot` uses the remaining 24. All six exported low-level purge functions validate the same contract before preparing D1 statements. `storageTablePrefix` is not auto-discovered and must match the `tablePrefix` used by `init()` or `createD1Storage()`.
+The prefix may be empty or must start with an ASCII letter or underscore and continue with ASCII letters, numbers, or underscores. It can contain at most 39 characters because Mastra limits final table identifiers to 63 characters and `mastra_workflow_snapshot` uses the remaining 24. The exported low-level purge functions validate the same contract before preparing D1 statements. `storageTablePrefix` is not auto-discovered and must match the `tablePrefix` used by `init()` or `createD1Storage()`.
 
 ## Approval lifecycle
 
@@ -453,7 +453,7 @@ Configure the same positive safe-integer `maxDeliveryAttempts` on `createNotific
 
 Dispatch requires `NotificationDeliveryStorage`; `D1NotificationsStorage` implements it. A custom store's `updateNotificationDeliveryIfUnchanged()` must compare the captured observation and apply the failure patch atomically against its other writers. Ordinary Core storage still serves notification ingestion. See the [delivery and receipt guide](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/durable-agents.md#bound-notification-delivery) for custom-store migration, lost responses and receipt retention.
 
-Summary source counts and a configured source delivery policy read own properties: the declared `@mastra/core` peer guards both lookups, so a source named after an `Object.prototype` member is counted under its own key and resolves the configured priority or default action. A core outside the declared peer range that predates [mastra-ai/mastra#23693](https://github.com/mastra-ai/mastra/issues/23693) and [mastra-ai/mastra#23694](https://github.com/mastra-ai/mastra/issues/23694) miscounts such a source and selects the inherited policy entry instead.
+Summary items arise only from rows written by Mastra's delivery policy, which means an unbranded agent's owner notifications. Summary source counts and a configured source delivery policy read own properties: the declared `@mastra/core` peer guards both lookups, so a source named after an `Object.prototype` member is counted under its own key and resolves the configured priority or default action. A core outside the declared peer range that predates [mastra-ai/mastra#23693](https://github.com/mastra-ai/mastra/issues/23693) and [mastra-ai/mastra#23694](https://github.com/mastra-ai/mastra/issues/23694) miscounts such a source and selects the inherited policy entry instead.
 
 Adapt Breakwater without adding a FlowSafe runtime dependency on it:
 
@@ -506,7 +506,7 @@ const signalRoutes = createThreadSignalRoutes({
 
 Build the request context only from the callback input. FlowSafe derives those fields from the asserted Thread Durable Object scope and server-owned metadata; never merge HTTP body context or caller-supplied identity into it.
 
-Notification ingestion is checked before persistence, and that check is authoritative rather than advisory: Mastra's default delivery decision sends an urgent notification — and an idle-thread high or medium one — straight out of `sendNotificationSignal`, so those records never reach the dispatcher. Storage owns the id, the timestamps and any coalescing, so ingestion inspects a canonical prospective notification carrying every untrusted model-visible field, in both renderings Mastra can choose between: the individual signal and the single-record summary. Dispatch then checks the exact persisted individual or summary signal for every record that was deferred or batched to the tick.
+A non-owner's notification, and an unbranded agent's owner notification, are checked before the inbox write, so a denied one is never recorded. Storage owns the id, the timestamps and any coalescing, so ingestion inspects a canonical prospective notification carrying every untrusted model-visible field, as the individual signal and as the single-record summary. An owner notification to a runtime-driven agent is delivered at ingestion instead: the route records it, checks the exact individual signal built from the stored row, and sends only that signal; a denial discards the row. Dispatch checks the exact persisted individual or summary signal for each record it delivers.
 
 `D1NotificationsStorage` and `D1ThreadStateStorage` mirror Mastra's in-memory domains on D1. `SignalClient` is available from the browser-safe `signals/client` export.
 
@@ -538,7 +538,7 @@ The composed `createFlowsafeWorker()` owns the shared route and maintenance-duty
 
 Configure `mutationEpoch` with a nonnegative safe integer or a synchronous environment callback. The Worker captures it before deployment verification or authentication, then forwards it through trusted contexts and protected internal headers. Start paths preserve the original actor, principal, epoch and selectors across waits, including class-backed context method receivers. Do not accept the epoch from public headers or start JSON.
 
-The internal durable-agent host start requires an eighth `AgentStartAuthority` argument, with an explicit `onPreparedStartIdentity` property. Built-in hosts supply `undefined` while Runtime and owner journals remain v1. This transport does not activate final-write epoch checks or managed recovery; the [deployment reference](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/deployment-reference.md#configure-the-trusted-caller-epoch) and [durable-agents guide](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/durable-agents.md) describe the boundary.
+The internal durable-agent host start requires an eighth `AgentStartAuthority` argument, with an explicit `onPreparedStartIdentity` property. This transport does not activate final-write epoch checks or managed recovery; the [deployment reference](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/deployment-reference.md#configure-the-trusted-caller-epoch) and [durable-agents guide](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/durable-agents.md) describe the boundary.
 
 Protect `GET` and `POST /admin/execution-fence` plus `GET /admin/inventory` with a distinct `MAINTENANCE_ADMIN_SECRET`. Fence transitions use CAS and return `409` with `FENCE_CAS_CONFLICT` when the expected state is stale. Fenced execution returns `503` with an `EXECUTION_FENCED` reason. The agent-host and stream routers preserve structured `503` and `409` refusals instead of collapsing them to a generic `500`.
 
@@ -574,7 +574,7 @@ Critical host obligations:
 
 ## Verification
 
-The repository's deterministic workerd spike proves suspend, process restart, resume, forged-resume denial, repeated gates, deployment-sentinel mismatch refusal, live streaming, durable-agent recovery, signals, goals, schedules, providers, notifications, and background-task restart. Durable Object conformance suites separately cover wrong and missing internal caller credentials.
+The repository runs a deterministic workerd spike against the package. Durable Object conformance suites separately cover wrong and missing internal caller credentials.
 
 ```bash
 pnpm --filter @proofoftech/flowsafe spike:verify

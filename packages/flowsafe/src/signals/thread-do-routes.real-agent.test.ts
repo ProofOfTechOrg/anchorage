@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import type { Agent } from '@mastra/core/agent';
+import {
+  type Agent,
+  type CreatedAgentSignal,
+  signalToXmlMarkup,
+} from '@mastra/core/agent';
 import { globalRunRegistry } from '@mastra/core/agent/durable';
 import { isLeaseProvider } from '@mastra/core/events';
 import type { MastraModelConfig } from '@mastra/core/llm';
@@ -21,6 +25,7 @@ import {
   type FlowsafeDurableAgent,
 } from '../agent-runner/index.js';
 import {
+  type ExecutionPrincipal,
   humanPrincipal,
   trustAutomationPrincipal,
 } from '../approval-api/index.js';
@@ -30,14 +35,32 @@ import {
   InvalidRunRequestError,
   init,
   type RunnerRuntime,
+  type RunStatus,
   type ThreadScope,
 } from '../do-runner/index.js';
 import type { SignalDatabase } from './d1-shared.js';
 import { DEFAULT_MAX_NOTIFICATION_DELIVERY_ATTEMPTS } from './notification-dispatch.js';
 import { D1NotificationsStorage } from './notifications-d1.js';
-import { createThreadSignalRoutes } from './thread-do-routes.js';
+import {
+  createThreadSignalRoutes,
+  type SignalContentPolicy,
+  type SignalContentPolicyInput,
+  type StartIdleRunInput,
+} from './thread-do-routes.js';
 
 const RESOURCE_ID = 'resource-real';
+
+const OWNER = humanPrincipal({ id: 'operator', role: 'operator' });
+const DISPATCHER = trustAutomationPrincipal({
+  kind: 'system',
+  id: 'notification-dispatch',
+  purpose: 'notification.dispatch',
+});
+const PROVIDER = trustAutomationPrincipal({
+  kind: 'service',
+  id: 'signal-provider-delivery',
+  purpose: 'signal-provider-delivery',
+});
 
 declare const process: {
   on(event: 'unhandledRejection', listener: (reason: unknown) => void): void;
@@ -98,7 +121,19 @@ function fakeRuntime(pubsub: ReturnType<typeof createHostPubSub>) {
   return { runtime, start };
 }
 
-async function createHarness(options: { canPersist?: boolean } = {}) {
+interface HarnessBlockingRun {
+  runId: string;
+  principal: ExecutionPrincipal;
+  status?: RunStatus;
+}
+
+async function createHarness(
+  options: {
+    blockingRun?: HarnessBlockingRun;
+    contentPolicy?: SignalContentPolicy;
+    runCapOpen?: boolean;
+  } = {},
+) {
   const pubsub = createHostPubSub();
   const memory = new MockMemory();
   const { runtime, start } = fakeRuntime(pubsub);
@@ -110,22 +145,35 @@ async function createHarness(options: { canPersist?: boolean } = {}) {
     default: new InMemoryStore(),
     domains: { notifications },
   });
-  const mastra = new Mastra({ storage, logger: false });
+  const mastra = new Mastra({
+    storage,
+    logger: false,
+    agents: { writer: guardedTestAgent(memory) },
+  });
   const agent = createFlowsafeDurableAgent({
-    agent: guardedTestAgent(memory),
+    agent: mastra.getAgentById('writer'),
     runtime,
     pubsub,
     cache: false,
     threadRuntime: mastra.agentThreadStreamRuntime,
   });
-  mastra.addAgent(agent);
   agent.__setPubSub(pubsub);
+  const startIdleRun = vi.fn(async (input: StartIdleRunInput) => ({
+    runId: input.runId,
+  }));
+  const consultRunCap = vi.fn(() => options.runCapOpen ?? true);
   const routes = createThreadSignalRoutes({
     resolveAgent: () => agent as unknown as Agent,
     resolveResourceId: () => RESOURCE_ID,
-    resolveBlockingRun: () => undefined,
+    resolveBlockingRun: () => options.blockingRun,
     serializeDispatch: async (_scope, operation) => operation(),
-    canPersist: () => options.canPersist ?? true,
+    // Mirrors canPersist in packages/agent-starter/src/durable-objects.ts.
+    canPersist: (threadScope) =>
+      threadScope.principal.kind === OWNER.kind &&
+      threadScope.principal.id === OWNER.id,
+    consultRunCap,
+    startIdleRun,
+    ...(options.contentPolicy ? { contentPolicy: options.contentPolicy } : {}),
     resolveNotificationsStorage: async () => {
       const notificationStorage = await mastra
         .getStorage()
@@ -135,16 +183,27 @@ async function createHarness(options: { canPersist?: boolean } = {}) {
       return notificationStorage;
     },
   });
-  return { agent, mastra, memory, notifications, pubsub, routes, start };
+  return {
+    agent,
+    consultRunCap,
+    mastra,
+    memory,
+    notifications,
+    pubsub,
+    routes,
+    start,
+    startIdleRun,
+  };
 }
 
 function scope(
   pubsub: ReturnType<typeof createHostPubSub>,
   threadId: string,
+  principal: ExecutionPrincipal = OWNER,
 ): ThreadScope {
   return {
     threadId,
-    principal: humanPrincipal({ id: 'operator', role: 'operator' }),
+    principal,
     init: init(
       { storage: new InMemoryStore() },
       { pubsub, executionFence: 'none', startIdempotency: 'none' },
@@ -178,6 +237,54 @@ async function recalled(memory: MockMemory, threadId: string) {
       threadId,
     })
   ).messages;
+}
+
+type Harness = Awaited<ReturnType<typeof createHarness>>;
+
+async function registerInProcessRun(
+  harness: Harness,
+  threadId: string,
+  runId: string,
+  status: 'running' | 'suspended',
+) {
+  let finish!: () => void;
+  const finished = new Promise<void>((resolve) => {
+    finish = resolve;
+  });
+  await harness.mastra.agentThreadStreamRuntime.registerRun(
+    harness.agent as never,
+    {
+      runId,
+      status,
+      fullStream: undefined,
+      _waitUntilFinished: () => finished,
+    } as never,
+    { runId, memory: { thread: threadId, resource: RESOURCE_ID } },
+    harness.pubsub,
+  );
+  return { runId, finish };
+}
+
+function canonicalMarkup(signal: CreatedAgentSignal): string {
+  const { type, tagName, attributes, contents } = signal;
+  if (typeof contents !== 'string') {
+    throw new Error('this test only renders string-contents signals');
+  }
+  return signalToXmlMarkup({ type, tagName, attributes, contents });
+}
+
+function recordingPolicy(): {
+  policy: SignalContentPolicy;
+  inputs: SignalContentPolicyInput[];
+} {
+  const inputs: SignalContentPolicyInput[] = [];
+  return {
+    inputs,
+    policy: (input) => {
+      inputs.push(input);
+      return { allowed: true };
+    },
+  };
 }
 
 async function waitForIdle(agent: FlowsafeDurableAgent, threadId: string) {
@@ -223,8 +330,13 @@ describe('thread signal routes with a real durable agent', () => {
   it.each([
     'deliver',
     'exhausted',
-  ] as const)('dispatches through D1 notification storage with a real agent: %s', async (mode) => {
-    const harness = await createHarness();
+    'capped',
+    'capped at the attempt bound',
+  ] as const)('dispatches a non-owner row through D1 notification storage with a real agent: %s', async (mode) => {
+    // #given — a due row the dispatch tick delivers as its own principal
+    const harness = await createHarness({
+      runCapOpen: mode !== 'capped' && mode !== 'capped at the attempt bound',
+    });
     const threadId = crypto.randomUUID();
     await seedThread(harness.memory, threadId);
     const now = new Date();
@@ -237,16 +349,21 @@ describe('thread signal routes with a real durable agent', () => {
       summary: 'notification input',
       deliverAt: now,
     });
-    if (mode === 'exhausted') {
+    if (mode === 'exhausted' || mode === 'capped at the attempt bound') {
       await harness.notifications.updateNotification({
         threadId,
         id: record.id,
-        deliveryAttempts: DEFAULT_MAX_NOTIFICATION_DELIVERY_ATTEMPTS,
+        deliveryAttempts:
+          mode === 'exhausted'
+            ? DEFAULT_MAX_NOTIFICATION_DELIVERY_ATTEMPTS
+            : DEFAULT_MAX_NOTIFICATION_DELIVERY_ATTEMPTS - 1,
         lastDeliveryError: 'target refused',
         lastDeliveryAttemptAt: now,
       });
     }
     const send = vi.spyOn(harness.agent, 'sendSignal');
+
+    // #when
     const response = await harness.routes(
       post('/signal/notifications/dispatch', {
         notificationIds: [record.id],
@@ -254,27 +371,23 @@ describe('thread signal routes with a real durable agent', () => {
         agentId: 'writer',
         now: now.toISOString(),
       }),
-      {
-        ...scope(harness.pubsub, threadId),
-        principal: trustAutomationPrincipal({
-          kind: 'system',
-          id: 'notification-dispatch',
-          purpose: 'notification.dispatch',
-        }),
-      },
+      scope(harness.pubsub, threadId, DISPATCHER),
     );
+
+    // #then
     expect(response?.status).toBe(200);
     const persisted = await harness.notifications.getNotification({
       threadId,
       id: record.id,
     });
+    expect(send).not.toHaveBeenCalled();
     if (mode === 'exhausted') {
       expect(await response?.json()).toMatchObject({
         delivered: 0,
         failed: 0,
         discarded: 1,
       });
-      expect(send).not.toHaveBeenCalled();
+      expect(harness.startIdleRun).not.toHaveBeenCalled();
       expect(persisted).toMatchObject({
         status: 'discarded',
         deliveryAttempts: DEFAULT_MAX_NOTIFICATION_DELIVERY_ATTEMPTS,
@@ -285,14 +398,46 @@ describe('thread signal routes with a real durable agent', () => {
       });
       expect(persisted?.deliverAt).toBeUndefined();
       expect(persisted?.summaryAt).toBeUndefined();
+    } else if (mode === 'capped') {
+      // A capped idle wake cannot fall back to a persist the dispatch
+      // principal is not allowed, so the round fails and the row retries.
+      expect(await response?.json()).toEqual({ delivered: 0, failed: 1 });
+      expect(harness.consultRunCap).toHaveBeenCalledOnce();
+      expect(harness.startIdleRun).not.toHaveBeenCalled();
+      expect(persisted).toMatchObject({
+        status: 'pending',
+        deliveryAttempts: 1,
+        deliverAt: expect.any(Date),
+      });
+    } else if (mode === 'capped at the attempt bound') {
+      expect(await response?.json()).toMatchObject({
+        delivered: 0,
+        failed: 0,
+        discarded: 1,
+      });
+      expect(harness.startIdleRun).not.toHaveBeenCalled();
+      expect(persisted).toMatchObject({
+        status: 'discarded',
+        deliveryAttempts: DEFAULT_MAX_NOTIFICATION_DELIVERY_ATTEMPTS,
+        deliveryReason: 'delivery-attempts-exhausted',
+      });
     } else {
+      // An idle thread wakes a run whose principal is the dispatch principal.
       expect(await response?.json()).toMatchObject({ delivered: 1, failed: 0 });
-      expect(send).toHaveBeenCalledOnce();
+      expect(harness.startIdleRun).toHaveBeenCalledOnce();
+      expect(harness.startIdleRun).toHaveBeenCalledWith(
+        expect.objectContaining({
+          threadId,
+          resourceId: RESOURCE_ID,
+          entryPath: 'notification.dispatch',
+          principal: DISPATCHER,
+          signal: expect.objectContaining({ contents: 'notification input' }),
+        }),
+      );
       expect(persisted).toMatchObject({
         status: 'delivered',
         deliveredSignalId: expect.any(String),
       });
-      expect(await recalled(harness.memory, threadId)).toHaveLength(1);
     }
     expect(harness.start).not.toHaveBeenCalled();
   });
@@ -324,7 +469,7 @@ describe('thread signal routes with a real durable agent', () => {
     expect(harness.start).not.toHaveBeenCalled();
   });
 
-  it('persists idle state and owner notifications without a run', async () => {
+  it('persists idle state and an owner notification without a run', async () => {
     const harness = await createHarness();
     const threadId = crypto.randomUUID();
     await seedThread(harness.memory, threadId);
@@ -350,21 +495,16 @@ describe('thread signal routes with a real durable agent', () => {
     const stateBody = (await stateResponse?.json()) as {
       decision: Record<string, unknown>;
     };
-    const notificationBody = (await notificationResponse?.json()) as {
-      delivery: Record<string, unknown>;
-    };
+    const notificationBody = await notificationResponse?.json();
     expect(stateBody).toMatchObject({
       decision: { action: 'persist' },
     });
     expect(stateBody.decision).not.toHaveProperty('runId');
     expect(notificationBody).toMatchObject({
-      delivery: { action: 'persist' },
-      record: {
-        decision: { action: 'deliver' },
-        record: { status: 'pending' },
-      },
+      delivery: { action: 'persist', signalId: expect.any(String) },
+      record: { status: 'delivered', deliveredSignalId: expect.any(String) },
     });
-    expect(notificationBody.delivery).not.toHaveProperty('runId');
+    // The state signal and the owner notification are both persisted.
     expect(await recalled(harness.memory, threadId)).toHaveLength(2);
     expect(
       harness.agent.getActiveThreadRunId({
@@ -372,11 +512,421 @@ describe('thread signal routes with a real durable agent', () => {
         resourceId: RESOURCE_ID,
       }),
     ).toBeUndefined();
+    expect(harness.startIdleRun).not.toHaveBeenCalled();
     expect(harness.start).not.toHaveBeenCalled();
   });
 
+  it('delivers an owner notification at ingestion to a wrapper no Mastra registers', async () => {
+    // #given — an idle thread with memory, and a wrapper that no Mastra
+    // registers
+    const harness = await createHarness();
+    const threadId = crypto.randomUUID();
+    await seedThread(harness.memory, threadId);
+    expect(Object.values(harness.mastra.listAgents())).not.toContain(
+      harness.agent,
+    );
+    const send = vi.spyOn(harness.agent, 'sendSignal');
+
+    // #when — the thread owner posts a notification
+    const response = await harness.routes(
+      post('/signal/notification', {
+        source: 'provider',
+        kind: 'changed',
+        summary: 'owner notification input',
+      }),
+      scope(harness.pubsub, threadId),
+    );
+
+    // #then — it is persisted to memory under the owner's principal, the row
+    // records the delivery, and neither a run nor the dispatcher is involved
+    expect(response?.status).toBe(200);
+    const body = (await response?.json()) as {
+      record: Record<string, unknown>;
+      delivery: Record<string, unknown>;
+    };
+    expect(Object.keys(body).sort()).toEqual(['delivery', 'record']);
+    expect(body.delivery).toEqual({
+      action: 'persist',
+      signalId: expect.any(String),
+    });
+    expect(body.record).toMatchObject({
+      status: 'delivered',
+      deliveredSignalId: body.delivery.signalId,
+    });
+    expect(send).toHaveBeenCalledOnce();
+    expect(send.mock.calls[0]?.[1]).toMatchObject({
+      threadId,
+      resourceId: RESOURCE_ID,
+      ifActive: { behavior: 'deliver' },
+      ifIdle: { behavior: 'persist' },
+    });
+    const rows = await harness.notifications.listNotifications({ threadId });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      threadId,
+      resourceId: RESOURCE_ID,
+      agentId: 'writer',
+      summary: 'owner notification input',
+      status: 'delivered',
+      deliveredSignalId: body.delivery.signalId,
+      deliveredAt: expect.any(Date),
+    });
+    expect(rows[0]?.deliverAt).toBeUndefined();
+    expect(rows[0]?.summaryAt).toBeUndefined();
+    expect(await recalled(harness.memory, threadId)).toHaveLength(1);
+    expect(harness.startIdleRun).not.toHaveBeenCalled();
+    expect(harness.start).not.toHaveBeenCalled();
+  });
+
+  it("delivers an owner notification into the owner's running run", async () => {
+    // #given — the owner's run is executing in this isolate
+    const threadId = crypto.randomUUID();
+    const runId = crypto.randomUUID();
+    const harness = await createHarness({
+      blockingRun: { runId, principal: OWNER, status: 'running' },
+    });
+    await seedThread(harness.memory, threadId);
+    const run = await registerInProcessRun(harness, threadId, runId, 'running');
+    const send = vi.spyOn(harness.agent, 'sendSignal');
+
+    // #when
+    const response = await harness.routes(
+      post('/signal/notification', {
+        source: 'provider',
+        kind: 'changed',
+        summary: 'owner notification input',
+      }),
+      scope(harness.pubsub, threadId),
+    );
+
+    // #then — the signal joins that run and the row records the delivery
+    expect(response?.status).toBe(200);
+    const body = (await response?.json()) as {
+      record: Record<string, unknown>;
+      delivery: Record<string, unknown>;
+    };
+    expect(body.delivery).toEqual({
+      action: 'deliver',
+      runId,
+      signalId: expect.any(String),
+    });
+    expect(body.record).toMatchObject({
+      status: 'delivered',
+      deliveredSignalId: body.delivery.signalId,
+    });
+    expect(send.mock.calls[0]?.[1]).toMatchObject({
+      ifActive: { behavior: 'deliver' },
+    });
+    expect(await recalled(harness.memory, threadId)).toHaveLength(0);
+
+    // #and — a delivery the run leaves undrained reaches the runner's
+    // terminal refusal, which keeps it in memory and starts no run
+    run.finish();
+    await waitForIdle(harness.agent, threadId);
+    await vi.waitFor(async () =>
+      expect(await recalled(harness.memory, threadId)).toHaveLength(1),
+    );
+    expect(harness.startIdleRun).not.toHaveBeenCalled();
+    expect(harness.start).not.toHaveBeenCalled();
+    expect(unhandled).toEqual([]);
+  });
+
+  it("persists an owner notification instead of queueing it into the owner's suspended run", async () => {
+    // #given — the owner's run is suspended but still registered in process
+    const threadId = crypto.randomUUID();
+    const runId = crypto.randomUUID();
+    const harness = await createHarness({
+      blockingRun: { runId, principal: OWNER, status: 'suspended' },
+    });
+    await seedThread(harness.memory, threadId);
+    await registerInProcessRun(harness, threadId, runId, 'suspended');
+    expect(
+      harness.agent.getActiveThreadRunId({
+        threadId,
+        resourceId: RESOURCE_ID,
+      }),
+    ).toBe(runId);
+    const send = vi.spyOn(harness.agent, 'sendSignal');
+
+    // #when
+    const response = await harness.routes(
+      post('/signal/notification', {
+        source: 'provider',
+        kind: 'changed',
+        summary: 'owner notification input',
+      }),
+      scope(harness.pubsub, threadId),
+    );
+
+    // #then — the signal is written to memory rather than queued in the run
+    expect(response?.status).toBe(200);
+    expect(await response?.json()).toMatchObject({
+      delivery: { action: 'persist', signalId: expect.any(String) },
+      record: { status: 'delivered', deliveredSignalId: expect.any(String) },
+    });
+    expect(send.mock.calls[0]?.[1]).toMatchObject({
+      ifActive: { behavior: 'persist' },
+    });
+    expect(await recalled(harness.memory, threadId)).toHaveLength(1);
+    expect(harness.startIdleRun).not.toHaveBeenCalled();
+    expect(harness.start).not.toHaveBeenCalled();
+  });
+
+  it("persists an owner notification when the owner's run survives only in storage", async () => {
+    // #given — the owner's run is durable but not in this isolate
+    const threadId = crypto.randomUUID();
+    const harness = await createHarness({
+      blockingRun: {
+        runId: crypto.randomUUID(),
+        principal: OWNER,
+        status: 'suspended',
+      },
+    });
+    await seedThread(harness.memory, threadId);
+
+    // #when
+    const response = await harness.routes(
+      post('/signal/notification', {
+        source: 'provider',
+        kind: 'changed',
+        summary: 'owner notification input',
+      }),
+      scope(harness.pubsub, threadId),
+    );
+
+    // #then
+    expect(response?.status).toBe(200);
+    expect(await response?.json()).toMatchObject({
+      delivery: { action: 'persist', signalId: expect.any(String) },
+      record: { status: 'delivered', deliveredSignalId: expect.any(String) },
+    });
+    expect(await recalled(harness.memory, threadId)).toHaveLength(1);
+    expect(harness.startIdleRun).not.toHaveBeenCalled();
+    expect(harness.start).not.toHaveBeenCalled();
+  });
+
+  it("refuses an owner notification while another principal's run holds the thread", async () => {
+    // #given — a nonterminal run that belongs to someone else
+    const threadId = crypto.randomUUID();
+    const { policy, inputs } = recordingPolicy();
+    const harness = await createHarness({
+      blockingRun: {
+        runId: 'other-run',
+        principal: humanPrincipal({ id: 'someone-else', role: 'operator' }),
+        status: 'running',
+      },
+      contentPolicy: policy,
+    });
+    await seedThread(harness.memory, threadId);
+    const send = vi.spyOn(harness.agent, 'sendSignal');
+
+    // #when
+    const response = await harness.routes(
+      post('/signal/notification', {
+        source: 'provider',
+        kind: 'changed',
+        summary: 'owner notification input',
+      }),
+      scope(harness.pubsub, threadId),
+    );
+
+    // #then — refused before inspection, recording, or delivery
+    expect(response?.status).toBe(409);
+    expect(await response?.json()).toEqual({
+      error: 'notification principal does not match the active run',
+      reason: 'principal-mismatch',
+      runId: 'other-run',
+      retry: true,
+    });
+    expect(await harness.notifications.listNotifications({ threadId })).toEqual(
+      [],
+    );
+    expect(inputs).toEqual([]);
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it('refuses an owner notification to an idle thread without memory', async () => {
+    // #given — an idle thread whose agent has no memory
+    const harness = await createHarness();
+    const threadId = crypto.randomUUID();
+    vi.spyOn(harness.agent, 'getMemory').mockResolvedValue(undefined as never);
+    const send = vi.spyOn(harness.agent, 'sendSignal');
+
+    // #when
+    const response = await harness.routes(
+      post('/signal/notification', {
+        source: 'provider',
+        kind: 'changed',
+        summary: 'owner notification input',
+      }),
+      scope(harness.pubsub, threadId),
+    );
+
+    // #then
+    expect(response?.status).toBe(409);
+    expect(await response?.json()).toEqual({
+      error: 'notification delivery requires agent memory',
+      reason: 'memory-unavailable',
+    });
+    expect(await harness.notifications.listNotifications({ threadId })).toEqual(
+      [],
+    );
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it('never makes an owner row due for the dispatcher', async () => {
+    // #given — an owner row left pending because no settle write landed
+    const harness = await createHarness();
+    const threadId = crypto.randomUUID();
+    await seedThread(harness.memory, threadId);
+    const settle = vi
+      .spyOn(harness.notifications, 'updateNotification')
+      .mockRejectedValue(new Error('inbox unavailable'));
+    const failed = await harness.routes(
+      post('/signal/notification', {
+        source: 'provider',
+        kind: 'changed',
+        summary: 'owner notification input',
+      }),
+      scope(harness.pubsub, threadId),
+    );
+    expect(failed?.status).toBe(502);
+    settle.mockRestore();
+    const [residue] = await harness.notifications.listNotifications({
+      threadId,
+    });
+    expect(residue).toMatchObject({ status: 'pending' });
+    expect(residue?.deliverAt).toBeUndefined();
+    expect(residue?.summaryAt).toBeUndefined();
+    const later = new Date(Date.now() + 86_400_000);
+
+    // #when — the dispatcher is handed the row, and the due scan runs
+    const dispatched = await harness.routes(
+      post('/signal/notifications/dispatch', {
+        notificationIds: [residue?.id],
+        resourceId: RESOURCE_ID,
+        agentId: 'writer',
+        now: later.toISOString(),
+      }),
+      scope(harness.pubsub, threadId, DISPATCHER),
+    );
+    const due = await harness.notifications.listDueNotifications({
+      now: later,
+    });
+
+    // #then — neither selects it
+    expect(await dispatched?.json()).toEqual({
+      delivered: 0,
+      failed: 0,
+      skipped: 1,
+    });
+    expect(due).toEqual([]);
+    expect(harness.startIdleRun).not.toHaveBeenCalled();
+  });
+
+  it('refuses an owner notification whose key matches a pending dispatcher row', async () => {
+    // #given — a non-owner row the dispatch tick will deliver
+    const harness = await createHarness();
+    const threadId = crypto.randomUUID();
+    await seedThread(harness.memory, threadId);
+    const recorded = await harness.routes(
+      post('/signal/notification', {
+        source: 'provider',
+        kind: 'changed',
+        summary: 'non-owner summary',
+        coalesceKey: 'shared-key',
+        attributes: { origin: 'provider' },
+      }),
+      scope(harness.pubsub, threadId, PROVIDER),
+    );
+    expect(await recorded?.json()).toMatchObject({
+      delivery: { action: 'deferred', reason: 'dispatcher' },
+    });
+    const send = vi.spyOn(harness.agent, 'sendSignal');
+
+    // #when — the owner posts with the same key
+    const response = await harness.routes(
+      post('/signal/notification', {
+        source: 'provider',
+        kind: 'changed',
+        summary: 'owner summary',
+        coalesceKey: 'shared-key',
+        attributes: { owner: 'yes' },
+      }),
+      scope(harness.pubsub, threadId),
+    );
+
+    // #then — nothing is sent or written, and the dispatcher's row is intact
+    expect(response?.status).toBe(409);
+    expect(await response?.json()).toEqual({
+      error: 'a matching notification is pending dispatch',
+      reason: 'notification-pending',
+    });
+    expect(send).not.toHaveBeenCalled();
+    const rows = await harness.notifications.listNotifications({ threadId });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      status: 'pending',
+      summary: 'non-owner summary',
+      attributes: { origin: 'provider' },
+      coalescedCount: 1,
+      deliverAt: expect.any(Date),
+    });
+  });
+
+  it('settles owner residue that an owner notification key matches', async () => {
+    // #given — an owner row left pending with no due time
+    const { policy, inputs } = recordingPolicy();
+    const harness = await createHarness({ contentPolicy: policy });
+    const threadId = crypto.randomUUID();
+    await seedThread(harness.memory, threadId);
+    const residue = await harness.notifications.createNotification({
+      threadId,
+      resourceId: RESOURCE_ID,
+      agentId: 'writer',
+      source: 'provider',
+      kind: 'changed',
+      summary: 'first summary',
+      coalesceKey: 'owner-key',
+      attributes: { first: 'yes' },
+    });
+    const send = vi.spyOn(harness.agent, 'sendSignal');
+
+    // #when — the owner posts again with the same key
+    const response = await harness.routes(
+      post('/signal/notification', {
+        source: 'provider',
+        kind: 'changed',
+        summary: 'second summary',
+        coalesceKey: 'owner-key',
+        attributes: { second: 'yes' },
+      }),
+      scope(harness.pubsub, threadId),
+    );
+
+    // #then — the merged residue row is inspected, sent, and settled
+    expect(response?.status).toBe(200);
+    expect(await response?.json()).toMatchObject({
+      record: {
+        id: residue.id,
+        status: 'delivered',
+        coalescedCount: 2,
+        attributes: { first: 'yes', second: 'yes' },
+      },
+      delivery: { action: 'persist' },
+    });
+    expect(send).toHaveBeenCalledOnce();
+    const sent = send.mock.calls[0]?.[0] as CreatedAgentSignal;
+    expect(inputs).toHaveLength(1);
+    expect(inputs[0]?.text).toBe(canonicalMarkup(sent));
+    expect(inputs[0]?.text).toContain(`id="${residue.id}"`);
+    expect(
+      await harness.notifications.listNotifications({ threadId }),
+    ).toHaveLength(1);
+  });
+
   it('records a non-owner notification for dispatcher delivery', async () => {
-    const harness = await createHarness({ canPersist: false });
+    const harness = await createHarness();
     const threadId = crypto.randomUUID();
     const response = await harness.routes(
       post('/signal/notification', {
@@ -384,7 +934,7 @@ describe('thread signal routes with a real durable agent', () => {
         kind: 'changed',
         summary: 'notification input',
       }),
-      scope(harness.pubsub, threadId),
+      scope(harness.pubsub, threadId, PROVIDER),
     );
 
     expect(await response?.json()).toMatchObject({
@@ -398,6 +948,7 @@ describe('thread signal routes with a real durable agent', () => {
         resourceId: RESOURCE_ID,
       }),
     ).toBeUndefined();
+    expect(harness.startIdleRun).not.toHaveBeenCalled();
     expect(harness.start).not.toHaveBeenCalled();
   });
 
@@ -544,25 +1095,6 @@ describe('thread signal routes with a real durable agent', () => {
         ),
     ],
     [
-      'sendNotificationSignal',
-      async (agent: FlowsafeDurableAgent, threadId: string) =>
-        agent.sendNotificationSignal(
-          {
-            source: 'provider',
-            kind: 'changed',
-            summary: 'notification input',
-          },
-          {
-            threadId,
-            resourceId: RESOURCE_ID,
-            ifIdle: {
-              behavior: 'wake',
-              streamOptions: { requestContext: actorContext() },
-            },
-          },
-        ),
-    ],
-    [
       'queueMessage',
       async (agent: FlowsafeDurableAgent, threadId: string) =>
         agent.queueMessage(
@@ -577,16 +1109,13 @@ describe('thread signal routes with a real durable agent', () => {
           },
         ),
     ],
-  ])('terminally heals direct %s idle wakes', async (name, invoke) => {
+  ])('terminally heals direct %s idle wakes', async (_name, invoke) => {
     const harness = await createHarness();
     const threadId = crypto.randomUUID();
     await seedThread(harness.memory, threadId);
     const saveMessages = vi.spyOn(harness.memory, 'saveMessages');
     const publish = vi.spyOn(harness.pubsub, 'publish');
     const result = await invoke(harness.agent, threadId);
-    if (name === 'sendNotificationSignal') {
-      expect(result).toMatchObject({ record: { status: 'delivered' } });
-    }
     const accepted = 'accepted' in result ? result.accepted : undefined;
     expect(accepted).toBeDefined();
     const decision = await accepted;
@@ -614,11 +1143,11 @@ describe('thread signal routes with a real durable agent', () => {
     expect(unhandled).toEqual([]);
   });
 
-  // A low-priority owner notification is deferred to the dispatcher, which is
-  // where the real durable agent and the real D1 store reach Core's summary
-  // helper over a batch. The source strings here name Object.prototype members.
-  it('summarizes prototype-colliding owner notifications through the dispatcher', async () => {
-    // #given — deferred owner notifications with colliding source names
+  // A non-owner notification is recorded with a due time and no summary time,
+  // so the dispatcher delivers each row as its own signal, low priority
+  // included. The source strings here name Object.prototype members.
+  it('delivers prototype-colliding non-owner notifications through the dispatcher', async () => {
+    // #given — deferred non-owner notifications with colliding source names
     const harness = await createHarness();
     const threadId = crypto.randomUUID();
     await seedThread(harness.memory, threadId);
@@ -631,19 +1160,22 @@ describe('thread signal routes with a real durable agent', () => {
           summary: `${source} input`,
           priority: 'low',
         }),
-        scope(harness.pubsub, threadId),
+        scope(harness.pubsub, threadId, PROVIDER),
       );
       expect(response?.status).toBe(200);
       const body = (await response?.json()) as {
-        record: { record: { id: string; source: string }; decision: unknown };
+        record: { id: string; source: string };
+        delivery: unknown;
       };
-      expect(body.record.decision).toMatchObject({ action: 'summarize' });
-      expect(body.record.record.source).toBe(source);
-      ids.push(body.record.record.id);
+      expect(body.delivery).toEqual({
+        action: 'deferred',
+        reason: 'dispatcher',
+      });
+      expect(body.record.source).toBe(source);
+      ids.push(body.record.id);
     }
 
-    // #when — the dispatcher summarizes the due batch
-    const send = vi.spyOn(harness.agent, 'sendSignal');
+    // #when — the dispatcher delivers the due rows
     const response = await harness.routes(
       post('/signal/notifications/dispatch', {
         notificationIds: ids,
@@ -651,46 +1183,50 @@ describe('thread signal routes with a real durable agent', () => {
         agentId: 'writer',
         now: new Date(Date.now() + 60_000).toISOString(),
       }),
-      {
-        ...scope(harness.pubsub, threadId),
-        principal: trustAutomationPrincipal({
-          kind: 'system',
-          id: 'notification-dispatch',
-          purpose: 'notification.dispatch',
-        }),
-      },
+      scope(harness.pubsub, threadId, DISPATCHER),
     );
 
-    // #then — each colliding source is counted once, as its own entry
+    // #then — each colliding source wakes the idle thread as its own signal
     expect(response?.status).toBe(200);
     expect(await response?.json()).toMatchObject({ delivered: 2, failed: 0 });
-    expect(send).toHaveBeenCalledOnce();
-    const summary = send.mock.calls[0]?.[0] as unknown as {
-      tagName: string;
-      contents: string;
-      attributes: Record<string, unknown>;
-      metadata: Record<string, unknown>;
-    };
-    expect(summary.tagName).toBe('notification-summary');
-    expect(summary.contents).toBe('__proto__: 1, constructor: 1');
-    expect(summary.attributes).toMatchObject({ pending: 2 });
-    expect(summary.metadata.notification).toMatchObject({
-      signal: 'summary',
-      pending: 2,
-      groups: [
-        { source: '__proto__', count: 1 },
-        { source: 'constructor', count: 1 },
-      ],
-      byPriority: { low: 2 },
-      priority: 'low',
+    expect(harness.startIdleRun).toHaveBeenCalledTimes(2);
+    const signals = harness.startIdleRun.mock.calls.map(([input]) => {
+      expect(input).toMatchObject({
+        entryPath: 'notification.dispatch',
+        principal: DISPATCHER,
+      });
+      return input.signal as unknown as {
+        tagName: string;
+        contents: string;
+        attributes: Record<string, unknown>;
+      };
     });
+    expect(
+      signals
+        .map(({ tagName, contents, attributes }) => ({
+          tagName,
+          contents,
+          source: attributes.source,
+        }))
+        .sort((left, right) => left.contents.localeCompare(right.contents)),
+    ).toEqual([
+      {
+        tagName: 'notification',
+        contents: '__proto__ input',
+        source: '__proto__',
+      },
+      {
+        tagName: 'notification',
+        contents: 'constructor input',
+        source: 'constructor',
+      },
+    ]);
     for (const id of ids) {
       expect(
         await harness.notifications.getNotification({ threadId, id }),
       ).toMatchObject({
-        status: 'pending',
-        summaryAt: undefined,
-        summarySignalId: expect.any(String),
+        status: 'delivered',
+        deliveredSignalId: expect.any(String),
       });
     }
     expect(harness.start).not.toHaveBeenCalled();

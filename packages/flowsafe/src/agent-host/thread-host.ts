@@ -76,7 +76,10 @@ import {
   lifecycleFromRequestContext,
   terminalCleanupFor,
 } from '../do-runner/run-lifecycle.js';
-import { isTerminalRunStatus } from '../do-runner/run-terminal-state.js';
+import {
+  isTerminalRunStatus,
+  type RunStatus,
+} from '../do-runner/run-terminal-state.js';
 import type {
   RecoveredStart,
   RunLifecycleTransitionResult,
@@ -233,6 +236,11 @@ export interface BoundThreadAgent {
 export interface BlockingAgentRun {
   runId: string;
   principal: ExecutionPrincipal;
+  /**
+   * The run's stored status. Absent for a run with an operation executing in
+   * this isolate, and for one with no readable started state.
+   */
+  status?: RunStatus;
 }
 
 export interface ThreadAgentHost {
@@ -439,13 +447,13 @@ function requestedBy(value: unknown): string {
 }
 
 /**
- * The reserved suspension-timeout envelope is minted by a run object's alarm and
- * by nothing else. Agent runs never arm a suspension deadline, so a forged
+ * The reserved suspension-timeout envelope is minted by a run object's alarm.
+ * Agent runs never arm a suspension deadline, so a forged
  * envelope here could only mislead a step — but this route forwards client
  * resume data verbatim under `requestedByKind: 'human'`, and the guarantee the
  * feature sells is that no caller can present itself to a step as an expired
- * deadline. The KEY is refused, exactly as the workflow resume route refuses it,
- * so a step that reads the key directly cannot be fooled either.
+ * deadline. The KEY is refused, so a step that reads the key directly cannot be
+ * fooled either.
  */
 function resumeData(value: unknown): unknown {
   if (
@@ -665,11 +673,11 @@ export function createThreadAgentHost(
   };
 
   /**
-   * The one entry gate, split by principal kind because the two kinds are
+   * The entry gate, split by principal kind because the two kinds are
    * authorized by different things and must not fall through to each other.
    *
    * A human passes the route-level start roles intersected with the agent's own
-   * allowedRoles, exactly as before. An automated principal never consults
+   * allowedRoles. An automated principal never consults
    * roles at all: it must be declared in the agent's `allowedAutomation` for
    * this precise entry path, AND survive the host's optional authorizer. Absent
    * declaration denies — which is why a scheduled start of an agent that has
@@ -829,16 +837,20 @@ export function createThreadAgentHost(
         },
         { includeLegacy: true },
       );
+      if (!state || state.kind === 'initial')
+        return { runId, principal: runRecord.principal };
+      const blocking = {
+        runId,
+        principal: runRecord.principal,
+        status: state.summary.status,
+      };
       if (
-        !state ||
-        state.kind === 'initial' ||
         !isTerminalRunStatus(state.summary.status) ||
         (state.kind === 'legacy' && !isTerminalRunStatus(state.snapshot.status))
       )
-        return { runId, principal: runRecord.principal };
+        return blocking;
       const recovery = await storage.get(ownerRecoveryKey(runId));
-      if (recovery !== undefined)
-        return { runId, principal: runRecord.principal };
+      if (recovery !== undefined) return blocking;
       await withRecoveryLock(() =>
         finalizeTerminalRecord(scope, runId, runRecord, state),
       );
@@ -1506,7 +1518,7 @@ export function createThreadAgentHost(
   // The bridge mints its own principal from this id, so the audit trail shows
   // an automated principal rather than a human operator.
   const systemPrincipalId = options.systemPrincipalId ?? 'flowsafe-system';
-  // Deliberately NOT vouched. Its only consumer projects it to an ApprovalActor
+  // NOT vouched. Its consumer projects it to an ApprovalActor
   // for a role-gated READ, which grants nothing an automated principal does not
   // already have — so calling the trust assertion here would assert trust that
   // nothing consumes, and `trustAutomationPrincipal` has to stay greppable as

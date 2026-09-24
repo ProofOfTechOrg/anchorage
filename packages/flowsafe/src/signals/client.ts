@@ -6,9 +6,8 @@
 // (`@proofoftech/flowsafe/signals/client`) — never the host-side signals barrel.
 //
 // The SEND surface targets the createSignalRouter routes
-// (`POST /api/threads/:threadId/{message,queue,signal,state,notification}`), so
-// every call crosses the P6 ingestion gate (auth → role → registry-backed thread
-// ownership → allowlist/size/rate → audit) before it reaches a thread DO.
+// (`POST /api/threads/:threadId/<channel>`), so every call crosses the P6
+// ingestion gate before it reaches a thread DO.
 //
 // SignalClient remains send-only. Supported live agent output uses the
 // authenticated agent-host route for one exact thread and run. The router
@@ -127,8 +126,8 @@ export class SignalClient {
   }
 
   /**
-   * A system signal (ifActive/ifIdle deliver/persist/discard/wake); a persist
-   * no agent memory can hold answers `memory-unavailable`.
+   * A system signal with its ifActive/ifIdle behaviors; a persist no agent
+   * memory can hold answers `memory-unavailable`.
    */
   async sendSignal(threadId: string, body: SendSignalBody): Promise<unknown> {
     return this.#post(threadId, 'signal', body);
@@ -148,8 +147,11 @@ export class SignalClient {
   }
 
   /**
-   * A durable AGENT inbox notification. Owners best-effort persist it for the
-   * next host-started turn; non-owners record it for the host dispatch tick.
+   * A durable AGENT inbox notification. For a runtime-driven agent, the thread
+   * owner's notification is delivered at ingestion into the owner's running
+   * run, or persisted to agent memory, and never wakes a run; a non-owner's is
+   * recorded for the host dispatch tick. An unbranded agent's owner
+   * notification follows Mastra's delivery policy.
    */
   async sendNotificationSignal(
     threadId: string,

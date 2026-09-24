@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // FlowsafeDurableAgent — drive Mastra's durable-agent loop through the ONE
 // RunnerRuntime chokepoint so every agent leg inherits the substrate's
-// invariants: server-minted runIds, per-leg requestContextForRun grant
-// derivation, snapshot provenance, RunSummary, and retention purge.
+// invariants.
 //
 // The mechanic was validated against @mastra/core 1.50.0 dist. Every offset in
-// THIS section is 1.50.0-vintage and deliberately kept as the provenance of the
-// original validation; later sections carry their own stamp:
+// THIS section is 1.50.0-vintage and kept as the provenance of the original
+// validation; later sections carry their own stamp:
 // DurableAgent compiles the agent loop to the default-engine workflow
 // 'durable-agentic-loop' (agent/durable index.js: AGENTIC_LOOP :62,
 // getWorkflow() :5936, agent-agnostic — the agent is resolved per run by the
@@ -101,10 +100,8 @@
 //
 // Agent-level surface (offsets in chunk-3S5BFAEP.js at 1.53.0 unless another
 // chunk or file is named). The base `Agent` also carries own members
-// DurableAgent does not shadow. Each is dispositioned into one of the buckets
-// below, and durable-agent-surface.test.ts pins that partition by name the same
-// way it pins the durable one — so the invariant holds over the WHOLE inherited
-// surface, not just the durable half, and stays holding on a bump.
+// DurableAgent does not shadow; durable-agent-surface.test.ts pins their
+// partition by name.
 //
 //   BLOCKED outright, because each is its own execution path:
 //     - listSuspendedRuns() (:49532) — the discovery ground.
@@ -146,12 +143,7 @@
 //   can produce lands on this runner's terminal path; queueMessage keeps the
 //   same containment property.
 //
-//     FlowSafe's queue and state routes, plus persist outcomes from wake routes,
-//     require agent memory and answer `memory-unavailable` without it. Owner
-//     notifications follow core's policy and treat their memory write as
-//     best-effort because the inbox row is already durable. Non-owner
-//     notifications are record-only until the trusted dispatcher delivers them.
-//     Direct sender calls can still reach core's minting sites: the idle wake
+//     Direct sender calls can reach core's minting sites: the idle wake
 //     (:7441), continuation (:6720), completion drain (:6665), and queued-id
 //     drain (:6808), all in chunk-P4Y2BJL7.js.
 //     executeWorkflow therefore treats a missing #startRequesters entry as a
@@ -241,15 +233,10 @@
 // typecheck if a future core drops it. Each signature satisfies the base it
 // shadows on that base's own terms; the caveat on each member says how.
 //
-// The runner's resume path is resumeViaRuntime(): ApprovalService.decide -> the
-// host's ResumeRunFn -> createAgentApprovalResumer -> the thread topology's
-// resume -> resumeViaRuntime -> runtime.resume; grants are derived on the
-// (suspendedAt, resumeCount) fingerprint there. Blocking does not un-brand the
-// agent — DurableAgentLike duck-types on `recover`/`recoverActiveRuns` merely
-// BEING functions (agent-Dk0N0Nlg.js:272), which the overrides still are. The
-// surface tripwire in durable-agent-surface.test.ts requires every DurableAgent
-// prototype member to stay classified, so a future peer bump surfaces whatever
-// it adds.
+// The runner's resume path is resumeViaRuntime(). Blocking does not un-brand
+// the agent — DurableAgentLike duck-types on `recover`/`recoverActiveRuns`
+// merely BEING functions (agent-Dk0N0Nlg.js:272), which the overrides still
+// are.
 //
 // Live-isolate scope: the loop resolves the tool's execute closure from the
 // in-process globalRunRegistry (populated by stream()). A DO holds one run in
@@ -360,8 +347,7 @@ const UNREGISTERED_RUN_REFUSAL_PREFIX =
 
 /**
  * @internal Metadata key that prevents a route delivery from being terminally
- * persisted. Deep-imported by `signals/thread-do-routes.ts` and kept off
- * `./index.js`.
+ * persisted. Kept off `./index.js`.
  */
 export const FLOWSAFE_PERSISTENCE_FORBIDDEN = 'flowsafe.persistence-forbidden';
 
@@ -572,10 +558,7 @@ const THREAD_TOOL_APPROVAL_REASON =
 /**
  * Why each blocked entry point is refused, keyed by method name. The SINGLE
  * source: every override throws `unavailableRunEntry(name,
- * BLOCKED_RUN_ENTRIES[name])`, and durable-agent-surface.test.ts derives both
- * its blocked-member partition and its per-method message assertions from these
- * keys — so a new blocked entry cannot ship with an unexercised refusal, and a
- * reason cannot drift between the throw and the test.
+ * BLOCKED_RUN_ENTRIES[name])`.
  *
  * The module comment walks the same members by PROVENANCE section (the durable
  * surface, then the Agent surface) rather than by ground, so its numbering is
@@ -629,10 +612,8 @@ export const BLOCKED_RUN_ENTRIES = {
 /**
  * The refusal every blocked run entry point throws. A plain `Error`, not
  * {@link InvalidRunRequestError}: that class means "the client's run request is
- * malformed" (runtime.ts homes the convention — client input is an
- * InvalidRunRequestError, a developer-controlled mistake is a plain Error), and
- * calling one of these is neither a run request nor recoverable by fixing an
- * argument. Same voice as #rehydrateRegistry's fail-closed throw. The message
+ * malformed", and calling one of these is neither a run request nor
+ * recoverable by fixing an argument. Same voice as #rehydrateRegistry's fail-closed throw. The message
  * names WHAT is refused and WHY, and carries no run data — the discovery
  * entries have none to carry, and the others must not echo an id the caller may
  * not own into its log.
@@ -667,13 +648,7 @@ function bindThreadCompletion<T extends object>(
 
 /**
  * Brand marking an agent as runtime-driven. The thread Durable Object requires
- * it before its message, signal, schedule, or notification-dispatch wake seam
- * may start a run. Queue and state persist rather than wake on idle. Non-owner
- * notifications are recorded for the trusted dispatcher and never send a
- * signal directly. An unbranded agent reports
- * `degraded: 'not-runtime-driven'` on state and owner-notification responses
- * that reach the sender, regardless of thread state. Skipped state and
- * `memory-unavailable` responses return earlier and carry no marker.
+ * it before a wake seam may start a run.
  *
  * Direct core sender calls that mint a run still reach the durable runner,
  * which fails them terminally without executing. Structural so a test double
@@ -815,9 +790,7 @@ export class FlowsafeDurableAgent<
    * guard, where a bare UUID is already indistinguishable from a legitimately
    * caller-minted one. So the guard must ALSO fire HERE, before
    * `super.stream()/generate()/prepare()`, while "absent" is still visible. Same
-   * posture as `RunnerRuntime.start`
-   * (typeof + PATH_SAFE_ID_PATTERN, NO generation fallback); the `typeof` check
-   * is load-bearing because `RegExp.test` coerces its argument to a string, so a
+   * posture as `RunnerRuntime.start`; the `typeof` check is load-bearing because `RegExp.test` coerces its argument to a string, so a
    * numeric runId would pass the pattern yet key a run by the number. Homed once
    * and shared by the call sites below so the rule cannot drift within this
    * class.
@@ -2048,9 +2021,7 @@ export function createFlowsafeDurableAgent<
   const workflow = durableAgent.getWorkflow();
   if (!options.runtime.workflowIds().includes(workflow.id)) {
     // getWorkflow()'s concrete engine generics are not single-cast-assignable to
-    // AnyWorkflow, so the double cast through `unknown` is required (init.ts gets
-    // away with a single cast because coreCreateWorkflow's return already lines
-    // up).
+    // AnyWorkflow, so the double cast through `unknown` is required.
     options.runtime.register(workflow as unknown as AnyWorkflow);
   }
   return durableAgent;
