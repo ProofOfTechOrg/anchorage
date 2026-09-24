@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import { fileURLToPath } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   createTestHarness,
@@ -7,11 +8,10 @@ import {
   type WorkerHandle,
 } from 'wrangler';
 
-const ROOT = new URL('..', import.meta.url).pathname;
-const PROBE = new URL(
-  './fixtures/inventory-hostname-harness-probe.ts',
-  import.meta.url,
-).pathname;
+const ROOT = fileURLToPath(new URL('..', import.meta.url));
+const PROBE = fileURLToPath(
+  new URL('./fixtures/inventory-hostname-harness-probe.ts', import.meta.url),
+);
 
 describe.sequential('inventory hostnames in workerd', {
   timeout: 30_000,
@@ -105,7 +105,7 @@ describe.sequential('inventory hostnames in workerd', {
     'user@é.example\t',
     'é.example:80\t',
     'bad\u0000é.example',
-  ])('retains finding refusal for %j', async (hostname) => {
+  ])('returns the finding refusal for %j', async (hostname) => {
     const response = await worker.fetch(
       `/?hostname=${encodeURIComponent(hostname)}`,
     );

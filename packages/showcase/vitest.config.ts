@@ -1,6 +1,7 @@
+import { fileURLToPath } from 'node:url';
 import { defineConfig } from 'vitest/config';
 
-const src = (path: string) => new URL(path, import.meta.url).pathname;
+const src = (path: string) => fileURLToPath(new URL(path, import.meta.url));
 
 export default defineConfig({
   resolve: {
@@ -16,9 +17,7 @@ export default defineConfig({
         replacement: src('../flowsafe/test-support/$1'),
       },
       // Exact aliases resolve these roots to source. Tests importing
-      // breakwater/policy-engine or /rbac resolve through dist, which the root
-      // pnpm typecheck builds through showcase's pretypecheck during its
-      // recursive package run.
+      // breakwater/policy-engine or /rbac resolve through dist.
       {
         find: /^@proofoftech\/breakwater$/,
         replacement: src('../breakwater/src/index.ts'),

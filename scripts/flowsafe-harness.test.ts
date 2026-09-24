@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import { fileURLToPath } from 'node:url';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import {
   createTestHarness,
@@ -6,7 +7,7 @@ import {
   type WorkerHandle,
 } from 'wrangler';
 
-const REPO_ROOT = new URL('..', import.meta.url).pathname;
+const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url));
 const DATABASE = {
   binding: 'DB',
   database_name: 'flowsafe-demo',

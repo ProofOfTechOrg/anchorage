@@ -1,3 +1,4 @@
+import { fileURLToPath } from 'node:url';
 import { createBuilder } from 'vite';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
@@ -18,7 +19,7 @@ const DATABASE = {
   database_name: 'anchorage-showcase-single-tenant',
   database_id: 'e8b62ac5-a155-4cc2-9942-e3da9773ad75',
 };
-const ROOT = new URL('..', import.meta.url).pathname;
+const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const BUILT_CONFIG = new URL(
   '../dist/anchorage_showcase_single_tenant/wrangler.json',
   import.meta.url,
@@ -44,8 +45,9 @@ function harnessOptions(streamTicketSecret: string) {
       {
         config: {
           name: 'showcase-harness-seeder',
-          main: new URL('../test-support/harness-seeder.ts', import.meta.url)
-            .pathname,
+          main: fileURLToPath(
+            new URL('../test-support/harness-seeder.ts', import.meta.url),
+          ),
           compatibility_date: '2026-07-26',
           d1_databases: [DATABASE],
         },

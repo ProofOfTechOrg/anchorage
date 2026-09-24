@@ -1,20 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // THE EXECUTION-ENTRY MATRIX: every way work can begin or continue on this
 // deployment, the fence predicate that polices it, and proof — by driving the
-// real surface in all four fence states — that it polices it the way the table
-// says.
+// real surface — that it polices it the way the table says.
 //
-// WHY A MATRIX, AND WHY HERE. The fence is not one check; it is a dozen, spread
-// across eight modules that never import each other. Each of those modules
-// tests its own gate, and every one of those tests passes on a deployment with
-// an entry NOBODY gated: a missing check looks exactly like an absent feature
+// WHY A MATRIX, AND WHY HERE. The fence is not one check; it is spread across
+// modules. A module's test of its own gate passes on a deployment with an
+// entry NOBODY gated: a missing check looks exactly like an absent feature
 // until an operator closes the fence and a run starts anyway. What no
 // per-module suite can hold is the LIST. This file is that list's
 // machine-readable home.
 //
 // ADDING AN ENTRY. Any new surface that mints a run, resumes one, authors
 // standing work, or executes queued work belongs in ENTRIES below, in the same
-// change that adds it. Pick its predicate from the four:
+// change that adds it. Pick its predicate:
 //
 //   admitsRunStart            a MINT. Refused from `draining` on, because a
 //                             drain that keeps minting never ends. In
@@ -33,8 +31,8 @@
 //                             dispatch pass, a webhook ingress. Drains, then
 //                             stops; nothing nominates it either.
 //
-//   Reads — status, inventory, list, observe — and the admin routes are UNGATED
-//   in every state by design. A surface that only reads does not belong here.
+//   Reads — status, inventory, list, observe — and the admin routes do not
+//   belong here.
 //
 // HOW THE PROOF WORKS. The expectation is never written down per entry. For
 // each state the table's declared predicate is EVALUATED — the real exported
@@ -45,7 +43,7 @@
 //
 // Proof-only is driven TWICE where the entry is nominatable: once carrying the
 // nomination the fence names, once not. That second probe is what separates the
-// predicate PAIRS — across the other three states admitsRunStart is
+// predicate PAIRS — across the other states admitsRunStart is
 // indistinguishable from admitsWorkAuthoring, and admitsExistingRun from
 // admitsDrainableExecution.
 
@@ -146,7 +144,7 @@ const PROOF_KEY = 'proof-key-1';
 const TEST_IDENTITY_SECRET = 'matrix-deployment-identity-secret-0001';
 const THREAD_ID = 'acme_t1';
 
-/** Which of the four exported admission predicates an entry is declared under. */
+/** Which exported admission predicate an entry is declared under. */
 type PredicateName =
   | 'admitsRunStart'
   | 'admitsExistingRun'
@@ -158,7 +156,7 @@ type PredicateName =
  *
  * `nomination` is what proof-only would have to name for this entry to be
  * admitted — an idempotency key for a mint, a complete generation for an existing
- * run — and it is `undefined` on the probe that deliberately does not carry it.
+ * run — and it is `undefined` on the probe that does not carry it.
  */
 function admits(
   predicate: PredicateName,
@@ -1104,9 +1102,7 @@ const ENTRIES: readonly Entry[] = [
         invoke: async () => {
           fired = 0;
           await tick();
-          // A fenced pass does NOTHING — it never reaches the CAS, because a
-          // claim it will not run consumes the fire (the claim advances
-          // nextFireAt) and the fenced runtime then refuses the start. The tick
+          // A fenced pass does NOTHING — it never reaches the CAS. The tick
           // runs on an alarm, so it degrades by doing nothing rather than by
           // refusing; the work it did is the only honest signal.
           return fired > 0 ? 'admitted' : 'refused';
@@ -1247,9 +1243,7 @@ const ENTRIES: readonly Entry[] = [
         executionFence: fence,
       });
       // Booted while the fence is still open, exactly as a host boots before an
-      // operator drains it: `boot()` is deliberately NOT fence-gated (a fenced
-      // refusal would be memoized forever and would take the read routes down
-      // with it), so the gate this entry drives is the enqueue's own.
+      // operator drains it, so the gate this entry drives is the enqueue's own.
       await host.boot();
       return {
         invoke: () =>
@@ -1277,7 +1271,7 @@ const ENTRIES: readonly Entry[] = [
 
 /**
  * Every place in `src/` that consults an admission predicate or guards an
- * initial INSERT in SQL, and how the four fence states are exercised against it.
+ * initial INSERT in SQL, and how the fence states are exercised against it.
  *
  * THIS IS THE LIST'S ENFORCEMENT. The drives above prove that the gates we know
  * about behave correctly; they can say nothing about a gate nobody added and
@@ -1285,10 +1279,8 @@ const ENTRIES: readonly Entry[] = [
  * new boundary fails until it is written down here — with either the matrix
  * entry that drives it, or the suite that already does.
  *
- * `drivenBy` names a matrix entry above wherever one exists. Delegated suites
- * exercise the background-task host's private dispatch paths, the serialized
- * wake lane, and proof nomination's reservation/snapshot/readback checks.
- * Their boundary-specific states and races live in the named test files.
+ * `drivenBy` names a matrix entry above wherever one exists. Delegated sites'
+ * boundary-specific states and races live in the named test files.
  */
 type GateSite = {
   file: string;
@@ -1462,6 +1454,10 @@ type SourceFileSystem = {
   readFileSync(path: string, encoding: string): string;
 };
 
+/**
+ * Node builtins load through getBuiltinModule, without adding a direct Node
+ * ambient-type requirement to this test.
+ */
 function sourceFileSystem(): SourceFileSystem {
   return (
     globalThis as {
@@ -1472,11 +1468,18 @@ function sourceFileSystem(): SourceFileSystem {
 
 type SourceFile = { readonly file: string; readonly source: string };
 
+type SourceUrlModule = { fileURLToPath(url: URL): string };
+
 function sourceRoot(): string {
   // This module's OWN directory, never `process.cwd()`: filtered and root test
   // runs use different working directories.
   const here = (import.meta as ImportMeta & { url: string }).url;
-  return new URL('.', here).pathname.replace(/\/$/, '');
+  const url = (
+    globalThis as {
+      process?: { getBuiltinModule?: (id: string) => unknown };
+    }
+  ).process?.getBuiltinModule?.('node:url') as SourceUrlModule;
+  return url.fileURLToPath(new URL('.', here)).replace(/\/$/, '');
 }
 
 function walkSourceFiles(
@@ -1507,9 +1510,6 @@ function walkSourceFiles(
 /**
  * Every actual predicate/delegation call. Definitions, re-exports and comments
  * are not calls; the defining module's own nomination gates remain visible.
- *
- * The filesystem reader keeps the schema guard's getBuiltinModule idiom,
- * without adding a direct Node ambient-type requirement to this test.
  */
 function predicateCallSites({ file, source }: SourceFile): GateSite[] {
   const found: GateSite[] = [];
@@ -2514,11 +2514,10 @@ describe('execution-entry matrix', () => {
     }
 
     it(`${entry.name} answers its proof-only nomination as ${entry.predicate} (${entry.module})`, async () => {
-      // #given — the probe that separates the predicate PAIRS. Across open,
-      // draining, and migration-locked, admitsRunStart is indistinguishable
-      // from admitsWorkAuthoring and admitsExistingRun from
-      // admitsDrainableExecution; only the nominated proof-only case tells them
-      // apart.
+      // #given — the probe that separates the predicate PAIRS. Outside
+      // proof-only, admitsRunStart is indistinguishable from
+      // admitsWorkAuthoring and admitsExistingRun from admitsDrainableExecution;
+      // only the nominated proof-only case tells them apart.
       const { fence, database, sqlite } = await openFence();
       const prepared = await entry.prepare(fence, database, sqlite);
       await fence.transition({

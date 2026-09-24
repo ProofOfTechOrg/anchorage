@@ -4,7 +4,7 @@ import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { runInNewContext } from 'node:vm';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DirectBootstrapError } from '../scripts/direct-credentialed-bootstrap.mjs';
@@ -593,7 +593,7 @@ describe.sequential('direct CLI runtime', () => {
     );
     const failure = await child(
       process.execPath,
-      ['--import', preload, entry, '--bad'],
+      ['--import', pathToFileURL(preload).href, entry, '--bad'],
       undefined,
       { [variable]: 'code' },
       {},
@@ -625,7 +625,7 @@ process.stderr.write = (...args) => {
     };
     const result = await child(
       process.execPath,
-      ['--import', preload, entry, '--run'],
+      ['--import', pathToFileURL(preload).href, entry, '--run'],
       undefined,
       credentials,
     );
@@ -906,7 +906,7 @@ process.stdout.write = (...args) => {
     );
     const result = await child(
       process.execPath,
-      ['--import', preload, entry, '--help'],
+      ['--import', pathToFileURL(preload).href, entry, '--help'],
       undefined,
       env,
     );
@@ -927,7 +927,7 @@ process.stdout.write = (...args) => {
     );
     const result = await child(process.execPath, [
       '--import',
-      preload,
+      pathToFileURL(preload).href,
       entry,
       '--help',
     ]);
@@ -990,7 +990,7 @@ process.on('exit', () => writeFileSync(${path}, JSON.stringify(reads)));\n`;
     const readsPath = join(f.directory, 'reads.json');
     const result = await child(
       process.execPath,
-      ['--import', preload, entry, '--help'],
+      ['--import', pathToFileURL(preload).href, entry, '--help'],
       undefined,
       {
         ...(variable ? { [variable]: 'DIRECT_CONFORMANCE' } : {}),
@@ -1018,7 +1018,7 @@ process.on('exit', () => writeFileSync(${path}, JSON.stringify(reads)));\n`;
     );
     const result = await child(
       process.execPath,
-      ['--import', preload, entry, '--preflight'],
+      ['--import', pathToFileURL(preload).href, entry, '--preflight'],
       undefined,
       {
         [variable]: 'DIRECT_CONFORMANCE',
@@ -1156,7 +1156,7 @@ process.on('exit', () => writeFileSync(${path}, JSON.stringify(reads)));\n`;
     const result = await child(process.execPath, [
       '--input-type=module',
       '-e',
-      `await import(${JSON.stringify(entry)}); Promise.reject(new Error('secret-stack'));`,
+      `await import(${JSON.stringify(pathToFileURL(entry).href)}); Promise.reject(new Error('secret-stack'));`,
     ]);
     expect(result.code).toBe(1);
     expect(result.stderr).toBe(

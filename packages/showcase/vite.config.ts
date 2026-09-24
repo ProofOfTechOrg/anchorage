@@ -1,8 +1,9 @@
+import { fileURLToPath } from 'node:url';
 import { cloudflare } from '@cloudflare/vite-plugin';
 import react from '@vitejs/plugin-react';
 import { defineConfig } from 'vite';
 
-const src = (path: string) => new URL(path, import.meta.url).pathname;
+const src = (path: string) => fileURLToPath(new URL(path, import.meta.url));
 
 // Full Vite React app and Cloudflare Worker for the Anchorage showcase. The
 // Cloudflare plugin drives both development and production from wrangler.jsonc,
@@ -13,13 +14,12 @@ export default defineConfig({
   // override record that governs this plugin too: the override selects a
   // miniflare version rather than a consumer, so the miniflare
   // @cloudflare/vite-plugin resolves runs on the overridden workerd, while the
-  // plugin's own workerd dependency stays 1.20260730.1.
+  // plugin's own workerd dependency keeps its declared version.
   plugins: [react(), cloudflare()],
   resolve: {
     // Mirrors tsconfig.json paths — @/ (SPA) and @flowsafe/ (deep DOM-free
-    // flowsafe source; the SPA bundles the library from source, exactly as it
-    // did when both lived in one package). #worker/* needs no entry — Vite
-    // resolves the package.json "imports" field natively.
+    // flowsafe source; the SPA bundles the library from source). #worker/*
+    // needs no entry — Vite resolves the package.json "imports" field natively.
     alias: [
       { find: /^@\/(.*)$/, replacement: src('./src/$1') },
       { find: /^@flowsafe\/(.*)$/, replacement: src('../flowsafe/src/$1') },

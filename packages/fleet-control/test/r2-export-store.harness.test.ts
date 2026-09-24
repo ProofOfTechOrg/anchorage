@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import { fileURLToPath } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   createTestHarness,
@@ -7,9 +8,10 @@ import {
   type WorkerHandle,
 } from 'wrangler';
 
-const ROOT = new URL('..', import.meta.url).pathname;
-const PROBE = new URL('./fixtures/r2-export-harness-probe.ts', import.meta.url)
-  .pathname;
+const ROOT = fileURLToPath(new URL('..', import.meta.url));
+const PROBE = fileURLToPath(
+  new URL('./fixtures/r2-export-harness-probe.ts', import.meta.url),
+);
 
 function harnessOptions() {
   return {

@@ -80,9 +80,8 @@ const blockedEntries = Object.keys(BLOCKED_RUN_ENTRIES) as ReadonlyArray<
  * assertion turns that into a failure that demands re-reading the member.
  * Each member's reason is its BLOCKED_RUN_ENTRIES entry.
  *
- * `__setThreadRuntimeAgent` and `listActiveThreadRuns` sit on Agent.prototype
- * at the pinned core. The exact-match assertion reads the same either way:
- * absent from DurableAgent.prototype counts as outside it.
+ * The exact-match assertion counts a member absent from both prototypes as
+ * outside DurableAgent.prototype.
  */
 const blockedOnAgentPrototype = [
   '__setThreadRuntimeAgent',
@@ -110,14 +109,16 @@ const blockedByRunner = blockedEntries.filter(
 );
 
 /**
- * Members that cannot start, resume or re-drive a run, and read no snapshot
- * storage.
+ * Entry points whose call cannot start, resume or re-drive a run, reads no
+ * snapshot storage, and matches none of the grounds documented on
+ * BLOCKED_RUN_ENTRIES. A member whose call matches a ground but is not refused
+ * is a recorded exception: its reason names the ground and says the call is
+ * not refused.
  *
- * Honest caveat: `getWorkflow`, `getDurableWorkflows` and `listWorkflows`
- * return objects that themselves expose `createRun().start()`, and they are
- * load-bearing rather than removable — `executeWorkflow` and `resumeViaRuntime`
- * both read `this.getWorkflow()`. So this partition classifies ENTRY POINTS ON
- * THE AGENT, not the capabilities of the objects they hand back.
+ * The rule classifies the call, not the object it returns. An entry point
+ * whose call returns a live object that reaches a capability a ground refuses
+ * stays in this list, and carries an inline reason naming what that object
+ * reaches.
  *
  * Offsets in the reasons below are @mastra/core 1.67.0-vintage, in
  * dist/create-durable-agent-DFHwqN2K.js, unless the reason names another
@@ -125,17 +126,32 @@ const blockedByRunner = blockedEntries.filter(
  * peer and a newer core gets a VERSION_SKEW row.
  */
 const nonExecution = [
+  // Returns a fork constructed with no runtime (:6453-6470). The fork's agent is
+  // a new plain Agent (agent-Dk0N0Nlg.js:35342), not a Breakwater guarded one,
+  // carrying the wrapped agent's Mastra (:35346), so it reaches what the `agent`
+  // reason below names.
   '__fork',
   '__getEditorConfig',
   '__getGoalConfig',
   '__getOverridableFields',
+  // Returns the wrapped agent's configured sub-agents
+  // (agent-Dk0N0Nlg.js:33698-33701): plain Agents whose own stream() and
+  // generate() run outside RunnerRuntime and carry none of this class's
+  // refusals.
   '__getStaticAgents',
   '__hasSubAgentsConfigured',
   '__registerMastra',
-  // Writes declarative schedule metadata onto the wrapped agent (:6240). A
-  // schedule Mastra later syncs into schedule storage still reaches this agent
-  // through a start seam, where a run the host never registered is terminally
-  // refused — so the worst case is a fail-closed refusal, not a start.
+  // Writes schedule metadata onto the wrapped agent (1.67.0,
+  // create-durable-agent-DFHwqN2K.js:6240-6242). Core's agent-schedule worker
+  // resolves a schedule's target agent by id on the Mastra it runs on, then
+  // fires the schedule through that agent's sendSignal or generate
+  // (worker-CemmWBp9.js:167, :319, :448). RunnerRuntime's Mastra and the
+  // thread host's register the wrapped agent, so a worker on either fires the
+  // schedule on the wrapped agent, outside RunnerRuntime; the runner's refusal
+  // applies only on a Mastra that registered this wrapper. FlowSafe calls
+  // neither Mastra's startWorkers() (mastra-CCeMcPkn.js:4525-4589), which
+  // starts that worker. The call matches the fourth ground by installation, as
+  // __setThreadRuntimeAgent does, and is not refused.
   '__setDeclaredSchedules',
   '__setMastra',
   '__setMemory',
@@ -150,29 +166,47 @@ const nonExecution = [
   // requestRemoteAbort (:6626), which publishes an abort request over pubsub
   // (:272) to whichever process holds the run — and abortRunStream returns
   // `aborted || this.#isRunExecuting(runId)` (:6585), a boolean existence oracle
-  // for a run id the caller may not own. A narrowed handle can omit a member,
-  // while an instance Mastra calls in-process can only refuse it, and neither
-  // of these matches a blocked ground.
+  // for a run id the caller may not own. Neither member matches a blocked
+  // ground.
   'abortRunStream',
   'abortThreadStream',
+  // Returns the wrapped agent (:6223-6225). Its own stream() and generate() run
+  // the agent loop in-process through createRun().start()
+  // (agent-Dk0N0Nlg.js:37816), outside RunnerRuntime, and it carries none of
+  // this class's refusals, so every blocked Agent-level member is callable on
+  // it. Core reads this getter (isDurableAgentLike, agent-Dk0N0Nlg.js:272;
+  // Mastra.addAgent, mastra-CCeMcPkn.js:1667), so it cannot throw.
   'agent',
   'browser',
   'cache',
   'cleanupTimeoutMs',
   'constructor',
-  // Compiles the loop workflow object; compiling starts no run.
+  // Compiles a new, unregistered loop workflow (:6529-6531); compiling starts
+  // no run. The workflow's createRun() mints a run id when none is given and
+  // starts the run on request (agent-Dk0N0Nlg.js:5546-5554), outside
+  // RunnerRuntime.
   'createWorkflow',
   'disableBackgroundTasks',
-  // Publishes an error event onto the run's feed; executeWorkflow and
-  // resumeViaRuntime both use it after a terminal summary.
+  // Publishes an error event onto a caller-named run's feed (:6539-6542); the
+  // runner publishes its terminal errors through it.
   'emitError',
   // The fire-and-forget half of emitError (:6548), which core calls from its
   // own failure paths; it publishes onto a run's feed and starts nothing.
   'emitErrorInBackground',
   'enableBackgroundTasks',
   'getBackgroundTasksConfig',
+  // Returns the wrapped agent's channels (1.67.0,
+  // create-durable-agent-DFHwqN2K.js:6405-6407). A plain AgentChannels there
+  // has the wrapped agent as its dispatch target (agent-Dk0N0Nlg.js:33470,
+  // :33477, :33794): an inbound channel message reaches its sendMessage, and a
+  // channel approval its approveToolCall or declineToolCall
+  // (agent-Dk0N0Nlg.js:21002, :21031, :21045), outside RunnerRuntime.
   'getChannels',
   'getConfiguredProcessorIds',
+  // Returns the wrapped agent's processor workflows, registered on its Mastra
+  // (:6336-6338; agent-Dk0N0Nlg.js:34186); a workflow's `mastra`
+  // (agent-Dk0N0Nlg.js:5025-5027) reaches what the getMastraInstance reason in
+  // agentNonExecution names.
   'getConfiguredProcessorWorkflows',
   'getConfiguredToolHooks',
   // Reads that schedule metadata back off the wrapped agent (:6233); it returns
@@ -183,9 +217,22 @@ const nonExecution = [
   'getDefaultOptions',
   'getDefaultStreamOptionsLegacy',
   'getDescription',
+  // Returns [this.getWorkflow()] (:7912-7914), which Mastra.addAgent reads
+  // (mastra-CCeMcPkn.js:1689); what that workflow reaches is the getWorkflow
+  // reason below.
   'getDurableWorkflows',
   'getInstructions',
+  // Returns the wrapped agent's LLM wrapper (:6265-6267). Its stream() runs
+  // core's multi-step, tool-executing model loop (agent-Dk0N0Nlg.js:28533,
+  // :28581) over the tools and run id the caller passes, outside RunnerRuntime
+  // and without the agent's instructions, memory or processors.
   'getLLM',
+  // Returns the wrapped agent's memory (:6315). Memory without storage of its
+  // own takes its Mastra's (agent-Dk0N0Nlg.js:34419-34424), which on the
+  // runtime's Mastra is the store the runtime reads snapshots from; the public
+  // `storage` getter (dist/memory/memory.d.ts:77) reaches that store's
+  // workflows domain, which lists and deletes workflow runs
+  // (dist/storage/domains/workflows/base.d.ts).
   'getMemory',
   'getMetadata',
   'getModel',
@@ -193,8 +240,18 @@ const nonExecution = [
   'getSkill',
   'getToolPayloadTransform',
   'getTracingPolicy',
+  // Returns the agent's voice, which carries its tools and instructions
+  // (agent-Dk0N0Nlg.js:34646-34664, :33460-33465); a composite voice hands
+  // them to its realtime provider (voice-Dc6kCQAB.js:296-306), which runs
+  // outside RunnerRuntime.
   'getVoice',
-  // Memoized accessor for the compiled loop; the factory registers its id.
+  // Memoized accessor for the compiled loop (:7852-7864); the factory registers
+  // its id. Once the runtime's Mastra registers it (mastra-CCeMcPkn.js:3514-3522),
+  // the workflow reaches createRun().start() (agent-Dk0N0Nlg.js:5546),
+  // listWorkflowRuns (:5793), restartAllActiveWorkflowRuns (:5822) and
+  // deleteWorkflowRunById (:5843) over that Mastra's storage. The runner's
+  // executeWorkflow and resumeViaRuntime read this.getWorkflow(), so it cannot
+  // throw.
   'getWorkflow',
   'getWorkspace',
   'guardrailLogger',
@@ -202,19 +259,35 @@ const nonExecution = [
   'hasOwnMemory',
   'hasOwnPubSub',
   'hasOwnWorkspace',
+  // Returns the wrapped agent's sub-agents with its Mastra registered on each
+  // (:6360-6362; agent-Dk0N0Nlg.js:34089-34109): plain Agents whose own
+  // stream() and generate() run outside RunnerRuntime.
   'listAgents',
   'listConfiguredInputProcessors',
   'listConfiguredOutputProcessors',
   'listErrorProcessors',
+  // listInputProcessors and listOutputProcessors return the wrapped agent's
+  // combined processor workflows, registered on its Mastra (:6339-6344;
+  // agent-Dk0N0Nlg.js:34186); a workflow's `mastra` reaches what the
+  // getMastraInstance reason in agentNonExecution names.
   'listInputProcessors',
   'listOutputProcessors',
   'listScorers',
   'listSkills',
   'listTools',
+  // Returns the wrapped agent's workflows with its Mastra registered on each
+  // (:6369-6371; agent-Dk0N0Nlg.js:34580-34591). Each reaches createRun(),
+  // start() and restart outside RunnerRuntime, and lists and deletes its own
+  // runs.
   'listWorkflows',
   'maxSteps',
   // Reattaches to an existing run's pubsub replay; it cannot drive one.
   'observe',
+  // pubsub and pubsubInternal return the pubsub this agent's thread runs are
+  // keyed by. Core's agentThreadStreamRuntime, public on a Mastra
+  // (mastra-CCeMcPkn.js:650-652), lists from it what the blocked
+  // listActiveThreadRuns refuses (storage-MbGlKLkB.js:1011-1023), and
+  // publishing on it aborts a run or injects events by a known run id (:272).
   'pubsub',
   'pubsubInternal',
   'requestContextSchema',
@@ -229,10 +302,29 @@ const nonExecution = [
   // loop (1.69.0, create-durable-agent-B36Fu53G.js:6734, read at :6723); it
   // writes and deletes no snapshot row.
   'resolveShouldPersistSnapshot',
+  // runRegistry and runRegistryInternal return this instance's live
+  // ExtendedRunRegistry (:6246, :6483; class at :138-262): the ids of its runs,
+  // with no principal parameter; each run's live state by reference; and
+  // cleanup, which flips the runner's isRunLive(). No core code reads either
+  // getter at 1.67.0, and the same runs sit isolate-wide in the public
+  // globalRunRegistry export, so refusing the getters closes nothing that
+  // in-process code lacks. The runner reads runRegistryInternal for isRunLive()
+  // and registry rehydration.
   'runRegistry',
   'runRegistryInternal',
   'setBrowser',
+  // Forwards the channels it is given to the wrapped agent (1.67.0,
+  // create-durable-agent-DFHwqN2K.js:6408-6410), which stores them and passes
+  // itself to their __setAgent (agent-Dk0N0Nlg.js:33791-33796). A plain
+  // AgentChannels then dispatches inbound messages to the wrapped agent's
+  // sendMessage, and channel approvals and declines to its approveToolCall and
+  // declineToolCall (agent-Dk0N0Nlg.js:21002, :21031, :21045), outside
+  // RunnerRuntime. The call matches the fourth ground by installation, as
+  // __setThreadRuntimeAgent does, and is not refused. An
+  // AgentControllerChannels' __setAgent is a no-op (channels-vPjjdXQh.js:73),
+  // so the wrapped agent is not its dispatch target.
   'setChannels',
+  // Returns the voice getVoice returns, which reaches what that reason names.
   'voice',
   // Calls the configured shouldPersistSnapshot predicate with synthetic
   // statuses and logs warnings (1.69.0, create-durable-agent-B36Fu53G.js:8090);
@@ -269,12 +361,8 @@ const agentSurface = Object.getOwnPropertyNames(Agent.prototype).filter(
  * so virtual dispatch already applies the rule and a second override would only
  * be somewhere for the two to drift apart.
  *
- * `resumeStreamUntilIdle` and `sendStreamResume` land on the BLOCKED
- * `resumeStream()`. The signal senders stay inherited because every run
- * outcome they can produce lands on the runner's terminal path, not because
- * each still has a route caller. Any run core mints through them reaches a
- * terminal output without entering RunnerRuntime; see the runner module comment
- * for the cleanup mechanism.
+ * A member without an inline reason takes its reason from the runner module
+ * comment's LEFT INHERITED paragraphs, which also give the cleanup mechanism.
  *
  * For the members that resolve their target through the thread runtime's agent
  * field, the containment holds only while `__setThreadRuntimeAgent` is blocked,
@@ -296,12 +384,21 @@ const delegatingToGuard = [
   'sendSignal',
   'sendStateSignal',
   'sendStreamResume',
+  // Subscribes to the thread the caller names (:38196-38198). Its listener
+  // drains the thread's queued idle signals into the queuing agent's stream()
+  // under the run id core minted when the signal was queued
+  // (storage-MbGlKLkB.js:1671-1675, reached from :2040 and :2117), so a signal
+  // this instance queued lands on the guarded stream override, where
+  // executeWorkflow refuses a run the host start seam never registered.
+  'subscribeToThread',
 ] as const;
 
 /**
- * Agent-level members that cannot start, resume or re-drive a run, and return
- * no run ids. Read individually; the ones that LOOK execution-shaped carry
- * their reason inline.
+ * Agent-level entry points whose call cannot start, resume or re-drive a run,
+ * and matches none of the grounds documented on BLOCKED_RUN_ENTRIES.
+ * nonExecution's rules for an entry point whose call returns a live object and
+ * for a recorded exception apply here too. Read individually; the ones that
+ * LOOK execution-shaped carry their reason inline.
  *
  * Not here: the base durable delegators DurableAgent shadows, which are not in
  * this surface at all — 'keeps the base durable delegators out of the
@@ -316,11 +413,11 @@ const agentNonExecution = [
   '__getDrainPendingSignals',
   '__getLogger',
   '__listLLMRequestProcessors',
-  // Sets the flag core's __fork path reads (:35357).
+  // Sets a flag (:35357); it starts nothing.
   '__markStoredVersionApplied',
   '__registerPrimitives',
   '__resetToOriginalModel',
-  // Run the processor chain, not a run. No run id, no storage.
+  // Run the processor chain, not an agent run.
   '__runInputProcessors',
   '__runOutputProcessors',
   '__runProcessInputStep',
@@ -331,7 +428,12 @@ const agentNonExecution = [
   'cancelQueuedMessages',
   // Objective read/write over thread state; drives nothing.
   'clearObjective',
+  // Returns a processor workflow registered on this instance's Mastra when a
+  // host registers it (:34186); the workflow's `mastra` (:5025-5027) then
+  // reaches what the getMastraInstance reason below names.
   'combineProcessorsIntoWorkflow',
+  // Includes the tools listAgentTools and listWorkflowTools build
+  // (:37055-37077), which reach what their reasons below name.
   'convertTools',
   'deriveSubAgentBackgroundConfig',
   // Returns the peer advertisements one pubsub instance carries —
@@ -356,40 +458,70 @@ const agentNonExecution = [
   'formatMessagePartsForTitle',
   'formatMessagesForTitle',
   'formatTools',
-  // Title summarization: llm.stream / llm.__text with no tools, no run id and
-  // no run state. Not an agent run.
+  // Title summarization: llm.stream / llm.__text with no tools (:35421-35440).
+  // Core's LLM wrapper runs that model call as an internal workflow under a run
+  // id it mints and does not return (:28245-28270, :28347-28354): a model
+  // call, not an agent run.
   'genTitle',
   'generateTitleFromUserMessage',
-  // In-process pubsub registry only — core's own docs contrast it with the
-  // storage-backed listSuspendedRuns, which is blocked.
+  // Returns the run id of the thread the caller names by (resourceId,
+  // threadId), from the in-process thread-stream state
+  // (storage-MbGlKLkB.js:1001-1009); it reads no storage. A lookup the caller
+  // keys discovers nothing, so it is not the discovery ground.
   'getActiveThreadRunId',
   // TS-private but runtime-public: returns the handler generateLegacy and
   // streamLegacy refuse. Same class of caveat as getWorkflow() returning a
   // startable object — reaching it takes a deliberate private cast.
   'getLegacyHandler',
+  // Returns the Mastra this instance is registered on (:33557-33559), or
+  // undefined: createFlowsafeDurableAgent registers the wrapped agent, not
+  // this one. When a host registers this wrapper on a Mastra, that Mastra
+  // reaches the thread runtime's listActiveThreadRuns
+  // (mastra-CCeMcPkn.js:650-652; storage-MbGlKLkB.js:1011-1023) and, through
+  // getStorage() (mastra-CCeMcPkn.js:4123-4125), the workflows domain that
+  // lists and deletes workflow runs.
   'getMastraInstance',
   'getMcpServerGuidance',
   'getMemoryMessages',
   'getMostRecentUserMessage',
   'getObjective',
+  // Returns a ProcessorRunner holding the processor workflows
+  // combineProcessorsIntoWorkflow builds, which reach what its reason names.
   'getProcessorRunner',
+  // Returns this agent's pubsub (:33560-33562). The thread runtime keys a
+  // thread's state by pubsub (storage-MbGlKLkB.js:150, :294), and its public
+  // listActiveThreadRuns(pubsub) (:1011-1023) lists, for the runs keyed by it,
+  // what the blocked listActiveThreadRuns refuses.
   'getPubSub',
   'getSkillsProcessors',
   'getSubAgentToolSchemas',
+  // Calls convertTools (:36940-36974), so it returns the tools convertTools'
+  // reason names.
   'getToolsForExecution',
   'getWorkspaceInstructionsProcessors',
   'isModelFallbacks',
+  // Builds agent tools over the wrapped agent's sub-agents (:36094-36739).
+  // Their execute runs a sub-agent's generate() or stream() under a run id the
+  // sub-agent's core mints, or resumes one under the run id the caller passes
+  // (:36390-36391, :36404, :36469-36470, :36483), outside RunnerRuntime for a
+  // plain sub-agent.
   'listAgentTools',
   'listAssignedTools',
   'listBrowserTools',
   'listClientTools',
   'listInputProcessorLoadedTools',
   'listMemoryTools',
+  // listResolvedInputProcessors and listResolvedOutputProcessors return the
+  // processor workflow combineProcessorsIntoWorkflow builds, which reaches what
+  // its reason names.
   'listResolvedInputProcessors',
   'listResolvedLLMRequestProcessors',
   'listResolvedOutputProcessors',
   'listSkillTools',
   'listToolsets',
+  // Builds workflow tools over the wrapped agent's workflows (:36740-36927).
+  // Their execute creates a run under the run id the caller passes or a minted
+  // one, then starts or resumes it (:36801-36842), outside RunnerRuntime.
   'listWorkflowTools',
   'listWorkspaceTools',
   'normalizeModelFallbacks',
@@ -417,8 +549,6 @@ const agentNonExecution = [
   // Registers a listener that receives queued-message counts for the thread the
   // caller names (:38348); it discloses a count and drives nothing.
   'subscribeThreadEvents',
-  // Reattaches to a thread's pubsub replay; cannot drive a run.
-  'subscribeToThread',
   'updateModelInModelList',
   'updateObjectiveOptions',
   // Edits the label, title and metadata of the advertisement an existing claim
@@ -488,9 +618,8 @@ interface ModuleModule {
 
 /**
  * Node builtins load through process.getBuiltinModule (the spdx.test.ts
- * pattern): this file compiles in the workers-typed package test pass, which
- * has no @types/node to resolve a `node:` specifier against, and this package's
- * src forbids importing one statically.
+ * pattern): this file compiles in the workers-typed package test pass, and
+ * this package's src forbids importing a `node:` specifier statically.
  */
 function builtin<T>(id: string): T {
   const getBuiltin = (
@@ -843,7 +972,7 @@ describe('FlowsafeDurableAgent prototype surface inventory', () => {
     );
     expect(
       unclassified,
-      `@mastra/core exposes new DurableAgent member(s) [${unclassified.join(', ')}]. Read each implementation in the installed dist, then add it to exactly one of the lists \`classified\` spreads, under the rule that list's comment states, or, if it falls under a ground documented on BLOCKED_RUN_ENTRIES in durable-agent-runner.ts, add it there with its reason, an override that throws, and a row in blockedCalls below. If the OTHER supported core does not carry it here, give it a VERSION_SKEW row too, naming the prototype level it sits on at each version.`,
+      `@mastra/core exposes new DurableAgent member(s) [${unclassified.join(', ')}]. Read each implementation in the installed dist and classify what calling it does. If that call falls under a ground documented on BLOCKED_RUN_ENTRIES in durable-agent-runner.ts, add the member there with its reason, an override that throws, and a row in blockedCalls below. Otherwise it meets the rule of one of the other lists (guardedByRunner, guardedByDelegation, nonExecution), stated in that list's comment: add it to that list. If the OTHER supported core does not carry it here, give it a VERSION_SKEW row too, naming the prototype level it sits on at each version.`,
     ).toEqual([]);
 
     // #then and nothing classified has since been removed from it, beyond the
@@ -958,7 +1087,7 @@ describe('FlowsafeDurableAgent prototype surface inventory', () => {
     );
     expect(
       unclassified,
-      `@mastra/core exposes new inherited Agent member(s) [${unclassified.join(', ')}] that FlowsafeDurableAgent also inherits. Read each implementation in the installed dist, then add it to exactly one of the lists \`agentClassified\` spreads, under the rule that list's comment states, or, if it falls under a ground documented on BLOCKED_RUN_ENTRIES in durable-agent-runner.ts, add it there with its reason, an override that throws, and a row in blockedCalls. If the OTHER supported core does not carry it here — because it is newer than the pin, or because DurableAgent shadows it there — give it a VERSION_SKEW row naming the level it sits on at each version, and classify it on every level that row names.`,
+      `@mastra/core exposes new inherited Agent member(s) [${unclassified.join(', ')}] that FlowsafeDurableAgent also inherits. Read each implementation in the installed dist and classify what calling it does. If that call falls under a ground documented on BLOCKED_RUN_ENTRIES in durable-agent-runner.ts, add the member there with its reason, an override that throws, and a row in blockedCalls, and add it to blockedOnAgentPrototype. Otherwise it meets the rule of one of the other lists (delegatingToGuard, agentNonExecution), stated in that list's comment: add it to that list. If the OTHER supported core does not carry it here — because it is newer than the pin, or because DurableAgent shadows it there — give it a VERSION_SKEW row naming the level it sits on at each version, and classify it on every level that row names.`,
     ).toEqual([]);
 
     // #then and nothing classified has since been removed from it, beyond the
@@ -1102,7 +1231,7 @@ describe('FlowsafeDurableAgent prototype surface inventory', () => {
     // under the package filter and under the root vitest project, which have
     // different working directories.
     const opener =
-      'The runner refuses every inherited entry point that falls under one of four grounds:';
+      'The runner refuses these inherited entry points, on these grounds:';
     const lines = builtin<FsModule>('node:fs')
       .readFileSync(new URL('../../../../docs/durable-agents.md', HERE), 'utf8')
       .split('\n');
@@ -1218,16 +1347,15 @@ describe('FlowsafeDurableAgent prototype surface inventory', () => {
     ).toBe(false);
   });
 
-  it('keeps resumeViaRuntime as the only resume path', () => {
+  it('keeps resumeViaRuntime, the runner resume path, on the wrapper and off the DurableAgent base', () => {
     // #given resumeViaRuntime is FlowSafe's own, not part of core's surface
     const agent = createFlowsafeDurableAgent({
       agent: testAgent(),
       runtime: fakeRuntime(),
     });
-    // #then the sanctioned resume path — reached from the approval decision,
-    // never from a client — exists here and nowhere on the base. That the
-    // INHERITED resume entry points are refused is proven by the reason-table
-    // rows above, not by this test.
+    // #then the sanctioned resume path exists here and nowhere on the base.
+    // That the INHERITED resume entry points are refused is proven by the
+    // reason-table rows above, not by this test.
     expect(typeof agent.resumeViaRuntime).toBe('function');
     expect(Object.getOwnPropertyNames(DurableAgent.prototype)).not.toContain(
       'resumeViaRuntime',
@@ -1301,9 +1429,8 @@ describe('FlowsafeDurableAgent blocked recovery entry points', () => {
    * drive the same rows through a stock DurableAgent on the same spied storage
    * and require the workflows store to be reached.
    *
-   * `toHaveBeenCalled()`, never a count: the network family resolves as soon as
-   * it has a stream object, before its loop settles, so the figure at assertion
-   * time is whatever that run happened to reach. The base fails these calls for
+   * `toHaveBeenCalled()`, never a count, for the reason registeredAgent()'s
+   * notes give on the network rows. The base fails these calls for
    * its own reasons (the unreachable model rejects, and there is no persisted
    * run) — swallowed, because the claim is only that storage was reached BEFORE
    * they did.

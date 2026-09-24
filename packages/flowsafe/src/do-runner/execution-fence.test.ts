@@ -12,10 +12,9 @@ import {
   type SqliteDatabase,
   sqliteUnitDatabase,
 } from '../../test-support/sqlite.js';
-// The raw table name and the state list come from the PROVISIONING PROTOCOL,
-// which is their single home — `./execution-fence.js` deliberately does not
-// re-export them (see its header), so a test that pinned them off the runtime
-// module would be pinning a second copy.
+// The raw table name and the state list come from the PROVISIONING PROTOCOL —
+// `./execution-fence.js` does not re-export them (see its header), so a test
+// that pinned them off the runtime module would be pinning a second copy.
 import {
   EXECUTION_FENCE_DDL,
   EXECUTION_FENCE_STATES,
@@ -540,8 +539,7 @@ describe('ExecutionFenceStore', () => {
   it('fails closed on a state name this build does not understand', async () => {
     // #given — a table this build did not create: a hand-edited row, or one
     // written by a NEWER flowsafe that added a state. The CHECK constraint is
-    // deliberately absent, which is exactly what such a database would look
-    // like from here.
+    // absent, which is exactly what such a database would look like from here.
     const { sqlite, db } = fenceFixture();
     const fence = new ExecutionFenceStore(db);
     sqlite.exec(
@@ -660,8 +658,7 @@ describe('ExecutionFenceStore', () => {
   });
 
   it('terminates on a cyclic cause chain rather than degrading into a hang', async () => {
-    // #given — an error whose cause is itself. The walk runs on the fence read
-    // that fronts every gated request, so it is bounded and cycle-aware.
+    // #given — an error whose cause is itself.
     const cyclic = new Error('D1_ERROR: query failed');
     (cyclic as { cause?: unknown }).cause = cyclic;
     const fence = new ExecutionFenceStore({
@@ -946,7 +943,7 @@ describe('versioned execution fence persistence', () => {
     });
   });
 
-  it('preserves active P1 metadata through every new proof-column prefix', async () => {
+  it('preserves active P1 metadata through every proof-column prefix', async () => {
     for (const stage of [4, 5, 6]) {
       const { fence, sqlite, db } = fenceFixture();
       const admitted = await fence.transition({
@@ -2081,7 +2078,7 @@ describe('versioned execution fence persistence', () => {
     }
   });
 
-  it('runs all persistence operations on a database without batch', async () => {
+  it('runs persistence operations on a database without batch', async () => {
     const { db: backing } = fenceFixture();
     const db = { prepare: (sql: string) => backing.prepare(sql) };
     const fence = new ExecutionFenceStore(
@@ -2123,7 +2120,7 @@ describe('execution fence admission predicates', () => {
     expect(admitsRunStart(reading('proof-only'), 'proof-1')).toBe(false);
   });
 
-  it('admits work on an EXISTING run through a drain, and in proof-only only for the proof run', () => {
+  it("admits work on an EXISTING run through a drain, and in proof-only refuses a bare run id, the proof run's included", () => {
     expect(admitsExistingRun(reading('open'), 'run-1')).toBe(true);
     expect(admitsExistingRun(reading('draining'), 'run-1')).toBe(true);
     expect(admitsExistingRun(reading('migration-locked'), 'run-1')).toBe(false);
@@ -2212,7 +2209,7 @@ describe('doErrorResponse', () => {
 
 describe('init() fence wiring', () => {
   it('auto-builds a fence from a { DB } source', async () => {
-    // #given — the shape every production host passes.
+    // #given
     const { sqlite, db } = fenceFixture();
     const { runtime, executionFence } = init({
       DB: db as never,
@@ -2257,9 +2254,8 @@ describe('init() fence wiring', () => {
   it('will not compile a { storage } source without explicit fence wiring', () => {
     // A TYPE-level pin. An UNUSED @ts-expect-error is itself an error in this
     // package's tsconfig, so `tsc` exiting 0 is what proves the negative: the
-    // options argument is required, and omitting `executionFence` from it
-    // fails. This is the compile-time obligation that keeps a host from
-    // silently building an unfenced runtime.
+    // options argument is required. This is the compile-time obligation that
+    // keeps a host from silently building an unfenced runtime.
     const build = (): unknown =>
       // @ts-expect-error a { storage } source must state its fence wiring
       init({ storage: new InMemoryStore() });
@@ -2476,7 +2472,7 @@ describe('RunnerRuntime enforcement', () => {
     });
 
     // #and — a SECOND start under the same key is refused: the proof is one
-    // run, and recordProofRun's CAS is what says so.
+    // run.
     await expect(
       runtime.start('gated', {
         runId: 'other-run',
@@ -2528,7 +2524,7 @@ describe('RunnerRuntime enforcement', () => {
     });
 
     // #then — in-flight compute is never preempted; only the NEXT start is
-    // refused. The drain sequence is drain, then prove empty, then lock.
+    // refused.
     expect(summary.status).toBe('success');
     await expect(fence.read()).resolves.toEqual({
       state: 'draining',
@@ -3114,18 +3110,16 @@ describe('FS8 D3 proof activation', () => {
 
 // ---------------------------------------------------------------------------
 // The contracts the fence's reservation seam rests on, each carrying its own
-// evidence. `refuses mismatched database ports before I/O and never lets the
-// legacy setter alter or acknowledge a modern tuple` is the structural DB-port
-// control and establishes nothing beyond it, so the import boundary, the codec
-// definitions and the refusal constructor are asserted here instead of being
-// read off that one case.
+// evidence.
 // ---------------------------------------------------------------------------
 
-type SourceReader = { readFileSync(path: string, encoding: string): string };
+type SourceReader = {
+  readFileSync(path: string | URL, encoding: string): string;
+};
 
 /**
  * A sibling module's source, through getBuiltinModule so this workers-typed
- * program needs no Node ambient types — the idiom test-support/sqlite.ts uses.
+ * program needs no Node ambient types.
  */
 function siblingSource(file: string): string {
   const fs = (
@@ -3135,7 +3129,7 @@ function siblingSource(file: string): string {
   ).process?.getBuiltinModule?.('node:fs') as SourceReader | undefined;
   if (!fs) throw new Error('node:fs unavailable — tests require node >= 22');
   return fs.readFileSync(
-    new URL(file, (import.meta as ImportMeta & { url: string }).url).pathname,
+    new URL(file, (import.meta as ImportMeta & { url: string }).url),
     'utf8',
   );
 }
@@ -3175,7 +3169,7 @@ describe('start-reservation contract evidence', () => {
     expect(namesAnotherModule("const notAnEdge = 'plain string';")).toBe(false);
   });
 
-  it('keeps the reservation contract a leaf of three declared edges', () => {
+  it('keeps the reservation contract a leaf of its declared edges', () => {
     // Source edges, not a cycle check: a cycle rule admits a one-way edge from
     // this leaf into a store, a fence, Runtime or a capability, and admitting
     // one would put the fence's codecs behind the graph they decode for. Type-
@@ -3191,7 +3185,7 @@ describe('start-reservation contract evidence', () => {
   });
 
   it('gives the fence and the reservation store one definition of each codec', () => {
-    // The strict admission-codec suites drive these two functions through the
+    // The strict admission-codec suites drive these functions through the
     // store's re-export; the fence imports them from the leaf. Same function
     // objects, so that evidence is evidence about the fence's own decode.
     expect(reExportedDecode).toBe(decodeStartReservationAdmissionResult);

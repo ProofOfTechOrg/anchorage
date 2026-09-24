@@ -2,6 +2,7 @@
 
 import { writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   DIRECT_PURGE_EXIT_CODES,
@@ -33,8 +34,7 @@ const env = {
   CLOUDFLARE_API_TOKEN: API_TOKEN,
 };
 const roles = ['a', 'b', 'recovery'] as const;
-const purgeEntry = new URL(directModuleUrl('direct-credentialed-purge'))
-  .pathname;
+const purgeEntry = fileURLToPath(directModuleUrl('direct-credentialed-purge'));
 const internalErrorLine = `${DIRECT_PURGE_OUTPUT_PREFIX}{"code":"internal-error"}\n`;
 
 beforeEach(() => {
@@ -425,7 +425,10 @@ describe('direct credentialed purge', () => {
     ],
   ] as const)('traps an injected %s behind the fixed internal-error line', async (name, injection) => {
     const world = await providerWorld({ tenants: true });
-    const preload = join(world.f.directory, `purge-${name}.mjs`);
+    const preload = join(
+      world.f.directory,
+      `purge-${name.replaceAll(' ', '-')}.mjs`,
+    );
     await writeFile(
       preload,
       `const write = process.stdout.write.bind(process.stdout);
@@ -441,7 +444,13 @@ process.stdout.write = (...args) => {
 `,
     );
     const result = await spawnDirectChild(
-      ['--import', preload, purgeEntry, '--delete', 'wrong'],
+      [
+        '--import',
+        pathToFileURL(preload).href,
+        purgeEntry,
+        '--delete',
+        'wrong',
+      ],
       {
         timeoutMs: 10_000,
         env: { ...env, FLEET_DIRECT_CONFORMANCE_CONFIG: world.f.configPath },
@@ -473,7 +482,7 @@ globalThis.fetch = async () => {
 `,
     );
     const result = await spawnDirectChild(
-      ['--import', preload, purgeEntry, '--list'],
+      ['--import', pathToFileURL(preload).href, purgeEntry, '--list'],
       {
         timeoutMs: 10_000,
         env: { ...env, FLEET_DIRECT_CONFORMANCE_CONFIG: world.f.configPath },

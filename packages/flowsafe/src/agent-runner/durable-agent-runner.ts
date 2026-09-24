@@ -2,8 +2,7 @@
 // FlowsafeDurableAgent — drive Mastra's durable-agent loop through the ONE
 // RunnerRuntime chokepoint so every agent leg inherits the substrate's
 // invariants: server-minted runIds, per-leg requestContextForRun grant
-// derivation, snapshot provenance, RunSummary, and retention purge, with no
-// second execution path to audit.
+// derivation, snapshot provenance, RunSummary, and retention purge.
 //
 // The mechanic was validated against @mastra/core 1.50.0 dist. Every offset in
 // THIS section is 1.50.0-vintage and deliberately kept as the provenance of the
@@ -33,23 +32,27 @@
 // there. The registry copy is read only for the fail-closed, over-require-safe
 // approval pre-check.
 //
-// Host-owned run ids at the boundary: stream()/generate()/prepare() are the
-// THREE inherited minting entry points. Each takes an OPTIONAL runId and, when
-// it is absent, lets core mint an unowned crypto.randomUUID() upstream
+// Host-owned run ids at the boundary: stream()/generate()/prepare() are
+// inherited minting entry points. Each takes an OPTIONAL runId and, when it is
+// absent, lets core mint an unowned crypto.randomUUID() upstream
 // (prepareForDurableExecution, agent/durable index.js:589) that
 // PATH_SAFE_ID_PATTERN then accepts, slipping past executeWorkflow's guard AND
 // RunnerRuntime.start's exact fallback, which the host-owned run-id rule
-// forbids. All three are overridden ONLY to require a caller-minted runId
-// before delegating to super. prepare() also REGISTERS the run under that id
+// forbids. They are overridden ONLY to require a caller-minted runId before
+// delegating to super. prepare() also REGISTERS the run under that id
 // (index.js:5984), so an unguarded prepare() strands an unowned run in the
 // registry. streamUntilIdle() needs no override: it drives agent.stream()
 // (index.js:368), so the stream() guard already covers it.
 //
-// EVERY OTHER inherited entry point that can drive a run — or that hands back
-// runs the caller may not own — is BLOCKED, overridden to throw before it
-// touches storage or the registry. BLOCKED_RUN_ENTRIES below is the single
-// source for which method is refused on which ground; the four grounds are
-// enumerated there.
+// EVERY OTHER inherited entry point whose call can drive a run that would not
+// land on those guarded overrides, or whose call itself discovers runs without
+// a scope the caller names, is BLOCKED, overridden to throw before it touches
+// storage or the registry. A call that returns the run id of a thread or run
+// the caller names discovers nothing. A call that installs a second execution
+// surface is refused on the fourth ground too, except the recorded exceptions
+// in durable-agent-surface.test.ts, whose reasons name that ground and say the
+// call is not refused. BLOCKED_RUN_ENTRIES below is the single source for which
+// method is refused on which ground; the grounds are enumerated there.
 //
 // Provenance for this section: read from the @mastra/core 1.53.0 dist. Chunk
 // file names are CONTENT-HASHED and move every release, so each offset below is
@@ -97,16 +100,14 @@
 //       call it.
 //
 // Agent-level surface (offsets in chunk-3S5BFAEP.js at 1.53.0 unless another
-// chunk or file is named). The base `Agent` carries 82 own members
-// DurableAgent does not shadow. Every one of them has been read and
-// dispositioned into exactly one of the three buckets below, and
-// durable-agent-surface.test.ts pins that partition by name the same way it
-// pins the 87-member durable one — so the invariant holds over the WHOLE
-// inherited surface, not just the durable half, and stays holding on a bump.
+// chunk or file is named). The base `Agent` also carries own members
+// DurableAgent does not shadow. Each is dispositioned into one of the buckets
+// below, and durable-agent-surface.test.ts pins that partition by name the same
+// way it pins the durable one — so the invariant holds over the WHOLE inherited
+// surface, not just the durable half, and stays holding on a bump.
 //
 //   BLOCKED outright, because each is its own execution path:
-//     - listSuspendedRuns() (:49532), the one direct data-returning discovery
-//       member — the discovery ground.
+//     - listSuspendedRuns() (:49532) — the discovery ground.
 //     - the network family: network() (:49263) and resumeNetwork() (:49326)
 //       start and resume THE SAME networkLoop (:32496), which compiles its own
 //       workflow and drives it with `mainWorkflow.createRun` (:32968) +
@@ -124,26 +125,26 @@
 //       every supported entry calls (requireAgentExecutionFGA, defined :48798,
 //       called from generate :49420, stream :49858, resumeStream :50002,
 //       resumeGenerate :50105, and durable stream/resume/generate
-//       chunk-XMEACVLS.js:5918/6158/6718 — seven sites, none of them on the
-//       network or legacy path). It touches no persisted workflow run state, so
-//       it is convicted on minting plus the skipped gate, not on re-drive.
-//     - sendToolApproval() (:50254), which has four exits and only one of them
-//       is the funnel its name suggests. With `messages && approved` it calls
+//       chunk-XMEACVLS.js:5918/6158/6718 — none of them on the network or
+//       legacy path). It touches no persisted workflow run state, so it is
+//       convicted on minting plus the skipped gate, not on re-drive.
+//     - sendToolApproval() (:50254), whose name suggests a funnel. With
+//       `messages && approved` it calls
 //       agentThreadStreamRuntime.continueWithMessages() (:50266), where
 //       `const runId = target.runId ?? randomUUID()` (chunk-P4Y2BJL7.js:6752)
 //       mints and `agent.stream(..., { runId })` (:6720) then starts a run
 //       under that core-minted id — path-safe, so #assertCallerRunId cannot
 //       tell it from a host-minted one. With no active thread run id it calls
-//       this.listSuspendedRuns() (:50287), already blocked. Only its tail
+//       this.listSuspendedRuns() (:50287), which is blocked. Only its tail
 //       reaches this.resumeStream() (:50338) / this.sendStreamResume()
 //       (:50345). The mint is the conviction.
 //
 //   LEFT INHERITED as funnellers, because virtual dispatch already lands them
 //   on an override: resumeStreamUntilIdle() (:49954 -> agent.resumeStream) and
 //   sendStreamResume() (:50212 -> this.resumeStream) reach the BLOCKED
-//   resumeStream. The five signal senders stay inherited because every outcome
-//   they can produce lands on this runner's terminal path; queueMessage has no
-//   remaining thread-route caller but keeps the same containment property.
+//   resumeStream. The signal senders stay inherited because every outcome they
+//   can produce lands on this runner's terminal path; queueMessage keeps the
+//   same containment property.
 //
 //     FlowSafe's queue and state routes, plus persist outcomes from wake routes,
 //     require agent memory and answer `memory-unavailable` without it. Owner
@@ -170,9 +171,9 @@
 //     cleanup before a synchronous refusal would be safe there. Upstream note:
 //     DurableAgent does not forward the wrapped Agent's `notifications`
 //     configuration, so the wrapper cannot inject a delivery policy.
-//     If both runner publication attempts and core's own fire-and-forget attempt
-//     fail, the terminal output never closes and the thread remains active until
-//     eviction or a new host start.
+//     If the runner's publication attempts and core's own fire-and-forget
+//     attempt fail, the terminal output never closes and the thread remains
+//     active until eviction or a new host start.
 //
 //   LEFT INHERITED as non-execution, on a read of each: the base delegators
 //   resume/recover/listActiveRuns/recoverActiveRuns/prepare (:50497 onward) are
@@ -180,55 +181,48 @@
 //   this instance; `observe` is likewise shadowed by DurableAgent but is NOT
 //   overridden and must not be — it only reattaches to a run's pubsub replay,
 //   and resumeViaRuntime() calls this.observe() itself after rehydration;
-//   `durable` (:44568) is a field accessor; subscribeToThread() (:49500) and
-//   getActiveThreadRunId() (:49507) read only the in-process pubsub registry,
-//   never storage; abortThreadStream() (:49600) and abortRunStream() (:49603)
-//   can stop a stream but not drive one; and genTitle() (:46377) /
+//   `durable` (:44568) is a field accessor; getActiveThreadRunId() (:49507)
+//   reads only the in-process pubsub registry, never storage;
+//   abortThreadStream() (:49600) and abortRunStream() (:49603) can stop a
+//   stream but not drive one; and genTitle() (:46377) /
 //   generateTitleFromUserMessage() (:46296) call `llm.stream`/`llm.__text` with
-//   no tools, no run id and no run state.
+//   no tools.
 //
-// Two residuals remain outside this class's reach rather than overlooked.
+// Residuals outside this class's reach include:
 // Mastra.restartAllActiveWorkflowRuns() is Mastra-level, not an agent member —
 // nothing here calls it, and it would hit core's processor-rebuild fallback if
 // a host did. getLegacyHandler() (:45595) is TS-private but runtime-public and
-// returns the very handler the legacy pair refuses; that is the same class of
-// caveat as getWorkflow() returning a startable object, and reaching it takes a
-// deliberate private cast, which is a first-party act.
+// returns the very handler the legacy entries refuse; that is the same class
+// of caveat as getWorkflow() returning a startable object, and reaching it
+// takes a deliberate private cast, which is a first-party act.
 //
-// Corroboration: breakwater's guarded handle reaches the same verdict on the
-// network four (network, resumeNetwork, approveNetworkToolCall,
-// declineNetworkToolCall), the legacy pair (generateLegacy, streamLegacy) and
-// sendToolApproval, which it files `intentionallyUnavailable`
-// (packages/breakwater/src/agent/agent.test.ts). It diverges on
-// listSuspendedRuns, which it files under `explicitlyNonExecution` — the same
-// divergence as listActiveRuns, and for the same reason: a narrowed HANDLE can
-// only omit, so a data-returning member is harmless there, while an INSTANCE
-// Mastra calls in-process must throw. The two members blocked below diverge the
-// same way; each entry records it.
+// Corroboration: breakwater's guarded handle inventory
+// (packages/breakwater/src/agent/agent.test.ts) classifies the same Agent
+// members for a narrowed HANDLE. A handle can only omit, so a data-returning
+// member or a setter is harmless there, while an INSTANCE Mastra calls
+// in-process must throw; the inventories can file a member differently for
+// that reason.
 //
-// Two more Agent-level members are blocked. Read from the @mastra/core 1.67.0
-// dist, the declared peer; offsets here are 1.67.0-vintage, in
-// agent-Dk0N0Nlg.js unless another file is named, and the 1.53.0 offsets above
-// are left as the provenance of that read. The peer carries both members, so
-// each refusal shadows a real implementation.
+// The Agent-level members below are blocked as well. Read from the
+// @mastra/core 1.67.0 dist, the declared peer; offsets here are 1.67.0-vintage,
+// in agent-Dk0N0Nlg.js unless another file is named, and the 1.53.0 offsets
+// above are left as the provenance of that read. The peer carries each of
+// them, so each refusal shadows a real implementation.
 //
 //   - listActiveThreadRuns() (:38214) is the discovery ground one scope wider
 //     than listActiveRuns. It takes no arguments and returns `{ runId,
 //     resourceId, threadId }` for every thread on the pubsub instance with a run
 //     in flight (storage-MbGlKLkB.js:1011-1023), and that state is keyed by
 //     pubsub instance rather than by agent (`#statesByPubSub`, :150, read through
-//     #getState :294), so it narrows by neither principal nor agent where the two
+//     #getState :294), so it narrows by neither principal nor agent where the
 //     listings above at least narrow by agentId. The in-process sibling
 //     getActiveThreadRunId() stays non-execution because it makes the caller name
 //     the (resourceId, threadId) pair: it confirms where this enumerates.
-//     Breakwater files it `explicitlyNonExecution` (agent.test.ts) for the reason
-//     it files listActiveRuns there: a narrowed HANDLE can only omit, so a
-//     data-returning member is harmless there, while an INSTANCE Mastra calls
-//     in-process must throw. Cost, stated rather than left to be rediscovered:
-//     core's AgentController aggregates this member across its backing agents
-//     (agent-controller-CKgKFyMR.js:5722-5725), so that aggregation now throws.
-//     It is already unusable over this class — the same controller calls the
-//     blocked sendToolApproval() at :4089 and :4118.
+//     Cost, stated rather than left to be rediscovered: core's AgentController
+//     aggregates this member across its backing agents
+//     (agent-controller-CKgKFyMR.js:5722-5725), so that aggregation throws. The
+//     controller is unusable over this class regardless — it calls the blocked
+//     sendToolApproval() at :4089 and :4118.
 //   - __setThreadRuntimeAgent() (:33609) installs another agent as the target
 //     the thread-runtime paths resolve through #getThreadRuntimeAgent()
 //     (:33612, `this.#threadRuntimeAgent ?? this`); the refusal in
@@ -237,33 +231,25 @@
 //     the containment those inherited members rely on IS virtual dispatch on
 //     `this`, so one call moves every run those paths start onto an agent
 //     carrying none of these overrides — no caller-minted runId assertion, no
-//     executeWorkflow, no #startRequesters backstop. subscribeToThread drives no
-//     run of its own; the field moves its replay target all the same. It is
-//     public in the type surface (agent.d.ts:229 declares it with no modifier),
-//     so unlike getLegacyHandler it takes no private cast.
-//     Breakwater files it `explicitlyNonExecution` (agent.test.ts) for the
-//     reason it files the listings there: a narrowed HANDLE can only omit, so
-//     a setter is harmless there, while an INSTANCE Mastra calls in-process
-//     must throw.
+//     executeWorkflow, no #startRequesters backstop. The field also moves
+//     subscribeToThread's replay target. It is public in the type surface
+//     (agent.d.ts:229 declares it with no modifier), so unlike getLegacyHandler
+//     it takes no private cast.
 //
-// Both carry the `override` keyword, like every other refusal in this class:
-// the declared peer declares both members, so the keyword holds each refusal to
-// a base that exists and fails the typecheck if a future core drops one. Each
-// signature satisfies the base it shadows on that base's own terms; the caveat
-// on each member says how.
+// Each carries the `override` keyword: the declared peer declares the member,
+// so the keyword holds the refusal to a base that exists and fails the
+// typecheck if a future core drops it. Each signature satisfies the base it
+// shadows on that base's own terms; the caveat on each member says how.
 //
-// Blocking them keeps the single-resume and no-capability guarantees true by
-// construction: resumeViaRuntime() is the ONLY way a run resumes.
-// ApprovalService.decide -> the host's ResumeRunFn ->
-// createAgentApprovalResumer, which hands every 'durable-agentic-loop' record to
-// the thread topology's resume (-> resumeViaRuntime -> runtime.resume) and
-// refuses one carrying no agent-thread target rather than falling through to the
-// generic resumer; grants are derived on the (suspendedAt, resumeCount)
-// fingerprint there. Blocking does not un-brand the agent — DurableAgentLike
-// duck-types on `recover`/`recoverActiveRuns` merely BEING functions
-// (agent-Dk0N0Nlg.js:272), which the overrides still are. The surface tripwire in
-// durable-agent-surface.test.ts requires every DurableAgent prototype member to
-// stay classified, so a future peer bump surfaces whatever it adds.
+// The runner's resume path is resumeViaRuntime(): ApprovalService.decide -> the
+// host's ResumeRunFn -> createAgentApprovalResumer -> the thread topology's
+// resume -> resumeViaRuntime -> runtime.resume; grants are derived on the
+// (suspendedAt, resumeCount) fingerprint there. Blocking does not un-brand the
+// agent — DurableAgentLike duck-types on `recover`/`recoverActiveRuns` merely
+// BEING functions (agent-Dk0N0Nlg.js:272), which the overrides still are. The
+// surface tripwire in durable-agent-surface.test.ts requires every DurableAgent
+// prototype member to stay classified, so a future peer bump surfaces whatever
+// it adds.
 //
 // Live-isolate scope: the loop resolves the tool's execute closure from the
 // in-process globalRunRegistry (populated by stream()). A DO holds one run in
@@ -374,8 +360,8 @@ const UNREGISTERED_RUN_REFUSAL_PREFIX =
 
 /**
  * @internal Metadata key that prevents a route delivery from being terminally
- * persisted. Deliberately deep-imported by `signals/thread-do-routes.ts` and
- * kept off `./index.js`.
+ * persisted. Deep-imported by `signals/thread-do-routes.ts` and kept off
+ * `./index.js`.
  */
 export const FLOWSAFE_PERSISTENCE_FORBIDDEN = 'flowsafe.persistence-forbidden';
 
@@ -551,27 +537,26 @@ export function breakwaterGuardedAgentHostProtocol(
 }
 
 /**
- * Why every member of the resume family is refused. Homed once: the seven
+ * Why every member of the resume family is refused. Homed once: the family's
  * entry points are one code path (resumeStream/resumeGenerate/the approve and
  * decline pairs all funnel into resume()), so one sentence must not drift into
- * seven.
+ * a copy per entry point.
  */
 const RESUME_FAMILY_REASON =
   "on a run-registry miss the inherited path rehydrates from persisted snapshot storage and re-drives with createRun + run.resume outside RunnerRuntime, bypassing the approval-decision path's grant derivation and the fail-closed registry rehydration";
 
 /**
- * Why the four network entry points are refused. Homed once: `network()` starts
- * and `resumeNetwork()` resumes THE SAME networkLoop, and the approve/decline
- * pair are one-line forwards to `resumeNetwork()`, so one sentence must not
- * drift into four.
+ * Why the network entry points are refused. Homed once: `network()` starts and
+ * `resumeNetwork()` resumes THE SAME networkLoop, and the approve/decline pair
+ * are one-line forwards to `resumeNetwork()`, so one sentence must not drift
+ * into a copy per entry point.
  */
 const NETWORK_FAMILY_REASON =
   'the multi-agent network loop compiles its own workflow and drives it with createRun plus run.stream/run.resumeStream on the default engine, outside RunnerRuntime, so no leg is run-owned, grant-derived or snapshot-provenanced — and under autoResumeSuspendedTools it additionally recovers a suspended run id from thread memory and re-drives that run';
 
 /**
- * Why both legacy execution entry points are refused. Homed once: each is a
- * one-line forward into the SAME AgentLegacyHandler, so they are one code path
- * wearing two names.
+ * Why the legacy execution entry points are refused. Homed once: each is a
+ * one-line forward into the SAME AgentLegacyHandler, so they are one code path.
  */
 const LEGACY_FAMILY_REASON =
   "the AI SDK v4 legacy handler is a second execution surface that converts and runs the agent's tools outside RunnerRuntime, mints its own run id when the caller omits one, and skips the authorization gate every supported entry calls (requireAgentExecutionFGA)";
@@ -592,9 +577,9 @@ const THREAD_TOOL_APPROVAL_REASON =
  * keys — so a new blocked entry cannot ship with an unexercised refusal, and a
  * reason cannot drift between the throw and the test.
  *
- * Four grounds. The module comment walks the same members by PROVENANCE
- * section (the durable surface, then the Agent surface) rather than by ground,
- * so its numbering is not this list's:
+ * The module comment walks the same members by PROVENANCE section (the durable
+ * surface, then the Agent surface) rather than by ground, so its numbering is
+ * not this list's. The grounds:
  *  1. re-drives a persisted run below `executeWorkflow`, where there is no
  *     RunnerRuntime — no run ownership, no per-leg grant, no snapshot
  *     provenance;
@@ -607,8 +592,8 @@ const THREAD_TOOL_APPROVAL_REASON =
  *     continuation, and the setter that installs a different agent as the
  *     thread runtime's execution target.
  *
- * Deliberately NOT re-exported from `./index.js` (a named-exports-only barrel),
- * so this stays off the public `@proofoftech/flowsafe/agent-runner` subpath.
+ * NOT re-exported from `./index.js` (a named-exports-only barrel), so this
+ * stays off the public `@proofoftech/flowsafe/agent-runner` subpath.
  */
 export const BLOCKED_RUN_ENTRIES = {
   recover:
@@ -834,7 +819,7 @@ export class FlowsafeDurableAgent<
    * (typeof + PATH_SAFE_ID_PATTERN, NO generation fallback); the `typeof` check
    * is load-bearing because `RegExp.test` coerces its argument to a string, so a
    * numeric runId would pass the pattern yet key a run by the number. Homed once
-   * and shared by the four call sites below so the rule cannot drift within this
+   * and shared by the call sites below so the rule cannot drift within this
    * class.
    */
   #assertCallerRunId(runId: unknown): asserts runId is string {
@@ -850,8 +835,8 @@ export class FlowsafeDurableAgent<
    * `#startRequesters` alone is insufficient because `streamUntilPersisted()`
    * removes it after the first summary while a suspended stream stays live.
    * The internal registry has no TTL, so it also covers long suspensions after
-   * the global registry's ten-minute TTL expires.
-   * The one exemption is the host's own first start: `streamUntilPersisted()`
+   * the global registry's TTL expires.
+   * It exempts the host's own first start: `streamUntilPersisted()`
    * stamps its exact options object with a single-use ticket that `stream()`
    * consumes. A private `WeakSet`, a locally constructed object, and first-use
    * consumption make that exemption unavailable to callers.
@@ -953,8 +938,7 @@ export class FlowsafeDurableAgent<
      * admits exactly the start whose key matches its nominated proof key, and
      * `RunnerRuntime.start` is where that comparison happens. It buys no
      * exactly-once property at this layer — the reservation above already did —
-     * so nothing here validates it beyond passing it on, and a run started
-     * without one behaves exactly as before.
+     * so nothing here validates it beyond passing it on.
      *
      * Parked per-runId beside the attempt token rather than threaded through
      * core, because core owns the call between `stream()` and
@@ -1089,7 +1073,7 @@ export class FlowsafeDurableAgent<
   /**
    * The same host-owned run-ID guard as {@link FlowsafeDurableAgent.stream}.
    * `prepare()`
-   * is the third inherited minting entry point: it forwards `options?.runId` into
+   * is an inherited minting entry point: it forwards `options?.runId` into
    * core's `prepareForDurableExecution` (create-durable-agent-DFHwqN2K.js:7882),
    * which mints an unowned `crypto.randomUUID()` when it is absent
    * (create-durable-agent-DFHwqN2K.js:1211) AND REGISTERS a run under that id
@@ -1134,9 +1118,9 @@ export class FlowsafeDurableAgent<
    * Refuse core's bulk recovery. `recoverActiveRuns()` is
    * {@link FlowsafeDurableAgent.listActiveRuns} plus a `recover()` per row, and
    * it is what `Mastra.recoverAllDurableAgents()` calls on every registered
-   * durable agent — so this is the one blocked entry point a host can reach
-   * without a FlowSafe call site, by opting into `recovery: { durableAgents:
-   * 'auto' }`. That loop isolates each agent in its own try/catch, so this
+   * durable agent — so a host reaches this blocked entry point without a
+   * FlowSafe call site by opting into `recovery: { durableAgents: 'auto' }`.
+   * That loop isolates each agent in its own try/catch, so this
    * refusal is logged there rather than failing boot. Refuse with an explicit
    * `runId` too: a single target is still a re-drive off RunnerRuntime.
    */
@@ -1180,10 +1164,7 @@ export class FlowsafeDurableAgent<
    * — and narrows by `agentId` plus the optional `threadId`/`resourceId`
    * filters the CALLER supplies, the same scoping `listActiveRuns()` applies.
    * Same ground too: an unfiltered call returns run, thread and resource ids
-   * across every principal that shares the agent. It is the one direct
-   * data-returning discovery member the base `Agent` surface adds; the other
-   * additions funnel through `this.resumeStream()` and so fail closed on that
-   * override.
+   * across every principal that shares the agent.
    */
   override async listSuspendedRuns(
     _options?: Parameters<
@@ -1207,9 +1188,9 @@ export class FlowsafeDurableAgent<
    * makes the caller name the (resourceId, threadId) pair it confirms.
    *
    * Signature caveat, and the reason this one is not `async`: the base declares
-   * it SYNCHRONOUS (`listActiveThreadRuns(): ActiveThreadRun[]`), so the
-   * `async … Promise<never>` shape every other refusal here carries would not
-   * be assignable to it. A re-check for a peer bump.
+   * it SYNCHRONOUS (`listActiveThreadRuns(): ActiveThreadRun[]`), so an
+   * `async … Promise<never>` refusal would not be assignable to it. A re-check
+   * for a peer bump.
    */
   override listActiveThreadRuns(): never {
     throw unavailableRunEntry(
@@ -1293,7 +1274,7 @@ export class FlowsafeDurableAgent<
    * omits one, and skips `requireAgentExecutionFGA` — the authorization gate
    * every SUPPORTED entry point calls, so this would run the agent without it.
    * (The network family skips that gate too; neither is unique in doing so.) It
-   * persists no workflow run state, which is why it is refused on those two
+   * persists no workflow run state, which is why it is refused on those
    * grounds rather than as a re-drive.
    *
    * Signature caveat: overloaded and generic in OUTPUT on the base, so this
@@ -1384,14 +1365,12 @@ export class FlowsafeDurableAgent<
   }
 
   /**
-   * Refuse core's durable resume. Until 1.53.0 this merely read the in-process
-   * run registry, which is why it was left inherited-but-unwired; now a registry
-   * MISS makes it load the persisted `durable-agentic-loop` snapshot, rehydrate
-   * through `prepare()` with the full application processor chain, and re-drive
-   * the run with `createRun + run.resume` — below `executeWorkflow`, so the leg
-   * carries no minted grant and no snapshot provenance.
-   * {@link FlowsafeDurableAgent.resumeViaRuntime} is the only resume path, and
-   * it is reached from the approval decision, never from a client.
+   * Refuse core's durable resume. From 1.53.0 a registry MISS makes it load the
+   * persisted `durable-agentic-loop` snapshot, rehydrate through `prepare()`
+   * with the full application processor chain, and re-drive the run with
+   * `createRun + run.resume` — below `executeWorkflow`, so the leg carries no
+   * minted grant and no snapshot provenance. The runner's resume path is
+   * {@link FlowsafeDurableAgent.resumeViaRuntime}.
    */
   override async resume(
     _runId: Parameters<DurableAgent<TAgentId, TTools, TOutput>['resume']>[0],
@@ -1470,11 +1449,11 @@ export class FlowsafeDurableAgent<
   }
 
   /**
-   * The 1.53.0 generate-shaped tool-approval pair. They funnel into
-   * `resumeGenerate()` -> `resume()`, so they are the same entry point wearing a
+   * The 1.53.0 generate-shaped tool-approval entries. They funnel into
+   * `resumeGenerate()` -> `resume()`, so they are the same entry point with a
    * different return type.
    *
-   * Signature caveat for both halves: the base method is GENERIC in its OUTPUT
+   * Signature caveat for each: the base method is GENERIC in its OUTPUT
    * type, which `Parameters<>` cannot carry, so the parameter type below is
    * hand-written rather than derived. Re-check it against the base on every
    * peer bump — nothing here fails if core changes the shape.
@@ -1676,7 +1655,7 @@ export class FlowsafeDurableAgent<
    * Publish one terminal ERROR attempt without throwing. The unregistered-run
    * terminal path retries once and throws its refusal only after registry
    * cleanup; resume publishes best-effort and preserves its summary or original
-   * error. Both call sites publish before cleanup because `emitError()` closes
+   * error. Its call sites publish before cleanup because `emitError()` closes
    * spans through the live global registry entry.
    */
   async #publishTerminalError(runId: string, error: unknown): Promise<boolean> {
@@ -2071,7 +2050,7 @@ export function createFlowsafeDurableAgent<
     // getWorkflow()'s concrete engine generics are not single-cast-assignable to
     // AnyWorkflow, so the double cast through `unknown` is required (init.ts gets
     // away with a single cast because coreCreateWorkflow's return already lines
-    // up). The runtime only ever reads id / getWorkflowRunById / createRun off it.
+    // up).
     options.runtime.register(workflow as unknown as AnyWorkflow);
   }
   return durableAgent;
