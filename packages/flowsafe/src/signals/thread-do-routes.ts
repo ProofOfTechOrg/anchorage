@@ -562,17 +562,13 @@ export function createThreadSignalRoutes(
     return next;
   };
 
-  const route: ThreadSignalRouter = async (request, scope) => {
-    if (request.method !== 'POST') return null;
-    const url = new URL(request.url);
+  const route = async (
+    url: URL,
+    scope: ThreadScope,
+    entryPath: AgentEntryPath,
+    body: Record<string, unknown>,
+  ): Promise<Response> => {
     const path = url.pathname;
-    if (path !== '/signal' && !path.startsWith('/signal/')) return null;
-    const entryPath = entryPathForSignalRoute(path);
-    if (entryPath === undefined) return json({ error: 'not found' }, 404);
-
-    const body = await readJson(request);
-    if (!body) return json({ error: 'a JSON body is required' }, 400);
-
     try {
       // The execution fence, read ONCE for this request and before any store
       // lookup. `migration-locked` refuses every signal route outright — the
@@ -960,15 +956,19 @@ export function createThreadSignalRoutes(
       return internalErrorResponse('signals.thread', error, 502);
     }
   };
-  return (request, scope) => {
-    if (request.method !== 'POST') return Promise.resolve(null);
-    const path = new URL(request.url).pathname;
-    if (path !== '/signal' && !path.startsWith('/signal/')) {
-      return Promise.resolve(null);
-    }
+  return async (request, scope) => {
+    if (request.method !== 'POST') return null;
+    const url = new URL(request.url);
+    const path = url.pathname;
+    if (path !== '/signal' && !path.startsWith('/signal/')) return null;
+    const entryPath = entryPathForSignalRoute(path);
+    if (entryPath === undefined) return json({ error: 'not found' }, 404);
+    // A queued request keeps its parsed body if the sender disconnects.
+    const body = await readJson(request);
+    if (!body) return json({ error: 'a JSON body is required' }, 400);
     return serializeDispatch
-      ? serializeDispatch(scope, () => route(request, scope))
-      : route(request, scope);
+      ? serializeDispatch(scope, () => route(url, scope, entryPath, body))
+      : route(url, scope, entryPath, body);
   };
 }
 

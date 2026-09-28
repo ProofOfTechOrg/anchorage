@@ -2311,11 +2311,11 @@ export function createThreadAgentHost(
     route: async (request, scope) => {
       let preflightedTermination = false;
       const preflightUrl = new URL(request.url);
-      const preflightSuffix = preflightUrl.pathname.startsWith(
-        AGENT_HOST_ROUTE_PREFIX,
-      )
-        ? preflightUrl.pathname.slice(AGENT_HOST_ROUTE_PREFIX.length)
-        : '';
+      if (!preflightUrl.pathname.startsWith(AGENT_HOST_ROUTE_PREFIX))
+        return null;
+      const preflightSuffix = preflightUrl.pathname.slice(
+        AGENT_HOST_ROUTE_PREFIX.length,
+      );
       const preflightSegments = preflightSuffix.split('/').filter(Boolean);
       // The start holds the dispatch lock while its liveness probe must remain responsive.
       if (
@@ -2399,9 +2399,19 @@ export function createThreadAgentHost(
           preflightedTermination = true;
         }
       }
+      // A queued start or resume keeps its parsed body if the sender disconnects.
+      const startBody =
+        request.method === 'POST' &&
+        preflightUrl.pathname === `${AGENT_HOST_ROUTE_PREFIX}/start`
+          ? await objectBody(request)
+          : undefined;
+      const resumeBody =
+        request.method === 'POST' &&
+        preflightUrl.pathname === `${AGENT_HOST_ROUTE_PREFIX}/resume`
+          ? await objectBody(request)
+          : undefined;
       return withDispatchLock(async () => {
         const url = new URL(request.url);
-        if (!url.pathname.startsWith(AGENT_HOST_ROUTE_PREFIX)) return null;
 
         if (
           request.method === 'GET' &&
@@ -2421,11 +2431,8 @@ export function createThreadAgentHost(
           return json({ bound: true });
         }
 
-        if (
-          request.method === 'POST' &&
-          url.pathname === `${AGENT_HOST_ROUTE_PREFIX}/start`
-        ) {
-          const body = await objectBody(request);
+        if (startBody) {
+          const body = startBody;
           if (
             'resourceOwner' in body ||
             'requestedBy' in body ||
@@ -2508,11 +2515,8 @@ export function createThreadAgentHost(
           );
         }
 
-        if (
-          request.method === 'POST' &&
-          url.pathname === `${AGENT_HOST_ROUTE_PREFIX}/resume`
-        ) {
-          const body = await objectBody(request);
+        if (resumeBody) {
+          const body = resumeBody;
           const ref = runRef(scope, body);
           const snapshotExecution = await snapshotExecutionFor(scope, ref);
           await statusFor(scope, ref, snapshotExecution.state);

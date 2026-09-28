@@ -167,6 +167,140 @@ function deferred<T>() {
 }
 
 describe('createThreadSignalRoutes', () => {
+  it.each([
+    '/signal/notification',
+    '/signal',
+  ])('reads the body before serializing %s', async (path) => {
+    const { agent } = mockAgent();
+    const storage = new InMemoryNotificationsStorage();
+    const request = post(
+      path,
+      path === '/signal'
+        ? { contents: 'hello' }
+        : { source: 'test', kind: 'update', summary: 'hello' },
+    );
+    const bodyUsed: boolean[] = [];
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+      resolveNotificationsStorage: () => storage,
+      serializeDispatch: async (_scope, operation) => {
+        bodyUsed.push(request.bodyUsed);
+        return operation();
+      },
+    });
+
+    expect((await routes(request, scopeWith(undefined)))?.status).toBe(200);
+    expect(bodyUsed).toEqual([true]);
+  });
+
+  it('records a queued notification after its sender disconnects', async () => {
+    const { agent, calls } = mockAgent();
+    const storage = new InMemoryNotificationsStorage();
+    const entered = deferred<void>();
+    const release = deferred<void>();
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    const body = new ReadableStream<Uint8Array>({
+      start(value) {
+        controller = value;
+      },
+      pull(value) {
+        value.enqueue(
+          new TextEncoder().encode(
+            JSON.stringify({
+              source: 'test',
+              kind: 'update',
+              summary: 'hello',
+            }),
+          ),
+        );
+        value.close();
+      },
+    });
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+      resolveNotificationsStorage: () => storage,
+      serializeDispatch: async (_scope, operation) => {
+        entered.resolve();
+        await release.promise;
+        return operation();
+      },
+    });
+    const responsePromise = routes(
+      new Request('http://thread/signal/notification', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body,
+        duplex: 'half',
+      } as RequestInit),
+      scopeWith(undefined),
+    );
+    await entered.promise;
+    controller.error(new Error('sender disconnected'));
+    release.resolve();
+
+    const response = await responsePromise;
+    expect(response?.status).toBe(200);
+    expect(calls.map((call) => call.method)).toEqual(['sendSignal']);
+    expect(
+      await storage.listNotifications({ threadId: 'acme_t1' }),
+    ).toMatchObject([
+      { summary: 'hello', status: 'delivered', deliveredSignalId: 's' },
+    ]);
+  });
+
+  it.each([
+    {
+      name: 'invalid signal JSON',
+      request: new Request('http://thread/signal', {
+        method: 'POST',
+        body: '{',
+      }),
+      expectedStatus: 400,
+      bodyUsed: true,
+    },
+    {
+      name: 'an unknown signal path',
+      request: post('/signal/unknown', {}),
+      expectedStatus: 404,
+      bodyUsed: false,
+    },
+    {
+      name: 'a non-signal path',
+      request: post('/other', {}),
+      expectedStatus: null,
+      bodyUsed: false,
+    },
+    {
+      name: 'a non-POST signal request',
+      request: new Request('http://thread/signal', {
+        method: 'PUT',
+        body: JSON.stringify({ contents: 'hi' }),
+      }),
+      expectedStatus: null,
+      bodyUsed: false,
+    },
+  ])('handles $name without dispatch serialization', async ({
+    request,
+    expectedStatus,
+    bodyUsed,
+  }) => {
+    const { agent } = mockAgent();
+    let serialized = 0;
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      serializeDispatch: async (_scope, operation) => {
+        serialized++;
+        return operation();
+      },
+    });
+    const response = await routes(request, scopeWith(undefined));
+    expect(response?.status ?? null).toBe(expectedStatus);
+    expect(request.bodyUsed).toBe(bodyUsed);
+    expect(serialized).toBe(0);
+  });
+
   it('stamps the DO pubsub onto the agent before signalling (the affinity carrier)', async () => {
     const { agent, pubsub } = mockAgent();
     const fakePubsub = { id: 'the-one-pubsub' };
@@ -1397,12 +1531,6 @@ describe('createThreadSignalRoutes', () => {
       scopeWith(undefined),
     );
     expect(res?.status).toBe(409);
-  });
-
-  it('returns null for a non-signal path', async () => {
-    const { agent } = mockAgent();
-    const routes = createThreadSignalRoutes({ resolveAgent: () => agent });
-    expect(await routes(post('/other', {}), scopeWith(undefined))).toBeNull();
   });
 
   it('400s a body missing contents', async () => {

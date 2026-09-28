@@ -780,6 +780,135 @@ const C_START_INPUT: ThreadAgentStartInput = {
   entryPath: 'http.start',
 };
 
+describe('agent-host request bodies awaiting dispatch', () => {
+  it('returns a non-host request without waiting for dispatch or reading its body', async () => {
+    const fixture = harness();
+    const entered = cDeferred();
+    const release = cDeferred();
+    const holder = fixture.host.serializeDispatch(async () => {
+      entered.resolve();
+      await release.promise;
+    });
+    await entered.promise;
+    const request = new Request('https://thread/signal/notification', {
+      method: 'POST',
+      body: JSON.stringify({ source: 'test', kind: 'update' }),
+    });
+    const pending = fixture.host.route(request, fixture.scope);
+    try {
+      const settled = await Promise.race([
+        pending.then(() => true),
+        new Promise<boolean>((resolve) => setImmediate(() => resolve(false))),
+      ]);
+      expect(settled).toBe(true);
+      expect(await pending).toBeNull();
+      expect(request.bodyUsed).toBe(false);
+    } finally {
+      release.resolve();
+      await holder;
+    }
+  });
+
+  it.each([
+    'start',
+    'resume',
+  ] as const)('rejects invalid %s JSON while dispatch is held', async (action) => {
+    const fixture = harness();
+    const entered = cDeferred();
+    const release = cDeferred();
+    const holder = fixture.host.serializeDispatch(async () => {
+      entered.resolve();
+      await release.promise;
+    });
+    await entered.promise;
+    const pending = fixture.host
+      .route(
+        new Request(`https://thread/_flowsafe/agent-host/${action}`, {
+          method: 'POST',
+          body: '{',
+        }),
+        fixture.scope,
+      )
+      .catch((cause: unknown) => cause);
+    try {
+      const settled = await Promise.race([
+        pending.then(() => true),
+        new Promise<boolean>((resolve) => setImmediate(() => resolve(false))),
+      ]);
+      expect(settled).toBe(true);
+      const response = doErrorResponse(await pending);
+      expect(response.status).toBe(400);
+      expect(await response.json()).toEqual({
+        error: 'a JSON object body is required',
+      });
+    } finally {
+      release.resolve();
+      await holder;
+    }
+  });
+
+  it.each([
+    'start',
+    'resume',
+  ] as const)('processes a queued %s after its sender disconnects', async (action) => {
+    const fixture = harness();
+    if (action === 'resume') seedSuspendedApprovalRun(fixture);
+    const entered = cDeferred();
+    const release = cDeferred();
+    const holder = fixture.host.serializeDispatch(async () => {
+      entered.resolve();
+      await release.promise;
+    });
+    await entered.promise;
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    const payload =
+      action === 'start'
+        ? C_START_INPUT
+        : {
+            agentId: 'writer',
+            threadId: 'acme_thread',
+            resourceId: RESOURCE_ID,
+            runId: 'acme_run',
+            entryPath: 'approval.resume',
+            requestedBy: 'operator-1',
+            resumeData: { approved: true },
+          };
+    const request = new Request(
+      `https://thread/_flowsafe/agent-host/${action}`,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: new ReadableStream<Uint8Array>({
+          start(value) {
+            controller = value;
+          },
+          pull(value) {
+            value.enqueue(new TextEncoder().encode(JSON.stringify(payload)));
+            value.close();
+          },
+        }),
+        duplex: 'half',
+      } as RequestInit,
+    );
+    const pending = fixture.host
+      .route(request, fixture.scope)
+      .catch((error: unknown) => doErrorResponse(error));
+    for (let index = 0; index < 20; index++) await Promise.resolve();
+    controller.error(new Error('sender disconnected'));
+    release.resolve();
+    await holder;
+    const response = await pending;
+
+    expect(response?.status).toBe(200);
+    expect(await response?.json()).toMatchObject({
+      runId: 'acme_run',
+      summary: { status: 'success' },
+    });
+    if (action === 'start') expect(mocked.stream).toHaveBeenCalledOnce();
+    else expect(mocked.resumeViaRuntime).toHaveBeenCalledOnce();
+  });
+});
+
 function cObserved<T extends object>(
   values: T,
   mode: 'alternate' | 'second-throw' = 'second-throw',
