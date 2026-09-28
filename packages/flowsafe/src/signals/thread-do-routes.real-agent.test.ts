@@ -682,6 +682,35 @@ describe('thread signal routes with a real durable agent', () => {
     expect(harness.start).not.toHaveBeenCalled();
   });
 
+  it('persists a direct signal into a suspended run', async () => {
+    const threadId = crypto.randomUUID();
+    const runId = crypto.randomUUID();
+    const harness = await createHarness({
+      blockingRun: { runId, principal: OWNER, status: 'suspended' },
+    });
+    await seedThread(harness.memory, threadId);
+    await registerInProcessRun(harness, threadId, runId, 'suspended');
+    const send = vi.spyOn(harness.agent, 'sendSignal');
+
+    const response = await harness.routes(
+      post('/signal', { contents: 'direct signal input' }),
+      scope(harness.pubsub, threadId),
+    );
+
+    expect(response?.status).toBe(200);
+    expect(await response?.json()).toMatchObject({
+      decision: { action: 'persist' },
+      signalId: expect.any(String),
+    });
+    expect(send).toHaveBeenCalledOnce();
+    expect(send.mock.calls[0]?.[1]).toMatchObject({
+      ifActive: { behavior: 'persist' },
+    });
+    expect(
+      (await harness.memory.recall({ threadId, hideSignals: [] })).messages,
+    ).toMatchObject([{ role: 'signal', type: 'system-reminder' }]);
+  });
+
   it("persists an owner notification when the owner's run survives only in storage", async () => {
     // #given — the owner's run is durable but not in this isolate
     const threadId = crypto.randomUUID();

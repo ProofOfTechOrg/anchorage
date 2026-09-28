@@ -243,9 +243,7 @@ export interface ThreadSignalRoutesOptions {
    * threadId)` signal key, so it MUST match whatever the loop registered under
    * or a send never finds the active run. Server-derived (a memory id is
    * TCB-only — never a client field); the host mints it from the authenticated
-   * host. Absent ⇒ threadId-only keying (resourceId ''), which is consistent
-   * within this DO but only interoperates with a loop that also omits it — the
-   * binding expected by the registered durable run.
+   * host. Delivery routes refuse with 409 when no resourceId resolves.
    */
   resolveResourceId?: (scope: ThreadScope) => string | undefined;
   /** Run-cap seam for idle-thread wakes. Absent means wakes are unmetered. */
@@ -259,12 +257,10 @@ export interface ThreadSignalRoutesOptions {
   startIdleRun?: StartIdleRun;
   /**
    * Storage-backed thread occupancy, including runs surviving DO eviction.
-   * `status` is the run's stored status when the host knows it. An owner
-   * notification to a runtime-driven agent is persisted to memory rather than
-   * queued into an active run whose reported status is not `running`: a
-   * queued delivery lives only in this isolate's memory, and a run that is not
-   * executing can be evicted before it drains. A run that reports no status is
-   * treated as running.
+   * `status` is the run's stored status when the host knows it. A delivery
+   * into a run that is not executing persists to memory because a queued
+   * delivery lives only in this isolate until the run drains it. A run that
+   * reports no status is treated as running.
    */
   resolveBlockingRun?: (
     scope: ThreadScope,
@@ -1185,12 +1181,12 @@ async function handleNotificationDispatch(options: {
       persistenceAllowed: options.persistenceAllowed,
       memoryAvailable: options.memoryAvailable,
       signal: deliverableSignal,
-      deliverActive: (runId, activeMemoryAvailable) =>
+      deliverActive: (runId, activeMemoryAvailable, resolvedActiveBehavior) =>
         options.agent.sendSignal(deliverableSignal, {
           runId,
           threadId: options.threadId,
           resourceId,
-          ifActive: { behavior: 'deliver' },
+          ifActive: { behavior: resolvedActiveBehavior },
           ifIdle: {
             behavior:
               activeMemoryAvailable && options.persistenceAllowed
@@ -1241,7 +1237,9 @@ async function handleNotificationDispatch(options: {
     const result = options.agent.sendSignal(signal, {
       threadId: options.threadId,
       resourceId,
-      ifActive: { behavior: 'deliver' },
+      ifActive: {
+        behavior: activeBehaviorForRun('deliver', durableBlockingRun),
+      },
       ifIdle: { behavior: 'persist' },
     });
     await result.accepted;
@@ -1449,6 +1447,25 @@ type BlockingRunResolver = () =>
   | undefined;
 type MemoryAvailable = () => Promise<boolean>;
 
+/** See resolveBlockingRun for why a run that is not executing gets persist. */
+function activeBehaviorForRun(
+  requested: ActiveBehavior,
+  blockingRun: Awaited<ReturnType<BlockingRunResolver>>,
+): ActiveBehavior {
+  return requested === 'deliver' &&
+    blockingRun?.status !== undefined &&
+    blockingRun.status !== 'running'
+    ? 'persist'
+    : requested;
+}
+
+function deliverableActiveBehavior(
+  behavior: ActiveBehavior,
+  persistenceAllowed: boolean,
+): ActiveBehavior {
+  return behavior === 'persist' && !persistenceAllowed ? 'discard' : behavior;
+}
+
 function notificationPrincipalMismatchResponse(runId: string): Response {
   return json(
     {
@@ -1531,19 +1548,23 @@ async function handleWake(options: {
   dispatchId?: string;
   safeContext?: Record<string, unknown>;
   /**
-   * Treat an explicit active-branch discard as the caller's own outcome: it
-   * suppresses both the memory-unavailable and the persistence-forbidden
-   * attribution. A stale active id can still read a substituted discard as
-   * the caller's, which core's bare discard result cannot distinguish.
-   */
-  activeDiscardAllowed?: boolean;
-  /**
    * The ONE fence reading this request took (never re-read per branch). The
    * route resolves it before dispatch.
    */
   executionFence: ExecutionFenceReading;
   proof?: SignalProofGuard;
-  deliverActive(runId: string, activeMemoryAvailable: boolean): WakeDelivery;
+  /**
+   * Treat an explicit active-branch discard as the caller's own outcome: it
+   * suppresses both the memory-unavailable and the persistence-forbidden
+   * attribution. A stale active id can still read a substituted discard as
+   * the caller's, which core's bare discard result cannot distinguish.
+   */
+  activeBehavior?: ActiveBehavior;
+  deliverActive(
+    runId: string,
+    activeMemoryAvailable: boolean,
+    resolvedActiveBehavior: ActiveBehavior,
+  ): WakeDelivery;
   persist(): WakeDelivery;
 }): Promise<Response> {
   return options.serializeWake(async () => {
@@ -1584,11 +1605,23 @@ async function handleWake(options: {
       const memoryAvailable = await options.memoryAvailable();
       await options.proof?.check(admitted);
       options.proof?.assertActive(admitted);
-      const delivered = options.deliverActive(activeRunId, memoryAvailable);
+      const activeBehavior = activeBehaviorForRun(
+        options.activeBehavior ?? 'deliver',
+        durableBlockingRun,
+      );
+      const deliveredActiveBehavior = deliverableActiveBehavior(
+        activeBehavior,
+        options.persistenceAllowed,
+      );
+      const delivered = options.deliverActive(
+        activeRunId,
+        memoryAvailable,
+        deliveredActiveBehavior,
+      );
       const decision = await delivered.accepted;
       if (delivered.persisted) await delivered.persisted;
       const action = recordValue(decision)?.action;
-      if (action === 'discard' && !options.activeDiscardAllowed) {
+      if (action === 'discard' && options.activeBehavior !== 'discard') {
         return options.persistenceAllowed
           ? memoryUnavailableResponse()
           : persistenceForbiddenResponse({ capped: false });
@@ -1937,6 +1970,11 @@ async function handleScheduleSignal(options: {
     } as AgentSignal['providerOptions'],
   };
   const ifActive = target.ifActive ?? { behavior: 'deliver' as const };
+  const requestedActiveBehavior = ifActive.behavior ?? 'deliver';
+  const effectiveIfActive = {
+    ...ifActive,
+    behavior: activeBehaviorForRun(requestedActiveBehavior, durableBlockingRun),
+  };
   const ifIdle = target.ifIdle ?? { behavior: 'wake' as const };
   const localActiveRunId = activeThreadRunIdOf(
     options.agent,
@@ -1944,10 +1982,13 @@ async function handleScheduleSignal(options: {
     resourceId,
   );
   const persistenceRequested = localActiveRunId
-    ? (ifActive.behavior ?? 'deliver') === 'persist'
+    ? effectiveIfActive.behavior === 'persist'
     : (ifIdle.behavior ?? 'wake') === 'persist';
+  // Occupancy can change before the send, so either branch may persist.
   const persistenceAllowed =
-    persistenceRequested && options.schedulePersistenceAllowed
+    (effectiveIfActive.behavior === 'persist' ||
+      (ifIdle.behavior ?? 'wake') === 'persist') &&
+    options.schedulePersistenceAllowed
       ? await options.schedulePersistenceAllowed({
           scheduleId,
           dispatchId,
@@ -2021,8 +2062,20 @@ async function handleScheduleSignal(options: {
   const signalTarget: SendAgentSignalOptions = {
     threadId: options.threadId,
     resourceId,
-    ifActive,
-    ifIdle: signalIfIdle,
+    ifActive: {
+      ...effectiveIfActive,
+      behavior: deliverableActiveBehavior(
+        effectiveIfActive.behavior,
+        persistenceAllowed,
+      ),
+    },
+    ifIdle: {
+      ...signalIfIdle,
+      behavior:
+        signalIfIdle.behavior === 'persist' && !persistenceAllowed
+          ? 'discard'
+          : signalIfIdle.behavior,
+    },
   };
 
   let decision: unknown;
@@ -2058,17 +2111,21 @@ async function handleScheduleSignal(options: {
       persistenceAllowed,
       memoryAvailable: options.memoryAvailable,
       signal: idleSignal,
+      activeBehavior: requestedActiveBehavior,
       runId,
       scheduleId,
       dispatchId,
       safeContext: { ...requestContext, ...idleRequestContext },
-      activeDiscardAllowed: ifActive.behavior === 'discard',
-      deliverActive: (activeRunId, activeMemoryAvailable) =>
+      deliverActive: (
+        activeRunId,
+        activeMemoryAvailable,
+        resolvedActiveBehavior,
+      ) =>
         options.agent.sendSignal(deliverableSignal, {
           runId: activeRunId,
           threadId: options.threadId,
           resourceId,
-          ifActive,
+          ifActive: { ...ifActive, behavior: resolvedActiveBehavior },
           ifIdle: {
             behavior:
               activeMemoryAvailable && persistenceAllowed
@@ -2206,12 +2263,12 @@ async function handleMessage(
       persistenceAllowed: options.persistenceAllowed,
       memoryAvailable: options.memoryAvailable,
       message,
-      deliverActive: (runId, activeMemoryAvailable) =>
+      deliverActive: (runId, activeMemoryAvailable, resolvedActiveBehavior) =>
         agent.sendMessage(message, {
           runId,
           threadId,
           resourceId,
-          ifActive: { behavior: 'deliver' },
+          ifActive: { behavior: resolvedActiveBehavior },
           // A stale active id can disappear before core sends. Persist only
           // when both the memory and authorization gates allow the write.
           ifIdle: {
@@ -2232,12 +2289,23 @@ async function handleMessage(
   if (behavior === 'persist' && !options.persistenceAllowed) {
     return persistenceForbiddenResponse({ capped: false });
   }
+  const activeBehavior = activeBehaviorForRun('deliver', durableBlockingRun);
+  const activePersistenceForbidden =
+    activeBehavior === 'persist' && !options.persistenceAllowed;
   const memoryAvailable = await options.memoryAvailable();
+  const wasActive =
+    activeThreadRunIdOf(agent, threadId, resourceId) !== undefined;
   await options.proof?.check();
   options.proof?.assertActive();
   const result = agent.sendMessage(message, {
     threadId,
     resourceId,
+    ifActive: {
+      behavior: deliverableActiveBehavior(
+        activeBehavior,
+        options.persistenceAllowed,
+      ),
+    },
     ifIdle: { behavior: memoryAvailable ? behavior : 'discard' },
   });
   const decision = await result.accepted;
@@ -2245,8 +2313,19 @@ async function handleMessage(
   if (
     behavior === 'persist' &&
     !memoryAvailable &&
+    !(wasActive && activePersistenceForbidden) &&
     recordValue(decision)?.action === 'discard'
   ) {
+    return memoryUnavailableResponse();
+  }
+  if (
+    activePersistenceForbidden &&
+    wasActive &&
+    recordValue(decision)?.action === 'discard'
+  ) {
+    return persistenceForbiddenResponse({ capped: false });
+  }
+  if (recordValue(decision)?.action === 'persist' && !memoryAvailable) {
     return memoryUnavailableResponse();
   }
   return json({
@@ -2348,6 +2427,14 @@ async function handleSignal(
   ) {
     return json({ error: 'tagName is not a valid XML name' }, 400);
   }
+  if (resourceId === undefined) {
+    return json(
+      {
+        error: 'this thread has no resourceId wired; signal delivery needs one',
+      },
+      409,
+    );
+  }
   const baseSignal: AgentSignal = {
     type: 'reactive',
     contents: body.contents,
@@ -2362,11 +2449,6 @@ async function handleSignal(
     (ACTIVE_BEHAVIORS as readonly string[]).includes(body.ifActive)
       ? (body.ifActive as ActiveBehavior)
       : 'deliver';
-  const activePersistenceForbidden =
-    activeBehavior === 'persist' && !options.persistenceAllowed;
-  const deliveredActiveBehavior: ActiveBehavior = activePersistenceForbidden
-    ? 'discard'
-    : activeBehavior;
   const durableBlockingRun = await options.blockingRun?.();
   if (
     durableBlockingRun &&
@@ -2380,22 +2462,16 @@ async function handleSignal(
     durableBlockingRun?.runId,
   );
   if (policyRefusal) return policyRefusal;
-  if (resourceId === undefined) {
-    // Active-only target: no idle branch available without a resourceId.
-    const runId = crypto.randomUUID();
-    if (!isPathSafeId(runId)) {
-      throw new Error('thread signal generated a non-path-safe run id');
-    }
-    await options.proof?.check();
-    options.proof?.assertActive();
-    const result = agent.sendSignal(signal, {
-      threadId,
-      runId,
-      ifActive: { behavior: deliveredActiveBehavior },
-    });
-    const decision = await result.accepted;
-    return json({ decision, signalId: result.signal.id });
-  }
+  const effectiveActiveBehavior = activeBehaviorForRun(
+    activeBehavior,
+    durableBlockingRun,
+  );
+  const activePersistenceForbidden =
+    effectiveActiveBehavior === 'persist' && !options.persistenceAllowed;
+  const deliveredActiveBehavior = deliverableActiveBehavior(
+    effectiveActiveBehavior,
+    options.persistenceAllowed,
+  );
   const behavior = requestedIdle(body);
   if (behavior === 'wake') {
     return handleWake({
@@ -2417,13 +2493,13 @@ async function handleSignal(
       persistenceAllowed: options.persistenceAllowed,
       memoryAvailable: options.memoryAvailable,
       signal,
-      activeDiscardAllowed: activeBehavior === 'discard',
-      deliverActive: (runId, activeMemoryAvailable) =>
+      activeBehavior,
+      deliverActive: (runId, activeMemoryAvailable, resolvedActiveBehavior) =>
         agent.sendSignal(signal, {
           runId,
           threadId,
           resourceId,
-          ifActive: { behavior: deliveredActiveBehavior },
+          ifActive: { behavior: resolvedActiveBehavior },
           ifIdle: {
             behavior:
               activeMemoryAvailable && options.persistenceAllowed
@@ -2803,12 +2879,7 @@ async function handleOwnerNotification(
   ) {
     return notificationPrincipalMismatchResponse(durableBlockingRun.runId);
   }
-  // See resolveBlockingRun for why a run that is not executing gets a persist.
-  const ifActive: ActiveBehavior =
-    durableBlockingRun?.status === undefined ||
-    durableBlockingRun.status === 'running'
-      ? 'deliver'
-      : 'persist';
+  const ifActive = activeBehaviorForRun('deliver', durableBlockingRun);
   const memoryAvailable = await options.memoryAvailable();
   if (
     !memoryAvailable &&
