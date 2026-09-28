@@ -324,6 +324,17 @@ export interface ThreadSignalRoutesOptions {
   resolveNotificationsStorage?: (
     scope: ThreadScope,
   ) => NotificationsStorage | Promise<NotificationsStorage>;
+  /**
+   * Consulted only for a non-owner `/signal/notification`. A false result
+   * answers 409 with `notification-dispatch-forbidden` before the inbox write.
+   * When absent, every non-owner notification is recorded for the dispatch
+   * tick. A true result does not guarantee dispatch: the host's automated-entry
+   * authorizer and required permissions still apply at the tick.
+   */
+  notificationDispatchAllowed?: (
+    scope: ThreadScope,
+    agentId: string,
+  ) => boolean | Promise<boolean>;
   /** Failed delivery rounds before a pending notification is discarded. */
   maxDeliveryAttempts?: number;
   /** Target-side lease and receipt store for at-least-once schedule fires. */
@@ -525,6 +536,7 @@ export function createThreadSignalRoutes(
     canPersist,
     canPersistSchedule,
     resolveNotificationsStorage,
+    notificationDispatchAllowed,
     resolveScheduleDispatchStore,
     contentPolicy,
   } = options;
@@ -917,6 +929,9 @@ export function createThreadSignalRoutes(
               runtimeDriven,
               memoryAvailable,
               inspectContent,
+              notificationDispatchAllowed: notificationDispatchAllowed
+                ? () => notificationDispatchAllowed(scope, agent.id)
+                : undefined,
               proof,
             },
           ),
@@ -1480,7 +1495,9 @@ function notificationPrincipalMismatchResponse(runId: string): Response {
 
 const OWNER_NOTIFICATION_REFUSALS = {
   'memory-unavailable': 'notification delivery requires agent memory',
-  'notification-pending': 'a matching notification is pending dispatch',
+  'notification-pending': 'a matching notification is already pending',
+  'notification-dispatch-forbidden':
+    'the target agent does not accept notification dispatch',
   'thread-blocked': 'the thread is blocked by another run',
 } as const;
 
@@ -2690,6 +2707,37 @@ async function handleState(
   });
 }
 
+function hasDueTime(row: NotificationRecord): boolean {
+  return row.deliverAt !== undefined || row.summaryAt !== undefined;
+}
+
+async function matchingPendingNotifications(
+  storage: NotificationsStorage,
+  notification: SendNotificationSignalInput,
+  threadId: string,
+  resourceId: string,
+  agentId: string,
+): Promise<NotificationRecord[]> {
+  if (!notification.dedupeKey && !notification.coalesceKey) return [];
+  const pending = await storage.listNotifications({
+    threadId,
+    status: 'pending',
+    source: notification.source,
+    agentId,
+    resourceId,
+  });
+  // Storage coalesces into a pending row with the same source, kind, agent,
+  // resource and key. D1 can match an empty key when the other key is truthy.
+  return pending.filter(
+    (row) =>
+      row.kind === notification.kind &&
+      ((notification.dedupeKey !== undefined &&
+        row.dedupeKey === notification.dedupeKey) ||
+        (notification.coalesceKey !== undefined &&
+          row.coalesceKey === notification.coalesceKey)),
+  );
+}
+
 async function handleNotification(
   agent: Agent,
   body: Record<string, unknown>,
@@ -2705,6 +2753,7 @@ async function handleNotification(
     runtimeDriven: boolean;
     memoryAvailable: MemoryAvailable;
     inspectContent: InspectSignalContent | undefined;
+    notificationDispatchAllowed?: () => boolean | Promise<boolean>;
     proof?: SignalProofGuard;
   },
 ): Promise<Response> {
@@ -2815,6 +2864,26 @@ async function handleNotification(
     if (!storage) {
       return json({ error: 'notifications storage unavailable' }, 409);
     }
+    if (
+      options.notificationDispatchAllowed &&
+      !(await options.notificationDispatchAllowed())
+    ) {
+      return ownerNotificationRefusal('notification-dispatch-forbidden');
+    }
+    // Owner residue cannot become due under the dispatch principal.
+    if (
+      (
+        await matchingPendingNotifications(
+          storage,
+          notification,
+          threadId,
+          resourceId,
+          agent.id,
+        )
+      ).some((row) => !hasDueTime(row))
+    ) {
+      return ownerNotificationRefusal('notification-pending');
+    }
     await options.proof?.check();
     options.proof?.assertActive();
     const record = await storage.createNotification({
@@ -2835,6 +2904,13 @@ async function handleNotification(
   // agent-Dk0N0Nlg.js:38431, :38447). The inbox row is the durable artifact, so
   // that path has no memory gate: without agent memory, a model-visible
   // persist is best-effort and the row stays pending.
+  const notificationsStore = await agent
+    .getMastraInstance?.()
+    ?.getStorage()
+    ?.getStore('notifications');
+  if (!notificationsStore) {
+    return json({ error: 'notifications storage unavailable' }, 409);
+  }
   await options.proof?.check();
   options.proof?.assertActive();
   const result = await agent.sendNotificationSignal(notification, {
@@ -2892,31 +2968,18 @@ async function handleOwnerNotification(
   if (!storage) {
     return json({ error: 'notifications storage unavailable' }, 409);
   }
-  const { dedupeKey, coalesceKey } = notification;
-  if (dedupeKey !== undefined || coalesceKey !== undefined) {
-    // Storage coalesces a create into the first pending row with the same
-    // source, kind, agent, resource and key. A row with a due time belongs to
-    // the dispatcher, which would deliver the owner's merged content as the
-    // dispatch principal; a row with neither time is owner residue that this
-    // create settles.
-    const pending = await storage.listNotifications({
-      threadId,
-      status: 'pending',
-      source: notification.source,
-      agentId: agent.id,
-      resourceId,
-    });
-    if (
-      pending.some(
-        (row) =>
-          row.kind === notification.kind &&
-          ((dedupeKey !== undefined && row.dedupeKey === dedupeKey) ||
-            (coalesceKey !== undefined && row.coalesceKey === coalesceKey)) &&
-          (row.deliverAt !== undefined || row.summaryAt !== undefined),
+  if (
+    (
+      await matchingPendingNotifications(
+        storage,
+        notification,
+        threadId,
+        resourceId,
+        agent.id,
       )
-    ) {
-      return ownerNotificationRefusal('notification-pending');
-    }
+    ).some(hasDueTime)
+  ) {
+    return ownerNotificationRefusal('notification-pending');
   }
   await options.proof?.check();
   options.proof?.assertActive();
@@ -2930,6 +2993,9 @@ async function handleOwnerNotification(
   });
   const now = new Date();
   let settled = false;
+  let accepted:
+    | { signalId: string; delivery: Record<string, unknown> }
+    | undefined;
   // Every settle write passes the proof gate first. When the gate refuses, the
   // row stays pending with no due time rather than bypass it.
   const settle = async (
@@ -2982,14 +3048,15 @@ async function handleOwnerNotification(
       action === 'deliver' ||
       (action === 'persist' && sent.memoryAvailable)
     ) {
+      accepted = {
+        signalId: sent.signal.id,
+        delivery: { ...decision, signalId: sent.signal.id },
+      };
       const record = await settle({
         status: 'delivered',
-        deliveredSignalId: sent.signal.id,
+        deliveredSignalId: accepted.signalId,
       });
-      return json({
-        record,
-        delivery: { ...decision, signalId: sent.signal.id },
-      });
+      return json({ record, delivery: accepted.delivery });
     }
     const cause =
       (action === 'persist' || action === 'discard') && !sent.memoryAvailable
@@ -3005,7 +3072,15 @@ async function handleOwnerNotification(
     }
     return ownerNotificationRefusal(cause);
   } catch (error) {
-    if (!settled && !isExecutionFenceRefusal(error)) {
+    if (isExecutionFenceRefusal(error)) throw error;
+    if (accepted !== undefined) {
+      const record = await settle({
+        status: 'delivered',
+        deliveredSignalId: accepted.signalId,
+      });
+      return json({ record, delivery: accepted.delivery });
+    }
+    if (!settled) {
       await settle({ status: 'discarded', deliveryReason: 'delivery-failed' });
     }
     throw error;

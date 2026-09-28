@@ -898,7 +898,7 @@ describe('thread signal routes with a real durable agent', () => {
     // #then — nothing is sent or written, and the dispatcher's row is intact
     expect(response?.status).toBe(409);
     expect(await response?.json()).toEqual({
-      error: 'a matching notification is pending dispatch',
+      error: 'a matching notification is already pending',
       reason: 'notification-pending',
     });
     expect(send).not.toHaveBeenCalled();
@@ -962,6 +962,135 @@ describe('thread signal routes with a real durable agent', () => {
     expect(
       await harness.notifications.listNotifications({ threadId }),
     ).toHaveLength(1);
+  });
+
+  it('refuses a non-owner keyed create that matches owner residue', async () => {
+    const harness = await createHarness();
+    const threadId = crypto.randomUUID();
+    await seedThread(harness.memory, threadId);
+    const residue = await harness.notifications.createNotification({
+      threadId,
+      resourceId: RESOURCE_ID,
+      agentId: 'writer',
+      source: 'provider',
+      kind: 'changed',
+      summary: 'owner summary',
+      coalesceKey: 'shared-key',
+      attributes: { origin: 'owner' },
+    });
+    const response = await harness.routes(
+      post('/signal/notification', {
+        source: 'provider',
+        kind: 'changed',
+        summary: 'provider summary',
+        coalesceKey: 'shared-key',
+        attributes: { origin: 'provider' },
+      }),
+      scope(harness.pubsub, threadId, PROVIDER),
+    );
+    expect(response?.status).toBe(409);
+    expect(await response?.json()).toMatchObject({
+      reason: 'notification-pending',
+    });
+    expect(
+      await harness.notifications.listNotifications({ threadId }),
+    ).toMatchObject([
+      {
+        id: residue.id,
+        status: 'pending',
+        summary: 'owner summary',
+        attributes: { origin: 'owner' },
+        coalescedCount: 1,
+      },
+    ]);
+    const [row] = await harness.notifications.listNotifications({ threadId });
+    expect(row?.deliverAt).toBeUndefined();
+    expect(row?.summaryAt).toBeUndefined();
+    expect(
+      await harness.notifications.listDueNotifications({
+        now: new Date(Date.now() + 86_400_000),
+      }),
+    ).toEqual([]);
+  });
+
+  it.each([
+    ['owner residue from a non-owner', false, PROVIDER],
+    ['a due non-owner row from an owner', true, OWNER],
+  ] as const)('refuses an empty dedupe key matching %s', async (_description, existingDue, incomingPrincipal) => {
+    const harness = await createHarness();
+    const threadId = crypto.randomUUID();
+    await seedThread(harness.memory, threadId);
+    await harness.notifications.createNotification({
+      threadId,
+      resourceId: RESOURCE_ID,
+      agentId: 'writer',
+      source: 'provider',
+      kind: 'changed',
+      summary: 'existing summary',
+      dedupeKey: '',
+      coalesceKey: 'old',
+      attributes: { origin: 'existing' },
+      ...(existingDue ? { deliverAt: new Date() } : {}),
+    });
+    const before = await harness.notifications.listNotifications({ threadId });
+    expect(before).toHaveLength(1);
+    expect(before[0]?.deliverAt !== undefined).toBe(existingDue);
+    expect(before[0]?.summaryAt).toBeUndefined();
+
+    const response = await harness.routes(
+      post('/signal/notification', {
+        source: 'provider',
+        kind: 'changed',
+        summary: 'incoming summary',
+        dedupeKey: '',
+        coalesceKey: 'new',
+        attributes: { origin: 'incoming' },
+      }),
+      scope(harness.pubsub, threadId, incomingPrincipal),
+    );
+
+    expect(response?.status).toBe(409);
+    expect(await response?.json()).toMatchObject({
+      reason: 'notification-pending',
+    });
+    expect(await harness.notifications.listNotifications({ threadId })).toEqual(
+      before,
+    );
+  });
+
+  it('coalesces a non-owner keyed create into a due non-owner row', async () => {
+    const harness = await createHarness();
+    const threadId = crypto.randomUUID();
+    const first = await harness.routes(
+      post('/signal/notification', {
+        source: 'provider',
+        kind: 'changed',
+        summary: 'first',
+        coalesceKey: 'shared-key',
+      }),
+      scope(harness.pubsub, threadId, PROVIDER),
+    );
+    expect(first?.status).toBe(200);
+    const second = await harness.routes(
+      post('/signal/notification', {
+        source: 'provider',
+        kind: 'changed',
+        summary: 'second',
+        coalesceKey: 'shared-key',
+      }),
+      scope(harness.pubsub, threadId, PROVIDER),
+    );
+    expect(second?.status).toBe(200);
+    expect(
+      await harness.notifications.listNotifications({ threadId }),
+    ).toMatchObject([
+      {
+        status: 'pending',
+        summary: 'second',
+        coalescedCount: 2,
+        deliverAt: expect.any(Date),
+      },
+    ]);
   });
 
   it('records a non-owner notification for dispatcher delivery', async () => {

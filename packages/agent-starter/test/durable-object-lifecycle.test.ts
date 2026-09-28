@@ -6,6 +6,7 @@ import {
   createThreadAgentHost,
 } from '@proofoftech/flowsafe/agent-host';
 import { seedDeploymentIdentity } from '@proofoftech/flowsafe/do-runner';
+import { createThreadSignalRoutes } from '@proofoftech/flowsafe/signals';
 import { describe, expect, it, vi } from 'vitest';
 
 import {
@@ -25,8 +26,17 @@ vi.mock('@proofoftech/flowsafe/agent-host', async (importOriginal) => {
   };
 });
 
+vi.mock('@proofoftech/flowsafe/signals', async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import('@proofoftech/flowsafe/signals')>();
+  return {
+    ...actual,
+    createThreadSignalRoutes: vi.fn(actual.createThreadSignalRoutes),
+  };
+});
+
 describe('starter run lifecycle wiring', () => {
-  it('FS8 D3 host activation passes the verified instance to cold alarm recovery', async () => {
+  it('passes the verified instance to cold alarm recovery and wires notification dispatch', async () => {
     const db = sqliteUnitDatabase(openSqlite()) as Env['DB'];
     await seedDeploymentIdentity(db, 'acme', 'open');
     const values = new Map<string, unknown>();
@@ -61,6 +71,8 @@ describe('starter run lifecycle wiring', () => {
       DB: db,
       DEPLOYMENT_TENANT: 'acme',
       DEPLOYMENT_IDENTITY_SECRET: 'starter-alarm-identity-secret-0001',
+      MODEL_ID: 'test/unreachable',
+      MODEL_API_KEY: 'test-key',
     } as Env;
     const createHost = vi.mocked(createThreadAgentHost);
     const actualCreate = createHost.getMockImplementation();
@@ -84,6 +96,14 @@ describe('starter run lifecycle wiring', () => {
       });
       expect(scopes[0]?.init.runtime.executionFence).toBe(executionFence(db));
       expect(scopes[0]).not.toHaveProperty('principal');
+      const routerOptions = vi.mocked(createThreadSignalRoutes).mock
+        .lastCall?.[0];
+      const dispatchAllowed = routerOptions?.notificationDispatchAllowed;
+      if (!dispatchAllowed || !scopes[0])
+        throw new Error('notification dispatch wiring is missing');
+      const threadScope = scopes[0] as Parameters<typeof dispatchAllowed>[0];
+      expect(await dispatchAllowed(threadScope, 'anchorage-agent')).toBe(true);
+      expect(await dispatchAllowed(threadScope, 'missing')).toBe(false);
       expect(values.size).toBe(0);
       expect(alarm).toBeNull();
     } finally {

@@ -289,6 +289,8 @@ export class StarterThread extends ThreadDurableObject<Env> {
         owner?.kind === scope.principal.kind && owner.id === scope.principal.id
       );
     },
+    notificationDispatchAllowed: (scope, agentId) =>
+      this.#host().notificationDispatchAllowed(scope, agentId),
     canPersistSchedule: (scope, input) =>
       canPersistScheduledAgentSignal(
         createScheduleStartSource(schedulesStore(this.env.DB)),

@@ -83,6 +83,9 @@ function mockAgent(
       stampedPubsub = p;
     },
     getMemory: () => memory,
+    getMastraInstance: () => ({
+      getStorage: () => ({ getStore: async () => ({}) }),
+    }),
     sendMessage: (_m: unknown, target: AgentCall['target']) => {
       calls.push({ method: 'sendMessage', target });
       const action =
@@ -1228,6 +1231,106 @@ describe('createThreadSignalRoutes', () => {
     });
   });
 
+  it('refuses a non-owner notification when the agent does not accept dispatch', async () => {
+    const { agent, calls } = mockAgent();
+    const storage = new InMemoryNotificationsStorage();
+    const allowed = vi.fn(() => false);
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+      canPersist: () => false,
+      resolveNotificationsStorage: () => storage,
+      notificationDispatchAllowed: allowed,
+    });
+    const scope = scopeWith(undefined);
+    const response = await routes(
+      post('/signal/notification', {
+        source: 'provider',
+        kind: 'changed',
+        summary: 'changed',
+      }),
+      scope,
+    );
+    expect(response?.status).toBe(409);
+    expect(await response?.json()).toMatchObject({
+      reason: 'notification-dispatch-forbidden',
+    });
+    expect(allowed).toHaveBeenCalledWith(scope, 'agent');
+    expect(await storage.listNotifications({ threadId: 'acme_t1' })).toEqual(
+      [],
+    );
+    expect(calls).toEqual([]);
+  });
+
+  it('records a non-owner notification when dispatch is allowed', async () => {
+    const { agent } = mockAgent();
+    const storage = new InMemoryNotificationsStorage();
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+      canPersist: () => false,
+      resolveNotificationsStorage: () => storage,
+      notificationDispatchAllowed: () => true,
+    });
+    const response = await routes(
+      post('/signal/notification', {
+        source: 'provider',
+        kind: 'changed',
+        summary: 'changed',
+      }),
+      scopeWith(undefined),
+    );
+    expect(response?.status).toBe(200);
+    expect(await response?.json()).toMatchObject({
+      delivery: { action: 'deferred', reason: 'dispatcher' },
+      record: { status: 'pending', deliverAt: expect.any(String) },
+    });
+  });
+
+  it('refuses a non-owner key that matches owner residue in core memory storage', async () => {
+    const { agent, calls } = mockAgent();
+    const storage = new InMemoryNotificationsStorage();
+    const residue = await storage.createNotification({
+      threadId: 'acme_t1',
+      resourceId: 'acme_res',
+      agentId: 'agent',
+      source: 'provider',
+      kind: 'changed',
+      summary: 'owner summary',
+      dedupeKey: 'shared-key',
+    });
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+      canPersist: () => false,
+      resolveNotificationsStorage: () => storage,
+    });
+    const response = await routes(
+      post('/signal/notification', {
+        source: 'provider',
+        kind: 'changed',
+        summary: 'provider summary',
+        dedupeKey: 'shared-key',
+      }),
+      scopeWith(undefined),
+    );
+    expect(response?.status).toBe(409);
+    expect(await response?.json()).toMatchObject({
+      reason: 'notification-pending',
+    });
+    expect(
+      await storage.listNotifications({ threadId: 'acme_t1' }),
+    ).toMatchObject([
+      {
+        id: residue.id,
+        status: 'pending',
+        summary: 'owner summary',
+        coalescedCount: 1,
+      },
+    ]);
+    expect(calls).toEqual([]);
+  });
+
   it.each([
     ['non-owner', false],
     ['runtime-driven owner', true],
@@ -1290,6 +1393,37 @@ describe('createThreadSignalRoutes', () => {
       degraded: 'not-runtime-driven',
     });
     expect(payload).not.toHaveProperty('delivery');
+  });
+
+  it('refuses an unbranded owner without a Mastra notifications store', async () => {
+    const { agent } = mockAgent({ runtimeDriven: false });
+    (
+      agent as unknown as { getMastraInstance: () => undefined }
+    ).getMastraInstance = () => undefined;
+    const sendNotificationSignal = vi.fn(() => {
+      throw new Error(
+        'sendNotificationSignal requires a notifications storage domain',
+      );
+    });
+    (
+      agent as unknown as { sendNotificationSignal: () => never }
+    ).sendNotificationSignal = sendNotificationSignal;
+    const response = await createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+    })(
+      post('/signal/notification', {
+        source: 'provider',
+        kind: 'changed',
+        summary: 'changed',
+      }),
+      scopeWith(undefined),
+    );
+    expect(response?.status).toBe(409);
+    expect(await response?.json()).toEqual({
+      error: 'notifications storage unavailable',
+    });
+    expect(sendNotificationSignal).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -5101,7 +5235,7 @@ describe('createThreadSignalRoutes — owner notifications to a runtime-driven a
     ]);
   });
 
-  it('discards the row as delivery-failed when the delivered settle write rejects', async () => {
+  it('retries a failed delivered settle without sending again', async () => {
     // #given — the first settle write fails and the second lands
     const { agent, calls } = mockAgent();
     const inbox = new InMemoryNotificationsStorage();
@@ -5117,18 +5251,47 @@ describe('createThreadSignalRoutes — owner notifications to a runtime-driven a
       scopeWith(undefined),
     );
 
-    // #then — one send, then the failed receipt is recorded as a discard
-    expect(response?.status).toBe(502);
+    expect(response?.status).toBe(200);
+    expect(await response?.json()).toMatchObject({
+      record: { status: 'delivered', deliveredSignalId: 's' },
+      delivery: { action: 'deliver', signalId: 's' },
+    });
     expect(calls.map((call) => call.method)).toEqual(['sendSignal']);
     expect(settle).toHaveBeenCalledTimes(2);
     expect(settle.mock.calls[0]?.[0]).toMatchObject({
       status: 'delivered',
       deliveredSignalId: 's',
     });
+    expect(settle.mock.calls[1]?.[0]).toMatchObject({
+      status: 'delivered',
+      deliveredSignalId: 's',
+    });
+    expect(
+      await inbox.listNotifications({ threadId: 'acme_t1' }),
+    ).toMatchObject([{ status: 'delivered', deliveredSignalId: 's' }]);
+  });
+
+  it('leaves an accepted notification pending when both delivered settles fail', async () => {
+    const { agent, calls } = mockAgent();
+    const inbox = new InMemoryNotificationsStorage();
+    const settle = vi
+      .spyOn(inbox, 'updateNotification')
+      .mockRejectedValue(new Error('inbox unavailable'));
+    const response = await ownerRoutes(agent, inbox)(
+      post('/signal/notification', notification),
+      scopeWith(undefined),
+    );
+    expect(response?.status).toBe(502);
+    expect(calls.map((call) => call.method)).toEqual(['sendSignal']);
+    expect(settle).toHaveBeenCalledTimes(2);
+    expect(settle.mock.calls.map(([input]) => input.status)).toEqual([
+      'delivered',
+      'delivered',
+    ]);
     expect(
       await inbox.listNotifications({ threadId: 'acme_t1' }),
     ).toMatchObject([
-      { status: 'discarded', deliveryReason: 'delivery-failed' },
+      { status: 'pending', deliverAt: undefined, summaryAt: undefined },
     ]);
   });
 

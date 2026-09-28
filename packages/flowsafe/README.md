@@ -496,6 +496,8 @@ function signalPolicyContext(input: SignalContentPolicyInput): RequestContext {
 
 const signalRoutes = createThreadSignalRoutes({
   // Existing server-owned resolvers and dispatch seams.
+  notificationDispatchAllowed: (scope, agentId) =>
+    host.notificationDispatchAllowed(scope, agentId),
   contentPolicy: (input) =>
     inspectContent({
       text: input.text,

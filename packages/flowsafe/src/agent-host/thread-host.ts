@@ -247,6 +247,14 @@ export interface ThreadAgentHost {
   requestContextForRun(base?: RequestContextProvider): RequestContextProvider;
   /** Serialize one target-thread dispatch decision with public start/resume routes. */
   serializeDispatch<T>(operation: () => Promise<T>): Promise<T>;
+  /**
+   * Check the catalog's system notification-dispatch declaration. Automated-entry
+   * authorization and required permissions still apply at dispatch.
+   */
+  notificationDispatchAllowed(
+    scope: ThreadScope,
+    agentId: string,
+  ): Promise<boolean>;
   start(
     scope: ThreadScope,
     input: ThreadAgentStartInput,
@@ -1866,6 +1874,18 @@ export function createThreadAgentHost(
         : values;
     },
     serializeDispatch: withDispatchLock,
+    notificationDispatchAllowed: async (scope, agentId) => {
+      instanceScopeFor(scope);
+      return (await catalogFor(scope)).automationAllowed(
+        agentId,
+        {
+          kind: 'system',
+          id: systemPrincipalId,
+          purpose: 'notification-dispatch',
+        },
+        'notification.dispatch',
+      );
+    },
     blockingRun: (scope) =>
       withBindingLock(() => findBlockingRun(instanceScopeFor(scope))),
     scheduleDispatchStatus: async (scope, input) => {

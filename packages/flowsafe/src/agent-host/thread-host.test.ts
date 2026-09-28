@@ -4388,6 +4388,28 @@ describe('createThreadAgentHost permission authorization', () => {
 });
 
 describe('createThreadAgentHost automated entry', () => {
+  it('checks notification dispatch declarations without starting or auditing', async () => {
+    const denied = harness(['writer']);
+    expect(
+      await denied.host.notificationDispatchAllowed(denied.scope, 'writer'),
+    ).toBe(false);
+    expect(
+      await denied.host.notificationDispatchAllowed(denied.scope, 'missing'),
+    ).toBe(false);
+    const allowed = harness(['writer'], {
+      allowedAutomation: [
+        { kind: 'system', entryPaths: ['notification.dispatch'] },
+      ],
+    });
+    expect(
+      await allowed.host.notificationDispatchAllowed(allowed.scope, 'writer'),
+    ).toBe(true);
+    expect(allowed.auditEvents).toEqual([]);
+    expect(denied.auditEvents).toEqual([]);
+    expect(mocked.stream).not.toHaveBeenCalled();
+    expect(allowed.state.size).toBe(0);
+    expect(denied.state.size).toBe(0);
+  });
   const SCHEDULER: ExecutionPrincipal = {
     kind: 'system',
     id: 'flowsafe-scheduler',
