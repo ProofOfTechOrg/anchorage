@@ -2,11 +2,11 @@
 
 [`README.md`](README.md) documents local, workerd, and public-demo operation.
 
-- `src/control-room/`: seven deterministic breakwater scenarios
+- `src/control-room/`: deterministic breakwater scenarios
 - `src/showcase-app.tsx`: signed-in one-page composition
 - `src/token-gate.tsx`: signed-out public entry
 - `src/glossary.ts`: product claims, workflow guides, and architecture copy
-- `worker/`: Cloudflare host and six workflow modules
+- `worker/`: Cloudflare host and workflow modules
 - `public/`: favicon, crawler metadata, sitemap, and social card
 - `scripts/`: production-bundle and public-metadata assertions
 - `wrangler.jsonc`: single Worker deployment for API and SPA
