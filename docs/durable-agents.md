@@ -79,16 +79,18 @@ import {
   type PrincipalPermissionResolver,
 } from '@proofoftech/flowsafe/agent-host';
 
-const reportAgent: AgentModule = {
-  meta: {
-    id: 'report-agent',
-    title: 'Report agent',
-    description: 'Builds and reads reports',
-    allowedRoles: ['operator'],
-    requiredPermissions: ['agents.report.run', 'reports.read'],
-  },
-  agent,
-};
+function createReportAgentModule(): AgentModule {
+  return {
+    meta: {
+      id: 'report-agent',
+      title: 'Report agent',
+      description: 'Builds and reads reports',
+      allowedRoles: ['operator'],
+      requiredPermissions: ['agents.report.run', 'reports.read'],
+    },
+    agent: createReportAgent(),
+  };
+}
 
 const resolvePrincipalPermissions: PrincipalPermissionResolver =
   (principal) => ({
@@ -104,12 +106,12 @@ The host installs the resolver beside its catalog module builder:
 ```typescript
 const agentHost = createThreadAgentHost({
   ...threadHostOptions,
-  buildModules: () => [reportAgent],
+  buildModules: () => [createReportAgentModule()],
   resolvePrincipalPermissions,
 });
 ```
 
-The resolver can map a human role or an automated identity to the same `Permission` vocabulary. Keep `permissionsForRole`, `permissionsForPrincipal`, and `accessPolicyVersion` in trusted host configuration.
+The resolver can map a human role or an automated identity to the same `Permission` vocabulary. Keep `permissionsForRole`, `permissionsForPrincipal`, and `accessPolicyVersion` in trusted host configuration. Have `createReportAgent()` construct a fresh agent because each thread Durable Object wraps its own agent.
 
 The thread host evaluates required permissions only after the human-role or automated-entry gate succeeds. A missing resolver, a thrown or rejected call, or malformed resolver output fails closed for a permission-requiring agent. Malformed output is a non-object resolution, a permission set that is not an array of canonical identifiers, or a `policyVersion` that is blank, longer than 200 characters, or contains ASCII control characters. Duplicate identifiers in the resolved set are tolerated because a repeat cannot change an all-of decision. A resolver failure surfaces only the generic audit reason `permission resolution failed`, so log failures inside the resolver itself.
 
@@ -182,27 +184,30 @@ Ordinary v1 and absent-provenance runs retain validated status, resume and lifec
 
 Protected keyed replay reads the actual wrapper's workflow once and pairs its public envelope with that observation's identity. A terminal ephemeral run does not need a retained thread binding to replay. Optional stored context may be pruned, but present selectors must agree with the original agent/thread/mode. The execution token, raw snapshot, claim and recovery journal remain internal. Proof-only signal delivery retains the selected generation through policy and memory waits and checks the active run again immediately before delivery.
 
-The runtime's pub/sub identity is reused by default. This lets the durable loop, observer, and active-thread signal delivery share one feed inside the thread Durable Object.
+The wrapper fixes its agent-level pub/sub at construction to `pubsub ?? runtime.pubsub`, or its own stream bus when both are absent. From its first start, every threaded run registers on the state that signal delivery and the run's drain read. A resumed run registers there when `threadRuntime` is passed. The constructor throws a `TypeError` when the wrapped agent has a pub/sub of its own that differs. The wrapper sets the wrapped agent's pub/sub, so that pub/sub follows the last wrapper constructed over the agent: do not wrap one agent in two thread Durable Objects that are live at once.
 
 This wrapper does not add the guarded-agent brand or catalog authorization to a raw agent. Use `agent-host` for the supported protected public surface. Route clients through its authenticated run routes, which start each run at the host start seam. Direct `stream()` with an unregistered id resolves to a failed output; direct `generate()` rejects. `stream()`, `generate()`, `prepare()`, and `streamUntilPersisted()` synchronously refuse a live id. A successful `prepare({ runId: X })` keeps `X` live until core cleans up that prepared run.
 
 The wrapper's constructor throws a `TypeError` when the agent it wraps has channels configured, declares Mastra agent schedules, sets the `durable` option, or is already a durable agent, such as a Mastra `DurableAgent` or another Flowsafe wrapper. Channels dispatch inbound messages and tool approval decisions to the wrapped agent outside `RunnerRuntime`, a Mastra schedule worker fires declared schedules on it outside `RunnerRuntime`, and a Mastra that registers a Mastra `DurableAgent`, or an agent with the `durable` option, exposes that agent's own recovery and run listing, which the runner does not guard. The guarded agent catalog applies the same checks to each module, so the thread host refuses such a module before its Mastra registers the agent. The wrapper itself cannot be registered on any Mastra; the Mastra host features that register it are listed after the grounds below.
 
+Do not wrap an agent constructed with Mastra `signals`. Core connects configured signal providers to that raw agent before FlowSafe builds its runtime, so their deliveries use core's raw-agent notification and signal path instead of the thread topology and `RunnerRuntime`. Use FlowSafe's signal-provider host and thread delivery instead.
+
 `RunnerRuntime` refuses a workflow object that another Mastra has registered. Register each workflow object on one runtime, and do not add a runtime's workflows, or the wrapper's `getWorkflow()`, to another Mastra.
 
-The runner cannot reach the raw agent you still hold. Channels bound to it after wrapping dispatch to it outside `RunnerRuntime`, and schedules set on it fire on it from the schedule worker of any Mastra that registers it and runs `startWorkers()`. Registering the raw agent on another Mastra moves its memory, when that memory has no storage of its own, and its pub/sub fallback to that Mastra. Do not bind channels or declare schedules on the raw agent after wrapping it, and do not register it on another Mastra.
+The runner cannot reach the raw agent you still hold. Channels bound to it after wrapping dispatch to it outside `RunnerRuntime`, and schedules set on it fire on it from the schedule worker of any Mastra that registers it and runs `startWorkers()`. Registering the raw agent on another Mastra moves its memory when that memory has no storage of its own. Do not bind channels or declare schedules on the raw agent after wrapping it, and do not register it on another Mastra.
 
 The runner refuses these inherited entry points, on these grounds:
 
 - **Re-drives a persisted run below `RunnerRuntime`.** The recovery entries `recover()` and `recoverActiveRuns()`, and the resume family `resume()`, `resumeStream()`, `resumeGenerate()`, `approveToolCall()`, `declineToolCall()`, `approveToolCallGenerate()`, and `declineToolCallGenerate()`, which rehydrate from snapshot storage on a run-registry miss.
-- **Discovers runs without the host topology's per-principal ownership checks**, returning run, thread, and resource ids the caller does not own: the recovery discovery API `listActiveRuns()`, the agent-level `listSuspendedRuns()`, and `listActiveThreadRuns()`, which takes no arguments and returns those ids for every thread on the pub/sub instance with a run in flight, scoped by neither principal nor agent.
+- **Discovers runs or thread identities without the host topology's per-principal ownership checks**: the recovery discovery API `listActiveRuns()`, the agent-level `listSuspendedRuns()`, and `listActiveThreadRuns()`, which returns run, thread and resource ids across the pub/sub instance; `discoverThreadPeers()` returns advertised agent, resource, thread and source identities without a caller-named thread or principal.
 - **Deletes snapshot rows that deployment-scoped retention owns**: `deleteRunSnapshots()`.
 - **Is a second execution surface outside `RunnerRuntime`, or mints a run id below the caller.** The network family `network()`, `resumeNetwork()`, `approveNetworkToolCall()`, and `declineNetworkToolCall()` compile and drive the multi-agent loop's own workflow with `createRun` plus `run.stream` or `run.resumeStream` on the default engine. The AI SDK v4 legacy entries `generateLegacy()` and `streamLegacy()` run the agent's tools through Mastra's legacy handler, skipping the authorization check every supported entry point calls. And `sendToolApproval()` reads like a resume but starts a run through the thread runtime's continuation when given messages. `network()`, `generateLegacy()`, `streamLegacy()`, and `sendToolApproval()` through the thread runtime's continuation generate a run id when the caller omits one, which is the unowned-run-id fallback Flowsafe refuses, so blocking them extends the host-minted run id rule that `stream()`, `generate()`, and `prepare()` enforce. `__setThreadRuntimeAgent()`, `setChannels()`, and `__setDeclaredSchedules()` are refused on the same ground without starting anything themselves: each installs something that later runs the agent outside `RunnerRuntime`, whether a thread-runtime execution target, a channel dispatch target, or a schedule that a Mastra schedule worker fires.
-- **Binds the runner to a Mastra the runtime did not build.** `__setMastra()` and `__registerMastra()` bind the wrapper and its wrapped agent to the Mastra they are given, so every later leg is prepared against that Mastra. Registered through `Mastra.addAgent()` once the runtime has built its own Mastra, they also repoint the runtime's loop workflow, and with it run state, to that Mastra's storage.
+- **Installs a runtime service — a Mastra, memory or pub/sub — after construction.** `__setMastra()` and `__registerMastra()` bind the wrapper and its wrapped agent to the Mastra they are given, so every later leg is prepared against that Mastra. Registered through `Mastra.addAgent()` once the runtime has built its own Mastra, they also repoint the runtime's loop workflow, and with it run state, to that Mastra's storage. `__setMemory()` and `__setPubSub()` install a service on the wrapper and forward it to the wrapped agent; the wrapper's pub/sub is fixed at construction.
+- **Cancels a run outside `RunnerRuntime`'s terminal lifecycle.** `abortRunStream()` and `abortThreadStream()` bypass the terminate route's ownership and disputed-settlement checks. Cancel through the terminate route; the stream result's own `abort()` remains available.
 
 All blocked inherited entries throw. The runner's resume path is `resumeViaRuntime()`, and host starts use `streamUntilPersisted()`.
 
-Mastra's own host features fail closed on the wrapper, because each registers it on a Mastra. `Mastra.addAgent()` throws, and so does constructing a `Mastra` or an `MCPServer` with the wrapper in `agents`. An `AgentController` over the wrapper throws at `init()`, where it registers each backing agent on the controller's Mastra. A wrapper configured as a static sub-agent of an agent registered on a Mastra makes every run of that parent fail when the parent converts its tools, so do not use the wrapper as a sub-agent. The signal and message senders remain inherited because every run outcome they can produce lands on the runner's terminal path. The `queue` and `state` routes persist rather than wake on idle. An owner notification is recorded in the durable inbox and delivered at ingestion under the owner's principal, into the owner's running run or persisted to memory; it never wakes a run. An accepted non-owner notification is recorded for the trusted dispatch tick, which delivers each row as the dispatch principal. A signal delivered into a running run remains in the isolate until the run's next step reads it; if the run suspends first, the signal can be lost with the isolate. Delivery into a suspended run persists to agent memory when the principal may persist and memory exists; otherwise the route answers `persistence-forbidden` or `memory-unavailable`. An explicit `discard` stays a discard. A default or `ifIdle: 'persist'` message or signal still delivers into a running run without memory; the memory gate responds only when core's outcome for the request replaced a persist (an idle discard substituted for a requested persist, or an active persist that no memory could write). If a direct sender call or Mastra completion drain reaches core's run-id mint, the runner persists the input when allowed, emits a terminal error, and lets Mastra clean up the thread state without entering `RunnerRuntime`.
+Mastra's own host features fail closed on the wrapper. `Mastra.addAgent()` throws, and so does constructing a `Mastra` or an `MCPServer` with the wrapper in `agents`. An `AgentController` over the wrapper throws during service installation when configured with memory or pub/sub that the wrapped agent does not own; otherwise, its `init()` still throws when it registers the wrapper on its Mastra through `__setMastra()`. A parent registered on a Mastra calls the wrapper's refused `__registerMastra()` during static sub-agent conversion. A parent with pub/sub also calls the refused `__setPubSub()` when the wrapped agent has no pub/sub of its own, even if the parent has no Mastra. Do not use the wrapper as a sub-agent. The signal and message senders remain inherited because every run outcome they can produce lands on the runner's terminal path. The `queue` and `state` routes persist rather than wake on idle. An owner notification is recorded in the durable inbox and delivered at ingestion under the owner's principal, into the owner's running run or persisted to memory; it never wakes a run. An accepted non-owner notification is recorded for the trusted dispatch tick, which delivers each row as the dispatch principal. A signal delivered into a running run remains in the isolate until the run's next step reads it; if the run suspends first, the signal can be lost with the isolate. Delivery into a suspended run persists to agent memory when the principal may persist and memory exists; otherwise the route answers `persistence-forbidden` or `memory-unavailable`. An explicit `discard` stays a discard. A default or `ifIdle: 'persist'` message or signal still delivers into a running run without memory; the memory gate responds only when core's outcome for the request replaced a persist (an idle discard substituted for a requested persist, or an active persist that no memory could write). If a direct sender call or Mastra completion drain reaches core's run-id mint, the runner persists the input when allowed, emits a terminal error, and lets Mastra clean up the thread state without entering `RunnerRuntime`.
 
 ## Create and protect memory identities
 
@@ -244,7 +249,7 @@ When you adopt a storage domain, declare its retention or standing-state lifecyc
 
 Subclass `ThreadDurableObject`, construct the catalog modules for that instance, and install `createThreadAgentHost()` and `createThreadSignalRoutes()` inside the subclass route. These factories share the asserted `ThreadScope` instead of mutable module or request-global state.
 
-- stamps the runtime pub/sub identity onto the agent before each call;
+- sets the thread's pub/sub on an agent that is not runtime-driven before each call, and answers `503` when a runtime-driven agent's pub/sub is missing or differs from the thread's;
 - serializes delivery into the thread;
 - checks whether a run is already active;
 - applies active and idle behavior;

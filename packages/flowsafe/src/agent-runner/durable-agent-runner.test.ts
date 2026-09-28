@@ -149,7 +149,7 @@ function fakeRuntime(
   };
 }
 
-function testAgent(id = 'writer'): Agent {
+function testAgent(id = 'writer', pubsub?: EventEmitterPubSub): Agent {
   return new Agent({
     id,
     name: id,
@@ -157,6 +157,7 @@ function testAgent(id = 'writer'): Agent {
     // A model-router id string (never invoked): executeWorkflow drives the
     // runtime, not the LLM, so the agent only has to construct.
     model: 'openai/gpt-4o-mini',
+    pubsub,
   });
 }
 
@@ -2475,7 +2476,7 @@ describe('FlowsafeDurableAgent INV-1 boundary (prepare)', () => {
   });
 });
 
-describe('FlowsafeDurableAgent pubsub identity (DL-001)', () => {
+describe('FlowsafeDurableAgent pubsub identity', () => {
   it("defaults the agent's stream pubsub to the runtime's identity", () => {
     // #given a runtime carrying a pubsub identity, and no explicit pubsub option
     const pubsub = new EventEmitterPubSub();
@@ -2491,6 +2492,37 @@ describe('FlowsafeDurableAgent pubsub identity (DL-001)', () => {
     // observe()/emitError align (no dead feed) without the host wiring it twice
     expect(agent.pubsub).toBe(pubsub);
   });
+
+  it('refuses a wrapped agent with a different pubsub of its own', () => {
+    const ownPubsub = new EventEmitterPubSub();
+    const { runtime } = fakeRuntime({ pubsub: new EventEmitterPubSub() });
+    const rawAgent = testAgent('writer', ownPubsub);
+
+    expect(() =>
+      createFlowsafeDurableAgent({ agent: rawAgent, runtime }),
+    ).toThrow(TypeError);
+  });
+
+  it('accepts a wrapped agent sharing the runtime pubsub', () => {
+    const pubsub = new EventEmitterPubSub();
+    const { runtime } = fakeRuntime({ pubsub });
+    const rawAgent = testAgent('writer', pubsub);
+
+    const agent = createFlowsafeDurableAgent({ agent: rawAgent, runtime });
+    expect(agent.getPubSub()).toBe(pubsub);
+  });
+
+  it('accepts a registered agent using its Mastra pubsub fallback', () => {
+    const pubsub = new EventEmitterPubSub();
+    const mastra = new Mastra({ agents: { writer: testAgent() }, pubsub });
+    const rawAgent = mastra.getAgentById('writer');
+    const agent = createFlowsafeDurableAgent({
+      agent: rawAgent,
+      runtime: fakeRuntime({ pubsub }).runtime,
+    });
+
+    expect(agent.getPubSub()).toBe(pubsub);
+  });
 });
 
 describe('FlowsafeDurableAgent thread runtime registration and rehydration', () => {
@@ -2499,73 +2531,44 @@ describe('FlowsafeDurableAgent thread runtime registration and rehydration', () 
     vi.restoreAllMocks();
   });
 
-  it('registers a started stream output under the same pubsub and memory options', async () => {
+  it('registers a resumed run on the agent pubsub with the default cache', async () => {
     const pubsub = new EventEmitterPubSub();
-    const { runtime } = fakeRuntime({ pubsub });
-    const registerRun = vi.fn(async () => undefined);
+    const { runtime, resume } = fakeRuntime({
+      pubsub,
+      resumeContext: actorContext(),
+    });
+    const registerRun = vi.fn(async (..._args: unknown[]) => undefined);
     const agent = createFlowsafeDurableAgent({
-      agent: testAgent(),
+      agent: guardedTestAgent(),
       runtime,
-      cache: false,
       threadRuntime: { registerRun } as never,
     });
-    const output = { id: 'output' };
-    vi.spyOn(DurableAgent.prototype, 'stream').mockResolvedValue({
-      output,
-    } as never);
-    const options = {
+    await agent.prepare('initial request', {
       runId: 'run-1',
+      requestContext: actorContext(),
       memory: { thread: 'thread-1', resource: 'resource-1' },
-    } as never;
-
-    await agent.stream('hello', options);
-
-    expect(registerRun).toHaveBeenCalledWith(agent, output, options, pubsub);
-  });
-
-  it.each([
-    ['boolean true', true],
-    ['object-valued untilIdle', { maxWaitMs: 1000 }],
-  ])('does not register the outer aggregate stream for %s', async (_label, untilIdle) => {
-    const pubsub = new EventEmitterPubSub();
-    const { runtime } = fakeRuntime({ pubsub });
-    const registerRun = vi.fn(async () => undefined);
-    const agent = createFlowsafeDurableAgent({
-      agent: testAgent(),
-      runtime,
-      cache: false,
-      threadRuntime: { registerRun } as never,
     });
-    vi.spyOn(DurableAgent.prototype, 'stream').mockResolvedValue({
-      output: { id: 'aggregate' },
-    } as never);
+    registryFor(agent).clear();
+    globalRunRegistry.clear();
+    const output = { id: 'rehydrated' };
+    const memory = { thread: 'thread-1', resource: 'resource-1' };
+    vi.spyOn(agent, 'observe').mockResolvedValue({ output } as never);
 
-    await agent.stream('hello', {
+    await agent.resumeViaRuntime({
       runId: 'run-1',
-      untilIdle,
-    } as never);
-
-    expect(registerRun).not.toHaveBeenCalled();
-  });
-
-  it('registers a concrete stream when untilIdle is explicitly false', async () => {
-    const { runtime } = fakeRuntime();
-    const registerRun = vi.fn(async () => undefined);
-    const agent = createFlowsafeDurableAgent({
-      agent: testAgent(),
-      runtime,
-      threadRuntime: { registerRun } as never,
+      requestedBy: 'reviewer-1',
+      memory,
     });
-    vi.spyOn(DurableAgent.prototype, 'stream').mockResolvedValue({
-      output: { id: 'concrete' },
-    } as never);
 
-    await agent.stream('hello', {
-      runId: 'run-1',
-      untilIdle: false,
-    } as never);
-
-    expect(registerRun).toHaveBeenCalledTimes(1);
+    expect(resume).toHaveBeenCalledOnce();
+    expect(registerRun).toHaveBeenCalledOnce();
+    expect(registerRun).toHaveBeenCalledWith(
+      agent,
+      expect.objectContaining(output),
+      { runId: 'run-1', memory },
+      agent.getPubSub(),
+    );
+    expect(agent.getPubSub()).toBe(pubsub);
   });
 
   it('rehydrates guarded registries without replaying application input processors', async () => {

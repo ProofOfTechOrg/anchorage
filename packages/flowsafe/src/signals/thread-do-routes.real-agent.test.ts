@@ -55,6 +55,14 @@ import {
 
 const RESOURCE_ID = 'resource-real';
 const DRAIN_MARK = 'MKDRAINLEFTOVER';
+const cacheShapes = [
+  { name: 'default cache', cache: 'default' as const },
+  { name: 'cache disabled', cache: false as const },
+];
+
+function drained(runId: string) {
+  return globalRunRegistry.get(runId)?.drainPendingSignals?.('pending');
+}
 
 const OWNER = humanPrincipal({ id: 'operator', role: 'operator' });
 const DISPATCHER = trustAutomationPrincipal({
@@ -110,7 +118,7 @@ function actorContext() {
   return context;
 }
 
-function fakeRuntime(pubsub: ReturnType<typeof createHostPubSub>) {
+function fakeRuntime(pubsub: ReturnType<typeof createHostPubSub> | undefined) {
   const registered: string[] = [];
   const start = vi.fn(
     async (_workflowId: string, options: { runId: string }) => ({
@@ -142,6 +150,7 @@ async function createHarness(
     contentPolicy?: SignalContentPolicy;
     runCapOpen?: boolean;
     policies?: readonly PolicyEvaluator[];
+    cache?: 'default' | false;
   } = {},
 ) {
   const pubsub = createHostPubSub();
@@ -164,10 +173,9 @@ async function createHarness(
     agent: mastra.getAgentById('writer'),
     runtime,
     pubsub,
-    cache: false,
+    cache: options.cache === 'default' ? undefined : false,
     threadRuntime: mastra.agentThreadStreamRuntime,
   });
-  agent.__setPubSub(pubsub);
   const startIdleRun = vi.fn(async (input: StartIdleRunInput) => ({
     runId: input.runId,
   }));
@@ -239,6 +247,55 @@ async function seedThread(memory: MockMemory, threadId: string) {
       metadata: {},
     },
   });
+}
+
+async function heldRun(
+  fixture: Pick<Harness, 'agent' | 'memory' | 'start'>,
+  threadId: string,
+  runId = crypto.randomUUID(),
+) {
+  await seedThread(fixture.memory, threadId);
+  let finish!: () => void;
+  fixture.start.mockImplementationOnce(
+    (_workflowId, options: { runId: string }) =>
+      new Promise((resolve) => {
+        finish = () =>
+          resolve({
+            runId: options.runId,
+            status: 'failed' as const,
+            error: 'host test terminal',
+          });
+      }),
+  );
+  const pending = fixture.agent.streamUntilPersisted(
+    'host stream',
+    {
+      runId,
+      memory: { thread: threadId, resource: RESOURCE_ID },
+      requestContext: actorContext(),
+    },
+    'operator',
+    'human',
+    undefined,
+    undefined,
+    undefined,
+    {
+      startIdentity: {
+        owner: { kind: 'human', id: 'operator' },
+        target: { kind: 'agent', id: 'writer', threadId },
+      },
+      agentStart: { threaded: true },
+      onPreparedStartIdentity: undefined,
+    },
+  );
+  await vi.waitFor(() => expect(fixture.start).toHaveBeenCalledOnce());
+  return { runId, pending, finish };
+}
+
+async function finishRun(run: Awaited<ReturnType<typeof heldRun>>) {
+  run.finish();
+  const result = await within(run.pending, 'held host run persistence');
+  await within(result.output.consumeStream(), 'held host run terminal');
 }
 
 async function recalled(memory: MockMemory, threadId: string) {
@@ -337,6 +394,36 @@ afterEach(() => {
 });
 
 describe('thread signal routes with a real durable agent', () => {
+  it.each(
+    cacheShapes,
+  )('routes and drains a signal into an HTTP-started run with $name', async ({
+    cache,
+  }) => {
+    const threadId = crypto.randomUUID();
+    const runId = crypto.randomUUID();
+    const harness = await createHarness({
+      cache,
+      blockingRun: { runId, principal: OWNER, status: 'running' },
+    });
+    const run = await heldRun(harness, threadId, runId);
+    try {
+      const response = await harness.routes(
+        post('/signal', { contents: 'routed signal' }),
+        scope(harness.pubsub, threadId),
+      );
+      expect(response?.status).toBe(200);
+      expect(await response?.json()).toMatchObject({
+        decision: { action: 'deliver', runId },
+      });
+      expect(drained(runId)).toEqual([
+        expect.objectContaining({ contents: 'routed signal' }),
+      ]);
+    } finally {
+      await finishRun(run);
+      expect(unhandled).toEqual([]);
+    }
+  }, 15_000);
+
   it.each([
     'deliver',
     'exhausted',
@@ -1844,4 +1931,208 @@ describe('FS8 D3 proof activation actual agent authority', () => {
     expect(saves).not.toHaveBeenCalled();
     expect(response?.status).toBe(503);
   });
+});
+
+function wrapper(options: {
+  cache?: 'default' | false;
+  pubsub?: ReturnType<typeof createHostPubSub>;
+  runtimePubsub?: ReturnType<typeof createHostPubSub>;
+}) {
+  const memory = new MockMemory();
+  const mastra = new Mastra({
+    logger: false,
+    agents: { writer: guardedTestAgent(memory) },
+    ...(options.runtimePubsub ? { pubsub: options.runtimePubsub } : {}),
+  });
+  const rawAgent = mastra.getAgentById('writer');
+  const { runtime, start } = fakeRuntime(options.runtimePubsub);
+  const agent = createFlowsafeDurableAgent({
+    agent: rawAgent,
+    runtime,
+    ...(options.pubsub ? { pubsub: options.pubsub } : {}),
+    ...(options.cache === false ? { cache: false } : {}),
+    threadRuntime: mastra.agentThreadStreamRuntime,
+  });
+  return { agent, mastra, memory, start };
+}
+
+describe('durable wrapper direct abort and peer discovery refusals', () => {
+  it.each([
+    'abortRunStream',
+    'abortThreadStream',
+  ] as const)('refuses direct %s while a host run stays live', async (method) => {
+    const threadId = crypto.randomUUID();
+    const fixture = wrapper({});
+    const run = await heldRun(fixture, threadId);
+    try {
+      const controller = globalRunRegistry.get(run.runId)?.abortController;
+      expect(controller).toBeDefined();
+      expect(controller?.signal.aborted).toBe(false);
+      let refusal: unknown;
+      try {
+        method === 'abortRunStream'
+          ? fixture.agent.abortRunStream(run.runId)
+          : fixture.agent.abortThreadStream({
+              threadId,
+              resourceId: RESOURCE_ID,
+            });
+      } catch (error) {
+        refusal = error;
+      }
+      expect(controller?.signal.aborted).toBe(false);
+      expect(refusal).toBeInstanceOf(Error);
+      expect((refusal as Error).message).toContain(
+        `FlowsafeDurableAgent.${method}() is unavailable`,
+      );
+    } finally {
+      await finishRun(run);
+    }
+  }, 15_000);
+
+  it('keeps the stream result abort handle working for a host run', async () => {
+    const fixture = wrapper({});
+    const stream = vi.spyOn(fixture.agent, 'stream');
+    const run = await heldRun(fixture, crypto.randomUUID());
+    try {
+      const controller = globalRunRegistry.get(run.runId)?.abortController;
+      expect(controller?.signal.aborted).toBe(false);
+      const result = await within(
+        stream.mock.results[0]?.value as Promise<{
+          abort: () => Promise<void>;
+        }>,
+        'held host stream result',
+      );
+      await result.abort();
+      expect(controller?.signal.aborted).toBe(true);
+    } finally {
+      await finishRun(run);
+    }
+  }, 15_000);
+
+  it('refuses peer discovery across wrappers sharing a pub/sub', async () => {
+    const pubsub = createHostPubSub();
+    const a = wrapper({ pubsub, runtimePubsub: pubsub });
+    const b = wrapper({ pubsub, runtimePubsub: pubsub });
+    const claim = await a.agent.claimThreadOwnership({
+      threadId: crypto.randomUUID(),
+      resourceId: RESOURCE_ID,
+      peer: { label: 'advertised peer' },
+    });
+    expect(claim.claimed).toBe(true);
+    try {
+      await expect(b.agent.discoverThreadPeers()).rejects.toThrow(
+        'FlowsafeDurableAgent.discoverThreadPeers() is unavailable',
+      );
+    } finally {
+      claim.unsubscribe();
+    }
+  }, 15_000);
+});
+
+describe('durable wrapper pub/sub identity', () => {
+  it.each(
+    cacheShapes,
+  )('isolates same-thread runs between wrappers on different pub/subs with $name', async ({
+    cache,
+  }) => {
+    const threadId = crypto.randomUUID();
+    const pubsubA = createHostPubSub();
+    const pubsubB = createHostPubSub();
+    const a = wrapper({ cache, pubsub: pubsubA, runtimePubsub: pubsubA });
+    const b = wrapper({ cache, pubsub: pubsubB, runtimePubsub: pubsubB });
+    const runA = await heldRun(a, threadId);
+    let runB: Awaited<ReturnType<typeof heldRun>> | undefined;
+    try {
+      expect(
+        b.agent.getActiveThreadRunId({ threadId, resourceId: RESOURCE_ID }),
+      ).toBeUndefined();
+      expect(
+        a.agent.getActiveThreadRunId({ threadId, resourceId: RESOURCE_ID }),
+      ).toBe(runA.runId);
+      runB = await heldRun(b, threadId);
+      expect(
+        a.agent.getActiveThreadRunId({ threadId, resourceId: RESOURCE_ID }),
+      ).toBe(runA.runId);
+      expect(
+        b.agent.getActiveThreadRunId({ threadId, resourceId: RESOURCE_ID }),
+      ).toBe(runB.runId);
+    } finally {
+      await finishRun(runA);
+      if (runB) await finishRun(runB);
+      expect(unhandled).toEqual([]);
+    }
+  }, 15_000);
+
+  it.each(
+    cacheShapes.flatMap((shape) => [
+      { ...shape, runtimePubsub: false as const },
+      { ...shape, runtimePubsub: true as const },
+    ]),
+  )('delivers and drains a direct signal with $name and runtime pubsub $runtimePubsub', async ({
+    cache,
+    runtimePubsub,
+  }) => {
+    const threadId = crypto.randomUUID();
+    const pubsub = runtimePubsub ? createHostPubSub() : undefined;
+    const fixture = wrapper({ cache, runtimePubsub: pubsub });
+    const run = await heldRun(fixture, threadId);
+    try {
+      expect(fixture.agent.getPubSub()).toBe(pubsub ?? fixture.agent.pubsub);
+      const sent = fixture.agent.sendSignal(
+        { type: 'reactive', contents: 'direct signal' },
+        {
+          runId: run.runId,
+          threadId,
+          resourceId: RESOURCE_ID,
+          ifActive: { behavior: 'deliver' },
+        },
+      );
+      await expect(sent.accepted).resolves.toMatchObject({
+        action: 'deliver',
+        runId: run.runId,
+      });
+      expect(drained(run.runId)).toEqual([
+        expect.objectContaining({ contents: 'direct signal' }),
+      ]);
+    } finally {
+      await finishRun(run);
+      expect(unhandled).toEqual([]);
+    }
+  }, 15_000);
+
+  it.each(
+    cacheShapes,
+  )('registers one stream on the signal delivery state with $name', async ({
+    cache,
+  }) => {
+    const threadId = crypto.randomUUID();
+    const pubsub = createHostPubSub();
+    const fixture = wrapper({ cache, pubsub, runtimePubsub: pubsub });
+    const registrations = vi.spyOn(
+      fixture.mastra.agentThreadStreamRuntime,
+      'registerRun',
+    );
+    const runId = crypto.randomUUID();
+    const topic = `agent.thread-stream.${encodeURIComponent(`${RESOURCE_ID}\0${threadId}`)}`;
+    const registrationsOnTopic: string[] = [];
+    const onEvent = (event: { type: string; runId: string }) => {
+      if (event.type === 'run-registered' && event.runId === runId)
+        registrationsOnTopic.push(event.runId);
+    };
+    await pubsub.subscribe(topic, onEvent);
+    const run = await heldRun(fixture, threadId, runId);
+    try {
+      expect(fixture.agent.getPubSub()).toBe(pubsub);
+      const calls = registrations.mock.calls.filter(
+        ([, , options]) => options.runId === run.runId,
+      );
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.[3]).toBe(fixture.agent.getPubSub());
+      expect(registrationsOnTopic).toEqual([runId]);
+    } finally {
+      await finishRun(run);
+      await pubsub.unsubscribe(topic, onEvent);
+      expect(unhandled).toEqual([]);
+    }
+  }, 15_000);
 });

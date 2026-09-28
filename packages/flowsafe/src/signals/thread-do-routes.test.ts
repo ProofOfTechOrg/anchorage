@@ -53,7 +53,11 @@ interface AgentCall {
 }
 
 function mockAgent(
-  options: { runtimeDriven?: boolean; memory?: unknown } = {},
+  options: {
+    runtimeDriven?: boolean;
+    memory?: unknown;
+    getPubSub?: () => unknown;
+  } = {},
 ): {
   agent: Agent;
   calls: AgentCall[];
@@ -82,6 +86,7 @@ function mockAgent(
     __setPubSub: (p: unknown) => {
       stampedPubsub = p;
     },
+    ...(options.getPubSub ? { getPubSub: options.getPubSub } : {}),
     getMemory: () => memory,
     getMastraInstance: () => ({
       getStorage: () => ({ getStore: async () => ({}) }),
@@ -304,8 +309,8 @@ describe('createThreadSignalRoutes', () => {
     expect(serialized).toBe(0);
   });
 
-  it('stamps the DO pubsub onto the agent before signalling (the affinity carrier)', async () => {
-    const { agent, pubsub } = mockAgent();
+  it('stamps the thread pubsub onto a plain agent before signalling', async () => {
+    const { agent, pubsub } = mockAgent({ runtimeDriven: false });
     const fakePubsub = { id: 'the-one-pubsub' };
     const routes = createThreadSignalRoutes({
       resolveAgent: () => agent,
@@ -313,6 +318,69 @@ describe('createThreadSignalRoutes', () => {
     });
     await routes(post('/signal', { contents: 'hi' }), scopeWith(fakePubsub));
     expect(pubsub()).toBe(fakePubsub);
+  });
+
+  it('refuses a runtime-driven agent without a verifiable thread pubsub', async () => {
+    const threadPubsub = { id: 'thread-pubsub' };
+    const { agent, pubsub, calls } = mockAgent();
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+    });
+
+    const response = await routes(
+      post('/signal', { contents: 'hi' }),
+      scopeWith(threadPubsub),
+    );
+
+    expect(response?.status).toBe(503);
+    expect(await response?.json()).toEqual({
+      error: "agent pub/sub does not match this thread's",
+    });
+    expect(calls.some(({ method }) => method === 'sendSignal')).toBe(false);
+    expect(pubsub()).toBeUndefined();
+  });
+
+  it('delivers to a runtime-driven agent with the thread pubsub without stamping', async () => {
+    const threadPubsub = { id: 'thread-pubsub' };
+    const { agent, pubsub, calls } = mockAgent({
+      getPubSub: () => threadPubsub,
+    });
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+    });
+
+    const response = await routes(
+      post('/signal', { contents: 'hi' }),
+      scopeWith(threadPubsub),
+    );
+
+    expect(response?.status).toBe(200);
+    expect(calls.some(({ method }) => method === 'sendSignal')).toBe(true);
+    expect(pubsub()).toBeUndefined();
+  });
+
+  it('refuses a runtime-driven agent with a different pubsub', async () => {
+    const { agent, calls, pubsub } = mockAgent({
+      getPubSub: () => ({ id: 'other-pubsub' }),
+    });
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+    });
+
+    const response = await routes(
+      post('/signal', { contents: 'hi' }),
+      scopeWith({ id: 'thread-pubsub' }),
+    );
+
+    expect(response?.status).toBe(503);
+    expect(await response?.json()).toEqual({
+      error: "agent pub/sub does not match this thread's",
+    });
+    expect(calls.some(({ method }) => method === 'sendSignal')).toBe(false);
+    expect(pubsub()).toBeUndefined();
   });
 
   it('returns the delivery decision from sendSignal', async () => {

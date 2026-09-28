@@ -8,15 +8,11 @@
 // Worker-side createSignalRouter's job, the same split createRunRouter (Worker
 // gate) → DurableObjectRunner (execution) uses.
 //
-// AFFINITY IS THE PUBSUB. Core keys its in-process signal registry by the pubsub
-// instance passed to each agent method (`#statesByPubSub`, falling back to a
-// module-level `defaultAgentThreadPubSub`), so a send only drains into an active
-// loop when BOTH run in one isolate (the DO gives this) AND both use the SAME
-// pubsub. The agent resolves its pubsub from `agent.getPubSub()`, so these routes
-// stamp the DO's ONE identity (`scope.init.pubsub`) onto the agent before every
-// call. Absent (host opted out) ⇒ core's module default, still one per
-// isolate, so affinity holds either way; a wired pubsub additionally makes
-// observe()/replay align (pubsub.ts).
+// Core keys its in-process signal registry by pub/sub identity. A runtime-driven
+// wrapper carries the thread Durable Object's pub/sub from construction; these
+// routes refuse a configured identity mismatch. Other agents receive the
+// thread's pub/sub before each call. Without a host pub/sub, other agents fall
+// back to core's module default and runtime-driven wrappers use their own stream bus.
 //
 // core's `agentThreadStreamRuntime` is NOT on the package exports map, so these
 // routes drive only the PUBLIC Agent methods, never a deep dist import across
@@ -635,17 +631,25 @@ export function createThreadSignalRoutes(
         );
       }
 
-      // Affinity: stamp the DO's ONE pubsub identity onto the agent so its signal
-      // methods share the registry state the loop registered under. Keep host
-      // resolution inside this catch-all: construction/storage failures are
-      // internal and must not escape through the outer DO error response.
+      // Host resolution stays inside this catch-all so construction and storage
+      // failures use the route's internal error response.
       const agent = await resolveAgent(scope, requestedAgentId, entryPath);
       if (requestedAgentId !== undefined && agent.id !== requestedAgentId) {
         return json({ error: 'agent binding does not match' }, 404);
       }
       const runtimeDriven = isRuntimeDrivenAgent(agent);
       const pubsub = scope.init.pubsub;
-      if (pubsub) agent.__setPubSub(pubsub);
+      if (pubsub && !runtimeDriven) agent.__setPubSub(pubsub);
+      if (
+        runtimeDriven &&
+        pubsub !== undefined &&
+        (typeof agent.getPubSub !== 'function' || agent.getPubSub() !== pubsub)
+      ) {
+        return json(
+          { error: "agent pub/sub does not match this thread's" },
+          503,
+        );
+      }
 
       const resourceId = resolveResourceId?.(scope);
       const threadId = scope.threadId;

@@ -87,6 +87,7 @@ const blockedOnAgentPrototype = [
   '__setThreadRuntimeAgent',
   'approveNetworkToolCall',
   'declineNetworkToolCall',
+  'discoverThreadPeers',
   'generateLegacy',
   'listActiveThreadRuns',
   'listSuspendedRuns',
@@ -138,22 +139,10 @@ const nonExecution = [
   // refusals.
   '__getStaticAgents',
   '__hasSubAgentsConfigured',
-  '__setMemory',
-  '__setPubSub',
   '__setTools',
   '__setWorkspace',
   '__updateInstructions',
   '__updateModel',
-  // Stop an in-flight run; there is no path from either to starting one. What
-  // they gained at 1.67.0 is reach and disclosure, not a mint: #abortDurableRun
-  // (:6598) flips any locally held controller and then calls
-  // requestRemoteAbort (:6626), which publishes an abort request over pubsub
-  // (:272) to whichever process holds the run — and abortRunStream returns
-  // `aborted || this.#isRunExecuting(runId)` (:6585), a boolean existence oracle
-  // for a run id the caller may not own. Neither member matches a blocked
-  // ground.
-  'abortRunStream',
-  'abortThreadStream',
   // Returns the wrapped agent (:6223-6225). Its own stream() and generate() run
   // the agent loop in-process through createRun().start()
   // (agent-Dk0N0Nlg.js:37816), outside RunnerRuntime, and it carries none of
@@ -266,19 +255,18 @@ const nonExecution = [
   'maxSteps',
   // Reattaches to an existing run's pubsub replay; it cannot drive one.
   'observe',
-  // pubsub and pubsubInternal return the pubsub this agent's thread runs are
-  // keyed by. Core's agentThreadStreamRuntime, public on a Mastra
-  // (mastra-CCeMcPkn.js:650-652), lists from it what the blocked
-  // listActiveThreadRuns refuses (storage-MbGlKLkB.js:1011-1023), and
-  // publishing on it aborts a run or injects events by a known run id (:272).
+  // Thread state is keyed by getPubSub(). These accessors return the stream
+  // bus, under the default cache a CachingPubSub over the agent-level pub/sub.
+  // Publishing on that bus reaches the agent-level pub/sub, including abort
+  // and event topics addressed by run id (:272). Core's
+  // agentThreadStreamRuntime (mastra-CCeMcPkn.js:650-652) lists state keyed by
+  // getPubSub(), which the blocked listActiveThreadRuns exposes
+  // (storage-MbGlKLkB.js:1011-1023).
   'pubsub',
   'pubsubInternal',
   'requestContextSchema',
-  // The abort primitive behind abortRunStream and abortThreadStream (:6626),
-  // and never blocked; the inventory asserts that rather than leaving it to
-  // this note. core calls it from #abortDurableRun (:6598, calling at :6601)
-  // and from the `abort` closure it returns with each durable stream result
-  // (:6814, :7095, :7265, :7796).
+  // The abort primitive reached by the `abort` closure core returns with each
+  // durable stream result (:6814, :7095, :7265, :7796).
   'requestRemoteAbort',
   'resolveProcessorById',
   // Returns the snapshot-persistence predicate createWorkflow compiles into the
@@ -407,20 +395,6 @@ const agentNonExecution = [
   // (:37055-37077), which reach what their reasons below name.
   'convertTools',
   'deriveSubAgentBackgroundConfig',
-  // Returns the peer advertisements one pubsub instance carries —
-  // agentId/resourceId/threadId plus sourceId and optional label, title and
-  // metadata (storage-MbGlKLkB.js:425-437), and no run ids. sourceId is the
-  // addressing half: claimThreadOwnership's listener drops an
-  // idle-signal-enqueued whose `data.targetSourceId` is not its own, so holding
-  // a peer's sourceId is what lets another process wake that peer's claimed
-  // thread. What bounds the disclosure is the thread DO, not pubsub identity:
-  // the thread runtime falls back to a module-global emitter when the agent
-  // carries none (storage-MbGlKLkB.js:151-152) and flowsafe's own pubsub is
-  // opt-in (do-runner/pubsub.ts), while host-kit/thread-topology.ts:126
-  // addresses the DO by idFromName(threadId). A host injecting one PubSub
-  // across threads through the init({ pubsub }) seam (do-runner/init.ts:67) is
-  // a residual.
-  'discoverThreadPeers',
   // Field accessor for the durable flag.
   'durable',
   // Pure title-generation prefilter over a message list (:35450).
@@ -752,6 +726,13 @@ function testAgent(id = 'writer'): Agent {
  *    Mastra references, register the agent's tools and processors on that
  *    Mastra, and rewire the inner pubsub (create-durable-agent-DFHwqN2K.js
  *    :7922-7939; agent-Dk0N0Nlg.js:35294-35326). None of them resolves a store.
+ *  - __setMemory / __setPubSub / abortRunStream / abortThreadStream /
+ *    discoverThreadPeers: VACUOUS by construction. The setters store the
+ *    service and forward it to the wrapped agent
+ *    (create-durable-agent-DFHwqN2K.js:6414-6421); the abort pair flips a
+ *    local controller and publishes an abort request (:6565-6601);
+ *    discoverThreadPeers reads in-memory thread-runtime state
+ *    (agent-Dk0N0Nlg.js:38208-38210). None reaches storage.
  *
  * All spies are installed after construction AND after that resolution, so
  * neither Mastra's own setup nor the resolution itself can be mistaken for a
@@ -881,6 +862,30 @@ const blockedCalls: ReadonlyArray<{
     // .catch, so a synchronous throw would escape the row that exists to
     // capture it and fail the test with the refusal it is asserting.
     invoke: async (agent) => agent.listActiveThreadRuns(),
+  },
+  {
+    method: 'discoverThreadPeers',
+    invoke: (agent) => agent.discoverThreadPeers(),
+  },
+  {
+    method: '__setMemory',
+    invoke: async (agent) => agent.__setMemory(new MockMemory()),
+  },
+  {
+    method: '__setPubSub',
+    invoke: async (agent) => agent.__setPubSub(agent.pubsub),
+  },
+  {
+    method: 'abortRunStream',
+    invoke: async (agent) => agent.abortRunStream(RUN_ID),
+  },
+  {
+    method: 'abortThreadStream',
+    invoke: async (agent) =>
+      agent.abortThreadStream({
+        threadId: 'thread-1',
+        resourceId: 'resource-1',
+      }),
   },
   {
     method: 'deleteRunSnapshots',
@@ -1284,7 +1289,7 @@ describe('FlowsafeDurableAgent prototype surface inventory', () => {
     // — so the structural assertions above hold either way and its exemption
     // needs an assertion of its own.
     const why =
-      'core calls it from #abortDurableRun and from the `abort` closure it returns with each durable stream result, so refusing it rejects the abort handle of every run this class itself started';
+      'core calls it from the `abort` closure it returns with each durable stream result, so refusing it rejects the abort handle of every run this class itself started';
 
     // #then no tabled reason, so nothing here demands an override for it
     expect(
@@ -1395,7 +1400,12 @@ describe('FlowsafeDurableAgent blocked recovery entry points', () => {
     '__registerMastra',
     '__setDeclaredSchedules',
     '__setMastra',
+    '__setMemory',
+    '__setPubSub',
     '__setThreadRuntimeAgent',
+    'abortRunStream',
+    'abortThreadStream',
+    'discoverThreadPeers',
     'generateLegacy',
     'listActiveThreadRuns',
     'setChannels',
