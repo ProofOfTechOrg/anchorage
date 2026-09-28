@@ -914,16 +914,29 @@ function assertNegatedWildcardCoverage(scripts, declared) {
   const direct = new Set(
     explicitProjects(scripts['test:direct-scenario'] ?? ''),
   );
-  const negatedWildcards = projectSelectors(scripts.test ?? '').filter(
-    (selector) => selector.startsWith('!') && selector.endsWith('*'),
-  );
-  assert.ok(negatedWildcards.length > 0, 'test negates no project wildcard');
-  for (const selector of negatedWildcards) {
-    const stem = selector.slice(1, -1);
-    for (const project of [...declared].filter((name) => name.startsWith(stem)))
+  for (const name of ['test', 'test:watch']) {
+    const negatedWildcards = projectSelectors(scripts[name] ?? '').filter(
+      (selector) => selector.startsWith('!') && selector.endsWith('*'),
+    );
+    assert.ok(
+      negatedWildcards.length > 0,
+      `${name} negates no project wildcard`,
+    );
+    const excluded = new Set();
+    for (const selector of negatedWildcards) {
+      const stem = selector.slice(1, -1);
+      for (const project of [...declared].filter((p) => p.startsWith(stem))) {
+        assert.ok(
+          direct.has(project),
+          `project '${project}' matches '${selector}' in ${name} but test:direct-scenario does not select it`,
+        );
+        excluded.add(project);
+      }
+    }
+    for (const project of direct)
       assert.ok(
-        direct.has(project),
-        `project '${project}' matches '${selector}' but test:direct-scenario does not select it`,
+        excluded.has(project),
+        `${name} does not exclude direct-scenario project '${project}'`,
       );
   }
 }
