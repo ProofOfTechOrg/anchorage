@@ -42,8 +42,7 @@ export interface SqliteUnitResult<T = unknown> {
 /**
  * The prepared statement the facade hands a caller. Method syntax and the row
  * type parameter are the shape the structural D1 subsets of this package
- * declare (src/signals/d1-shared.ts, src/do-runner/workflow-snapshot-row.ts);
- * src/do-runner/sqlite-fixture.test.ts pins the facade against them.
+ * declare (src/signals/d1-shared.ts, src/do-runner/workflow-snapshot-row.ts).
  */
 export interface SqliteUnitStatement {
   bind(...values: unknown[]): SqliteUnitStatement;

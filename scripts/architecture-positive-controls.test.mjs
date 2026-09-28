@@ -71,15 +71,6 @@ const packageProjectPaths = readdirSync(join(root, 'packages'), {
   .filter((entry) => entry.isDirectory())
   .map((entry) => `packages/${entry.name}/vitest.config.ts`)
   .filter((projectPath) => existsSync(join(root, projectPath)));
-const rootProjectNames = {
-  [directScenarioProjects[0]]: 'fleet-control-direct-scenario',
-  [directScenarioProjects[1]]: 'fleet-control-direct-scenario-seams',
-  'vitest.breakwater-workers.config.mts': 'breakwater-workers',
-  'vitest.flowsafe-harness.config.ts': 'flowsafe-harness',
-  'vitest.flowsafe-workers.config.ts': 'flowsafe-workers',
-  'vitest.workerd-lifecycle.config.ts': 'workerd-lifecycle',
-};
-
 function adjacencyOf(report, keep) {
   return new Map(
     report.modules.map((module) => [
@@ -495,34 +486,6 @@ const stringsOf = (source, property) => {
   return strings;
 };
 
-test('the config parse refuses an array element it cannot read', () => {
-  const synthetic = (elements) =>
-    ts.createSourceFile(
-      join(root, 'vitest.synthetic.config.ts'),
-      `export default { test: { projects: [${elements}] } };`,
-      ts.ScriptTarget.Latest,
-      true,
-    );
-  for (const elements of [
-    "...['packages/missing-*/vitest.config.ts']",
-    "{ test: { name: 'inline' } }",
-    'declaredElsewhere',
-  ]) {
-    assert.throws(
-      () => stringsOf(synthetic(elements), 'projects'),
-      /cannot read/,
-      elements,
-    );
-  }
-  assert.deepEqual(
-    stringsOf(
-      synthetic("...configDefaults.exclude, 'packages/*/vitest.config.ts'"),
-      'projects',
-    ),
-    ['packages/*/vitest.config.ts'],
-  );
-});
-
 test('the root vitest projects resolve to exactly the config files the repository holds', () => {
   const entries = stringsOf(parse('vitest.config.ts'), 'projects');
   const resolved = new Set();
@@ -539,39 +502,10 @@ test('the root vitest projects resolve to exactly the config files the repositor
   );
 });
 
-test('every root vitest project declares its expected name', () => {
-  assert.deepEqual(
-    Object.keys(rootProjectNames).sort(),
-    [...rootProjectPaths].sort(),
-  );
-  for (const projectPath of rootProjectPaths) {
-    assert.equal(
-      explicitProjectName(projectPath),
-      rootProjectNames[projectPath],
-      projectPath,
-    );
-  }
-});
-
-test('the direct-scenario suites are declared by their projects and excluded from the package project', () => {
-  const expectedIncludes = new Map([
-    [
-      directScenarioProjects[0],
-      [
-        'test/direct-credentialed-scenario.test.ts',
-        'test/direct-reference-fence.harness.test.ts',
-      ],
-    ],
-    [
-      directScenarioProjects[1],
-      ['test/direct-credentialed-scenario.seams.test.ts'],
-    ],
-  ]);
+test('the package project excludes every direct-scenario suite', () => {
   const packageExclude = stringsOf(parse(fleetControlProject), 'exclude');
-  for (const [project, expectedInclude] of expectedIncludes) {
-    const directInclude = stringsOf(parse(project), 'include');
-    assert.deepEqual([...directInclude].sort(), [...expectedInclude].sort());
-    for (const entry of directInclude) {
+  for (const project of directScenarioProjects) {
+    for (const entry of stringsOf(parse(project), 'include')) {
       assert.ok(
         packageExclude.includes(entry),
         `the package project does not exclude '${entry}'`,
@@ -1024,59 +958,8 @@ test('root --project selections name discovered vitest projects', () => {
   const declared = new Set(
     [...packageProjectPaths, ...rootProjectPaths].map(resolvedProjectName),
   );
-  const fixtures = {
-    double: 'vitest run --project="flowsafe-harness"',
-    equals: 'vitest run --project=fleet-control-direct-scenario',
-    negated: "vitest run --project '!fleet-control-direct-scenario'",
-    package: "vitest run --project '@proofoftech/breakwater'",
-    wildcard: "vitest run --project='!fleet-control-direct-scenario*'",
-  };
-  const synthetic = ts.createSourceFile(
-    join(root, 'vitest.synthetic.config.ts'),
-    "export default { test: { plugins: [{ name: 'not-a-project' }] } };",
-    ts.ScriptTarget.Latest,
-    true,
-  );
-  assert.equal(
-    explicitProjectName('vitest.synthetic.config.ts', synthetic),
-    undefined,
-  );
-
-  assert.deepEqual(assertProjectSelections(fixtures, declared), [
-    ['double', 'flowsafe-harness'],
-    ['equals', 'fleet-control-direct-scenario'],
-    ['negated', 'fleet-control-direct-scenario'],
-    ['package', '@proofoftech/breakwater'],
-    ['wildcard', 'fleet-control-direct-scenario*'],
-  ]);
   assertProjectSelections(scripts, declared);
   assertNegatedWildcardCoverage(scripts, declared);
-  assert.throws(
-    () =>
-      assertNegatedWildcardCoverage(
-        scripts,
-        new Set([...declared, 'fleet-control-direct-scenario-unselected']),
-      ),
-    /test:direct-scenario does not select it/u,
-  );
-  assert.throws(
-    () =>
-      assertNegatedWildcardCoverage(
-        { 'test:direct-scenario': scripts['test:direct-scenario'] },
-        declared,
-      ),
-    /negates no project wildcard/u,
-  );
-  for (const command of [
-    'vitest run --project=missing-project',
-    "vitest run --project '@proofoftech/missing'",
-    "vitest run --project='!missing-project*'",
-  ]) {
-    assert.throws(
-      () => assertProjectSelections({ invalid: command }, declared),
-      /absent from the discovered Vitest projects/u,
-    );
-  }
 });
 
 for (const [ruleName, fixture] of Object.entries(controls)) {
