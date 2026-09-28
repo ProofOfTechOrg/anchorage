@@ -16,7 +16,6 @@ import {
   FleetInventoryRunTokenOperationError,
   type FleetInventoryStage,
   FleetInventoryStateError,
-  fleetInventoryGenerationRefFromUnknown,
   fleetInventoryOptionsDigest,
   fleetInventoryRunRecordFromUnknown,
   fleetInventoryStagedFactFromUnknown,
@@ -162,22 +161,6 @@ describe('fleet inventory state', () => {
         ...runRecord(),
         optionsDigest: 'b'.repeat(64),
       }),
-    ).toThrow(FleetInventoryStateError);
-  });
-
-  it('round-trips a finalized generation reference', () => {
-    const ref = {
-      generation: 7,
-      operationId: OPERATION_ID,
-      finalizedAtMs: 1_788_000_000_000,
-      rowManifest: { ...emptyFleetInventoryRowCounts(), deployment: 2 },
-      factCount: 6,
-    };
-    expect(
-      fleetInventoryGenerationRefFromUnknown(structuredClone(ref)),
-    ).toEqual(ref);
-    expect(() =>
-      fleetInventoryGenerationRefFromUnknown({ ...ref, generation: 0 }),
     ).toThrow(FleetInventoryStateError);
   });
 

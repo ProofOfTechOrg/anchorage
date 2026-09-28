@@ -427,47 +427,6 @@ export async function listDispatchScriptPage(
   };
 }
 
-export async function listAllDispatchScripts(
-  context: CloudflareWorkerAttachmentScanContext,
-  namespace: string,
-  signal?: AbortSignal,
-): Promise<readonly NormalizedDispatchScript[]> {
-  const scripts: NormalizedDispatchScript[] = [];
-  let cursor: string | undefined;
-  let pageNumber = 0;
-  const seenCursorSha256 = new Set<string>();
-  do {
-    const page = await listDispatchScriptPage(context, {
-      namespace,
-      cursor,
-      perPage: 1_000,
-      signal,
-    });
-    scripts.push(...page.scripts);
-    if (scripts.length > CLOUDFLARE_INVENTORY_BOUND) {
-      throw inventoryBoundExceeded(
-        'dispatch script inventory',
-        CLOUDFLARE_INVENTORY_BOUND,
-      );
-    }
-    cursor = page.nextCursor;
-    if (cursor) {
-      pageNumber += 1;
-      if (pageNumber >= DISPATCH_PAGE_BOUND) {
-        throw new Error(
-          'Cloudflare dispatch script listing exceeded 100 pages',
-        );
-      }
-      const digest = cursorDigest(cursor);
-      if (seenCursorSha256.has(digest)) {
-        throw new Error('Cloudflare dispatch script listing repeated a cursor');
-      }
-      seenCursorSha256.add(digest);
-    }
-  } while (cursor);
-  return scripts;
-}
-
 async function listOrdinaryScripts(
   context: CloudflareWorkerAttachmentScanContext,
   target: WorkerAttachmentScanTarget,

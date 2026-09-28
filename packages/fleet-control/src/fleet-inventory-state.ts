@@ -981,36 +981,6 @@ export function fleetInventoryStagedFactFromUnknown(
   };
 }
 
-/** Strict generation-reference codec; the manifest carries every row kind. */
-export function fleetInventoryGenerationRefFromUnknown(
-  value: unknown,
-): FleetInventoryGenerationRef {
-  const candidate = plainRecord(value);
-  exactKeys(candidate, [
-    'generation',
-    'operationId',
-    'finalizedAtMs',
-    'rowManifest',
-    'factCount',
-  ]);
-  if (
-    !safeIntegerAtLeast(candidate.generation, 1) ||
-    typeof candidate.operationId !== 'string' ||
-    !UUID_V4.test(candidate.operationId) ||
-    !safeIntegerAtLeast(candidate.finalizedAtMs) ||
-    !safeIntegerAtLeast(candidate.factCount)
-  ) {
-    return malformed();
-  }
-  return {
-    generation: candidate.generation,
-    operationId: candidate.operationId,
-    finalizedAtMs: candidate.finalizedAtMs,
-    rowManifest: rowCountsFromUnknown(candidate.rowManifest),
-    factCount: candidate.factCount,
-  };
-}
-
 /** Strict token codec; the token carries nothing but version and position. */
 export function parseFleetInventoryRunToken(
   value: unknown,
