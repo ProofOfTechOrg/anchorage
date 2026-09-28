@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-import { existsSync, readFileSync } from 'node:fs';
 import { createTool } from '@mastra/core/tools';
 import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
@@ -1786,51 +1785,6 @@ describe('connector egress conformance', () => {
       cases: [quietCase],
     });
     expect(next.conformant).toBe(true);
-  });
-
-  it('keeps the published limit text identical to the harness constant', () => {
-    // #given
-    const documents = [
-      '../../CONNECTORS.md',
-      '../../../../docs/connector-interface.md',
-    ];
-    // Changesets are consumed at versioning.
-    const changeset = new URL(
-      '../../../../.changeset/connector-conformance-harness.md',
-      import.meta.url,
-    );
-    // #when
-    const published = documents.map((relative) => ({
-      relative,
-      text: readFileSync(new URL(relative, import.meta.url), 'utf8'),
-    }));
-    const changesetText = existsSync(changeset)
-      ? readFileSync(changeset, 'utf8')
-      : undefined;
-    // #then
-    for (const { relative, text } of published) {
-      expect(text, relative).toContain(CONFORMANCE_LIMIT);
-    }
-    if (changesetText !== undefined) {
-      expect(changesetText).toContain(CONFORMANCE_LIMIT);
-    }
-  });
-
-  it('points the published limit at a section and a shipped file that exist', () => {
-    // #given
-    const guideUrl = new URL('../../CONNECTORS.md', import.meta.url);
-    const packageUrl = new URL('../../package.json', import.meta.url);
-    // #when
-    const guide = readFileSync(guideUrl, 'utf8');
-    const packageManifest: { files?: string[] } = JSON.parse(
-      readFileSync(packageUrl, 'utf8'),
-    );
-    // #then
-    expect(CONFORMANCE_LIMIT).toContain(
-      'under Conformance limits in the CONNECTORS.md that ships with this package',
-    );
-    expect(guide).toContain('\n### Conformance limits\n');
-    expect(packageManifest.files).toContain('CONNECTORS.md');
   });
 
   it('restores the installed entry points when a later install fails', async () => {

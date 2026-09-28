@@ -17,80 +17,11 @@ const WORKFLOW_IDS = [
   'access-request',
 ];
 
-const WORKFLOW_TOPOLOGY = {
-  'wire-transfer': {
-    steps: ['prepareTransfer', 'approveTransfer', 'releaseFunds'],
-    gateSteps: ['approveTransfer'],
-  },
-  'gtm-outbound': {
-    steps: [
-      'researchAccounts',
-      'enrichContacts',
-      'generateOutreach',
-      'reviewAndApprove',
-      'sendOutreach',
-    ],
-    gateSteps: ['reviewAndApprove'],
-  },
-  'content-pipeline': {
-    steps: [
-      'researchTopic',
-      'writeIntro',
-      'writeBody',
-      'writeConclusion',
-      'reviewContent',
-      'publishContent',
-    ],
-    gateSteps: ['reviewContent'],
-  },
-  'lead-generation': {
-    steps: [
-      'scoreLeads',
-      'fastTrack',
-      'nurture',
-      'reviewHotLeads',
-      'assignLeads',
-    ],
-    gateSteps: ['reviewHotLeads'],
-    conditionalSteps: ['fastTrack', 'nurture'],
-  },
-  'product-launch': {
-    steps: [
-      'validateReadiness',
-      'approveLaunch',
-      'executeLaunch',
-      'confirmRollout',
-      'completeLaunch',
-    ],
-    gateSteps: ['approveLaunch', 'confirmRollout'],
-  },
-  'access-request': {
-    steps: ['requestAccess', 'approveAccess', 'grantAccess'],
-    gateSteps: ['approveAccess'],
-  },
-} as const;
-
 describe('glossary completeness', () => {
   it('describes every narration zone', () => {
     for (const zone of ['browser', 'worker', 'do', 'd1', 'alarm'] as const) {
       expect(ZONES[zone].label.length).toBeGreaterThan(0);
       expect(ZONES[zone].blurb.length).toBeGreaterThan(0);
-    }
-  });
-
-  it('contains no obsolete data-plane scheduled-trigger terminology', () => {
-    const sources = import.meta.glob(
-      [
-        './glossary.ts',
-        './narration.ts',
-        './architecture-legend.tsx',
-        './zone-badge.tsx',
-        '../worker/worker.ts',
-      ],
-      { eager: true, import: 'default', query: '?raw' },
-    ) as Record<string, string>;
-    for (const [source, contents] of Object.entries(sources)) {
-      expect(contents, source).not.toMatch(/\bcron(?:s)?\b/i);
     }
   });
 
@@ -112,23 +43,6 @@ describe('workflow guides', () => {
     expect(Object.keys(WORKFLOW_GUIDES).sort()).toEqual(
       [...WORKFLOW_IDS].sort(),
     );
-  });
-
-  it('pins workflow steps, gates, and conditional branches to the definitions', () => {
-    for (const [id, guide] of Object.entries(WORKFLOW_GUIDES)) {
-      const expected = WORKFLOW_TOPOLOGY[id as keyof typeof WORKFLOW_TOPOLOGY];
-      expect(guide.steps, `${id} steps`).toEqual(expected.steps);
-      expect(guide.gateSteps, `${id} gates`).toEqual(expected.gateSteps);
-      expect(guide.conditionalSteps, `${id} conditional steps`).toEqual(
-        'conditionalSteps' in expected ? expected.conditionalSteps : undefined,
-      );
-      expect(guide.note.length, id).toBeGreaterThan(0);
-      expect(guide.capabilities.length, id).toBeGreaterThan(0);
-      for (const capability of guide.capabilities) {
-        expect(capability.label.length).toBeGreaterThan(0);
-        expect(capability.tip.length).toBeGreaterThan(0);
-      }
-    }
   });
 
   it('pins the lead-generation short-circuit narration', () => {

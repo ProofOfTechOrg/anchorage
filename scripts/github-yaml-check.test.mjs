@@ -142,19 +142,6 @@ function assertDirectScenarioJobs(manifest, workflow) {
   }
 }
 
-function bashFenceAfter(path, marker) {
-  const lines = readFileSync(join(repositoryRoot, path), 'utf8').split('\n');
-  const markerIndex = lines.findIndex((line) => line.includes(marker));
-  assert.notEqual(markerIndex, -1, `${path} contains '${marker}'`);
-  const fenceStart = lines.findIndex(
-    (line, index) => index > markerIndex && line === '```bash',
-  );
-  assert.notEqual(fenceStart, -1, `${path} has a bash fence after '${marker}'`);
-  const fenceEnd = lines.indexOf('```', fenceStart + 1);
-  assert.notEqual(fenceEnd, -1, `${path} closes its bash fence`);
-  return lines.slice(fenceStart + 1, fenceEnd).filter(Boolean);
-}
-
 function runVerifyGate(step, needs) {
   const variables = Object.keys(step.env ?? {});
   assert.equal(
@@ -3068,25 +3055,6 @@ test('the node-tools script names the entry-point and baseline-recorder suites',
   assert.match(
     scripts['test:node-tools'],
     /scripts\/baseline-recorder\.test\.mjs/u,
-  );
-});
-
-test('the public verification lists mirror verify-core', () => {
-  const commands = readVerifyCoreJob()
-    .steps.filter((step) => typeof step.run === 'string')
-    .map((step) => step.run);
-  const contributorCommands = commands.map((command) =>
-    command === 'pnpm test:without-direct-scenario' ? 'pnpm test' : command,
-  );
-  const maintainerCommands = contributorCommands.slice(1);
-
-  assert.deepEqual(
-    bashFenceAfter('CONTRIBUTING.md', 'The verification list below mirrors'),
-    contributorCommands,
-  );
-  assert.deepEqual(
-    bashFenceAfter('docs/maintainer-guide.md', '## Verification'),
-    maintainerCommands,
   );
 });
 

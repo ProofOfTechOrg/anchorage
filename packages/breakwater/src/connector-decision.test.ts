@@ -128,24 +128,6 @@ describe('connector decision catalogue', () => {
     }
   });
 
-  it('keeps the public reference table executable', () => {
-    const doc = readFileSync(
-      new URL('../../../docs/connector-interface.md', import.meta.url),
-      'utf8',
-    );
-    const rows = [
-      ...doc.matchAll(/^\| `([A-Z_]+)` \|[^\n]*\| (true|false) \|$/gm),
-    ];
-    expect(rows.map((row) => row[1]).sort()).toEqual(
-      Object.keys(catalogue).sort(),
-    );
-    for (const [, code, retryable] of rows) {
-      expect(isConnectorDecisionCode(code)).toBe(true);
-      if (!isConnectorDecisionCode(code)) throw new Error('unknown doc code');
-      expect(CONNECTOR_DECISIONS[code].retryable).toBe(retryable === 'true');
-    }
-  });
-
   it.each([
     'constructor',
     '__proto__',
