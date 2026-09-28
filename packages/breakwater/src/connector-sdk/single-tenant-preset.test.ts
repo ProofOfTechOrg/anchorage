@@ -3,7 +3,14 @@ import { RequestContext } from '@mastra/core/request-context';
 import type { Tool, ToolExecutionContext } from '@mastra/core/tools';
 import { describe, expect, it, vi } from 'vitest';
 
-import { AuditLogger } from '../audit/index.js';
+import {
+  type AuditEvent,
+  AuditLogger,
+  type AuditSink,
+  combineAuditSinks,
+  type MetricsRecorder,
+  metricsAuditSink,
+} from '../audit/index.js';
 import {
   backgroundExecution,
   networkEgress,
@@ -188,6 +195,61 @@ describe('singleTenantConnectorPolicies', () => {
     expect(policies.audit).toBeUndefined();
   });
 
+  it('exports through a combined production sink, whose malformed members are refused before the preset', async () => {
+    // #given — the README's composition of a metrics sink and a destination
+    const exported: AuditEvent[] = [];
+    const counted: string[] = [];
+    const logger = new AuditLogger({
+      sink: combineAuditSinks(
+        metricsAuditSink({
+          increment: (name) => {
+            counted.push(name);
+          },
+          observe: () => undefined,
+        }),
+        (event) => {
+          exported.push(event);
+        },
+      ),
+    });
+    const policies = singleTenantConnectorPolicies({
+      ...productionOptions(),
+      audit: { mode: 'production', logger },
+    });
+    const connector = createConnector({
+      id: 'records.read',
+      description: 'Read one record',
+      permissions: { sideEffect: 'read' },
+      policies,
+      execute: async () => ({ ok: true }),
+    });
+
+    // #when
+    await connector.execute({}, {
+      requestContext: new RequestContext(),
+    } as ToolExecutionContext);
+
+    // #then — each call reaches both members
+    expect(exported).toHaveLength(1);
+    expect(counted).toEqual(['breakwater.audit.decision']);
+    for (const build of [
+      () => combineAuditSinks(),
+      () => combineAuditSinks(undefined as unknown as AuditSink),
+      () => combineAuditSinks('https://audit.example.com/ingest' as never),
+      () => metricsAuditSink({} as MetricsRecorder),
+    ]) {
+      expect(() =>
+        singleTenantConnectorPolicies({
+          ...productionOptions(),
+          audit: {
+            mode: 'production',
+            logger: new AuditLogger({ sink: build() }),
+          },
+        }),
+      ).toThrow(/^(combineAuditSinks|metricsAuditSink): /);
+    }
+  });
+
   it('rejects incomplete audit posture and non-D1 stores at the builder', () => {
     expect(() =>
       singleTenantConnectorPolicies({
@@ -310,6 +372,46 @@ describe('singleTenantConnectorPolicies', () => {
         execute: async () => ({ ok: true }),
       }),
     ).toThrow(/single-tenant preset audit was replaced, removed, or added/);
+  });
+
+  it.each([
+    ['a trailing space', 'CRM.* '],
+    ['a newline', 'crm.\n*'],
+    ['a zero-width space', 'crm.​*'],
+    ['a colon', 'tenant:crm.*'],
+  ])('refuses an approval pattern with %s', (_label, pattern) => {
+    // #when / #then — the pattern could never match an accepted connector id
+    expect(() =>
+      singleTenantConnectorPolicies({
+        ...productionOptions(),
+        writePermissions: { requireApproval: ['records.*', pattern] },
+      }),
+    ).toThrow(
+      new TypeError(
+        "singleTenantConnectorPolicies: invalid writePermissions.requireApproval.1: must not contain ':', whitespace, or a control or format character",
+      ),
+    );
+  });
+
+  it('keeps an uppercase approval pattern that matches an uppercase id', async () => {
+    // #given
+    const policies = singleTenantConnectorPolicies({
+      ...productionOptions(),
+      writePermissions: { requireApproval: ['CRM.*'] },
+    });
+    const connector = createConnector({
+      id: 'CRM.assign',
+      description: 'Assign a record',
+      permissions: { sideEffect: 'write' },
+      policies,
+      execute: async () => ({ ok: true }),
+    }) as Tool<unknown, unknown>;
+    // #when / #then
+    await expect(
+      connector.execute?.({}, {
+        requestContext: new RequestContext(),
+      } as ToolExecutionContext),
+    ).rejects.toMatchObject({ code: 'APPROVAL_GRANT_MISSING' });
   });
 
   it('keeps destructive approval enabled in preset mode', () => {

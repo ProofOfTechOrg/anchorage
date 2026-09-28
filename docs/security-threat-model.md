@@ -61,7 +61,7 @@ breakwater.workflowScope
 breakwater.isolationScope
 ```
 
-Only trusted host/runtime code may populate actor, grant, principal-permission, or workflow values. Idempotency keys and dry-run selection may originate from authorized application logic, but must not overwrite the other keys. `breakwater.isolationScope` remains an opaque Breakwater policy input; Flowsafe does not mint it for the single-organization data plane.
+Only trusted host/runtime code may populate actor, grant, principal-permission, or workflow values. Idempotency keys and dry-run selection may originate from authorized application logic, but must not overwrite the other keys. `breakwater.isolationScope` remains an opaque Breakwater policy input, a non-empty string; Flowsafe does not mint it for the single-organization data plane. A value of the wrong type in these keys is data an application can produce, so the connector denies a malformed isolation scope or dry-run selection instead of reading it as absent.
 
 [`isReservedExecutionContextKey()`](../packages/flowsafe/src/do-runner/execution-context.ts) defines the reserved namespace. API-start and schedule `requestContext` records reject those keys at ingestion. Persisted compatibility paths strip reserved entries before trusted derivation.
 
@@ -70,6 +70,12 @@ An API start may carry non-reserved application context after authentication, st
 Trusted merges apply sanitized external or stored context first, then workflow, run, current execution identity, structured connector grants, and trusted actor/audit correlation. Provider-supplied isolation scope is dropped. An empty grant array overwrites any stale value, and the agent host projects the principal-permission resolution or an explicit `null` on every leg so a stale persisted projection cannot survive a resume.
 
 For an API start, provider application values override matching stored values. A verified schedule target controls its context even when it supplies none. Persisted application values survive resume, while trusted providers refresh capability state. Keyed replay revalidates input and host policy but preserves the winning run's context.
+
+### Host code to Breakwater configuration
+
+Breakwater validates host configuration as data: what a JSON or YAML file, an environment variable or a typo can produce. Each option's reference entry states what it refuses.
+
+Host code that builds configuration objects is trusted and runs with Breakwater's own privileges; like caller-provided callbacks and store ports, it remains a trusted executable capability. Breakwater does not defend against host code that builds adversarial objects: getters that change their answers, Proxies, own iterators or methods, or configuration reassigned or mutated after construction.
 
 ### Worker to Durable Object
 
@@ -184,11 +190,11 @@ A same-revision failed run is not evidence that a chunk committed. Convergence r
 
 A bounded account inventory run persists its progress and its enumerated rows in Fleet D1, so what may enter those rows is a boundary in its own right. Every durable inventory string passes a credential and length control: at most 512 bytes, and none of the case-insensitive substrings `authorization`, `bearer`, `x-auth`, or `api_token`. Every value interpolated into a durable `finding` detail additionally has to be printable and free of whitespace after the caller normalizes a hostname to ASCII. The bounded fleet audit below is a documented exception to the 512-byte figure: its composed finding details are sentences, not short provider-claimed values, so they validate against a 4 KiB string bound instead, under the same credential-substring and control-byte denylist. Neither control is a name grammar, because Cloudflare KV key names permit all printable non-whitespace characters and custom domains may be returned as internationalized Unicode; a narrower charset would abort a run that should merely have recorded a `malformed-route` finding.
 
-The two sites that previously interpolated a provider error string are sanitized. A durable finding stores only `registered script '<name>' could not be inspected` or `plain Worker '<name>' could not be inventoried`. The transient provider text stays in call-local diagnostics that are never written to a row, a deployment fact, or the run record. `collectFleetInventory()` composes today's exact bytes from those call-local diagnostics, so the in-memory result is unchanged while the durable row carries no provider text.
+The sites that previously interpolated a provider error string are sanitized. A durable finding stores only `registered script '<name>' could not be inspected` or `plain Worker '<name>' could not be inventoried`. The transient provider text stays in call-local diagnostics that are never written to a row, a deployment fact, or the run record. `collectFleetInventory()` composes today's exact bytes from those call-local diagnostics, so the in-memory result is unchanged while the durable row carries no provider text.
 
 Resource names reached through the enumeration — script names, physical script names, database names, route hostnames, zone route patterns, and dispatch namespace names — are either constructed by this codebase from the tenant tag and environment or configured by the operator. A secret can appear in one only if an operator names a resource after a secret, which is self-inflicted and out of scope, exactly as it already is for today's in-memory findings and every existing fleet record field. Bounded inventory adds no new channel there. The one genuinely untrusted input is the raw host-routing KV key name, which any KV writer can set: it faces the credential and length control first, and a name that is base64 or high-entropy shaped (32 or more characters matching the base64 alphabet with no `.`) is never persisted. Such a key is identified by its listing ordinal in the finding.
 
-Provider resumption cursors are the one deliberate carve-out. `stage.cursor` and `stage.startAfter` are opaque provider text and they do live in the run record, because bounded resumption is impossible without them. They are confined to the run record, face the credential and length control only — never the finding-detail rule, since a legitimate cursor is base64 — and are never copied into an inventory row, a deployment fact, a continuation token, or a Queue message. Continuation tokens carry a version, an operation id, and a revision, and nothing else.
+Provider resumption cursors are a deliberate carve-out. `stage.cursor` and `stage.startAfter` are opaque provider text and they do live in the run record, because bounded resumption is impossible without them. They are confined to the run record, face the credential and length control only — never the finding-detail rule, since a legitimate cursor is base64 — and are never copied into an inventory row, a deployment fact, a continuation token, or a Queue message. Continuation tokens carry a version, an operation id, and a revision, and nothing else.
 
 Only a finalized generation is readable. Partial, failed, and count-divergent generations are structurally unreadable, and historical generations require an explicit pin before a read so bounded garbage collection cannot race a legitimate reader. A generation is a point-in-time-per-stage snapshot rather than a globally consistent one; account-wide mutation locking against independent external tokens remains out of scope, unchanged from the single-call enumeration.
 
@@ -200,7 +206,7 @@ Provider observations are a different provenance class. Finding `tenantTag` and 
 
 Any finding `detail`, composed by the engine or passed through from the pinned inventory generation, passes a non-throwing credential-substring and control-byte gate on write. Unsafe detail is withheld through the fixed `finding detail withheld: unsafe bytes (kind '<kind>')` fallback rather than aborting the operation, while the read codec still enforces the control-byte rule and accepts an empty detail. Before either global or per-record staging, the coordinator checks every finding and fact against the staged-row codec's serialized-payload, per-string, depth, and node bounds. An excess fails the operation durably as `emission-bound-exceeded` and releases its pin before the store sees the row. Finding and fact shape, vocabulary, and byte bounds remain enforced on both write and read; after the coordinator's envelope preflight, a write-side codec failure means store or generation corruption, so the advance throws `fleet operation state is malformed`, persists no operation row or progress from that call, and leaves the operation running until `abandonFleetAuditOperation()` fails it and releases its pin. That scope is the operation store: a `per-record` advance can already have committed its guarded maintenance re-arm to the Fleet state store before the check runs.
 
-The bounded engine never persists the raw diagnostic bytes a one-shot audit composes call-locally. All six families — the three resolver failures, the live inspection failure, the maintenance re-arm failure, and the segmented multi-duty `maintenance-stale` composition — durably record a fixed template alone; the one-shot `auditFleetDrift()` remains byte-identical to its pre-decomposition behavior and is the only path that ever produces the raw bytes, and only into its in-memory return value, never a durable row.
+The bounded engine never persists the raw diagnostic bytes a one-shot audit composes call-locally. The resolver failures, the live inspection failure, the maintenance re-arm failure, and the segmented multi-duty `maintenance-stale` composition durably record a fixed template alone; the one-shot `auditFleetDrift()` remains byte-identical to its pre-decomposition behavior and is the only path that ever produces the raw bytes, and only into its in-memory return value, never a durable row.
 
 An audit start pins its finalized inventory generation through completion and replay. See [audit an account under a request budget](fleet-control.md#audit-an-account-under-a-request-budget) for release, adoption, and custom-store behavior.
 
@@ -234,7 +240,7 @@ The control plane attests the active route after promotion; the threat is traffi
 
 ### Deployment sentinel
 
-Provisioning writes the same stable tag to two independent locations:
+Provisioning writes the same stable tag to independent locations:
 
 - the Worker's `DEPLOYMENT_TENANT` variable
 - the singleton `flowsafe_deployment.tenant_tag` row in D1
@@ -361,7 +367,7 @@ This boundary protects trusted application code from accidental or unsupported i
 
 ## RBAC model
 
-Breakwater exports five role labels:
+Breakwater exports these role labels:
 
 ```text
 admin

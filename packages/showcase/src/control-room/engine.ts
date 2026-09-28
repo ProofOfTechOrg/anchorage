@@ -245,7 +245,8 @@ export async function screenInput(
       retryCount: 0,
       requestContext,
       abort: abortThrowing,
-      // messageList is required by the type but unread by both gates.
+      // No messageList: without one neither gate removes a refused call's
+      // input, and the policy engine treats every message as the call's own.
     } as unknown as InputArgs);
     return { blocked: false };
   } catch (error) {

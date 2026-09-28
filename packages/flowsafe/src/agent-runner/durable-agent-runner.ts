@@ -146,9 +146,9 @@
 //     (:7441), continuation (:6720), completion drain (:6665), and queued-id
 //     drain (:6808), all in chunk-P4Y2BJL7.js.
 //     executeWorkflow therefore treats a missing #startRequesters entry as a
-//     terminal refusal: it preserves the serialized input when memory permits,
-//     except route deliveries marked persistence-forbidden in non-rendered
-//     signal metadata, publishes ERROR, and never calls RunnerRuntime.
+//     terminal refusal: it preserves input by the guarded input chain's
+//     verdict when memory permits, publishes ERROR, and never calls
+//     RunnerRuntime. #persistUnownedInput states the verdict rule.
 //
 //     Core registers thread state only when stream options carry a memory
 //     thread (chunk-P4Y2BJL7.js:6557-6594). For those runs its completion
@@ -278,10 +278,14 @@
 import {
   type Agent,
   type AgentExecutionOptions,
+  type CreatedAgentSignal,
+  isCreatedAgentSignal,
   isDurableAgentLike,
   isMastraSignalMessage,
+  isTransientSignalMessage,
   MessageList,
   mastraDBMessageToSignal,
+  signalToMastraDBMessage,
   type ToolsInput,
 } from '@mastra/core/agent';
 import {
@@ -292,6 +296,7 @@ import {
   globalRunRegistry,
   prepareForDurableExecution,
 } from '@mastra/core/agent/durable';
+import type { MastraDBMessage } from '@mastra/core/agent/message-list';
 import type { Mastra } from '@mastra/core/mastra';
 import type { RequestContext } from '@mastra/core/request-context';
 import type { AnyWorkflow } from '@mastra/core/workflows';
@@ -384,6 +389,7 @@ export const FLOWSAFE_PERSISTENCE_FORBIDDEN = 'flowsafe.persistence-forbidden';
 const BREAKWATER_GUARDED_AGENT_HOST_PROTOCOL = Symbol.for(
   '@proofoftech/breakwater/guarded-agent-host/v1',
 );
+const BREAKWATER_RBAC_PROCESSOR_ID = 'breakwater-rbac';
 
 interface BreakwaterGuardedAgentHostProtocol {
   readonly version: 1;
@@ -820,6 +826,11 @@ export class FlowsafeDurableAgent<
   >();
   // The host's exact options object receives one private, single-use re-entry ticket.
   readonly #hostStreamTickets = new WeakSet<object>();
+  // The created signal of a start with neither a host ticket nor a request
+  // context, the options a drain inherits from a run resumeViaRuntime()
+  // registered. An RBAC refusal removes that signal from the prepared message
+  // list, so executeWorkflow preserves it from this capture.
+  readonly #replayedSignals = new Map<string, CreatedAgentSignal>();
 
   constructor(options: FlowsafeDurableAgentOptions<TAgentId, TTools, TOutput>) {
     const refusal = unwrappableAgentReason(options.agent);
@@ -931,7 +942,24 @@ export class FlowsafeDurableAgent<
     this.#assertCallerRunId(callOptions?.runId);
     if (!hostStreamTicket) this.#assertRunIdNotLive(callOptions.runId);
     this.#assertGuardedStructuredOutput(callOptions);
-    const result = await super.stream(messages, callOptions);
+    let capturedSignal = false;
+    if (
+      !hostStreamTicket &&
+      callOptions.requestContext === undefined &&
+      isCreatedAgentSignal(messages)
+    ) {
+      this.#replayedSignals.set(callOptions.runId, messages);
+      capturedSignal = true;
+    }
+    let result: Awaited<
+      ReturnType<DurableAgent<TAgentId, TTools, TOutput>['stream']>
+    >;
+    try {
+      result = await super.stream(messages, callOptions);
+    } catch (error) {
+      if (capturedSignal) this.#replayedSignals.delete(callOptions.runId);
+      throw error;
+    }
     if (!callOptions?.untilIdle) {
       await this.#threadRuntime?.registerRun(
         this as unknown as Parameters<
@@ -1588,7 +1616,7 @@ export class FlowsafeDurableAgent<
           return async (requestContext?: RequestContext) => {
             inputProcessors = await target.listInputProcessors(requestContext);
             return inputProcessors.filter(
-              (processor) => processor.id === 'breakwater-rbac',
+              (processor) => processor.id === BREAKWATER_RBAC_PROCESSOR_ID,
             );
           };
         }
@@ -1758,12 +1786,32 @@ export class FlowsafeDurableAgent<
   }
 
   /**
-   * Preserve unowned input before terminal refusal. A bounded best-effort write
-   * prevents hung memory from blocking the ERROR that heals thread state.
+   * Preserve unowned input before terminal refusal, by the guarded input
+   * chain's verdict on the call:
+   * - no tripwire: the prepared input;
+   * - a tripwire from Breakwater's RBAC gate on a call whose created signal
+   *   `stream()` captured: that signal;
+   * - any other tripwire, an RBAC one on a call with no capture included:
+   *   nothing.
+   *
+   * `stream()` captures a created signal only on a start that carries neither
+   * a host ticket nor a request context: a drain after a run
+   * `resumeViaRuntime()` registered, which the gate refuses for its missing
+   * actor without reading content. On a guarded agent such a call has no
+   * actor, so the gate refuses it before any application input processor
+   * runs. Host code that calls `stream()` the same way, with a created signal
+   * or an object carrying the signal brand as input, has that input kept when
+   * the gate refuses it.
+   *
+   * The verdict comes from the tripwire rather than from the prepared list, so
+   * it holds whether or not the guard removes refused input from the list. A
+   * bounded best-effort write prevents hung memory from blocking the ERROR
+   * that heals thread state.
    */
   async #persistUnownedInput(
     runId: string,
     workflowInput: DurableAgenticWorkflowInput,
+    replayedSignal: CreatedAgentSignal | undefined,
   ): Promise<void> {
     let timeout: ReturnType<typeof setTimeout> | undefined;
     try {
@@ -1774,18 +1822,38 @@ export class FlowsafeDurableAgent<
           if (!threadId || state?.threadExists !== true) return;
           // Explicit read-only memory forbids preserving denied input.
           if (state.memoryConfig?.readOnly === true) return;
+          const registryEntry = globalRunRegistry.get(runId);
+          const tripwire = registryEntry?.tripwire;
           const memory = await this.getMemory({
-            requestContext: globalRunRegistry.get(runId)?.requestContext,
+            requestContext: registryEntry?.requestContext,
           });
           if (!memory) return;
-          const list = new MessageList({
-            threadId,
-            resourceId: state.resourceId,
-          }).deserialize(workflowInput.messageListState);
-          const inputIds = list.makeMessageSourceChecker().input;
-          const messages = list.get.all
-            .db()
-            .filter((message) => inputIds.has(message.id))
+          let candidates: MastraDBMessage[];
+          if (tripwire === undefined) {
+            const list = new MessageList({
+              threadId,
+              resourceId: state.resourceId,
+            }).deserialize(workflowInput.messageListState);
+            const inputIds = list.makeMessageSourceChecker().input;
+            candidates = list.get.all
+              .db()
+              .filter((message) => inputIds.has(message.id));
+          } else if (
+            tripwire.processorId === BREAKWATER_RBAC_PROCESSOR_ID &&
+            replayedSignal !== undefined
+          ) {
+            candidates = [
+              signalToMastraDBMessage(replayedSignal, {
+                threadId,
+                resourceId: state.resourceId,
+              }),
+            ];
+          } else {
+            return;
+          }
+          const messages = candidates
+            // Mastra's own persist lane stores no transient signal either.
+            .filter((message) => !isTransientSignalMessage(message))
             // Honor markPersistenceForbidden's route-to-runner metadata contract.
             .filter(
               (message) =>
@@ -2025,10 +2093,13 @@ export class FlowsafeDurableAgent<
         }
         // No #startRequesters entry means the host start seam never registered
         // this id, so core minted it below our boundary. Such a run has no
-        // ownership record or trusted engine-leg context. Preserve its input
-        // when allowed, then close the stream so core can clean up its maps and
+        // ownership record or trusted engine-leg context. Preserve what the
+        // input chain's verdict allows, including a signal stream() captured
+        // for this id, then close the stream so core can clean up its maps and
         // release the lease transferred to this id.
-        await this.#persistUnownedInput(runId, workflowInput);
+        const replayedSignal = this.#replayedSignals.get(runId);
+        this.#replayedSignals.delete(runId);
+        await this.#persistUnownedInput(runId, workflowInput, replayedSignal);
         const refusal = new InvalidRunRequestError(
           `${UNREGISTERED_RUN_REFUSAL_PREFIX}run '${runId}' was not registered by the host start seam — the durable-agent runner never executes a run it does not own`,
         );
@@ -2038,6 +2109,7 @@ export class FlowsafeDurableAgent<
             (await this.#publishTerminalError(runId, refusal)) ||
             (await this.#publishTerminalError(runId, refusal));
         } finally {
+          this.#replayedSignals.delete(runId);
           this.runRegistryInternal.cleanup(runId);
           globalRunRegistry.delete(runId);
         }

@@ -8,7 +8,10 @@ import {
 } from '@mastra/core/schema';
 import type { Tool, ToolExecutionContext } from '@mastra/core/tools';
 import { createTool, isValidationError, noopObserve } from '@mastra/core/tools';
-import { agentAuditDetail } from '../audit/index.js';
+import {
+  agentAuditDetail,
+  malformedAgentAuditContextEvent,
+} from '../audit/index.js';
 import { safeAuditErrorSummary } from '../audit/safe-error.js';
 import {
   CONNECTOR_DECISIONS,
@@ -25,6 +28,13 @@ import {
   isInstanceOf,
   readProperty,
 } from '../connector-decision.js';
+import {
+  assertKnownFields,
+  describeEntry,
+  readFrozenList,
+  readNumberInRange,
+  unknownFieldOf,
+} from '../host-input.js';
 import type {
   ToolCallContext,
   ToolPolicyEvaluator,
@@ -32,9 +42,17 @@ import type {
 import {
   approvalRequired,
   assertEgressHostList,
+  assertManifestBooleans,
+  hasBackgroundOverride,
   ISOLATION_SCOPE_CONTEXT_KEY,
+  isConnectorIdText,
+  isSideEffect,
   LLM_BACKGROUND_OVERRIDE_KEY,
+  MANIFEST_BOOLEAN_FIELD_SET,
   networkEgress,
+  PERMISSION_MANIFEST_KEYS,
+  SIDE_EFFECT_MEMBERS,
+  snapshotWritePermissions,
   WORKFLOW_SCOPE_CONTEXT_KEY,
 } from '../policy-engine/tool-policy.js';
 import { actorFromRequestContext } from '../rbac/index.js';
@@ -86,7 +104,10 @@ import {
   registerConnectorInvocation,
 } from './invocation-registry.js';
 import { newToken } from './new-token.js';
-import { assertSingleTenantConnectorPolicies } from './single-tenant-preset.js';
+import {
+  assertSingleTenantConnectorPolicies,
+  CONNECTOR_POLICIES_KEYS,
+} from './single-tenant-preset.js';
 
 export type {
   ConnectorEgressPosture,
@@ -267,6 +288,13 @@ function pinInputValidationBoundary<T>(
   }) as StandardSchemaWithJSON<T>;
 }
 
+const IN_MEMORY_IDEMPOTENCY_STORE_OPTION_KEYS = {
+  maxEntries: true,
+} satisfies Record<
+  keyof NonNullable<ConstructorParameters<typeof InMemoryIdempotencyStore>[0]>,
+  true
+>;
+
 /**
  * Dev/test store. Per-isolate and evictable — production replay protection
  * needs a durable store (D1IdempotencyStore).
@@ -281,7 +309,21 @@ export class InMemoryIdempotencyStore
   #pending = new Map<string, string>();
 
   constructor(options: { maxEntries?: number } = {}) {
-    this.#maxEntries = options.maxEntries ?? 1000;
+    // A misspelled capacity would fall to the default and evict records the
+    // host sized the store to keep.
+    assertKnownFields(
+      'InMemoryIdempotencyStore options',
+      options,
+      IN_MEMORY_IDEMPOTENCY_STORE_OPTION_KEYS,
+    );
+    // Eviction runs while the store holds more than this many records, so a
+    // value below 1 evicts the record just written and replays nothing.
+    this.#maxEntries = readNumberInRange(
+      'InMemoryIdempotencyStore maxEntries',
+      options.maxEntries ?? 1000,
+      (value) => Number.isSafeInteger(value) && value >= 1,
+      'a positive safe integer',
+    );
   }
 
   /** Return a completed in-memory record, or `undefined` on a miss. */
@@ -453,7 +495,8 @@ export const IDEMPOTENCY_KEY_CONTEXT_KEY = 'breakwater.idempotencyKey';
  * pause is skipped via the compiled `requireApproval` predicate on the
  * standard agent path; runtime paths that evaluate the predicate without a
  * context still pause (fail closed). Connectors without dry-run support
- * deny.
+ * deny. A present value that is not a boolean is denied with
+ * `DRY_RUN_INVALID` before any side effect.
  */
 export const DRY_RUN_CONTEXT_KEY = 'breakwater.dryRun';
 
@@ -639,6 +682,7 @@ function grantForExecution(
   context: ToolExecutionContext,
   connectorId: string,
   toolCallId: string | undefined,
+  isolationScope: string | undefined,
 ): ConnectorApprovalGrant | undefined {
   const requestContext = context.requestContext;
   if (requestContext?.get(LEGACY_CONNECTOR_GRANTS_CONTEXT_KEY) !== undefined) {
@@ -655,7 +699,6 @@ function grantForExecution(
   }
 
   const workflowScope = requestContext?.get(WORKFLOW_SCOPE_CONTEXT_KEY);
-  const isolationScope = isolationScopeOf(requestContext);
   const requestRunId = requestContext?.get('runId');
   if (
     workflowScope !== identity.workflowId ||
@@ -696,27 +739,6 @@ function consumeDirectInvocation(
   delete directContext[DIRECT_INVOCATION_STATE];
   if (state) state.entered = true;
   return state;
-}
-
-// The `_background` model-override field (core LLMBackgroundOverride) smuggled
-// into tool-call args. Presence alone is the smuggling signal — a foreground-
-// only connector must never receive it, whatever its `enabled` value.
-function hasBackgroundOverride(input: unknown): boolean {
-  return (
-    typeof input === 'object' &&
-    input !== null &&
-    LLM_BACKGROUND_OVERRIDE_KEY in input
-  );
-}
-
-// The caller's opaque isolation scope (multi-tenant hosts mint their tenant
-// id; see ISOLATION_SCOPE_CONTEXT_KEY). Deployments that must not run
-// scope-less include the tenantIsolation evaluator in their policy set.
-function isolationScopeOf(
-  requestContext: RequestContext | undefined,
-): string | undefined {
-  const scope = requestContext?.get(ISOLATION_SCOPE_CONTEXT_KEY);
-  return typeof scope === 'string' && scope.length > 0 ? scope : undefined;
 }
 
 // An in-memory store loses its cross-isolate reach the moment a host
@@ -770,31 +792,25 @@ function normalizedRequiredPermissions(
   permissions: readonly Permission[] | undefined,
 ): readonly Permission[] | undefined {
   if (permissions === undefined) return undefined;
-  if (!Array.isArray(permissions)) {
-    throw new TypeError(
-      `connector ${connectorId}: permissions.requiredPermissions must be an array`,
-    );
-  }
-  if (permissions.length === 0) {
-    throw new TypeError(
-      `connector ${connectorId}: permissions.requiredPermissions must not be empty`,
-    );
-  }
+  const subject = `connector ${connectorId}: permissions.requiredPermissions`;
   const unique = new Set<Permission>();
-  for (const permission of permissions) {
-    if (!isPermissionIdentifier(permission)) {
-      throw new TypeError(
-        `connector ${connectorId}: permissions.requiredPermissions contains a malformed permission identifier`,
-      );
-    }
-    if (unique.has(permission)) {
-      throw new TypeError(
-        `connector ${connectorId}: permissions.requiredPermissions contains duplicate '${permission}'`,
-      );
-    }
-    unique.add(permission);
-  }
-  return Object.freeze([...permissions]);
+  return readFrozenList(
+    subject,
+    permissions,
+    (permission) => {
+      if (!isPermissionIdentifier(permission)) {
+        throw new TypeError(
+          `${subject} contains a malformed permission identifier`,
+        );
+      }
+      if (unique.has(permission)) {
+        throw new TypeError(`${subject} contains duplicate '${permission}'`);
+      }
+      unique.add(permission);
+      return permission;
+    },
+    true,
+  );
 }
 
 function normalizedEgress(
@@ -815,6 +831,34 @@ function normalizedEgress(
   );
 }
 
+const CONNECTOR_CONFIG_KEYS = {
+  id: true,
+  description: true,
+  inputSchema: true,
+  outputSchema: true,
+  execute: true,
+  dryRunExecute: true,
+  permissions: true,
+  policies: true,
+} satisfies Record<keyof ConnectorConfig, true>;
+
+type ManifestBooleanField = {
+  [K in keyof PermissionManifest]-?: NonNullable<
+    PermissionManifest[K]
+  > extends boolean
+    ? K
+    : never;
+}[keyof PermissionManifest];
+
+// The boolean-member table sits beside approvalRequired(), whose module cannot
+// import PermissionManifest. The first Record fails to compile while the table
+// lacks a boolean member, and the second while it names another member.
+MANIFEST_BOOLEAN_FIELD_SET satisfies Record<ManifestBooleanField, true> &
+  Record<
+    Exclude<keyof typeof MANIFEST_BOOLEAN_FIELD_SET, ManifestBooleanField>,
+    never
+  >;
+
 /**
  * Compile a connector: a real Mastra createTool() call whose execute is
  * wrapped with the manifest's enforcement. `requiresApproval` (and the org
@@ -829,16 +873,37 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
   config: ConnectorConfig<TInput, TOutput>,
 ): Connector<TInput, TOutput> {
   const { id } = config;
-  const configuredPolicies = config.policies ?? {};
+  if (typeof id !== 'string' || id.length === 0) {
+    throw new TypeError(
+      `connector id must be a non-empty string (got ${describeEntry(id)})`,
+    );
+  }
   // The rate-budget key is `[scope:]connector`; changing its format would
   // reset active windows. A colon-free final connector component keeps that
   // tuple injective.
-  if (typeof id === 'string' && id.includes(':')) {
+  if (id.includes(':')) {
     throw new TypeError(
       `connector id '${id}' must not contain a colon: the rate-limit budget key remains '<scope>:<id>', so a colon in id can collide two distinct tuples on a shared store. Use a colon-free id (camelCase or dot-delimited).`,
     );
   }
+  if (!isConnectorIdText(id)) {
+    throw new TypeError(
+      `connector id ${JSON.stringify(id)} must not contain whitespace or a control or format character, which an approval pattern cannot contain`,
+    );
+  }
+  assertKnownFields(`connector ${id}: config`, config, CONNECTOR_CONFIG_KEYS);
+  const configuredPolicies = config.policies ?? {};
+  assertKnownFields(
+    `connector ${id}: policies`,
+    configuredPolicies,
+    CONNECTOR_POLICIES_KEYS,
+  );
   const permissions = config.permissions;
+  assertKnownFields(
+    `connector ${id}: permissions`,
+    permissions,
+    PERMISSION_MANIFEST_KEYS,
+  );
   const requiredPermissions = normalizedRequiredPermissions(
     id,
     permissions.requiredPermissions,
@@ -849,6 +914,12 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
     egress,
     ...(requiredPermissions !== undefined ? { requiredPermissions } : {}),
   });
+  if (!isSideEffect(manifest.sideEffect)) {
+    throw new TypeError(
+      `connector ${id}: permissions.sideEffect must be ${SIDE_EFFECT_MEMBERS} (got ${describeEntry(manifest.sideEffect)})`,
+    );
+  }
+  assertManifestBooleans(`connector ${id}: permissions`, manifest);
   const validatedPolicies = assertSingleTenantConnectorPolicies(
     id,
     manifest,
@@ -940,15 +1011,49 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
 
   const auditRecord = validatedPolicies.auditRecord;
   const networkEgressPolicy = policies.networkEgress;
+  if (
+    networkEgressPolicy != null &&
+    (typeof networkEgressPolicy !== 'object' ||
+      Array.isArray(networkEgressPolicy))
+  ) {
+    throw new TypeError(
+      `connector ${id}: policies.networkEgress must be an object (got ${Array.isArray(networkEgressPolicy) ? 'an array' : describeEntry(networkEgressPolicy)})`,
+    );
+  }
+  const configuredEvaluators = policies.evaluators;
+  const evaluators =
+    configuredEvaluators == null
+      ? []
+      : readFrozenList(
+          `connector ${id}: policies.evaluators`,
+          configuredEvaluators,
+          (entry, index) => {
+            if (
+              typeof entry !== 'object' ||
+              entry === null ||
+              typeof (entry as Partial<ToolPolicyEvaluator>).name !==
+                'string' ||
+              typeof (entry as Partial<ToolPolicyEvaluator>).evaluate !==
+                'function'
+            ) {
+              throw new TypeError(
+                `connector ${id}: policies.evaluators entry ${index} must be an evaluator with a string name and an evaluate function (got ${describeEntry(entry)})`,
+              );
+            }
+            return entry as ToolPolicyEvaluator;
+          },
+        );
   const gates: readonly ToolPolicyEvaluator[] = [
-    ...(networkEgressPolicy ? [networkEgress(networkEgressPolicy)] : []),
-    ...(policies.evaluators ?? []),
+    ...(networkEgressPolicy != null
+      ? [networkEgress(networkEgressPolicy)]
+      : []),
+    ...evaluators,
   ];
-  const needsApproval = approvalRequired(
-    id,
-    manifest,
+  const writePermissions = snapshotWritePermissions(
+    `connector ${id}: policies.writePermissions`,
     policies.writePermissions,
   );
+  const needsApproval = approvalRequired(id, manifest, writePermissions);
   if (
     manifest.idempotencyKey &&
     store &&
@@ -1107,6 +1212,7 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
 
   async function consumeRateLimit(
     requestContext: RequestContext | undefined,
+    scope: string | undefined,
   ): Promise<void> {
     if (!rateLimit) return;
     // Budget key segments by isolation scope: tenant A exhausting connector
@@ -1115,7 +1221,6 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
     // is shared is the store's reach: an in-memory store bounds the window
     // to this isolate (under DO-per-run routing, to this RUN), so a cap that
     // must hold across isolates needs a durable store (D1RateLimitStore).
-    const scope = isolationScopeOf(requestContext);
     if (
       scope !== undefined &&
       rateLimit.store instanceof InMemoryRateLimitStore
@@ -1257,12 +1362,60 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
     const toolCallId =
       context.agent?.toolCallId ?? directInvocation?.toolCallId;
 
+    const malformedAuditContext = malformedAgentAuditContextEvent(
+      requestContext,
+      id,
+      actorFromRequestContext(requestContext) ?? null,
+    );
+    if (malformedAuditContext) auditRecord?.(malformedAuditContext);
+
     if (!manifest.background && hasBackgroundOverride(inputData)) {
       deny(
         requestContext,
         'background',
         `tool-call args carry a '${LLM_BACKGROUND_OVERRIDE_KEY}' override but this connector is foreground-only (the manifest does not opt into background execution)`,
         { code: 'BACKGROUND_OVERRIDE_DENIED' },
+      );
+    }
+    // Mastra's standard agent loop marks the call it dispatches as a
+    // background task; its durable loop and static executors pass no marker.
+    if (!manifest.background && context.agent?.isBackgroundTask === true) {
+      deny(
+        requestContext,
+        'background',
+        'Mastra runs this call as a background task but this connector is foreground-only (the manifest does not opt into background execution)',
+        { code: 'BACKGROUND_TASK_DENIED' },
+      );
+    }
+
+    // Read once and used by the grant, budget and replay keys. Another kind
+    // of value would read as no scope and share one tenant's grants, budget
+    // and stored results with every other such tenant.
+    const configuredScope: unknown = requestContext?.get(
+      ISOLATION_SCOPE_CONTEXT_KEY,
+    );
+    if (
+      configuredScope !== undefined &&
+      (typeof configuredScope !== 'string' || configuredScope.length === 0)
+    ) {
+      deny(
+        requestContext,
+        'isolation-scope',
+        `requestContext '${ISOLATION_SCOPE_CONTEXT_KEY}' must be an opaque non-empty string when present (got ${describeEntry(configuredScope)})`,
+        { code: 'ISOLATION_SCOPE_INVALID' },
+      );
+    }
+    const isolationScope = configuredScope;
+    // Only `true` asks for a simulation, so any other present value but
+    // `false` would run the real side effect the caller may have meant to
+    // avoid.
+    const dryRunRequest: unknown = requestContext?.get(DRY_RUN_CONTEXT_KEY);
+    if (dryRunRequest !== undefined && typeof dryRunRequest !== 'boolean') {
+      deny(
+        requestContext,
+        'dry-run',
+        `requestContext '${DRY_RUN_CONTEXT_KEY}' must be a boolean when present (got ${describeEntry(dryRunRequest)})`,
+        { code: 'DRY_RUN_INVALID' },
       );
     }
 
@@ -1376,7 +1529,7 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
       );
     }
 
-    if (requestContext?.get(DRY_RUN_CONTEXT_KEY) === true) {
+    if (dryRunRequest === true) {
       // The caller asked for a simulation; an unsupported manifest fails
       // closed — executing for real would violate the caller's intent. This
       // branches BEFORE the approval gate on the documented no-side-effect
@@ -1418,7 +1571,7 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
     // must mint the grant into the requestContext the resumed call runs
     // under.
     if (needsApproval) {
-      const grant = grantForExecution(context, id, toolCallId);
+      const grant = grantForExecution(context, id, toolCallId, isolationScope);
       if (!grant) {
         deny(
           requestContext,
@@ -1469,7 +1622,6 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
       // which two tenants can legitimately share — without the scope segment
       // tenant B's send would replay tenant A's cached result object
       // (confidentiality AND availability). No scope => the unscoped key.
-      const isolationScope = isolationScopeOf(requestContext);
       if (
         isolationScope !== undefined &&
         store instanceof InMemoryIdempotencyStore
@@ -1594,7 +1746,7 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
             // and joins never spend budget.
             const attempt = (async () => {
               try {
-                await consumeRateLimit(requestContext);
+                await consumeRateLimit(requestContext, isolationScope);
                 const result = await config.execute(
                   typedInput,
                   context,
@@ -1658,7 +1810,7 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
           }
           const attempt = (async () => {
             // Consume inside the attempt — see the reserve-probe note above.
-            await consumeRateLimit(requestContext);
+            await consumeRateLimit(requestContext, isolationScope);
             const result = await config.execute(typedInput, context, runtime);
             const validatedResult = validateOutput(result);
             // Only successful results are replayable — a thrown execute must
@@ -1691,7 +1843,7 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
       }
     }
 
-    await consumeRateLimit(requestContext);
+    await consumeRateLimit(requestContext, isolationScope);
     try {
       const result = await config.execute(typedInput, context, runtime);
       return finishAllowed(requestContext, validateOutput(result));
@@ -1837,6 +1989,13 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
   return connector;
 }
 
+const CONNECTOR_INVOCATION_OPTION_KEYS = {
+  requestContext: true,
+  abortSignal: true,
+  observe: true,
+  toolCallId: true,
+} satisfies Record<keyof ConnectorInvocationOptions, true>;
+
 /**
  * Invoke a Breakwater connector outside a Mastra agent loop while retaining
  * Mastra schema validation and every compiled Breakwater gate.
@@ -1868,6 +2027,41 @@ export async function invokeConnector<TInput, TOutput>(
       'invokeConnector refuses a connector whose execution boundary was modified after construction',
     );
   }
+  // A misspelled requestContext would run without it, and the absent dry-run
+  // request then runs the real side effect.
+  if (
+    typeof options !== 'object' ||
+    options === null ||
+    Array.isArray(options)
+  ) {
+    throw new ConnectorInvocationError(
+      invocation.id,
+      'CONNECTOR_INVOCATION_OPTIONS_INVALID',
+      `invokeConnector options must be an object (got ${Array.isArray(options) ? 'an array' : describeEntry(options)})`,
+    );
+  }
+  const unknownOption = unknownFieldOf(
+    options,
+    CONNECTOR_INVOCATION_OPTION_KEYS,
+  );
+  if (unknownOption !== undefined) {
+    throw new ConnectorInvocationError(
+      invocation.id,
+      'CONNECTOR_INVOCATION_OPTIONS_INVALID',
+      `invokeConnector options has unknown field ${JSON.stringify(unknownOption)} (valid fields: ${Object.keys(CONNECTOR_INVOCATION_OPTION_KEYS).join(', ')})`,
+    );
+  }
+  const requestContext: unknown = options.requestContext;
+  if (
+    requestContext !== undefined &&
+    !(requestContext instanceof RequestContext)
+  ) {
+    throw new ConnectorInvocationError(
+      invocation.id,
+      'CONNECTOR_INVOCATION_OPTIONS_INVALID',
+      `invokeConnector requestContext must be a RequestContext when provided (got ${describeEntry(requestContext)})`,
+    );
+  }
   const toolCallId = options.toolCallId;
   if (toolCallId !== undefined && !nonEmptyString(toolCallId)) {
     throw new ConnectorInvocationError(
@@ -1882,7 +2076,7 @@ export async function invokeConnector<TInput, TOutput>(
     ...(toolCallId === undefined ? {} : { toolCallId }),
   };
   const context: DirectInvocationContext = {
-    requestContext: options.requestContext ?? new RequestContext(),
+    requestContext: requestContext ?? new RequestContext(),
     abortSignal: options.abortSignal,
     observe: options.observe ?? noopObserve,
     [DIRECT_INVOCATION_STATE]: state,

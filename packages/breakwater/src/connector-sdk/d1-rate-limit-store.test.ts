@@ -251,6 +251,53 @@ describe('D1RateLimitStore (Node SQLite facsimile)', () => {
     }
   });
 
+  it.each<[string, number | null]>([
+    ['a NULL count', null],
+    ['a negative count', -5],
+  ])('fails a call closed when a table it did not create returns %s', async (_label, stored) => {
+    // #given — a table with a nullable count, created before the store
+    const sqlite = openSqlite();
+    sqlite.exec(
+      `CREATE TABLE breakwater_rate_limit (
+         budget_key TEXT NOT NULL,
+         window_start INTEGER NOT NULL,
+         count INTEGER,
+         PRIMARY KEY (budget_key, window_start)
+       )`,
+    );
+    sqlite
+      .prepare('INSERT INTO breakwater_rate_limit VALUES (?, ?, ?)')
+      .run('crm.create', T0, stored);
+    const execute = vi.fn(async () => ({ ok: true }));
+    const tool = createConnector({
+      id: 'crm.create',
+      description: 'Create one CRM record',
+      permissions: { sideEffect: 'write', rateLimit: '1/min' },
+      policies: { rateLimitStore: new D1RateLimitStore(d1Like(sqlite)) },
+      execute,
+    });
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(T0);
+      // #when
+      const failure = await runConnector(tool).catch((error: unknown) => error);
+      // #then
+      expect(failure).toBeInstanceOf(ConnectorStoreError);
+      expect(failure).toMatchObject({
+        code: 'STORE_UNAVAILABLE',
+        store: 'rate-limit',
+        operation: 'increment',
+        cause: expect.objectContaining({
+          message:
+            "D1RateLimitStore: increment returned a count that is not a positive safe integer for 'crm.create'",
+        }),
+      });
+      expect(execute).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('epoch-aligns windows so every caller computes the same boundary', async () => {
     // #given — two calls inside the same epoch-aligned minute
     const store = new D1RateLimitStore(d1Like(openSqlite()));

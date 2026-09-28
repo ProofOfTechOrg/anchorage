@@ -14,6 +14,13 @@ import type {
   ConnectorDecisionCode,
   ConnectorPolicyName,
 } from '../connector-decision.js';
+import {
+  assertKnownFields,
+  describeEntry,
+  readFrozenList,
+  readNumberInRange,
+  unknownFieldOf,
+} from '../host-input.js';
 import type { Actor } from '../rbac/actor.js';
 
 /** Request-context key for trusted agent and run correlation fields. */
@@ -77,38 +84,93 @@ const AGENT_AUDIT_OPTIONAL_FIELDS = Object.keys(
   AGENT_AUDIT_OPTIONAL_FIELD_SET,
 ) as readonly AgentAuditOptionalField[];
 
-/**
- * Read only the documented scalar fields from trusted request context.
- *
- * Unknown properties are ignored, so prompts, tool inputs, URLs, secrets, and
- * model output cannot reach audit detail through this correlation seam.
- */
-export function agentAuditContextFromRequestContext(
+const AGENT_AUDIT_CONTEXT_KEYS = {
+  agentId: true,
+  entryPath: true,
+  ...AGENT_AUDIT_OPTIONAL_FIELD_SET,
+} satisfies Record<keyof AgentAuditContext, true>;
+
+interface AgentAuditContextRead {
+  context?: AgentAuditContext;
+  malformed: boolean;
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0;
+}
+
+function readAgentAuditContext(
   requestContext: RequestContext | undefined,
-): AgentAuditContext | undefined {
-  const value = requestContext?.get(AGENT_AUDIT_CONTEXT_KEY);
-  if (!value || typeof value !== 'object') return undefined;
+): AgentAuditContextRead {
+  const value: unknown = requestContext?.get(AGENT_AUDIT_CONTEXT_KEY);
+  if (value === undefined) return { malformed: false };
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return { malformed: true };
+  }
   try {
     const candidate = value as Record<string, unknown>;
+    let malformed =
+      unknownFieldOf(candidate, AGENT_AUDIT_CONTEXT_KEYS) !== undefined;
     const agentId = candidate.agentId;
-    if (typeof agentId !== 'string' || agentId.length === 0) return undefined;
     const entryPath = candidate.entryPath;
-    if (typeof entryPath !== 'string' || entryPath.length === 0)
-      return undefined;
+    if (!isNonEmptyString(agentId) || !isNonEmptyString(entryPath)) {
+      return { malformed: true };
+    }
     const context: AgentAuditContext = {
       agentId,
       entryPath,
     };
     for (const field of AGENT_AUDIT_OPTIONAL_FIELDS) {
       const fieldValue = candidate[field];
-      if (typeof fieldValue === 'string' && fieldValue.length > 0) {
+      if (isNonEmptyString(fieldValue)) {
         context[field] = fieldValue;
+      } else if (fieldValue !== undefined) {
+        malformed = true;
       }
     }
-    return context;
+    return { context, malformed };
   } catch {
-    return undefined;
+    return { malformed: true };
   }
+}
+
+/**
+ * Read only the documented scalar fields from trusted request context.
+ *
+ * Unknown properties are not copied, so prompts, tool inputs, URLs, secrets,
+ * and model output cannot reach audit detail through this correlation seam.
+ * An optional field that is not a non-empty string is not copied either.
+ */
+export function agentAuditContextFromRequestContext(
+  requestContext: RequestContext | undefined,
+): AgentAuditContext | undefined {
+  return readAgentAuditContext(requestContext).context;
+}
+
+/**
+ * @internal The error event an entry boundary records when request context
+ * carries a `breakwater.auditContext` that is not an object, lacks a valid
+ * `agentId` or `entryPath`, has a present optional field that is not a
+ * non-empty string, or has a field {@link AgentAuditContext} does not declare.
+ * Such a value loses correlation, and the event keeps that loss from passing
+ * silently; the boundary still decides as it would without it. `undefined`
+ * when the key is absent or well formed.
+ */
+export function malformedAgentAuditContextEvent(
+  requestContext: RequestContext | undefined,
+  resource: string,
+  actor: Actor | null,
+): Omit<AuditEvent, 'timestamp'> | undefined {
+  const read = readAgentAuditContext(requestContext);
+  if (!read.malformed) return undefined;
+  return {
+    actor,
+    action: 'audit.context',
+    resource,
+    decision: 'error',
+    reason: `request context '${AGENT_AUDIT_CONTEXT_KEY}' is malformed`,
+    ...(read.context === undefined ? {} : { detail: { ...read.context } }),
+  };
 }
 
 /**
@@ -154,13 +216,28 @@ export type AuditSink = (event: AuditEvent) => void | Promise<void>;
 
 /** Configuration for `AuditLogger`. */
 export interface AuditLoggerOptions {
-  /** Optional external destination. The logger buffers records regardless. */
+  /**
+   * Optional external destination. The logger buffers records regardless. A
+   * present value must be a function.
+   */
   sink?: AuditSink;
-  /** Sink failures must not break the agent path; surface them here instead. */
+  /**
+   * Sink failures must not break the agent path; surface them here instead. A
+   * present value must be a function.
+   */
   onSinkError?: (error: unknown, event: AuditEvent) => void;
-  /** In-memory ring buffer capacity. Oldest events drop first. */
+  /**
+   * In-memory ring buffer capacity. Oldest events drop first. Default 1000. A
+   * present value must be a non-negative safe integer.
+   */
   maxBuffered?: number;
 }
+
+const AUDIT_LOGGER_OPTION_KEYS = {
+  sink: true,
+  onSinkError: true,
+  maxBuffered: true,
+} satisfies Record<keyof AuditLoggerOptions, true>;
 
 /** In-memory audit ring buffer with an optional failure-isolated sink. */
 export class AuditLogger {
@@ -170,9 +247,29 @@ export class AuditLogger {
   #buffer: AuditEvent[] = [];
 
   constructor(options: AuditLoggerOptions = {}) {
+    assertKnownFields(
+      'AuditLogger: options',
+      options,
+      AUDIT_LOGGER_OPTION_KEYS,
+    );
+    // A sink that is not a function would count as external while every
+    // record it should export is dropped.
+    for (const field of ['sink', 'onSinkError'] as const) {
+      const callback: unknown = options[field];
+      if (callback !== undefined && typeof callback !== 'function') {
+        throw new TypeError(
+          `AuditLogger: ${field} must be a function when provided (got ${describeEntry(callback)})`,
+        );
+      }
+    }
     this.#sink = options.sink;
     this.#onSinkError = options.onSinkError;
-    this.#maxBuffered = options.maxBuffered ?? 1000;
+    this.#maxBuffered = readNumberInRange(
+      'AuditLogger: maxBuffered',
+      options.maxBuffered ?? 1000,
+      (capacity) => Number.isSafeInteger(capacity) && capacity >= 0,
+      'a non-negative safe integer',
+    );
   }
 
   /** Stamp, buffer, and optionally export an audit event. */
@@ -210,7 +307,7 @@ export class AuditLogger {
 
   /** Whether this logger exports records beyond its in-memory ring buffer. */
   hasExternalSink(): boolean {
-    return this.#sink !== undefined;
+    return typeof this.#sink === 'function';
   }
 
   /** Remove every buffered event without changing the configured sink. */
@@ -242,10 +339,36 @@ export interface MetricsRecorder {
  * NaN, Infinity, or NEGATIVE `durationSeconds` simply skips the observe call
  * (a duration histogram must stay non-negative; cross-isolate clock skew can
  * stamp a decide before its create, and that skew is not a duration).
+ *
+ * `metrics` must be an object whose `increment` and `observe` are functions:
+ * the returned sink counts as external wherever a logger holds it, so one that
+ * could export nothing is refused when it is built.
  */
 export function metricsAuditSink(metrics: MetricsRecorder): AuditSink {
+  if (
+    (typeof metrics !== 'object' && typeof metrics !== 'function') ||
+    metrics === null
+  ) {
+    throw new TypeError(
+      `metricsAuditSink: metrics must be an object with increment and observe functions (got ${describeEntry(metrics)})`,
+    );
+  }
+  const increment: unknown = metrics.increment;
+  const observe: unknown = metrics.observe;
+  for (const [member, value] of [
+    ['increment', increment],
+    ['observe', observe],
+  ] as const) {
+    if (typeof value !== 'function') {
+      throw new TypeError(
+        `metricsAuditSink: metrics.${member} must be a function (got ${describeEntry(value)})`,
+      );
+    }
+  }
+  const recordDecision = increment as MetricsRecorder['increment'];
+  const recordDuration = observe as MetricsRecorder['observe'];
   return (event: AuditEvent): void => {
-    metrics.increment('breakwater.audit.decision', {
+    recordDecision.call(metrics, 'breakwater.audit.decision', {
       action: event.action,
       decision: event.decision,
     });
@@ -255,9 +378,12 @@ export function metricsAuditSink(metrics: MetricsRecorder): AuditSink {
       Number.isFinite(duration) &&
       duration >= 0
     ) {
-      metrics.observe('breakwater.audit.duration_seconds', duration, {
-        action: event.action,
-      });
+      recordDuration.call(
+        metrics,
+        'breakwater.audit.duration_seconds',
+        duration,
+        { action: event.action },
+      );
     }
   };
 }
@@ -285,8 +411,27 @@ export function metricsAuditSink(metrics: MetricsRecorder): AuditSink {
  * promise, the sync errors (if any) are thrown immediately and the function
  * returns void synchronously, keeping AuditLogger.record's plain sync
  * try/catch path for an all-sync sink set.
+ *
+ * At least one sink is required, and every sink must be a function: the
+ * combined sink counts as external wherever a logger holds it, so one that
+ * could export nothing is refused when it is built.
  */
-export function combineAuditSinks(...sinks: readonly AuditSink[]): AuditSink {
+export function combineAuditSinks(
+  ...configuredSinks: readonly AuditSink[]
+): AuditSink {
+  const sinks = readFrozenList(
+    'combineAuditSinks: sinks',
+    configuredSinks,
+    (entry, index) => {
+      if (typeof entry !== 'function') {
+        throw new TypeError(
+          `combineAuditSinks: sinks entry ${index} must be a function (got ${Array.isArray(entry) ? 'an array' : describeEntry(entry)})`,
+        );
+      }
+      return entry as AuditSink;
+    },
+    true,
+  );
   return (event: AuditEvent): void | Promise<void> => {
     const syncErrors: unknown[] = [];
     const pending: Promise<void>[] = [];

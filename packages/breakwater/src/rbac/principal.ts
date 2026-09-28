@@ -9,6 +9,8 @@
 //
 // @internal
 
+import { describeEntry } from '../host-input.js';
+
 /**
  * What KIND of principal an actor is. Roles are a human vocabulary — a
  * scheduled job, a service call, and an agent delegating to another agent have
@@ -35,7 +37,9 @@ export const DEFAULT_ALLOWED_PRINCIPAL_KINDS: readonly PrincipalKind[] = [
 ];
 
 /**
- * An actor's effective kind, treating the absent field as its default.
+ * An actor's effective kind, treating the absent field as its default. Throws
+ * a `TypeError` for a present `kind`, `null` included, that is not a
+ * {@link PRINCIPAL_KINDS} member, which must never read as the human default.
  *
  * Structurally typed rather than taking `Actor` so this leaf does not depend on
  * the barrel that re-exports it.
@@ -43,7 +47,14 @@ export const DEFAULT_ALLOWED_PRINCIPAL_KINDS: readonly PrincipalKind[] = [
 export function principalKindOf(actor: {
   kind?: PrincipalKind;
 }): PrincipalKind {
-  return actor.kind ?? 'human';
+  const kind: unknown = actor.kind;
+  if (kind === undefined) return 'human';
+  if (!(PRINCIPAL_KINDS as readonly unknown[]).includes(kind)) {
+    throw new TypeError(
+      `principalKindOf: kind must be one of ${PRINCIPAL_KINDS.join(', ')} (got ${describeEntry(kind)})`,
+    );
+  }
+  return kind as PrincipalKind;
 }
 
 /**

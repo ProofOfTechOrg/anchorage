@@ -15,6 +15,7 @@ import {
 import {
   assertEgressHostList,
   egressDomainAllowed,
+  PERMISSION_MANIFEST_KEYS,
 } from '../policy-engine/tool-policy.js';
 import type {
   Connector,
@@ -560,21 +561,20 @@ function validateOptions<TInput>(
 }
 
 /**
- * Every member of `PermissionManifest`. The `Record` makes the list a
- * compile-time obligation: a member the interface gains is a missing property
- * here, and a name it does not have is an excess one.
+ * Every member of `PermissionManifest`: the table the manifest's unknown-field
+ * refusals read, checked here because its own module cannot import the
+ * interface. The first `Record` fails to compile while the table lacks a
+ * member the interface has, and the second while it names one the interface
+ * does not have.
  */
-const MANIFEST_MEMBER_SET: Record<keyof PermissionManifest, true> = {
-  sideEffect: true,
-  egress: true,
-  idempotencyKey: true,
-  requiresApproval: true,
-  dryRun: true,
-  rateLimit: true,
-  background: true,
-  requiredPermissions: true,
-  egressEnforcement: true,
-};
+const MANIFEST_MEMBER_SET = PERMISSION_MANIFEST_KEYS satisfies Record<
+  keyof PermissionManifest,
+  true
+> &
+  Record<
+    Exclude<keyof typeof PERMISSION_MANIFEST_KEYS, keyof PermissionManifest>,
+    never
+  >;
 
 const MANIFEST_MEMBERS = Object.keys(
   MANIFEST_MEMBER_SET,

@@ -24,15 +24,25 @@ interface PolicyEvaluator {
 }
 ```
 
-Each decision is either `{ allowed: true }` or `{ allowed: false, reason }`. An evaluator exception is a policy-engine failure, is audited as an error, and fails the request closed.
+Each decision is either `{ allowed: true }` or `{ allowed: false, reason }`. An evaluator that throws, or returns anything else, has failed. The engine records an error event for the failure and stops the call: it aborts at input and in-stream, on both of Mastra's agent loops, and rethrows at the final result, which stops Mastra's standard loop.
 
 Policies run in array order. The engine snapshots the list and each evaluator's
 name, phase/channel selectors, hold-back hint, and evaluator reference at
 construction. Class-based evaluators keep their original receiver, so private
-fields and helper methods continue to work. Later replacement of the evaluator
+fields, instance fields, TypeScript parameter properties and helper methods
+continue to work. Later replacement of the evaluator
 method or mutation of caller-owned selector arrays does not change enforcement;
 mutable state owned by the evaluator instance or its closures remains the
 application's responsibility. The first denial aborts the phase.
+
+Construction refuses a `PolicyEngine` option its type does not declare, a
+field outside `PolicyEvaluator` on a plain-object evaluator (a literal, a
+spread of a factory's output, or a null-prototype object), and a present
+`audit` without a callable `record`. A class-based evaluator's own fields are
+its state and are not checked. A present `holdBackChars` must be a number of
+at least 0, or `Infinity`. Each included evaluator throws on a `text` that is
+not a string, so a direct call with malformed context fails instead of
+allowing it.
 
 ### Host content gate
 
@@ -44,7 +54,15 @@ one whose declared phases exclude `input`, or whose declared channels exclude
 `answer` — is rejected at construction rather than silently skipped, because a
 policy that never runs is a hole at a security boundary. Of the included
 policies only `maxTextLength` is affected: it declares the output phase by
-default and needs an explicit `phases: ['input']` here.
+default and needs an explicit `phases: ['input']` here. The gate also rejects
+an empty policy list, which would allow every input.
+
+The function the gate returns checks its call input before any policy runs.
+An input that is not an object, carries a field other than `text` and
+`requestContext`, has a `text` that is not a string, or has a present
+`requestContext` that is not a `RequestContext` returns the error outcome and
+records the static error event, so every policy answers a malformed input the
+same way.
 
 The result is deliberately opaque: `{ allowed: true }`,
 `{ allowed: false, outcome: 'denied' }`, or
@@ -60,7 +78,7 @@ side effect.
 
 ## Phases and channels
 
-Input processing joins textual message parts and evaluates them under the `answer` channel. Output processing maintains independent accumulated text for:
+Input processing evaluates, under the `answer` channel, the text Mastra renders into the model prompt from the call's own messages. It builds that text with Mastra's public `convertMessages()` conversion and applies the stored tool-output substitution Mastra's prompt builder makes, so replayed tool calls, tool results, reasoning and signals are evaluated like new input. Mastra substitutes a stored output into any tool result with its call id, in memory-loaded history and in later loop steps too, so the engine also reads every stored output the messages carry, whether or not one of their tool results receives it. The messages come from the processor's `messageList`: history that memory loads into the list is not passed to policies as `messages`, and is not evaluated unless a guarded agent's application input processor changes it, including the tool calls and tool results an earlier gated call saved, so content must be checked where it is written to memory or returned by a tool. Without a `messageList`, every message counts as the call's own. Inside a guarded agent, the engine also evaluates what the agent's application input processors added to the prompt or changed in it outside the call's messages, which the processor wrapper records per call: each such system message as its text parts joined as Mastra joins them, with the values the same provider-option rules read from the options Mastra sends with it, and each such message of another source, memory-loaded history a processor rewrites through any source included, read as the call's messages are. Each such message's text is in `text` once for each version a processor left it in: on `generate()` and `stream()` a context or response message a processor added is also in `messages` and read there, and on Mastra's durable loop `messages` holds the input messages only; a refused option or unclassified content aborts input as it does in a call's message. The agent's instructions are evaluated only when such a processor changes them. The wrapper compares the list before its processor runs with the list once the processor's returned promise settles, so a change made after that, or content served through a Proxy that shows the comparison other values than Mastra renders, is not evaluated. A standalone engine has no such record and reads the call's messages alone. A call that RBAC, an input policy or an application input processor refuses has its input, its response messages, and every other non-system message its application input processors added or changed, the refusing processor's own included, removed from Mastra's message list before it stops. It saves none of them to memory, Mastra's durable loop generates no thread title from them, and on `generate()` and `stream()` the result's `messages` and `rememberedMessages` omit them, a history message such a processor changed included. Provider options that a model adapter bundled with Mastra renders into its request as message content or role, and that no genuine replay carries, abort input; those that replayed responses store as content, such as Anthropic citations, are read. Tool-call ids, provider metadata such as signatures, cache control and provider-held references like an OpenAI Responses `itemId`, and file and image data are not inspected; neither is the base64 data of a tool output's content items, which the adapters that send tool output as JSON text send as text. A provider-executed tool result that Mastra places in an assistant message is read without the encrypted payload, file reference, base64 document or generated image that the provider returned, such as Anthropic web search's `encryptedContent`, where the root of the result has the shape a model adapter bundled with Mastra stores for that tool. The engine matches a shape only at the root because an adapter can send a result's nested members as they stand: the same field elsewhere in a result is read, such as in the tool definitions of an OpenAI Responses `tool_search` result, and so is the whole of a result that names a Google server-tool call or answers an Anthropic MCP call, which those adapters send on as content. Tool messages and stored model outputs are read whole. Call-level provider options are not part of the messages and are not read. The Vercel AI Gateway adapter forwards every provider option to a hosted service whose rendering Breakwater does not know. A message whose role, part type or tool-invocation state the engine does not classify, a rendered part or tool output it does not classify, a refused provider option, or content Mastra's conversion throws on aborts input with a static reason and one error event, rather than throwing, because Mastra's durable preparation continues to the model after an input processor error that is not a tripwire; `extractMessageText()` throws a `TypeError` for the same content, with the conversion's error as its `cause` when there is one. A guarded agent refuses a caller message with `role: 'system'`, at the top level or in the nested list Mastra flattens, which Mastra would pass to the model as a system message outside the input policies, and a list nested deeper than Mastra accepts. Output processing maintains independent accumulated text for:
 
 | Channel | Source |
 | --- | --- |
@@ -69,6 +87,8 @@ Input processing joins textual message parts and evaluates them under the `answe
 | `object` | Canonical JSON structured-output snapshots |
 
 A policy defaults to both phases and the `answer` channel. Set `phases` and `channels` when a policy applies more narrowly.
+
+A text or reasoning delta whose text is not a string, and a result step whose reasoning text is present but not a string, abort the stream with a static reason and an audit error event. No policy could read such a chunk, so forwarding it would release text unseen.
 
 Under the supported core version, the engine sees the `object` channel only for object chunks that flow through the processor chain (model-native streaming). It requires those values to be JSON data, evaluates the canonical serialization, and forwards the same canonical clone. A `generate()` result's parsed object and core's `StructuredOutputProcessor` chunks never pass through the chain, and Mastra may expose the parsed value before `generate()` returns. `createGuardedAgent` therefore rejects structured output and rejects object-only policies at construction. JSON carried in answer text is still inspected by policies that include `answer`. A standalone engine with an object-only policy requires an audit sink and aborts at the result boundary unless a processor-visible object chunk provided coverage.
 
@@ -82,7 +102,7 @@ Denial reasons identify the configured pattern, not the matched input span. Do n
 
 ### Maximum length
 
-`maxTextLength(limit, options)` denies accumulated text beyond a configured bound. Apply different policies per channel when answer and reasoning budgets differ.
+`maxTextLength(limit, options)` denies accumulated text beyond a configured bound, a finite number of at least 0. Apply different policies per channel when answer and reasoning budgets differ.
 
 ### PII and secrets
 
@@ -94,6 +114,12 @@ Denial reasons identify the configured pattern, not the matched input span. Do n
 - high-Shannon-entropy token detection with a minimum candidate floor;
 - allowlist exemptions;
 - streaming overlap windows sized to the enabled detectors.
+
+`entropyThreshold` must be a number greater than 0 and at most the entropy of
+a candidate that uses each of the 67 characters a candidate is drawn from
+equally often (about 6.066 bits per character), the highest entropy a candidate
+can reach. The bound is the value the detector computes for that candidate, so
+a threshold at the maximum still detects it.
 
 The detector is a guardrail, not a semantic data-loss-prevention system. Encodings, fragmented values beyond configured windows, domain-specific identifiers, and adversarial transformations can evade pattern detectors.
 
@@ -115,9 +141,9 @@ const moderation = classifierPolicy({
 });
 ```
 
-Input and final-result phases always classify. During append-only streaming, the evaluator runs when accumulated text grows by the configured cadence; object snapshots classify individually.
+Input and final-result phases always classify. During append-only streaming, the evaluator runs when accumulated text grows by the configured cadence, `evaluateEveryChars`, a positive safe integer; object snapshots classify individually.
 
-A timeout or classifier failure fails closed. No fail-open option is provided.
+A timeout, a classifier failure or a classifier that returns no decision fails closed at input and in-stream on both of Mastra's agent loops, and at the final result on Mastra's standard loop. No fail-open option is provided.
 
 ## Hold-back and leakage
 
@@ -169,13 +195,13 @@ The connector reads `breakwater.connectorGrants` and `breakwater.connectorExecut
 
 `tenantIsolation()` is the Breakwater API for requiring a non-empty opaque `breakwater.isolationScope`. The same scope segments idempotency and rate-limit keys.
 
-Use it only in a host that has another trusted logical partition and mints the scope on every path, including dry runs. Breakwater does not parse the value. Flowsafe's physically isolated data plane deliberately mints no isolation scope and drops provider attempts to add one, so its connector budgets are deployment-wide.
+Use it only in a host that has another trusted logical partition and mints the scope on every path, including dry runs. Breakwater does not parse the value, but the connector wrapper denies a present value that is not a non-empty string with `ISOLATION_SCOPE_INVALID`, whether or not `tenantIsolation()` is installed. Flowsafe's physically isolated data plane deliberately mints no isolation scope and drops provider attempts to add one, so its connector budgets are deployment-wide.
 
 ### Background execution
 
 `backgroundExecution()` and the connector wrapper protect Mastra's `_background` model override. A connector is foreground-only unless its manifest declares `background: true`, and only a read-only connector can opt in. Write, destructive, and idempotent connectors remain foreground-only. A read-only connector may opt in even when its manifest separately requires approval; the grant check still runs at execution.
 
-Schema validation may strip `_background` on some agent paths. The connector check still protects no-schema, passthrough, workflow, and direct calls.
+`backgroundExecution()` denies a write-class call whose arguments carry `_background`, whatever its value, using the connector wrapper's presence test, and denies a call whose `sideEffect` is not a side-effect member. Mastra's standard agent loop removes a truthy `_background` before dispatch, so a call Mastra runs as a background task carries no key; the wrapper refuses that call instead, with `BACKGROUND_TASK_DENIED`, on every connector without `background: true`. That refusal reaches only the standard loop's in-process dispatch: Mastra's durable agent loop, static background executors, calls nested inside background work, and Flowsafe `BackgroundTaskHost` executors pass no background flag. It is not final either: Mastra retries a refused task, and a Mastra that starts on the same storage can recover a task that is still queued, or running with retries left, through a static executor. `createGuardedAgent()` disables background dispatch, and Flowsafe's `RunnerRuntime` and agent thread host run no background-task manager. On a raw Mastra agent, do not make a connector without `background: true` background-eligible, and do not register one as a `BackgroundTaskHost` executor. See the [connector `background` contract](connector-interface.md#background).
 
 ### Custom evaluators
 

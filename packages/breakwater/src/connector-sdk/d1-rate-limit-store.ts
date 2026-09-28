@@ -5,12 +5,9 @@
 // each get a fresh window, so a manifest `rateLimit: '5/min'` admits fifty
 // executions a minute. Sharing the counter in D1 makes the declared budget
 // mean what it says across every isolate that shares the database. The
-// count-then-check contract matches InMemoryRateLimitStore exactly: the
-// UPSERT always increments and returns the post-increment count; the
-// connector wrapper compares it to the manifest limit. Structural typing on
-// purpose (no @cloudflare/workers-types import), same posture as
-// D1IdempotencyStore: tests back the interface with node:sqlite, Workers
-// pass env.DB.
+// UPSERT always increments and returns the post-increment count. Structural
+// typing on purpose (no @cloudflare/workers-types import): tests back the
+// interface with node:sqlite, Workers pass env.DB.
 
 import type { RateLimitStore } from './contracts.js';
 
@@ -58,8 +55,8 @@ export class D1RateLimitStore implements RateLimitStore {
 
   async increment(key: string, windowMs: number, now: number): Promise<number> {
     await this.#ready();
-    // Epoch-aligned bucketing, identical to InMemoryRateLimitStore: every
-    // isolate computes the same window boundaries from the caller's clock.
+    // Epoch-aligned bucketing: every isolate computes the same window
+    // boundaries from the caller's clock.
     const windowStart = now - (now % windowMs);
     // D1 batch() is transactional. Keep the increment and rollover cleanup in
     // one batch so a cleanup failure rolls back the increment instead of
@@ -94,7 +91,19 @@ export class D1RateLimitStore implements RateLimitStore {
         `D1RateLimitStore: increment returned no row for '${key}'`,
       );
     }
-    return row.count;
+    const count: unknown = row.count;
+    if (
+      typeof count !== 'number' ||
+      !Number.isSafeInteger(count) ||
+      count < 1
+    ) {
+      // A table this store did not create can return a NULL, negative or
+      // non-numeric count, which would never exceed the limit.
+      throw new Error(
+        `D1RateLimitStore: increment returned a count that is not a positive safe integer for '${key}'`,
+      );
+    }
+    return count;
   }
 
   // Lazy, memoized schema creation; a failed attempt clears the memo so the

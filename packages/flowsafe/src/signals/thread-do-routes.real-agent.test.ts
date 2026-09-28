@@ -16,6 +16,8 @@ import {
   ACTOR_CONTEXT_KEY,
   AuditLogger,
   createGuardedAgent,
+  denyPatterns,
+  type PolicyEvaluator,
 } from '@proofoftech/breakwater';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
@@ -52,6 +54,7 @@ import {
 } from './thread-do-routes.js';
 
 const RESOURCE_ID = 'resource-real';
+const DRAIN_MARK = 'MKDRAINLEFTOVER';
 
 const OWNER = humanPrincipal({ id: 'operator', role: 'operator' });
 const DISPATCHER = trustAutomationPrincipal({
@@ -83,7 +86,10 @@ function unreachableModel(): MastraModelConfig {
   };
 }
 
-function guardedTestAgent(memory: MockMemory): Agent {
+function guardedTestAgent(
+  memory: MockMemory,
+  policies: readonly PolicyEvaluator[] = [],
+): Agent {
   return createGuardedAgent({
     id: 'writer',
     name: 'Writer',
@@ -91,7 +97,7 @@ function guardedTestAgent(memory: MockMemory): Agent {
     model: unreachableModel(),
     memory,
     allowedRoles: ['operator'],
-    policies: [],
+    policies,
     audit: new AuditLogger(),
     maxSteps: 2,
     toolChoice: 'auto',
@@ -135,6 +141,7 @@ async function createHarness(
     blockingRun?: HarnessBlockingRun;
     contentPolicy?: SignalContentPolicy;
     runCapOpen?: boolean;
+    policies?: readonly PolicyEvaluator[];
   } = {},
 ) {
   const pubsub = createHostPubSub();
@@ -151,7 +158,7 @@ async function createHarness(
   const mastra = new Mastra({
     storage,
     logger: false,
-    agents: { writer: guardedTestAgent(memory) },
+    agents: { writer: guardedTestAgent(memory, options.policies) },
   });
   const agent = createFlowsafeDurableAgent({
     agent: mastra.getAgentById('writer'),
@@ -956,13 +963,14 @@ describe('thread signal routes with a real durable agent', () => {
   });
 
   it.each([
-    ['owner leftover', undefined, 1],
+    ['owner leftover', {}, 1],
     [
       'marked non-owner leftover',
-      { [FLOWSAFE_PERSISTENCE_FORBIDDEN]: true },
+      { metadata: { [FLOWSAFE_PERSISTENCE_FORBIDDEN]: true } },
       0,
     ],
-  ] as const)('terminally heals a completion drain for %s', async (_label, signalMetadata, expectedSavedMessages) => {
+    ['transient leftover', { transient: true }, 0],
+  ] as const)('terminally heals a completion drain for %s', async (_label, signalFields, expectedSavedMessages) => {
     const harness = await createHarness();
     const threadId = crypto.randomUUID();
     const previousRunId = crypto.randomUUID();
@@ -988,11 +996,7 @@ describe('thread signal routes with a real durable agent', () => {
       harness.pubsub,
     );
     const sent = harness.agent.sendSignal(
-      {
-        type: 'reactive',
-        contents: 'leftover',
-        ...(signalMetadata ? { metadata: signalMetadata } : {}),
-      },
+      { type: 'reactive', contents: 'leftover', ...signalFields },
       {
         runId: previousRunId,
         threadId,
@@ -1041,6 +1045,101 @@ describe('thread signal routes with a real durable agent', () => {
         ]),
       );
     }
+    expect(harness.start).not.toHaveBeenCalled();
+    expect(unhandled).toEqual([]);
+  });
+
+  it.each([
+    ['keeps a leftover the input chain allows', [], {}, 1],
+    [
+      'keeps nothing of a leftover an input policy denies',
+      [denyPatterns([DRAIN_MARK])],
+      {},
+      0,
+    ],
+    [
+      'keeps nothing of a transient leftover the input chain allows',
+      [],
+      { transient: true },
+      0,
+    ],
+  ] as const)('terminally heals a completion drain after a run carrying the owner actor, and %s', async (_label, policies, signalFields, expectedSavedMessages) => {
+    // #given — the previous run carries the owner's actor, as a host start
+    // does, and the leftover carries the marker
+    const harness = await createHarness({ policies });
+    const threadId = crypto.randomUUID();
+    const previousRunId = crypto.randomUUID();
+    await seedThread(harness.memory, threadId);
+    const saveMessages = vi.spyOn(harness.memory, 'saveMessages');
+    const publish = vi.spyOn(harness.pubsub, 'publish');
+    let finish!: () => void;
+    const finished = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    await harness.mastra.agentThreadStreamRuntime.registerRun(
+      harness.agent as never,
+      {
+        runId: previousRunId,
+        status: 'running',
+        fullStream: undefined,
+        _waitUntilFinished: () => finished,
+      } as never,
+      {
+        runId: previousRunId,
+        memory: { thread: threadId, resource: RESOURCE_ID },
+        requestContext: actorContext(),
+      },
+      harness.pubsub,
+    );
+    const sent = harness.agent.sendSignal(
+      { type: 'reactive', contents: `${DRAIN_MARK} leftover`, ...signalFields },
+      {
+        runId: previousRunId,
+        threadId,
+        resourceId: RESOURCE_ID,
+        ifActive: { behavior: 'deliver' },
+      },
+    );
+    await expect(sent.accepted).resolves.toMatchObject({ action: 'deliver' });
+
+    // #when — the previous run completes and core drains the leftover into
+    // a run the host start seam never registered
+    finish();
+    await waitForIdle(harness.agent, threadId);
+
+    // #then — the drain run was refused terminally, and memory holds the
+    // leftover only when the input chain allowed it
+    const nextRunId = publish.mock.calls.find(
+      ([, event]) =>
+        event.type === 'run-completed' && event.runId !== previousRunId,
+    )?.[1].runId;
+    expect(nextRunId).toEqual(expect.any(String));
+    expect(
+      publish.mock.calls.some(
+        ([, event]) => event.type === 'error' && event.runId === nextRunId,
+      ),
+    ).toBe(true);
+    const savedMessages = saveMessages.mock.calls.flatMap(
+      ([input]) => input.messages,
+    );
+    expect(savedMessages).toHaveLength(expectedSavedMessages);
+    expect(savedMessages).toEqual(
+      Array.from({ length: expectedSavedMessages }, () =>
+        expect.objectContaining({
+          role: 'signal',
+          threadId,
+          resourceId: RESOURCE_ID,
+        }),
+      ),
+    );
+    // Recall hides reactive signals unless asked to include every signal.
+    const { messages } = await harness.memory.recall({
+      threadId,
+      hideSignals: false,
+    });
+    expect(JSON.stringify(messages).includes(DRAIN_MARK)).toBe(
+      expectedSavedMessages > 0,
+    );
     expect(harness.start).not.toHaveBeenCalled();
     expect(unhandled).toEqual([]);
   });

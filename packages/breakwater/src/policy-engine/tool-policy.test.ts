@@ -6,6 +6,7 @@ import {
   CONNECTOR_DECISIONS,
   connectorDecisionRetryable,
 } from '../connector-decision.js';
+import type { PermissionManifest } from '../connector-sdk/index.js';
 import {
   approvalRequired,
   backgroundExecution,
@@ -17,6 +18,7 @@ import {
   type ToolCallContext,
   tenantIsolation,
   WORKFLOW_SCOPE_CONTEXT_KEY,
+  type WritePermissionsPolicy,
 } from './index.js';
 
 function call(
@@ -91,6 +93,24 @@ class ExfilMatchingList extends Array<unknown> {
     return ['exfil.example'] as never[];
   }
 }
+
+// A real array whose own container methods and iterator answer with
+// `answer`, never with its indexed entries.
+function answeringList<T>(entries: readonly T[], answer: readonly unknown[]) {
+  return Object.assign([...entries], {
+    map: () => [...answer],
+    some: () => answer.length > 0,
+    every: () => true,
+    includes: () => answer.length > 0,
+    [Symbol.iterator]: function* () {
+      yield* answer;
+    },
+  }) as T[];
+}
+
+const SIDE_EFFECT_RULE = "'read', 'write', 'destructive' or 'idempotent'";
+const PATTERN_RULE =
+  "a non-empty string without ':', whitespace, or a control or format character";
 
 describe('tool policy decision metadata', () => {
   const callerContext = new RequestContext();
@@ -364,6 +384,24 @@ describe('egressDomainAllowed', () => {
     // #when / #then
     expect(egressDomainAllowed(domain, ['*.vendor.example'])).toBe(false);
   });
+
+  it.each<[string, string, readonly string[]]>([
+    ['an empty host against an empty entry', '', ['']],
+    ['a blank host against a blank entry', ' ', [' ']],
+    ['an empty host among valid entries', '', ['', 'api.example.com']],
+    ['a scheme-bearing host against itself', 'https://x', ['https://x']],
+  ])('matches nothing for %s, which no hostname can be', (_label, domain, allowed) => {
+    // #when / #then
+    expect(egressDomainAllowed(domain, allowed)).toBe(false);
+  });
+
+  it('skips a malformed entry and still matches a valid one', () => {
+    // #when / #then
+    expect(
+      egressDomainAllowed('API.example.com.', ['', ' ', 'api.example.com']),
+    ).toBe(true);
+    expect(egressDomainAllowed('', [])).toBe(false);
+  });
 });
 
 describe('approvalRequired', () => {
@@ -423,13 +461,202 @@ describe('approvalRequired', () => {
     ).toBe(true);
   });
 
-  it('treats an empty pattern as matching nothing real', () => {
+  it.each([
+    ['an empty pattern', '', '""'],
+    ['a trailing space', 'crm.* ', '"crm.* "'],
+    ['a newline', 'crm.\n*', '"crm.\\n*"'],
+    ['a tab', 'crm.\t*', '"crm.\\t*"'],
+    ['a zero-width space', 'crm.​*', '"crm.​*"'],
+    ['a control character', 'crm.\u0007*', '"crm.\\u0007*"'],
+    ['a colon', 'tenant:crm.*', '"tenant:crm.*"'],
+  ])('refuses %s in an approval pattern', (_label, pattern, got) => {
+    // #when / #then — a pattern no accepted id can match never requires approval
+    expect(() =>
+      approvalRequired(
+        'crm.assign',
+        { sideEffect: 'write' },
+        { requireApproval: ['crm.*', pattern] },
+      ),
+    ).toThrow(
+      new TypeError(
+        `approvalRequired: policy.requireApproval entry 1 must be ${PATTERN_RULE} (got ${got})`,
+      ),
+    );
+  });
+
+  it.each<[string, unknown, string]>([
+    ['a number', 42, 'number'],
+    ['null', null, 'null'],
+    ['an object with its own split', { split: () => ['', ''] }, 'object'],
+    ['a String object', new String('crm.*'), 'object'],
+    ['a Symbol', Symbol('crm.*'), 'symbol'],
+  ])('refuses %s as an approval pattern without calling it', (_label, entry, got) => {
+    // #when / #then
+    expect(() =>
+      approvalRequired(
+        'crm.assign',
+        { sideEffect: 'write' },
+        { requireApproval: [entry] as unknown as readonly string[] },
+      ),
+    ).toThrow(
+      new TypeError(
+        `approvalRequired: policy.requireApproval entry 0 must be ${PATTERN_RULE} (got ${got})`,
+      ),
+    );
+  });
+
+  it.each<[string, unknown]>([
+    ['a string', 'crm.*'],
+    ['a Set', new Set(['crm.*'])],
+    ['an array-like object', { length: 1, 0: 'crm.*' }],
+  ])('refuses %s as the approval pattern list', (_label, requireApproval) => {
+    // #when / #then
+    expect(() =>
+      approvalRequired(
+        'crm.assign',
+        { sideEffect: 'write' },
+        { requireApproval: requireApproval as readonly string[] },
+      ),
+    ).toThrow(
+      new TypeError(
+        'approvalRequired: policy.requireApproval must be an array',
+      ),
+    );
+  });
+
+  it('matches through index reads, not through the list its own some answers', () => {
+    // #given — own some/iterator answer that nothing matches
+    const requireApproval = answeringList(['crm.*'], []);
     // #when / #then
     expect(
       approvalRequired(
-        'salesforce.createContact',
+        'crm.assign',
         { sideEffect: 'write' },
-        { requireApproval: [''] },
+        {
+          requireApproval,
+        },
+      ),
+    ).toBe(true);
+  });
+
+  it('validates the whole policy before any rule decides, for every connector', () => {
+    // #given — a read connector and an always-approve manifest decide without
+    // the pattern list
+    const policy = { requireApproval: [42] as unknown as readonly string[] };
+    // #when / #then
+    expect(() =>
+      approvalRequired('crm.lookup', { sideEffect: 'read' }, policy),
+    ).toThrow(TypeError);
+    expect(() =>
+      approvalRequired(
+        'crm.assign',
+        { sideEffect: 'write', requiresApproval: true },
+        policy,
+      ),
+    ).toThrow(TypeError);
+  });
+
+  it.each<[string, unknown, string]>([
+    [
+      'a string destructiveRequiresApproval',
+      { destructiveRequiresApproval: 'false' },
+      'approvalRequired: policy.destructiveRequiresApproval must be a boolean (got "false")',
+    ],
+    [
+      'an unknown policy field',
+      { requireAproval: ['crm.*'] },
+      'approvalRequired: policy has unknown field "requireAproval" (valid fields: requireApproval, destructiveRequiresApproval)',
+    ],
+    [
+      'a null policy',
+      null,
+      'approvalRequired: policy must be an object (got null)',
+    ],
+    [
+      'a string policy',
+      'crm.*',
+      'approvalRequired: policy must be an object (got "crm.*")',
+    ],
+  ])('refuses %s', (_label, policy, message) => {
+    // #when / #then
+    expect(() =>
+      approvalRequired(
+        'crm.assign',
+        { sideEffect: 'write' },
+        policy as WritePermissionsPolicy,
+      ),
+    ).toThrow(new TypeError(message));
+  });
+
+  it.each([
+    ['a mistyped side effect', 'Destructive', '"Destructive"'],
+    ['a missing side effect', undefined, 'undefined'],
+  ])('refuses %s', (_label, sideEffect, got) => {
+    // #when / #then — an unknown side effect would skip the destructive default
+    expect(() =>
+      approvalRequired('fs.deleteAll', {
+        sideEffect: sideEffect as SideEffect,
+      }),
+    ).toThrow(
+      new TypeError(
+        `approvalRequired: manifest.sideEffect must be ${SIDE_EFFECT_RULE} (got ${got})`,
+      ),
+    );
+  });
+
+  it('refuses a connector id that is not a string', () => {
+    // #when / #then
+    expect(() =>
+      approvalRequired(42 as unknown as string, { sideEffect: 'write' }),
+    ).toThrow(
+      new TypeError(
+        'approvalRequired: connectorId must be a string (got number)',
+      ),
+    );
+  });
+
+  it("lets '*' match across a line terminator in an unchecked id", () => {
+    // #given — createConnector refuses this id, but approvalRequired is public
+    const connectorId = 'crm\nassign';
+    // #when / #then
+    expect(
+      approvalRequired(
+        connectorId,
+        { sideEffect: 'write' },
+        {
+          requireApproval: ['crm*'],
+        },
+      ),
+    ).toBe(true);
+    expect(
+      approvalRequired(
+        connectorId,
+        { sideEffect: 'write' },
+        {
+          requireApproval: ['*'],
+        },
+      ),
+    ).toBe(true);
+  });
+
+  it('keeps an uppercase pattern that matches an uppercase id', () => {
+    // #when / #then
+    expect(
+      approvalRequired(
+        'CRM.assign',
+        { sideEffect: 'write' },
+        {
+          requireApproval: ['CRM.*'],
+        },
+      ),
+    ).toBe(true);
+    expect(
+      approvalRequired(
+        'crm.assign',
+        { sideEffect: 'write' },
+        {
+          requireApproval: ['CRM.*'],
+        },
       ),
     ).toBe(false);
   });
@@ -478,11 +705,92 @@ describe('approvalRequired', () => {
     ).toBe(true);
   });
 
+  it('refuses a misspelled manifest field, which would drop the approval it spells', () => {
+    // #given
+    const manifest = { sideEffect: 'write', requireApproval: true };
+    // #when / #then
+    expect(() =>
+      approvalRequired('crm.assign', manifest as { sideEffect: SideEffect }),
+    ).toThrow(
+      new TypeError(
+        'approvalRequired: manifest has unknown field "requireApproval" (valid fields: sideEffect, egress, egressEnforcement, idempotencyKey, requiresApproval, dryRun, rateLimit, background, requiredPermissions)',
+      ),
+    );
+  });
+
+  it('reads a full permission manifest, every member present', () => {
+    // #given — createConnector passes the whole manifest
+    const manifest: Required<PermissionManifest> = {
+      sideEffect: 'write',
+      egress: ['api.example.com'],
+      egressEnforcement: 'enforced',
+      idempotencyKey: false,
+      requiresApproval: true,
+      dryRun: false,
+      rateLimit: '1/min',
+      background: false,
+      requiredPermissions: ['crm.write'],
+    };
+    // #when / #then
+    expect(approvalRequired('crm.assign', manifest)).toBe(true);
+  });
+
   it('requires nothing for unmatched writes', () => {
     // #when / #then
     expect(approvalRequired('github.comment', { sideEffect: 'write' })).toBe(
       false,
     );
+  });
+
+  it.each<[string, unknown, string]>([
+    ['an empty string', '', '""'],
+    ['0', 0, 'number'],
+    ['NaN', Number.NaN, 'number'],
+    ['null', null, 'null'],
+    ["the string 'false'", 'false', '"false"'],
+    ['1', 1, 'number'],
+  ])('refuses %s as manifest.requiresApproval, which createConnector refuses too', (_label, requiresApproval, got) => {
+    // #when / #then
+    expect(() =>
+      approvalRequired('crm.assign', {
+        sideEffect: 'write',
+        requiresApproval: requiresApproval as boolean,
+      }),
+    ).toThrow(
+      new TypeError(
+        `approvalRequired: manifest.requiresApproval must be a boolean when provided (got ${got})`,
+      ),
+    );
+  });
+
+  it('refuses a non-boolean dryRun in a full manifest', () => {
+    // #when / #then
+    expect(() =>
+      approvalRequired('crm.assign', {
+        sideEffect: 'write',
+        dryRun: 'yes',
+      } as unknown as PermissionManifest),
+    ).toThrow(
+      new TypeError(
+        'approvalRequired: manifest.dryRun must be a boolean when provided (got "yes")',
+      ),
+    );
+  });
+
+  it('keeps the answer for a boolean requiresApproval', () => {
+    // #when / #then
+    expect(
+      approvalRequired('crm.assign', {
+        sideEffect: 'write',
+        requiresApproval: true,
+      }),
+    ).toBe(true);
+    expect(
+      approvalRequired('crm.assign', {
+        sideEffect: 'write',
+        requiresApproval: false,
+      }),
+    ).toBe(false);
   });
 });
 
@@ -617,6 +925,35 @@ describe('backgroundExecution', () => {
     });
   });
 
+  it.each<[string, Record<string, unknown>, string]>([
+    ["'Write'", { sideEffect: 'Write' }, '"Write"'],
+    ["'writes'", { sideEffect: 'writes' }, '"writes"'],
+    ['null', { sideEffect: null }, 'null'],
+    ['a missing side effect', {}, 'undefined'],
+    ['side_effect for sideEffect', { side_effect: 'write' }, 'undefined'],
+  ])('denies a call whose side effect is %s, even with no override', async (_label, fields, got) => {
+    // #given
+    const context = {
+      connectorId: 'crm.assign',
+      egress: [],
+      input: { _background: true },
+      ...fields,
+    } as unknown as ToolCallContext;
+    const withoutOverride = {
+      ...context,
+      input: {},
+    } as ToolCallContext;
+
+    // #when / #then
+    for (const candidate of [context, withoutOverride]) {
+      expect(await policy.evaluate(candidate)).toEqual({
+        allowed: false,
+        reason: `the call's side effect must be 'read', 'write', 'destructive' or 'idempotent' (got ${got}), so background execution cannot be ruled out`,
+        code: 'BACKGROUND_EXECUTION_DENIED',
+      });
+    }
+  });
+
   it.each([
     ['write', 'write' as SideEffect],
     ['destructive', 'destructive' as SideEffect],
@@ -638,26 +975,28 @@ describe('backgroundExecution', () => {
     ).toMatchObject({ allowed: false, code: 'BACKGROUND_EXECUTION_DENIED' });
   });
 
-  it('allows a write-class call that explicitly forces FOREGROUND (enabled:false)', async () => {
-    // #when / #then — forcing foreground is the safe direction
+  it.each<[string, unknown]>([
+    ['{ enabled: false }', { enabled: false }],
+    ["{ disposition: 'foreground' }", { disposition: 'foreground' }],
+    [
+      "{ enabled: false, disposition: 'deferred' }",
+      { enabled: false, disposition: 'deferred' },
+    ],
+    ['null', null],
+    ['undefined', undefined],
+    ["the scalar 'true'", 'true'],
+    ['false', false],
+  ])('denies a write-class call whose _background key holds %s', async (_label, value) => {
+    // #when / #then — the key's presence decides, as in the connector wrapper
     expect(
-      await policy.evaluate(
-        bgCall('write', { _background: { enabled: false } }),
-      ),
-    ).toEqual({ allowed: true });
+      await policy.evaluate(bgCall('write', { _background: value })),
+    ).toMatchObject({ allowed: false, code: 'BACKGROUND_EXECUTION_DENIED' });
   });
 
   it('allows a read-only call to run in the background', async () => {
     // #when / #then — a read has no side effect whose timing the flip would move
     expect(
       await policy.evaluate(bgCall('read', { _background: { enabled: true } })),
-    ).toEqual({ allowed: true });
-  });
-
-  it('ignores a non-object _background arg', async () => {
-    // #when / #then — a scalar `_background` is not the LLMBackgroundOverride shape
-    expect(
-      await policy.evaluate(bgCall('write', { _background: 'true' })),
     ).toEqual({ allowed: true });
   });
 
@@ -670,5 +1009,56 @@ describe('backgroundExecution', () => {
         bgCall('idempotent', { _background: { enabled: true } }),
       ),
     ).toEqual({ allowed: true });
+  });
+
+  it.each<[string, unknown, string]>([
+    ['a string', 'write', 'backgroundExecution: writeClass must be an array'],
+    [
+      'a Set',
+      new Set(['write']),
+      'backgroundExecution: writeClass must be an array',
+    ],
+    ['an empty list', [], 'backgroundExecution: writeClass must not be empty'],
+    [
+      'an unknown member',
+      ['write', 'rite'],
+      `backgroundExecution: writeClass entry 1 must be ${SIDE_EFFECT_RULE} (got "rite")`,
+    ],
+    [
+      'a mistyped member',
+      ['Write'],
+      `backgroundExecution: writeClass entry 0 must be ${SIDE_EFFECT_RULE} (got "Write")`,
+    ],
+    [
+      'a String object member',
+      [new String('write')],
+      `backgroundExecution: writeClass entry 0 must be ${SIDE_EFFECT_RULE} (got object)`,
+    ],
+    [
+      'an invalid member behind methods that answer with valid ones',
+      answeringList(['rite'], ['write']),
+      `backgroundExecution: writeClass entry 0 must be ${SIDE_EFFECT_RULE} (got "rite")`,
+    ],
+  ])('refuses %s as writeClass', (_label, writeClass, message) => {
+    // #when / #then
+    expect(() =>
+      backgroundExecution({
+        writeClass: writeClass as readonly SideEffect[],
+      }),
+    ).toThrow(new TypeError(message));
+  });
+
+  it('decides on the writeClass it copied by index', async () => {
+    // #given — own includes/iterator answer that nothing is write-class, and
+    // the caller empties its list after construction
+    const writeClass = answeringList<SideEffect>(['write'], []);
+    const strict = backgroundExecution({ writeClass });
+    writeClass.length = 0;
+    // #when / #then
+    expect(
+      await strict.evaluate(
+        bgCall('write', { _background: { enabled: true } }),
+      ),
+    ).toMatchObject({ allowed: false, code: 'BACKGROUND_EXECUTION_DENIED' });
   });
 });

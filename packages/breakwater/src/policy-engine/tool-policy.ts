@@ -9,6 +9,11 @@
 
 import type { RequestContext } from '@mastra/core/request-context';
 import type { ConnectorDenialMetadata } from '../connector-decision.js';
+import {
+  assertKnownFields,
+  describeEntry,
+  readFrozenList,
+} from '../host-input.js';
 
 /**
  * Decision shape a policy evaluator returns. Defined here — the leaf module —
@@ -28,6 +33,20 @@ export type PolicyDecision =
 
 /** Side-effect classification a connector declares in its manifest. */
 export type SideEffect = 'read' | 'write' | 'destructive' | 'idempotent';
+
+/** @internal The members of {@link SideEffect}, as a refusal message names them. */
+export const SIDE_EFFECT_MEMBERS =
+  "'read', 'write', 'destructive' or 'idempotent'";
+
+/** @internal Whether a value is one of the {@link SideEffect} members. */
+export function isSideEffect(value: unknown): value is SideEffect {
+  return (
+    value === 'read' ||
+    value === 'write' ||
+    value === 'destructive' ||
+    value === 'idempotent'
+  );
+}
 
 /** One connector call, as seen by tool-boundary policies. */
 export interface ToolCallContext {
@@ -107,23 +126,29 @@ export function domainAllowed(
  * One-shot public wrapper: normalizes `domain` and each string entry in
  * `allowedDomains` (case/trailing-dot) then delegates to `domainAllowed` for
  * the match, for a single normalized comparison without keeping a normalized
- * allowlist. A non-string `domain` or entry, or a list that is not an array,
- * matches nothing: this wrapper validates no list, and an object could answer
- * the matcher's string methods itself. The list is read by index into a fresh
- * array, so a method of the caller's container cannot answer for it.
+ * allowlist. A `domain` or entry that is not a string matching
+ * EGRESS_HOSTNAME_PATTERN, or a list that is not an array, matches nothing:
+ * this wrapper refuses no list, an object could answer the matcher's string
+ * methods itself, and an empty host would otherwise match an empty entry. The
+ * list is read by index into a fresh array, so a method of the caller's
+ * container cannot answer for it.
  */
 export function egressDomainAllowed(
   domain: string,
   allowedDomains: readonly string[],
 ): boolean {
-  if (typeof domain !== 'string' || !Array.isArray(allowedDomains)) {
+  if (
+    typeof domain !== 'string' ||
+    !EGRESS_HOSTNAME_PATTERN.test(domain) ||
+    !Array.isArray(allowedDomains)
+  ) {
     return false;
   }
   const length = allowedDomains.length;
   const normalizedAllowed: string[] = [];
   for (let index = 0; index < length; index += 1) {
     const entry: unknown = allowedDomains[index];
-    if (typeof entry === 'string') {
+    if (typeof entry === 'string' && EGRESS_HOSTNAME_PATTERN.test(entry)) {
       normalizedAllowed.push(normalizeDomain(entry));
     }
   }
@@ -260,10 +285,13 @@ export function crossWorkflowIsolation(
 }
 
 /**
- * requestContext key: the caller's OPAQUE isolation scope (a multi-tenant
- * host mints its tenant id here); breakwater never parses the value. Minted
- * by the trusted runtime — trust boundary 6 applies: never populate it from
- * client input, model output, or tool results.
+ * requestContext key: the caller's isolation scope, an opaque non-empty string
+ * (a multi-tenant host mints its tenant id here); breakwater never parses the
+ * value. A connector denies a present value of any other kind with
+ * `ISOLATION_SCOPE_INVALID`, since reading it as no scope would share one
+ * tenant's replay cache, budget and grants with another. Minted by the trusted
+ * runtime — trust boundary 6 applies: never populate it from client input,
+ * model output, or tool results.
  */
 export const ISOLATION_SCOPE_CONTEXT_KEY = 'breakwater.isolationScope';
 
@@ -315,20 +343,17 @@ export function isTenantIsolationEvaluator(
  */
 export const LLM_BACKGROUND_OVERRIDE_KEY = '_background';
 
-/** The `_background` override shape, as seen at the tool boundary. */
-interface LlmBackgroundOverride {
-  enabled?: boolean;
-  timeoutMs?: number;
-  maxRetries?: number;
-}
-
-function backgroundOverrideOf(
-  input: unknown,
-): LlmBackgroundOverride | undefined {
-  if (typeof input !== 'object' || input === null) return undefined;
-  const value = (input as Record<string, unknown>)[LLM_BACKGROUND_OVERRIDE_KEY];
-  if (typeof value !== 'object' || value === null) return undefined;
-  return value as LlmBackgroundOverride;
+/**
+ * @internal Whether tool-call arguments carry the `_background` key, whatever
+ * its value, `undefined` included. The connector wrapper and
+ * {@link backgroundExecution} share it, so both decide on one presence test.
+ */
+export function hasBackgroundOverride(input: unknown): boolean {
+  return (
+    typeof input === 'object' &&
+    input !== null &&
+    LLM_BACKGROUND_OVERRIDE_KEY in input
+  );
 }
 
 /** Configuration for {@link backgroundExecution}. */
@@ -338,44 +363,69 @@ export interface BackgroundExecutionOptions {
    * these. A write-class connector carries a side effect whose approval
    * topology and timing the background flip would move off the foreground
    * path, so v1 keeps them foreground-only. Default: everything but 'read'.
+   * A present list must be a non-empty array of {@link SideEffect} members;
+   * construction copies it.
    */
   writeClass?: readonly SideEffect[];
   /** Policy name used in denials and audit records. */
   name?: string;
 }
 
+const DEFAULT_WRITE_CLASS: readonly SideEffect[] = Object.freeze([
+  'write',
+  'destructive',
+  'idempotent',
+]);
+
 const backgroundExecutionEvaluators = new WeakSet<object>();
 
 /**
- * Deny a write-class connector call carrying an LLM `_background` override
- * that asks for background execution. This complements `createConnector`'s
- * hard `_background` argument rejection.
+ * Deny a write-class connector call whose arguments carry the LLM
+ * `_background` key, whatever its value. This complements `createConnector`'s
+ * hard `_background` argument rejection, which uses the same presence test.
  *
- * This evaluator sees only the override present in the connector arguments.
- * Mastra removes `_background` before dispatching agent tool calls, so the
- * check primarily protects direct and nested programmatic calls. Breakwater
- * connectors do not enable Mastra background execution by default, which
- * prevents an agent override from opting them in upstream. Read-only calls and
- * explicit `{ enabled: false }` overrides pass. Register the evaluator through
- * `ConnectorPolicies.evaluators`.
+ * Mastra's standard agent loop removes a truthy `_background` from the
+ * arguments before dispatch, so a call Mastra runs as a background task
+ * carries no key and this evaluator cannot see it; the connector wrapper
+ * refuses that call instead. Read-only calls pass. A call whose `sideEffect`
+ * is not a {@link SideEffect} member is denied, since it cannot be shown to be
+ * read-only. Register the evaluator through `ConnectorPolicies.evaluators`.
  */
 export function backgroundExecution(
   options: BackgroundExecutionOptions = {},
 ): ToolPolicyEvaluator {
-  const writeClass = options.writeClass ?? [
-    'write',
-    'destructive',
-    'idempotent',
-  ];
+  const configuredWriteClass = options.writeClass;
+  const writeClass =
+    configuredWriteClass === undefined
+      ? DEFAULT_WRITE_CLASS
+      : readFrozenList(
+          'backgroundExecution: writeClass',
+          configuredWriteClass,
+          (entry, index) => {
+            if (!isSideEffect(entry)) {
+              throw new TypeError(
+                `backgroundExecution: writeClass entry ${index} must be ${SIDE_EFFECT_MEMBERS} (got ${describeEntry(entry)})`,
+              );
+            }
+            return entry;
+          },
+          true,
+        );
   const evaluator: ToolPolicyEvaluator = {
     name: options.name ?? 'background-execution',
     evaluate({ sideEffect, input, connectorId }): PolicyDecision {
-      if (!writeClass.includes(sideEffect)) return { allowed: true };
-      const override = backgroundOverrideOf(input);
-      if (override !== undefined && override.enabled !== false) {
+      if (!isSideEffect(sideEffect)) {
         return {
           allowed: false,
-          reason: `write-class connector '${connectorId}' may not run in background: an LLM _background override would move it off the foreground path (v1 connectors are foreground-only)`,
+          reason: `the call's side effect must be ${SIDE_EFFECT_MEMBERS} (got ${describeEntry(sideEffect)}), so background execution cannot be ruled out`,
+          code: 'BACKGROUND_EXECUTION_DENIED',
+        };
+      }
+      if (!writeClass.includes(sideEffect)) return { allowed: true };
+      if (hasBackgroundOverride(input)) {
+        return {
+          allowed: false,
+          reason: `write-class connector '${connectorId}' may not run in background: its arguments carry an LLM _background override (v1 connectors are foreground-only)`,
           code: 'BACKGROUND_EXECUTION_DENIED',
         };
       }
@@ -397,42 +447,186 @@ export function isBackgroundExecutionEvaluator(
 export interface WritePermissionsPolicy {
   /**
    * Connector-id globs ('salesforce.*') whose write-class calls
-   * (write | destructive | idempotent) require approval.
+   * (write | destructive | idempotent) require approval. Each pattern follows
+   * the connector-id character rule, and '*' matches any run of characters.
    */
   requireApproval?: readonly string[];
   /** Destructive connectors always require approval. Default true. */
   destructiveRequiresApproval?: boolean;
 }
 
-// '*' is the only glob token; every other character matches literally.
+// Ids and approval patterns share one character rule. A pattern carrying a
+// character no accepted id can contain, such as a trailing space or a
+// zero-width character, would never match, and an approval pattern that never
+// matches stops requiring approval without any error.
+const CONNECTOR_ID_EXCLUDED_CHARACTER = /[:\s\p{Cc}\p{Cf}]/u;
+
+/**
+ * @internal Whether a value is a valid connector id or approval pattern: a
+ * non-empty string with no ':', whitespace, or control or format character.
+ */
+export function isConnectorIdText(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    value.length > 0 &&
+    !CONNECTOR_ID_EXCLUDED_CHARACTER.test(value)
+  );
+}
+
+const EMPTY_WRITE_PERMISSIONS: Readonly<WritePermissionsPolicy> = Object.freeze(
+  {},
+);
+
+const WRITE_PERMISSIONS_POLICY_KEYS = {
+  requireApproval: true,
+  destructiveRequiresApproval: true,
+} satisfies Record<keyof WritePermissionsPolicy, true>;
+
+/**
+ * @internal The `PermissionManifest` members. That interface is declared in
+ * `connector-sdk/contracts.ts`, which imports this module, so the table cannot
+ * name it here without an import cycle; `connector-sdk/egress-conformance.ts`
+ * checks the table against the interface at compile time.
+ */
+export const PERMISSION_MANIFEST_KEYS = {
+  sideEffect: true,
+  egress: true,
+  egressEnforcement: true,
+  idempotencyKey: true,
+  requiresApproval: true,
+  dryRun: true,
+  rateLimit: true,
+  background: true,
+  requiredPermissions: true,
+} satisfies Record<string, true>;
+
+/**
+ * @internal The boolean `PermissionManifest` members. `connector-sdk/index.ts`
+ * checks the table against the interface at compile time, for the reason
+ * {@link PERMISSION_MANIFEST_KEYS} gives.
+ */
+export const MANIFEST_BOOLEAN_FIELD_SET = {
+  idempotencyKey: true,
+  requiresApproval: true,
+  dryRun: true,
+  background: true,
+} satisfies Partial<Record<keyof typeof PERMISSION_MANIFEST_KEYS, true>>;
+
+/**
+ * @internal Refuse a boolean manifest member whose present value is not a
+ * boolean: each is read for truthiness, so a value such as '' or 0 would
+ * silently read as off. `subject` names the manifest in the refusal.
+ */
+export function assertManifestBooleans(
+  subject: string,
+  manifest: object,
+): void {
+  for (const field of Object.keys(MANIFEST_BOOLEAN_FIELD_SET)) {
+    const value: unknown = (manifest as Record<string, unknown>)[field];
+    if (value !== undefined && typeof value !== 'boolean') {
+      throw new TypeError(
+        `${subject}.${field} must be a boolean when provided (got ${describeEntry(value)})`,
+      );
+    }
+  }
+}
+
+/**
+ * @internal Validate a write-permissions policy and return a frozen copy built
+ * from one read of each field. `subject` names the caller's field in refusals.
+ */
+export function snapshotWritePermissions(
+  subject: string,
+  policy: unknown,
+): Readonly<WritePermissionsPolicy> {
+  if (policy === undefined) return EMPTY_WRITE_PERMISSIONS;
+  assertKnownFields(subject, policy, WRITE_PERMISSIONS_POLICY_KEYS);
+  const fields = policy as Record<string, unknown>;
+  const configuredPatterns = fields.requireApproval;
+  const destructiveRequiresApproval = fields.destructiveRequiresApproval;
+  const requireApproval =
+    configuredPatterns === undefined
+      ? undefined
+      : readFrozenList(
+          `${subject}.requireApproval`,
+          configuredPatterns,
+          (entry, index) => {
+            if (!isConnectorIdText(entry)) {
+              throw new TypeError(
+                `${subject}.requireApproval entry ${index} must be a non-empty string without ':', whitespace, or a control or format character (got ${describeEntry(entry)})`,
+              );
+            }
+            return entry;
+          },
+        );
+  if (
+    destructiveRequiresApproval !== undefined &&
+    typeof destructiveRequiresApproval !== 'boolean'
+  ) {
+    throw new TypeError(
+      `${subject}.destructiveRequiresApproval must be a boolean (got ${describeEntry(destructiveRequiresApproval)})`,
+    );
+  }
+  return Object.freeze({
+    ...(requireApproval === undefined ? {} : { requireApproval }),
+    ...(destructiveRequiresApproval === undefined
+      ? {}
+      : { destructiveRequiresApproval }),
+  });
+}
+
+// '*' is the only glob token; every other character matches literally. The
+// `s` flag lets '*' span line terminators, which ids that approvalRequired()
+// receives from callers other than createConnector() may contain.
 function matchesConnectorId(pattern: string, connectorId: string): boolean {
   const source = pattern
     .split('*')
     .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
     .join('.*');
-  return new RegExp(`^${source}$`).test(connectorId);
+  return new RegExp(`^${source}$`, 's').test(connectorId);
 }
 
 /**
  * Whether a call to this connector needs human approval — the single source
- * of truth the connector SDK compiles into its approval enforcement.
+ * of truth the connector SDK compiles into its approval enforcement. Throws a
+ * `TypeError` for a non-string `connectorId`, a `manifest` field that is not a
+ * `PermissionManifest` member, a boolean manifest member such as
+ * `requiresApproval` whose present value is not a boolean, an unknown
+ * `sideEffect` or a malformed `policy`, whatever the connector.
  */
 export function approvalRequired(
   connectorId: string,
   manifest: { sideEffect: SideEffect; requiresApproval?: boolean },
   policy: WritePermissionsPolicy = {},
 ): boolean {
-  if (manifest.requiresApproval) return true;
-  if (
-    manifest.sideEffect === 'destructive' &&
-    policy.destructiveRequiresApproval !== false
-  ) {
+  if (typeof connectorId !== 'string') {
+    throw new TypeError(
+      `approvalRequired: connectorId must be a string (got ${describeEntry(connectorId)})`,
+    );
+  }
+  // A full manifest is a valid argument, so the check reads every manifest
+  // member as known, not only the members its parameter type declares.
+  assertKnownFields(
+    'approvalRequired: manifest',
+    manifest,
+    PERMISSION_MANIFEST_KEYS,
+  );
+  assertManifestBooleans('approvalRequired: manifest', manifest);
+  const requiresApproval = manifest.requiresApproval;
+  const sideEffect: unknown = manifest.sideEffect;
+  if (!isSideEffect(sideEffect)) {
+    throw new TypeError(
+      `approvalRequired: manifest.sideEffect must be ${SIDE_EFFECT_MEMBERS} (got ${describeEntry(sideEffect)})`,
+    );
+  }
+  const { requireApproval = [], destructiveRequiresApproval } =
+    snapshotWritePermissions('approvalRequired: policy', policy);
+  if (requiresApproval) return true;
+  if (sideEffect === 'destructive' && destructiveRequiresApproval !== false) {
     return true;
   }
   return (
-    manifest.sideEffect !== 'read' &&
-    (policy.requireApproval ?? []).some((pattern) =>
-      matchesConnectorId(pattern, connectorId),
-    )
+    sideEffect !== 'read' &&
+    requireApproval.some((pattern) => matchesConnectorId(pattern, connectorId))
   );
 }

@@ -4,6 +4,7 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { RequestContext } from '@mastra/core/request-context';
+import { standardSchemaToJSONSchema } from '@mastra/core/schema';
 import type { ToolExecutionContext } from '@mastra/core/tools';
 import { describe, expect, it, type Mock, vi } from 'vitest';
 
@@ -19,10 +20,12 @@ import {
   DRY_RUN_CONTEXT_KEY,
   IDEMPOTENCY_KEY_CONTEXT_KEY,
   InMemoryIdempotencyStore,
+  InMemoryRateLimitStore,
   invokeConnector,
 } from '../connector-sdk/index.js';
 import { WORKFLOW_SCOPE_CONTEXT_KEY } from '../policy-engine/index.js';
 import {
+  type AgentCliConnectorOptions,
   type AgentCliDefinition,
   AgentCliError,
   type AgentCliExec,
@@ -107,6 +110,14 @@ function mockExec(
 }
 
 const GRANTED = (id: string) => makeContext({ approved: [id] });
+
+// The input properties the model is offered, from the tool's JSON schema.
+function modelSchemaProperties(tool: { inputSchema?: unknown }): string[] {
+  const schema = standardSchemaToJSONSchema(tool.inputSchema as never, {
+    io: 'input',
+  }) as { properties?: Record<string, unknown> };
+  return Object.keys(schema.properties ?? {});
+}
 const PRIVATE_PROMPT = 'private-prompt-7b3b631a';
 const PRIVATE_PROCESS_OUTPUT = 'private-process-output-10fd1f62';
 
@@ -185,6 +196,98 @@ describe('createClaudeCodeConnector', () => {
       text: 'done: created 3 files',
       exitCode: 0,
     });
+  });
+
+  it('keeps cwd in the model schema and forwards it when no host cwd is set', () => {
+    // #given
+    const tool = createCodexConnector({ exec: mockExec() });
+
+    // #when
+    const schema = modelSchemaProperties(tool);
+
+    // #then
+    expect(schema).toEqual(['prompt', 'cwd', 'model']);
+  });
+
+  it('drops cwd from the model schema and spawns in the host cwd when one is set', async () => {
+    // #given
+    const exec = mockExec();
+    const tool = createCodexConnector({
+      exec,
+      requiresApproval: false,
+      cwd: '/srv/workspace',
+    });
+
+    // #when
+    const schema = modelSchemaProperties(tool);
+    await run(tool, { prompt: 'fix it' }, makeContext());
+
+    // #then
+    expect(schema).toEqual(['prompt', 'model']);
+    expect(exec).toHaveBeenCalledWith(
+      'codex',
+      ['exec', '--sandbox=workspace-write', '--', 'fix it'],
+      { cwd: '/srv/workspace', timeoutMs: 600_000 },
+    );
+  });
+
+  it.each([
+    '/',
+    '/home/someone/.ssh',
+  ])('ignores the model-supplied cwd %s under a host cwd', async (modelCwd) => {
+    // #given
+    const exec = mockExec();
+    const tool = createCodexConnector({
+      exec,
+      requiresApproval: false,
+      cwd: '/srv/workspace',
+    });
+
+    // #when
+    const output = await run(
+      tool,
+      { prompt: 'fix it', cwd: modelCwd },
+      makeContext(),
+    );
+
+    // #then — validation drops the key, so the spawn never sees it
+    expect(output).toMatchObject({ exitCode: 0 });
+    expect(exec).toHaveBeenCalledTimes(1);
+    expect(exec.mock.calls[0]?.[2]).toEqual({
+      cwd: '/srv/workspace',
+      timeoutMs: 600_000,
+    });
+  });
+
+  it('still forwards the model-supplied cwd when no host cwd is set', async () => {
+    // #given
+    const exec = mockExec();
+    const tool = createCodexConnector({ exec, requiresApproval: false });
+
+    // #when
+    await run(tool, { prompt: 'fix it', cwd: '/repo' }, makeContext());
+
+    // #then
+    expect(exec.mock.calls[0]?.[2]).toEqual({
+      cwd: '/repo',
+      timeoutMs: 600_000,
+    });
+  });
+
+  it.each<[string, unknown, string]>([
+    ['an empty string', '', '""'],
+    ['a number', 42, 'number'],
+    ['null', null, 'null'],
+    ['a list', ['/srv/workspace'], 'object'],
+  ])('refuses %s as the host cwd', (_label, cwd, got) => {
+    // #when / #then
+    expect(() =>
+      createClaudeCodeConnector({ exec: mockExec(), cwd: cwd as string }),
+    ).toThrow(
+      new TypeError(
+        `agent CLI connector agent-cli.claude-code: cwd must be a non-empty string when provided (got ${got})`,
+      ),
+    );
   });
 
   it('falls back to raw stdout when the JSON envelope drifts', async () => {
@@ -557,6 +660,140 @@ describe('agent CLI connector enforcement', () => {
     // #then
     expect(result.error).toBe(true);
     expect(exec).not.toHaveBeenCalled();
+  });
+});
+
+describe('agent CLI option validation', () => {
+  it.each<[string, unknown]>([
+    ['ratelimit', '1/min'],
+    ['idempotencykey', true],
+    ['policy', {}],
+    ['binarypath', '/opt/sandbox/claude-wrapper'],
+    ['executor', mockExec()],
+  ])('refuses the misspelled option %s', (key, value) => {
+    // #when / #then
+    expect(() =>
+      createClaudeCodeConnector({ exec: mockExec(), [key]: value }),
+    ).toThrow(
+      new TypeError(
+        `agent CLI connector options has unknown field ${JSON.stringify(key)} (valid fields: exec, binaryPath, cwd, timeoutMs, requiresApproval, rateLimit, idempotencyKey, id, policies, maxOutputBytes)`,
+      ),
+    );
+  });
+
+  it.each<[string, string]>([
+    [
+      'egres',
+      'agent CLI connector definition has unknown field "egres" (valid fields: id, description, binary, egress, buildFlags, parseOutput)',
+    ],
+  ])('refuses the misspelled definition field %s', (key, message) => {
+    // #given
+    const { egress: _egress, ...rest } = privateDefinition();
+    // #when / #then
+    expect(() =>
+      createAgentCliConnector(
+        { ...rest, [key]: ['api.vendor.example'] } as never,
+        {
+          exec: mockExec(),
+        },
+      ),
+    ).toThrow(new TypeError(message));
+  });
+
+  it.each<[string, unknown, string]>([
+    ['a missing egress', undefined, 'undefined'],
+    ['a null egress', null, 'null'],
+    ['a string egress', 'api.vendor.example', '"api.vendor.example"'],
+  ])('refuses %s, which would pass the organization egress gate', (_label, egress, got) => {
+    // #when / #then
+    expect(() =>
+      createAgentCliConnector(
+        privateDefinition({ egress: egress as readonly string[] }),
+        { exec: mockExec() },
+      ),
+    ).toThrow(
+      new TypeError(
+        `agent CLI connector definition.egress must be an array (got ${got})`,
+      ),
+    );
+  });
+
+  it('constructs with every declared definition field and option', () => {
+    // #given — the Required types fail to compile while a declared field is
+    // missing here
+    const definition: Required<AgentCliDefinition> = {
+      ...privateDefinition({ egress: ['api.vendor.example'] }),
+      parseOutput: (stdout) => stdout,
+    };
+    const options: Required<AgentCliConnectorOptions> = {
+      exec: mockExec(),
+      binaryPath: '/opt/sandbox/private-probe',
+      cwd: '/srv/workspace',
+      timeoutMs: 1_000,
+      requiresApproval: true,
+      rateLimit: '10/hour',
+      idempotencyKey: true,
+      id: 'agent-cli.private-probe-2',
+      policies: {
+        idempotencyStore: new InMemoryIdempotencyStore(),
+        idempotencyKeyMigration: 'legacy-writers-drained',
+        rateLimitStore: new InMemoryRateLimitStore(),
+      },
+      maxOutputBytes: 1_024,
+    };
+    // #when / #then
+    expect(
+      connectorManifest(createAgentCliConnector(definition, options)),
+    ).toMatchObject({ requiresApproval: true, egress: ['api.vendor.example'] });
+  });
+
+  it.each<[string, unknown, string]>([
+    ['an empty string', '', '""'],
+    ['0', 0, 'number'],
+    ['NaN', Number.NaN, 'number'],
+  ])('refuses %s as requiresApproval, which used to spawn without a grant', (_label, requiresApproval, got) => {
+    // #when / #then
+    expect(() =>
+      createClaudeCodeConnector({
+        exec: mockExec(),
+        requiresApproval: requiresApproval as boolean,
+      }),
+    ).toThrow(
+      new TypeError(
+        `connector agent-cli.claude-code: permissions.requiresApproval must be a boolean when provided (got ${got})`,
+      ),
+    );
+  });
+
+  it('keeps the default approval requirement when requiresApproval is omitted', async () => {
+    // #given
+    const exec = mockExec();
+    const tool = createCodexConnector({ exec });
+    // #when
+    const failure = await run(tool, { prompt: 'p' }, makeContext()).catch(
+      (error: unknown) => error,
+    );
+    // #then
+    expect(failure).toMatchObject({ code: 'APPROVAL_GRANT_MISSING' });
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it.each<[string, unknown, string]>([
+    ["the string 'false'", 'false', '"false"'],
+    ['0', 0, 'number'],
+    ['null', null, 'null'],
+  ])('refuses %s as idempotencyKey', (_label, idempotencyKey, got) => {
+    // #when / #then
+    expect(() =>
+      createClaudeCodeConnector({
+        exec: mockExec(),
+        idempotencyKey: idempotencyKey as boolean,
+      }),
+    ).toThrow(
+      new TypeError(
+        `agent CLI connector agent-cli.claude-code: idempotencyKey must be a boolean when provided (got ${got})`,
+      ),
+    );
   });
 });
 

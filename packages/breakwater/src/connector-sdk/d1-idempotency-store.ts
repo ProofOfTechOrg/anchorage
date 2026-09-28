@@ -8,6 +8,7 @@
 // platform-agnostic — no @cloudflare/workers-types import — so tests back
 // the interfaces with node:sqlite and Workers pass env.DB directly.
 
+import { assertKnownFields } from '../host-input.js';
 import type {
   AtomicIdempotencyStore,
   IdempotencyInspection,
@@ -80,6 +81,12 @@ export interface D1IdempotencyStoreOptions {
   /** Clock override for tests. */
   now?: () => number;
 }
+
+const D1_IDEMPOTENCY_STORE_OPTION_KEYS = {
+  table: true,
+  pendingTtlMs: true,
+  now: true,
+} satisfies Record<keyof D1IdempotencyStoreOptions, true>;
 
 const DEFAULT_TABLE = 'breakwater_idempotency';
 const DEFAULT_PENDING_TTL_MS = 900_000;
@@ -197,6 +204,11 @@ export class D1IdempotencyStore
     db: IdempotencyDatabase,
     options: D1IdempotencyStoreOptions = {},
   ) {
+    assertKnownFields(
+      'D1IdempotencyStore options',
+      options,
+      D1_IDEMPOTENCY_STORE_OPTION_KEYS,
+    );
     this.#db = db;
     this.#table = options.table ?? DEFAULT_TABLE;
     this.pendingTtlMs = options.pendingTtlMs ?? DEFAULT_PENDING_TTL_MS;

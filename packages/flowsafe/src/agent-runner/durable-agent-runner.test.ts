@@ -7,7 +7,7 @@
 // "rejects re-entry after the host waiter settles while the run registry stays
 // live".
 
-import { Agent } from '@mastra/core/agent';
+import { Agent, createSignal } from '@mastra/core/agent';
 import {
   DurableAgent,
   type DurableAgenticWorkflowInput,
@@ -88,10 +88,8 @@ import {
 
 // A fake runtime that records register() and start() and models the shared-id
 // registry so the idempotency path is exercised. The cast to RunnerRuntime
-// stands on what the literal below implements — registerAgent, register,
-// workflowIds, start, resume, and pubsub when an override supplies it; a
-// runner call to any other member of the interface reaches undefined here and
-// throws. `startResult` overrides the summary start() resolves to (e.g. a
+// stands on what the literal below implements; a runner call to any other
+// member of the interface reaches undefined here and throws. `startResult` overrides the summary start() resolves to (e.g. a
 // 'failed' run); `pubsub` exposes an identity for the inheritance test.
 function fakeRuntime(
   overrides: {
@@ -175,6 +173,8 @@ function guardedTestAgent(): Agent {
     toolChoice: 'auto',
   }) as unknown as Agent;
 }
+
+const UNOWNED_INPUT_MARK = 'MKUNOWNEDINPUT';
 
 function actorContext(role: Role = 'operator'): RequestContext {
   const context = new RequestContext();
@@ -1813,6 +1813,92 @@ describe('FlowsafeDurableAgent.executeWorkflow', () => {
     });
 
     expect(saveMessages).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [
+      'the RBAC gate refuses it for a missing actor',
+      `${UNOWNED_INPUT_MARK} text`,
+      undefined,
+      'agent.input.authorize',
+    ],
+    [
+      'an input policy refuses it',
+      `${UNOWNED_INPUT_MARK} text`,
+      actorContext,
+      'agent.input.policy',
+    ],
+    [
+      'the RBAC gate refuses a created signal streamed with a request context',
+      createSignal({ type: 'user', contents: `${UNOWNED_INPUT_MARK} text` }),
+      () => new RequestContext(),
+      'agent.input.authorize',
+    ],
+  ] as const)('saves none of a direct unowned stream input when %s', async (_label, input, requestContext, refusingAction) => {
+    // #given — a guarded agent whose input policy denies the marker, over a
+    // thread that exists
+    const { runtime, start } = fakeRuntime();
+    const memory = new MockMemory();
+    await memory.saveThread({
+      thread: {
+        id: 'thread-1',
+        resourceId: 'resource-1',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        metadata: {},
+      },
+    });
+    const audit = new AuditLogger();
+    const agent = createFlowsafeDurableAgent({
+      agent: createGuardedAgent({
+        id: 'writer',
+        name: 'Writer',
+        instructions: 'Answer the request.',
+        model: 'openai/gpt-4o-mini',
+        memory,
+        allowedRoles: ['operator'],
+        policies: [denyPatterns([UNOWNED_INPUT_MARK])],
+        audit,
+        maxSteps: 2,
+        toolChoice: 'auto',
+      }) as unknown as Agent,
+      runtime,
+      cache: false,
+    });
+    const saveMessages = vi.spyOn(memory, 'saveMessages');
+    const emitError = vi.spyOn(
+      agent as unknown as {
+        emitError: (id: string, error: Error) => Promise<void>;
+      },
+      'emitError',
+    );
+
+    // #when — a caller streams its own input past the host start seam
+    await agent.stream(input, {
+      runId: 'run-1',
+      memory: { thread: 'thread-1', resource: 'resource-1' },
+      ...(requestContext ? { requestContext: requestContext() } : {}),
+    });
+    await vi.waitFor(() =>
+      expect(emitError).toHaveBeenCalledWith(
+        'run-1',
+        expect.any(InvalidRunRequestError),
+      ),
+    );
+
+    // #then — the named gate refused the call, and memory holds none of it
+    expect(
+      audit
+        .events()
+        .some(
+          (event) =>
+            event.action === refusingAction && event.decision === 'denied',
+        ),
+    ).toBe(true);
+    expect(start).not.toHaveBeenCalled();
+    expect(saveMessages).not.toHaveBeenCalled();
+    const { messages } = await memory.recall({ threadId: 'thread-1' });
+    expect(JSON.stringify(messages)).not.toContain(UNOWNED_INPUT_MARK);
   });
 
   it('publishes the terminal error when unowned input persistence times out', async () => {

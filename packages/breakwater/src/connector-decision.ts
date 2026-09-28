@@ -61,10 +61,13 @@ export const CONNECTOR_DECISIONS = Object.freeze({
   IDEMPOTENCY_LEGACY_AMBIGUOUS: decision('idempotency-key-migration', false),
   IDEMPOTENCY_MIGRATION_REQUIRED: decision('idempotency-key-migration', false),
   DRY_RUN_UNSUPPORTED: decision('dry-run', false),
+  DRY_RUN_INVALID: decision('dry-run', false),
   WORKFLOW_SCOPE_MISSING: decision('cross-workflow-isolation', false),
   CROSS_WORKFLOW_ACCESS_DENIED: decision('cross-workflow-isolation', false),
   ISOLATION_SCOPE_MISSING: decision('tenant-isolation', false),
+  ISOLATION_SCOPE_INVALID: decision('tenant-isolation', false),
   BACKGROUND_OVERRIDE_DENIED: decision('background', false),
+  BACKGROUND_TASK_DENIED: decision('background', false),
   BACKGROUND_EXECUTION_DENIED: decision('background-execution', false),
   EVALUATOR_DENIED: decision('evaluator', false),
   EVALUATOR_FAILED: decision('evaluator', false),
@@ -123,10 +126,13 @@ export type ConnectorDenialCode =
   | 'IDEMPOTENCY_LEGACY_AMBIGUOUS'
   | 'IDEMPOTENCY_MIGRATION_REQUIRED'
   | 'DRY_RUN_UNSUPPORTED'
+  | 'DRY_RUN_INVALID'
   | 'WORKFLOW_SCOPE_MISSING'
   | 'CROSS_WORKFLOW_ACCESS_DENIED'
   | 'ISOLATION_SCOPE_MISSING'
+  | 'ISOLATION_SCOPE_INVALID'
   | 'BACKGROUND_OVERRIDE_DENIED'
+  | 'BACKGROUND_TASK_DENIED'
   | 'BACKGROUND_EXECUTION_DENIED'
   | 'EVALUATOR_DENIED';
 
@@ -226,10 +232,13 @@ const denialDetails = {
   IDEMPOTENCY_LEGACY_AMBIGUOUS: noDetails,
   IDEMPOTENCY_MIGRATION_REQUIRED: noDetails,
   DRY_RUN_UNSUPPORTED: noDetails,
+  DRY_RUN_INVALID: noDetails,
   WORKFLOW_SCOPE_MISSING: noDetails,
   CROSS_WORKFLOW_ACCESS_DENIED: noDetails,
   ISOLATION_SCOPE_MISSING: noDetails,
+  ISOLATION_SCOPE_INVALID: noDetails,
   BACKGROUND_OVERRIDE_DENIED: noDetails,
+  BACKGROUND_TASK_DENIED: noDetails,
   BACKGROUND_EXECUTION_DENIED: noDetails,
   EVALUATOR_DENIED: noDetails,
 } satisfies {

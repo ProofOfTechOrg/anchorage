@@ -12,6 +12,7 @@ import {
   backgroundExecution,
   egressDomainAllowed,
   isBackgroundExecutionEvaluator,
+  isConnectorIdText,
   isTenantIsolationEvaluator,
   networkEgress,
 } from '../policy-engine/tool-policy.js';
@@ -131,7 +132,17 @@ const evaluatorSchema = z.custom<ToolPolicyEvaluator>(
 );
 
 const writePermissionsSchema = z.strictObject({
-  requireApproval: z.array(z.string().min(1)).optional(),
+  requireApproval: z
+    .array(
+      z
+        .string()
+        .min(1)
+        .refine(
+          isConnectorIdText,
+          "must not contain ':', whitespace, or a control or format character",
+        ),
+    )
+    .optional(),
   destructiveRequiresApproval: z.literal(true).optional(),
 });
 
@@ -229,13 +240,14 @@ function snapshotRateLimitStore(store: D1RateLimitStore): RateLimitStore {
   });
 }
 
-// Policy members the preset pins between validation and construction. The
-// order decides which member a multi-member tamper is reported against, since
-// the first mismatch throws; `Object.keys` preserves the literal's insertion
-// order, so the order written here is the order checked. Exhaustive over
-// ConnectorPolicies: a member the interface gains is a missing property here,
-// one it drops an excess property.
-const PINNED_PRESET_MEMBER_SET: Record<keyof ConnectorPolicies, true> = {
+/**
+ * @internal Every `ConnectorPolicies` member. The preset pins each between
+ * validation and construction, and the order decides which member a
+ * multi-member tamper is reported against, since the first mismatch throws;
+ * `Object.keys` preserves the literal's insertion order, so the order written
+ * here is the order checked.
+ */
+export const CONNECTOR_POLICIES_KEYS = {
   networkEgress: true,
   idempotencyKeyMigration: true,
   writePermissions: true,
@@ -245,10 +257,10 @@ const PINNED_PRESET_MEMBER_SET: Record<keyof ConnectorPolicies, true> = {
   audit: true,
   fetch: true,
   requireEgressEnforcement: true,
-};
+} satisfies Record<keyof ConnectorPolicies, true>;
 
 const PINNED_PRESET_MEMBERS = Object.keys(
-  PINNED_PRESET_MEMBER_SET,
+  CONNECTOR_POLICIES_KEYS,
 ) as readonly (keyof ConnectorPolicies)[];
 
 function assertUnchangedSurface(
