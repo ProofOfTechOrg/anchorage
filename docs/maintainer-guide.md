@@ -20,7 +20,7 @@ The root `package.json` `engines` field sets the Node and pnpm versions the work
 
 ## Verification
 
-The commands below mirror the CI `verify-core` job after dependency installation, in order. `pnpm test` also covers the direct scenario projects, which CI runs in gating jobs of their own:
+Run these after dependency installation. `pnpm test` leaves out the direct scenario projects, which CI runs in gating jobs of their own; run them locally with `pnpm test:direct-scenario` (below).
 
 ```bash
 pnpm github:check
@@ -65,7 +65,7 @@ passing scan.
 
 ### Direct scenario projects
 
-`pnpm test:direct-scenario` runs the direct scenario Vitest projects. `fleet-control-direct-scenario` takes about thirty-five minutes on a workstation. `fleet-control-direct-scenario-seams` contains the process-loss titles and takes about fifty-five minutes, with fifteen-to-twenty-minute quiet gaps. The projects drive the reference and tenant Workers through full runs on local workerd with native bindings. They need the package dists, so run `pnpm build` first. They reach no network. `pnpm test:direct-scenario:fast` and `pnpm test:direct-scenario:seams` run the projects separately. `pnpm test:without-direct-scenario` runs the root workspace without them.
+`pnpm test:direct-scenario` runs the direct scenario Vitest projects. `fleet-control-direct-scenario` takes about thirty-five minutes on a workstation. `fleet-control-direct-scenario-seams` contains the process-loss titles and takes about fifty-five minutes, with fifteen-to-twenty-minute quiet gaps. The projects drive the reference and tenant Workers through full runs on local workerd with native bindings. They need the package dists, so run `pnpm build` first. They reach no network. `pnpm test:direct-scenario:fast` and `pnpm test:direct-scenario:seams` run the projects separately. `pnpm test` runs the root workspace without them.
 
 To run one title, select it through the project's own config so its timeout and includes apply:
 

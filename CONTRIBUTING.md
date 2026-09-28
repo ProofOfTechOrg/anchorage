@@ -41,7 +41,8 @@ Install with `pnpm install --frozen-lockfile`, then run the commands under
 [Verification](docs/maintainer-guide.md#verification) in the maintainer guide.
 
 Lint is one Biome pass at the root, and `pnpm test` is one root vitest run
-covering every package. Git hooks (husky) back the gate up:
+covering every package except the direct scenario projects
+(`pnpm test:direct-scenario`). Git hooks (husky) back the gate up:
 pre-commit runs Biome on staged files and checks the complete `.github` YAML
 directory when a `.github/**/*.{yml,yaml}` file is staged (lint-staged);
 pre-push runs react-doctor on the branch's changed files

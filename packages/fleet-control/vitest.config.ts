@@ -3,11 +3,10 @@ import { configDefaults, defineConfig } from 'vitest/config';
 export default defineConfig({
   test: {
     include: ['test/**/*.test.ts'],
-    // The direct scenario suites belong to the root direct-scenario projects,
-    // which the package `test` script runs after this config and CI runs in
-    // jobs beside `verify-core`. Listing them here as well would run them twice
-    // under `pnpm test`. Those projects are standalone: an option added here
-    // does not reach them, so a shared option is written in each config.
+    // The direct scenario suites belong to the root direct-scenario projects
+    // (`pnpm test:direct-scenario`); listing them here would pull them into
+    // `pnpm test`. Those projects are standalone: an option added here does not
+    // reach them, so a shared option is written in each config.
     exclude: [
       ...configDefaults.exclude,
       'test/direct-credentialed-scenario.test.ts',

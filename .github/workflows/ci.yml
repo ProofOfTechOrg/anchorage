@@ -65,7 +65,7 @@ jobs:
       # steps leave the job budget unspent.
       - name: Test
         timeout-minutes: 30
-        run: pnpm test:without-direct-scenario
+        run: pnpm test
 
       - name: Build
         run: pnpm build

@@ -12,9 +12,8 @@
   "scripts": {
     "build": "pnpm -r build",
     "dev": "pnpm --filter showcase dev",
-    "test": "pnpm run architecture:check && vitest run",
-    "test:watch": "vitest",
-    "test:without-direct-scenario": "pnpm run architecture:check && vitest run --project=!fleet-control-direct-scenario*",
+    "test": "pnpm run architecture:check && vitest run --project=!fleet-control-direct-scenario*",
+    "test:watch": "vitest --project=!fleet-control-direct-scenario*",
     "test:direct-scenario": "vitest run --project=fleet-control-direct-scenario --project=fleet-control-direct-scenario-seams",
     "test:direct-scenario:fast": "vitest run --project=fleet-control-direct-scenario",
     "test:direct-scenario:seams": "vitest run --project=fleet-control-direct-scenario-seams",

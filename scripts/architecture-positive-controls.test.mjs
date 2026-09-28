@@ -914,13 +914,10 @@ function assertNegatedWildcardCoverage(scripts, declared) {
   const direct = new Set(
     explicitProjects(scripts['test:direct-scenario'] ?? ''),
   );
-  const negatedWildcards = projectSelectors(
-    scripts['test:without-direct-scenario'] ?? '',
-  ).filter((selector) => selector.startsWith('!') && selector.endsWith('*'));
-  assert.ok(
-    negatedWildcards.length > 0,
-    'test:without-direct-scenario negates no project wildcard',
+  const negatedWildcards = projectSelectors(scripts.test ?? '').filter(
+    (selector) => selector.startsWith('!') && selector.endsWith('*'),
   );
+  assert.ok(negatedWildcards.length > 0, 'test negates no project wildcard');
   for (const selector of negatedWildcards) {
     const stem = selector.slice(1, -1);
     for (const project of [...declared].filter((name) => name.startsWith(stem)))
