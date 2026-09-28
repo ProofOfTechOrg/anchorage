@@ -4046,6 +4046,181 @@ describe('RunnerRuntime', () => {
   });
 });
 
+describe('RunnerRuntime ownership changes during operations', () => {
+  const refusal = /is not registered on this runtime's Mastra/;
+
+  function repoint(workflow: Parameters<RunnerRuntime['register']>[0]) {
+    const storage = new InMemoryStore();
+    const foreign = new Mastra({
+      storage,
+      logger: false,
+      workflows: { [workflow.id]: workflow },
+    });
+    const getStorage = vi.spyOn(foreign, 'getStorage');
+    const row = async (runId: string) =>
+      (await storage.getStore('workflows'))?.loadWorkflowSnapshot({
+        workflowName: workflow.id,
+        runId,
+      });
+    return { getStorage, row };
+  }
+
+  async function expectRefusedWithoutForeignStorage(
+    result: unknown,
+    foreign: ReturnType<typeof repoint> | undefined,
+    runId: string,
+  ) {
+    assert(foreign);
+    expect(result).toBeInstanceOf(Error);
+    expect((result as Error).message).toMatch(refusal);
+    expect(foreign.getStorage).not.toHaveBeenCalled();
+    expect(await foreign.row(runId)).toBeNull();
+  }
+
+  it('refuses start repointed after entry before storage capture', async () => {
+    const f = await d3RuntimeFixture('custom');
+    const runId = 'start-after-entry';
+    try {
+      const pending = f.runtime.start(f.workflow.id, f.options(runId));
+      const foreign = repoint(f.workflow);
+      const result = await pending.catch((error: unknown) => error);
+      await expectRefusedWithoutForeignStorage(result, foreign, runId);
+    } finally {
+      f.close();
+    }
+  });
+
+  it('refuses resume repointed after entry before storage capture', async () => {
+    const f = await d3RuntimeFixture('custom');
+    const runId = 'resume-after-entry';
+    try {
+      await f.runtime.start(f.workflow.id, {
+        ...f.options(runId),
+        inputData: { suspend: true },
+      });
+      const pending = f.runtime.resume(f.workflow.id, runId, {
+        resumeData: { go: true },
+      });
+      const foreign = repoint(f.workflow);
+      const result = await pending.catch((error: unknown) => error);
+      await expectRefusedWithoutForeignStorage(result, foreign, runId);
+    } finally {
+      f.close();
+    }
+  });
+
+  it('refuses start recovery repointed after entry before storage capture', async () => {
+    const f = await d3RuntimeFixture('fenced');
+    try {
+      await f.runtime.start(f.workflow.id, f.options());
+      const state = await f.runtime.authoritativeStartState(
+        f.workflow.id,
+        'd3-run',
+      );
+      assert(state?.storage === 'd1');
+      const pending = f.runtime.recoverStartAttempt(state.execution, {
+        attemptToken: 'H',
+        isOwnerQuiescent: () => true,
+      });
+      const foreign = repoint(f.workflow);
+      const result = await pending.catch((error: unknown) => error);
+      expect(result).toBeInstanceOf(ExecutionFenceUnreadableError);
+      await expectRefusedWithoutForeignStorage(
+        (result as Error & { cause?: Error }).cause,
+        foreign,
+        'd3-run',
+      );
+    } finally {
+      f.close();
+    }
+  });
+
+  it('refuses unfenced start repointed after storage capture before createRun', async () => {
+    const f = await d3RuntimeFixture('custom');
+    const runId = 'start-after-capture';
+    let foreign: ReturnType<typeof repoint> | undefined;
+    try {
+      const result = await f.runtime
+        .start(f.workflow.id, {
+          ...f.options(runId),
+          onPreparedStartIdentity: async () => {
+            foreign = repoint(f.workflow);
+          },
+        })
+        .catch((error: unknown) => error);
+      await expectRefusedWithoutForeignStorage(result, foreign, runId);
+    } finally {
+      f.close();
+    }
+  });
+
+  it('refuses fenced start repointed after storage capture before createRun', async () => {
+    const f = await d3RuntimeFixture('fenced');
+    let foreign: ReturnType<typeof repoint> | undefined;
+    try {
+      const result = await f.runtime
+        .start(f.workflow.id, {
+          ...f.options(),
+          onPreparedStartIdentity: async () => {
+            foreign = repoint(f.workflow);
+          },
+        })
+        .catch((error: unknown) => error);
+      await expectRefusedWithoutForeignStorage(result, foreign, 'd3-run');
+    } finally {
+      f.close();
+    }
+  });
+
+  it('refuses resume repointed after storage capture before createRun', async () => {
+    const f = await d3RuntimeFixture('custom');
+    const runId = 'resume-after-capture';
+    let foreign: ReturnType<typeof repoint> | undefined;
+    try {
+      await f.runtime.start(f.workflow.id, {
+        ...f.options(runId),
+        inputData: { suspend: true },
+      });
+      const result = await f.runtime
+        .resume(f.workflow.id, runId, {
+          resumeData: { go: true },
+          prepareExecution: async () => {
+            foreign = repoint(f.workflow);
+          },
+        })
+        .catch((error: unknown) => error);
+      await expectRefusedWithoutForeignStorage(result, foreign, runId);
+    } finally {
+      f.close();
+    }
+  });
+
+  it('refuses resume repointed during capture before its state read', async () => {
+    const f = await d3RuntimeFixture('custom');
+    const runId = 'resume-during-capture';
+    try {
+      await f.runtime.start(f.workflow.id, {
+        ...f.options(runId),
+        inputData: { suspend: true },
+      });
+      const originalGetStore = f.storage.getStore.bind(f.storage);
+      let foreign: ReturnType<typeof repoint> | undefined;
+      vi.spyOn(f.storage, 'getStore').mockImplementationOnce((...args) => {
+        foreign = repoint(f.workflow);
+        return originalGetStore(...args);
+      });
+      const result = await f.runtime
+        .resume(f.workflow.id, runId, {
+          resumeData: { go: true },
+        })
+        .catch((error: unknown) => error);
+      await expectRefusedWithoutForeignStorage(result, foreign, runId);
+    } finally {
+      f.close();
+    }
+  });
+});
+
 const ISO_8601 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/;
 
 describe('RunnerRuntime.status projection', () => {

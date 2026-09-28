@@ -1482,14 +1482,15 @@ export class RunnerRuntime {
         const originalCached = workflow.runs.get(runId);
         let provenance: ProgressRunProvenance | undefined;
         try {
-          const existing = await workflow.getWorkflowRunById(runId);
+          const existing =
+            await this.#getWorkflow(workflowId).getWorkflowRunById(runId);
           if (existing || originalCached)
             throw new RunAlreadyExistsError(
               workflowId,
               runId,
               existing?.status ?? 'pending',
             );
-          const source = await this.#captureWorkflowStorage(workflow);
+          const source = await this.#captureWorkflowStorage(workflowId);
           active.source = source;
           provenance = {
             version: 2,
@@ -1564,7 +1565,7 @@ export class RunnerRuntime {
                       candidate = workflow.runs.get(runId);
                     },
                   },
-                  () => workflow.createRun({ runId, pubsub: this.#pubsub }),
+                  () => this.#createRun(workflowId, runId),
                 );
                 if (
                   !admitted?.witness ||
@@ -1594,7 +1595,7 @@ export class RunnerRuntime {
                     ...capturedExecution,
                     ...startIdentity,
                   });
-                run = await workflow.createRun({ runId, pubsub: this.#pubsub });
+                run = await this.#createRun(workflowId, runId);
               }
               active.run = run;
               engineEntered = true;
@@ -1645,7 +1646,7 @@ export class RunnerRuntime {
           }
           if (engineEntered && provenance && !outcomeReadStarted) {
             const recovered = await this.#summaryForAttempt(
-              workflow,
+              workflowId,
               runId,
               provenance,
             );
@@ -1673,7 +1674,7 @@ export class RunnerRuntime {
     runId: string,
     options: ResumeRunOptions = {},
   ): Promise<RunSummary> {
-    const workflow = this.#getWorkflow(workflowId);
+    this.#getWorkflow(workflowId);
     const proof = await this.#assertResumeFence(workflowId, runId);
     return this.#withRunLock(workflowId, runId, async () => {
       const activeKey = this.#runKey(workflowId, runId);
@@ -1685,9 +1686,9 @@ export class RunnerRuntime {
       let engineEntered = false;
       let outcomeReadStarted = false;
       try {
-        const source = await this.#captureWorkflowStorage(workflow);
+        const source = await this.#captureWorkflowStorage(workflowId);
         active.source = source;
-        const state = await this.#workflowState(workflow, runId, true);
+        const state = await this.#workflowState(workflowId, runId, true);
         if (!state) throw new UnknownRunError(workflowId, runId);
         if (state.isFromInMemory)
           throw new RunStateUnreadableError(workflowId, runId);
@@ -1751,7 +1752,7 @@ export class RunnerRuntime {
           );
           await this.#withLifecycleLock(workflowId, runId, check);
         }
-        const run = await workflow.createRun({ runId, pubsub: this.#pubsub });
+        const run = await this.#createRun(workflowId, runId);
         const { executionPromise } = await this.#withLifecycleLock(
           workflowId,
           runId,
@@ -1802,7 +1803,7 @@ export class RunnerRuntime {
       } catch (error) {
         if (engineEntered && provenance && !outcomeReadStarted) {
           const recovered = await this.#summaryForAttempt(
-            workflow,
+            workflowId,
             runId,
             provenance,
           );
@@ -1845,7 +1846,7 @@ export class RunnerRuntime {
       async () => {
         const source =
           this.#activeRuns.get(this.#runKey(workflowId, runId))?.source ??
-          (await this.#captureWorkflowStorage(this.#getWorkflow(workflowId)));
+          (await this.#captureWorkflowStorage(workflowId));
         const state = await source.load.call(source.workflows, {
           workflowName: workflowId,
           runId,
@@ -2016,9 +2017,7 @@ export class RunnerRuntime {
   ): Promise<RunLifecycleTransitionResult> {
     this.#getWorkflow(workflowId);
     return this.#withRunLock(workflowId, runId, async () => {
-      const source = await this.#captureWorkflowStorage(
-        this.#getWorkflow(workflowId),
-      );
+      const source = await this.#captureWorkflowStorage(workflowId);
       const state = await source.load.call(source.workflows, {
         workflowName: workflowId,
         runId,
@@ -2159,9 +2158,7 @@ export class RunnerRuntime {
   ): Promise<RunSummary> {
     this.#getWorkflow(workflowId);
     return this.#withRunLock(workflowId, runId, async () => {
-      const source = await this.#captureWorkflowStorage(
-        this.#getWorkflow(workflowId),
-      );
+      const source = await this.#captureWorkflowStorage(workflowId);
       const state = await source.load.call(source.workflows, {
         workflowName: workflowId,
         runId,
@@ -2217,8 +2214,7 @@ export class RunnerRuntime {
    * that did not reach storage.
    */
   async status(workflowId: string, runId: string): Promise<RunSummary | null> {
-    const workflow = this.#getWorkflow(workflowId);
-    const state = await this.#workflowState(workflow, runId);
+    const state = await this.#workflowState(workflowId, runId);
     if (!state) return null;
     return this.#summaryFromState(runId, state);
   }
@@ -2245,8 +2241,7 @@ export class RunnerRuntime {
     workflowId: string,
     runId: string,
   ): Promise<RunSummary | null> {
-    const workflow = this.#getWorkflow(workflowId);
-    const state = await this.#workflowState(workflow, runId);
+    const state = await this.#workflowState(workflowId, runId);
     if (!state) return null;
     if (state.isFromInMemory === true) {
       throw new RunStateUnreadableError(workflowId, runId);
@@ -2278,11 +2273,10 @@ export class RunnerRuntime {
   }
 
   async #captureWorkflowStorage(
-    workflow: AnyWorkflow,
+    workflowId: string,
   ): Promise<CapturedWorkflowStorage> {
-    const workflows = await workflow.mastra
-      ?.getStorage()
-      ?.getStore('workflows');
+    this.#getWorkflow(workflowId);
+    const workflows = await this.#mastra?.getStorage()?.getStore('workflows');
     if (!workflows) throw new Error('workflow storage is unavailable');
     const methods = {
       workflows,
@@ -2348,9 +2342,9 @@ export class RunnerRuntime {
       throw new InvalidRunRequestError('workflowId is malformed');
     if (!isPathSafeId(runId))
       throw new InvalidRunRequestError('runId is malformed');
-    const workflow = this.#getWorkflow(workflowId);
+    this.#getWorkflow(workflowId);
     try {
-      const source = await this.#captureWorkflowStorage(workflow);
+      const source = await this.#captureWorkflowStorage(workflowId);
       return {
         source,
         state: await this.#readStartState(source, workflowId, runId),
@@ -2635,13 +2629,13 @@ export class RunnerRuntime {
         'run start recovery is unresolved',
       );
     const { workflowId, runId } = execution;
-    const workflow = this.#getWorkflow(workflowId);
+    this.#getWorkflow(workflowId);
     return this.#withRunLock(workflowId, runId, () =>
       this.#withLifecycleLock(workflowId, runId, async () => {
         try {
           if (this.isRunActive(workflowId, runId))
             throw new Error('run owner is not quiescent');
-          const source = await this.#captureWorkflowStorage(workflow);
+          const source = await this.#captureWorkflowStorage(workflowId);
           if (
             this.isRunActive(workflowId, runId) ||
             (await Reflect.apply(isOwnerQuiescent, undefined, [])) !== true ||
@@ -2927,11 +2921,11 @@ export class RunnerRuntime {
   }
 
   #workflowState(
-    workflow: AnyWorkflow,
+    workflowId: string,
     runId: string,
     withNestedWorkflows = false,
   ): Promise<WorkflowState | null> {
-    return workflow.getWorkflowRunById(runId, {
+    return this.#getWorkflow(workflowId).getWorkflowRunById(runId, {
       fields: RUN_STATE_FIELDS,
       withNestedWorkflows,
     });
@@ -2982,10 +2976,7 @@ export class RunnerRuntime {
         await this.settleStartExecution(selected);
       return selected.summary;
     }
-    const state = await this.#workflowState(
-      this.#getWorkflow(workflowId),
-      runId,
-    );
+    const state = await this.#workflowState(workflowId, runId);
     if (!state) throw new UnknownRunError(workflowId, runId);
     return this.#summaryFromState(runId, state);
   }
@@ -3004,21 +2995,21 @@ export class RunnerRuntime {
   }
 
   async #summaryForAttempt(
-    workflow: AnyWorkflow,
+    workflowId: string,
     runId: string,
     expected: Pick<RunProvenance, 'version' | 'startToken' | 'attemptToken'>,
   ): Promise<RunSummary | undefined> {
     try {
       if (expected.version === 2) {
         const source = this.#activeRuns.get(
-          this.#runKey(workflow.id, runId),
+          this.#runKey(workflowId, runId),
         )?.source;
         if (!source) return undefined;
         const state = await this.#completedStartState(
           source,
           {
             tablePrefix: source.tablePrefix,
-            workflowId: workflow.id,
+            workflowId,
             runId,
             startToken: expected.startToken,
           },
@@ -3027,7 +3018,7 @@ export class RunnerRuntime {
         await this.#settleStartReservation(state);
         return state.summary;
       }
-      const persisted = await this.#workflowState(workflow, runId);
+      const persisted = await this.#workflowState(workflowId, runId);
       if (
         !persisted ||
         persisted.isFromInMemory ||
@@ -3152,14 +3143,26 @@ export class RunnerRuntime {
     this.#ensureMastra();
     const workflow = this.#workflows.get(workflowId);
     if (!workflow) throw new UnknownWorkflowError(workflowId);
-    // Run-state reads go through the workflow's own Mastra, so a workflow
-    // another Mastra registered would read that Mastra's storage.
+    // Run-state reads and run creation go through the workflow's own Mastra,
+    // so a workflow another Mastra registered would reach that Mastra's storage.
+    // Another Mastra can register the object during any await, so callers look
+    // the workflow up again where they reach storage, not only at entry.
     if (workflow.mastra !== this.#mastra) {
       throw new Error(
         `RunnerRuntime: workflow '${workflowId}' is not registered on this runtime's Mastra — another runtime or Mastra has registered the same workflow object`,
       );
     }
     return workflow;
+  }
+
+  #createRun(
+    workflowId: string,
+    runId: string,
+  ): ReturnType<AnyWorkflow['createRun']> {
+    return this.#getWorkflow(workflowId).createRun({
+      runId,
+      pubsub: this.#pubsub,
+    });
   }
 
   #ensureMastra(): void {
