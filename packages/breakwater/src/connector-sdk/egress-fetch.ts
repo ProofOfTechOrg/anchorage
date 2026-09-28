@@ -47,9 +47,11 @@ export interface EgressResponse {
 }
 
 /**
- * RequestInit subset the guarded fetch understands. Members it does not
- * model (cache, credentials, cf, duplex, …) pass through to the base fetch
- * untouched via the index signature.
+ * RequestInit subset the guarded fetch understands. The guard forwards own
+ * enumerable members and the standard and Workers request-init members it
+ * defines, whether own or inherited, reading each once per call. Class
+ * instances, Object.create objects, and Requests passed as init retain their
+ * method, headers, body, and signal. Redirect is replaced by the checked mode.
  */
 export interface EgressRequestInit {
   /** HTTP method. Defaults to the base fetch implementation's default. */
@@ -68,6 +70,40 @@ export interface EgressRequestInit {
   /** Cancellation signal forwarded to the base fetch. */
   signal?: unknown;
   [key: string]: unknown;
+}
+
+// Spread copies only own enumerable members; Requests and class instances carry
+// request-init members on their prototypes.
+const REQUEST_INIT_MEMBERS = [
+  'method',
+  'headers',
+  'body',
+  'redirect',
+  'signal',
+  'cache',
+  'credentials',
+  'integrity',
+  'keepalive',
+  'mode',
+  'referrer',
+  'referrerPolicy',
+  'window',
+  'duplex',
+  'priority',
+  'cf',
+  'fetcher',
+  'encodeResponseBody',
+] as const;
+
+function forwardedInit(init: EgressRequestInit | undefined): EgressRequestInit {
+  const snapshot: EgressRequestInit = { ...init };
+  if (init == null) return snapshot;
+  for (const key of REQUEST_INIT_MEMBERS) {
+    if (Object.hasOwn(snapshot, key)) continue;
+    const value = init[key];
+    if (value !== undefined) (snapshot as Record<string, unknown>)[key] = value;
+  }
+  return snapshot;
 }
 
 /**
@@ -421,11 +457,12 @@ export function egressFetch(
       });
     }
     let url = checkUrl(raw, 0);
+    const requestInit = forwardedInit(init);
     // The base fetch reads and converts `redirect` again, so the guard reads it
     // once and sends the string it checked: a value that converts to 'follow',
     // or a getter that answers differently, would otherwise make the base
     // follow redirects without a hop check.
-    const mode: unknown = init?.redirect;
+    const mode: unknown = requestInit.redirect;
     if (mode !== undefined && mode !== 'follow') {
       if (mode !== 'manual' && mode !== 'error') {
         throw denied({
@@ -437,14 +474,14 @@ export function egressFetch(
       }
       // 'manual' hands the 3xx back to the caller (any follow-up fetch goes
       // through this guard again); 'error' fails on it at the base.
-      return base(url.href, { ...init, redirect: mode });
+      return base(url.href, { ...requestInit, redirect: mode });
     }
 
-    let method = (init?.method ?? 'GET').toUpperCase();
-    let body = init?.body ?? null;
+    let method = (requestInit.method ?? 'GET').toUpperCase();
+    let body = requestInit.body ?? null;
     let headers: HeadersLike | undefined; // built on the first hop only
     let response = await base(url.href, {
-      ...(init ?? {}),
+      ...requestInit,
       redirect: 'manual',
     });
 
@@ -475,7 +512,7 @@ export function egressFetch(
       }
       const nextUrl = checkUrl(location, hop, url);
       headers ??= new (requireGlobal<HeadersConstructor>('Headers'))(
-        init?.headers,
+        requestInit.headers,
       );
       const nextMethod = redirectMethod(status, method);
       if (nextMethod !== method) {
@@ -496,7 +533,7 @@ export function egressFetch(
       method = nextMethod;
       url = nextUrl;
       response = await base(url.href, {
-        ...(init ?? {}),
+        ...requestInit,
         method,
         headers,
         body,

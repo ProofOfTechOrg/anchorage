@@ -5,6 +5,7 @@ import {
   type EgressDenial,
   EgressDeniedError,
   EgressGuardError,
+  type EgressRequestInit,
   egressFetch,
 } from './egress-fetch.js';
 
@@ -677,6 +678,99 @@ describe('egressFetch redirect following', () => {
     expect(response.status).toBe(302);
     expect(calls).toHaveLength(1);
     expect(calls[0]?.init).toMatchObject({ method: 'POST', redirect });
+  });
+
+  function inheritedInit(redirect?: 'manual' | 'error') {
+    const controller = new AbortController();
+    const headers = {
+      'content-type': 'application/json',
+      authorization: 'Bearer t',
+    };
+    const cf = { cacheTtl: 5 };
+    const init = Object.create({
+      method: 'POST',
+      headers,
+      body: '{"a":1}',
+      signal: controller.signal,
+      cf,
+      cache: 'no-store',
+      credentials: 'include',
+      ...(redirect === undefined ? {} : { redirect }),
+    }) as EgressRequestInit;
+    return { init, headers, signal: controller.signal, cf };
+  }
+
+  it.each([
+    'manual',
+    'error',
+  ] as const)('forwards request init inherited members in %s mode', async (redirect) => {
+    const { init, headers, signal, cf } = inheritedInit(redirect);
+    const { fn, calls } = baseFetch(stubResponse(200));
+    const guarded = egressFetch(['api.example.com'], { fetch: fn });
+
+    await guarded('https://api.example.com/things', init);
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.init).toMatchObject({
+      method: 'POST',
+      body: '{"a":1}',
+      cache: 'no-store',
+      credentials: 'include',
+      redirect,
+    });
+    expect(calls[0]?.init?.headers).toBe(headers);
+    expect(calls[0]?.init?.signal).toBe(signal);
+    expect(calls[0]?.init?.cf).toBe(cf);
+  });
+
+  it('forwards request init inherited members across a 307 redirect', async () => {
+    const { init, headers, signal, cf } = inheritedInit();
+    const { fn, calls } = baseFetch(
+      stubResponse(307, { location: '/retry' }),
+      stubResponse(200),
+    );
+    const guarded = egressFetch(['api.example.com'], { fetch: fn });
+
+    await guarded('https://api.example.com/things', init);
+
+    expect(calls).toHaveLength(2);
+    for (const call of calls) {
+      expect(call.init).toMatchObject({
+        method: 'POST',
+        body: '{"a":1}',
+        cache: 'no-store',
+        credentials: 'include',
+        redirect: 'manual',
+      });
+      expect(call.init?.signal).toBe(signal);
+      expect(call.init?.cf).toBe(cf);
+    }
+    expect(calls[0]?.init?.headers).toBe(headers);
+    expect(hopHeaders(calls[1] as BaseCall).get('content-type')).toBe(
+      'application/json',
+    );
+  });
+
+  it('forwards request init members from a Request', async () => {
+    const request = new Request('https://api.example.com/things', {
+      method: 'POST',
+      headers: { 'x-test': '1' },
+      body: 'payload',
+    });
+    const { fn, calls } = baseFetch(stubResponse(200));
+    const guarded = egressFetch(['api.example.com'], { fetch: fn });
+
+    // Request provides RequestInit members through prototype accessors.
+    await guarded(
+      'https://api.example.com/things',
+      request as unknown as EgressRequestInit,
+    );
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.init?.method).toBe('POST');
+    expect(hopHeaders(calls[0] as BaseCall).get('x-test')).toBe('1');
+    expect(request.body).not.toBeNull();
+    expect(calls[0]?.init?.body).toBe(request.body);
   });
 
   it.each<[string, unknown]>([
