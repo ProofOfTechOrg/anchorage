@@ -306,7 +306,7 @@ describe('createThreadSignalRoutes', () => {
       },
     });
     const response = await routes(request, scopeWith(undefined));
-    expect(response?.status ?? null).toBe(expectedStatus);
+    expect(response === null ? null : response.status).toBe(expectedStatus);
     expect(request.bodyUsed).toBe(bodyUsed);
     expect(serialized).toBe(0);
   });

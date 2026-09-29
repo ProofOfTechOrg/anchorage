@@ -2367,47 +2367,27 @@ async function handleMessage(
   const activeBehavior = activeBehaviorForRun('deliver', durableBlockingRun);
   const activePersistenceForbidden =
     activeBehavior === 'persist' && !options.persistenceAllowed;
-  const memoryAvailable = await options.memoryAvailable();
-  const wasActive =
-    activeThreadRunIdOf(agent, threadId, resourceId) !== undefined;
-  await options.proof?.check();
-  options.proof?.assertActive();
-  const result = agent.sendMessage(message, {
-    threadId,
-    resourceId,
-    ifActive: {
-      behavior: deliverableActiveBehavior(
-        activeBehavior,
-        options.persistenceAllowed,
-      ),
+  const deliveredActiveBehavior = deliverableActiveBehavior(
+    activeBehavior,
+    options.persistenceAllowed,
+  );
+  const sent = await sendWithoutWake(
+    agent,
+    (sendOptions) => agent.sendMessage(message, sendOptions),
+    {
+      threadId,
+      resourceId,
+      ifActive: deliveredActiveBehavior,
+      ifIdle: behavior,
     },
-    ifIdle: { behavior: memoryAvailable ? behavior : 'discard' },
-  });
-  const decision = await result.accepted;
-  if (result.persisted) await result.persisted;
-  if (
-    behavior === 'persist' &&
-    !memoryAvailable &&
-    !(wasActive && activePersistenceForbidden) &&
-    recordValue(decision)?.action === 'discard'
-  ) {
-    return memoryUnavailableResponse();
-  }
-  if (
-    activePersistenceForbidden &&
-    wasActive &&
-    recordValue(decision)?.action === 'discard'
-  ) {
-    return persistenceForbiddenResponse({ capped: false });
-  }
-  if (recordValue(decision)?.action === 'persist' && !memoryAvailable) {
-    return memoryUnavailableResponse();
-  }
-  return json({
-    decision,
-    capped: false,
-    signalId: result.signal.id,
-  });
+    options,
+  );
+  return noWakeResponse(
+    sent,
+    behavior,
+    deliveredActiveBehavior,
+    activePersistenceForbidden,
+  );
 }
 
 async function handleQueue(
@@ -2594,14 +2574,9 @@ async function handleSignal(
   if (behavior === 'persist' && !options.persistenceAllowed) {
     return persistenceForbiddenResponse({ capped: false });
   }
-  const {
-    decision,
-    signal: sent,
-    wasActive,
-    memoryAvailable,
-  } = await sendWithoutWake(
+  const sent = await sendWithoutWake(
     agent,
-    signal,
+    (sendOptions) => agent.sendSignal(signal, sendOptions),
     {
       threadId,
       resourceId,
@@ -2610,6 +2585,21 @@ async function handleSignal(
     },
     options,
   );
+  return noWakeResponse(
+    sent,
+    behavior,
+    deliveredActiveBehavior,
+    activePersistenceForbidden,
+  );
+}
+
+function noWakeResponse(
+  sent: Awaited<ReturnType<typeof sendWithoutWake>>,
+  behavior: Exclude<IdleBehavior, 'wake'>,
+  deliveredActiveBehavior: ActiveBehavior,
+  activePersistenceForbidden: boolean,
+): Response {
+  const { decision, signal, wasActive, memoryAvailable } = sent;
   const action = recordValue(decision)?.action;
   if (action === 'persist' && !memoryAvailable) {
     return memoryUnavailableResponse();
@@ -2630,18 +2620,23 @@ async function handleSignal(
   return json({
     decision,
     capped: false,
-    signalId: sent.id,
+    signalId: signal.id,
   });
 }
 
 /**
- * Send a signal that never wakes a run, behind the proof gate. Without agent
- * memory the idle behavior becomes `discard`, because core's idle persist
- * reports `persist` even when no memory wrote the signal.
+ * Send a signal or message that never wakes a run, behind the proof gate.
+ * Without agent memory the idle behavior becomes `discard`, because core's
+ * idle persist reports `persist` even when no memory wrote the signal.
  */
 async function sendWithoutWake(
   agent: Agent,
-  signal: AgentSignal,
+  send: (sendOptions: {
+    threadId: string;
+    resourceId: string;
+    ifActive: { behavior: ActiveBehavior };
+    ifIdle: { behavior: Exclude<IdleBehavior, 'wake'> };
+  }) => WakeDelivery,
   target: {
     threadId: string;
     resourceId: string;
@@ -2661,7 +2656,7 @@ async function sendWithoutWake(
     undefined;
   await options.proof?.check();
   options.proof?.assertActive();
-  const result = agent.sendSignal(signal, {
+  const result = send({
     threadId: target.threadId,
     resourceId: target.resourceId,
     ifActive: { behavior: target.ifActive },
@@ -3096,7 +3091,7 @@ async function handleOwnerNotification(
     }
     const sent = await sendWithoutWake(
       agent,
-      signal,
+      (sendOptions) => agent.sendSignal(signal, sendOptions),
       { threadId, resourceId, ifActive, ifIdle: 'persist' },
       options,
     );
