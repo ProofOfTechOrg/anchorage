@@ -12,9 +12,8 @@
   "scripts": {
     "build": "pnpm -r build",
     "dev": "pnpm --filter showcase dev",
-    "test": "pnpm run architecture:check && vitest run",
-    "test:watch": "vitest",
-    "test:without-direct-scenario": "pnpm run architecture:check && vitest run --project=!fleet-control-direct-scenario*",
+    "test": "pnpm run architecture:check && vitest run --project=!fleet-control-direct-scenario*",
+    "test:watch": "vitest --project=!fleet-control-direct-scenario*",
     "test:direct-scenario": "vitest run --project=fleet-control-direct-scenario --project=fleet-control-direct-scenario-seams",
     "test:direct-scenario:fast": "vitest run --project=fleet-control-direct-scenario",
     "test:direct-scenario:seams": "vitest run --project=fleet-control-direct-scenario-seams",
@@ -67,12 +66,10 @@
     "publint": "0.3.22",
     "remark-gfm": "4.0.1",
     "remark-parse": "11.0.0",
-    "tree-sitter-bash": "0.25.1",
     "typedoc": "^0.28.19",
     "unified": "11.0.5",
     "unist-util-visit": "5.1.0",
     "vitest": "^4.1.8",
-    "web-tree-sitter": "0.27.0",
     "wrangler": "4.129.0",
     "yaml": "2.9.0"
   },
@@ -83,7 +80,6 @@
   "packageManager": "pnpm@10.34.4",
   "pnpm": {
     "ignoredBuiltDependencies": [
-      "tree-sitter-bash",
       "workerd"
     ],
     "overrides": {

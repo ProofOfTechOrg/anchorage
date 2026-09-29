@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // FlowsafeDurableAgent — drive Mastra's durable-agent loop through the ONE
 // RunnerRuntime chokepoint so every agent leg inherits the substrate's
-// invariants: server-minted runIds, per-leg requestContextForRun grant
-// derivation, snapshot provenance, RunSummary, and retention purge, with no
-// second execution path to audit.
+// invariants.
 //
 // The mechanic was validated against @mastra/core 1.50.0 dist. Every offset in
-// THIS section is 1.50.0-vintage and deliberately kept as the provenance of the
-// original validation; later sections carry their own stamp:
+// THIS section is 1.50.0-vintage and kept as the provenance of the original
+// validation; later sections carry their own stamp:
 // DurableAgent compiles the agent loop to the default-engine workflow
 // 'durable-agentic-loop' (agent/durable index.js: AGENTIC_LOOP :62,
 // getWorkflow() :5936, agent-agnostic — the agent is resolved per run by the
@@ -33,23 +31,29 @@
 // there. The registry copy is read only for the fail-closed, over-require-safe
 // approval pre-check.
 //
-// Host-owned run ids at the boundary: stream()/generate()/prepare() are the
-// THREE inherited minting entry points. Each takes an OPTIONAL runId and, when
-// it is absent, lets core mint an unowned crypto.randomUUID() upstream
+// Host-owned run ids at the boundary: stream()/generate()/prepare() are
+// inherited minting entry points. Each takes an OPTIONAL runId and, when it is
+// absent, lets core mint an unowned crypto.randomUUID() upstream
 // (prepareForDurableExecution, agent/durable index.js:589) that
 // PATH_SAFE_ID_PATTERN then accepts, slipping past executeWorkflow's guard AND
 // RunnerRuntime.start's exact fallback, which the host-owned run-id rule
-// forbids. All three are overridden ONLY to require a caller-minted runId
-// before delegating to super. prepare() also REGISTERS the run under that id
+// forbids. They are overridden ONLY to require a caller-minted runId before
+// delegating to super. prepare() also REGISTERS the run under that id
 // (index.js:5984), so an unguarded prepare() strands an unowned run in the
 // registry. streamUntilIdle() needs no override: it drives agent.stream()
 // (index.js:368), so the stream() guard already covers it.
 //
-// EVERY OTHER inherited entry point that can drive a run — or that hands back
-// runs the caller may not own — is BLOCKED, overridden to throw before it
-// touches storage or the registry. BLOCKED_RUN_ENTRIES below is the single
-// source for which method is refused on which ground; the four grounds are
-// enumerated there.
+// EVERY OTHER inherited entry point whose call can drive a run that would not
+// land on those guarded overrides, or whose call itself discovers run or thread
+// identities without a scope the caller names, is BLOCKED, overridden to throw
+// before it touches storage or the registry. A call that returns the run id of
+// a thread or run the caller names discovers nothing. A call that installs a
+// second execution surface is refused on the fourth ground too. Installing a
+// runtime service after construction is refused on the fifth ground.
+// Direct cancellation outside RunnerRuntime's terminal lifecycle is refused
+// on the sixth.
+// BLOCKED_RUN_ENTRIES below is the single source for which method is refused on
+// which ground; the grounds are enumerated there.
 //
 // Provenance for this section: read from the @mastra/core 1.53.0 dist. Chunk
 // file names are CONTENT-HASHED and move every release, so each offset below is
@@ -68,7 +72,7 @@
 //       reaches it, and the snapshot rows belong to deployment-scoped retention
 //       purge.
 //
-//   (2) Unscoped run DISCOVERY, which returns run/thread/resource ids rather
+//   (2) Unscoped run or thread identity DISCOVERY returns identities rather
 //       than driving anything. listActiveRuns() (chunk-XMEACVLS.js:6927)
 //       enumerates `listWorkflowRuns({ workflowName: 'durable-agentic-loop',
 //       status: 'running' })`, and the Agent-level listSuspendedRuns()
@@ -79,7 +83,9 @@
 //       (:6962-6981 and :49563-49586). Neither consults the host topology's
 //       per-principal run-ownership checks (resourceAccess().owner('run', …)),
 //       so either one hands a caller ids for runs it does not own. Run listing
-//       is the topology's job.
+//       is the topology's job. discoverThreadPeers()
+//       (agent-Dk0N0Nlg.js:38208-38210) likewise enumerates advertised thread
+//       identities on the pub/sub without a caller-named thread or principal.
 //
 //   (3) The resume family, in chunk-XMEACVLS.js: resume() (:6072) and its
 //       funnels resumeStream() (:6650), resumeGenerate() (:6878),
@@ -87,8 +93,7 @@
 //       approveToolCallGenerate() (:6679) / declineToolCallGenerate() (:6683),
 //       plus the new resume(..., { toolCallId }) which only forwards toolCallId
 //       as run.resume's `label` (:6293). None of them MINTS — each takes the
-//       runId from its caller — which is why they were merely unwired before.
-//       1.53.0 changed that: resume() no longer requires a live registry entry,
+//       runId from its caller. 1.53.0 changed what they reach: resume() no longer requires a live registry entry,
 //       and on a miss it loads the persisted snapshot (:6075-6076), rehydrates
 //       via prepare() (:6115) with the full application processor chain, then
 //       re-drives with createRun + run.resume (:6281/:6293) below
@@ -97,16 +102,12 @@
 //       call it.
 //
 // Agent-level surface (offsets in chunk-3S5BFAEP.js at 1.53.0 unless another
-// chunk or file is named). The base `Agent` carries 82 own members
-// DurableAgent does not shadow. Every one of them has been read and
-// dispositioned into exactly one of the three buckets below, and
-// durable-agent-surface.test.ts pins that partition by name the same way it
-// pins the 87-member durable one — so the invariant holds over the WHOLE
-// inherited surface, not just the durable half, and stays holding on a bump.
+// chunk or file is named). The base `Agent` also carries own members
+// DurableAgent does not shadow; durable-agent-surface.test.ts pins their
+// partition by name.
 //
 //   BLOCKED outright, because each is its own execution path:
-//     - listSuspendedRuns() (:49532), the one direct data-returning discovery
-//       member — the discovery ground.
+//     - listSuspendedRuns() (:49532) — the discovery ground.
 //     - the network family: network() (:49263) and resumeNetwork() (:49326)
 //       start and resume THE SAME networkLoop (:32496), which compiles its own
 //       workflow and drives it with `mainWorkflow.createRun` (:32968) +
@@ -124,39 +125,34 @@
 //       every supported entry calls (requireAgentExecutionFGA, defined :48798,
 //       called from generate :49420, stream :49858, resumeStream :50002,
 //       resumeGenerate :50105, and durable stream/resume/generate
-//       chunk-XMEACVLS.js:5918/6158/6718 — seven sites, none of them on the
-//       network or legacy path). It touches no persisted workflow run state, so
-//       it is convicted on minting plus the skipped gate, not on re-drive.
-//     - sendToolApproval() (:50254), which has four exits and only one of them
-//       is the funnel its name suggests. With `messages && approved` it calls
+//       chunk-XMEACVLS.js:5918/6158/6718 — none of them on the network or
+//       legacy path). It touches no persisted workflow run state, so it is
+//       convicted on minting plus the skipped gate, not on re-drive.
+//     - sendToolApproval() (:50254), whose name suggests a funnel. With
+//       `messages && approved` it calls
 //       agentThreadStreamRuntime.continueWithMessages() (:50266), where
 //       `const runId = target.runId ?? randomUUID()` (chunk-P4Y2BJL7.js:6752)
 //       mints and `agent.stream(..., { runId })` (:6720) then starts a run
 //       under that core-minted id — path-safe, so #assertCallerRunId cannot
 //       tell it from a host-minted one. With no active thread run id it calls
-//       this.listSuspendedRuns() (:50287), already blocked. Only its tail
+//       this.listSuspendedRuns() (:50287), which is blocked. Only its tail
 //       reaches this.resumeStream() (:50338) / this.sendStreamResume()
 //       (:50345). The mint is the conviction.
 //
 //   LEFT INHERITED as funnellers, because virtual dispatch already lands them
 //   on an override: resumeStreamUntilIdle() (:49954 -> agent.resumeStream) and
 //   sendStreamResume() (:50212 -> this.resumeStream) reach the BLOCKED
-//   resumeStream. The five signal senders stay inherited because every outcome
-//   they can produce lands on this runner's terminal path; queueMessage has no
-//   remaining thread-route caller but keeps the same containment property.
+//   resumeStream. The signal senders stay inherited because every outcome they
+//   can produce lands on this runner's terminal path; queueMessage keeps the
+//   same containment property.
 //
-//     FlowSafe's queue and state routes, plus persist outcomes from wake routes,
-//     require agent memory and answer `memory-unavailable` without it. Owner
-//     notifications follow core's policy and treat their memory write as
-//     best-effort because the inbox row is already durable. Non-owner
-//     notifications are record-only until the trusted dispatcher delivers them.
-//     Direct sender calls can still reach core's minting sites: the idle wake
+//     Direct sender calls can reach core's minting sites: the idle wake
 //     (:7441), continuation (:6720), completion drain (:6665), and queued-id
 //     drain (:6808), all in chunk-P4Y2BJL7.js.
 //     executeWorkflow therefore treats a missing #startRequesters entry as a
-//     terminal refusal: it preserves the serialized input when memory permits,
-//     except route deliveries marked persistence-forbidden in non-rendered
-//     signal metadata, publishes ERROR, and never calls RunnerRuntime.
+//     terminal refusal: it preserves input by the guarded input chain's
+//     verdict when memory permits, publishes ERROR, and never calls
+//     RunnerRuntime. #persistUnownedInput states the verdict rule.
 //
 //     Core registers thread state only when stream options carry a memory
 //     thread (chunk-P4Y2BJL7.js:6557-6594). For those runs its completion
@@ -170,9 +166,9 @@
 //     cleanup before a synchronous refusal would be safe there. Upstream note:
 //     DurableAgent does not forward the wrapped Agent's `notifications`
 //     configuration, so the wrapper cannot inject a delivery policy.
-//     If both runner publication attempts and core's own fire-and-forget attempt
-//     fail, the terminal output never closes and the thread remains active until
-//     eviction or a new host start.
+//     If the runner's publication attempts and core's own fire-and-forget
+//     attempt fail, the terminal output never closes and the thread remains
+//     active until eviction or a new host start.
 //
 //   LEFT INHERITED as non-execution, on a read of each: the base delegators
 //   resume/recover/listActiveRuns/recoverActiveRuns/prepare (:50497 onward) are
@@ -180,55 +176,49 @@
 //   this instance; `observe` is likewise shadowed by DurableAgent but is NOT
 //   overridden and must not be — it only reattaches to a run's pubsub replay,
 //   and resumeViaRuntime() calls this.observe() itself after rehydration;
-//   `durable` (:44568) is a field accessor; subscribeToThread() (:49500) and
-//   getActiveThreadRunId() (:49507) read only the in-process pubsub registry,
-//   never storage; abortThreadStream() (:49600) and abortRunStream() (:49603)
-//   can stop a stream but not drive one; and genTitle() (:46377) /
-//   generateTitleFromUserMessage() (:46296) call `llm.stream`/`llm.__text` with
-//   no tools, no run id and no run state.
+//   `durable` (:44568) is a field accessor; getActiveThreadRunId() (:49507)
+//   reads only the in-process pubsub registry, never storage;
+//   genTitle() (:46377) and generateTitleFromUserMessage() (:46296) call
+//   `llm.stream`/`llm.__text` with no tools.
 //
-// Two residuals remain outside this class's reach rather than overlooked.
-// Mastra.restartAllActiveWorkflowRuns() is Mastra-level, not an agent member —
+// Residuals outside this class's reach include:
+// Mastra.restartAllActiveWorkflowRuns() belongs to Mastra, not an agent —
 // nothing here calls it, and it would hit core's processor-rebuild fallback if
 // a host did. getLegacyHandler() (:45595) is TS-private but runtime-public and
-// returns the very handler the legacy pair refuses; that is the same class of
-// caveat as getWorkflow() returning a startable object, and reaching it takes a
-// deliberate private cast, which is a first-party act.
+// returns the very handler the legacy entries refuse; that is the same class
+// of caveat as getWorkflow() returning a startable object, and reaching it
+// takes a deliberate private cast, which is a first-party act.
 //
-// Corroboration: breakwater's guarded handle reaches the same verdict on the
-// network four (network, resumeNetwork, approveNetworkToolCall,
-// declineNetworkToolCall), the legacy pair (generateLegacy, streamLegacy) and
-// sendToolApproval, which it files `intentionallyUnavailable`
-// (packages/breakwater/src/agent/agent.test.ts). It diverges on
-// listSuspendedRuns, which it files under `explicitlyNonExecution` — the same
-// divergence as listActiveRuns, and for the same reason: a narrowed HANDLE can
-// only omit, so a data-returning member is harmless there, while an INSTANCE
-// Mastra calls in-process must throw. The two members blocked below diverge the
-// same way; each entry records it.
+// Corroboration: breakwater's guarded handle inventory
+// (packages/breakwater/src/agent/agent.test.ts) classifies the same Agent
+// members for a narrowed HANDLE. A handle can only omit, so a data-returning
+// member or a setter is harmless there, while an INSTANCE Mastra calls
+// in-process must throw; the inventories can file a member differently for
+// that reason.
 //
-// Two more Agent-level members are blocked. Read from the @mastra/core 1.67.0
-// dist, the declared peer; offsets here are 1.67.0-vintage, in
-// agent-Dk0N0Nlg.js unless another file is named, and the 1.53.0 offsets above
-// are left as the provenance of that read. The peer carries both members, so
-// each refusal shadows a real implementation.
+// The Agent-level members below are blocked as well. Read from the
+// @mastra/core 1.67.0 dist, the declared peer; offsets here are 1.67.0-vintage,
+// in agent-Dk0N0Nlg.js unless another file is named, and the 1.53.0 offsets
+// above are left as the provenance of that read. The peer carries each of
+// them, so each refusal shadows a real implementation.
 //
 //   - listActiveThreadRuns() (:38214) is the discovery ground one scope wider
 //     than listActiveRuns. It takes no arguments and returns `{ runId,
 //     resourceId, threadId }` for every thread on the pubsub instance with a run
 //     in flight (storage-MbGlKLkB.js:1011-1023), and that state is keyed by
 //     pubsub instance rather than by agent (`#statesByPubSub`, :150, read through
-//     #getState :294), so it narrows by neither principal nor agent where the two
+//     #getState :294), so it narrows by neither principal nor agent where the
 //     listings above at least narrow by agentId. The in-process sibling
 //     getActiveThreadRunId() stays non-execution because it makes the caller name
 //     the (resourceId, threadId) pair: it confirms where this enumerates.
-//     Breakwater files it `explicitlyNonExecution` (agent.test.ts) for the reason
-//     it files listActiveRuns there: a narrowed HANDLE can only omit, so a
-//     data-returning member is harmless there, while an INSTANCE Mastra calls
-//     in-process must throw. Cost, stated rather than left to be rediscovered:
-//     core's AgentController aggregates this member across its backing agents
-//     (agent-controller-CKgKFyMR.js:5722-5725), so that aggregation now throws.
-//     It is already unusable over this class — the same controller calls the
-//     blocked sendToolApproval() at :4089 and :4118.
+//     Cost, stated rather than left to be rediscovered: core's AgentController
+//     aggregates this member across its backing agents
+//     (agent-controller-CKgKFyMR.js:5722-5725), so that aggregation throws. The
+//     controller installs configured memory or pub/sub when the agent lacks its
+//     own (agent-controller-CKgKFyMR.js:5618-5622), reaching the refused
+//     __setMemory() or __setPubSub(). When it installs neither, init() still
+//     reaches the refused __setMastra() through Mastra.addAgent(). It also calls
+//     the blocked sendToolApproval() at :4089 and :4118.
 //   - __setThreadRuntimeAgent() (:33609) installs another agent as the target
 //     the thread-runtime paths resolve through #getThreadRuntimeAgent()
 //     (:33612, `this.#threadRuntimeAgent ?? this`); the refusal in
@@ -237,33 +227,56 @@
 //     the containment those inherited members rely on IS virtual dispatch on
 //     `this`, so one call moves every run those paths start onto an agent
 //     carrying none of these overrides — no caller-minted runId assertion, no
-//     executeWorkflow, no #startRequesters backstop. subscribeToThread drives no
-//     run of its own; the field moves its replay target all the same. It is
-//     public in the type surface (agent.d.ts:229 declares it with no modifier),
-//     so unlike getLegacyHandler it takes no private cast.
-//     Breakwater files it `explicitlyNonExecution` (agent.test.ts) for the
-//     reason it files the listings there: a narrowed HANDLE can only omit, so
-//     a setter is harmless there, while an INSTANCE Mastra calls in-process
-//     must throw.
+//     executeWorkflow, no #startRequesters backstop. The field also moves
+//     subscribeToThread's replay target. It is public in the type surface
+//     (agent.d.ts:229 declares it with no modifier), so unlike getLegacyHandler
+//     it takes no private cast.
+// The DurableAgent-level members below are blocked too. Read from the
+// @mastra/core 1.67.0 dist; offsets here are 1.67.0-vintage, in
+// create-durable-agent-DFHwqN2K.js unless another file is named.
 //
-// Both carry the `override` keyword, like every other refusal in this class:
-// the declared peer declares both members, so the keyword holds each refusal to
-// a base that exists and fails the typecheck if a future core drops one. Each
-// signature satisfies the base it shadows on that base's own terms; the caveat
-// on each member says how.
+//   - setChannels() (:6408) and __setDeclaredSchedules() (:6240) forward what
+//     they are given to the wrapped agent. Channels make that agent their
+//     dispatch target (agent-Dk0N0Nlg.js:33791-33796), so a plain AgentChannels
+//     delivers inbound messages to its sendMessage, and channel approvals and
+//     declines to its approveToolCall and declineToolCall (agent-Dk0N0Nlg.js
+//     :21002, :21031, :21045). The schedule worker of a Mastra that registers
+//     the wrapped agent and runs startWorkers() (mastra-CCeMcPkn.js:4525-4589)
+//     resolves each declared schedule's agent by id and fires it through that
+//     agent's sendSignal or generate (worker-CemmWBp9.js:167, :319, :448). Both
+//     run the wrapped agent outside RunnerRuntime, so each call is the fourth
+//     ground by installation, as __setThreadRuntimeAgent() is.
+//   - __setMemory() and __setPubSub() (:6414-6421) install and forward services
+//     to the wrapped agent. AgentController reaches them under the conditions
+//     above (agent-controller-CKgKFyMR.js:5618-5622); a parent with pub/sub
+//     also reaches __setPubSub() when the wrapped agent has no pub/sub of its
+//     own (agent-Dk0N0Nlg.js:34105).
+//   - abortRunStream() and abortThreadStream() (:6565-6601) cancel outside the
+//     terminate route's ownership and settlement checks.
+//   - __setMastra() (:7922) forwards to __registerMastra() (:7934), which sets
+//     this wrapper's Mastra and the wrapped agent's (:7934-7939). Every later
+//     leg is prepared against that Mastra: core hands it to
+//     prepareForDurableExecution (:6693, :7362, :7882), and so does
+//     #rehydrateRegistry. Mastra.addAgent calls __setMastra()
+//     (mastra-CCeMcPkn.js:1674) and then adds getDurableWorkflows() to its own
+//     registry (:1689-1692); once the runtime has built its own Mastra, that
+//     repoints the runtime's loop workflow, and with it run state, to the
+//     other Mastra's storage. Agent.listAgents calls
+//     __registerMastra() on each static sub-agent (agent-Dk0N0Nlg.js:34104).
+//     A parent with pub/sub also calls __setPubSub() on a static sub-agent
+//     without its own pub/sub (:34105), even when it has no Mastra. These are
+//     the fifth ground. The refusal throws from addAgent before its registry
+//     write and before it repoints the loop.
 //
-// Blocking them keeps the single-resume and no-capability guarantees true by
-// construction: resumeViaRuntime() is the ONLY way a run resumes.
-// ApprovalService.decide -> the host's ResumeRunFn ->
-// createAgentApprovalResumer, which hands every 'durable-agentic-loop' record to
-// the thread topology's resume (-> resumeViaRuntime -> runtime.resume) and
-// refuses one carrying no agent-thread target rather than falling through to the
-// generic resumer; grants are derived on the (suspendedAt, resumeCount)
-// fingerprint there. Blocking does not un-brand the agent — DurableAgentLike
-// duck-types on `recover`/`recoverActiveRuns` merely BEING functions
-// (agent-Dk0N0Nlg.js:272), which the overrides still are. The surface tripwire in
-// durable-agent-surface.test.ts requires every DurableAgent prototype member to
-// stay classified, so a future peer bump surfaces whatever it adds.
+// Each carries the `override` keyword: the declared peer declares the member,
+// so the keyword holds the refusal to a base that exists and fails the
+// typecheck if a future core drops it. Each signature satisfies the base it
+// shadows on that base's own terms.
+//
+// The runner's resume path is resumeViaRuntime(). Blocking does not un-brand
+// the agent — DurableAgentLike duck-types on `recover`/`recoverActiveRuns`
+// merely BEING functions (agent-Dk0N0Nlg.js:272), which the overrides still
+// are.
 //
 // Live-isolate scope: the loop resolves the tool's execute closure from the
 // in-process globalRunRegistry (populated by stream()). A DO holds one run in
@@ -276,9 +289,14 @@
 import {
   type Agent,
   type AgentExecutionOptions,
+  type CreatedAgentSignal,
+  isCreatedAgentSignal,
+  isDurableAgentLike,
   isMastraSignalMessage,
+  isTransientSignalMessage,
   MessageList,
   mastraDBMessageToSignal,
+  signalToMastraDBMessage,
   type ToolsInput,
 } from '@mastra/core/agent';
 import {
@@ -289,6 +307,7 @@ import {
   globalRunRegistry,
   prepareForDurableExecution,
 } from '@mastra/core/agent/durable';
+import type { MastraDBMessage } from '@mastra/core/agent/message-list';
 import type { Mastra } from '@mastra/core/mastra';
 import type { RequestContext } from '@mastra/core/request-context';
 import type { AnyWorkflow } from '@mastra/core/workflows';
@@ -374,14 +393,14 @@ const UNREGISTERED_RUN_REFUSAL_PREFIX =
 
 /**
  * @internal Metadata key that prevents a route delivery from being terminally
- * persisted. Deliberately deep-imported by `signals/thread-do-routes.ts` and
- * kept off `./index.js`.
+ * persisted. Kept off `./index.js`.
  */
 export const FLOWSAFE_PERSISTENCE_FORBIDDEN = 'flowsafe.persistence-forbidden';
 
 const BREAKWATER_GUARDED_AGENT_HOST_PROTOCOL = Symbol.for(
   '@proofoftech/breakwater/guarded-agent-host/v1',
 );
+const BREAKWATER_RBAC_PROCESSOR_ID = 'breakwater-rbac';
 
 interface BreakwaterGuardedAgentHostProtocol {
   readonly version: 1;
@@ -525,7 +544,7 @@ function snapshotDurableCallOptions<T extends object>(
   return Object.freeze(snapshot) as T;
 }
 
-/** @internal Shared with the guarded agent catalog's compatibility check. */
+/** @internal */
 export function breakwaterGuardedAgentHostProtocol(
   agent: unknown,
 ): BreakwaterGuardedAgentHostProtocol | undefined {
@@ -551,27 +570,48 @@ export function breakwaterGuardedAgentHostProtocol(
 }
 
 /**
- * Why every member of the resume family is refused. Homed once: the seven
+ * @internal Why the runner refuses to wrap `agent`, or `undefined` when it
+ * accepts it.
+ */
+export function unwrappableAgentReason(
+  agent: Pick<Agent, 'durable' | 'getChannels' | 'getDeclaredSchedules'>,
+): string | undefined {
+  if (agent.durable) {
+    return "sets the 'durable' option: a Mastra that registers it wraps it in its own DurableAgent, whose loop, recovery and run listing run outside RunnerRuntime";
+  }
+  if (isDurableAgentLike(agent)) {
+    return 'is already a durable agent: the runtime registers the agent it wraps on its own Mastra, where a Mastra DurableAgent brings recovery and run listing outside RunnerRuntime and a FlowsafeDurableAgent refuses to register; wrap the plain Agent instead';
+  }
+  if (agent.getChannels() != null) {
+    return 'has channels configured: Mastra dispatches their inbound messages and tool approvals to that agent outside RunnerRuntime';
+  }
+  if (agent.getDeclaredSchedules().length > 0) {
+    return 'declares schedules: the schedule worker of a Mastra that registers that agent fires them on it outside RunnerRuntime';
+  }
+  return undefined;
+}
+
+/**
+ * Why every member of the resume family is refused. Homed once: the family's
  * entry points are one code path (resumeStream/resumeGenerate/the approve and
  * decline pairs all funnel into resume()), so one sentence must not drift into
- * seven.
+ * a copy per entry point.
  */
 const RESUME_FAMILY_REASON =
   "on a run-registry miss the inherited path rehydrates from persisted snapshot storage and re-drives with createRun + run.resume outside RunnerRuntime, bypassing the approval-decision path's grant derivation and the fail-closed registry rehydration";
 
 /**
- * Why the four network entry points are refused. Homed once: `network()` starts
- * and `resumeNetwork()` resumes THE SAME networkLoop, and the approve/decline
- * pair are one-line forwards to `resumeNetwork()`, so one sentence must not
- * drift into four.
+ * Why the network entry points are refused. Homed once: `network()` starts and
+ * `resumeNetwork()` resumes THE SAME networkLoop, and the approve/decline pair
+ * are one-line forwards to `resumeNetwork()`, so one sentence must not drift
+ * into a copy per entry point.
  */
 const NETWORK_FAMILY_REASON =
   'the multi-agent network loop compiles its own workflow and drives it with createRun plus run.stream/run.resumeStream on the default engine, outside RunnerRuntime, so no leg is run-owned, grant-derived or snapshot-provenanced — and under autoResumeSuspendedTools it additionally recovers a suspended run id from thread memory and re-drives that run';
 
 /**
- * Why both legacy execution entry points are refused. Homed once: each is a
- * one-line forward into the SAME AgentLegacyHandler, so they are one code path
- * wearing two names.
+ * Why the legacy execution entry points are refused. Homed once: each is a
+ * one-line forward into the SAME AgentLegacyHandler, so they are one code path.
  */
 const LEGACY_FAMILY_REASON =
   "the AI SDK v4 legacy handler is a second execution surface that converts and runs the agent's tools outside RunnerRuntime, mints its own run id when the caller omits one, and skips the authorization gate every supported entry calls (requireAgentExecutionFGA)";
@@ -585,30 +625,45 @@ const THREAD_TOOL_APPROVAL_REASON =
   'the messages-plus-approved branch does not resume at all: it hands the thread runtime a continuation whose run id falls back to randomUUID() when the caller names none, then starts a run under that id — path-safe, so the host-owned run-id guard cannot tell it from a caller-minted one — and its no-active-run branch reaches the equally unscoped suspended-run discovery';
 
 /**
- * Why each blocked entry point is refused, keyed by method name. The SINGLE
- * source: every override throws `unavailableRunEntry(name,
- * BLOCKED_RUN_ENTRIES[name])`, and durable-agent-surface.test.ts derives both
- * its blocked-member partition and its per-method message assertions from these
- * keys — so a new blocked entry cannot ship with an unexercised refusal, and a
- * reason cannot drift between the throw and the test.
+ * Why binding the wrapper to a Mastra is refused. Homed once: `__setMastra()`
+ * forwards to `__registerMastra()`, so the two are one code path.
+ */
+const MASTRA_BINDING_REASON =
+  "it binds the runner and its wrapped agent to a Mastra the runtime did not build, so every later leg is prepared against that Mastra; registered through Mastra.addAgent once the runtime has built its own Mastra, it also repoints the runtime's loop workflow, and with it run state, to that Mastra's storage";
+/**
+ * Why service setters are refused. Homed once: both install after construction
+ * and forward their service to the wrapped agent.
+ */
+const INSTALLED_SERVICE_REASON =
+  "it installs memory or pub/sub after construction and forwards it to the wrapped agent; the wrapper's pub/sub is fixed at construction because thread state, signal delivery and the run's drain share it";
+/**
+ * Why direct aborts are refused. Homed once: both bypass the terminate route's
+ * ownership and disputed-settlement checks.
+ */
+const DIRECT_ABORT_REASON =
+  "a direct abort bypasses the terminate route's ownership check and disputed-settlement refusal, stops running tools, and can reach another thread's run in the isolate through core's global run registry; cancel through the terminate route";
+
+/**
+ * Why each blocked entry point is refused, keyed by method name: the SINGLE
+ * source of those reasons.
  *
- * Four grounds. The module comment walks the same members by PROVENANCE
- * section (the durable surface, then the Agent surface) rather than by ground,
- * so its numbering is not this list's:
+ * The grounds:
  *  1. re-drives a persisted run below `executeWorkflow`, where there is no
  *     RunnerRuntime — no run ownership, no per-leg grant, no snapshot
  *     provenance;
- *  2. unscoped run discovery that bypasses the host topology's per-principal
- *     run-ownership checks and returns ids the caller does not own;
+ *  2. unscoped run or thread identity discovery that bypasses the host
+ *     topology's per-principal ownership checks and returns identities the
+ *     caller does not own;
  *  3. snapshot deletion owned by deployment-scoped retention;
- *  4. a SECOND execution surface that runs the agent outside RunnerRuntime
- *     entirely, or that mints a run id below the caller — the network loop's
- *     own workflow, the legacy handler, the thread runtime's tool-approval
- *     continuation, and the setter that installs a different agent as the
- *     thread runtime's execution target.
+ *  4. a SECOND execution surface outside RunnerRuntime, whether the call runs
+ *     it or installs something that later does, or that mints a run id below
+ *     the caller;
+ *  5. installs a runtime service — a Mastra, memory or pub/sub — after
+ *     construction;
+ *  6. cancels a run outside RunnerRuntime's terminal lifecycle.
  *
- * Deliberately NOT re-exported from `./index.js` (a named-exports-only barrel),
- * so this stays off the public `@proofoftech/flowsafe/agent-runner` subpath.
+ * NOT re-exported from `./index.js` (a named-exports-only barrel), so this
+ * stays off the public `@proofoftech/flowsafe/agent-runner` subpath.
  */
 export const BLOCKED_RUN_ENTRIES = {
   recover:
@@ -628,6 +683,8 @@ export const BLOCKED_RUN_ENTRIES = {
     "core scopes the suspended-run listing by agentId plus the caller's own optional thread and resource ids, never by per-principal ownership, so it bypasses the host topology's run-ownership checks and returns run, thread and resource ids the caller does not own",
   listActiveThreadRuns:
     'core scopes the active thread-run listing by nothing at all: it takes no arguments and returns the run, thread and resource ids of every thread on the pubsub instance with a run in flight, which core keys by pubsub instance rather than by agent, so it enumerates ids across every principal AND every agent that shares the instance',
+  discoverThreadPeers:
+    'it takes no caller-named thread or principal and returns the agent, resource, thread and source identities every peer on the pub/sub advertises',
   deleteRunSnapshots:
     'durable-agent snapshot rows are retained until deployment-scoped retention purge removes them',
   network: `${NETWORK_FAMILY_REASON}, and it mints an unowned run id when the caller omits one`,
@@ -639,22 +696,29 @@ export const BLOCKED_RUN_ENTRIES = {
   sendToolApproval: THREAD_TOOL_APPROVAL_REASON,
   __setThreadRuntimeAgent:
     "it installs the agent the thread-runtime paths resolve their target through — on @mastra/core 1.67.0 these are subscribeToThread, claimThreadOwnership, sendMessage, queueMessage, sendStateSignal, sendNotificationSignal and sendSignal, which read the field it writes — so one call moves every run those paths start, and subscribeToThread's replay target with them, onto an agent that carries none of this class's overrides: no caller-minted run id, no executeWorkflow, and no terminal refusal for a run the host start seam never registered",
+  setChannels:
+    "it forwards the channels it is given to the wrapped agent, which becomes their dispatch target, so a plain AgentChannels delivers inbound messages to the wrapped agent's sendMessage, and channel approvals and declines to its approveToolCall and declineToolCall, outside RunnerRuntime; an AgentControllerChannels dispatches through its controller instead, and is refused as well because a controller over this class cannot install its runtime services or register this wrapper on its Mastra",
+  __setDeclaredSchedules:
+    "it forwards the schedules it is given to the wrapped agent, and the schedule worker of a Mastra that registers that agent and runs startWorkers() fires each of them through the wrapped agent's sendSignal or generate, outside RunnerRuntime",
+  __setMastra: MASTRA_BINDING_REASON,
+  __registerMastra: MASTRA_BINDING_REASON,
+  __setMemory: INSTALLED_SERVICE_REASON,
+  __setPubSub: INSTALLED_SERVICE_REASON,
+  abortRunStream: DIRECT_ABORT_REASON,
+  abortThreadStream: DIRECT_ABORT_REASON,
 } as const;
 
 /**
- * The refusal every blocked run entry point throws. A plain `Error`, not
+ * The refusal for a blocked run entry point. A plain `Error`, not
  * {@link InvalidRunRequestError}: that class means "the client's run request is
- * malformed" (runtime.ts homes the convention — client input is an
- * InvalidRunRequestError, a developer-controlled mistake is a plain Error), and
- * calling one of these is neither a run request nor recoverable by fixing an
- * argument. Same voice as #rehydrateRegistry's fail-closed throw. The message
- * names WHAT is refused and WHY, and carries no run data — the discovery
+ * malformed", and calling one of these is neither a run request nor
+ * recoverable by fixing an argument. The message names WHAT is refused and WHY, and carries no run data — the discovery
  * entries have none to carry, and the others must not echo an id the caller may
  * not own into its log.
  */
 function unavailableRunEntry(method: string, why: string): Error {
   return new Error(
-    `FlowsafeDurableAgent.${method}() is unavailable: ${why} — the durable-agentic-loop runs only through RunnerRuntime (executeWorkflow), and resume flows only through the approval-decision path (resumeViaRuntime)`,
+    `FlowsafeDurableAgent.${method}() is unavailable: ${why} — this wrapper starts runs through RunnerRuntime from the host start seam (streamUntilPersisted) and resumes them through the approval-decision path (resumeViaRuntime)`,
   );
 }
 
@@ -663,18 +727,18 @@ function bindThreadCompletion<T extends object>(
   completion: Promise<void>,
 ): T {
   return new Proxy(output, {
-    get(target, property, receiver) {
+    get(target, property) {
+      // Core's output getters read private fields, which a proxy receiver lacks.
+      const value = Reflect.get(target, property, target);
       if (property === '_waitUntilFinished') {
-        const wait = Reflect.get(target, property, target);
         return () =>
-          typeof wait === 'function'
+          typeof value === 'function'
             ? Promise.race([
-                Promise.resolve(wait.call(target) as unknown),
+                Promise.resolve(value.call(target) as unknown),
                 completion,
               ])
             : completion;
       }
-      const value = Reflect.get(target, property, receiver);
       return typeof value === 'function' ? value.bind(target) : value;
     },
   });
@@ -682,13 +746,7 @@ function bindThreadCompletion<T extends object>(
 
 /**
  * Brand marking an agent as runtime-driven. The thread Durable Object requires
- * it before its message, signal, schedule, or notification-dispatch wake seam
- * may start a run. Queue and state persist rather than wake on idle. Non-owner
- * notifications are recorded for the trusted dispatcher and never send a
- * signal directly. An unbranded agent reports
- * `degraded: 'not-runtime-driven'` on state and owner-notification responses
- * that reach the sender, regardless of thread state. Skipped state and
- * `memory-unavailable` responses return earlier and carry no marker.
+ * it before a wake seam may start a run.
  *
  * Direct core sender calls that mint a run still reach the durable runner,
  * which fails them terminally without executing. Structural so a test double
@@ -736,17 +794,19 @@ export interface FlowsafeDurableAgentOptions<
   /** Resumable-stream cache — see createDurableAgent's `cache`. */
   cache?: DurableAgentConfig<TAgentId, TTools, TOutput>['cache'];
   /**
-   * PubSub for the agent's own stream events (observe()/onChunk). DEFAULTS to
-   * `runtime.pubsub` (the host Durable Object's single identity) when omitted, so the
-   * run's events and the agent's observe()/emitError feed agree without the host
-   * wiring it twice — a mismatched pubsub would leave observe() replaying an
-   * empty feed. Pass an explicit instance only to override that default.
+   * Stream and agent-level pub/sub. Uses `pubsub ?? runtime.pubsub`, or the
+   * wrapper's stream bus when both are absent. Thread state, signal delivery,
+   * and the run's drain share this identity. Construction refuses a wrapped
+   * agent with a different pub/sub of its own. The wrapped agent's pub/sub
+   * follows the last wrapper constructed over it.
    */
   pubsub?: DurableAgentConfig<TAgentId, TTools, TOutput>['pubsub'];
   /**
-   * Public Mastra thread runtime (`mastra.agentThreadStreamRuntime`). When
-   * present, started and rehydrated outputs are registered on the same pubsub
-   * identity so active-thread signals join the durable loop.
+   * Public Mastra thread runtime (`mastra.agentThreadStreamRuntime`). Core
+   * registers started runs itself. When present, a run resumed through
+   * `resumeViaRuntime()` registers on the agent's pub/sub so active-thread
+   * signals join it. Without it, resumed runs are absent from thread state and
+   * signals sent while they run are not delivered into them.
    */
   threadRuntime?: Mastra['agentThreadStreamRuntime'];
   /** Max steps for the agentic loop (bakes into the shared loop's isTaskComplete step). */
@@ -786,9 +846,7 @@ export class FlowsafeDurableAgent<
   /**
    * runId -> the reservation key the thread topology took for this start, so
    * `executeWorkflow` can hand it to `RunnerRuntime.start` for the execution
-   * fence's proof-only match. Same lifetime and same cleanup as the attempt
-   * token beside it: registered by `streamUntilPersisted`, dropped in its
-   * `finally`, so nothing outlives the start it belongs to.
+   * fence's proof-only match.
    */
   readonly #startIdempotencyKeys = new Map<string, string>();
   readonly #startAuthorities = new Map<string, AgentStartAuthority>();
@@ -798,27 +856,41 @@ export class FlowsafeDurableAgent<
   >();
   // The host's exact options object receives one private, single-use re-entry ticket.
   readonly #hostStreamTickets = new WeakSet<object>();
+  // The created signal of a start with neither a host ticket nor a request
+  // context, the options a drain inherits from a run resumeViaRuntime()
+  // registered. An RBAC refusal removes that signal from the prepared message
+  // list, so executeWorkflow preserves it from this capture.
+  readonly #replayedSignals = new Map<string, CreatedAgentSignal>();
 
   constructor(options: FlowsafeDurableAgentOptions<TAgentId, TTools, TOutput>) {
+    const refusal = unwrappableAgentReason(options.agent);
+    if (refusal !== undefined) {
+      throw new TypeError(`FlowsafeDurableAgent: the wrapped agent ${refusal}`);
+    }
+    const pubsub = options.pubsub ?? options.runtime.pubsub;
+    // The run's drain reads the wrapped agent's pub/sub, where an own pub/sub
+    // wins over the one this wrapper installs.
+    if (options.agent.hasOwnPubSub() && options.agent.getPubSub() !== pubsub) {
+      throw new TypeError(
+        "FlowsafeDurableAgent: the wrapped agent has its own pub/sub, which differs from the one the wrapper uses; signal delivery and the run's drain must read the same pub/sub",
+      );
+    }
     const guardedProtocol = breakwaterGuardedAgentHostProtocol(options.agent);
     super({
       agent: options.agent,
       id: options.id,
       name: options.name,
       cache: options.cache,
-      // Default the agent's own stream pubsub to the runtime's identity (ONE
-      // feed per DO), so a host that configures only init()'s pubsub still
-      // gets observe()/emitError aligned with the run's events (the run is driven
-      // through the runtime, which publishes on THAT identity). An explicit
-      // pubsub wins; both-absent falls to core's per-agent default (poll-only,
-      // byte-identical to before this seam existed).
-      pubsub: options.pubsub ?? options.runtime.pubsub,
+      pubsub,
       maxSteps: options.maxSteps,
     });
     this.#runtime = options.runtime;
     this.#wrappedAgent = options.agent;
     this.#isBreakwaterGuardedAgent = guardedProtocol !== undefined;
     this.#threadRuntime = options.threadRuntime;
+    // Core keys thread state and signal delivery on the agent-level pub/sub;
+    // its stream pub/sub option leaves that identity unset for the run's drain.
+    super.__setPubSub(pubsub ?? this.pubsub);
   }
 
   /**
@@ -829,12 +901,10 @@ export class FlowsafeDurableAgent<
    * wrapper forbids — and hands it to `executeWorkflow` BELOW this class's own
    * guard, where a bare UUID is already indistinguishable from a legitimately
    * caller-minted one. So the guard must ALSO fire HERE, before
-   * `super.stream()/generate()/prepare()`, while "absent" is still visible. Same
-   * posture as `RunnerRuntime.start`
-   * (typeof + PATH_SAFE_ID_PATTERN, NO generation fallback); the `typeof` check
-   * is load-bearing because `RegExp.test` coerces its argument to a string, so a
+   * `super.stream()/generate()/prepare()`, while "absent" is still visible. The
+   * `typeof` check is load-bearing because `RegExp.test` coerces its argument to a string, so a
    * numeric runId would pass the pattern yet key a run by the number. Homed once
-   * and shared by the four call sites below so the rule cannot drift within this
+   * and shared by the call sites below so the rule cannot drift within this
    * class.
    */
   #assertCallerRunId(runId: unknown): asserts runId is string {
@@ -850,8 +920,8 @@ export class FlowsafeDurableAgent<
    * `#startRequesters` alone is insufficient because `streamUntilPersisted()`
    * removes it after the first summary while a suspended stream stays live.
    * The internal registry has no TTL, so it also covers long suspensions after
-   * the global registry's ten-minute TTL expires.
-   * The one exemption is the host's own first start: `streamUntilPersisted()`
+   * the global registry's TTL expires.
+   * It exempts the host's own first start: `streamUntilPersisted()`
    * stamps its exact options object with a single-use ticket that `stream()`
    * consumes. A private `WeakSet`, a locally constructed object, and first-use
    * consumption make that exemption unavailable to callers.
@@ -908,20 +978,21 @@ export class FlowsafeDurableAgent<
     this.#assertCallerRunId(callOptions?.runId);
     if (!hostStreamTicket) this.#assertRunIdNotLive(callOptions.runId);
     this.#assertGuardedStructuredOutput(callOptions);
-    const result = await super.stream(messages, callOptions);
-    if (!callOptions?.untilIdle) {
-      await this.#threadRuntime?.registerRun(
-        this as unknown as Parameters<
-          Mastra['agentThreadStreamRuntime']['registerRun']
-        >[0],
-        result.output,
-        (callOptions ?? {}) as Parameters<
-          Mastra['agentThreadStreamRuntime']['registerRun']
-        >[2],
-        this.pubsub,
-      );
+    let capturedSignal = false;
+    if (
+      !hostStreamTicket &&
+      callOptions.requestContext === undefined &&
+      isCreatedAgentSignal(messages)
+    ) {
+      this.#replayedSignals.set(callOptions.runId, messages);
+      capturedSignal = true;
     }
-    return result;
+    try {
+      return await super.stream(messages, callOptions);
+    } catch (error) {
+      if (capturedSignal) this.#replayedSignals.delete(callOptions.runId);
+      throw error;
+    }
   }
 
   /**
@@ -949,12 +1020,11 @@ export class FlowsafeDurableAgent<
     /**
      * The idempotency key the thread topology already RESERVED for this run.
      *
-     * It travels down here for one job: the execution fence's proof-only state
+     * It travels down here because the execution fence's proof-only state
      * admits exactly the start whose key matches its nominated proof key, and
      * `RunnerRuntime.start` is where that comparison happens. It buys no
      * exactly-once property at this layer — the reservation above already did —
-     * so nothing here validates it beyond passing it on, and a run started
-     * without one behaves exactly as before.
+     * so nothing here validates it beyond passing it on.
      *
      * Parked per-runId beside the attempt token rather than threaded through
      * core, because core owns the call between `stream()` and
@@ -1089,7 +1159,7 @@ export class FlowsafeDurableAgent<
   /**
    * The same host-owned run-ID guard as {@link FlowsafeDurableAgent.stream}.
    * `prepare()`
-   * is the third inherited minting entry point: it forwards `options?.runId` into
+   * is an inherited minting entry point: it forwards `options?.runId` into
    * core's `prepareForDurableExecution` (create-durable-agent-DFHwqN2K.js:7882),
    * which mints an unowned `crypto.randomUUID()` when it is absent
    * (create-durable-agent-DFHwqN2K.js:1211) AND REGISTERS a run under that id
@@ -1097,8 +1167,7 @@ export class FlowsafeDurableAgent<
    * `resume(runId)`/`executeWorkflow` sees a bare UUID `PATH_SAFE_ID_PATTERN`
    * already accepts, past every downstream guard. Enforce the caller-minted ID
    * here, while "absent" is still visible. A prepared id remains live until core
-   * cleans up the run, so later `stream()`, `generate()`, `prepare()`, and
-   * `streamUntilPersisted()` calls carrying that id are refused.
+   * cleans up the run.
    */
   override async prepare(
     messages: Parameters<DurableAgent<TAgentId, TTools, TOutput>['prepare']>[0],
@@ -1134,9 +1203,9 @@ export class FlowsafeDurableAgent<
    * Refuse core's bulk recovery. `recoverActiveRuns()` is
    * {@link FlowsafeDurableAgent.listActiveRuns} plus a `recover()` per row, and
    * it is what `Mastra.recoverAllDurableAgents()` calls on every registered
-   * durable agent — so this is the one blocked entry point a host can reach
-   * without a FlowSafe call site, by opting into `recovery: { durableAgents:
-   * 'auto' }`. That loop isolates each agent in its own try/catch, so this
+   * durable agent — so a host reaches this blocked entry point without a
+   * FlowSafe call site by opting into `recovery: { durableAgents: 'auto' }`.
+   * That loop isolates each agent in its own try/catch, so this
    * refusal is logged there rather than failing boot. Refuse with an explicit
    * `runId` too: a single target is still a re-drive off RunnerRuntime.
    */
@@ -1180,10 +1249,7 @@ export class FlowsafeDurableAgent<
    * — and narrows by `agentId` plus the optional `threadId`/`resourceId`
    * filters the CALLER supplies, the same scoping `listActiveRuns()` applies.
    * Same ground too: an unfiltered call returns run, thread and resource ids
-   * across every principal that shares the agent. It is the one direct
-   * data-returning discovery member the base `Agent` surface adds; the other
-   * additions funnel through `this.resumeStream()` and so fail closed on that
-   * override.
+   * across every principal that shares the agent.
    */
   override async listSuspendedRuns(
     _options?: Parameters<
@@ -1207,14 +1273,38 @@ export class FlowsafeDurableAgent<
    * makes the caller name the (resourceId, threadId) pair it confirms.
    *
    * Signature caveat, and the reason this one is not `async`: the base declares
-   * it SYNCHRONOUS (`listActiveThreadRuns(): ActiveThreadRun[]`), so the
-   * `async … Promise<never>` shape every other refusal here carries would not
-   * be assignable to it. A re-check for a peer bump.
+   * it SYNCHRONOUS (`listActiveThreadRuns(): ActiveThreadRun[]`), so an
+   * `async … Promise<never>` refusal would not be assignable to it. A re-check
+   * for a peer bump.
    */
   override listActiveThreadRuns(): never {
     throw unavailableRunEntry(
       'listActiveThreadRuns',
       BLOCKED_RUN_ENTRIES.listActiveThreadRuns,
+    );
+  }
+
+  /** Refuse unscoped thread identity discovery under the second ground. */
+  override async discoverThreadPeers(_options?: unknown): Promise<never> {
+    throw unavailableRunEntry(
+      'discoverThreadPeers',
+      BLOCKED_RUN_ENTRIES.discoverThreadPeers,
+    );
+  }
+
+  /** Refuse direct run cancellation under the sixth ground. */
+  override abortRunStream(_runId: string): never {
+    throw unavailableRunEntry(
+      'abortRunStream',
+      BLOCKED_RUN_ENTRIES.abortRunStream,
+    );
+  }
+
+  /** Refuse direct thread cancellation under the sixth ground. */
+  override abortThreadStream(_options: unknown): never {
+    throw unavailableRunEntry(
+      'abortThreadStream',
+      BLOCKED_RUN_ENTRIES.abortThreadStream,
     );
   }
 
@@ -1293,7 +1383,7 @@ export class FlowsafeDurableAgent<
    * omits one, and skips `requireAgentExecutionFGA` — the authorization gate
    * every SUPPORTED entry point calls, so this would run the agent without it.
    * (The network family skips that gate too; neither is unique in doing so.) It
-   * persists no workflow run state, which is why it is refused on those two
+   * persists no workflow run state, which is why it is refused on those
    * grounds rather than as a re-drive.
    *
    * Signature caveat: overloaded and generic in OUTPUT on the base, so this
@@ -1364,15 +1454,82 @@ export class FlowsafeDurableAgent<
   }
 
   /**
+   * Refuse binding channels. The base forwards them to the wrapped agent,
+   * which becomes their dispatch target outside RunnerRuntime: the fourth
+   * ground reached by installation.
+   */
+  override setChannels(_agentChannels: unknown): never {
+    throw unavailableRunEntry('setChannels', BLOCKED_RUN_ENTRIES.setChannels);
+  }
+
+  /**
+   * Refuse declaring schedules. The base forwards them to the wrapped agent,
+   * which a Mastra schedule worker fires outside RunnerRuntime: the fourth
+   * ground reached by installation.
+   *
+   * Signature caveat: the parameter is `unknown` rather than core's
+   * `DeclaredAgentSchedule[]`, which it satisfies without depending on method
+   * bivariance.
+   */
+  override __setDeclaredSchedules(_schedules: unknown): never {
+    throw unavailableRunEntry(
+      '__setDeclaredSchedules',
+      BLOCKED_RUN_ENTRIES.__setDeclaredSchedules,
+    );
+  }
+
+  /**
+   * Refuse memory installation after construction under the fifth ground.
+   *
+   * Signature caveat: `unknown` accepts core's memory parameter without
+   * depending on method bivariance.
+   */
+  override __setMemory(_memory: unknown): never {
+    throw unavailableRunEntry('__setMemory', BLOCKED_RUN_ENTRIES.__setMemory);
+  }
+
+  /**
+   * Refuse pub/sub installation after construction under the fifth ground.
+   *
+   * Signature caveat: `unknown` accepts core's pub/sub parameter without
+   * depending on method bivariance.
+   */
+  override __setPubSub(_pubsub: unknown): never {
+    throw unavailableRunEntry('__setPubSub', BLOCKED_RUN_ENTRIES.__setPubSub);
+  }
+
+  /**
+   * Refuse Mastra registration. `Mastra.addAgent` calls this first, so the
+   * refusal throws before the registry write and before the loop workflow is
+   * added to that Mastra.
+   *
+   * Signature caveat: the parameter is `unknown` rather than core's `Mastra`,
+   * which it satisfies without depending on method bivariance.
+   */
+  override __setMastra(_mastra: unknown): never {
+    throw unavailableRunEntry('__setMastra', BLOCKED_RUN_ENTRIES.__setMastra);
+  }
+
+  /**
+   * The member {@link FlowsafeDurableAgent.__setMastra} forwards to, which
+   * `Agent.listAgents` calls directly on a static sub-agent.
+   */
+  override __registerMastra(_mastra: unknown): never {
+    throw unavailableRunEntry(
+      '__registerMastra',
+      BLOCKED_RUN_ENTRIES.__registerMastra,
+    );
+  }
+
+  /**
    * Refuse core's terminal snapshot cleanup. Its only call sites are the base
    * `executeWorkflow` (overridden here), the blocked `resume()` and the blocked
    * `recover()`, so nothing this class drives reaches it; blocking keeps the
    * snapshot rows — which deployment-scoped retention purge owns — from being
    * dropped out from under that owner by a future internal caller.
    *
-   * Note what this override buys beyond that call-site audit: the member
-   * inventory in durable-agent-surface.test.ts sees a NEW member, never a new
-   * core call site on an EXISTING one. So the override is the standing guard —
+   * Note what this override buys beyond that call-site audit: the override is
+   * the standing guard —
    * it converts core's best-effort cleanup into a throw the moment a future
    * release calls it on a path FlowSafe drives. None does at 1.67.0.
    */
@@ -1384,14 +1541,12 @@ export class FlowsafeDurableAgent<
   }
 
   /**
-   * Refuse core's durable resume. Until 1.53.0 this merely read the in-process
-   * run registry, which is why it was left inherited-but-unwired; now a registry
-   * MISS makes it load the persisted `durable-agentic-loop` snapshot, rehydrate
-   * through `prepare()` with the full application processor chain, and re-drive
-   * the run with `createRun + run.resume` — below `executeWorkflow`, so the leg
-   * carries no minted grant and no snapshot provenance.
-   * {@link FlowsafeDurableAgent.resumeViaRuntime} is the only resume path, and
-   * it is reached from the approval decision, never from a client.
+   * Refuse core's durable resume. From 1.53.0 a registry MISS makes it load the
+   * persisted `durable-agentic-loop` snapshot, rehydrate through `prepare()`
+   * with the full application processor chain, and re-drive the run with
+   * `createRun + run.resume` — below `executeWorkflow`, so the leg carries no
+   * minted grant and no snapshot provenance. The runner's resume path is
+   * {@link FlowsafeDurableAgent.resumeViaRuntime}.
    */
   override async resume(
     _runId: Parameters<DurableAgent<TAgentId, TTools, TOutput>['resume']>[0],
@@ -1470,11 +1625,11 @@ export class FlowsafeDurableAgent<
   }
 
   /**
-   * The 1.53.0 generate-shaped tool-approval pair. They funnel into
-   * `resumeGenerate()` -> `resume()`, so they are the same entry point wearing a
+   * The 1.53.0 generate-shaped tool-approval entries. They funnel into
+   * `resumeGenerate()` -> `resume()`, so they are the same entry point with a
    * different return type.
    *
-   * Signature caveat for both halves: the base method is GENERIC in its OUTPUT
+   * Signature caveat for each: the base method is GENERIC in its OUTPUT
    * type, which `Parameters<>` cannot carry, so the parameter type below is
    * hand-written rather than derived. Re-check it against the base on every
    * peer bump — nothing here fails if core changes the shape.
@@ -1525,7 +1680,7 @@ export class FlowsafeDurableAgent<
           return async (requestContext?: RequestContext) => {
             inputProcessors = await target.listInputProcessors(requestContext);
             return inputProcessors.filter(
-              (processor) => processor.id === 'breakwater-rbac',
+              (processor) => processor.id === BREAKWATER_RBAC_PROCESSOR_ID,
             );
           };
         }
@@ -1646,7 +1801,7 @@ export class FlowsafeDurableAgent<
               } as Parameters<
                 Mastra['agentThreadStreamRuntime']['registerRun']
               >[2],
-              this.pubsub,
+              this.getPubSub(),
             );
           },
         },
@@ -1673,11 +1828,9 @@ export class FlowsafeDurableAgent<
   }
 
   /**
-   * Publish one terminal ERROR attempt without throwing. The unregistered-run
-   * terminal path retries once and throws its refusal only after registry
-   * cleanup; resume publishes best-effort and preserves its summary or original
-   * error. Both call sites publish before cleanup because `emitError()` closes
-   * spans through the live global registry entry.
+   * Publish one terminal ERROR attempt without throwing. Call sites publish
+   * before cleanup because `emitError()` closes spans through the live global
+   * registry entry.
    */
   async #publishTerminalError(runId: string, error: unknown): Promise<boolean> {
     const terminalError =
@@ -1697,12 +1850,32 @@ export class FlowsafeDurableAgent<
   }
 
   /**
-   * Preserve unowned input before terminal refusal. A bounded best-effort write
-   * prevents hung memory from blocking the ERROR that heals thread state.
+   * Preserve unowned input before terminal refusal, by the guarded input
+   * chain's verdict on the call:
+   * - no tripwire: the prepared input;
+   * - a tripwire from Breakwater's RBAC gate on a call whose created signal
+   *   `stream()` captured: that signal;
+   * - any other tripwire, an RBAC one on a call with no capture included:
+   *   nothing.
+   *
+   * `stream()` captures a created signal only on a start that carries neither
+   * a host ticket nor a request context: a drain after a run
+   * `resumeViaRuntime()` registered, which the gate refuses for its missing
+   * actor without reading content. On a guarded agent such a call has no
+   * actor, so the gate refuses it before any application input processor
+   * runs. Host code that calls `stream()` the same way, with a created signal
+   * or an object carrying the signal brand as input, has that input kept when
+   * the gate refuses it.
+   *
+   * The verdict comes from the tripwire rather than from the prepared list, so
+   * it holds whether or not the guard removes refused input from the list. A
+   * bounded best-effort write prevents hung memory from blocking the ERROR
+   * that heals thread state.
    */
   async #persistUnownedInput(
     runId: string,
     workflowInput: DurableAgenticWorkflowInput,
+    replayedSignal: CreatedAgentSignal | undefined,
   ): Promise<void> {
     let timeout: ReturnType<typeof setTimeout> | undefined;
     try {
@@ -1713,18 +1886,38 @@ export class FlowsafeDurableAgent<
           if (!threadId || state?.threadExists !== true) return;
           // Explicit read-only memory forbids preserving denied input.
           if (state.memoryConfig?.readOnly === true) return;
+          const registryEntry = globalRunRegistry.get(runId);
+          const tripwire = registryEntry?.tripwire;
           const memory = await this.getMemory({
-            requestContext: globalRunRegistry.get(runId)?.requestContext,
+            requestContext: registryEntry?.requestContext,
           });
           if (!memory) return;
-          const list = new MessageList({
-            threadId,
-            resourceId: state.resourceId,
-          }).deserialize(workflowInput.messageListState);
-          const inputIds = list.makeMessageSourceChecker().input;
-          const messages = list.get.all
-            .db()
-            .filter((message) => inputIds.has(message.id))
+          let candidates: MastraDBMessage[];
+          if (tripwire === undefined) {
+            const list = new MessageList({
+              threadId,
+              resourceId: state.resourceId,
+            }).deserialize(workflowInput.messageListState);
+            const inputIds = list.makeMessageSourceChecker().input;
+            candidates = list.get.all
+              .db()
+              .filter((message) => inputIds.has(message.id));
+          } else if (
+            tripwire.processorId === BREAKWATER_RBAC_PROCESSOR_ID &&
+            replayedSignal !== undefined
+          ) {
+            candidates = [
+              signalToMastraDBMessage(replayedSignal, {
+                threadId,
+                resourceId: state.resourceId,
+              }),
+            ];
+          } else {
+            return;
+          }
+          const messages = candidates
+            // Mastra's own persist lane stores no transient signal either.
+            .filter((message) => !isTransientSignalMessage(message))
             // Honor markPersistenceForbidden's route-to-runner metadata contract.
             .filter(
               (message) =>
@@ -1964,10 +2157,13 @@ export class FlowsafeDurableAgent<
         }
         // No #startRequesters entry means the host start seam never registered
         // this id, so core minted it below our boundary. Such a run has no
-        // ownership record or trusted engine-leg context. Preserve its input
-        // when allowed, then close the stream so core can clean up its maps and
+        // ownership record or trusted engine-leg context. Preserve what the
+        // input chain's verdict allows, including a signal stream() captured
+        // for this id, then close the stream so core can clean up its maps and
         // release the lease transferred to this id.
-        await this.#persistUnownedInput(runId, workflowInput);
+        const replayedSignal = this.#replayedSignals.get(runId);
+        this.#replayedSignals.delete(runId);
+        await this.#persistUnownedInput(runId, workflowInput, replayedSignal);
         const refusal = new InvalidRunRequestError(
           `${UNREGISTERED_RUN_REFUSAL_PREFIX}run '${runId}' was not registered by the host start seam — the durable-agent runner never executes a run it does not own`,
         );
@@ -1977,6 +2173,7 @@ export class FlowsafeDurableAgent<
             (await this.#publishTerminalError(runId, refusal)) ||
             (await this.#publishTerminalError(runId, refusal));
         } finally {
+          this.#replayedSignals.delete(runId);
           this.runRegistryInternal.cleanup(runId);
           globalRunRegistry.delete(runId);
         }
@@ -2069,9 +2266,7 @@ export function createFlowsafeDurableAgent<
   const workflow = durableAgent.getWorkflow();
   if (!options.runtime.workflowIds().includes(workflow.id)) {
     // getWorkflow()'s concrete engine generics are not single-cast-assignable to
-    // AnyWorkflow, so the double cast through `unknown` is required (init.ts gets
-    // away with a single cast because coreCreateWorkflow's return already lines
-    // up). The runtime only ever reads id / getWorkflowRunById / createRun off it.
+    // AnyWorkflow, so the double cast through `unknown` is required.
     options.runtime.register(workflow as unknown as AnyWorkflow);
   }
   return durableAgent;

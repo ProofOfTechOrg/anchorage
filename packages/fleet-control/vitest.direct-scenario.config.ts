@@ -5,17 +5,11 @@ import { defineConfig } from 'vitest/config';
 // the pair needs the breakwater, flowsafe and fleet-control dists (the suites
 // import @proofoftech/flowsafe subpaths that resolve into flowsafe's dist, and
 // the observations module imports the fleet-control package). They are a root
-// project of their own so CI can run them in the `direct-scenario` job beside
-// `verify-core`, while `pnpm test` at the root and the package `test` script
-// still run them with everything else. The package project (vitest.config.ts)
-// excludes the same two files. This configuration sits in the package rather
-// than at the root because its include paths resolve against this directory
-// and the package `test` script runs it by that path.
-// The project name below is the one the root scripts
-// `test:without-direct-scenario` and `test:direct-scenario` select. The root
-// control in `scripts/architecture-positive-controls.test.mjs` pins the same
-// literal, and `test:without-direct-scenario` runs that control through
-// `pnpm run architecture:check`, so a name that drifts fails there.
+// project of their own so `pnpm test` can leave them out and
+// `pnpm test:direct-scenario` can select them; the package project
+// (vitest.config.ts) excludes their files. This configuration sits in the
+// package because its include paths resolve against this directory.
+// The project name below is the literal the root scripts select and negate.
 export default defineConfig({
   test: {
     name: 'fleet-control-direct-scenario',

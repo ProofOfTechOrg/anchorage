@@ -373,6 +373,7 @@ export async function runDirectCredentialedScenario(input) {
         operation: 'read',
       });
       state.proofs.fence[operation][role] = {
+        role,
         before,
         after: null,
         ordinal: null,
@@ -1440,6 +1441,7 @@ export async function runDirectCredentialedScenario(input) {
             if (state.proofs.fence.sweeps[role] === null) {
               const first = await fenceSweep(role);
               state.proofs.fence.sweeps[role] = {
+                role,
                 first,
                 second: null,
                 intervalMs: null,
@@ -1493,6 +1495,7 @@ export async function runDirectCredentialedScenario(input) {
             });
             requireFact(future.classification === 'future');
             state.proofs.fence.probes[role] = {
+              role,
               current: 'accepted',
               missing: 'missing',
               stale: 'stale',

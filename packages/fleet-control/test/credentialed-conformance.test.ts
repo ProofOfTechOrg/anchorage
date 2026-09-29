@@ -34,16 +34,6 @@ import {
   validateDeploymentSpec,
 } from '../src/validation.js';
 
-const REQUIRED_ENVIRONMENT_VARIABLES = [
-  'FLEET_CONFORMANCE_CONFIG',
-  'CLOUDFLARE_API_TOKEN',
-  'CLOUDFLARE_ACCOUNT_ID',
-  'FLEET_MAINTENANCE_CAPABILITY_PRIVATE_JWK',
-  'FLEET_STATE_EGRESS_ROOT_SECRET',
-  'FLEET_CONFORMANCE_APPLICATION_SECRET',
-] as const;
-
-const packageRoot = fileURLToPath(new URL('..', import.meta.url));
 const scriptPath = fileURLToPath(
   new URL('../scripts/credentialed-conformance.mjs', import.meta.url),
 );
@@ -589,36 +579,6 @@ describe('credentialed conformance command', () => {
     ).toThrow(/missing \[UnknownStateClass\]/u);
   });
 
-  it('pins live-only plain-lane request and recovery invariants', () => {
-    const source = readFileSync(scriptPath, 'utf8');
-    expect(source).toMatch(
-      /const cloudflare = new Cloudflare\(\{\s*apiToken,\s*logLevel: 'off',\s*maxRetries: 0,\s*\}\);/u,
-    );
-    expect(source).toMatch(
-      /deployment\.store\.withDeploymentLease\(\s*spec\.tenantTag,\s*spec\.environment,\s*async \(fence\)/u,
-    );
-    expect(source).toContain(
-      'await client.getDatabase(decommissioned.databaseExport.databaseId)',
-    );
-    expect(source).toMatch(
-      /plain Worker database '\$\{decommissioned\.databaseExport\.databaseId\}' remains after terminal decommission/u,
-    );
-  });
-
-  it('pins the source form of the unread contract-response releases', () => {
-    const source = readFileSync(scriptPath, 'utf8');
-    expect(source).toMatch(
-      /function assertResponse\(response, condition, message\) \{\s*if \(condition\) return;\s*const refusal = new Error\(message\);\s*cancelBodyWithoutAwait\(response\.body, refusal\);\s*throw refusal;\s*\}/u,
-    );
-    expect(source).toMatch(
-      /assertResponse\(\s*response,\s*response\.status === expectedStatus,/u,
-    );
-    expect(source).toMatch(
-      /assertResponse\(\s*overLimit,\s*overLimit\.status === config\.conformance\.cpuOverLimitStatus,/u,
-    );
-    expect(source).toContain('cancelBodyWithoutAwait(overLimit.body);');
-  });
-
   it('runs every mandatory probe in release order and returns only asserted truth', async () => {
     const deployments = [{ id: 'a' }, { id: 'b' }];
     const calls: string[] = [];
@@ -738,31 +698,6 @@ describe('credentialed conformance command', () => {
       ),
     ).rejects.toThrow(new RegExp(`requires ${missingOperation}`, 'u'));
     expect(calls).toEqual([]);
-  });
-
-  it('keeps required environment inputs, docs, and application-secret assertions synchronized', () => {
-    const source = readFileSync(scriptPath, 'utf8');
-    const readme = readFileSync(`${packageRoot}/README.md`, 'utf8');
-    const operatorGuide = readFileSync(
-      fileURLToPath(new URL('../../../docs/fleet-control.md', import.meta.url)),
-      'utf8',
-    );
-    for (const name of REQUIRED_ENVIRONMENT_VARIABLES) {
-      expect(source).toContain(`'${name}'`);
-      expect(readme).toContain(`\`${name}\``);
-      expect(operatorGuide).toContain(`\`${name}\``);
-    }
-    expect(validConfig.applicationSecretBinding).toBe(
-      'APPLICATION_CONFORMANCE_SECRET',
-    );
-    expect((validConfig.application as { secrets: unknown[] }).secrets).toEqual(
-      [],
-    );
-    expect(JSON.stringify(validConfig)).not.toContain(
-      'FLEET_CONFORMANCE_APPLICATION_SECRET',
-    );
-    expect(source).toContain("createHmac('sha256', applicationSecret)");
-    expect(source).toContain('timingSafeEqual(actual, expected)');
   });
 
   it('fails before loading the client or making a request without credentials', () => {

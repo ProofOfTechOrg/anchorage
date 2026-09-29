@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
+import { Agent } from '@mastra/core/agent';
 import { resolveBackgroundConfig } from '@mastra/core/background-tasks';
+import type { MastraModelConfig } from '@mastra/core/llm';
+import { Mastra } from '@mastra/core/mastra';
 import { RequestContext } from '@mastra/core/request-context';
 import type { PublicSchema } from '@mastra/core/schema';
+import { InMemoryStore } from '@mastra/core/storage';
 import { createTool, type ToolExecutionContext } from '@mastra/core/tools';
 import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
@@ -14,6 +18,7 @@ import {
   ISOLATION_SCOPE_CONTEXT_KEY,
   tenantIsolation,
   WORKFLOW_SCOPE_CONTEXT_KEY,
+  type WritePermissionsPolicy,
 } from '../policy-engine/index.js';
 import {
   ACTOR_CONTEXT_KEY,
@@ -47,14 +52,15 @@ import {
   InMemoryRateLimitStore,
   invokeConnector,
   migrateLegacyConnectorIdempotency,
+  type PermissionManifest,
   type SingleTenantConnectorPoliciesOptions,
   singleTenantConnectorPolicies,
 } from './index.js';
 import { replaceConnectorInvocation } from './invocation-registry.js';
 
-// Most tests exercise post-migration behavior. Migration-boundary tests call
-// createConnectorBase directly so absence of the explicit acknowledgement and
-// atomic inspect() capability remain visible.
+// Builds a connector in the post-migration state; call createConnectorBase
+// directly where absence of the explicit acknowledgement and atomic inspect()
+// capability must remain visible.
 function createConnector<TInput = unknown, TOutput = unknown>(
   config: ConnectorConfig<TInput, TOutput>,
 ) {
@@ -270,8 +276,8 @@ function makeToolCallGrantContext(
   } as unknown as ToolExecutionContext;
 }
 
-// Structural on purpose: connectors infer different TOutput per test, and
-// Tool<...> instantiations don't cross-assign cleanly.
+// Structural: connectors infer different TOutput per test, and Tool<...>
+// instantiations don't cross-assign cleanly.
 async function run<TInput>(
   tool: {
     execute?: (
@@ -329,6 +335,49 @@ function makeConnector(
   return { tool, execute };
 }
 
+const matchesEveryHost = {
+  startsWith: () => true,
+  slice: () => '',
+  toString: () => 'x',
+};
+const stringMethodsEntry = {
+  toString: () => 'api.vendor.example',
+  toLowerCase: () => ({ replace: () => matchesEveryHost }),
+};
+
+function egressWith(entry: unknown): unknown[] {
+  return ['api.vendor.example', entry];
+}
+
+function egressWithHole(): unknown[] {
+  const egress: unknown[] = ['api.vendor.example'];
+  egress.length = 2;
+  return egress;
+}
+
+const nonStringEgressEntries: [string, () => unknown[], string][] = [
+  ['null', () => egressWith(null), 'null'],
+  ['undefined', () => egressWith(undefined), 'undefined'],
+  ['a hole', egressWithHole, 'undefined'],
+  ['a number', () => egressWith(123), 'number'],
+  ['a Symbol', () => egressWith(Symbol('api.vendor.example')), 'symbol'],
+  [
+    'a String object',
+    () => egressWith(new String('api.vendor.example')),
+    'object',
+  ],
+  [
+    'a plain object with toString',
+    () => egressWith({ toString: () => 'api.vendor.example' }),
+    'object',
+  ],
+  [
+    'an object with its own string methods',
+    () => egressWith(stringMethodsEntry),
+    'object',
+  ],
+];
+
 describe('connector egress posture', () => {
   it('carries a declared egressEnforcement onto the frozen manifest', () => {
     // #given
@@ -350,6 +399,51 @@ describe('connector egress posture', () => {
     // #then
     expect(connectorManifest(tool)).toEqual({ sideEffect: 'read', egress: [] });
     expect(connectorManifest(tool)).not.toHaveProperty('egressEnforcement');
+  });
+
+  it.each([
+    ['a string', 'localhost'],
+    ['a Set', new Set(['api.vendor.example'])],
+  ])('refuses %s as egress at construction', (_label, egress) => {
+    // #given
+    const permissions = {
+      sideEffect: 'read',
+      egress,
+    } as unknown as ConnectorConfig['permissions'];
+    // #when / #then
+    expect(() => makeConnector({ permissions })).toThrow(TypeError);
+    expect(() => makeConnector({ permissions })).toThrow(
+      'connector salesforce.createContact: permissions.egress must be an array',
+    );
+  });
+
+  it('registers a null egress as a frozen empty list', () => {
+    // #given
+    const permissions = {
+      sideEffect: 'read',
+      egress: null,
+    } as unknown as ConnectorConfig['permissions'];
+    // #when
+    const { tool } = makeConnector({ permissions });
+    // #then
+    expect(connectorManifest(tool)).toEqual({ sideEffect: 'read', egress: [] });
+    expect(Object.isFrozen(connectorManifest(tool)?.egress)).toBe(true);
+  });
+
+  it.each(
+    nonStringEgressEntries,
+  )('refuses %s as an egress entry at construction', (_label, egress, got) => {
+    // #given
+    const permissions = {
+      sideEffect: 'read',
+      egress: egress(),
+    } as unknown as ConnectorConfig['permissions'];
+    // #when / #then
+    expect(() => makeConnector({ permissions })).toThrow(
+      new TypeError(
+        `connector salesforce.createContact: permissions.egress entry 1 must be a string (got ${got})`,
+      ),
+    );
   });
 
   it('resolves an undeclared posture to declaration-only', () => {
@@ -380,7 +474,7 @@ describe('connector egress posture', () => {
     expect(connectorEgressPosture({})).toBeUndefined();
   });
 
-  it('refuses an egressEnforcement value outside the two literals at construction', () => {
+  it('refuses an egressEnforcement value outside the posture literals at construction', () => {
     // #given
     for (const value of ['Enforced', '', null, true, false, 0, {}, []]) {
       const permissions = {
@@ -487,7 +581,7 @@ describe('connector egress posture', () => {
       });
       // #when
       await expect(run(tool, input)).resolves.toEqual({ ok: true });
-      // #then — one resolution serves the readback and the audit detail.
+      // #then
       expect(audit.events()[0]?.detail).toMatchObject({
         egressEnforcement: connectorEgressPosture(tool),
       });
@@ -581,9 +675,8 @@ describe('connector egress posture', () => {
 });
 
 describe('connector id validation', () => {
-  it("rejects an id containing ':' because the unchanged rate-budget tuple needs a colon-free final component", () => {
-    // #given / #when — active rate-limit windows retain the legacy
-    // `[scope:]connector` key across the idempotency-only migration.
+  it("rejects an id containing ':' because the rate-budget tuple needs a colon-free final component", () => {
+    // #given / #when
     let error: unknown;
     try {
       makeConnector({ id: 'tenant:createContact' });
@@ -598,10 +691,434 @@ describe('connector id validation', () => {
     expect(message).toContain('rate-limit');
   });
 
-  it('constructs shipped id shapes that are colon-free (camelCase and dotted agent-cli)', () => {
-    // #when / #then — the guard rejects nothing shipped
+  it('constructs colon-free camelCase and dotted ids', () => {
+    // #when / #then
     expect(() => makeConnector({ id: 'createContact' })).not.toThrow();
     expect(() => makeConnector({ id: 'agent-cli.claude-code' })).not.toThrow();
+  });
+
+  it.each([
+    ['a space', 'crm assign', '"crm assign"'],
+    ['a trailing space', 'crm.assign ', '"crm.assign "'],
+    ['a newline', 'crm\nassign', '"crm\\nassign"'],
+    ['a line separator', 'crm assign', '"crm assign"'],
+    ['a no-break space', 'crm assign', '"crm assign"'],
+    ['a zero-width space', 'crm​assign', '"crm​assign"'],
+    ['a byte-order mark', '﻿crm.assign', '"﻿crm.assign"'],
+    ['a control character', 'crm\u0000assign', '"crm\\u0000assign"'],
+  ])('refuses an id containing %s', (_label, id, quoted) => {
+    // #when / #then — no approval pattern can carry the character
+    expect(() => makeConnector({ id })).toThrow(
+      new TypeError(
+        `connector id ${quoted} must not contain whitespace or a control or format character, which an approval pattern cannot contain`,
+      ),
+    );
+  });
+
+  it.each<[string, unknown, string]>([
+    ['an empty string', '', '""'],
+    ['a number', 42, 'number'],
+    ['undefined', undefined, 'undefined'],
+    ['a String object', new String('crm.assign'), 'object'],
+  ])('refuses %s as an id before any other use of it', (_label, id, got) => {
+    // #when / #then
+    expect(() => makeConnector({ id: id as string })).toThrow(
+      new TypeError(`connector id must be a non-empty string (got ${got})`),
+    );
+  });
+});
+
+describe('connector construction checks', () => {
+  it.each<[string, unknown, string]>([
+    ['a mistyped side effect', 'Destructive', '"Destructive"'],
+    ['a missing side effect', undefined, 'undefined'],
+    ['a String object', new String('write'), 'object'],
+  ])('refuses %s', (_label, sideEffect, got) => {
+    // #when / #then — an unknown side effect would skip the destructive
+    // approval default
+    expect(() =>
+      makeConnector({
+        permissions: { sideEffect: sideEffect as 'write' },
+      }),
+    ).toThrow(
+      new TypeError(
+        `connector salesforce.createContact: permissions.sideEffect must be 'read', 'write', 'destructive' or 'idempotent' (got ${got})`,
+      ),
+    );
+  });
+
+  it.each<[string, unknown, string]>([
+    ["the string 'false'", 'false', '"false"'],
+    ['the number 1', 1, 'number'],
+    ['null', null, 'null'],
+  ])('refuses %s as permissions.background on a read connector', (_label, background, got) => {
+    // #when / #then — a truthy non-boolean would read as an opt-in
+    expect(() =>
+      makeConnector({
+        permissions: { sideEffect: 'read', background: background as boolean },
+      }),
+    ).toThrow(
+      new TypeError(
+        `connector salesforce.createContact: permissions.background must be a boolean when provided (got ${got})`,
+      ),
+    );
+  });
+
+  it.each<[string, unknown, string]>([
+    [
+      'an unknown writePermissions field',
+      { requireAproval: ['salesforce.*'] },
+      'connector salesforce.createContact: policies.writePermissions has unknown field "requireAproval" (valid fields: requireApproval, destructiveRequiresApproval)',
+    ],
+    [
+      'an approval pattern with a trailing space',
+      { requireApproval: ['salesforce.* '] },
+      `connector salesforce.createContact: policies.writePermissions.requireApproval entry 0 must be a non-empty string without ':', whitespace, or a control or format character (got "salesforce.* ")`,
+    ],
+    [
+      'an approval pattern object with its own split',
+      { requireApproval: [{ split: () => [] }] },
+      `connector salesforce.createContact: policies.writePermissions.requireApproval entry 0 must be a non-empty string without ':', whitespace, or a control or format character (got object)`,
+    ],
+    [
+      'a string approval list',
+      { requireApproval: 'salesforce.*' },
+      'connector salesforce.createContact: policies.writePermissions.requireApproval must be an array',
+    ],
+    [
+      'a string destructiveRequiresApproval',
+      { destructiveRequiresApproval: 'false' },
+      'connector salesforce.createContact: policies.writePermissions.destructiveRequiresApproval must be a boolean (got "false")',
+    ],
+  ])('refuses %s', (_label, writePermissions, message) => {
+    // #when / #then
+    expect(() =>
+      makeConnector({
+        policies: {
+          writePermissions: writePermissions as WritePermissionsPolicy,
+        },
+      }),
+    ).toThrow(new TypeError(message));
+  });
+
+  it('requires approval from the pattern list read by index', async () => {
+    // #given — own methods and iterator answer that no pattern matches
+    const requireApproval = Object.assign(['salesforce.*'], {
+      some: () => false,
+      includes: () => false,
+      map: () => [],
+      [Symbol.iterator]: function* () {},
+    });
+    const { tool, execute } = makeConnector({
+      policies: { writePermissions: { requireApproval } },
+    });
+    // #when
+    const failure = await run(tool, input).catch((error: unknown) => error);
+    // #then
+    expect(failure).toMatchObject({ code: 'APPROVAL_GRANT_MISSING' });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('requires the permissions it read by index', async () => {
+    // #given — a copy taken through the own iterator would register no
+    // requirement
+    const requiredPermissions = Object.assign(['contacts.write'], {
+      some: () => false,
+      includes: () => false,
+      map: () => [],
+      [Symbol.iterator]: function* () {},
+    });
+    const { tool, execute } = makeConnector({
+      permissions: { sideEffect: 'read', requiredPermissions },
+    });
+    // #when
+    const failure = await run(
+      tool,
+      input,
+      makeContext({
+        principalPermissions: { permissions: [], policyVersion: 'v1' },
+      }),
+    ).catch((error: unknown) => error);
+    // #then
+    expect(failure).toMatchObject({ code: 'PERMISSION_MISSING' });
+    expect(execute).not.toHaveBeenCalled();
+    expect(connectorManifest(tool)?.requiredPermissions).toEqual([
+      'contacts.write',
+    ]);
+  });
+});
+
+const MANIFEST_FIELDS =
+  'sideEffect, egress, egressEnforcement, idempotencyKey, requiresApproval, dryRun, rateLimit, background, requiredPermissions';
+const CONFIG_FIELDS =
+  'id, description, inputSchema, outputSchema, execute, dryRunExecute, permissions, policies';
+const POLICY_FIELDS =
+  'networkEgress, idempotencyKeyMigration, writePermissions, evaluators, idempotencyStore, rateLimitStore, audit, fetch, requireEgressEnforcement';
+
+describe('connector unknown fields', () => {
+  it.each<[string, string, unknown]>([
+    ['requiresApproval', 'requireApproval', true],
+    ['requiredPermissions', 'requiredPermission', ['contacts.write']],
+    ['rateLimit', 'ratelimit', '1/min'],
+    ['idempotencyKey', 'idempotencykey', true],
+    ['egress', 'egres', ['api.other.com']],
+  ])('refuses permissions.%s misspelled as %s', (_field, key, value) => {
+    // #when / #then
+    expect(() =>
+      makeConnector({
+        permissions: { sideEffect: 'write', [key]: value } as never,
+      }),
+    ).toThrow(
+      new TypeError(
+        `connector salesforce.createContact: permissions has unknown field ${JSON.stringify(key)} (valid fields: ${MANIFEST_FIELDS})`,
+      ),
+    );
+  });
+
+  it('still requires approval under the correctly spelled requiresApproval', async () => {
+    // #given
+    const { tool, execute } = makeConnector({
+      permissions: { sideEffect: 'write', requiresApproval: true },
+    });
+    // #when
+    const failure = await run(tool, input).catch((error: unknown) => error);
+    // #then
+    expect(failure).toMatchObject({ code: 'APPROVAL_GRANT_MISSING' });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it.each<[string, string]>([
+    ['policies', 'policy'],
+    ['inputSchema', 'inputschema'],
+  ])('refuses config.%s misspelled as %s', (_field, key) => {
+    // #when / #then
+    expect(() =>
+      createConnectorBase({
+        ...connectorConfig(),
+        [key]: {},
+      } as ConnectorConfig),
+    ).toThrow(
+      new TypeError(
+        `connector salesforce.createContact: config has unknown field ${JSON.stringify(key)} (valid fields: ${CONFIG_FIELDS})`,
+      ),
+    );
+  });
+
+  it.each<[string, string, unknown]>([
+    [
+      'networkEgress',
+      'networkegress',
+      { allowedDomains: ['api.salesforce.com'] },
+    ],
+    ['writePermissions', 'writePermission', { requireApproval: ['crm.*'] }],
+    ['evaluators', 'evaluator', [tenantIsolation()]],
+    ['requireEgressEnforcement', 'requireEgressEnforced', true],
+    ['audit', 'auditLogger', new AuditLogger()],
+  ])('refuses policies.%s misspelled as %s', (_field, key, value) => {
+    // #when / #then
+    expect(() =>
+      createConnectorBase(
+        connectorConfig({ policies: { [key]: value } as ConnectorPolicies }),
+      ),
+    ).toThrow(
+      new TypeError(
+        `connector salesforce.createContact: policies has unknown field ${JSON.stringify(key)} (valid fields: ${POLICY_FIELDS})`,
+      ),
+    );
+  });
+
+  it('still runs the correctly spelled policies.evaluators', async () => {
+    // #given
+    const { tool, execute } = makeConnector({
+      policies: { evaluators: [tenantIsolation()] },
+    });
+    // #when
+    const failure = await run(tool, input).catch((error: unknown) => error);
+    // #then
+    expect(failure).toMatchObject({ code: 'ISOLATION_SCOPE_MISSING' });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('constructs with every declared config, permissions and policies field', () => {
+    // #given — the Required types fail to compile while a declared field is
+    // missing here
+    const permissions: Required<PermissionManifest> = {
+      sideEffect: 'read',
+      egress: ['api.salesforce.com'],
+      egressEnforcement: 'enforced',
+      idempotencyKey: true,
+      requiresApproval: false,
+      dryRun: true,
+      rateLimit: '10/min',
+      background: false,
+      requiredPermissions: ['contacts.read'],
+    };
+    const policies: Required<ConnectorPolicies> = {
+      networkEgress: { allowedDomains: ['api.salesforce.com'] },
+      idempotencyKeyMigration: 'legacy-writers-drained',
+      writePermissions: { requireApproval: ['salesforce.*'] },
+      evaluators: [tenantIsolation()],
+      idempotencyStore: new InMemoryIdempotencyStore(),
+      rateLimitStore: new InMemoryRateLimitStore(),
+      audit: new AuditLogger(),
+      fetch: async () => new Response(null),
+      requireEgressEnforcement: true,
+    };
+    const config: Required<ConnectorConfig> = {
+      id: 'salesforce.getContact',
+      description: 'Read a Salesforce contact',
+      inputSchema: z.object({ email: z.string() }),
+      outputSchema: z.object({ ok: z.boolean() }),
+      execute: async () => ({ ok: true }),
+      dryRunExecute: async () => ({ ok: true }),
+      permissions,
+      policies,
+    };
+    // #when / #then
+    expect(connectorManifest(createConnectorBase(config))).toMatchObject({
+      sideEffect: 'read',
+      requiresApproval: false,
+    });
+  });
+});
+
+describe('connector value types', () => {
+  it.each<[string, unknown, string]>([
+    ['an empty string', '', '""'],
+    ['0', 0, 'number'],
+    ['NaN', Number.NaN, 'number'],
+    ["the string 'false'", 'false', '"false"'],
+    ['null', null, 'null'],
+  ])('refuses %s as permissions.requiresApproval', (_label, value, got) => {
+    // #when / #then — a falsy non-boolean would read as no approval
+    expect(() =>
+      makeConnector({
+        permissions: {
+          sideEffect: 'write',
+          requiresApproval: value as boolean,
+        },
+      }),
+    ).toThrow(
+      new TypeError(
+        `connector salesforce.createContact: permissions.requiresApproval must be a boolean when provided (got ${got})`,
+      ),
+    );
+  });
+
+  it.each<[string, unknown, string]>([
+    ['dryRun', 'true', '"true"'],
+    ['idempotencyKey', 1, 'number'],
+  ])('refuses a non-boolean permissions.%s', (field, value, got) => {
+    // #when / #then
+    expect(() =>
+      makeConnector({
+        permissions: { sideEffect: 'write', [field]: value },
+      }),
+    ).toThrow(
+      new TypeError(
+        `connector salesforce.createContact: permissions.${field} must be a boolean when provided (got ${got})`,
+      ),
+    );
+  });
+
+  it.each<[string, unknown, string]>([
+    ['a string', 'x', '"x"'],
+    ['an empty string', '', '""'],
+    ['a number', 5, 'number'],
+    ['0', 0, 'number'],
+    ['true', true, 'boolean'],
+    ['false', false, 'boolean'],
+    ['a list', [], 'an array'],
+  ])('refuses %s as config.policies', (_label, policies, got) => {
+    // #when / #then — a scalar used to run the connector ungated
+    expect(() =>
+      createConnectorBase(
+        connectorConfig({ policies: policies as ConnectorPolicies }),
+      ),
+    ).toThrow(
+      new TypeError(
+        `connector salesforce.createContact: policies must be an object (got ${got})`,
+      ),
+    );
+  });
+
+  it.each<[string, unknown, string]>([
+    ['an empty string', '', '""'],
+    ['0', 0, 'number'],
+    ['false', false, 'boolean'],
+    ['a string', 'x', '"x"'],
+    ['a list', [], 'an array'],
+  ])('refuses %s as policies.networkEgress', (_label, networkEgress, got) => {
+    // #when / #then — a falsy value used to drop the organization egress gate
+    expect(() =>
+      createConnectorBase(
+        connectorConfig({
+          policies: {
+            networkEgress: networkEgress as ConnectorPolicies['networkEgress'],
+          },
+        }),
+      ),
+    ).toThrow(
+      new TypeError(
+        `connector salesforce.createContact: policies.networkEgress must be an object (got ${got})`,
+      ),
+    );
+  });
+
+  it('still denies an undeclared host under an object policies.networkEgress', async () => {
+    // #given
+    const { tool, execute } = makeConnector({
+      permissions: {
+        sideEffect: 'read',
+        egressEnforcement: 'declaration-only',
+        egress: ['api.other.com'],
+      },
+      policies: { networkEgress: { allowedDomains: ['api.example.com'] } },
+    });
+    // #when
+    const failure = await run(tool, input).catch((error: unknown) => error);
+    // #then
+    expect(failure).toMatchObject({ code: 'EGRESS_HOST_NOT_ALLOWED_BY_ORG' });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it.each<[string, unknown, string]>([
+    [
+      'an empty string, which used to run no gate',
+      '',
+      'connector salesforce.createContact: policies.evaluators must be an array',
+    ],
+    [
+      'a plain object',
+      {},
+      'connector salesforce.createContact: policies.evaluators must be an array',
+    ],
+    [
+      'an entry without a name',
+      [{ evaluate: () => ({ allowed: true }) }],
+      'connector salesforce.createContact: policies.evaluators entry 0 must be an evaluator with a string name and an evaluate function (got object)',
+    ],
+    [
+      'a null entry',
+      [null],
+      'connector salesforce.createContact: policies.evaluators entry 0 must be an evaluator with a string name and an evaluate function (got null)',
+    ],
+    [
+      'a string entry',
+      ['tenant-isolation'],
+      'connector salesforce.createContact: policies.evaluators entry 0 must be an evaluator with a string name and an evaluate function (got "tenant-isolation")',
+    ],
+  ])('refuses %s as policies.evaluators', (_label, evaluators, message) => {
+    // #when / #then
+    expect(() =>
+      createConnectorBase(
+        connectorConfig({
+          policies: {
+            evaluators: evaluators as ConnectorPolicies['evaluators'],
+          },
+        }),
+      ),
+    ).toThrow(new TypeError(message));
   });
 });
 
@@ -678,7 +1195,11 @@ const POLICY_READ_CASES: Record<
     policies: { idempotencyStore: new InMemoryIdempotencyStore() },
   },
   idempotencyKeyMigration: {
-    policies: { idempotencyKeyMigration: 'legacy-writers-drained' },
+    permissions: { sideEffect: 'write', idempotencyKey: true },
+    policies: {
+      idempotencyStore: new InMemoryIdempotencyStore(),
+      idempotencyKeyMigration: 'legacy-writers-drained',
+    },
   },
   rateLimitStore: {
     permissions: { sideEffect: 'write', rateLimit: '2/min' },
@@ -687,40 +1208,88 @@ const POLICY_READ_CASES: Record<
   networkEgress: {
     policies: { networkEgress: { allowedDomains: ['api.salesforce.com'] } },
   },
-  // These members stay inline because construction reads them once.
   fetch: null,
   requireEgressEnforcement: null,
   evaluators: null,
   writePermissions: null,
-  // The preset validator captures the audit binding.
   audit: null,
+};
+
+// Request contexts for rows whose counted member the call path reads only
+// under that context.
+const READ_CASE_CONTEXTS: Partial<Record<string, () => ToolExecutionContext>> =
+  {
+    dryRunExecute: () => makeContext({ dryRun: true }),
+    idempotencyStore: () => makeContext({ idempotencyKey: 'order-1' }),
+    idempotencyKeyMigration: () => makeContext({ idempotencyKey: 'order-1' }),
+  };
+
+async function callOnce(tool: Connector, field: string): Promise<void> {
+  const context = READ_CASE_CONTEXTS[field]?.() ?? makeContext();
+  await run(tool, {}, context).catch(() => undefined);
+}
+
+// Members the call path reads live, so a simulation or a migration
+// acknowledgement set or withdrawn after construction applies to the next
+// call (the acknowledgement: CONNECTORS.md, "Use the right idempotency
+// store"; the simulation: packages/breakwater/CHANGELOG.md, 0.14.0).
+const LIVE_CALL_READS: ReadonlySet<string> = new Set([
+  'dryRunExecute',
+  'idempotencyKeyMigration',
+]);
+
+const WRITE_PERMISSIONS_READ_CASES: Record<
+  keyof WritePermissionsPolicy,
+  WritePermissionsPolicy
+> = {
+  requireApproval: { requireApproval: ['salesforce.*'] },
+  destructiveRequiresApproval: { destructiveRequiresApproval: true },
 };
 
 describe('caller-supplied member reads', () => {
   // The rule is "the members createConnectorBase hoists into a local before
   // using them more than once". A further hoist needs a fixture in the records
   // above; their keys require classification when the public interfaces grow.
-  // invokeConnector's toolCallId case covers its check and call-identity local.
   for (const [field, overrides] of Object.entries(CONFIG_READ_CASES)) {
     if (overrides === null) continue;
-    it(`reads config.${field} once`, () => {
+    it(`reads config.${field} once at construction and as documented on a call`, async () => {
       const { config, reads } = countingConfig(
         field as keyof ConnectorConfig,
         overrides,
       );
-      createConnectorBase(config);
+      const tool = createConnectorBase(config);
       expect(reads()).toBe(1);
+      await callOnce(tool, field);
+      expect(reads()).toBe(LIVE_CALL_READS.has(field) ? 2 : 1);
     });
   }
 
   for (const [field, overrides] of Object.entries(POLICY_READ_CASES)) {
     if (overrides === null) continue;
-    it(`reads policies.${field} once at construction`, () => {
+    it(`reads policies.${field} once at construction and as documented on a call`, async () => {
       const { config, reads } = countingPolicies(
         field as keyof ConnectorPolicies,
         overrides,
       );
-      createConnectorBase(config);
+      const tool = createConnectorBase(config);
+      expect(reads()).toBe(1);
+      await callOnce(tool, field);
+      expect(reads()).toBe(LIVE_CALL_READS.has(field) ? 2 : 1);
+    });
+  }
+
+  for (const [field, fixture] of Object.entries(WRITE_PERMISSIONS_READ_CASES)) {
+    it(`reads policies.writePermissions.${field} once through construction and a call`, async () => {
+      const writePermissions: WritePermissionsPolicy = { ...fixture };
+      const reads = countingAccessor(
+        writePermissions,
+        field as keyof WritePermissionsPolicy,
+      );
+      const tool = createConnectorBase(
+        connectorConfig({ policies: { writePermissions } }),
+      );
+      expect(reads()).toBe(1);
+      await callOnce(tool, field);
       expect(reads()).toBe(1);
     });
   }
@@ -816,9 +1385,8 @@ describe('createConnector classification', () => {
     }).tool.requireApproval as ApprovalPredicate;
 
     // #when / #then — a normal call requires approval; a dry-run request
-    // skips the agent pause (the wrapper's dry-run branch never reaches a
-    // side effect); a ctx-less evaluation stays fail-closed (Mastra's
-    // network/durable paths omit the context)
+    // skips the agent pause; a ctx-less evaluation stays fail-closed
+    // (Mastra's network/durable paths omit the context)
     for (const predicate of [destructive, orgGated]) {
       expect(typeof predicate).toBe('function');
       expect(predicate(input, { requestContext: {} })).toBe(true);
@@ -845,6 +1413,109 @@ describe('createConnector classification', () => {
         },
       }),
     ).toThrow(TypeError);
+  });
+});
+
+describe('invokeConnector options', () => {
+  function dryRunConnector() {
+    const execute = vi.fn(async () => ({ simulated: false }));
+    const dryRunExecute = vi.fn(async () => ({ simulated: true }));
+    const tool = createConnector({
+      id: 'direct.options',
+      description: 'Check the invocation options',
+      execute,
+      dryRunExecute,
+      permissions: { sideEffect: 'write', dryRun: true },
+    });
+    return { tool, execute, dryRunExecute };
+  }
+
+  function dryRunRequest(): RequestContext {
+    const requestContext = new RequestContext();
+    requestContext.set(DRY_RUN_CONTEXT_KEY, true);
+    return requestContext;
+  }
+
+  it.each([
+    'requestcontext',
+    'context',
+    'ctx',
+    'request_context',
+    'runtimeContext',
+  ])('refuses the misspelled option %s, which would drop the dry-run request', async (key) => {
+    // #given
+    const { tool, execute, dryRunExecute } = dryRunConnector();
+
+    // #when / #then
+    await expect(
+      invokeConnector(tool, {}, {
+        [key]: dryRunRequest(),
+      } as ConnectorInvocationOptions),
+    ).rejects.toMatchObject({
+      name: 'ConnectorInvocationError',
+      code: 'CONNECTOR_INVOCATION_OPTIONS_INVALID',
+      message: `invokeConnector options has unknown field ${JSON.stringify(key)} (valid fields: requestContext, abortSignal, observe, toolCallId)`,
+    });
+    expect(execute).not.toHaveBeenCalled();
+    expect(dryRunExecute).not.toHaveBeenCalled();
+  });
+
+  it.each<[string, unknown, string]>([
+    ['a string', 'x', '"x"'],
+    ['null', null, 'null'],
+    ['a list', [], 'an array'],
+  ])('refuses %s as the options', async (_label, options, got) => {
+    // #given
+    const { tool, execute } = dryRunConnector();
+
+    // #when / #then
+    await expect(
+      invokeConnector(tool, {}, options as ConnectorInvocationOptions),
+    ).rejects.toMatchObject({
+      code: 'CONNECTOR_INVOCATION_OPTIONS_INVALID',
+      message: `invokeConnector options must be an object (got ${got})`,
+    });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it.each<[string, unknown, string]>([
+    ['a plain object', { 'breakwater.dryRun': true }, 'object'],
+    ['a Map', new Map([['breakwater.dryRun', true]]), 'object'],
+    ['a string', 'ctx', '"ctx"'],
+  ])('refuses %s as the requestContext', async (_label, requestContext, got) => {
+    // #given
+    const { tool, execute, dryRunExecute } = dryRunConnector();
+
+    // #when / #then
+    await expect(
+      invokeConnector(tool, {}, {
+        requestContext,
+      } as ConnectorInvocationOptions),
+    ).rejects.toMatchObject({
+      code: 'CONNECTOR_INVOCATION_OPTIONS_INVALID',
+      message: `invokeConnector requestContext must be a RequestContext when provided (got ${got})`,
+    });
+    expect(execute).not.toHaveBeenCalled();
+    expect(dryRunExecute).not.toHaveBeenCalled();
+  });
+
+  it('still simulates under the correctly spelled requestContext, and runs with no options', async () => {
+    // #given
+    const { tool, execute, dryRunExecute } = dryRunConnector();
+
+    // #when
+    const simulated = await invokeConnector(
+      tool,
+      {},
+      { requestContext: dryRunRequest() },
+    );
+    const real = await invokeConnector(tool, {});
+
+    // #then
+    expect(simulated).toEqual({ simulated: true });
+    expect(real).toEqual({ simulated: false });
+    expect(dryRunExecute).toHaveBeenCalledTimes(1);
+    expect(execute).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -1841,8 +2512,7 @@ describe('custom tool-boundary evaluators', () => {
   });
 
   it('enforces crossWorkflowIsolation end-to-end through policies.evaluators', async () => {
-    // #given — the isolation evaluator registered in the reserved slot; the
-    // caller's scope is runtime-minted into requestContext
+    // #given — the caller's scope is runtime-minted into requestContext
     const audit = new AuditLogger();
     const { tool, execute } = makeConnector({
       inputSchema: z.object({ workflowId: z.string().optional() }),
@@ -2103,7 +2773,7 @@ describe('write permission gate', () => {
   it('requires a grant even under an agent-run context', async () => {
     // #given — an agent-shaped context is forwardable into nested and
     // direct calls, so it is no proof that Mastra's native approval ran for
-    // THIS call; the grant is the only approval token
+    // THIS call
     const { tool, execute } = makeConnector({
       permissions: { sideEffect: 'destructive' },
     });
@@ -2327,7 +2997,7 @@ describe('required-permissions gate', () => {
       { permissions: [...REQUIRED], policyVersion: '\n' },
     ],
     [
-      'a policy version over the 200-character bound',
+      'a policy version over the length bound',
       { permissions: [...REQUIRED], policyVersion: 'v'.repeat(201) },
     ],
     ['a missing policy version', { permissions: [...REQUIRED] }],
@@ -3079,11 +3749,11 @@ describe('idempotency', () => {
     expect(execute).not.toHaveBeenCalled();
   });
 
-  it('treats an empty-string isolation scope as absent (unscoped key)', async () => {
-    // #given — isolationScopeOf's length > 0 guard must fold '' to undefined
+  it('denies an empty-string isolation scope before the store, rather than reading it as unscoped', async () => {
+    // #given — '' is not an opaque non-empty string
     const get = vi.fn(() => undefined);
     const put = vi.fn();
-    const { tool } = makeConnector({
+    const { tool, execute } = makeConnector({
       permissions: { sideEffect: 'write', idempotencyKey: true },
       policies: { idempotencyStore: { get, put } },
     });
@@ -3092,11 +3762,13 @@ describe('idempotency', () => {
     requestContext.set(ISOLATION_SCOPE_CONTEXT_KEY, '');
     const context = { requestContext } as unknown as ToolExecutionContext;
 
-    // #when
-    await run(tool, input, context);
-
-    // #then — the same key as an unscoped call, no scope prefix
-    expect(get).toHaveBeenCalledWith('salesforce.createContact:k1');
+    // #when / #then
+    await expect(run(tool, input, context)).rejects.toMatchObject({
+      name: 'ConnectorPolicyError',
+      code: 'ISOLATION_SCOPE_INVALID',
+    });
+    expect(get).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
   });
 });
 
@@ -3132,7 +3804,7 @@ describe('idempotency composite-key migration', () => {
     return { tool, execute };
   }
 
-  it('keeps the reported legacy collision distinct under v2', async () => {
+  it('keeps a legacy collision distinct under v2', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     try {
       const store = new InMemoryIdempotencyStore();
@@ -3653,7 +4325,7 @@ describe('atomic idempotency (reserve path)', () => {
     });
 
     // #when — the call succeeds (the side effect already happened) and the
-    // reservation is deliberately NOT released...
+    // reservation is NOT released...
     expect(
       await run(tool, input, makeContext({ idempotencyKey: 'k1' })),
     ).toEqual({ ok: true });
@@ -3720,8 +4392,7 @@ describe('atomic idempotency (reserve path)', () => {
   });
 
   it('audits a keyed rate-limit store PRIMITIVE throw exactly once (wrapped, audit-once holds)', async () => {
-    // #given — nothing in the RateLimitStore contract requires Error
-    // instances; a primitive throw must not defeat the audit-once WeakSet
+    // #given — a primitive throw must not defeat the audit-once WeakSet
     const audit = new AuditLogger();
     const store = spyAtomicStore();
     const { tool, execute } = makeConnector({
@@ -3735,7 +4406,7 @@ describe('atomic idempotency (reserve path)', () => {
         idempotencyStore: store,
         rateLimitStore: {
           increment: () => {
-            // deliberately a bare string throw
+            // a bare string throw
             throw 'counter backend down (primitive)';
           },
         },
@@ -3987,8 +4658,7 @@ describe('atomic idempotency (reserve path)', () => {
     failExecute(new Error('salesforce 500'));
     const outcomes = await calls;
     // #then — both callers reject; the reservation is released exactly
-    // once; each caller records its own execute failure (audit-once covers
-    // store errors and denials, not shared execute outcomes)
+    // once; each caller records its own execute failure
     for (const outcome of outcomes) {
       expect(outcome.status).toBe('rejected');
     }
@@ -4035,6 +4705,97 @@ describe('dry-run', () => {
     expect(audit.events()).toMatchObject([
       { decision: 'allowed', detail: { dryRun: true } },
     ]);
+  });
+
+  function contextWithDryRun(value: unknown): ToolExecutionContext {
+    const requestContext = new RequestContext();
+    requestContext.set(DRY_RUN_CONTEXT_KEY, value);
+    return { requestContext } as unknown as ToolExecutionContext;
+  }
+
+  const invalidDryRunValues: [string, unknown, string][] = [
+    ["the string 'true'", 'true', '"true"'],
+    ['1', 1, 'number'],
+    ["the string 'yes'", 'yes', '"yes"'],
+    ["the string '1'", '1', '"1"'],
+    ["the string 'TRUE'", 'TRUE', '"TRUE"'],
+    ['an object', {}, 'object'],
+    ['a list', [], 'object'],
+    ["the string 'false'", 'false', '"false"'],
+    ['0', 0, 'number'],
+    ['an empty string', '', '""'],
+    ['NaN', Number.NaN, 'number'],
+    ['null', null, 'null'],
+  ];
+
+  it.each(
+    invalidDryRunValues,
+  )('denies %s as a dry-run request before any side effect', async (_label, value, got) => {
+    // #given — a write connector that needs no grant and supports dry-run
+    const audit = new AuditLogger();
+    const { tool, execute, dryRunExecute } = makeDryRunnable({
+      permissions: { sideEffect: 'write', dryRun: true },
+      policies: { audit },
+    });
+
+    // #when / #then
+    await expect(
+      run(tool, input, contextWithDryRun(value)),
+    ).rejects.toMatchObject({
+      name: 'ConnectorPolicyError',
+      code: 'DRY_RUN_INVALID',
+      policyKind: 'dry-run',
+      retryable: false,
+      reason: `requestContext 'breakwater.dryRun' must be a boolean when present (got ${got})`,
+    });
+    expect(execute).not.toHaveBeenCalled();
+    expect(dryRunExecute).not.toHaveBeenCalled();
+    expect(audit.events()).toMatchObject([
+      { decision: 'denied', decisionCode: 'DRY_RUN_INVALID' },
+    ]);
+  });
+
+  it("denies 'true' on a connector without dry-run support, and on a granted approval connector", async () => {
+    // #given
+    const plain = makeConnector({ permissions: { sideEffect: 'write' } });
+    const granted = makeDryRunnable({
+      permissions: {
+        sideEffect: 'write',
+        dryRun: true,
+        requiresApproval: true,
+      },
+    });
+    const grantedContext = makeContext({
+      approved: ['salesforce.createContact'],
+    });
+    grantedContext.requestContext?.set(DRY_RUN_CONTEXT_KEY, 'true');
+
+    // #when / #then
+    await expect(
+      run(plain.tool, input, contextWithDryRun('true')),
+    ).rejects.toMatchObject({ code: 'DRY_RUN_INVALID' });
+    await expect(
+      run(granted.tool, input, grantedContext),
+    ).rejects.toMatchObject({ code: 'DRY_RUN_INVALID' });
+    expect(plain.execute).not.toHaveBeenCalled();
+    expect(granted.execute).not.toHaveBeenCalled();
+  });
+
+  it('keeps true as a simulation and false as a real call', async () => {
+    // #given
+    const { tool, execute, dryRunExecute } = makeDryRunnable({
+      permissions: { sideEffect: 'write', dryRun: true },
+    });
+
+    // #when
+    const simulated = await run(tool, input, contextWithDryRun(true));
+    const real = await run(tool, input, contextWithDryRun(false));
+
+    // #then
+    expect(simulated).toEqual({ ok: true, simulated: true });
+    expect(real).toEqual({ ok: true, simulated: false });
+    expect(dryRunExecute).toHaveBeenCalledTimes(1);
+    expect(execute).toHaveBeenCalledTimes(1);
   });
 
   it('exempts dry-run requests from the compiled native approval pause', () => {
@@ -4257,7 +5018,7 @@ describe('rate limit', () => {
   });
 
   it('does not consume budget on an idempotent replay', async () => {
-    // #given — budget 1; the same key runs then replays twice
+    // #given — budget 1; the same key runs then replays
     const { tool, execute } = makeConnector({
       permissions: {
         sideEffect: 'write',
@@ -4276,7 +5037,7 @@ describe('rate limit', () => {
       input,
       makeContext({ idempotencyKey: 'k1' }),
     );
-    // #then — replays served from the store, budget untouched
+    // #then — replay served from the store, budget untouched
     expect(replayed).toEqual({ ok: true });
     expect(execute).toHaveBeenCalledTimes(1);
   });
@@ -4349,6 +5110,73 @@ describe('InMemoryIdempotencyStore', () => {
     expect(store.get('k2')).toBeUndefined();
     expect(store.get('k1')).toEqual({ result: 1 });
     expect(store.get('k3')).toEqual({ result: 3 });
+  });
+
+  it.each<[string, unknown, string]>([
+    ['0, which evicts every record it writes', 0, '0'],
+    ['a negative number', -1, '-1'],
+    ['a fraction', 1.5, '1.5'],
+    ['NaN, which never evicts', Number.NaN, 'NaN'],
+    ['Infinity', Number.POSITIVE_INFINITY, 'Infinity'],
+    ["the string '0'", '0', '"0"'],
+    ['an empty string', '', '""'],
+    ['false', false, 'boolean'],
+    ['an empty list', [], 'object'],
+  ])('refuses %s as maxEntries', (_label, maxEntries, got) => {
+    // #when / #then
+    expect(
+      () => new InMemoryIdempotencyStore({ maxEntries: maxEntries as number }),
+    ).toThrow(
+      new TypeError(
+        `InMemoryIdempotencyStore maxEntries must be a positive safe integer (got ${got})`,
+      ),
+    );
+  });
+
+  it.each([
+    'maxentries',
+    'maxEntry',
+    'max_entries',
+    'capacity',
+  ])('refuses the misspelled option %s, which would fall to the default capacity', (key) => {
+    // #when / #then
+    expect(
+      () =>
+        new InMemoryIdempotencyStore({ [key]: 5000 } as {
+          maxEntries?: number;
+        }),
+    ).toThrow(
+      new TypeError(
+        `InMemoryIdempotencyStore options has unknown field ${JSON.stringify(key)} (valid fields: maxEntries)`,
+      ),
+    );
+  });
+
+  it('keeps a correctly spelled capacity above the default', () => {
+    // #given
+    const store = new InMemoryIdempotencyStore({ maxEntries: 5000 });
+    // #when
+    for (let index = 0; index <= 1000; index += 1) {
+      store.put(`k${index}`, { result: index });
+    }
+    // #then — the first key outlives the 1000-record default
+    expect(store.get('k0')).toEqual({ result: 0 });
+  });
+
+  it('replays a keyed call under maxEntries 1', async () => {
+    // #given
+    const { tool, execute } = makeConnector({
+      permissions: { sideEffect: 'write', idempotencyKey: true },
+      policies: {
+        idempotencyStore: new InMemoryIdempotencyStore({ maxEntries: 1 }),
+      },
+    });
+    const context = () => makeContext({ idempotencyKey: 'order-1' });
+    // #when
+    await run(tool, input, context());
+    await run(tool, input, context());
+    // #then
+    expect(execute).toHaveBeenCalledTimes(1);
   });
 
   it('reserves once, reports the holder as pending, and replays after put', () => {
@@ -4485,8 +5313,7 @@ describe('Mastra integration edges', () => {
       permissions: { sideEffect: 'read' },
     });
 
-    // #when / #then — ordinary values still delegate to the host schema;
-    // the private carrier optimization applies only to wrapper execution
+    // #when / #then — ordinary values still delegate to the host schema
     const validation = await tool.outputSchema?.['~standard'].validate('raw');
     expect(validation).toEqual({ value: 'raw!' });
   });
@@ -4634,6 +5461,76 @@ describe('audit attribution', () => {
       },
     });
   });
+
+  it.each<[string, unknown, Record<string, unknown> | undefined]>([
+    [
+      'a numeric tenant id',
+      { agentId: 'agent-1', entryPath: 'http-start', tenantId: 42 },
+      { agentId: 'agent-1', entryPath: 'http-start' },
+    ],
+    [
+      'a misspelled tenant id',
+      { agentId: 'agent-1', entryPath: 'http-start', tenantID: 'acme' },
+      { agentId: 'agent-1', entryPath: 'http-start' },
+    ],
+    [
+      'an empty tenant id',
+      { agentId: 'agent-1', entryPath: 'http-start', tenantId: '' },
+      { agentId: 'agent-1', entryPath: 'http-start' },
+    ],
+    ['a numeric agent id', { agentId: 42, entryPath: 'http-start' }, undefined],
+    ['a JSON string', '{"agentId":"agent-1"}', undefined],
+    ['a list', [], undefined],
+    ['null', null, undefined],
+  ])('records an error event for %s and still executes the call', async (_label, auditContext, correlation) => {
+    // #given
+    const audit = new AuditLogger();
+    const { tool, execute } = makeConnector({ policies: { audit } });
+
+    // #when
+    await run(tool, input, makeContext({ auditContext }));
+
+    // #then — the call is decided as before; the loss is recorded first
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(audit.events()).toHaveLength(2);
+    expect(audit.events()[0]).toEqual({
+      timestamp: expect.any(String),
+      actor: null,
+      action: 'audit.context',
+      resource: 'salesforce.createContact',
+      decision: 'error',
+      reason: "request context 'breakwater.auditContext' is malformed",
+      ...(correlation === undefined ? {} : { detail: correlation }),
+    });
+    expect(audit.events()[1]).toMatchObject({
+      decision: 'allowed',
+      decisionCode: 'CONNECTOR_ALLOWED',
+    });
+  });
+
+  it('records no error event for an undefined optional field', async () => {
+    // #given
+    const audit = new AuditLogger();
+    const { tool } = makeConnector({ policies: { audit } });
+
+    // #when
+    await run(
+      tool,
+      input,
+      makeContext({
+        auditContext: {
+          agentId: 'agent-1',
+          entryPath: 'http-start',
+          purpose: undefined,
+        },
+      }),
+    );
+
+    // #then
+    expect(audit.events().map(({ action }) => action)).toEqual([
+      'connector.execute',
+    ]);
+  });
 });
 
 describe('isolation scope (multi-tenant key segmentation)', () => {
@@ -4707,7 +5604,7 @@ describe('isolation scope (multi-tenant key segmentation)', () => {
     ).resolves.toEqual({ ok: true });
   });
 
-  it('absent scope preserves the single-tenant keys exactly (no flag to forget)', async () => {
+  it('absent scope replays a same-key call (no flag to forget)', async () => {
     // #given — no scope anywhere: the OSS default
     const { tool, execute } = makeConnector({
       permissions: { sideEffect: 'write', idempotencyKey: true },
@@ -4718,14 +5615,13 @@ describe('isolation scope (multi-tenant key segmentation)', () => {
     await run(tool, input, scopedContext({ idempotencyKey: 'k1' }));
     await run(tool, input, scopedContext({ idempotencyKey: 'k1' }));
 
-    // #then — replayed, exactly as before the scope feature existed
+    // #then — replayed
     expect(execute).toHaveBeenCalledTimes(1);
   });
 
   it('a tenantIsolation-policied connector denies a scope-less call INCLUDING dry-run', async () => {
     // #given — the platform's policy set includes the evaluator; the dry-run
-    // branch returns before idempotency/rate-limit, so only a gates-loop
-    // evaluator can bind simulations
+    // branch returns before idempotency/rate-limit
     const dryRunExecute = vi.fn(async () => ({ ok: true }));
     const { tool, execute } = makeConnector({
       permissions: { sideEffect: 'write', dryRun: true },
@@ -4754,9 +5650,113 @@ describe('isolation scope (multi-tenant key segmentation)', () => {
     ).resolves.toEqual({ ok: true });
     expect(dryRunExecute).toHaveBeenCalledTimes(1);
   });
+
+  function contextWithScope(
+    scope: unknown,
+    idempotencyKey?: string,
+  ): ToolExecutionContext {
+    const requestContext = new RequestContext();
+    requestContext.set(ISOLATION_SCOPE_CONTEXT_KEY, scope);
+    if (idempotencyKey !== undefined) {
+      requestContext.set(IDEMPOTENCY_KEY_CONTEXT_KEY, idempotencyKey);
+    }
+    return { requestContext } as unknown as ToolExecutionContext;
+  }
+
+  const invalidScopes: [string, unknown, string][] = [
+    ['a number', 42, 'number'],
+    ['zero', 0, 'number'],
+    ['NaN', Number.NaN, 'number'],
+    ['an object', { id: 'acme' }, 'object'],
+    ['a list', ['acme'], 'object'],
+    ['true', true, 'boolean'],
+    ['false', false, 'boolean'],
+    ['an empty string', '', '""'],
+    ['null', null, 'null'],
+  ];
+
+  it.each(
+    invalidScopes,
+  )('denies %s as the isolation scope before any replay, budget or grant', async (_label, scope, got) => {
+    // #given — two tenants share one business key and a 1/min budget
+    const audit = new AuditLogger();
+    const { tool, execute } = makeConnector({
+      permissions: {
+        sideEffect: 'write',
+        idempotencyKey: true,
+        rateLimit: '1/min',
+      },
+      policies: {
+        audit,
+        idempotencyStore: new InMemoryIdempotencyStore(),
+        rateLimitStore: new InMemoryRateLimitStore(),
+      },
+    });
+
+    // #when / #then
+    await expect(
+      run(tool, input, contextWithScope(scope, 'invoice-1')),
+    ).rejects.toMatchObject({
+      name: 'ConnectorPolicyError',
+      code: 'ISOLATION_SCOPE_INVALID',
+      policyKind: 'tenant-isolation',
+      retryable: false,
+      reason: `requestContext 'breakwater.isolationScope' must be an opaque non-empty string when present (got ${got})`,
+    });
+    expect(execute).not.toHaveBeenCalled();
+    expect(audit.events()).toMatchObject([
+      { decision: 'denied', decisionCode: 'ISOLATION_SCOPE_INVALID' },
+    ]);
+  });
+
+  it('keeps numeric tenant scopes from replaying one another by refusing both', async () => {
+    // #given — the value pair the sweep replayed across tenants
+    const { tool, execute } = makeConnector({
+      permissions: { sideEffect: 'write', idempotencyKey: true },
+      policies: { idempotencyStore: new InMemoryIdempotencyStore() },
+    });
+
+    // #when / #then
+    for (const scope of [42, 43]) {
+      await expect(
+        run(tool, input, contextWithScope(scope, 'invoice-1')),
+      ).rejects.toMatchObject({ code: 'ISOLATION_SCOPE_INVALID' });
+    }
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('denies a malformed scope ahead of a grant the scope-less identity would match', async () => {
+    // #given — an approval connector whose grant and identity carry no scope
+    const { tool, execute } = makeConnector({
+      permissions: { sideEffect: 'write', requiresApproval: true },
+    });
+    const context = makeContext({ approved: ['salesforce.createContact'] });
+    context.requestContext?.set(ISOLATION_SCOPE_CONTEXT_KEY, 42);
+
+    // #when / #then
+    await expect(run(tool, input, context)).rejects.toMatchObject({
+      code: 'ISOLATION_SCOPE_INVALID',
+    });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('still accepts an opaque blank scope, which is a non-empty string', async () => {
+    // #given
+    const { tool, execute } = makeConnector({
+      permissions: { sideEffect: 'write', idempotencyKey: true },
+      policies: { idempotencyStore: new InMemoryIdempotencyStore() },
+    });
+
+    // #when
+    await run(tool, input, contextWithScope(' ', 'invoice-1'));
+    await run(tool, input, contextWithScope('acme', 'invoice-1'));
+
+    // #then — two scopes, two executions
+    expect(execute).toHaveBeenCalledTimes(2);
+  });
 });
 
-describe('in-memory store under a minted isolation scope (D5)', () => {
+describe('in-memory store under a minted isolation scope', () => {
   it('warns once per idempotency store instance when a scope is present', async () => {
     // #given
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
@@ -4843,7 +5843,7 @@ describe('in-memory store under a minted isolation scope (D5)', () => {
 
 describe('createConnector egress-fetch runtime', () => {
   // The third execute argument: a fetch bound to the manifest's declared
-  // egress. Structural response mock (test tsconfig is lib-ES2022-only).
+  // egress.
   function vendorFetch(status = 200) {
     const calls: { url: string; init: Record<string, unknown> | undefined }[] =
       [];
@@ -4913,8 +5913,8 @@ describe('createConnector egress-fetch runtime', () => {
     ]);
   });
 
-  it('audits the guard-boundary denial even when execute swallows it (DL-002)', async () => {
-    // #given — DL-002 records the egress denial at the guard boundary, not
+  it('audits the guard-boundary denial even when execute swallows it', async () => {
+    // #given — the egress denial is recorded at the guard boundary, not
     // where execute chooses to handle it. A connector that catches its own
     // runtime.fetch rejection would otherwise suppress the record; this pins
     // that it cannot. execute swallows the ConnectorPolicyError and returns a
@@ -4941,8 +5941,7 @@ describe('createConnector egress-fetch runtime', () => {
     expect(result).toEqual({ ok: true });
     expect(vendor.calls).toHaveLength(0);
     // ...yet the guard-boundary 'denied' audit survived the swallow: exactly
-    // one, carrying the undeclared host and hop (a later 'allowed' record from
-    // the normal return is expected and deliberately not asserted here).
+    // one, carrying the undeclared host and hop.
     const denials = audit
       .events()
       .filter((event) => event.decision === 'denied');
@@ -5020,10 +6019,7 @@ describe('createConnector egress-fetch runtime', () => {
 
 describe('_background model-override defense (DL-005)', () => {
   // These connectors declare NO stripping inputSchema, so a `_background` arg
-  // reaches gatedExecute — the paths this check has teeth on (a schema'd
-  // connector on the agent path already has `_background` stripped by core's
-  // cleanedArgs and by Mastra's schema validation; the check is belt-and-braces
-  // there and the real guard on no-schema / passthrough / direct calls).
+  // reaches gatedExecute.
   function bgWriteConnector(audit?: AuditLogger) {
     const execute = vi.fn(async () => ({ ok: true }));
     const tool = createConnector({
@@ -5121,7 +6117,7 @@ describe('_background model-override defense (DL-005)', () => {
   });
 
   it('lets a read-only connector that OPTS IN receive _background args', async () => {
-    // #given — a read-only tool that deliberately supports background
+    // #given — a read-only tool that supports background
     const execute = vi.fn(async () => ({ ok: true }));
     const tool = createConnector({
       id: 'search.web',
@@ -5165,26 +6161,290 @@ describe('_background model-override defense (DL-005)', () => {
     expect(execute).toHaveBeenCalledTimes(1);
   });
 
-  // HONESTY (QA): every test above exercises the DIRECT/nested path — args flow
-  // straight into gatedExecute, where the presence check has teeth. The AGENT
-  // path is different, and NOT what these tests cover: core deletes `_background`
-  // from the tool-call args before dispatch AND resolves eligibility itself. So
-  // the breakwater `_background` reads catch nothing on the agent path; this test
-  // pins the mechanism that makes it core's responsibility, against core's REAL
-  // resolver, so the suite does not manufacture false confidence.
-  it("is INERT on the agent path: core's resolveBackgroundConfig keeps a no-background-config connector foreground even under an LLM _background:enabled override (baseEnabled gate)", () => {
-    // #given — a breakwater connector sets NO tool background config, so
-    // core's baseEnabled (agent/tool `enabled`) resolves false
+  // On the DIRECT/nested path args flow straight into gatedExecute. On the
+  // AGENT path core deletes `_background` from the tool-call args before
+  // dispatch AND resolves eligibility itself; this test pins the mechanism
+  // that makes it core's responsibility, against core's REAL resolver, so the
+  // suite does not manufacture false confidence.
+  it("core's resolveBackgroundConfig keeps a no-background-config connector foreground even under an LLM _background:enabled override (baseEnabled gate)", () => {
+    // #given — with NO tool background config, core's baseEnabled
+    // (agent/tool `enabled`) resolves false
     // #when — the model asks for background via the LLM override
     const resolved = resolveBackgroundConfig({
       llmBgOverrides: { enabled: true },
       toolName: 'crm.assign',
-      // toolConfig/agentConfig omitted — exactly what createConnector produces
+      // toolConfig/agentConfig omitted
     });
     // #then — core refuses to background an ineligible tool regardless of the
-    // override, so the breakwater _background presence check is defense-in-depth
-    // for direct/nested calls only (the grant is the real agent-path boundary)
+    // override
     expect(resolved.runInBackground).toBe(false);
+  });
+});
+
+const TERMINAL_TASK_STATUSES = new Set([
+  'completed',
+  'failed',
+  'cancelled',
+  'timed_out',
+]);
+
+const scriptedUsage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
+
+// Calls `toolName` with `args` on its first stream, then answers with text.
+function toolCallModel(toolName: string, args: unknown): MastraModelConfig {
+  let streams = 0;
+  return {
+    specificationVersion: 'v2',
+    provider: 'breakwater-test',
+    modelId: 'background-task',
+    supportedUrls: {},
+    doGenerate: async () => {
+      throw new Error('doGenerate is not scripted');
+    },
+    doStream: async () => {
+      streams += 1;
+      const callsTool = streams === 1;
+      return {
+        stream: new ReadableStream({
+          start(controller) {
+            controller.enqueue({ type: 'stream-start', warnings: [] });
+            if (callsTool) {
+              controller.enqueue({
+                type: 'tool-call',
+                toolCallId: 'call-1',
+                toolName,
+                input: JSON.stringify(args),
+              });
+              controller.enqueue({
+                type: 'finish',
+                finishReason: 'tool-calls',
+                usage: scriptedUsage,
+              });
+            } else {
+              controller.enqueue({ type: 'text-start', id: 'answer' });
+              controller.enqueue({
+                type: 'text-delta',
+                id: 'answer',
+                delta: 'done',
+              });
+              controller.enqueue({ type: 'text-end', id: 'answer' });
+              controller.enqueue({
+                type: 'finish',
+                finishReason: 'stop',
+                usage: scriptedUsage,
+              });
+            }
+            controller.close();
+          },
+        }),
+      };
+    },
+  };
+}
+
+// Runs one tool call through Mastra's real standard agent loop on a Mastra
+// with background tasks enabled, and returns the terminal status of every
+// background task it created.
+async function runOnStandardAgentLoop(options: {
+  tool: Connector;
+  args: Record<string, unknown>;
+  agentBackgroundTools?: boolean;
+  requestContext?: RequestContext;
+}): Promise<string[]> {
+  const agent = new Agent({
+    id: 'raw',
+    name: 'raw',
+    instructions: 'Call the tool.',
+    model: toolCallModel('crm_assign', options.args),
+    tools: { crm_assign: options.tool },
+    ...(options.agentBackgroundTools
+      ? { backgroundTasks: { tools: 'all' as const } }
+      : {}),
+  });
+  const mastra = new Mastra({
+    agents: { raw: agent },
+    storage: new InMemoryStore(),
+    backgroundTasks: { enabled: true },
+    logger: false,
+  });
+  const manager = mastra.backgroundTaskManager;
+  if (manager === undefined) throw new Error('no background task manager');
+  try {
+    const output = await mastra.getAgent('raw').stream('go', {
+      requestContext: options.requestContext ?? new RequestContext(),
+      maxSteps: 3,
+    });
+    for await (const _chunk of output.fullStream) {
+      // Drain: the loop dispatches the tool call while the stream is read.
+    }
+    for (let attempt = 0; attempt < 250; attempt += 1) {
+      const { tasks } = await manager.listTasks({});
+      if (tasks.every((task) => TERMINAL_TASK_STATUSES.has(task.status))) {
+        return tasks.map((task) => task.status);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    throw new Error('a background task did not reach a terminal status');
+  } finally {
+    await manager.shutdown();
+  }
+}
+
+function recordingConnector(
+  permissions: ConnectorConfig['permissions'],
+  extra: Partial<ConnectorConfig> = {},
+) {
+  const audit = new AuditLogger();
+  const seen: { isBackgroundTask: boolean }[] = [];
+  const execute = vi.fn(
+    async (_input: unknown, context: ToolExecutionContext) => {
+      seen.push({ isBackgroundTask: context.agent?.isBackgroundTask === true });
+      return { ok: true };
+    },
+  );
+  const tool = createConnector({
+    id: 'crm.assign',
+    description: 'Assign a CRM record',
+    execute,
+    permissions,
+    policies: { audit },
+    ...extra,
+  });
+  const decisions = () =>
+    audit.events().map((event) => `${event.decision}:${event.decisionCode}`);
+  return { tool, execute, seen, decisions };
+}
+
+describe('background-task refusal on the standard agent loop', () => {
+  it('refuses a write connector an agent makes background-eligible', async () => {
+    // #given — tools: 'all' runs every tool as a deferred background task
+    const { tool, execute, decisions } = recordingConnector({
+      sideEffect: 'write',
+    });
+    // #when
+    const statuses = await runOnStandardAgentLoop({
+      tool,
+      args: { topic: 'x' },
+      agentBackgroundTools: true,
+    });
+    // #then
+    expect(statuses).toEqual(['failed']);
+    expect(execute).not.toHaveBeenCalled();
+    expect(decisions()).toEqual(['denied:BACKGROUND_TASK_DENIED']);
+  });
+
+  it('refuses each attempt of a task the model gives retries', async () => {
+    // #given — Mastra retries a refused task up to the model's maxRetries
+    const { tool, execute, decisions } = recordingConnector({
+      sideEffect: 'write',
+    });
+    // #when
+    const statuses = await runOnStandardAgentLoop({
+      tool,
+      args: { topic: 'x', _background: { maxRetries: 2 } },
+      agentBackgroundTools: true,
+    });
+    // #then
+    expect(statuses).toEqual(['failed']);
+    expect(execute).not.toHaveBeenCalled();
+    expect(decisions()).toEqual([
+      'denied:BACKGROUND_TASK_DENIED',
+      'denied:BACKGROUND_TASK_DENIED',
+      'denied:BACKGROUND_TASK_DENIED',
+    ]);
+  });
+
+  it('refuses the task when the model sends _background: null to a connector without a schema', async () => {
+    // #given — Mastra keeps a falsy _background, then its injected schema
+    // drops the null before the task executes
+    const { tool, execute, decisions } = recordingConnector({
+      sideEffect: 'write',
+    });
+    // #when
+    const statuses = await runOnStandardAgentLoop({
+      tool,
+      args: { topic: 'x', _background: null },
+      agentBackgroundTools: true,
+    });
+    // #then
+    expect(statuses).toEqual(['failed']);
+    expect(execute).not.toHaveBeenCalled();
+    expect(decisions()).toEqual(['denied:BACKGROUND_TASK_DENIED']);
+  });
+
+  it("runs a call the model keeps in the foreground with _background: { disposition: 'foreground' }", async () => {
+    // #given
+    const { tool, seen, decisions } = recordingConnector({
+      sideEffect: 'write',
+    });
+    // #when
+    const statuses = await runOnStandardAgentLoop({
+      tool,
+      args: { topic: 'x', _background: { disposition: 'foreground' } },
+      agentBackgroundTools: true,
+    });
+    // #then — Mastra removes the truthy override and dispatches inline
+    expect(statuses).toEqual([]);
+    expect(seen).toEqual([{ isBackgroundTask: false }]);
+    expect(decisions()).toEqual(['allowed:CONNECTOR_ALLOWED']);
+  });
+
+  it('runs a read connector that opts in as a background task', async () => {
+    // #given
+    const { tool, seen, decisions } = recordingConnector({
+      sideEffect: 'read',
+      background: true,
+    });
+    // #when
+    const statuses = await runOnStandardAgentLoop({
+      tool,
+      args: { topic: 'x' },
+      agentBackgroundTools: true,
+    });
+    // #then
+    expect(statuses).toEqual(['completed']);
+    expect(seen).toEqual([{ isBackgroundTask: true }]);
+    expect(decisions()).toEqual(['allowed:CONNECTOR_ALLOWED']);
+  });
+
+  it('refuses a read connector without the opt-in after its tool.background is assigned', async () => {
+    // #given — the manifest captured at construction has no opt-in
+    const { tool, execute, decisions } = recordingConnector({
+      sideEffect: 'read',
+    });
+    tool.background = { enabled: true };
+    // #when
+    const statuses = await runOnStandardAgentLoop({
+      tool,
+      args: { topic: 'x' },
+    });
+    // #then
+    expect(statuses).toEqual(['failed']);
+    expect(execute).not.toHaveBeenCalled();
+    expect(decisions()).toEqual(['denied:BACKGROUND_TASK_DENIED']);
+  });
+
+  it('refuses a dry-run request dispatched as a background task', async () => {
+    // #given
+    const dryRunExecute = vi.fn(async () => ({ ok: true }));
+    const { tool, execute, decisions } = recordingConnector(
+      { sideEffect: 'write', dryRun: true },
+      { dryRunExecute },
+    );
+    const requestContext = new RequestContext();
+    requestContext.set(DRY_RUN_CONTEXT_KEY, true);
+    // #when
+    const statuses = await runOnStandardAgentLoop({
+      tool,
+      args: { topic: 'x' },
+      agentBackgroundTools: true,
+      requestContext,
+    });
+    // #then — the refusal precedes the dry-run branch
+    expect(statuses).toEqual(['failed']);
+    expect(dryRunExecute).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
+    expect(decisions()).toEqual(['denied:BACKGROUND_TASK_DENIED']);
   });
 });
 
@@ -5285,6 +6545,18 @@ describe('connector decision taxonomy', () => {
       policyKind: 'background',
       config: {},
       input: { _background: { enabled: false } },
+    },
+    {
+      label: 'background task',
+      code: 'BACKGROUND_TASK_DENIED',
+      policyKind: 'background',
+      config: {},
+      context: () => {
+        const context = makeContext({ agent: true });
+        (context.agent as { isBackgroundTask?: boolean }).isBackgroundTask =
+          true;
+        return context;
+      },
     },
     {
       label: 'missing workflow scope',
@@ -6195,6 +7467,46 @@ describe('runtime fetch decision projection', () => {
         policyKind: 'egress-fetch',
         retryable: false,
         detail: { host, hop },
+      },
+    ]);
+  });
+
+  it('refuses a redirect mode from JSON before the base fetch and audits the denial', async () => {
+    // #given
+    const audit = new AuditLogger();
+    const fetch = vi.fn(async () => ({
+      status: 302,
+      headers: { get: () => 'http://169.254.169.254/latest/meta-data/' },
+    }));
+    const tool = createConnector({
+      id: 'taxonomy.redirect',
+      description: 'Forward fetch options from data',
+      permissions: { sideEffect: 'read', egress: ['api.example.com'] },
+      policies: { audit, fetch },
+      execute: async (_input, _context, runtime) =>
+        runtime.fetch(
+          'https://api.example.com/start',
+          JSON.parse('{"redirect":["follow"]}'),
+        ),
+    });
+    // #when
+    const error = await run(tool, {}).catch((failure: unknown) => failure);
+    // #then
+    expect(error).toBeInstanceOf(ConnectorPolicyError);
+    expect(error).toMatchObject({
+      code: 'EGRESS_INPUT_INVALID',
+      policyKind: 'egress-fetch',
+      retryable: false,
+      details: { host: 'api.example.com', hop: 0 },
+    });
+    expect(fetch).not.toHaveBeenCalled();
+    expect(audit.events()).toMatchObject([
+      {
+        decision: 'denied',
+        decisionCode: 'EGRESS_INPUT_INVALID',
+        policyKind: 'egress-fetch',
+        retryable: false,
+        detail: { host: 'api.example.com', hop: 0 },
       },
     ]);
   });

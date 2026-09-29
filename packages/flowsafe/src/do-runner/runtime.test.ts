@@ -605,9 +605,9 @@ describe('FS8 D1 authoritative start state', () => {
       await expect(
         f.runtime.authoritativeStartState('d1-workflow', 'd1-run'),
       ).rejects.toThrow(RunStateUnreadableError);
-      const missingStorage = new Mastra({ logger: false });
-      vi.spyOn(missingStorage, 'getStorage').mockReturnValue(undefined);
-      vi.spyOn(f.workflow, 'mastra', 'get').mockReturnValue(missingStorage);
+      const ownMastra = f.workflow.mastra;
+      assert(ownMastra);
+      vi.spyOn(ownMastra, 'getStorage').mockReturnValue(undefined);
       await expect(
         f.runtime.authoritativeStartState('d1-workflow', 'd1-run'),
       ).rejects.toThrow(RunStateUnreadableError);
@@ -706,9 +706,9 @@ describe('FS8 D1 authoritative start state', () => {
     const actual = await d1Fixture('prefixed');
     try {
       await actual.seed();
-      vi.spyOn(f.workflow, 'mastra', 'get').mockReturnValue(
-        new Mastra({ storage: actual.storage, logger: false }),
-      );
+      const ownMastra = f.workflow.mastra;
+      assert(ownMastra);
+      vi.spyOn(ownMastra, 'getStorage').mockReturnValue(actual.storage);
       const nominal = vi.spyOn(f.capability, 'readSnapshot');
       expect(
         await f.runtime.authoritativeStartState('d1-workflow', 'd1-run'),
@@ -2821,10 +2821,8 @@ describe('RunnerRuntime host pubsub identity', () => {
       { startIdempotency: 'none', pubsub, executionFence: 'none' },
     );
 
-    // #then — the SAME instance is reachable, so the agent's createRun
-    // sites and observe() replay share one feed. Delete the thread in init.ts
-    // and this fails: runtime.pubsub is undefined, so the two createRun sites
-    // each let core default a separate emitter — the bug this seam prevents.
+    // #then — the SAME instance is reachable. Delete the thread in init.ts and
+    // this fails.
     expect(runtime.pubsub).toBe(pubsub);
   });
 
@@ -2835,7 +2833,7 @@ describe('RunnerRuntime host pubsub identity', () => {
       { startIdempotency: 'none', executionFence: 'none' },
     );
 
-    // #then — undefined, the polling-fallback posture existing hosts keep
+    // #then — undefined, the polling-fallback posture
     expect(runtime.pubsub).toBeUndefined();
   });
 });
@@ -3921,8 +3919,7 @@ describe('RunnerRuntime', () => {
       { startIdempotency: 'none', executionFence: 'none' },
     );
 
-    // #when — unreserved-character id, including the '.' that only the bare
-    // dot-segments '.' and '..' are barred from
+    // #when — unreserved-character id, including '.'
     createWorkflow({
       id: 'demo-approval.v2_~ok',
       inputSchema: z.object({}),
@@ -3965,6 +3962,262 @@ describe('RunnerRuntime', () => {
     expect(() => runtime.registerAgent(runtimeAgent('late'))).toThrowError(
       /before the first run/,
     );
+  });
+
+  it('refuses a workflow another Mastra registered after the first run', async () => {
+    // #given a workflow whose runtime built its Mastra on the first run
+    const { createWorkflow, createStep, runtime } = init(
+      { storage: new InMemoryStore() },
+      { startIdempotency: 'none', executionFence: 'none' },
+    );
+    const step = createStep({
+      id: 'noop',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+      execute: async () => ({}),
+    });
+    const workflow = createWorkflow({
+      id: 'wf',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+    })
+      .then(step)
+      .commit();
+    const runId = crypto.randomUUID();
+    await expect(
+      runtime.start('wf', { runId, inputData: {} }),
+    ).resolves.toMatchObject({ status: 'success' });
+
+    // #when another Mastra registers the same workflow object
+    new Mastra({
+      storage: new InMemoryStore(),
+      logger: false,
+      workflows: { wf: workflow },
+    });
+
+    // #then the runtime refuses it rather than read that Mastra's storage
+    const refusal =
+      "RunnerRuntime: workflow 'wf' is not registered on this runtime's Mastra";
+    await expect(runtime.status('wf', runId)).rejects.toThrow(refusal);
+    await expect(
+      runtime.start('wf', { runId: crypto.randomUUID(), inputData: {} }),
+    ).rejects.toThrow(refusal);
+  });
+
+  it('refuses a workflow object on the runtime whose Mastra no longer holds it', async () => {
+    // #given one workflow object registered on two runtimes, run on the first
+    const first = init(
+      { storage: new InMemoryStore() },
+      { startIdempotency: 'none', executionFence: 'none' },
+    );
+    const step = first.createStep({
+      id: 'noop',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+      execute: async () => ({}),
+    });
+    const workflow = first
+      .createWorkflow({
+        id: 'shared',
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+      })
+      .then(step)
+      .commit();
+    const second = init(
+      { storage: new InMemoryStore() },
+      { startIdempotency: 'none', executionFence: 'none' },
+    );
+    second.runtime.register(workflow);
+    const runId = crypto.randomUUID();
+    await expect(
+      first.runtime.start('shared', { runId, inputData: {} }),
+    ).resolves.toMatchObject({ status: 'success' });
+
+    // #when the second runtime's first operation builds its Mastra, which
+    // registers the object there
+    await expect(second.runtime.status('shared', runId)).resolves.toBeNull();
+
+    // #then the first runtime refuses the object rather than read the second
+    // runtime's storage
+    await expect(first.runtime.status('shared', runId)).rejects.toThrow(
+      "RunnerRuntime: workflow 'shared' is not registered on this runtime's Mastra",
+    );
+  });
+});
+
+describe('RunnerRuntime ownership changes during operations', () => {
+  const refusal = /is not registered on this runtime's Mastra/;
+
+  function repoint(workflow: Parameters<RunnerRuntime['register']>[0]) {
+    const storage = new InMemoryStore();
+    const foreign = new Mastra({
+      storage,
+      logger: false,
+      workflows: { [workflow.id]: workflow },
+    });
+    const getStorage = vi.spyOn(foreign, 'getStorage');
+    const row = async (runId: string) =>
+      (await storage.getStore('workflows'))?.loadWorkflowSnapshot({
+        workflowName: workflow.id,
+        runId,
+      });
+    return { getStorage, row };
+  }
+
+  async function expectRefusedWithoutForeignStorage(
+    result: unknown,
+    foreign: ReturnType<typeof repoint> | undefined,
+    runId: string,
+  ) {
+    assert(foreign);
+    expect(result).toBeInstanceOf(Error);
+    expect((result as Error).message).toMatch(refusal);
+    expect(foreign.getStorage).not.toHaveBeenCalled();
+    expect(await foreign.row(runId)).toBeNull();
+  }
+
+  it('refuses start repointed after entry before storage capture', async () => {
+    const f = await d3RuntimeFixture('custom');
+    const runId = 'start-after-entry';
+    try {
+      const pending = f.runtime.start(f.workflow.id, f.options(runId));
+      const foreign = repoint(f.workflow);
+      const result = await pending.catch((error: unknown) => error);
+      await expectRefusedWithoutForeignStorage(result, foreign, runId);
+    } finally {
+      f.close();
+    }
+  });
+
+  it('refuses resume repointed after entry before storage capture', async () => {
+    const f = await d3RuntimeFixture('custom');
+    const runId = 'resume-after-entry';
+    try {
+      await f.runtime.start(f.workflow.id, {
+        ...f.options(runId),
+        inputData: { suspend: true },
+      });
+      const pending = f.runtime.resume(f.workflow.id, runId, {
+        resumeData: { go: true },
+      });
+      const foreign = repoint(f.workflow);
+      const result = await pending.catch((error: unknown) => error);
+      await expectRefusedWithoutForeignStorage(result, foreign, runId);
+    } finally {
+      f.close();
+    }
+  });
+
+  it('refuses start recovery repointed after entry before storage capture', async () => {
+    const f = await d3RuntimeFixture('fenced');
+    try {
+      await f.runtime.start(f.workflow.id, f.options());
+      const state = await f.runtime.authoritativeStartState(
+        f.workflow.id,
+        'd3-run',
+      );
+      assert(state?.storage === 'd1');
+      const pending = f.runtime.recoverStartAttempt(state.execution, {
+        attemptToken: 'H',
+        isOwnerQuiescent: () => true,
+      });
+      const foreign = repoint(f.workflow);
+      const result = await pending.catch((error: unknown) => error);
+      expect(result).toBeInstanceOf(ExecutionFenceUnreadableError);
+      await expectRefusedWithoutForeignStorage(
+        (result as Error & { cause?: Error }).cause,
+        foreign,
+        'd3-run',
+      );
+    } finally {
+      f.close();
+    }
+  });
+
+  it('refuses unfenced start repointed after storage capture before createRun', async () => {
+    const f = await d3RuntimeFixture('custom');
+    const runId = 'start-after-capture';
+    let foreign: ReturnType<typeof repoint> | undefined;
+    try {
+      const result = await f.runtime
+        .start(f.workflow.id, {
+          ...f.options(runId),
+          onPreparedStartIdentity: async () => {
+            foreign = repoint(f.workflow);
+          },
+        })
+        .catch((error: unknown) => error);
+      await expectRefusedWithoutForeignStorage(result, foreign, runId);
+    } finally {
+      f.close();
+    }
+  });
+
+  it('refuses fenced start repointed after storage capture before createRun', async () => {
+    const f = await d3RuntimeFixture('fenced');
+    let foreign: ReturnType<typeof repoint> | undefined;
+    try {
+      const result = await f.runtime
+        .start(f.workflow.id, {
+          ...f.options(),
+          onPreparedStartIdentity: async () => {
+            foreign = repoint(f.workflow);
+          },
+        })
+        .catch((error: unknown) => error);
+      await expectRefusedWithoutForeignStorage(result, foreign, 'd3-run');
+    } finally {
+      f.close();
+    }
+  });
+
+  it('refuses resume repointed after storage capture before createRun', async () => {
+    const f = await d3RuntimeFixture('custom');
+    const runId = 'resume-after-capture';
+    let foreign: ReturnType<typeof repoint> | undefined;
+    try {
+      await f.runtime.start(f.workflow.id, {
+        ...f.options(runId),
+        inputData: { suspend: true },
+      });
+      const result = await f.runtime
+        .resume(f.workflow.id, runId, {
+          resumeData: { go: true },
+          prepareExecution: async () => {
+            foreign = repoint(f.workflow);
+          },
+        })
+        .catch((error: unknown) => error);
+      await expectRefusedWithoutForeignStorage(result, foreign, runId);
+    } finally {
+      f.close();
+    }
+  });
+
+  it('refuses resume repointed during capture before its state read', async () => {
+    const f = await d3RuntimeFixture('custom');
+    const runId = 'resume-during-capture';
+    try {
+      await f.runtime.start(f.workflow.id, {
+        ...f.options(runId),
+        inputData: { suspend: true },
+      });
+      const originalGetStore = f.storage.getStore.bind(f.storage);
+      let foreign: ReturnType<typeof repoint> | undefined;
+      vi.spyOn(f.storage, 'getStore').mockImplementationOnce((...args) => {
+        foreign = repoint(f.workflow);
+        return originalGetStore(...args);
+      });
+      const result = await f.runtime
+        .resume(f.workflow.id, runId, {
+          resumeData: { go: true },
+        })
+        .catch((error: unknown) => error);
+      await expectRefusedWithoutForeignStorage(result, foreign, runId);
+    } finally {
+      f.close();
+    }
   });
 });
 
@@ -5618,7 +5871,7 @@ describe('RunnerRuntime requestContextForRun', () => {
 
   it('mints the workflow-scope key on every leg, even without a provider', async () => {
     // #given — NO requestContextForRun provider; a step that records the
-    // runtime-minted scope (breakwater's crossWorkflowIsolation reads it)
+    // runtime-minted scope
     const seen: unknown[] = [];
     const { createWorkflow, createStep, runtime } = init(
       { storage: new InMemoryStore() },
@@ -5874,9 +6127,9 @@ describe('RunnerRuntime resumeCount projection (re-suspension)', () => {
       outputSchema: z.object({}),
       suspendSchema: z.object({ reason: z.string() }),
       // No resumeSchema on purpose: with a required schema, core rejects a
-      // no-payload resume before execute, so the falsy-resume re-suspension
-      // (the bug's trigger) is unreachable. Without one, a falsy resume passes
-      // validation and re-suspends via the guard below.
+      // no-payload resume before execute, so the falsy-resume re-suspension is
+      // unreachable. Without one, a falsy resume passes validation and
+      // re-suspends via the guard below.
       execute: async ({ resumeData, suspend }) => {
         if (!resumeData) return suspend({ reason: 'round 1' });
         rounds += 1;
@@ -5973,7 +6226,7 @@ describe('RunnerRuntime resumeCount projection (re-suspension)', () => {
   });
 
   it('carries resumeCount on a NO-PAYLOAD re-suspension even though Mastra omits resumedAt', async () => {
-    // #given — the regression: a falsy resume re-suspends via
+    // #given — a falsy resume re-suspends via
     // `if (!resumeData) return suspend(...)`, so Mastra never stamps resumedAt.
     const runtime = buildReSuspender();
     const started = await runtime.start('resuspend', {
@@ -5988,8 +6241,7 @@ describe('RunnerRuntime resumeCount projection (re-suspension)', () => {
 
     // #then — resumedAt stays undefined (Mastra's payload-conditional stamp),
     // but the runtime-owned resumeCount is present, so the grant binding can
-    // still tell this re-suspension apart from the first suspension. Pre-fix
-    // (resumeCount did not exist) this re-suspension was indistinguishable.
+    // still tell this re-suspension apart from the first suspension.
     expect(reSuspended.suspended).toEqual([['gate2x']]);
     expect(reSuspended.resumedAt?.gate2x).toBeUndefined();
     expect(reSuspended.resumeCount?.gate2x).toBe(1);
@@ -5999,10 +6251,9 @@ describe('RunnerRuntime resumeCount projection (re-suspension)', () => {
     // Tripwire pinning the Mastra-version-dependent boundary the falsy-resume
     // fixtures rely on: with a REQUIRED resumeSchema, core validates resume
     // data and rejects a no-payload resume BEFORE execute, so the falsy-resume
-    // re-suspension (the bug's trigger) is only reachable for schema-less /
-    // optional-schema / validateInputs-off steps. If a Mastra bump changes
-    // this, the "schema-less fixture required" assumption (buildReSuspender,
-    // the relaunch-falsy e2e fixture) goes silently stale.
+    // re-suspension is only reachable for schema-less / optional-schema /
+    // validateInputs-off steps. If a Mastra bump changes
+    // this, the "schema-less fixture required" assumption goes silently stale.
     const { createWorkflow, createStep, runtime } = init(
       { storage: new InMemoryStore() },
       { startIdempotency: 'none', executionFence: 'none' },
@@ -6656,10 +6907,7 @@ describe('RunnerRuntime snapshot provenance durability', () => {
   });
 });
 
-// A step arms a per-suspension deadline through Mastra's own suspend payload,
-// so these tests exercise the whole author-facing contract at the runtime level:
-// what the summary carries back, and what a Mastra suspendSchema does to the
-// reserved key on the way through.
+// A step arms a per-suspension deadline through Mastra's own suspend payload.
 describe('per-suspension deadline contract', () => {
   const SUSPENSION_DEADLINE_MS = 900_000;
 
@@ -6679,7 +6927,7 @@ describe('per-suspension deadline contract', () => {
       { startIdempotency: 'none', executionFence: 'none' },
     );
     // Built as a value so the reserved key survives a suspendSchema that does
-    // not declare it — which is exactly what the stripping test measures.
+    // not declare it.
     const suspendPayload: Record<string, unknown> = {
       reason: 'awaiting signal',
       [SUSPENSION_DEADLINE_PAYLOAD_KEY]: SUSPENSION_DEADLINE_MS,
@@ -6717,11 +6965,10 @@ describe('per-suspension deadline contract', () => {
 
   /**
    * Blind the workflows store's row read — the exact seam Mastra falls back
-   * from — and hand back the restore. Deliberately NOT the Workflow method:
-   * stubbing that would FABRICATE the fallback, and what is under test is that
-   * Mastra produces it and stamps it. File-local rather than shared: the DO
-   * suite needs the same seam and keeping each copy beside the fixtures it
-   * serves is cheaper than a new shared module for eight lines.
+   * from — and hand back the restore. NOT the Workflow method: stubbing that
+   * would FABRICATE the fallback, and what is under test is that Mastra
+   * produces it and stamps it. File-local rather than shared: keeping each copy
+   * beside the fixtures it serves is cheaper than a new shared module.
    */
   async function blindWorkflowRow(storage: InMemoryStore): Promise<() => void> {
     const store = (await storage.getStore('workflows')) as unknown as {
@@ -6836,11 +7083,9 @@ describe('per-suspension deadline contract', () => {
   });
 
   it('fails the timeout resume of a step whose resumeSchema rejects the envelope', async () => {
-    // The likelier of the two authoring footguns: every realistic approval
-    // step declares a resumeSchema, and Mastra validates resume data before
-    // the engine is touched, so a schema that does not accept the envelope
-    // makes the timeout resume throw. The wake then charges its retry ledger
-    // and eventually drops the deadline — documented, and pinned here.
+    // Every realistic approval step declares a resumeSchema, and Mastra
+    // validates resume data before the engine is touched, so a schema that
+    // does not accept the envelope makes the timeout resume throw.
     const { runtime, start } = timedGateRuntime(
       'resume-schema-gate',
       undefined,
@@ -6919,11 +7164,11 @@ describe('per-suspension deadline contract', () => {
       ],
     });
 
-    // #then — and refused again on the projection the alarm and the recovered
-    // start read, which reports the SAME suspension as the enclosing step
-    // alone. A refusal on only one of the two projections is worse than none:
-    // the entry arms from the projection that misses it and then resumes a
-    // step whose fence describes a different suspension.
+    // #then — and refused again on the status() projection, which reports the
+    // SAME suspension as the enclosing step alone. A refusal on only one of the
+    // two projections is worse than none: the entry arms from the projection
+    // that misses it and then resumes a step whose fence describes a different
+    // suspension.
     const rehydrated = await runtime.status('nested-outer', started.runId);
     expect(rehydrated?.suspended).toEqual([['nested']]);
     expect(suspensionDeadlinesOf(rehydrated as RunSummary)).toEqual({
@@ -7005,10 +7250,8 @@ describe('per-suspension deadline contract', () => {
     // __workflow_meta is: against the REAL producer. Mastra answers a state
     // read from the in-memory Run it still holds whenever the row lookup comes
     // back empty, and stamps `isFromInMemory` on exactly that answer. A rename
-    // or a dropped stamp would put the wake back to concluding things from a
-    // read that never reached storage — deleting a live record, spending an
-    // abandonment budget, deleting a real row in recoverStartAttempt — so it
-    // fails here rather than there.
+    // or a dropped stamp would let the wake conclude things from a read that
+    // never reached storage, so it fails here rather than there.
     const { runtime, storage, workflow, start } =
       timedGateRuntime('marker-gate');
     const started = await start();
@@ -7033,9 +7276,7 @@ describe('per-suspension deadline contract', () => {
       ).toBeUndefined();
 
       // #then — the authoritative read refuses it, naming both ids and NO
-      // cause: the run object mints this same class for any read that did not
-      // succeed, so a message claiming the in-memory fallback would name the
-      // wrong one during a storage incident.
+      // cause
       await expect(
         runtime.authoritativeStatus('marker-gate', started.runId),
       ).rejects.toBeInstanceOf(RunStateUnreadableError);
@@ -7049,8 +7290,7 @@ describe('per-suspension deadline contract', () => {
 
       // #then — while status() still serves the fabricated summary, which is
       // 'pending' for a run that has never been resumed and so passes the
-      // self-consistency backstop: the marker is the only thing that catches
-      // this shape.
+      // self-consistency backstop.
       expect(fallback.status).toBe('pending');
       expect(fallback.suspended).toBeUndefined();
       expect(isReadableRunSummary(fallback)).toBe(true);
@@ -7875,9 +8115,11 @@ describe('FS8 D3 Runtime activation', () => {
       release = cDeferred();
     let pending: Promise<RunSummary> | undefined;
     try {
-      vi.spyOn(nominal.workflow, 'mastra', 'get').mockReturnValue(
-        new Mastra({ storage: actual.storage, logger: false }),
-      );
+      const nominalMastra = nominal.workflow.mastra;
+      assert(nominalMastra);
+      const nominalSource = vi
+        .spyOn(nominalMastra, 'getStorage')
+        .mockReturnValue(actual.storage);
       // A participating reservation store must match the selected D1 binding.
       const refused = await nominal.runtime
         .start(nominal.workflow.id, nominal.options())
@@ -7886,15 +8128,19 @@ describe('FS8 D3 Runtime activation', () => {
       expect(await nominal.row()).toBeNull();
       expect(nominal.effects).not.toHaveBeenCalled();
       expect(refused).toBeInstanceOf(Error);
+      expect((refused as Error).message).toBe(
+        'workflow storage binding disagrees with runtime stores',
+      );
+      nominalSource.mockRestore();
       const standalone = init(
         { storage: nominal.storage },
         { executionFence: 'none', startIdempotency: 'none' },
       ).runtime;
       standalone.register(nominal.workflow);
       await standalone.status(nominal.workflow.id, 'initialize-actual');
-      nominal.workflow.__registerMastra(
-        new Mastra({ storage: actual.storage, logger: false }),
-      );
+      const standaloneMastra = nominal.workflow.mastra;
+      assert(standaloneMastra);
+      vi.spyOn(standaloneMastra, 'getStorage').mockReturnValue(actual.storage);
       const source = actual.capability;
       assert(source);
       const receivers: unknown[] = [];
@@ -9657,9 +9903,9 @@ describe('FS8 D3 fix R1 legacy Runtime observations', () => {
     try {
       await nominal.seed(d1Snapshot());
       await actual.seed(d3LegacySnapshot('v1'));
-      vi.spyOn(nominal.workflow, 'mastra', 'get').mockReturnValue(
-        new Mastra({ storage: actual.storage, logger: false }),
-      );
+      const nominalMastra = nominal.workflow.mastra;
+      assert(nominalMastra);
+      vi.spyOn(nominalMastra, 'getStorage').mockReturnValue(actual.storage);
       const options = { includeLegacy: true as const };
       const receivers: unknown[] = [];
       if (storage === 'prefixed') {

@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import type { Agent } from '@mastra/core/agent';
+import { type Agent, isCreatedAgentSignal } from '@mastra/core/agent';
 import {
   AGENT_STREAM_TOPIC,
   globalRunRegistry,
 } from '@mastra/core/agent/durable';
 import { Mastra } from '@mastra/core/mastra';
 import type { MastraCompositeStore } from '@mastra/core/storage';
+import {
+  assertAcceptedCallProviderOptions,
+  assertNoGuardedSystemMessages,
+} from '@proofoftech/breakwater/agent';
 import { isPrincipalPermissions } from '@proofoftech/breakwater/rbac';
 import {
   AgentRunSelectorMismatchError,
@@ -76,7 +80,10 @@ import {
   lifecycleFromRequestContext,
   terminalCleanupFor,
 } from '../do-runner/run-lifecycle.js';
-import { isTerminalRunStatus } from '../do-runner/run-terminal-state.js';
+import {
+  isTerminalRunStatus,
+  type RunStatus,
+} from '../do-runner/run-terminal-state.js';
 import type {
   RecoveredStart,
   RunLifecycleTransitionResult,
@@ -192,6 +199,11 @@ export interface ThreadAgentStartInput {
   resourceId: string;
   runId: string;
   prompt?: string;
+  /**
+   * Created signals, alone or as list items, pass through unchanged. Every
+   * other input must be structured-cloneable (use string file and image URLs),
+   * or start answers 400.
+   */
   messages?: Parameters<FlowsafeDurableAgent['stream']>[0];
   entryPath: AgentEntryPath;
   threaded?: boolean;
@@ -233,12 +245,25 @@ export interface BoundThreadAgent {
 export interface BlockingAgentRun {
   runId: string;
   principal: ExecutionPrincipal;
+  /**
+   * The run's stored status. Absent for a run with an operation executing in
+   * this isolate, and for one with no readable started state.
+   */
+  status?: RunStatus;
 }
 
 export interface ThreadAgentHost {
   requestContextForRun(base?: RequestContextProvider): RequestContextProvider;
   /** Serialize one target-thread dispatch decision with public start/resume routes. */
   serializeDispatch<T>(operation: () => Promise<T>): Promise<T>;
+  /**
+   * Check the catalog's system notification-dispatch declaration. Automated-entry
+   * authorization and required permissions still apply at dispatch.
+   */
+  notificationDispatchAllowed(
+    scope: ThreadScope,
+    agentId: string,
+  ): Promise<boolean>;
   start(
     scope: ThreadScope,
     input: ThreadAgentStartInput,
@@ -439,13 +464,13 @@ function requestedBy(value: unknown): string {
 }
 
 /**
- * The reserved suspension-timeout envelope is minted by a run object's alarm and
- * by nothing else. Agent runs never arm a suspension deadline, so a forged
+ * The reserved suspension-timeout envelope is minted by a run object's alarm.
+ * Agent runs never arm a suspension deadline, so a forged
  * envelope here could only mislead a step — but this route forwards client
  * resume data verbatim under `requestedByKind: 'human'`, and the guarantee the
  * feature sells is that no caller can present itself to a step as an expired
- * deadline. The KEY is refused, exactly as the workflow resume route refuses it,
- * so a step that reads the key directly cannot be fooled either.
+ * deadline. The KEY is refused, so a step that reads the key directly cannot be
+ * fooled either.
  */
 function resumeData(value: unknown): unknown {
   if (
@@ -665,11 +690,11 @@ export function createThreadAgentHost(
   };
 
   /**
-   * The one entry gate, split by principal kind because the two kinds are
+   * The entry gate, split by principal kind because the two kinds are
    * authorized by different things and must not fall through to each other.
    *
    * A human passes the route-level start roles intersected with the agent's own
-   * allowedRoles, exactly as before. An automated principal never consults
+   * allowedRoles. An automated principal never consults
    * roles at all: it must be declared in the agent's `allowedAutomation` for
    * this precise entry path, AND survive the host's optional authorizer. Absent
    * declaration denies — which is why a scheduled start of an agent that has
@@ -829,16 +854,20 @@ export function createThreadAgentHost(
         },
         { includeLegacy: true },
       );
+      if (!state || state.kind === 'initial')
+        return { runId, principal: runRecord.principal };
+      const blocking = {
+        runId,
+        principal: runRecord.principal,
+        status: state.summary.status,
+      };
       if (
-        !state ||
-        state.kind === 'initial' ||
         !isTerminalRunStatus(state.summary.status) ||
         (state.kind === 'legacy' && !isTerminalRunStatus(state.snapshot.status))
       )
-        return { runId, principal: runRecord.principal };
+        return blocking;
       const recovery = await storage.get(ownerRecoveryKey(runId));
-      if (recovery !== undefined)
-        return { runId, principal: runRecord.principal };
+      if (recovery !== undefined) return blocking;
       await withRecoveryLock(() =>
         finalizeTerminalRecord(scope, runId, runRecord, state),
       );
@@ -1506,7 +1535,7 @@ export function createThreadAgentHost(
   // The bridge mints its own principal from this id, so the audit trail shows
   // an automated principal rather than a human operator.
   const systemPrincipalId = options.systemPrincipalId ?? 'flowsafe-system';
-  // Deliberately NOT vouched. Its only consumer projects it to an ApprovalActor
+  // NOT vouched. Its consumer projects it to an ApprovalActor
   // for a role-gated READ, which grants nothing an automated principal does not
   // already have — so calling the trust assertion here would assert trust that
   // nothing consumes, and `trustAutomationPrincipal` has to stay greppable as
@@ -1854,6 +1883,18 @@ export function createThreadAgentHost(
         : values;
     },
     serializeDispatch: withDispatchLock,
+    notificationDispatchAllowed: async (scope, agentId) => {
+      instanceScopeFor(scope);
+      return (await catalogFor(scope)).automationAllowed(
+        agentId,
+        {
+          kind: 'system',
+          id: systemPrincipalId,
+          purpose: 'notification-dispatch',
+        },
+        'notification.dispatch',
+      );
+    },
     blockingRun: (scope) =>
       withBindingLock(() => findBlockingRun(instanceScopeFor(scope))),
     scheduleDispatchStatus: async (scope, input) => {
@@ -2021,6 +2062,33 @@ export function createThreadAgentHost(
       const resolvedProviderOptions = source.target
         ? source.target.providerOptions
         : input.providerOptions;
+      // This host bypasses the guarded handle, so checks run on forwarded
+      // snapshots before state writes.
+      let providerOptionsSnapshot: Record<string, unknown> | undefined;
+      let messagesSnapshot: typeof messages;
+      try {
+        providerOptionsSnapshot = providerOptions(resolvedProviderOptions);
+        // Created signals carry methods that structuredClone cannot copy.
+        messagesSnapshot = isCreatedAgentSignal(messages)
+          ? messages
+          : Array.isArray(messages)
+            ? messages.map((item) =>
+                isCreatedAgentSignal(item) ? item : structuredClone(item),
+              )
+            : structuredClone(messages);
+      } catch (error) {
+        if (error instanceof AgentHostRequestError) throw error;
+        throw new AgentHostRequestError(400, 'agent input must be cloneable');
+      }
+      try {
+        assertNoGuardedSystemMessages(messagesSnapshot);
+        assertAcceptedCallProviderOptions(providerOptionsSnapshot);
+      } catch (error) {
+        if (error instanceof TypeError) {
+          throw new AgentHostRequestError(400, error.message);
+        }
+        throw error;
+      }
       const { current, module, principalPermissions } = await authorize(
         scope,
         ref.agentId,
@@ -2178,8 +2246,8 @@ export function createThreadAgentHost(
               : {}),
             maxSteps: module.agent.maxSteps,
             disableBackgroundTasks: true,
-            ...(resolvedProviderOptions !== undefined
-              ? { providerOptions: providerOptions(resolvedProviderOptions) }
+            ...(providerOptionsSnapshot !== undefined
+              ? { providerOptions: providerOptionsSnapshot }
               : {}),
           };
           const scheduleDispatch =
@@ -2191,7 +2259,7 @@ export function createThreadAgentHost(
               : undefined;
           try {
             await durable.streamUntilPersisted(
-              messages,
+              messagesSnapshot,
               streamOptions,
               principal.id,
               principal.kind,
@@ -2299,11 +2367,11 @@ export function createThreadAgentHost(
     route: async (request, scope) => {
       let preflightedTermination = false;
       const preflightUrl = new URL(request.url);
-      const preflightSuffix = preflightUrl.pathname.startsWith(
-        AGENT_HOST_ROUTE_PREFIX,
-      )
-        ? preflightUrl.pathname.slice(AGENT_HOST_ROUTE_PREFIX.length)
-        : '';
+      if (!preflightUrl.pathname.startsWith(AGENT_HOST_ROUTE_PREFIX))
+        return null;
+      const preflightSuffix = preflightUrl.pathname.slice(
+        AGENT_HOST_ROUTE_PREFIX.length,
+      );
       const preflightSegments = preflightSuffix.split('/').filter(Boolean);
       // The start holds the dispatch lock while its liveness probe must remain responsive.
       if (
@@ -2387,9 +2455,19 @@ export function createThreadAgentHost(
           preflightedTermination = true;
         }
       }
+      // A queued start or resume keeps its parsed body if the sender disconnects.
+      const startBody =
+        request.method === 'POST' &&
+        preflightUrl.pathname === `${AGENT_HOST_ROUTE_PREFIX}/start`
+          ? await objectBody(request)
+          : undefined;
+      const resumeBody =
+        request.method === 'POST' &&
+        preflightUrl.pathname === `${AGENT_HOST_ROUTE_PREFIX}/resume`
+          ? await objectBody(request)
+          : undefined;
       return withDispatchLock(async () => {
         const url = new URL(request.url);
-        if (!url.pathname.startsWith(AGENT_HOST_ROUTE_PREFIX)) return null;
 
         if (
           request.method === 'GET' &&
@@ -2409,11 +2487,8 @@ export function createThreadAgentHost(
           return json({ bound: true });
         }
 
-        if (
-          request.method === 'POST' &&
-          url.pathname === `${AGENT_HOST_ROUTE_PREFIX}/start`
-        ) {
-          const body = await objectBody(request);
+        if (startBody) {
+          const body = startBody;
           if (
             'resourceOwner' in body ||
             'requestedBy' in body ||
@@ -2496,11 +2571,8 @@ export function createThreadAgentHost(
           );
         }
 
-        if (
-          request.method === 'POST' &&
-          url.pathname === `${AGENT_HOST_ROUTE_PREFIX}/resume`
-        ) {
-          const body = await objectBody(request);
+        if (resumeBody) {
+          const body = resumeBody;
           const ref = runRef(scope, body);
           const snapshotExecution = await snapshotExecutionFor(scope, ref);
           await statusFor(scope, ref, snapshotExecution.state);

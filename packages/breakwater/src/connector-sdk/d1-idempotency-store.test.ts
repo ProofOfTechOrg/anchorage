@@ -13,6 +13,7 @@ import { z } from 'zod';
 import { ISOLATION_SCOPE_CONTEXT_KEY } from '../policy-engine/index.js';
 import {
   D1IdempotencyStore,
+  type D1IdempotencyStoreOptions,
   type IdempotencyBatchDatabase,
   type IdempotencyDatabase,
   type IdempotencyStatement,
@@ -153,6 +154,37 @@ describe('D1IdempotencyStore (Node SQLite facsimile)', () => {
         pendingTtlMs: 8_640_000_000_000_000,
       }).pendingTtlMs,
     ).toBe(8_640_000_000_000_000);
+  });
+
+  it.each([
+    'pendingTTLMs',
+    'pendingTtl',
+  ])('refuses the misspelled option %s, which would keep the shorter default TTL', (key) => {
+    // #when / #then
+    expect(
+      () =>
+        new D1IdempotencyStore(d1Like(openSqlite()), {
+          [key]: 3_600_000,
+        } as D1IdempotencyStoreOptions),
+    ).toThrow(
+      new TypeError(
+        `D1IdempotencyStore options has unknown field ${JSON.stringify(key)} (valid fields: table, pendingTtlMs, now)`,
+      ),
+    );
+  });
+
+  it('keeps the correctly spelled pendingTtlMs and every declared option', () => {
+    // #given — the Required type fails to compile while a declared option is
+    // missing here
+    const options: Required<D1IdempotencyStoreOptions> = {
+      table: 'breakwater_idempotency',
+      pendingTtlMs: 3_600_000,
+      now: () => 0,
+    };
+    // #when / #then
+    expect(
+      new D1IdempotencyStore(d1Like(openSqlite()), options).pendingTtlMs,
+    ).toBe(3_600_000);
   });
 
   it('round-trips reserve -> put -> replay', async () => {

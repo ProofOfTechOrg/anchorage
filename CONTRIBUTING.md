@@ -25,10 +25,10 @@ Contributions — new connectors, policies, bug fixes, and docs — are welcome.
 - **Docs & examples** — workflows that exercise the policy engine, gaps in the
   blueprint.
 
-Every PR must pass the verification gate below; CI
-(`.github/workflows/ci.yml`) runs it on push and PR. `verify` is the only
-required check, so a red `mastra-compat` canary on a PR reports a Mastra
-release to investigate, not a fault in the contribution.
+Every PR must pass the verification gate; CI (`.github/workflows/ci.yml`) runs
+it on push and PR. `verify` is the only required check, so a red
+`mastra-compat` canary on a PR reports a Mastra release to investigate, not a
+fault in the contribution.
 
 ## Development setup
 
@@ -37,38 +37,12 @@ git clone https://github.com/ProofOfTechOrg/anchorage.git
 cd anchorage
 ```
 
-The verification list below mirrors the CI `verify-core` job in order;
-`pnpm test` also covers the direct scenario projects that CI runs in the
-`direct-scenario` and `direct-scenario-seams` jobs:
-
-```bash
-pnpm install --frozen-lockfile
-pnpm github:check
-pnpm github:check:test
-pnpm lint
-pnpm typecheck
-pnpm test
-pnpm build
-pnpm test:node-tools
-pnpm docs:check
-pnpm docs:check:test
-pnpm docs:api
-pnpm test:release-order
-pnpm test:release-invocation
-pnpm test:packed-breakwater
-pnpm test:packed-fleet-control
-pnpm test:packed-flowsafe-agent-host
-pnpm test:packed-flowsafe-provisioning
-pnpm --filter @proofoftech/flowsafe test:signals-client-export
-pnpm --filter @proofoftech/flowsafe typecheck:react18
-pnpm --filter showcase run react-doctor
-pnpm --filter @proofoftech/flowsafe spike:verify
-pnpm test:conformance-config
-pnpm conformance:verify
-```
+Install with `pnpm install --frozen-lockfile`, then run the commands under
+[Verification](docs/maintainer-guide.md#verification) in the maintainer guide.
 
 Lint is one Biome pass at the root, and `pnpm test` is one root vitest run
-covering every package. Git hooks (husky) back the gate up:
+covering every package except the direct scenario projects
+(`pnpm test:direct-scenario`). Git hooks (husky) back the gate up:
 pre-commit runs Biome on staged files and checks the complete `.github` YAML
 directory when a `.github/**/*.{yml,yaml}` file is staged (lint-staged);
 pre-push runs react-doctor on the branch's changed files

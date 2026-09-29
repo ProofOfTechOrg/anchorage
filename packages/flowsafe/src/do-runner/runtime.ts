@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // RunnerRuntime hosts Mastra workflow execution against injected storage.
-// It is deliberately environment-free: the Durable Object shell feeds it
+// It is environment-free: the Durable Object shell feeds it
 // D1-backed storage; tests feed it InMemoryStore. Durability comes from
 // Mastra's own snapshot persistence — createRun() writes the initial
 // snapshot, the engine persists after each step boundary, and resume()
@@ -155,9 +155,8 @@ export class RunNotSuspendedError extends Error {
  * An authoritative run-state read did not succeed, so nothing that read
  * returned is evidence about the run. One cause is Mastra answering from its
  * in-memory fallback instead of from storage — what comes back then describes
- * the Run object this isolate happens to hold rather than what is persisted —
- * and the run object's alarm raises it for any other failed read too, carrying
- * the underlying fault as `cause`. Distinct from UnknownRunError: the run may
+ * the Run object this isolate happens to hold rather than what is persisted.
+ * Distinct from UnknownRunError: the run may
  * well exist and be suspended — nothing about it could be READ. The message
  * therefore names no cause: it is minted where the read failed, not where the
  * reason is known.
@@ -198,15 +197,10 @@ export class InvalidRunRequestError extends Error {
   }
 }
 
-// PATH_SAFE_ID_PATTERN validates runId and workflowId (full rationale lives on
-// the leaf module). runId is validated at start() (client input →
-// InvalidRunRequestError); workflowId is developer-controlled and validated at
-// register() (programming error → plain Error).
-
 // Core surfaces input/resume-schema violations and wrong-step selections as
 // untyped Errors. Message matching is brittle, so it is scoped to choosing
 // the HTTP-facing error class only; anything unmatched propagates unchanged
-// (a 500 at the DO boundary, same as before classification existed).
+// (a 500 at the DO boundary).
 const CLIENT_ERROR_MARKERS = [
   'Invalid input',
   'Invalid resume data',
@@ -459,7 +453,7 @@ function resolveResumeStep(
 
 // The live attempt for a step. Repeated steps (foreach) store an array of
 // attempts, so the current suspension/resume is the latest; a single-run step
-// stores one entry. Shared by the suspendedAt/resumedAt/suspendPayload readers.
+// stores one entry.
 function latestAttempt(
   steps: WorkflowState['steps'] | undefined,
   stepKey: string,
@@ -490,15 +484,13 @@ function resumedAtOf(
 }
 
 /**
- * One home for the per-step projection convention behind every RunSummary map
- * (suspendedAt / resumedAt / resumeCount / suspendPayload): collect
+ * One home for the per-step projection convention: collect
  * `stepKey -> value` over the suspended step keys, projecting an empty result
  * as undefined so JSON summaries omit the field. The accumulator is
  * null-prototype because step keys are author-chosen strings: on a plain
  * object literal a step named '__proto__' would route into the
  * Object.prototype setter and silently vanish (or, for an object-valued
- * payload, rewire the accumulator's prototype) — the same hazard
- * snapshot provenance stores [stepKey, count] pairs to avoid.
+ * payload, rewire the accumulator's prototype).
  */
 function byStep<T>(
   suspendedKeys: readonly string[],
@@ -632,7 +624,7 @@ function summaryWithRequester(
  * runtime-owned monotonic resume ordinal (undefined on a step's first
  * suspension, `1,2,…` on successive re-suspensions) — so a provider can tell
  * two same-step suspensions apart even when their `suspendedAt` stamps collide
- * within a millisecond. It replaces the payload-conditional `resumedAt` as the
+ * within a millisecond. Unlike the payload-conditional `resumedAt`, it is the
  * tie-breaker: the runtime increments it on every resume, so no-payload
  * resumes cannot erase the first-vs-re-suspension distinction.
  */
@@ -720,49 +712,33 @@ export interface RunnerRuntimeOptions {
   /**
    * The host Durable Object's single pubsub identity from do-runner/pubsub.ts, threaded
    * here by init() alongside storage so a host that configures it
-   * reaches the runtime with no host change: every DO subclass already returns
-   * init()'s runtime from build(), and nothing else in the isolate can hand this
-   * object a pubsub.
+   * reaches the runtime with no host change.
    *
-   * PASSED TO CORE at the two `workflow.createRun({ runId, pubsub })` sites in
-   * start()/resume() — the only place core accepts one; the
-   * `pubsub` getter still exposes the held identity so an agent runner sharing
-   * this isolate takes THIS instance rather than building a second feed. Absent
-   * ⇒ undefined ⇒ core defaults a fresh emitter per run ⇒ byte-identical to
-   * before this seam existed.
+   * PASSED TO CORE at `workflow.createRun({ runId, pubsub })` — the only place
+   * core accepts one; the `pubsub` getter still exposes the held identity so an
+   * agent runner sharing this isolate takes THIS instance rather than building
+   * a second feed. Absent ⇒ undefined ⇒ core defaults a fresh emitter per run.
    */
   pubsub?: HostPubSub;
   /**
    * The deployment execution fence (execution-fence.ts), consulted on EVERY
-   * start and resume. THIS is the closure guarantee for runs: every mint in
-   * this package funnels through start() and every re-entry through resume(),
-   * so a check here cannot be routed around by a surface that forgot to gate
-   * itself — the route-level checks are the same refusal made earlier and
-   * cheaper, never the boundary.
+   * start and resume. THIS is the closure guarantee for runs: a check here
+   * cannot be routed around by a surface that forgot to gate itself.
    *
-   * Absent ⇒ unfenced, byte-identical to before this seam existed. `init()`
-   * builds one automatically from a `{ DB }` source and REQUIRES an explicit
-   * `executionFence` (a store, or `'none'`) from a `{ storage }` one, so
-   * absence here is always something a host wrote down.
+   * Absent ⇒ unfenced.
    */
   executionFence?: ExecutionFenceStore;
   /**
    * The deployment's start reservations (start-idempotency.ts). The runtime
-   * neither creates nor claims one — the surfaces above it do — but it is the
-   * one layer that sees EVERY way a run reaches a terminal state, so it owns
+   * neither creates nor claims one — the surfaces above it do — but it owns
    * the terminal reconcile that marks a key spent.
    *
-   * Homed here rather than at the routes for exactly that reason: a run can end
-   * by completing, by failing, by being cancelled and by timing out, on the
-   * workflow surface and the agent surface alike, and a reconcile attached to
-   * any one route would miss the rest. A reservation that never settles is not
-   * a correctness bug (replay still answers from the snapshot) but it never
-   * leaves the drain inventory and never becomes purgeable, so a deployment
-   * would eventually be unable to prove itself empty.
+   * A reservation that never settles is not a correctness bug (replay still
+   * answers from the snapshot) but it never leaves the drain inventory and
+   * never becomes purgeable, so a deployment would eventually be unable to
+   * prove itself empty.
    *
-   * Absent ⇒ no reconcile. `init()` builds one from a `{ DB }` source, and
-   * `DurableObjectRunner.build` refuses a runtime that has none while a DB is
-   * bound, so absence means a host with no database to reserve against.
+   * Absent ⇒ no reconcile.
    */
   startIdempotency?: StartIdempotencyStore;
 }
@@ -784,8 +760,7 @@ export type StartRunOptions = {
   /**
    * Required: the runtime never generates a runId. Hosts mint it server-side
    * (createRunRouter) so a client can never choose the identity a run is
-   * keyed by everywhere it lands (D1 snapshot row, DO name, R2 segment,
-   * grant-list predicate). A generation fallback here would let any caller
+   * keyed by everywhere it lands. A generation fallback here would let any caller
    * that forgets to mint create a run under an id the host never issued.
    */
   runId: string;
@@ -806,11 +781,8 @@ export type StartRunOptions = {
   /** Trusted schedule source; never accepted directly from a public request. */
   scheduleDispatch?: RunScheduleDispatch;
   /**
-   * The start's idempotency key. The runtime uses it for exactly one thing: the
-   * execution fence's proof-only state admits the start whose key matches its
-   * nominated proof key, and this is where that comparison happens. The
-   * exactly-once property the key also carries is enforced ABOVE the runtime,
-   * by the start reservation the surfaces take before calling in.
+   * The start's idempotency key. The execution fence's proof-only state admits
+   * the start whose key matches its nominated proof key.
    *
    * INTERNAL: it reaches the runtime from a trusted host seam, never from a
    * request body and never through an open request-context key — a tenant able
@@ -1200,9 +1172,8 @@ export class RunnerRuntime {
   readonly #terminalAbortIntents = new Map<string, RunTerminalStatus>();
   readonly #lifecycleLocks = new Map<string, Promise<unknown>>();
   // The host DO's pubsub identity (RunnerRuntimeOptions.pubsub), threaded into
-  // both createRun sites below so a configured host publishes and
-  // replays on ONE shared feed. Undefined ⇒ core defaults a fresh emitter per
-  // run ⇒ byte-identical to before this seam existed.
+  // createRun so a configured host publishes and replays on ONE shared feed.
+  // Undefined ⇒ core defaults a fresh emitter per run.
   readonly #pubsub?: HostPubSub;
   readonly #executionFence?: ExecutionFenceStore;
   readonly #startIdempotency?: StartIdempotencyStore;
@@ -1220,10 +1191,7 @@ export class RunnerRuntime {
   /**
    * The deployment execution fence this runtime enforces, or undefined when
    * the host built an unfenced runtime. Exposed so the surfaces ABOVE the
-   * runtime — the run object's routes, the thread DO's signal routes — gate on
-   * the same store rather than constructing a second one, and so
-   * DurableObjectRunner can assert that a runtime built against a bound
-   * database is never fence-less.
+   * runtime gate on the same store rather than constructing a second one.
    */
   get executionFence(): ExecutionFenceStore | undefined {
     return this.#executionFence;
@@ -1299,7 +1267,7 @@ export class RunnerRuntime {
     }
     if (!isPathSafeId(workflow.id)) {
       throw new Error(
-        `RunnerRuntime: workflow id '${workflow.id}' must be URL-path-safe (letters, digits, '.', '_', '~', '-'; 1-200 chars) — it feeds the DO name join and the /runs/:workflowId/:runId path`,
+        `RunnerRuntime: workflow id '${workflow.id}' must be URL-path-safe — it feeds the DO name join and the /runs/:workflowId/:runId path`,
       );
     }
     if (this.#workflows.has(workflow.id)) {
@@ -1514,14 +1482,15 @@ export class RunnerRuntime {
         const originalCached = workflow.runs.get(runId);
         let provenance: ProgressRunProvenance | undefined;
         try {
-          const existing = await workflow.getWorkflowRunById(runId);
+          const existing =
+            await this.#getWorkflow(workflowId).getWorkflowRunById(runId);
           if (existing || originalCached)
             throw new RunAlreadyExistsError(
               workflowId,
               runId,
               existing?.status ?? 'pending',
             );
-          const source = await this.#captureWorkflowStorage(workflow);
+          const source = await this.#captureWorkflowStorage(workflowId);
           active.source = source;
           provenance = {
             version: 2,
@@ -1596,7 +1565,7 @@ export class RunnerRuntime {
                       candidate = workflow.runs.get(runId);
                     },
                   },
-                  () => workflow.createRun({ runId, pubsub: this.#pubsub }),
+                  () => this.#createRun(workflowId, runId),
                 );
                 if (
                   !admitted?.witness ||
@@ -1626,7 +1595,7 @@ export class RunnerRuntime {
                     ...capturedExecution,
                     ...startIdentity,
                   });
-                run = await workflow.createRun({ runId, pubsub: this.#pubsub });
+                run = await this.#createRun(workflowId, runId);
               }
               active.run = run;
               engineEntered = true;
@@ -1677,7 +1646,7 @@ export class RunnerRuntime {
           }
           if (engineEntered && provenance && !outcomeReadStarted) {
             const recovered = await this.#summaryForAttempt(
-              workflow,
+              workflowId,
               runId,
               provenance,
             );
@@ -1705,7 +1674,7 @@ export class RunnerRuntime {
     runId: string,
     options: ResumeRunOptions = {},
   ): Promise<RunSummary> {
-    const workflow = this.#getWorkflow(workflowId);
+    this.#getWorkflow(workflowId);
     const proof = await this.#assertResumeFence(workflowId, runId);
     return this.#withRunLock(workflowId, runId, async () => {
       const activeKey = this.#runKey(workflowId, runId);
@@ -1717,9 +1686,9 @@ export class RunnerRuntime {
       let engineEntered = false;
       let outcomeReadStarted = false;
       try {
-        const source = await this.#captureWorkflowStorage(workflow);
+        const source = await this.#captureWorkflowStorage(workflowId);
         active.source = source;
-        const state = await this.#workflowState(workflow, runId, true);
+        const state = await this.#workflowState(workflowId, runId, true);
         if (!state) throw new UnknownRunError(workflowId, runId);
         if (state.isFromInMemory)
           throw new RunStateUnreadableError(workflowId, runId);
@@ -1783,7 +1752,7 @@ export class RunnerRuntime {
           );
           await this.#withLifecycleLock(workflowId, runId, check);
         }
-        const run = await workflow.createRun({ runId, pubsub: this.#pubsub });
+        const run = await this.#createRun(workflowId, runId);
         const { executionPromise } = await this.#withLifecycleLock(
           workflowId,
           runId,
@@ -1834,7 +1803,7 @@ export class RunnerRuntime {
       } catch (error) {
         if (engineEntered && provenance && !outcomeReadStarted) {
           const recovered = await this.#summaryForAttempt(
-            workflow,
+            workflowId,
             runId,
             provenance,
           );
@@ -1877,7 +1846,7 @@ export class RunnerRuntime {
       async () => {
         const source =
           this.#activeRuns.get(this.#runKey(workflowId, runId))?.source ??
-          (await this.#captureWorkflowStorage(this.#getWorkflow(workflowId)));
+          (await this.#captureWorkflowStorage(workflowId));
         const state = await source.load.call(source.workflows, {
           workflowName: workflowId,
           runId,
@@ -2048,9 +2017,7 @@ export class RunnerRuntime {
   ): Promise<RunLifecycleTransitionResult> {
     this.#getWorkflow(workflowId);
     return this.#withRunLock(workflowId, runId, async () => {
-      const source = await this.#captureWorkflowStorage(
-        this.#getWorkflow(workflowId),
-      );
+      const source = await this.#captureWorkflowStorage(workflowId);
       const state = await source.load.call(source.workflows, {
         workflowName: workflowId,
         runId,
@@ -2191,9 +2158,7 @@ export class RunnerRuntime {
   ): Promise<RunSummary> {
     this.#getWorkflow(workflowId);
     return this.#withRunLock(workflowId, runId, async () => {
-      const source = await this.#captureWorkflowStorage(
-        this.#getWorkflow(workflowId),
-      );
+      const source = await this.#captureWorkflowStorage(workflowId);
       const state = await source.load.call(source.workflows, {
         workflowName: workflowId,
         runId,
@@ -2249,8 +2214,7 @@ export class RunnerRuntime {
    * that did not reach storage.
    */
   async status(workflowId: string, runId: string): Promise<RunSummary | null> {
-    const workflow = this.#getWorkflow(workflowId);
-    const state = await this.#workflowState(workflow, runId);
+    const state = await this.#workflowState(workflowId, runId);
     if (!state) return null;
     return this.#summaryFromState(runId, state);
   }
@@ -2270,15 +2234,14 @@ export class RunnerRuntime {
    * that did not reach storage. `null` still means the read SUCCEEDED and
    * found nothing.
    *
-   * Both status readers refuse a valid v2 pending row before lifecycle
-   * projection; it has no durable execution outcome yet.
+   * A valid v2 pending row is refused before lifecycle projection; it has no
+   * durable execution outcome yet.
    */
   async authoritativeStatus(
     workflowId: string,
     runId: string,
   ): Promise<RunSummary | null> {
-    const workflow = this.#getWorkflow(workflowId);
-    const state = await this.#workflowState(workflow, runId);
+    const state = await this.#workflowState(workflowId, runId);
     if (!state) return null;
     if (state.isFromInMemory === true) {
       throw new RunStateUnreadableError(workflowId, runId);
@@ -2310,11 +2273,10 @@ export class RunnerRuntime {
   }
 
   async #captureWorkflowStorage(
-    workflow: AnyWorkflow,
+    workflowId: string,
   ): Promise<CapturedWorkflowStorage> {
-    const workflows = await workflow.mastra
-      ?.getStorage()
-      ?.getStore('workflows');
+    this.#getWorkflow(workflowId);
+    const workflows = await this.#mastra?.getStorage()?.getStore('workflows');
     if (!workflows) throw new Error('workflow storage is unavailable');
     const methods = {
       workflows,
@@ -2380,9 +2342,9 @@ export class RunnerRuntime {
       throw new InvalidRunRequestError('workflowId is malformed');
     if (!isPathSafeId(runId))
       throw new InvalidRunRequestError('runId is malformed');
-    const workflow = this.#getWorkflow(workflowId);
+    this.#getWorkflow(workflowId);
     try {
-      const source = await this.#captureWorkflowStorage(workflow);
+      const source = await this.#captureWorkflowStorage(workflowId);
       return {
         source,
         state: await this.#readStartState(source, workflowId, runId),
@@ -2667,13 +2629,13 @@ export class RunnerRuntime {
         'run start recovery is unresolved',
       );
     const { workflowId, runId } = execution;
-    const workflow = this.#getWorkflow(workflowId);
+    this.#getWorkflow(workflowId);
     return this.#withRunLock(workflowId, runId, () =>
       this.#withLifecycleLock(workflowId, runId, async () => {
         try {
           if (this.isRunActive(workflowId, runId))
             throw new Error('run owner is not quiescent');
-          const source = await this.#captureWorkflowStorage(workflow);
+          const source = await this.#captureWorkflowStorage(workflowId);
           if (
             this.isRunActive(workflowId, runId) ||
             (await Reflect.apply(isOwnerQuiescent, undefined, [])) !== true ||
@@ -2798,9 +2760,8 @@ export class RunnerRuntime {
   // only ever deny downstream (fail closed), so loud propagation is safe.
   //
   // Every leg — provider or not — carries a base context minting the
-  // workflow-scope key (breakwater's crossWorkflowIsolation reads it): the
-  // runtime is the trusted authority for "which workflow is executing", so
-  // the scope is never client-suppliable. Provider values are partitioned into
+  // workflow-scope key: the runtime is the trusted authority for "which
+  // workflow is executing", so the scope is never client-suppliable. Provider values are partitioned into
   // stored application context, capabilities, and trusted identity so every
   // layer has an explicit order and a provider cannot replace runtime scope.
   async #requestContextFor(
@@ -2822,13 +2783,8 @@ export class RunnerRuntime {
       base[RUN_LIFECYCLE_CONTEXT_KEY] = lifecycle;
     }
     // No isolation scope is minted here: a deployment serves exactly one
-    // organization, so breakwater's connector idempotency and rate-limit keys
-    // are deployment-wide by construction. Budget partitioning within a
-    // deployment stays available
-    // through breakwater's crossWorkflowIsolation, which reads the workflow
-    // scope minted above. The isolation-scope context key remains RESERVED —
-    // orderedRequestContext drops it from provider values — so a provider can
-    // never mint a scope that desyncs from the execution identity below.
+    // organization. The isolation-scope context key is RESERVED, so a provider
+    // can never mint a scope that desyncs from the execution identity below.
     if (leg.kind === 'start') {
       base[BREAKWATER_CONNECTOR_EXECUTION_KEY] = {
         kind: 'start',
@@ -2965,11 +2921,11 @@ export class RunnerRuntime {
   }
 
   #workflowState(
-    workflow: AnyWorkflow,
+    workflowId: string,
     runId: string,
     withNestedWorkflows = false,
   ): Promise<WorkflowState | null> {
-    return workflow.getWorkflowRunById(runId, {
+    return this.#getWorkflow(workflowId).getWorkflowRunById(runId, {
       fields: RUN_STATE_FIELDS,
       withNestedWorkflows,
     });
@@ -3020,10 +2976,7 @@ export class RunnerRuntime {
         await this.settleStartExecution(selected);
       return selected.summary;
     }
-    const state = await this.#workflowState(
-      this.#getWorkflow(workflowId),
-      runId,
-    );
+    const state = await this.#workflowState(workflowId, runId);
     if (!state) throw new UnknownRunError(workflowId, runId);
     return this.#summaryFromState(runId, state);
   }
@@ -3042,21 +2995,21 @@ export class RunnerRuntime {
   }
 
   async #summaryForAttempt(
-    workflow: AnyWorkflow,
+    workflowId: string,
     runId: string,
     expected: Pick<RunProvenance, 'version' | 'startToken' | 'attemptToken'>,
   ): Promise<RunSummary | undefined> {
     try {
       if (expected.version === 2) {
         const source = this.#activeRuns.get(
-          this.#runKey(workflow.id, runId),
+          this.#runKey(workflowId, runId),
         )?.source;
         if (!source) return undefined;
         const state = await this.#completedStartState(
           source,
           {
             tablePrefix: source.tablePrefix,
-            workflowId: workflow.id,
+            workflowId,
             runId,
             startToken: expected.startToken,
           },
@@ -3065,7 +3018,7 @@ export class RunnerRuntime {
         await this.#settleStartReservation(state);
         return state.summary;
       }
-      const persisted = await this.#workflowState(workflow, runId);
+      const persisted = await this.#workflowState(workflowId, runId);
       if (
         !persisted ||
         persisted.isFromInMemory ||
@@ -3190,7 +3143,26 @@ export class RunnerRuntime {
     this.#ensureMastra();
     const workflow = this.#workflows.get(workflowId);
     if (!workflow) throw new UnknownWorkflowError(workflowId);
+    // Run-state reads and run creation go through the workflow's own Mastra,
+    // so a workflow another Mastra registered would reach that Mastra's storage.
+    // Another Mastra can register the object during any await, so callers look
+    // the workflow up again where they reach storage, not only at entry.
+    if (workflow.mastra !== this.#mastra) {
+      throw new Error(
+        `RunnerRuntime: workflow '${workflowId}' is not registered on this runtime's Mastra — another runtime or Mastra has registered the same workflow object`,
+      );
+    }
     return workflow;
+  }
+
+  #createRun(
+    workflowId: string,
+    runId: string,
+  ): ReturnType<AnyWorkflow['createRun']> {
+    return this.#getWorkflow(workflowId).createRun({
+      runId,
+      pubsub: this.#pubsub,
+    });
   }
 
   #ensureMastra(): void {
@@ -3216,8 +3188,8 @@ export class RunnerRuntime {
   // alone. The same caller-supplied runId under two workflows are DISTINCT
   // persisted runs (Mastra snapshots key on workflowName+runId) and must never
   // share a per-run FIFO entry. Composing the key in ONE place keeps every
-  // per-run map keyed identically, so a future map cannot reintroduce a
-  // runId-only key and cross workflow boundaries.
+  // per-run map keyed identically, so no map can key by runId alone and cross
+  // workflow boundaries.
   // This is the exact string the DO name join produces
   // (idFromName(`${workflowId}:${runId}`)); PATH_SAFE_ID_PATTERN excludes ':'
   // from both ids, so the join is unambiguous.

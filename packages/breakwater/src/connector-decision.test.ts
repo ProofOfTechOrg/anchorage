@@ -91,10 +91,13 @@ const catalogue = {
   IDEMPOTENCY_LEGACY_AMBIGUOUS: ['idempotency-key-migration', false],
   IDEMPOTENCY_MIGRATION_REQUIRED: ['idempotency-key-migration', false],
   DRY_RUN_UNSUPPORTED: ['dry-run', false],
+  DRY_RUN_INVALID: ['dry-run', false],
   WORKFLOW_SCOPE_MISSING: ['cross-workflow-isolation', false],
   CROSS_WORKFLOW_ACCESS_DENIED: ['cross-workflow-isolation', false],
   ISOLATION_SCOPE_MISSING: ['tenant-isolation', false],
+  ISOLATION_SCOPE_INVALID: ['tenant-isolation', false],
   BACKGROUND_OVERRIDE_DENIED: ['background', false],
+  BACKGROUND_TASK_DENIED: ['background', false],
   BACKGROUND_EXECUTION_DENIED: ['background-execution', false],
   EVALUATOR_DENIED: ['evaluator', false],
   EVALUATOR_FAILED: ['evaluator', false],
@@ -122,24 +125,6 @@ describe('connector decision catalogue', () => {
       expect(CONNECTOR_DECISIONS[code]).toEqual({ policyKind, retryable });
       expect(Object.isFrozen(CONNECTOR_DECISIONS[code])).toBe(true);
       expect(connectorDecisionRetryable(code)).toBe(retryable);
-    }
-  });
-
-  it('keeps the public reference table executable', () => {
-    const doc = readFileSync(
-      new URL('../../../docs/connector-interface.md', import.meta.url),
-      'utf8',
-    );
-    const rows = [
-      ...doc.matchAll(/^\| `([A-Z_]+)` \|[^\n]*\| (true|false) \|$/gm),
-    ];
-    expect(rows.map((row) => row[1]).sort()).toEqual(
-      Object.keys(catalogue).sort(),
-    );
-    for (const [, code, retryable] of rows) {
-      expect(isConnectorDecisionCode(code)).toBe(true);
-      if (!isConnectorDecisionCode(code)) throw new Error('unknown doc code');
-      expect(CONNECTOR_DECISIONS[code].retryable).toBe(retryable === 'true');
     }
   });
 

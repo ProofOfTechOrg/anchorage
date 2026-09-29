@@ -4,6 +4,10 @@ import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { afterEach, expect, it } from 'vitest';
 import { z } from 'zod';
+import type {
+  DirectScenarioFenceProofs,
+  DirectScenarioProofs,
+} from '../scripts/direct-credentialed-scenario.mjs';
 import {
   DIRECT_SCENARIO_INVOCATION_BUDGET,
   DIRECT_SCENARIO_PHASES,
@@ -33,8 +37,6 @@ function mutation(name: string, before: string, after: string) {
 afterEach(cleanupDirectRunState);
 
 it('pins provider-promotion coupling to the native feasibility control', async () => {
-  // `LV2 singleton continuation native feasibility` compares the promoted
-  // generation and provider observation after this source tripwire reds.
   const before = await source('./fixtures/direct-scenario-harness.ts');
   const after = before.replace(
     'if (response.ok) await syncNativeTenant();',
@@ -46,8 +48,6 @@ it('pins provider-promotion coupling to the native feasibility control', async (
 });
 
 it('pins the three-member namespace tuple used by native feasibility', async () => {
-  // `LV2 singleton continuation native feasibility` compares the fresh
-  // database and both namespace identifiers independently.
   const before = await source('./fixtures/direct-native-tenant.ts');
   const after = before.replace(
     'JSON.stringify([databaseId, maintenanceNamespaceId, runnerNamespaceId])',
@@ -63,8 +63,6 @@ it('pins the three-member namespace tuple used by native feasibility', async () 
 });
 
 it('pins provider SQL to the native D1 feasibility path', async () => {
-  // `LV2 singleton continuation native feasibility` reads the retained marker
-  // through the provider SQL path before comparing the A and B generations.
   const before = await source('./fixtures/direct-scenario-harness.ts');
   const after = before.replace(
     'return tenant?.providerRequest(request);',
@@ -128,10 +126,11 @@ it.each([
   [
     'export proofs and their history digests',
     (state: ReturnType<typeof completeScenario>) => {
-      [state.proofs.exports.a, state.proofs.exports.b] = [
-        state.proofs.exports.b,
-        state.proofs.exports.a,
-      ];
+      const exports = state.proofs.exports as unknown as {
+        a: unknown;
+        b: unknown;
+      };
+      [exports.a, exports.b] = [exports.b, exports.a];
       const originalA = present(
         state.proofs.exportVerifications.find(
           ({ cycle, role }) => cycle === null && role === 'a',
@@ -148,6 +147,18 @@ it.each([
       ];
     },
   ],
+  [
+    'fence proof groups',
+    (state: ReturnType<typeof completeScenario>) => {
+      for (const group of ['drain', 'sweeps', 'reopen', 'probes'] as const) {
+        const pair = state.proofs.fence[group] as unknown as {
+          a: unknown;
+          b: unknown;
+        };
+        [pair.a, pair.b] = [pair.b, pair.a];
+      }
+    },
+  ],
 ] as const)('rejects swapped keyed %s in the stored journal', async (_name, swap) => {
   const { journal } = await scenarioJournal();
   const state = completeScenario();
@@ -158,6 +169,41 @@ it.each([
   await expect(journal.recordScenario(state)).rejects.toMatchObject({
     code: 'invalid-state',
   });
+});
+
+it('declares the listed keyed proofs bound to the role of their keys', () => {
+  // Typecheck carries this case. `false extends` fails a group on any one key:
+  // keys that disagree index to `boolean`, which accepts `true`.
+  type Equal<Left, Right> =
+    (<Value>() => Value extends Left ? 1 : 2) extends <
+      Value,
+    >() => Value extends Right ? 1 : 2
+      ? true
+      : false;
+  type KeyBound<Group> = false extends {
+    [Key in keyof Group]: [NonNullable<Group[Key]>] extends [
+      { readonly role: infer Bound },
+    ]
+      ? Equal<Bound, Key>
+      : false;
+  }[keyof Group]
+    ? false
+    : true;
+  const bound: [
+    KeyBound<DirectScenarioProofs['initial']>,
+    KeyBound<DirectScenarioProofs['candidate']>,
+    KeyBound<DirectScenarioProofs['final']>,
+    KeyBound<DirectScenarioProofs['exports']>,
+    KeyBound<DirectScenarioProofs['reprovision']>,
+    KeyBound<DirectScenarioProofs['reprovisionFinal']>,
+    KeyBound<DirectScenarioProofs['reprovisionSettlement']>,
+    KeyBound<DirectScenarioProofs['reprovisionExports']>,
+    KeyBound<DirectScenarioFenceProofs['drain']>,
+    KeyBound<DirectScenarioFenceProofs['sweeps']>,
+    KeyBound<DirectScenarioFenceProofs['reopen']>,
+    KeyBound<DirectScenarioFenceProofs['probes']>,
+  ] = [true, true, true, true, true, true, true, true, true, true, true, true];
+  void bound;
 });
 
 it('rejects a new run id in the finished continuation proof', async () => {

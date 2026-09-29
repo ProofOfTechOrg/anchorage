@@ -29,7 +29,7 @@ import {
 
 type ConnectorDatabase = IdempotencyDatabase & RateLimitDatabase;
 
-export function codingConnectors(db: ConnectorDatabase) {
+export function codingConnectors(db: ConnectorDatabase, workspace: string) {
   const policies = {
     idempotencyStore: new D1IdempotencyStore(db, {
       pendingTtlMs: 20 * 60 * 1_000,
@@ -40,6 +40,7 @@ export function codingConnectors(db: ConnectorDatabase) {
 
   return {
     claude: createClaudeCodeConnector({
+      cwd: workspace,
       timeoutMs: 15 * 60 * 1_000,
       maxOutputBytes: 1024 * 1024,
       idempotencyKey: true,
@@ -47,6 +48,7 @@ export function codingConnectors(db: ConnectorDatabase) {
       policies,
     }),
     codex: createCodexConnector({
+      cwd: workspace,
       timeoutMs: 15 * 60 * 1_000,
       maxOutputBytes: 1024 * 1024,
       idempotencyKey: true,
@@ -58,6 +60,8 @@ export function codingConnectors(db: ConnectorDatabase) {
 ```
 
 Both adapters require approval by default. Keep that default for any writable workspace.
+
+Set `cwd` from trusted host configuration, as above; this is the recommended setup. Every call then runs in that directory, `cwd` leaves the input schema the model sees, and a `cwd` in a call's input is dropped by validation before the process starts. A present `cwd` option must be a non-empty string. A connector without the option runs in the directory the call's input names, so the model chooses the workspace it may write to; approval shows that value, but no gate checks it.
 
 Set `idempotencyKeyMigration` only after every older connector writer sharing
 the D1 store has stopped and drained. A new empty deployment can acknowledge
@@ -76,6 +80,8 @@ interface AgentCliInput {
   model?: string;
 }
 ```
+
+`cwd` is absent from the model's input schema when the connector sets the `cwd` option.
 
 The output is:
 
@@ -231,7 +237,7 @@ The connector still applies its approval, idempotency, rate, input/output, error
 Run coding connectors in a dedicated environment:
 
 1. Create an ephemeral or resettable checkout for the task.
-2. Derive `cwd` from trusted host configuration, not model or client input.
+2. Set the connector's `cwd` option from trusted host configuration, so neither model nor client input chooses the workspace.
 3. Give the process the minimum repository and credential access.
 4. Keep the vendor CLI updated and pin the version in your image.
 5. Apply operating-system or container CPU, memory, process, filesystem, and network limits.

@@ -40,15 +40,26 @@ export interface PolicyContext {
   /** Output channel `text` came from. Always 'answer' in the input phase. */
   channel: OutputChannel;
   /**
-   * The gated messages. Empty during streaming output — processOutputStream
-   * exposes no discrete messages — and empty at a standalone
-   * `createContentPolicyGate` boundary, which has only the rendered text. The
-   * shipped evaluators read only `text`.
+   * The gated messages. In the input phase, the messages `text` is read from:
+   * the message list's non-system messages whose id memory does not hold. On
+   * Mastra's durable loop these are the list's input messages; on
+   * `generate()` and `stream()` they also include the context and response
+   * messages a guarded agent's application input processors added. History
+   * memory loads, a message such a processor added with source `memory`, and
+   * any message whose id memory holds, a history message a processor rewrote
+   * included, are never among them. Empty during streaming output —
+   * processOutputStream exposes no discrete messages — and empty at a
+   * standalone `createContentPolicyGate` boundary, which has only the
+   * rendered text.
    */
   messages: MastraDBMessage[];
   /**
    * Concatenated text of the gated content: input messages, one channel of
    * the streamed output accumulated so far, or the final output result.
+   * Inside a guarded agent the input text also holds the text of each system
+   * message and each other message its application input processors added or
+   * changed, once for each version a processor left it in; a version still
+   * among `messages` is read there, not again.
    */
   text: string;
   /** Mastra request context associated with the agent call. */
@@ -66,11 +77,15 @@ export interface PolicyContext {
 export interface PolicyEvaluator {
   /** Stable policy name used in audit events and denial messages. */
   name: string;
-  /** Phases this policy gates. Default: both. */
+  /**
+   * Phases this policy gates. Default: both. A present list must be a
+   * non-empty array of {@link PolicyPhase} members.
+   */
   phases?: readonly PolicyPhase[];
   /**
    * Output channels this policy gates. Default: ['answer'] — evaluators
-   * written before channels existed keep seeing only client-visible text.
+   * written before channels existed keep seeing only client-visible text. A
+   * present list must be a non-empty array of {@link OutputChannel} members.
    */
   channels?: readonly OutputChannel[];
   /**
@@ -78,7 +93,8 @@ export interface PolicyEvaluator {
    * stay unemitted for this policy to catch a violation straddling the
    * emission frontier. Consulted only when the engine's `holdBack` option is
    * on. Policies without the hint contribute 0 — hint your evaluator to get
-   * hold-back coverage. `Infinity` buffers everything until stream finish.
+   * hold-back coverage. `Infinity` buffers everything until stream finish. A
+   * present value must be a number of at least 0, or `Infinity`.
    */
   holdBackChars?: number;
   /** Decide whether the supplied policy context is allowed. */

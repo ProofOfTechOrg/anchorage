@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import type { Agent } from '@mastra/core/agent';
 import { isGuardedAgentHandle } from '@proofoftech/breakwater/agent';
-import { breakwaterGuardedAgentHostProtocol } from '../agent-runner/durable-agent-runner.js';
+import {
+  breakwaterGuardedAgentHostProtocol,
+  unwrappableAgentReason,
+} from '../agent-runner/durable-agent-runner.js';
 import { AGENT_ENTRY_PATHS } from '../agent-runner/index.js';
 import {
   type ApprovalRole,
@@ -226,6 +230,8 @@ export function validateAgentModule(module: AgentModule): AgentModule {
       `agent '${meta.id}' was built by a @proofoftech/breakwater release without the durable-host protocol (added in 0.12.0); install a release inside the declared peer range`,
     );
   }
+  const refusal = unwrappableAgentReason(module.agent as unknown as Agent);
+  if (refusal !== undefined) fail(`agent '${meta.id}' ${refusal}`);
   if (module.agent.id !== meta.id) {
     fail(
       `metadata id '${meta.id}' does not match guarded agent id '${module.agent.id}'`,
@@ -253,7 +259,7 @@ export function validateAgentModule(module: AgentModule): AgentModule {
   // such field. Say so, rather than throwing on `.filter` of undefined.
   if (!Array.isArray(module.agent.allowedPrincipalKinds)) {
     fail(
-      `agent '${meta.id}' was built by a @proofoftech/breakwater without principal kinds; >=0.7.0 is required`,
+      `agent '${meta.id}' was built by a @proofoftech/breakwater without principal kinds`,
     );
   }
   const metaKinds = new Set(

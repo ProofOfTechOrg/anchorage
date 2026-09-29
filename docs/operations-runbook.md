@@ -27,6 +27,7 @@ pnpm lint
 pnpm typecheck
 pnpm test
 pnpm build
+pnpm test:direct-scenario
 pnpm test:packed-breakwater
 pnpm test:packed-flowsafe-agent-host
 pnpm test:packed-flowsafe-provisioning

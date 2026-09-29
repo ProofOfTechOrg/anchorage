@@ -3,7 +3,7 @@
 import { existsSync } from 'node:fs';
 import { readdir, readFile, stat, unlink, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import {
   DIRECT_CONFORMANCE_EXIT_CODES,
@@ -36,8 +36,8 @@ const cleanup: Array<() => Promise<void>> = [];
 const apiToken = 'inert-provider-token';
 const invokeSecret = 'inert-invoke';
 const SUITE_TIMEOUT_MS = 900_000;
-// The child is killed a minute before the suite times out, so a hung run is
-// reported with the child's own output rather than as a suite timeout.
+// The child is killed before the suite times out, so a hung run is reported
+// with the child's own output rather than as a suite timeout.
 const CHILD_TIMEOUT_MS = SUITE_TIMEOUT_MS - 60_000;
 const REFERENCE_REQUEST_TIMEOUT_MS = 30_000;
 const INVOCATION_TIMEOUT_MS = 600_000;
@@ -421,7 +421,7 @@ process.on('exit', () => writeFileSync(${JSON.stringify(attemptsPath)}, JSON.str
     const attempts = async () =>
       JSON.parse(await readFile(attemptsPath, 'utf8')) as string[];
     const preflight = await childProcess(
-      ['--import', guard, entry, '--preflight'],
+      ['--import', pathToFileURL(guard).href, entry, '--preflight'],
       {
         FLEET_DIRECT_CONFORMANCE_CONFIG: local.configPath,
       },
@@ -431,7 +431,12 @@ process.on('exit', () => writeFileSync(${JSON.stringify(attemptsPath)}, JSON.str
     expect(preflight.stdout.trim().split('\n')).toHaveLength(1);
     expect(preflight.stdout).toMatch(/^DIRECT_CONFORMANCE /u);
     expect(await attempts()).toEqual([]);
-    const help = await childProcess(['--import', guard, entry, '--help']);
+    const help = await childProcess([
+      '--import',
+      pathToFileURL(guard).href,
+      entry,
+      '--help',
+    ]);
     expect(help.status).toBe(0);
     expect(help.stderr).toBe('');
     expect(help.stdout).toContain('--resume');

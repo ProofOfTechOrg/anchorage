@@ -5,11 +5,10 @@ import {
   type EgressDenial,
   EgressDeniedError,
   EgressGuardError,
+  type EgressRequestInit,
   egressFetch,
 } from './egress-fetch.js';
 
-// Plain structural response — breakwater's test tsconfig is lib-ES2022-only,
-// so mocks model the fetch surface the same way the guard's own types do.
 // `body` models the runtime Response body stream the guard cancels on
 // discarded redirect hops; omitted (undefined) for the common case.
 function stubResponse(
@@ -50,6 +49,45 @@ function baseFetch(...responses: StubResponse[]) {
 function hopHeaders(call: BaseCall): { get(name: string): string | null } {
   return call.init?.headers as { get(name: string): string | null };
 }
+
+const matchesEveryHost = {
+  startsWith: () => true,
+  slice: () => '',
+  toString: () => 'x',
+};
+const stringMethodsEntry = {
+  toString: () => 'api.example.com',
+  toLowerCase: () => ({ replace: () => matchesEveryHost }),
+};
+
+function hostsWith(entry: unknown): unknown[] {
+  return ['api.example.com', entry];
+}
+
+function hostsWithHole(): unknown[] {
+  const hosts: unknown[] = ['api.example.com'];
+  hosts.length = 2;
+  return hosts;
+}
+
+const nonStringHostEntries: [string, () => unknown[], string][] = [
+  ['null', () => hostsWith(null), 'null'],
+  ['undefined', () => hostsWith(undefined), 'undefined'],
+  ['a hole', hostsWithHole, 'undefined'],
+  ['a number', () => hostsWith(123), 'number'],
+  ['a Symbol', () => hostsWith(Symbol('api.example.com')), 'symbol'],
+  ['a String object', () => hostsWith(new String('api.example.com')), 'object'],
+  [
+    'a plain object with toString',
+    () => hostsWith({ toString: () => 'api.example.com' }),
+    'object',
+  ],
+  [
+    'an object with its own string methods',
+    () => hostsWith(stringMethodsEntry),
+    'object',
+  ],
+];
 
 describe('egress decision metadata', () => {
   it.each([
@@ -256,7 +294,7 @@ describe('egress decision metadata', () => {
     expect(cancel).toHaveBeenCalledTimes(2);
   });
 
-  it('retains legacy standalone construction and copies safe details', () => {
+  it('supports construction without a code and copies safe details', () => {
     const denial = { host: 'api.example.com', hop: 0, reason: 'custom reason' };
     const error = new EgressDeniedError(denial);
     denial.host = 'changed.example.com';
@@ -284,9 +322,53 @@ describe('egressFetch construction', () => {
     );
   });
 
+  it.each(
+    nonStringHostEntries,
+  )('refuses %s as an allowlist entry', (_label, allowedHosts, got) => {
+    // #when / #then
+    expect(() =>
+      egressFetch(allowedHosts() as unknown as readonly string[]),
+    ).toThrow(
+      new TypeError(
+        `egressFetch: allowedHosts entry 1 must be a string (got ${got})`,
+      ),
+    );
+  });
+
+  it('refuses an allowlist that is not an array', () => {
+    // #when / #then
+    expect(() =>
+      egressFetch('api.example.com' as unknown as readonly string[]),
+    ).toThrow(new TypeError('egressFetch: allowedHosts must be an array'));
+  });
+
+  it('enforces the allowlist entries it validated', async () => {
+    // #given
+    let reads = 0;
+    const allowedHosts = new Proxy(['api.example.com'], {
+      get(target, key, receiver) {
+        if (key === '0') {
+          reads += 1;
+          return reads === 1 ? 'api.example.com' : stringMethodsEntry;
+        }
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    const { fn, calls } = baseFetch(stubResponse(200));
+    const guarded = egressFetch(allowedHosts, { fetch: fn });
+    // #when / #then
+    await expect(guarded('https://exfil.example/private')).rejects.toThrow(
+      EgressDeniedError,
+    );
+    expect(calls).toHaveLength(0);
+    await guarded('https://api.example.com/v1');
+    expect(calls.map((call) => call.url)).toEqual([
+      'https://api.example.com/v1',
+    ]);
+    expect(reads).toBe(1);
+  });
+
   it('rejects a non-integer or negative maxRedirects at construction', () => {
-    // #given — maxRedirects gates the redirect loop; NaN/negative/fractional
-    // would make `hop > maxRedirects` never fire and loop unbounded
     // #when / #then
     expect(() =>
       egressFetch(['api.example.com'], { maxRedirects: -1 }),
@@ -297,7 +379,7 @@ describe('egressFetch construction', () => {
     expect(() =>
       egressFetch(['api.example.com'], { maxRedirects: Number.NaN }),
     ).toThrow(TypeError);
-    // #then — 0 is valid: refuse all redirects
+    // #then — 0 is valid
     expect(() =>
       egressFetch(['api.example.com'], { maxRedirects: 0 }),
     ).not.toThrow();
@@ -318,7 +400,7 @@ describe('egressFetch host checks', () => {
     expect(response.status).toBe(200);
     expect(calls).toHaveLength(1);
     expect(calls[0]?.url).toBe('https://api.example.com/v1/things');
-    // follow mode drives redirects manually so no hop can escape the check
+    // follow mode drives redirects manually
     expect(calls[0]?.init).toMatchObject({
       method: 'POST',
       body: '{}',
@@ -342,7 +424,7 @@ describe('egressFetch host checks', () => {
   });
 
   it('denies everything when the allowlist is empty', async () => {
-    // #given — no declared egress means no network
+    // #given
     const { fn, calls } = baseFetch();
     const guarded = egressFetch([], { fetch: fn });
     // #when / #then
@@ -368,7 +450,7 @@ describe('egressFetch host checks', () => {
     );
   });
 
-  it('normalizes case and trailing dots like the declaration gate', async () => {
+  it('normalizes case and trailing dots', async () => {
     // #given — 'API.EXAMPLE.COM.' is the same DNS name as 'api.example.com'
     const { fn, calls } = baseFetch(stubResponse(200));
     const guarded = egressFetch(['api.example.com'], { fetch: fn });
@@ -405,8 +487,7 @@ describe('egressFetch host checks', () => {
     // #given
     const { fn, calls } = baseFetch(stubResponse(200));
     const guarded = egressFetch(['api.example.com'], { fetch: fn });
-    // #when / #then — {href} is a URL; {url} is a Request, which smuggles
-    // body/redirect state the guard cannot see
+    // #when / #then — {href} is a URL; {url} is a Request
     await expect(
       guarded({ href: 'https://api.example.com/v1' }),
     ).resolves.toMatchObject({ status: 200 });
@@ -453,7 +534,7 @@ describe('egressFetch redirect following', () => {
   });
 
   it('strips credential headers on a cross-origin hop and keeps them same-origin', async () => {
-    // #given — two allowed hosts; the fetch spec strips Authorization when
+    // #given — the fetch spec strips Authorization when
     // the origin changes, and a manual follower must do the same
     const crossOrigin = baseFetch(
       stubResponse(302, { location: 'https://other.example.com/next' }),
@@ -579,7 +660,10 @@ describe('egressFetch redirect following', () => {
     expect(calls).toHaveLength(3);
   });
 
-  it('passes redirect: "manual" through and returns the 3xx to the caller', async () => {
+  it.each([
+    'manual',
+    'error',
+  ] as const)('passes redirect: "%s" through and returns the 3xx to the caller', async (redirect) => {
     // #given
     const { fn, calls } = baseFetch(
       stubResponse(302, { location: 'https://exfil.example.org/x' }),
@@ -587,12 +671,167 @@ describe('egressFetch redirect following', () => {
     const guarded = egressFetch(['api.example.com'], { fetch: fn });
     // #when
     const response = await guarded('https://api.example.com/start', {
-      redirect: 'manual',
+      method: 'POST',
+      redirect,
     });
     // #then — no hop happens, so the disallowed Location never gets fetched
     expect(response.status).toBe(302);
     expect(calls).toHaveLength(1);
-    expect(calls[0]?.init).toMatchObject({ redirect: 'manual' });
+    expect(calls[0]?.init).toMatchObject({ method: 'POST', redirect });
+  });
+
+  function inheritedInit(redirect?: 'manual' | 'error') {
+    const controller = new AbortController();
+    const headers = {
+      'content-type': 'application/json',
+      authorization: 'Bearer t',
+    };
+    const cf = { cacheTtl: 5 };
+    const init = Object.create({
+      method: 'POST',
+      headers,
+      body: '{"a":1}',
+      signal: controller.signal,
+      cf,
+      cache: 'no-store',
+      credentials: 'include',
+      ...(redirect === undefined ? {} : { redirect }),
+    }) as EgressRequestInit;
+    return { init, headers, signal: controller.signal, cf };
+  }
+
+  it.each([
+    'manual',
+    'error',
+  ] as const)('forwards request init inherited members in %s mode', async (redirect) => {
+    const { init, headers, signal, cf } = inheritedInit(redirect);
+    const { fn, calls } = baseFetch(stubResponse(200));
+    const guarded = egressFetch(['api.example.com'], { fetch: fn });
+
+    await guarded('https://api.example.com/things', init);
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.init).toMatchObject({
+      method: 'POST',
+      body: '{"a":1}',
+      cache: 'no-store',
+      credentials: 'include',
+      redirect,
+    });
+    expect(calls[0]?.init?.headers).toBe(headers);
+    expect(calls[0]?.init?.signal).toBe(signal);
+    expect(calls[0]?.init?.cf).toBe(cf);
+  });
+
+  it('forwards request init inherited members across a 307 redirect', async () => {
+    const { init, headers, signal, cf } = inheritedInit();
+    const { fn, calls } = baseFetch(
+      stubResponse(307, { location: '/retry' }),
+      stubResponse(200),
+    );
+    const guarded = egressFetch(['api.example.com'], { fetch: fn });
+
+    await guarded('https://api.example.com/things', init);
+
+    expect(calls).toHaveLength(2);
+    for (const call of calls) {
+      expect(call.init).toMatchObject({
+        method: 'POST',
+        body: '{"a":1}',
+        cache: 'no-store',
+        credentials: 'include',
+        redirect: 'manual',
+      });
+      expect(call.init?.signal).toBe(signal);
+      expect(call.init?.cf).toBe(cf);
+    }
+    expect(calls[0]?.init?.headers).toBe(headers);
+    expect(hopHeaders(calls[1] as BaseCall).get('content-type')).toBe(
+      'application/json',
+    );
+  });
+
+  it('forwards request init members from a Request', async () => {
+    const request = new Request('https://api.example.com/things', {
+      method: 'POST',
+      headers: { 'x-test': '1' },
+      body: 'payload',
+    });
+    const { fn, calls } = baseFetch(stubResponse(200));
+    const guarded = egressFetch(['api.example.com'], { fetch: fn });
+
+    // Request provides RequestInit members through prototype accessors.
+    await guarded(
+      'https://api.example.com/things',
+      request as unknown as EgressRequestInit,
+    );
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.init?.method).toBe('POST');
+    expect(hopHeaders(calls[0] as BaseCall).get('x-test')).toBe('1');
+    expect(request.body).not.toBeNull();
+    expect(calls[0]?.init?.body).toBe(request.body);
+  });
+
+  it.each<[string, unknown]>([
+    ['an array', ['follow']],
+    ['a String object', new String('follow')],
+    ['an object with toString', { toString: () => 'follow' }],
+    [
+      'an object with Symbol.toPrimitive',
+      { [Symbol.toPrimitive]: () => 'follow' },
+    ],
+    ['a Symbol', Symbol('follow')],
+  ])('refuses %s as init.redirect before the base fetch runs', async (_label, redirect) => {
+    // #given
+    const { fn, calls } = baseFetch(
+      stubResponse(302, { location: 'https://exfil.example.org/x' }),
+    );
+    const guarded = egressFetch(['api.example.com'], { fetch: fn });
+    // #when
+    const failure = await guarded('https://api.example.com/start', {
+      redirect: redirect as never,
+    }).catch((error: unknown) => error);
+    // #then
+    expect(failure).toBeInstanceOf(EgressDeniedError);
+    expect(failure).toMatchObject({
+      code: 'EGRESS_INPUT_INVALID',
+      host: 'api.example.com',
+      hop: 0,
+      reason: "init.redirect must be 'follow', 'manual' or 'error'",
+      details: { host: 'api.example.com', hop: 0 },
+    });
+    expect(calls).toHaveLength(0);
+  });
+
+  it('sends the base the redirect mode it checked when init.redirect is a getter', async () => {
+    // #given
+    let reads = 0;
+    const init = {
+      get redirect(): 'follow' | 'manual' {
+        reads += 1;
+        return reads === 1 ? 'manual' : 'follow';
+      },
+    };
+    const { fn, calls } = baseFetch(
+      stubResponse(302, { location: 'https://exfil.example.org/x' }),
+    );
+    const guarded = egressFetch(['api.example.com'], { fetch: fn });
+    // #when
+    const response = await guarded('https://api.example.com/start', init);
+    // #then
+    expect(response.status).toBe(302);
+    expect(calls).toHaveLength(1);
+    const descriptor = Object.getOwnPropertyDescriptor(
+      calls[0]?.init,
+      'redirect',
+    );
+    expect(descriptor).toEqual({
+      value: 'manual',
+      writable: true,
+      enumerable: true,
+      configurable: true,
+    });
   });
 
   it('returns a 3xx without a Location header as-is', async () => {
@@ -607,7 +846,7 @@ describe('egressFetch redirect following', () => {
   });
 
   it('cancels each intermediate redirect body but never the returned response', async () => {
-    // #given — an allowed hop then the final response; both carry a live body.
+    // #given — an allowed hop then the final response.
     // Following must release the discarded 3xx's stream but leave the caller's
     // response intact (the caller still reads it).
     const hopCancel = vi.fn(() => Promise.resolve());

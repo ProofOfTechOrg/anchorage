@@ -16,14 +16,20 @@ import { describe, expect, it } from 'vitest';
 import { AGENT_AUDIT_CONTEXT_KEY, AuditLogger } from '../audit/index.js';
 import { ACTOR_CONTEXT_KEY, type Actor } from '../rbac/index.js';
 import {
+  type ContentPolicyGate,
+  type ContentPolicyGateInput,
+  type ContentPolicyGateOptions,
+  classifierPolicy,
   createContentPolicyGate,
   denyPatterns,
   extractMessageText,
   maxTextLength,
   type OutputChannel,
   PolicyEngine,
+  type PolicyEngineOptions,
   type PolicyEvaluator,
   type PolicyPhase,
+  piiSecrets,
 } from './index.js';
 
 class Tripwire extends Error {}
@@ -329,21 +335,22 @@ describe('PolicyEngine', () => {
     ).rejects.toThrowError(Tripwire);
   });
 
-  it('records an error audit event and rethrows when an evaluator throws', async () => {
+  it('records an error audit event and aborts with a static reason when an evaluator throws', async () => {
     // #given
     const audit = new AuditLogger();
-    const failure = new Error('evaluator internal failure');
     const crashing: PolicyEvaluator = {
       name: 'crashy',
       evaluate: () => {
-        throw failure;
+        throw new Error('evaluator internal failure');
       },
     };
     const engine = new PolicyEngine({ policies: [crashing], audit });
 
-    // #when / #then — the crash propagates (fail closed) AND leaves an audit
+    // #when / #then — the crash aborts (fail closed) AND leaves an audit
     // record; an internal error must not leave less evidence than a denial.
-    await expect(engine.processInput(makeInputArgs('x'))).rejects.toBe(failure);
+    await expect(engine.processInput(makeInputArgs('x'))).rejects.toEqual(
+      new Tripwire('policy evaluation failed'),
+    );
     expect(audit.events()).toHaveLength(1);
     expect(audit.events()[0]).toMatchObject({
       decision: 'error',
@@ -355,7 +362,7 @@ describe('PolicyEngine', () => {
     );
   });
 
-  it('records an error audit event when an async evaluator rejects', async () => {
+  it('records an error audit event and aborts when an async evaluator rejects', async () => {
     // #given
     const audit = new AuditLogger();
     const rejecting: PolicyEvaluator = {
@@ -367,10 +374,106 @@ describe('PolicyEngine', () => {
     const engine = new PolicyEngine({ policies: [rejecting], audit });
 
     // #when / #then
-    await expect(engine.processInput(makeInputArgs('x'))).rejects.toThrowError(
-      'boom',
+    await expect(engine.processInput(makeInputArgs('x'))).rejects.toEqual(
+      new Tripwire('policy evaluation failed'),
     );
-    expect(audit.events()[0]).toMatchObject({ decision: 'error' });
+    expect(audit.events()).toMatchObject([{ decision: 'error' }]);
+  });
+
+  const NOT_DECISIONS: ReadonlyArray<[string, unknown]> = [
+    ['undefined', undefined],
+    ['null', null],
+    ['a string', 'allowed'],
+    ['a non-boolean allowed', { allowed: 'yes' }],
+    ['a denial with a non-string reason', { allowed: false, reason: 42 }],
+  ];
+
+  it.each(
+    NOT_DECISIONS,
+  )('records an error event and aborts input for an evaluator that returns %s', async (_label, value) => {
+    // #given
+    const audit = new AuditLogger();
+    const undecided: PolicyEvaluator = {
+      name: 'undecided',
+      evaluate: () => value as never,
+    };
+    const engine = new PolicyEngine({
+      policies: [undecided, denyPatterns(['x'])],
+      audit,
+    });
+
+    // #when / #then — the later policy never runs
+    await expect(engine.processInput(makeInputArgs('x'))).rejects.toEqual(
+      new Tripwire('policy evaluation failed'),
+    );
+    expect(audit.events()).toMatchObject([
+      {
+        action: 'agent.input.policy',
+        decision: 'error',
+        reason: 'policy evaluation failed',
+        detail: { policy: 'undecided' },
+      },
+    ]);
+  });
+
+  it('answers a policy that returns no decision with the content gate error outcome', async () => {
+    // #given
+    const audit = new AuditLogger();
+    const gate = createContentPolicyGate({
+      policies: [{ name: 'undecided', evaluate: () => undefined as never }],
+      audit,
+    });
+
+    // #when / #then
+    await expect(gate({ text: 'hello' })).resolves.toEqual({
+      allowed: false,
+      outcome: 'error',
+    });
+    expect(audit.events()).toMatchObject([
+      { decision: 'error', reason: 'policy evaluation failed' },
+    ]);
+  });
+
+  it('rethrows a static TypeError at the final result for a policy that returns no decision', async () => {
+    // #given
+    const engine = new PolicyEngine({
+      policies: [
+        {
+          name: 'undecided',
+          phases: ['output'],
+          evaluate: () => undefined as never,
+        },
+      ],
+    });
+
+    // #when / #then
+    await expect(
+      engine.processOutputResult(makeOutputArgs('answer')),
+    ).rejects.toEqual(new TypeError('policy evaluator returned no decision'));
+  });
+
+  it('removes the call input from the message list before an input abort', async () => {
+    // #given — the list holds the call's input, as Mastra's does
+    const engine = new PolicyEngine({ policies: [denyPatterns(['blocked'])] });
+    const args = makeInputArgs('blocked text');
+    args.messageList.add(args.messages, 'input');
+
+    // #when / #then
+    await expect(engine.processInput(args)).rejects.toThrowError(Tripwire);
+    expect(args.messageList.get.input.db()).toEqual([]);
+  });
+
+  it('keeps the call input in the message list when the input is allowed', async () => {
+    // #given
+    const engine = new PolicyEngine({ policies: [denyPatterns(['blocked'])] });
+    const args = makeInputArgs('clean text');
+    args.messageList.add(args.messages, 'input');
+
+    // #when
+    await engine.processInput(args);
+
+    // #then
+    expect(args.messageList.get.input.db()).toHaveLength(1);
   });
 });
 
@@ -624,6 +727,330 @@ describe('createContentPolicyGate', () => {
   });
 });
 
+describe('content gate call input', () => {
+  const SECRET = 'contact john.doe@example.com now';
+  const gates = (): Array<[string, ContentPolicyGate]> => [
+    ['piiSecrets', createContentPolicyGate({ policies: [piiSecrets()] })],
+    [
+      'maxTextLength',
+      createContentPolicyGate({
+        policies: [maxTextLength(10, { phases: ['input'] })],
+      }),
+    ],
+    [
+      'denyPatterns',
+      createContentPolicyGate({ policies: [denyPatterns(['john.doe'])] }),
+    ],
+  ];
+
+  it.each<[string, unknown]>([
+    ['the text passed bare', SECRET],
+    ['text misspelled as txt', { txt: SECRET }],
+    ['text misspelled as body', { body: SECRET }],
+    ['text misspelled as contents', { contents: SECRET }],
+    ['an undefined text', { text: undefined }],
+    ['a null text', { text: null }],
+    ['a text list', { text: [SECRET] }],
+    [
+      'message content as text',
+      { text: { format: 2, parts: [{ type: 'text', text: SECRET }] } },
+    ],
+    ['a part list as text', { text: [{ type: 'text', text: SECRET }] }],
+    ['a length-bearing object as text', { text: { length: 0 } }],
+    ['the input inside a list', [{ text: SECRET }]],
+    ['undefined', undefined],
+    ['null', null],
+    ['a plain-object requestContext', { text: SECRET, requestContext: {} }],
+    ['a Map requestContext', { text: SECRET, requestContext: new Map() }],
+    [
+      'an extra field',
+      { text: SECRET, requestContext: new RequestContext(), note: 'x' },
+    ],
+  ])('returns the error outcome for %s, whatever the policy', async (_label, input) => {
+    for (const [, gate] of gates()) {
+      // #when / #then
+      await expect(gate(input as ContentPolicyGateInput)).resolves.toEqual({
+        allowed: false,
+        outcome: 'error',
+      });
+    }
+  });
+
+  it('records the static error for a malformed input and never evaluates it', async () => {
+    // #given
+    const audit = new AuditLogger();
+    let evaluated = false;
+    const gate = createContentPolicyGate({
+      policies: [
+        {
+          name: 'observe',
+          evaluate: () => {
+            evaluated = true;
+            return { allowed: true };
+          },
+        },
+      ],
+      audit,
+    });
+
+    // #when
+    await gate({ txt: SECRET } as unknown as ContentPolicyGateInput);
+
+    // #then
+    expect(evaluated).toBe(false);
+    expect(audit.events()).toEqual([
+      expect.objectContaining({
+        actor: null,
+        action: 'agent.input.policy',
+        resource: 'breakwater-content-policy-gate',
+        decision: 'error',
+        reason: 'content gate input is malformed',
+      }),
+    ]);
+    expect(JSON.stringify(audit.events())).not.toContain('john.doe');
+  });
+
+  it('still denies the valid input under every policy, with or without a request context', async () => {
+    for (const [, gate] of gates()) {
+      for (const input of [
+        { text: SECRET },
+        { text: SECRET, requestContext: new RequestContext() },
+      ]) {
+        // #when / #then
+        await expect(gate(input)).resolves.toEqual({
+          allowed: false,
+          outcome: 'denied',
+        });
+      }
+    }
+  });
+});
+
+describe('content evaluator text', () => {
+  it.each<[string, () => PolicyEvaluator, unknown, string]>([
+    ['denyPatterns', () => denyPatterns(['secret']), undefined, 'undefined'],
+    ['denyPatterns', () => denyPatterns(['secret']), ['secret'], 'object'],
+    ['maxTextLength', () => maxTextLength(10), ['a'.repeat(20)], 'object'],
+    ['maxTextLength', () => maxTextLength(10), { length: 0 }, 'object'],
+  ])('%s refuses a non-string text (%#)', async (subject, build, text, got) => {
+    // #given
+    const evaluator = build();
+
+    // #when / #then
+    await expect(async () =>
+      evaluator.evaluate({
+        phase: 'output',
+        channel: 'answer',
+        messages: [],
+        text: text as string,
+      }),
+    ).rejects.toThrow(
+      new TypeError(`${subject}: text must be a string (got ${got})`),
+    );
+  });
+
+  it('turns the refusal into the engine error path', async () => {
+    // #given
+    const audit = new AuditLogger();
+    const engine = new PolicyEngine({ policies: [maxTextLength(10)], audit });
+    const args = makeOutputArgs('fine');
+    (args.result as { text: unknown }).text = ['a'.repeat(20)];
+
+    // #when / #then
+    await expect(engine.processOutputResult(args)).rejects.toThrow(
+      new TypeError('maxTextLength: text must be a string (got object)'),
+    );
+    expect(audit.events()[0]).toMatchObject({
+      decision: 'error',
+      reason: 'policy evaluation failed',
+    });
+  });
+});
+
+describe('class-based evaluators with instance state', () => {
+  class ParameterPropertyPolicy implements PolicyEvaluator {
+    readonly name = 'parameter-property';
+    constructor(private readonly words: readonly string[]) {}
+    evaluate({ text }: Parameters<PolicyEvaluator['evaluate']>[0]) {
+      return this.words.some((word) => text.includes(word))
+        ? { allowed: false as const, reason: 'matched a word' }
+        : { allowed: true as const };
+    }
+  }
+
+  class AssignedStatePolicy implements PolicyEvaluator {
+    readonly name = 'assigned-state';
+    readonly blocked: string;
+    constructor(blocked: string) {
+      this.blocked = blocked;
+    }
+    evaluate({ text }: Parameters<PolicyEvaluator['evaluate']>[0]) {
+      return text.includes(this.blocked)
+        ? { allowed: false as const, reason: 'matched assigned state' }
+        : { allowed: true as const };
+    }
+  }
+
+  class PublicFieldPolicy implements PolicyEvaluator {
+    readonly name = 'public-field';
+    minLength = 3;
+    evaluate({ text }: Parameters<PolicyEvaluator['evaluate']>[0]) {
+      return text.length >= this.minLength
+        ? { allowed: false as const, reason: 'too long' }
+        : { allowed: true as const };
+    }
+  }
+
+  it.each<[string, () => PolicyEvaluator]>([
+    [
+      'a TypeScript parameter property',
+      () => new ParameterPropertyPolicy(['blocked']),
+    ],
+    ['a constructor-assigned field', () => new AssignedStatePolicy('blocked')],
+    ['a public class field', () => new PublicFieldPolicy()],
+  ])('constructs and enforces an evaluator holding %s', async (_label, build) => {
+    // #given
+    const engine = new PolicyEngine({ policies: [build()] });
+    const gate = createContentPolicyGate({ policies: [build()] });
+
+    // #when / #then
+    await expect(
+      engine.processInput(makeInputArgs('blocked text')),
+    ).rejects.toThrow(Tripwire);
+    await expect(gate({ text: 'blocked text' })).resolves.toEqual({
+      allowed: false,
+      outcome: 'denied',
+    });
+    await expect(gate({ text: 'ok' })).resolves.toEqual({ allowed: true });
+  });
+
+  it('still refuses a misspelled field on a plain-object spread', () => {
+    // #when / #then
+    expect(
+      () =>
+        new PolicyEngine({
+          policies: [
+            {
+              ...denyPatterns(['x']),
+              holdbackChars: 5,
+            } as unknown as PolicyEvaluator,
+          ],
+        }),
+    ).toThrow(
+      new TypeError(
+        'PolicyEngine: policies entry 0 has unknown field "holdbackChars" (valid fields: name, phases, channels, holdBackChars, evaluate)',
+      ),
+    );
+  });
+
+  it('still refuses a misspelled field on a null-prototype object', () => {
+    // #given
+    const entry = Object.assign(Object.create(null), {
+      ...denyPatterns(['x']),
+      holdbackChars: 5,
+    }) as PolicyEvaluator;
+
+    // #when / #then
+    expect(() => createContentPolicyGate({ policies: [entry] })).toThrow(
+      new TypeError(
+        'createContentPolicyGate: policies entry 0 has unknown field "holdbackChars" (valid fields: name, phases, channels, holdBackChars, evaluate)',
+      ),
+    );
+  });
+});
+
+describe('malformed audit context at the engine and gate', () => {
+  function contextWith(auditContext: unknown): RequestContext {
+    const requestContext = new RequestContext();
+    requestContext.set(ACTOR_CONTEXT_KEY, { id: 'u1', role: 'operator' });
+    requestContext.set(AGENT_AUDIT_CONTEXT_KEY, auditContext);
+    return requestContext;
+  }
+
+  it('records an error event on input and result, and still decides', async () => {
+    // #given — a numeric tenant id is dropped from correlation
+    const audit = new AuditLogger();
+    const engine = new PolicyEngine({ policies: [], audit });
+    const requestContext = contextWith({
+      agentId: 'writer',
+      entryPath: 'http-start',
+      tenantId: 42,
+    });
+    const input = makeInputArgs('hello');
+    const output = makeOutputArgs('fine');
+
+    // #when
+    await engine.processInput({ ...input, requestContext });
+    await engine.processOutputResult({ ...output, requestContext });
+
+    // #then
+    expect(
+      audit.events().map(({ action, decision }) => [action, decision]),
+    ).toEqual([
+      ['audit.context', 'error'],
+      ['agent.input.policy', 'allowed'],
+      ['audit.context', 'error'],
+      ['agent.output.policy', 'allowed'],
+    ]);
+    expect(audit.events()[0]).toMatchObject({
+      actor: { id: 'u1', role: 'operator' },
+      resource: 'breakwater-policy-engine',
+      reason: "request context 'breakwater.auditContext' is malformed",
+      detail: { agentId: 'writer', entryPath: 'http-start' },
+    });
+  });
+
+  it('records an error event at the gate, and still allows clean text', async () => {
+    // #given
+    const audit = new AuditLogger();
+    const gate = createContentPolicyGate({
+      policies: [denyPatterns(['secret'])],
+      audit,
+      resource: 'signal-content',
+    });
+
+    // #when
+    const result = await gate({
+      text: 'hello',
+      requestContext: contextWith({ agentID: 'writer', entryPath: 'x' }),
+    });
+
+    // #then
+    expect(result).toEqual({ allowed: true });
+    expect(audit.events()).toMatchObject([
+      {
+        action: 'audit.context',
+        resource: 'signal-content',
+        decision: 'error',
+      },
+      { action: 'agent.input.policy', decision: 'allowed' },
+    ]);
+    expect(audit.events()[0]?.detail).toBeUndefined();
+  });
+
+  it('records nothing extra for a well-formed context with an undefined optional field', async () => {
+    // #given
+    const audit = new AuditLogger();
+    const engine = new PolicyEngine({ policies: [], audit });
+    const input = makeInputArgs('hello');
+
+    // #when
+    await engine.processInput({
+      ...input,
+      requestContext: contextWith({
+        agentId: 'writer',
+        entryPath: 'http-start',
+        purpose: undefined,
+      }),
+    });
+
+    // #then
+    expect(audit.events().map(({ action }) => action)).toEqual([
+      'agent.input.policy',
+    ]);
+  });
+});
+
 describe('PolicyEngine constructor validation (K2)', () => {
   it('rejects a policy whose explicit phases include input but explicit channels exclude answer', () => {
     // #given — processInput hardcodes channel: 'answer', so this policy
@@ -744,6 +1171,484 @@ describe('PolicyEngine constructor validation (K2)', () => {
     await expect(
       engine.processOutputResult(makeOutputArgs('blocked')),
     ).rejects.toThrowError(/private-field-policy: matched private field/);
+  });
+});
+
+// A real array whose own container methods and iterator answer with
+// `answer`, never with its indexed entries.
+function answeringList<T>(entries: readonly T[], answer: readonly unknown[]) {
+  return Object.assign([...entries], {
+    map: () => [...answer],
+    some: () => answer.length > 0,
+    every: () => true,
+    includes: () => answer.length > 0,
+    [Symbol.iterator]: function* () {
+      yield* answer;
+    },
+  }) as T[];
+}
+
+function denySecret(overrides: Partial<PolicyEvaluator> = {}): PolicyEvaluator {
+  return {
+    name: 'deny-secret',
+    evaluate: ({ text }) =>
+      text.includes('secret')
+        ? { allowed: false, reason: 'secret' }
+        : { allowed: true },
+    ...overrides,
+  };
+}
+
+describe('policy selector validation', () => {
+  it.each<[string, Partial<PolicyEvaluator>, string]>([
+    [
+      'a string phases selector',
+      { phases: 'input' as unknown as PolicyPhase[] },
+      "policy 'deny-secret' phases must be an array",
+    ],
+    [
+      'a string channels selector',
+      { channels: 'answer' as unknown as OutputChannel[] },
+      "policy 'deny-secret' channels must be an array",
+    ],
+    [
+      'an empty phases selector',
+      { phases: [] },
+      "policy 'deny-secret' phases must not be empty",
+    ],
+    [
+      'an empty channels selector',
+      { channels: [] },
+      "policy 'deny-secret' channels must not be empty",
+    ],
+    [
+      'an unknown phase',
+      { phases: ['input', 'Output' as PolicyPhase] },
+      `policy 'deny-secret' phases entry 1 must be 'input' or 'output' (got "Output")`,
+    ],
+    [
+      'an unknown channel',
+      { channels: ['answers' as OutputChannel] },
+      `policy 'deny-secret' channels entry 0 must be 'answer', 'reasoning' or 'object' (got "answers")`,
+    ],
+    [
+      'a non-string phase',
+      { phases: [new String('input') as unknown as PolicyPhase] },
+      `policy 'deny-secret' phases entry 0 must be 'input' or 'output' (got object)`,
+    ],
+  ])('refuses %s in PolicyEngine and createContentPolicyGate', (_label, overrides, message) => {
+    // #given
+    const policies = [denySecret(overrides)];
+    // #when / #then — a policy whose selector selects nothing never runs
+    expect(() => new PolicyEngine({ policies })).toThrow(
+      new TypeError(`PolicyEngine: ${message}`),
+    );
+    expect(() => createContentPolicyGate({ policies })).toThrow(
+      new TypeError(`createContentPolicyGate: ${message}`),
+    );
+  });
+
+  it.each<[string, unknown]>([
+    ['a single policy', denySecret()],
+    ['an array-like object', { length: 1, 0: denySecret() }],
+  ])('refuses %s as the policy list', (_label, policies) => {
+    // #when / #then
+    expect(
+      () =>
+        new PolicyEngine({ policies: policies as readonly PolicyEvaluator[] }),
+    ).toThrow(new TypeError('PolicyEngine: policies must be an array'));
+  });
+
+  it('evaluates the policies it read by index, not the list its own map answers', async () => {
+    // #given — own map answers with a policy that allows everything
+    const policies = answeringList(
+      [denySecret({ phases: ['input'] })],
+      [{ name: 'allow-all', evaluate: () => ({ allowed: true }) }],
+    );
+    const engine = new PolicyEngine({ policies });
+    // #when / #then
+    await expect(
+      engine.processInput(makeInputArgs('the secret')),
+    ).rejects.toThrowError(Tripwire);
+  });
+
+  it('reads selectors by index, not through their own iterators', async () => {
+    // #given — spreading these selectors produces ['output'] and []
+    const phases = answeringList<PolicyPhase>(['input'], ['output']);
+    const channels = answeringList<OutputChannel>(['answer'], []);
+    const engine = new PolicyEngine({
+      policies: [denySecret({ phases, channels })],
+    });
+    const gate = createContentPolicyGate({
+      policies: [denySecret({ phases, channels })],
+    });
+    // #when / #then
+    await expect(
+      engine.processInput(makeInputArgs('the secret')),
+    ).rejects.toThrowError(Tripwire);
+    await expect(gate({ text: 'the secret' })).resolves.toEqual({
+      allowed: false,
+      outcome: 'denied',
+    });
+  });
+});
+
+const EVALUATOR_FIELDS = 'name, phases, channels, holdBackChars, evaluate';
+
+describe('policy engine unknown fields', () => {
+  it('refuses a misspelled PolicyEngine option, which would drop zero-leak buffering', () => {
+    // #when / #then
+    expect(
+      () =>
+        new PolicyEngine({
+          policies: [denySecret()],
+          holdback: true,
+        } as PolicyEngineOptions),
+    ).toThrow(
+      new TypeError(
+        'PolicyEngine: options has unknown field "holdback" (valid fields: policies, audit, resource, holdBack)',
+      ),
+    );
+  });
+
+  it('refuses a misspelled createContentPolicyGate option, which would drop its audit', () => {
+    // #when / #then
+    expect(() =>
+      createContentPolicyGate({
+        policies: [denySecret()],
+        auditLogger: new AuditLogger(),
+      } as ContentPolicyGateOptions),
+    ).toThrow(
+      new TypeError(
+        'createContentPolicyGate: options has unknown field "auditLogger" (valid fields: policies, audit, resource)',
+      ),
+    );
+  });
+
+  it.each<[string, string, unknown]>([
+    ['holdBackChars', 'holdbackChars', 5],
+    ['channels', 'channel', ['reasoning']],
+  ])('refuses a policy entry whose %s is misspelled as %s', (_field, key, value) => {
+    // #given
+    const policies = [{ ...denySecret(), [key]: value }];
+    // #when / #then
+    expect(() => new PolicyEngine({ policies })).toThrow(
+      new TypeError(
+        `PolicyEngine: policies entry 0 has unknown field ${JSON.stringify(key)} (valid fields: ${EVALUATOR_FIELDS})`,
+      ),
+    );
+    expect(() => createContentPolicyGate({ policies })).toThrow(
+      new TypeError(
+        `createContentPolicyGate: policies entry 0 has unknown field ${JSON.stringify(key)} (valid fields: ${EVALUATOR_FIELDS})`,
+      ),
+    );
+  });
+
+  it('refuses a null policy entry', () => {
+    // #when / #then
+    expect(
+      () =>
+        new PolicyEngine({
+          policies: [null] as unknown as PolicyEvaluator[],
+        }),
+    ).toThrow(
+      new TypeError(
+        'PolicyEngine: policies entry 0 must be an object (got null)',
+      ),
+    );
+  });
+
+  it('constructs with every declared option and evaluator field', () => {
+    // #given — the Required types fail to compile while a declared field is
+    // missing here
+    const policy: Required<PolicyEvaluator> = {
+      ...denySecret(),
+      phases: ['input', 'output'],
+      channels: ['answer'],
+      holdBackChars: 5,
+    };
+    const engineOptions: Required<PolicyEngineOptions> = {
+      policies: [policy],
+      audit: new AuditLogger(),
+      resource: 'engine',
+      holdBack: true,
+    };
+    const gateOptions: Required<ContentPolicyGateOptions> = {
+      policies: [policy],
+      audit: new AuditLogger(),
+      resource: 'gate',
+    };
+    // #when / #then
+    expect(() => new PolicyEngine(engineOptions)).not.toThrow();
+    expect(() => createContentPolicyGate(gateOptions)).not.toThrow();
+  });
+});
+
+describe('policy engine values', () => {
+  it.each<[string, unknown, string]>([
+    ['an empty string', '', '""'],
+    ['an empty list', [], 'object'],
+    ['false', false, 'boolean'],
+    ['null', null, 'null'],
+    ['a negative number', -1, '-1'],
+    ['NaN', Number.NaN, 'NaN'],
+    ['a numeric string', '5', '"5"'],
+  ])('refuses %s as a hand-built policy holdBackChars', (_label, holdBackChars, got) => {
+    // #given — a window of 0 would release text before the policy saw it whole
+    const policies = [denySecret({ holdBackChars: holdBackChars as number })];
+    // #when / #then
+    expect(() => new PolicyEngine({ policies, holdBack: true })).toThrow(
+      new TypeError(
+        `PolicyEngine: policy 'deny-secret' holdBackChars must be a number of at least 0, or Infinity (got ${got})`,
+      ),
+    );
+  });
+
+  it('holds back the window a valid hand-built hint asks for', async () => {
+    // #given
+    const engine = new PolicyEngine({
+      policies: [denySecret({ phases: ['output'], holdBackChars: 5 })],
+      holdBack: true,
+    });
+    // #when
+    const released = await engine.processOutputStream(
+      makeStreamArgs([textDelta('the se')], {}),
+    );
+    // #then — the five trailing chars stay held
+    expect(
+      (released as { payload?: { text?: string } } | null)?.payload?.text,
+    ).toBe('t');
+  });
+
+  it('accepts Infinity as a hand-built policy holdBackChars', () => {
+    // #when / #then
+    expect(
+      () =>
+        new PolicyEngine({
+          policies: [denySecret({ holdBackChars: Number.POSITIVE_INFINITY })],
+          holdBack: true,
+        }),
+    ).not.toThrow();
+  });
+
+  it.each<[string, unknown, string]>([
+    ['null, which would bypass the object-only fence', null, 'null'],
+    ['a plain object without record', {}, 'object'],
+    ['a string', 'audit', '"audit"'],
+  ])('refuses %s as the PolicyEngine audit', (_label, audit, got) => {
+    // #given
+    const policy: PolicyEvaluator = {
+      name: 'object-only',
+      channels: ['object'],
+      evaluate: () => ({ allowed: true }),
+    };
+    // #when / #then
+    expect(
+      () =>
+        new PolicyEngine({
+          policies: [policy],
+          audit: audit as AuditLogger,
+        }),
+    ).toThrow(
+      new TypeError(
+        `PolicyEngine: audit must be an AuditLogger when provided (got ${got})`,
+      ),
+    );
+  });
+
+  it('refuses a content-policy gate with no policies, which allows every input', () => {
+    // #when / #then
+    expect(() => createContentPolicyGate({ policies: [] })).toThrow(
+      new TypeError('createContentPolicyGate: policies must not be empty'),
+    );
+  });
+
+  it('keeps a PolicyEngine with no policies, which a guarded agent runs for RBAC alone', () => {
+    // #when / #then
+    expect(() => new PolicyEngine({ policies: [] })).not.toThrow();
+  });
+
+  it('denies through a gate with one policy', async () => {
+    // #given
+    const gate = createContentPolicyGate({
+      policies: [denyPatterns(['secret'])],
+    });
+    // #when / #then
+    await expect(gate({ text: 'the secret' })).resolves.toEqual({
+      allowed: false,
+      outcome: 'denied',
+    });
+  });
+
+  it.each<[string, unknown, string]>([
+    ['Infinity, which never denies', Number.POSITIVE_INFINITY, 'Infinity'],
+    ['a negative number', -1, '-1'],
+    ['NaN', Number.NaN, 'NaN'],
+    ['a numeric string', '10', '"10"'],
+    ['null', null, 'null'],
+  ])('refuses %s as maxTextLength maxChars', (_label, maxChars, got) => {
+    // #when / #then
+    expect(() => maxTextLength(maxChars as number)).toThrow(
+      new TypeError(
+        `maxTextLength: maxChars must be a finite number of at least 0 (got ${got})`,
+      ),
+    );
+  });
+
+  it('denies input over a finite maxChars', async () => {
+    // #given
+    const engine = new PolicyEngine({
+      policies: [maxTextLength(10, { phases: ['input'] })],
+    });
+    // #when / #then
+    await expect(
+      engine.processInput(makeInputArgs('x'.repeat(50))),
+    ).rejects.toThrowError(/max-text-length: text length 50 exceeds limit 10/);
+  });
+
+  it('refuses a misspelled maxTextLength option, which would narrow the phases it gates', () => {
+    // #when / #then
+    expect(() =>
+      maxTextLength(10, { phase: ['input'] } as Parameters<
+        typeof maxTextLength
+      >[1]),
+    ).toThrow(
+      new TypeError(
+        'maxTextLength: options has unknown field "phase" (valid fields: name, phases, channels)',
+      ),
+    );
+  });
+
+  it('constructs maxTextLength with every declared option', () => {
+    // #given
+    const options: Required<NonNullable<Parameters<typeof maxTextLength>[1]>> =
+      { name: 'cap', phases: ['input'], channels: ['answer'] };
+    // #when / #then
+    expect(maxTextLength(10, options)).toMatchObject({ name: 'cap' });
+  });
+
+  it.each<[string, unknown, string]>([
+    ['a negative number', -1, '-1'],
+    ['an empty string', '', '""'],
+    ['NaN', Number.NaN, 'NaN'],
+  ])('refuses %s as denyPatterns holdBackChars', (_label, holdBackChars, got) => {
+    // #when / #then
+    expect(() =>
+      denyPatterns(['secret'], { holdBackChars: holdBackChars as number }),
+    ).toThrow(
+      new TypeError(
+        `denyPatterns: holdBackChars must be a number of at least 0, or Infinity (got ${got})`,
+      ),
+    );
+  });
+
+  it('keeps a valid denyPatterns holdBackChars override', () => {
+    // #when / #then
+    expect(denyPatterns([/secret/], { holdBackChars: 6 }).holdBackChars).toBe(
+      6,
+    );
+  });
+});
+
+describe('denyPatterns entry validation', () => {
+  const ownTest = /secret/;
+  ownTest.test = () => false;
+  const ownExec = /secret/;
+  ownExec.exec = () => null;
+  class NeverMatches extends RegExp {
+    override test(): boolean {
+      return false;
+    }
+  }
+
+  it.each<[string, unknown, string]>([
+    ['an object with its own test', { test: () => false }, 'object'],
+    ['an object with its own exec', { exec: () => null }, 'object'],
+    [
+      'a RegExp-tagged object',
+      {
+        [Symbol.toStringTag]: 'RegExp',
+        test: () => false,
+        source: 'secret',
+        flags: '',
+      },
+      'object',
+    ],
+    [
+      'an object whose prototype is RegExp.prototype',
+      Object.create(RegExp.prototype),
+      'object',
+    ],
+    ['RegExp.prototype', RegExp.prototype, 'object'],
+    ['a String object', new String('secret'), 'object'],
+    ['a number', 42, 'number'],
+    ['null', null, 'null'],
+  ])('refuses %s as a pattern', (_label, entry, got) => {
+    // #when / #then
+    expect(() => denyPatterns(['blocked', entry as string])).toThrow(
+      new TypeError(
+        `denyPatterns: patterns entry 1 must be a string or a RegExp (got ${got})`,
+      ),
+    );
+  });
+
+  it.each<[string, unknown, string]>([
+    ['an empty list', [], 'denyPatterns: patterns must not be empty'],
+    ['a string', 'secret', 'denyPatterns: patterns must be an array'],
+  ])('refuses %s as the pattern list', (_label, patterns, message) => {
+    // #when / #then — a deny list with no entries never denies
+    expect(() => denyPatterns(patterns as readonly string[])).toThrow(
+      new TypeError(message),
+    );
+  });
+
+  it.each<[string, () => RegExp]>([
+    ['a RegExp with its own test', () => ownTest],
+    ['a RegExp with its own exec', () => ownExec],
+    ['a RegExp subclass overriding test', () => new NeverMatches('secret')],
+  ])('matches %s by the RegExp it copied', (_label, pattern) => {
+    // #given
+    const policy = denyPatterns([pattern()]);
+    // #when / #then
+    expect(
+      policy.evaluate({
+        phase: 'input',
+        channel: 'answer',
+        messages: [],
+        text: 'the secret',
+      }),
+    ).toMatchObject({ allowed: false });
+  });
+
+  it('keeps matching when test is assigned to the caller RegExp after construction', () => {
+    // #given
+    const pattern = /secret/;
+    const policy = denyPatterns([pattern]);
+    pattern.test = () => false;
+    // #when / #then
+    expect(
+      policy.evaluate({
+        phase: 'input',
+        channel: 'answer',
+        messages: [],
+        text: 'the secret',
+      }),
+    ).toMatchObject({ allowed: false });
+  });
+
+  it('matches the patterns it read by index, not the list its own map answers', () => {
+    // #given — own map answers with an entry whose test never matches
+    const patterns = answeringList(['secret'], [{ test: () => false }]);
+    const policy = denyPatterns(patterns);
+    // #when / #then
+    expect(
+      policy.evaluate({
+        phase: 'input',
+        channel: 'answer',
+        messages: [],
+        text: 'the secret',
+      }),
+    ).toMatchObject({ allowed: false });
   });
 });
 
@@ -1000,6 +1905,29 @@ describe('PolicyEngine.processOutputStream', () => {
     );
   });
 
+  it('aborts mid-stream with an error event for a policy that returns no decision', async () => {
+    // #given
+    const audit = new AuditLogger();
+    const engine = new PolicyEngine({
+      policies: [
+        {
+          name: 'undecided',
+          phases: ['output'],
+          evaluate: () => undefined as never,
+        },
+      ],
+      audit,
+    });
+
+    // #when / #then
+    await expect(
+      engine.processOutputStream(makeStreamArgs([textDelta('anything')])),
+    ).rejects.toEqual(new Tripwire('policy evaluation failed'));
+    expect(audit.events()).toMatchObject([
+      { decision: 'error', reason: 'policy evaluation failed' },
+    ]);
+  });
+
   it('fails closed when streamParts omits the current part', async () => {
     // #given — a driver/caller whose streamParts does not include the current
     // chunk; the forbidden text lives only in `part`. Accumulation reads
@@ -1023,24 +1951,56 @@ describe('PolicyEngine.processOutputStream', () => {
     );
   });
 
-  it('ignores a text-delta whose payload.text is not a string', async () => {
-    // #given — a malformed chunk; the literal "undefined" must not be coerced
-    // into the gated text and trip a policy
-    const engine = new PolicyEngine({
-      policies: [denyPatterns(['undefined'], { phases: ['output'] })],
-    });
-    // deliberately runtime-invalid to exercise the typeof guard
-    const malformed = {
-      runId: 'run',
-      from: ChunkFrom.AGENT,
-      type: 'text-delta',
-      payload: { id: 'out', text: undefined },
-    } as unknown as ChunkType;
+  it.each<[string, 'text-delta' | 'reasoning-delta', unknown]>([
+    ['an undefined answer delta', 'text-delta', undefined],
+    ['an answer delta list', 'text-delta', ['the SECRET']],
+    ['an answer delta object', 'text-delta', { value: 'the SECRET' }],
+    ['a numeric answer delta', 'text-delta', 42],
+    ['a reasoning delta list', 'reasoning-delta', ['the SECRET']],
+  ])('aborts on %s, which no policy could read, under hold-back off and on', async (_label, type, text) => {
+    for (const holdBack of [false, true]) {
+      // #given
+      const audit = new AuditLogger();
+      const engine = new PolicyEngine({
+        policies: [denyPatterns(['SECRET'], { phases: ['output'] })],
+        audit,
+        holdBack,
+      });
+      const malformed = {
+        runId: 'run',
+        from: ChunkFrom.AGENT,
+        type,
+        payload: { id: 'out', text },
+      } as unknown as ChunkType;
 
-    // #then — no coercion, no false positive; the chunk passes through
+      // #when / #then — the chunk is never forwarded
+      await expect(
+        engine.processOutputStream(makeStreamArgs([malformed])),
+      ).rejects.toThrow(new Tripwire('output text is not a string'));
+      expect(audit.events()).toMatchObject([
+        {
+          action: 'agent.output.policy',
+          decision: 'error',
+          reason: 'output text is not a string',
+          detail: {
+            channel: type === 'text-delta' ? 'answer' : 'reasoning',
+          },
+        },
+      ]);
+    }
+  });
+
+  it('still forwards a string delta that passes', async () => {
+    // #given
+    const engine = new PolicyEngine({
+      policies: [denyPatterns(['SECRET'], { phases: ['output'] })],
+    });
+    const chunk = textDelta('the plan');
+
+    // #when / #then
     await expect(
-      engine.processOutputStream(makeStreamArgs([malformed])),
-    ).resolves.toBe(malformed);
+      engine.processOutputStream(makeStreamArgs([chunk])),
+    ).resolves.toBe(chunk);
   });
 });
 
@@ -1247,6 +2207,48 @@ describe('PolicyEngine output channels — result phase', () => {
       detail: { evaluated: ['deny-patterns', 'max-text-length'] },
     });
   });
+
+  it('aborts on a step whose reasoningText is present but not a string', async () => {
+    // #given
+    const audit = new AuditLogger();
+    const engine = new PolicyEngine({
+      policies: [denyPatterns(['secret'], { phases: ['output'] })],
+      audit,
+    });
+    const args = makeOutputArgs(
+      'clean answer',
+      [],
+      [
+        reasoningStep('fine'),
+        reasoningStep(['the secret plan'] as unknown as string),
+      ],
+    );
+
+    // #when / #then
+    await expect(engine.processOutputResult(args)).rejects.toThrow(
+      new Tripwire('output text is not a string'),
+    );
+    expect(audit.events().at(-1)).toMatchObject({
+      decision: 'error',
+      reason: 'output text is not a string',
+      detail: { channel: 'reasoning' },
+    });
+  });
+
+  it('skips a step with no reasoningText', async () => {
+    // #given
+    const engine = new PolicyEngine({
+      policies: [denyPatterns(['secret'], { phases: ['output'] })],
+    });
+    const args = makeOutputArgs(
+      'clean answer',
+      [],
+      [{} as OutputResult['steps'][number], reasoningStep('fine')],
+    );
+
+    // #when / #then
+    await expect(engine.processOutputResult(args)).resolves.toBe(args.messages);
+  });
 });
 
 describe('PolicyEngine hold-back buffering', () => {
@@ -1300,6 +2302,243 @@ describe('PolicyEngine hold-back buffering', () => {
     return (chunk as { payload?: { id?: string } } | null | undefined)?.payload
       ?.id;
   }
+
+  it.each([
+    {
+      label: 'text-end',
+      delta: textDelta('fine'),
+      end: textEnd(),
+      holdBackChars: Infinity,
+      emitted: '',
+      calls: ['fine'],
+    },
+    {
+      label: 'reasoning-end',
+      delta: reasoningDelta('fine'),
+      end: reasoningEnd(),
+      holdBackChars: Infinity,
+      emitted: '',
+      calls: ['fine'],
+    },
+    {
+      label: 'finish without an end marker',
+      delta: textDelta('fine'),
+      end: finishChunk(),
+      holdBackChars: Infinity,
+      emitted: '',
+      calls: ['fine'],
+    },
+    {
+      label: 'text-end with a finite window',
+      delta: textDelta('finebad'),
+      end: textEnd(),
+      holdBackChars: 3,
+      emitted: 'fine',
+      calls: ['finebad'],
+    },
+  ])('terminal classifier denies held text at $label', async ({
+    delta,
+    end,
+    holdBackChars,
+    emitted: expectedEmitted,
+    calls: expectedCalls,
+  }) => {
+    const calls: string[] = [];
+    const engine = new PolicyEngine({
+      policies: [
+        {
+          ...classifierPolicy({
+            channels: ['answer', 'reasoning'],
+            evaluateEveryChars: 100,
+            classify: async (text) => {
+              calls.push(text);
+              return { allowed: false, reason: 'denied segment' };
+            },
+          }),
+          holdBackChars,
+        },
+      ],
+      holdBack: true,
+    });
+    const state: Record<string, unknown> = {};
+    const initial = await engine.processOutputStream(
+      makeStreamArgs([delta], state),
+    );
+    let emitted = textOf(initial);
+    let aborted = false;
+    try {
+      emitted += textOf(
+        await engine.processOutputStream(makeStreamArgs([delta, end], state)),
+      );
+    } catch (error) {
+      aborted = error instanceof Tripwire;
+    }
+
+    expect(emitted).toBe(expectedEmitted);
+    expect(aborted).toBe(true);
+    expect(calls).toEqual(expectedCalls);
+  });
+
+  it.each([
+    'denies',
+    'throws',
+  ] as const)('does not flush either held channel when reasoning $0 at finish', async (outcome) => {
+    const calls: string[] = [];
+    const engine = new PolicyEngine({
+      policies: [
+        {
+          ...classifierPolicy({
+            channels: ['answer', 'reasoning'],
+            evaluateEveryChars: 100,
+            classify: async (_text, { channel }) => {
+              calls.push(channel);
+              if (channel === 'reasoning') {
+                if (outcome === 'throws') throw new Error('classifier failed');
+                return { allowed: false, reason: 'denied segment' };
+              }
+              return { allowed: true };
+            },
+          }),
+          holdBackChars: Infinity,
+        },
+      ],
+      holdBack: true,
+    });
+    const state: Record<string, unknown> = {};
+    const answer = await engine.processOutputStream(
+      makeStreamArgs([textDelta('answer')], state),
+    );
+    const reasoning = await engine.processOutputStream(
+      makeStreamArgs([reasoningDelta('reasoning')], state),
+    );
+    let aborted = false;
+    let finish: ChunkType | null | undefined;
+    try {
+      finish = await engine.processOutputStream(
+        makeStreamArgs([finishChunk()], state),
+      );
+    } catch (error) {
+      aborted = error instanceof Tripwire;
+    }
+
+    expect(textOf(answer) + textOf(reasoning) + textOf(finish)).toBe('');
+    expect(aborted).toBe(true);
+    expect(calls).toEqual(['answer', 'reasoning']);
+  });
+
+  it.each([
+    { evaluateEveryChars: 100, callsAfterDelta: [] },
+    { evaluateEveryChars: 4, callsAfterDelta: ['fine'] },
+  ])('classifies a clean held segment once before its end marker at cadence $evaluateEveryChars', async ({
+    evaluateEveryChars,
+    callsAfterDelta,
+  }) => {
+    const calls: string[] = [];
+    const engine = new PolicyEngine({
+      policies: [
+        {
+          ...classifierPolicy({
+            evaluateEveryChars,
+            classify: async (text) => {
+              calls.push(text);
+              return { allowed: true };
+            },
+          }),
+          holdBackChars: Infinity,
+        },
+      ],
+      holdBack: true,
+    });
+    const state: Record<string, unknown> = {};
+    const delta = textDelta('fine');
+    const end = textEnd();
+    const initial = await engine.processOutputStream(
+      makeStreamArgs([delta], state),
+    );
+    expect(initial).toBeNull();
+    expect(calls).toEqual(callsAfterDelta);
+
+    const flush = await engine.processOutputStream(
+      makeStreamArgs([delta, end], state),
+    );
+    expect(textOf(flush)).toBe('fine');
+    expect(calls).toEqual(['fine']);
+    expect(state[REPROCESS_KEY]).toBe(end);
+    delete state[REPROCESS_KEY];
+    await expect(
+      engine.processOutputStream(makeStreamArgs([delta, end], state)),
+    ).resolves.toBe(end);
+    await expect(
+      engine.processOutputStream(makeStreamArgs([finishChunk()], state)),
+    ).resolves.toMatchObject({ type: 'finish' });
+    expect(calls).toEqual(['fine']);
+  });
+
+  it('does not deny unchanged held text whose rescan window would split a token', async () => {
+    const policy = piiSecrets({ phases: ['output'] });
+    const maxEnabledSpan = (policy.holdBackChars ?? 0) + 1;
+    const prefix = 'a123-45-6789';
+    // Exact span length starts a rescan at index 1, dropping the 'a'.
+    const text = prefix + ' '.repeat(maxEnabledSpan - prefix.length);
+    const engine = new PolicyEngine({ policies: [policy], holdBack: true });
+    const state: Record<string, unknown> = {};
+    const delta = textDelta(text);
+    const first = await engine.processOutputStream(
+      makeStreamArgs([delta], state),
+    );
+    const tail = await engine.processOutputStream(
+      makeStreamArgs([delta, textEnd()], state),
+    );
+
+    expect(textOf(first) + textOf(tail)).toBe(text);
+  });
+
+  it('classifies a second held segment at its end after a clean first segment', async () => {
+    const calls: string[] = [];
+    const engine = new PolicyEngine({
+      policies: [
+        {
+          ...classifierPolicy({
+            evaluateEveryChars: 100,
+            classify: async (text) => {
+              calls.push(text);
+              return text.includes('bad')
+                ? { allowed: false, reason: 'denied segment' }
+                : { allowed: true };
+            },
+          }),
+          holdBackChars: Infinity,
+        },
+      ],
+      holdBack: true,
+    });
+    const state: Record<string, unknown> = {};
+    const fine = textDelta('fine');
+    const firstEnd = textEnd();
+    const initial = await engine.processOutputStream(
+      makeStreamArgs([fine], state),
+    );
+    const firstFlush = await engine.processOutputStream(
+      makeStreamArgs([fine, firstEnd], state),
+    );
+    expect(initial).toBeNull();
+    expect(textOf(firstFlush)).toBe('fine');
+    expect(state[REPROCESS_KEY]).toBe(firstEnd);
+    delete state[REPROCESS_KEY];
+    await expect(
+      engine.processOutputStream(makeStreamArgs([fine, firstEnd], state)),
+    ).resolves.toBe(firstEnd);
+
+    const bad = textDelta('bad');
+    const second = [fine, firstEnd, bad];
+    expect(
+      await engine.processOutputStream(makeStreamArgs(second, state)),
+    ).toBeNull();
+    await expect(
+      engine.processOutputStream(makeStreamArgs([...second, textEnd()], state)),
+    ).rejects.toBeInstanceOf(Tripwire);
+    expect(calls).toEqual(['fine', 'finebad']);
+  });
 
   it('emits no char of a violating span: pattern split across three chunks', async () => {
     // #given — holdBack on; "secret" (window 5) straddles chunks 1-3
@@ -1522,8 +2761,20 @@ describe('PolicyEngine hold-back buffering', () => {
 
   it('drains multiple held channels over successive finish re-drives', async () => {
     // #given — pending text on both answer and reasoning (Infinity windows)
+    const calls: OutputChannel[] = [];
     const engine = new PolicyEngine({
-      policies: [denyPatterns([/x-\d/], { phases: ['output'] })],
+      policies: [
+        {
+          name: 'counting-evaluator',
+          phases: ['output'],
+          channels: ['answer', 'reasoning'],
+          holdBackChars: Infinity,
+          evaluate: ({ channel }) => {
+            calls.push(channel);
+            return { allowed: true };
+          },
+        },
+      ],
       holdBack: true,
     });
     const state: Record<string, unknown> = {};
@@ -1533,6 +2784,7 @@ describe('PolicyEngine hold-back buffering', () => {
     await engine.processOutputStream(
       makeStreamArgs([reasoningDelta('the trace')], state),
     );
+    expect(calls).toEqual(['answer', 'reasoning']);
 
     // #when — the first finish pass flushes the answer channel (on the
     // channel's own chunk shape) and stashes finish
@@ -1543,6 +2795,7 @@ describe('PolicyEngine hold-back buffering', () => {
     expect(flushAnswer).toMatchObject({ type: 'text-delta' });
     expect(textOf(flushAnswer)).toBe('final answer');
     expect(state[REPROCESS_KEY]).toBe(finish);
+    expect(calls).toEqual(['answer', 'reasoning', 'answer', 'reasoning']);
 
     // #when — the runner re-drives the stashed finish: reasoning flushes
     delete state[REPROCESS_KEY];
@@ -1552,12 +2805,14 @@ describe('PolicyEngine hold-back buffering', () => {
     expect(flushReasoning).toMatchObject({ type: 'reasoning-delta' });
     expect(textOf(flushReasoning)).toBe('the trace');
     expect(state[REPROCESS_KEY]).toBe(finish);
+    expect(calls).toEqual(['answer', 'reasoning', 'answer', 'reasoning']);
 
     // #then — the third pass has nothing pending; finish flows through
     delete state[REPROCESS_KEY];
     await expect(
       engine.processOutputStream(makeStreamArgs([finish], state)),
     ).resolves.toBe(finish);
+    expect(calls).toEqual(['answer', 'reasoning', 'answer', 'reasoning']);
   });
 
   it('flushes the held tail before text-end and re-drives the end chunk', async () => {
@@ -1881,6 +3136,604 @@ describe('extractMessageText', () => {
     expect(extractMessageText([legacyOnly, makeMessage('second')])).toBe(
       'legacy content\nsecond',
     );
+  });
+
+  it("reads each tool call's name and input, then each result's name and output, in prompt order", () => {
+    // #given — the format-2 shape Mastra builds from a replayed tool call and
+    // its tool result
+    const toolHistory: MastraDBMessage = {
+      id: `msg-${++messageSeq}`,
+      role: 'assistant',
+      createdAt: new Date(),
+      content: {
+        format: 2,
+        parts: [
+          {
+            type: 'tool-invocation',
+            toolInvocation: {
+              toolCallId: 'c1',
+              toolName: 'lookup',
+              args: { note: 'argument text' },
+              state: 'result',
+              result: 'result text',
+            },
+          },
+          {
+            type: 'tool-invocation',
+            toolInvocation: {
+              toolCallId: 'c2',
+              toolName: 'lookup',
+              args: { q: 'second' },
+              state: 'result',
+              result: { v: 'json result' },
+            },
+          },
+        ],
+      },
+    };
+
+    // #when / #then — a string stays as written; other values as JSON
+    expect(extractMessageText([toolHistory, makeMessage('hi')])).toBe(
+      'lookup\n{"note":"argument text"}\nlookup\n{"q":"second"}\nlookup\nresult text\nlookup\n{"v":"json result"}\nhi',
+    );
+  });
+
+  it('reads the input of a tool call that has no result yet', () => {
+    // #given
+    const pendingCall: MastraDBMessage = {
+      id: `msg-${++messageSeq}`,
+      role: 'assistant',
+      createdAt: new Date(),
+      content: {
+        format: 2,
+        parts: [
+          {
+            type: 'tool-invocation',
+            toolInvocation: {
+              toolCallId: 'c1',
+              toolName: 'lookup',
+              args: { note: 'pending' },
+              state: 'call',
+            },
+          },
+        ],
+      },
+    };
+
+    // #when / #then
+    expect(extractMessageText([pendingCall])).toBe(
+      'lookup\n{"note":"pending"}',
+    );
+  });
+
+  function toolResultMessage(
+    result: unknown,
+    providerMetadata?: Record<string, unknown>,
+  ): MastraDBMessage {
+    return {
+      id: `msg-${++messageSeq}`,
+      role: 'assistant',
+      createdAt: new Date(),
+      content: {
+        format: 2,
+        parts: [
+          {
+            type: 'tool-invocation',
+            toolInvocation: {
+              toolCallId: 'call-id-text',
+              toolName: 'lookup',
+              args: {},
+              state: 'result',
+              result,
+            },
+            ...(providerMetadata !== undefined ? { providerMetadata } : {}),
+          },
+        ],
+      },
+    } as MastraDBMessage;
+  }
+
+  it("reads a stored model output in place of the raw result it replaces in the model's prompt", () => {
+    // #given — a tool whose model output leaves out what its raw result holds
+    const message = toolResultMessage('raw result for john.doe@example.com', {
+      mastra: { modelOutput: { type: 'text', value: 'summary for the model' } },
+    });
+
+    // #when
+    const text = extractMessageText([message]);
+
+    // #then
+    expect(text).toBe('lookup\n{}\nlookup\nsummary for the model');
+  });
+
+  it('leaves out tool-call ids and provider metadata while reading text file data', () => {
+    // #given
+    const message = toolResultMessage('result text', {
+      openai: { itemId: 'provider-option-text' },
+    });
+    const file: MastraDBMessage = {
+      id: `msg-${++messageSeq}`,
+      role: 'user',
+      createdAt: new Date(),
+      content: {
+        format: 2,
+        parts: [
+          { type: 'file', mimeType: 'text/plain', data: 'ZmlsZS1kYXRh' },
+          { type: 'text', text: 'hi' },
+        ],
+      },
+    };
+
+    // #when
+    const text = extractMessageText([message, file]);
+
+    // #then
+    expect(text).toBe(
+      'lookup\n{}\nlookup\nresult text\ntext/plain\nfile-data\nhi',
+    );
+  });
+
+  const UNCLASSIFIED: Array<[string, MastraDBMessage]> = [
+    [
+      'a part type',
+      {
+        ...makeMessage('hi'),
+        content: {
+          format: 2,
+          parts: [{ type: 'mystery', text: 'hi' }],
+        },
+      } as unknown as MastraDBMessage,
+    ],
+    [
+      'a tool-invocation state',
+      {
+        ...makeMessage('hi', 'assistant'),
+        content: {
+          format: 2,
+          parts: [
+            {
+              type: 'tool-invocation',
+              toolInvocation: {
+                toolCallId: 'c1',
+                toolName: 'lookup',
+                args: {},
+                state: 'mystery',
+              },
+            },
+          ],
+        },
+      } as unknown as MastraDBMessage,
+    ],
+    [
+      'a legacy tool-invocation state',
+      {
+        ...makeMessage('hi', 'assistant'),
+        content: {
+          format: 2,
+          parts: [{ type: 'text', text: 'hi' }],
+          toolInvocations: [
+            {
+              toolCallId: 'c1',
+              toolName: 'lookup',
+              args: {},
+              state: 'mystery',
+            },
+          ],
+        },
+      } as unknown as MastraDBMessage,
+    ],
+    [
+      'a role',
+      { ...makeMessage('hi'), role: 'developer' } as unknown as MastraDBMessage,
+    ],
+    ['a system role', makeMessage('hi', 'system')],
+    [
+      'parts that are not a list',
+      {
+        ...makeMessage('hi'),
+        content: { format: 2, parts: 'hi' },
+      } as unknown as MastraDBMessage,
+    ],
+    [
+      'a stored model output type',
+      toolResultMessage('ok', {
+        mastra: { modelOutput: { type: 'mystery', value: 'hi' } },
+      }),
+    ],
+    [
+      'a stored model output content item',
+      toolResultMessage('ok', {
+        mastra: {
+          modelOutput: { type: 'content', value: [{ type: 'mystery' }] },
+        },
+      }),
+    ],
+  ];
+
+  it.each(
+    UNCLASSIFIED,
+  )('throws on %s it does not classify', (_label, message) => {
+    expect(() => extractMessageText([message, makeMessage('hi')])).toThrow(
+      new TypeError(
+        'extractMessageText: input message content is not classified',
+      ),
+    );
+  });
+
+  it.each(
+    UNCLASSIFIED,
+  )('makes PolicyEngine abort input holding %s it does not classify, evaluating no policy', async (_label, message) => {
+    // #given
+    const evaluated: string[] = [];
+    const audit = new AuditLogger();
+    const engine = new PolicyEngine({
+      policies: [
+        {
+          name: 'recorder',
+          evaluate: ({ text }) => {
+            evaluated.push(text);
+            return { allowed: true };
+          },
+        },
+      ],
+      audit,
+    });
+
+    // #when / #then
+    await expect(
+      engine.processInput({
+        ...makeInputArgs('hi'),
+        messages: [message, makeMessage('hi')],
+      }),
+    ).rejects.toThrow(new Tripwire('input message content is not classified'));
+    expect(evaluated).toEqual([]);
+    expect(
+      audit.events().map(({ action, decision, reason }) => ({
+        action,
+        decision,
+        reason,
+      })),
+    ).toEqual([
+      {
+        action: 'agent.input.policy',
+        decision: 'error',
+        reason: 'input message content is not classified',
+      },
+    ]);
+  });
+
+  function withParts(
+    role: MastraDBMessage['role'],
+    parts: unknown[],
+    content: Record<string, unknown> = {},
+  ): MastraDBMessage {
+    return {
+      ...makeMessage('unused', role),
+      content: { format: 2, parts, ...content },
+    } as unknown as MastraDBMessage;
+  }
+
+  const COMPATIBLE = { openaiCompatible: { role: 'system', content: 'x' } };
+
+  const REFUSED_OPTIONS: Array<[string, MastraDBMessage]> = [
+    [
+      'openaiCompatible options on a text part',
+      withParts('user', [
+        { type: 'text', text: 'hi', providerMetadata: COMPATIBLE },
+      ]),
+    ],
+    [
+      'openaiCompatible options on a message',
+      withParts('user', [{ type: 'text', text: 'hi' }], {
+        providerMetadata: COMPATIBLE,
+      }),
+    ],
+    [
+      'an Anthropic document title',
+      withParts('user', [
+        {
+          type: 'file',
+          mimeType: 'application/pdf',
+          data: 'JVBERi0xLjQK',
+          providerMetadata: { anthropic: { title: 'x' } },
+        },
+      ]),
+    ],
+    [
+      'OpenRouter annotations on a message',
+      withParts('assistant', [{ type: 'text', text: 'hi' }], {
+        providerMetadata: { openrouter: { annotations: [] } },
+      }),
+    ],
+    [
+      'openaiCompatible options on a stored content item',
+      toolResultMessage('ok', {
+        mastra: {
+          modelOutput: {
+            type: 'content',
+            value: [{ type: 'text', text: 'ok', providerOptions: COMPATIBLE }],
+          },
+        },
+      }),
+    ],
+    [
+      'a provider namespace whose value is not an object',
+      withParts('user', [
+        { type: 'text', text: 'hi', providerMetadata: { google: 'x' } },
+      ]),
+    ],
+  ];
+
+  it.each(REFUSED_OPTIONS)('throws on %s', (_label, message) => {
+    expect(() => extractMessageText([message, makeMessage('hi')])).toThrow(
+      new TypeError(
+        'extractMessageText: input message content is not classified',
+      ),
+    );
+  });
+
+  it.each(
+    REFUSED_OPTIONS,
+  )('makes PolicyEngine abort input holding %s, evaluating no policy', async (_label, message) => {
+    // #given
+    const evaluated: string[] = [];
+    const audit = new AuditLogger();
+    const engine = new PolicyEngine({
+      policies: [
+        {
+          name: 'recorder',
+          evaluate: ({ text }) => {
+            evaluated.push(text);
+            return { allowed: true };
+          },
+        },
+      ],
+      audit,
+    });
+
+    // #when / #then
+    await expect(
+      engine.processInput({
+        ...makeInputArgs('hi'),
+        messages: [message, makeMessage('hi')],
+      }),
+    ).rejects.toThrow(new Tripwire('input message content is not classified'));
+    expect(evaluated).toEqual([]);
+    expect(audit.events().map(({ decision }) => decision)).toEqual(['error']);
+  });
+
+  it('reads the text of replayed Anthropic citations and OpenRouter reasoning details, not their signatures, ids or encrypted values', () => {
+    // #given — the provider metadata Anthropic and OpenRouter responses store
+    const message = withParts('assistant', [
+      {
+        type: 'text',
+        text: 'answer',
+        providerMetadata: {
+          anthropic: {
+            citations: [
+              {
+                type: 'web_search_result_location',
+                cited_text: 'cited passage',
+                url: 'https://example.invalid/page',
+                title: 'page title',
+                encrypted_index: 'ENCRYPTEDINDEX',
+              },
+            ],
+          },
+        },
+      },
+      {
+        type: 'reasoning',
+        reasoning: 'thinking',
+        details: [],
+        providerMetadata: {
+          openrouter: {
+            reasoning_details: [
+              {
+                type: 'reasoning.text',
+                text: 'detail text',
+                signature: 'SIGNATURE',
+              },
+              { type: 'reasoning.summary', summary: 'detail summary' },
+              {
+                type: 'reasoning.encrypted',
+                data: 'ENCRYPTEDDATA',
+                id: 'DETAILID',
+              },
+            ],
+          },
+        },
+      },
+    ]);
+
+    // #when
+    const text = extractMessageText([message, makeMessage('hi')]);
+
+    // #then
+    for (const read of [
+      'cited passage',
+      'https://example.invalid/page',
+      'page title',
+      'detail text',
+      'detail summary',
+    ]) {
+      expect(text).toContain(read);
+    }
+    for (const unread of [
+      'ENCRYPTEDINDEX',
+      'SIGNATURE',
+      'ENCRYPTEDDATA',
+      'DETAILID',
+    ]) {
+      expect(text).not.toContain(unread);
+    }
+  });
+
+  it('reads every stored model output, on any role and state, whether or not a tool result receives it', () => {
+    // #given — outputs no tool result in these messages receives
+    const userCarrier = withParts('user', [
+      { type: 'text', text: 'hi' },
+      {
+        type: 'tool-invocation',
+        toolInvocation: {
+          toolCallId: 'elsewhere',
+          toolName: 'lookup',
+          args: {},
+          state: 'result',
+          result: 'ok',
+        },
+        providerMetadata: {
+          mastra: { modelOutput: { type: 'text', value: 'user-held output' } },
+        },
+      },
+    ]);
+    const pending = withParts('assistant', [
+      {
+        type: 'tool-invocation',
+        toolInvocation: {
+          toolCallId: 'pending',
+          toolName: 'lookup',
+          args: {},
+          state: 'call',
+        },
+        providerMetadata: {
+          mastra: { modelOutput: { type: 'text', value: 'pending output' } },
+        },
+      },
+    ]);
+
+    // #when
+    const text = extractMessageText([userCarrier, pending]);
+
+    // #then
+    expect(text).toContain('user-held output');
+    expect(text).toContain('pending output');
+  });
+
+  it('reads every field of a stored content item except its base64 data', () => {
+    // #given
+    const message = toolResultMessage('ok', {
+      mastra: {
+        modelOutput: {
+          type: 'content',
+          value: [
+            { type: 'image-url', url: 'https://example.invalid/image' },
+            { type: 'file-id', fileId: 'file-provider-id' },
+            {
+              type: 'image-data',
+              data: 'BASE64DATA',
+              mediaType: 'image/png',
+              providerOptions: { host: { note: 'item note' } },
+            },
+          ],
+        },
+      },
+    });
+
+    // #when
+    const text = extractMessageText([message]);
+
+    // #then
+    for (const read of [
+      'https://example.invalid/image',
+      'file-provider-id',
+      'image/png',
+      'item note',
+    ]) {
+      expect(text).toContain(read);
+    }
+    expect(text).not.toContain('BASE64DATA');
+  });
+
+  it('throws the classification TypeError with the conversion error as its cause', () => {
+    // #given — Mastra's conversion throws on a text part whose text is a number
+    const message = withParts('user', [{ type: 'text', text: 42 }]);
+
+    // #when
+    let thrown: unknown;
+    try {
+      extractMessageText([message]);
+    } catch (error) {
+      thrown = error;
+    }
+
+    // #then
+    expect(thrown).toEqual(
+      new TypeError(
+        'extractMessageText: input message content is not classified',
+      ),
+    );
+    expect((thrown as Error).cause).toBeInstanceOf(Error);
+  });
+
+  it.each<[string, MastraDBMessage]>([
+    [
+      'a text part whose text is a number',
+      withParts('user', [{ type: 'text', text: 42 }]),
+    ],
+    [
+      'a value structuredClone cannot copy',
+      withParts('user', [
+        {
+          type: 'text',
+          text: 'hi',
+          providerMetadata: { host: { callback: () => 'hi' } },
+        },
+      ]),
+    ],
+  ])('makes PolicyEngine abort, not throw, on %s, with one error event', async (_label, message) => {
+    // #given
+    const audit = new AuditLogger();
+    const engine = new PolicyEngine({ policies: [denySecret()], audit });
+
+    // #when / #then
+    await expect(
+      engine.processInput({ ...makeInputArgs('hi'), messages: [message] }),
+    ).rejects.toThrow(new Tripwire('input message content is not classified'));
+    expect(
+      audit.events().map(({ action, decision, reason }) => ({
+        action,
+        decision,
+        reason,
+      })),
+    ).toEqual([
+      {
+        action: 'agent.input.policy',
+        decision: 'error',
+        reason: 'input message content is not classified',
+      },
+    ]);
+  });
+
+  it('evaluates the call messages and not the history memory adds to the message list', async () => {
+    // #given
+    const seen: { text: string; ids: string[] }[] = [];
+    const engine = new PolicyEngine({
+      policies: [
+        {
+          name: 'recorder',
+          evaluate: ({ text, messages }) => {
+            seen.push({ text, ids: messages.map(({ id }) => id) });
+            return { allowed: true };
+          },
+        },
+      ],
+    });
+    const remembered = makeMessage('remembered history');
+    const caller = makeMessage('caller input');
+    const messageList = new MessageList();
+    messageList.add(remembered, 'memory');
+    messageList.add(caller, 'input');
+
+    // #when
+    await engine.processInput({
+      ...makeInputArgs('unused'),
+      messages: messageList.get.all.db(),
+      messageList,
+    });
+
+    // #then
+    expect(seen).toEqual([{ text: 'caller input', ids: [caller.id] }]);
   });
 });
 

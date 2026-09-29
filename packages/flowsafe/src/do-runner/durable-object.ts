@@ -1879,8 +1879,8 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
 
     if (request.method === 'POST' && segments.length === 1) {
       const principal = this.#trustedExecutionPrincipal(encodedPrincipal);
+      const body = await readJson<StartBody>(request);
       return this.#withOperationLock(async () => {
-        const body = await readJson<StartBody>(request);
         if (
           body &&
           [

@@ -79,16 +79,18 @@ import {
   type PrincipalPermissionResolver,
 } from '@proofoftech/flowsafe/agent-host';
 
-const reportAgent: AgentModule = {
-  meta: {
-    id: 'report-agent',
-    title: 'Report agent',
-    description: 'Builds and reads reports',
-    allowedRoles: ['operator'],
-    requiredPermissions: ['agents.report.run', 'reports.read'],
-  },
-  agent,
-};
+function createReportAgentModule(): AgentModule {
+  return {
+    meta: {
+      id: 'report-agent',
+      title: 'Report agent',
+      description: 'Builds and reads reports',
+      allowedRoles: ['operator'],
+      requiredPermissions: ['agents.report.run', 'reports.read'],
+    },
+    agent: createReportAgent(),
+  };
+}
 
 const resolvePrincipalPermissions: PrincipalPermissionResolver =
   (principal) => ({
@@ -104,14 +106,16 @@ The host installs the resolver beside its catalog module builder:
 ```typescript
 const agentHost = createThreadAgentHost({
   ...threadHostOptions,
-  buildModules: () => [reportAgent],
+  buildModules: () => [createReportAgentModule()],
   resolvePrincipalPermissions,
 });
 ```
 
-The resolver can map a human role or an automated identity to the same `Permission` vocabulary. Keep `permissionsForRole`, `permissionsForPrincipal`, and `accessPolicyVersion` in trusted host configuration.
+The resolver can map a human role or an automated identity to the same `Permission` vocabulary. Keep `permissionsForRole`, `permissionsForPrincipal`, and `accessPolicyVersion` in trusted host configuration. Have `createReportAgent()` construct a fresh agent because each thread Durable Object wraps its own agent.
 
-The thread host evaluates required permissions only after the existing human-role or automated-entry gate succeeds. A missing resolver, a thrown or rejected call, or malformed resolver output fails closed for a permission-requiring agent. Malformed output is a non-object resolution, a permission set that is not an array of canonical identifiers, or a `policyVersion` that is blank, longer than 200 characters, or contains ASCII control characters. Duplicate identifiers in the resolved set are tolerated because a repeat cannot change an all-of decision. A resolver failure surfaces only the generic audit reason `permission resolution failed`, so log failures inside the resolver itself.
+The thread host refuses a start containing a `role: 'system'` message or call-level provider options outside `assertAcceptedCallProviderOptions()` with `400`, before authorization or any write. For a threadless schedule fire, those call-level options come from its stored target; a refused fire records `failed` and the schedule advances. Put per-agent provider options on the agent's model entry (`model: [{ model, providerOptions }]`), which Mastra merges with precedence.
+
+The thread host evaluates required permissions only after the human-role or automated-entry gate succeeds. A missing resolver, a thrown or rejected call, or malformed resolver output fails closed for a permission-requiring agent. Malformed output is a non-object resolution, a permission set that is not an array of canonical identifiers, or a `policyVersion` that is blank, longer than 200 characters, or contains ASCII control characters. Duplicate identifiers in the resolved set are tolerated because a repeat cannot change an all-of decision. A resolver failure surfaces only the generic audit reason `permission resolution failed`, so log failures inside the resolver itself.
 
 A configured resolver runs on every authorized entry, including role-only agents, because its resolution is also the input to connector authorization. The host projects it into the run's derived request context as `breakwater.principalPermissions` on every start and resume leg — an explicit `null` when no resolution exists, so a resume retires a stale persisted projection instead of inheriting it. A connector that declares `PermissionManifest.requiredPermissions` enforces its own all-of list against that projection inside Breakwater, before its dry-run branch and approval grant. A role-only agent does not require the resolver: a failed resolution still starts the run, records an `agent.permissions.resolve` error event, and leaves the projection `null`, so permission-declaring connectors inside that run fail closed.
 
@@ -139,9 +143,11 @@ Each stream line contains the next reconnect cursor and one event. Replay depend
 
 Approval records store an `agent-thread` target with the agent, thread, resource, and original authorized principal. `createAgentApprovalResumer()` re-authorizes that stored principal against the current catalog: a human against the agent's roles and an automated principal against its `allowedAutomation` declaration on the `approval.resume` entry path. The thread host then enforces any `requiredPermissions` through the current resolver policy. It reconstructs the guarded module after eviction and resumes as the original principal. Before resume, the wrapper rebuilds Mastra's local and global run registries from fresh trusted context. It invokes only Breakwater's reserved RBAC `processInput` hook during rehydration, then installs the complete input, LLM-request, and output processor lists for resumed loop execution. It does not replay application or policy `processInput` hooks. An authorization denial stops before registry installation, observation, or tool execution. The reviewer identity remains attached to the approval decision.
 
+On Mastra's durable loop, output policies, including hold-back's terminal classification, stop the stream a subscriber receives. Mastra logs a result-phase refusal. The thread message it saves and the result it returns come from model output and are not filtered by output policies.
+
 ## Use the lower-level durable wrapper
 
-`createFlowsafeDurableAgent()` remains available for compatibility. Create an ordinary Mastra `Agent`, then wrap it:
+`createFlowsafeDurableAgent()` is available for compatibility. Create an ordinary Mastra `Agent`, then wrap it:
 
 ```typescript
 import { Agent } from '@mastra/core/agent';
@@ -166,9 +172,11 @@ const durableAgent = createFlowsafeDurableAgent({
 });
 ```
 
-`createFlowsafeDurableAgent()` registers Mastra's `durable-agentic-loop` workflow on the supplied runtime. Its `stream()`, `generate()`, and `prepare()` entry points require a host-minted opaque run id. Only a start registered through `streamUntilPersisted()` reaches `RunnerRuntime`; an unregistered start fails terminally after a bounded, best-effort attempt to preserve its serialized input. Preservation is skipped when the thread is missing or memory is explicitly read-only. `prepare()` remains an initial-execution API and runs the full initial processor chain. `resumeViaRuntime()` uses the dedicated registry rehydration behavior described above.
+`createFlowsafeDurableAgent()` registers Mastra's `durable-agentic-loop` workflow on the supplied runtime. Its `stream()`, `generate()`, and `prepare()` entry points require a host-minted opaque run id. Only a start registered through `streamUntilPersisted()` reaches `RunnerRuntime`; an unregistered start fails terminally after a bounded, best-effort attempt to preserve its input, decided by the guarded input chain's verdict. When no input processor refused the start, its prepared input is preserved. When the start's input is a created signal, the call carries neither a host ticket nor a request context, and Breakwater's RBAC gate refuses the start, the signal is kept as received. Mastra starts such a call when it drains a signal after a run registered through `resumeViaRuntime()` completes: the drain inherits that run's options, which carry no request context, and the gate refuses it for its missing actor without reading content. On a guarded agent such a start has no actor, so the gate refuses it before any application input processor runs. Host code that calls `stream()` the same way, with a created signal or an object carrying the signal brand as input, has that input kept when the gate refuses it. After any other refusal nothing is preserved, so on a guarded agent content an input policy or processor refused never reaches the thread. Preservation is skipped when the thread is missing, memory is explicitly read-only, or the signal is transient. `prepare()` remains an initial-execution API and runs the full initial processor chain. `resumeViaRuntime()` uses the dedicated registry rehydration behavior described above.
 
 The trusted host calls `streamUntilPersisted(messages, options, requestedBy, requestedByKind, attemptToken, scheduleDispatch, idempotencyKey, authority)`. The eighth argument is required; pass explicit `undefined` for unused positional options. Its `AgentStartAuthority` type is exported only from `agent-runner`. It carries the initiating owner, agent and thread identity, threaded mode, optional caller epoch, separate resource-owner guard and original successful start-reservation claim when keyed.
+
+A host that calls `streamUntilPersisted()` itself applies Breakwater's `assertNoGuardedSystemMessages()` to the messages and `assertAcceptedCallProviderOptions()` to the call-level provider options first, as the thread host does. This direct path bypasses the guarded handle's checks.
 
 The bridge captures that authority before streaming and keeps it out of Core input, stream options and public JSON. It preserves the original method caller's requester identity even when a schedule or thread has a different resource owner. Mutable caller objects cannot replace the captured values after an await.
 
@@ -182,22 +190,30 @@ Ordinary v1 and absent-provenance runs retain validated status, resume and lifec
 
 Protected keyed replay reads the actual wrapper's workflow once and pairs its public envelope with that observation's identity. A terminal ephemeral run does not need a retained thread binding to replay. Optional stored context may be pruned, but present selectors must agree with the original agent/thread/mode. The execution token, raw snapshot, claim and recovery journal remain internal. Proof-only signal delivery retains the selected generation through policy and memory waits and checks the active run again immediately before delivery.
 
-The runtime's pub/sub identity is reused by default. This lets the durable loop, observer, and active-thread signal delivery share one feed inside the thread Durable Object.
+The wrapper fixes its agent-level pub/sub at construction to `pubsub ?? runtime.pubsub`, or its own stream bus when both are absent. From its first start, every threaded run registers on the state that signal delivery and the run's drain read. A resumed run registers there when `threadRuntime` is passed. The constructor throws a `TypeError` when the wrapped agent has a pub/sub of its own that differs. The wrapper sets the wrapped agent's pub/sub, so that pub/sub follows the last wrapper constructed over the agent: do not wrap one agent in two thread Durable Objects that are live at once.
 
-This wrapper does not add the guarded-agent brand or catalog authorization to a raw agent. Use `agent-host` for the supported protected public surface. Route clients through its authenticated run routes because only the host start seam may execute a run. Direct `stream()` with an unregistered id resolves to a failed output; direct `generate()` rejects. `stream()`, `generate()`, `prepare()`, and `streamUntilPersisted()` synchronously refuse a live id. A successful `prepare({ runId: X })` keeps `X` live until core cleans up that prepared run.
+This wrapper does not add the guarded-agent brand or catalog authorization to a raw agent. Use `agent-host` for the supported protected public surface. Route clients through its authenticated run routes, which start each run at the host start seam. Direct `stream()` with an unregistered id resolves to a failed output; direct `generate()` rejects. `stream()`, `generate()`, `prepare()`, and `streamUntilPersisted()` synchronously refuse a live id. A successful `prepare({ runId: X })` keeps `X` live until core cleans up that prepared run.
 
-The runner refuses every inherited entry point that falls under one of four grounds:
+The wrapper's constructor throws a `TypeError` when the agent it wraps has channels configured, declares Mastra agent schedules, sets the `durable` option, or is already a durable agent, such as a Mastra `DurableAgent` or another Flowsafe wrapper. Channels dispatch inbound messages and tool approval decisions to the wrapped agent outside `RunnerRuntime`, a Mastra schedule worker fires declared schedules on it outside `RunnerRuntime`, and a Mastra that registers a Mastra `DurableAgent`, or an agent with the `durable` option, exposes that agent's own recovery and run listing, which the runner does not guard. The guarded agent catalog applies the same checks to each module, so the thread host refuses such a module before its Mastra registers the agent. The wrapper itself cannot be registered on any Mastra; the Mastra host features that register it are listed after the grounds below.
 
-- **Re-drives a persisted run below `RunnerRuntime`.** The recovery pair `recover()` and `recoverActiveRuns()`, and the resume family `resume()`, `resumeStream()`, `resumeGenerate()`, `approveToolCall()`, `declineToolCall()`, `approveToolCallGenerate()`, and `declineToolCallGenerate()`, which rehydrate from snapshot storage on a run-registry miss.
-- **Discovers runs without the host topology's per-principal ownership checks**, returning run, thread, and resource ids the caller does not own: the recovery discovery API `listActiveRuns()`, the agent-level `listSuspendedRuns()`, and `listActiveThreadRuns()`, which takes no arguments and returns those ids for every thread on the pub/sub instance with a run in flight, scoped by neither principal nor agent.
+Do not wrap an agent constructed with Mastra `signals`. Core connects configured signal providers to that raw agent before FlowSafe builds its runtime, so their deliveries use core's raw-agent notification and signal path instead of the thread topology and `RunnerRuntime`. Use FlowSafe's signal-provider host and thread delivery instead.
+
+`RunnerRuntime` refuses a workflow object that another Mastra has registered. Register each workflow object on one runtime, and do not add a runtime's workflows, or the wrapper's `getWorkflow()`, to another Mastra.
+
+The runner cannot reach the raw agent you still hold. Channels bound to it after wrapping dispatch to it outside `RunnerRuntime`, and schedules set on it fire on it from the schedule worker of any Mastra that registers it and runs `startWorkers()`. Registering the raw agent on another Mastra moves its memory when that memory has no storage of its own. Do not bind channels or declare schedules on the raw agent after wrapping it, and do not register it on another Mastra.
+
+The runner refuses these inherited entry points, on these grounds:
+
+- **Re-drives a persisted run below `RunnerRuntime`.** The recovery entries `recover()` and `recoverActiveRuns()`, and the resume family `resume()`, `resumeStream()`, `resumeGenerate()`, `approveToolCall()`, `declineToolCall()`, `approveToolCallGenerate()`, and `declineToolCallGenerate()`, which rehydrate from snapshot storage on a run-registry miss.
+- **Discovers runs or thread identities without the host topology's per-principal ownership checks**: the recovery discovery API `listActiveRuns()`, the agent-level `listSuspendedRuns()`, and `listActiveThreadRuns()`, which returns run, thread and resource ids across the pub/sub instance; `discoverThreadPeers()` returns advertised agent, resource, thread and source identities without a caller-named thread or principal.
 - **Deletes snapshot rows that deployment-scoped retention owns**: `deleteRunSnapshots()`.
-- **Is a second execution surface outside `RunnerRuntime`, or mints a run id below the caller.** The network family `network()`, `resumeNetwork()`, `approveNetworkToolCall()`, and `declineNetworkToolCall()` compile and drive the multi-agent loop's own workflow with `createRun` plus `run.stream` or `run.resumeStream` on the default engine. The AI SDK v4 legacy pair `generateLegacy()` and `streamLegacy()` run the agent's tools through Mastra's legacy handler, skipping the authorization check every supported entry point calls. And `sendToolApproval()` reads like a resume but starts a run through the thread runtime's continuation when given messages. Four of these generate a run id when the caller omits one — `network()`, `generateLegacy()`, `streamLegacy()`, and `sendToolApproval()` through the thread runtime's continuation — which is the unowned-run-id fallback Flowsafe refuses everywhere else, so blocking them extends the host-minted run id rule that `stream()`, `generate()`, and `prepare()` already enforce across the whole inherited surface. `__setThreadRuntimeAgent()` is refused on the same ground without starting anything itself; `BLOCKED_RUN_ENTRIES` contains the authoritative refusal rationale that the runner and its documentation mirror.
+- **Is a second execution surface outside `RunnerRuntime`, or mints a run id below the caller.** The network family `network()`, `resumeNetwork()`, `approveNetworkToolCall()`, and `declineNetworkToolCall()` compile and drive the multi-agent loop's own workflow with `createRun` plus `run.stream` or `run.resumeStream` on the default engine. The AI SDK v4 legacy entries `generateLegacy()` and `streamLegacy()` run the agent's tools through Mastra's legacy handler, skipping the authorization check every supported entry point calls. And `sendToolApproval()` reads like a resume but starts a run through the thread runtime's continuation when given messages. `network()`, `generateLegacy()`, `streamLegacy()`, and `sendToolApproval()` through the thread runtime's continuation generate a run id when the caller omits one, which is the unowned-run-id fallback Flowsafe refuses, so blocking them extends the host-minted run id rule that `stream()`, `generate()`, and `prepare()` enforce. `__setThreadRuntimeAgent()`, `setChannels()`, and `__setDeclaredSchedules()` are refused on the same ground without starting anything themselves: each installs something that later runs the agent outside `RunnerRuntime`, whether a thread-runtime execution target, a channel dispatch target, or a schedule that a Mastra schedule worker fires.
+- **Installs a runtime service — a Mastra, memory or pub/sub — after construction.** `__setMastra()` and `__registerMastra()` bind the wrapper and its wrapped agent to the Mastra they are given, so every later leg is prepared against that Mastra. Registered through `Mastra.addAgent()` once the runtime has built its own Mastra, they also repoint the runtime's loop workflow, and with it run state, to that Mastra's storage. `__setMemory()` and `__setPubSub()` install a service on the wrapper and forward it to the wrapped agent; the wrapper's pub/sub is fixed at construction.
+- **Cancels a run outside `RunnerRuntime`'s terminal lifecycle.** `abortRunStream()` and `abortThreadStream()` bypass the terminate route's ownership and disputed-settlement checks. Cancel through the terminate route; the stream result's own `abort()` remains available.
 
-All blocked inherited entries throw. `resumeViaRuntime()` is the only resume path, and host starts use `streamUntilPersisted()`.
+All blocked inherited entries throw. The runner's resume path is `resumeViaRuntime()`, and host starts use `streamUntilPersisted()`.
 
-Mastra's own host features that reach a run through a blocked entry fail closed by design: the agent-controller session's chat tool approval calls `sendToolApproval()`, now blocked outright; its active-thread-run aggregation calls `listActiveThreadRuns()` on every backing agent, refused under the discovery ground above, so that aggregation throws on a controller the tool-approval block already made unusable here; its thread resume reaches `sendStreamResume()` and an until-idle resume reaches `resumeStreamUntilIdle()`, both of which land on the blocked `resumeStream()` by virtual dispatch. The five signal and message senders (`sendMessage()`, `queueMessage()`, `sendSignal()`, `sendStateSignal()`, `sendNotificationSignal()`) remain inherited because every run outcome they can produce lands on the runner's terminal path, not because every sender still has a route caller. The `queue` and `state` routes persist rather than wake on idle. Owner notifications follow Mastra's delivery policy and treat their model-visible memory write as best-effort; non-owner notifications enter the durable inbox for the trusted dispatcher. Other persist outcomes require agent memory and return `memory-unavailable` without it. A default or `ifIdle: 'persist'` message or signal still delivers into an active run without memory; the memory gate responds only when core's outcome for the request replaced a persist (an idle discard substituted for a requested persist, or an active persist that no memory could write). If a direct sender call or Mastra completion drain reaches core's run-id mint, the runner persists the input when allowed, emits a terminal error, and lets Mastra clean up the thread state without entering `RunnerRuntime`.
-
-Leave `recovery.durableAgents` at its default `'off'`. Setting it to `'auto'` makes Mastra call `recoverActiveRuns()` on every registered durable agent at boot; each refusal is caught by Mastra's own per-agent handler, which logs `Failed to recover active runs for durable agent`. Flowsafe does not log it.
+Mastra's own host features fail closed on the wrapper. `Mastra.addAgent()` throws, and so does constructing a `Mastra` or an `MCPServer` with the wrapper in `agents`. An `AgentController` over the wrapper throws during service installation when configured with memory or pub/sub that the wrapped agent does not own; otherwise, its `init()` still throws when it registers the wrapper on its Mastra through `__setMastra()`. A parent registered on a Mastra calls the wrapper's refused `__registerMastra()` during static sub-agent conversion. A parent with pub/sub also calls the refused `__setPubSub()` when the wrapped agent has no pub/sub of its own, even if the parent has no Mastra. Do not use the wrapper as a sub-agent. The signal and message senders remain inherited because every run outcome they can produce lands on the runner's terminal path. The `queue` and `state` routes persist rather than wake on idle. An owner notification is recorded in the durable inbox and delivered at ingestion under the owner's principal, into the owner's running run or persisted to memory; it never wakes a run. An accepted non-owner notification is recorded for the trusted dispatch tick, which delivers each row as the dispatch principal. A signal delivered into a running run remains in the isolate until the run's next step reads it; if the run suspends first, the signal can be lost with the isolate. Delivery into a suspended run persists to agent memory when the principal may persist and memory exists; otherwise the route answers `persistence-forbidden` or `memory-unavailable`. An explicit `discard` stays a discard. A default or `ifIdle: 'persist'` message or signal still delivers into a running run without memory; the memory gate responds only when core's outcome for the request replaced a persist (an idle discard substituted for a requested persist, or an active persist that no memory could write). If a direct sender call or Mastra completion drain reaches core's run-id mint, the runner persists the input when allowed, emits a terminal error, and lets Mastra clean up the thread state without entering `RunnerRuntime`.
 
 ## Create and protect memory identities
 
@@ -231,7 +247,7 @@ See [Agent memory isolation](agent-memory-isolation.md) for the exact identity, 
 | Schedules | `createScheduleStorageDomains()` | `mastra_schedules`, `mastra_schedule_triggers` |
 | Background tasks | `createBackgroundTaskD1Domains()` | serialized workflow and deployment task domains |
 
-The signals helper is injected into do-runner rather than imported by it, which avoids a package cycle. The schedule store mirrors Mastra's schedule contract because the Cloudflare D1 adapter does not ship that domain. Flowsafe owns both signal tables and the subscription table.
+The signals helper is injected into do-runner rather than imported by it, which avoids a package cycle. The schedule store mirrors Mastra's schedule contract because the Cloudflare D1 adapter does not ship that domain. Flowsafe owns the signal tables and the subscription table.
 
 When you adopt a storage domain, declare its retention or standing-state lifecycle in the same change. The package schema guard pins that correspondence internally; your host must still schedule each exported retention duty.
 
@@ -239,7 +255,7 @@ When you adopt a storage domain, declare its retention or standing-state lifecyc
 
 Subclass `ThreadDurableObject`, construct the catalog modules for that instance, and install `createThreadAgentHost()` and `createThreadSignalRoutes()` inside the subclass route. These factories share the asserted `ThreadScope` instead of mutable module or request-global state.
 
-- stamps the runtime pub/sub identity onto the agent before each call;
+- sets the thread's pub/sub on an agent that is not runtime-driven before each call, and answers `503` when a runtime-driven agent's pub/sub is missing or differs from the thread's;
 - serializes delivery into the thread;
 - checks whether a run is already active;
 - applies active and idle behavior;
@@ -257,13 +273,13 @@ Before production use, the host's idle-start seam must:
 
 The agent host persists a thread-to-agent binding and per-run principal record in Durable Object storage. It rejects a second simultaneous operation for the same run with 409 instead of replacing the active execution context.
 
-Thread delivery is priority-planned across summaries and individual notifications, remains stable across 100-record chunks, and suppresses summarized high-priority rows while the thread was active.
+Thread delivery is priority-planned across summaries and individual notifications, remains stable across chunks, and suppresses summarized high-priority rows while the thread was active. Summary items arise only from rows written by Mastra's delivery policy, which means an unbranded agent's owner notifications.
 
 ### Bound notification delivery
 
 `createNotificationDispatchTick()` and `createThreadSignalRoutes()` accept `maxDeliveryAttempts`, a positive safe integer defaulting to `DEFAULT_MAX_NOTIFICATION_DELIVERY_ATTEMPTS`. Use the same value on both factories. They capture the policy at construction; request bodies cannot change it. A tick with `limit: 0` performs no delivery or storage work; invalid numeric policy still fails at construction, and storage without the conditional delivery operation fails construction at every `limit`.
 
-`deliveryAttempts` counts persisted failed rounds. At the bound, the conditional write sets `discarded`, `deliveryReason: "delivery-attempts-exhausted"` and cleared delivery cursors. A row already at the bound is not sent; its conditional discard preserves the previous count, error and attempt time. Retry delays below the bound retain the existing backoff. Malformed counters remain unmodified and produce an unresolved failure. A due row whose other scalars cannot be read is not written: it is counted as a failed outcome, re-selected on every pass, holds its place in the bounded window and in the `pending-notifications` inventory category, and must be repaired or deleted directly.
+`deliveryAttempts` counts persisted failed rounds. At the bound, the conditional write sets `discarded`, `deliveryReason: "delivery-attempts-exhausted"` and cleared delivery cursors. A row already at the bound is not sent; its conditional discard preserves the previous count, error and attempt time. Retry delays below the bound keep their backoff. Malformed counters remain unmodified and produce an unresolved failure. A due row whose other scalars cannot be read is not written: it is counted as a failed outcome, re-selected on every pass, holds its place in the bounded window and in the `pending-notifications` inventory category, and must be repaired or deleted directly.
 
 Terminal receipts remain available through `getNotification()` and `listNotifications()` until the host's configured retention removes them. They include the last error/count and discard timestamp. The due scan excludes terminal notifications so a persistently refused target can release its place in the bounded dispatch window.
 
@@ -287,15 +303,17 @@ Mount `createSignalRouter()` through `createFlowsafeWorker({ buildSignalRouter }
 | `queue` | `POST /api/threads/:threadId/queue` | Queue a message for the next host-started turn (persisted; never wakes) |
 | `signal` | `POST /api/threads/:threadId/signal` | Send a named signal |
 | `state` | `POST /api/threads/:threadId/state` | Persist owner-authorized thread state for the next host-started turn; may return `principal-mismatch`, `persistence-forbidden`, or `memory-unavailable` |
-| `notification` | `POST /api/threads/:threadId/notification` | Record a notification; owners follow the delivery policy, while non-owners require notification storage and defer delivery to the host dispatch tick |
+| `notification` | `POST /api/threads/:threadId/notification` | Record a notification in the durable inbox. For a runtime-driven agent, an owner's notification is delivered at ingestion and a non-owner's waits for the host dispatch tick; see [Run alarm-driven duties](#run-alarm-driven-duties) |
 
-Without agent memory, persist outcomes return `memory-unavailable`, except that a default or `ifIdle: 'persist'` message or signal still delivers into an active run (an active persist that no memory could write still answers `memory-unavailable`), a persist-behavior agent-schedule fire settles a canonical `discard` receipt, and an owner notification keeps its inbox row while the model-visible memory write remains best-effort.
+Without agent memory, persist outcomes return `memory-unavailable`, except that a default or `ifIdle: 'persist'` message or signal still delivers into a running run (an active persist that no memory could write still answers `memory-unavailable`), and a persist-behavior agent-schedule fire settles a canonical `discard` receipt. Delivery into a suspended run needs memory.
 
-Configure `SignalRouterOptions.validateThreadTarget` with the existing `BoundThreadTargetValidator` type to apply host-specific restrictions before body parsing or signal forwarding. `createAgentThreadTopology().requireBoundThread` verifies a durable binding. For strict ownership, compare the captured principal's `kind` and `id` with the owner returned by `await context.resourceOwnerFor('thread', target.threadId)`, and throw `RunRouteError` with status 404 on refusal. Omitting the callback retains the router's existing resource-access policy, including its administrator access.
+Configure `SignalRouterOptions.validateThreadTarget` with the `BoundThreadTargetValidator` type to apply host-specific restrictions before body parsing or signal forwarding. `createAgentThreadTopology().requireBoundThread` verifies a durable binding. For strict ownership, compare the captured principal's `kind` and `id` with the owner returned by `await context.resourceOwnerFor('thread', target.threadId)`, and throw `RunRouteError` with status 404 on refusal. Omitting the callback keeps the router's resource-access policy, including its administrator access.
 
 The router records acceptance after the downstream response succeeds and normalizes thread-not-found refusals from registry access, the validator and the receiving Durable Object. Audit-sink and diagnostic failures retain the selected response. The starter's limiter is isolate-local example protection; use shared durable state when the limit is contractual across the deployment.
 
 Signals are untrusted model input. Core escapes the XML representation, while the route validates tag and attribute names and caps payload size. A receiving agent's ordinary `processInput` policy is not a complete signal boundary: Mastra can drain queued signals after the initiating input processor has run. Configure `createThreadSignalRoutes({ contentPolicy })` to inspect Mastra's canonical escaped XML inside the Thread Durable Object before delivery, persistence, wake, or run start. The same boundary covers direct routes, providers, schedules, and notification dispatch.
+
+For a threaded schedule's stored provider options, configure `scheduleProviderOptionsPolicy`; `contentPolicy` does not inspect those options.
 
 `SignalClient` is DOM-free and is also exported from `@proofoftech/flowsafe/signals/client`.
 
@@ -345,6 +363,8 @@ The tick:
 - starts agent targets through the injected thread topology callback;
 - isolates each schedule's failure and records the actual joined run id.
 
+A threadless agent schedule passes its stored `providerOptions` through the thread host's start check. A threaded fire carries them as the signal's message-level options whether the thread is busy or idle. On an idle wake, the host also forwards them as call-level options and applies `assertAcceptedCallProviderOptions()`. The guarded input chain reads message-level options on an idle wake, but an active run drains the signal after that chain runs. The starter's `scheduleProviderOptionsPolicy` denies options when either `providerOptionsCarryContent()` finds model-visible content or `assertAcceptedCallProviderOptions()` refuses the call-level options. Hosts that wire this policy should apply both Breakwater checks before the signal is created.
+
 Threaded agent schedule delivery is at-least-once across a target-DO crash.
 Every retry carries the same `dispatchId` as the signal id, waits for the
 current target lease, and replays a settled receipt. If the target accepted the
@@ -376,7 +396,9 @@ The host manager:
 
 Pass `backgroundTasks` to `createFlowsafeWorker()` to add terminal-task TTL cleanup to the maintenance purge duty. The default cleanup windows are package-defined; set explicit values when your data policy differs.
 
-Only connectors whose permission manifest is read-only may opt into model-requested background execution. Write, destructive, and idempotent connectors stay foreground-only. A read-only connector may separately require approval; its grant check still runs when the background task executes.
+Only connectors whose permission manifest is read-only may opt into background execution with `background: true`. Write, destructive, and idempotent connectors stay foreground-only. A read-only connector may separately require approval; its grant check still runs when the background task executes.
+
+The connector wrapper refuses a call that Mastra's standard agent loop runs as a background task in the dispatching process, on every connector without the opt-in. The refusal does not reach a `BackgroundTaskHost` executor, Mastra's durable agent loop, a static background executor running a task queued or recovered after a restart or on a separate worker, or a connector called from inside background work: none of them passes a background flag to the connector. The refusal is not final: Mastra retries a refused task, and a Mastra that starts on the same storage can recover a task that is still queued, or running with retries left, through a static executor. `createGuardedAgent()` disables background dispatch, and Flowsafe's `RunnerRuntime` and agent thread host run no background-task manager. Do not register a connector without `background: true` as a `BackgroundTaskHost` executor, and do not make one background-eligible on a raw Mastra agent. See the [connector `background` contract](connector-interface.md#background).
 
 ## Add signal providers
 
@@ -419,11 +441,19 @@ Keep independent duties in separate alarm invocations. CPU termination is not a 
 | Schedule tick | When schedules are enabled |
 | Schedule-trigger purge | When trigger history has a TTL |
 | Background-task purge | When background tasks are enabled |
-| Notification dispatch tick | When delayed notifications are enabled |
+| Notification dispatch tick | When notifications are enabled |
 | Provider polling alarm | Singleton host when a pollable subscription exists |
 
 Each duty that reaches an agent carries an automated principal: the schedule tick fires as `system` on `schedule.fire`, the notification dispatch tick as `system` on `notification.dispatch`, and provider delivery as `service` on `signal.notification`. Enabling a duty is not enough — the target agent must declare that kind and entry path in `allowedAutomation`, or the run is refused at the host.
 
-Non-owner `/signal/notification` ingestion requires the notifications storage domain and returns `409` without it. It writes a due inbox row but deliberately bypasses the agent's `notifications.deliveryPolicy` and `__ensureNotificationDispatchReady`; the host must run `createNotificationDispatchTick()` to deliver those rows. The advanced starter runs that duty every 60 seconds, so delivery can take up to one tick. A host without the tick records non-owner notifications but never delivers them. The spike has no dispatch tick, and its provider probes therefore assert only the inbox row.
+`/signal/notification` ingestion to a runtime-driven agent, or from a principal that `canPersist` refuses, requires the notifications storage domain and returns `409` without it. What follows the inbox write depends on the principal:
+
+- **An owner notification to a runtime-driven agent** is delivered at ingestion under the owner's principal: into the owner's running run, or persisted to agent memory when the thread is idle or the owner's run is not running. It never wakes a run, and no dispatch tick selects its row. The running-to-suspended loss window is described under [Use the lower-level durable wrapper](#use-the-lower-level-durable-wrapper). A delivery that the run does not drain before it ends reaches the runner's terminal refusal, which publishes an error and keeps the signal in agent memory, when memory exists, unless the guarded agent's input chain refuses its content. Before writing anything, the route answers `409` with a `reason` when another principal's run holds the thread (`principal-mismatch`, with `retry: true`), when the delivery would need agent memory the agent lacks (`memory-unavailable`), or when a `dedupeKey` or `coalesceKey` matches a pending row the tick will deliver (`notification-pending`). After the write, the row is discarded when Mastra reports the thread blocked (`409`, `thread-blocked`), when the content policy denies the signal (`422`) or fails (`503`), and when storage or the send fails before acceptance (`502`). If the delivered receipt write fails after an accepted send, the route retries that write. If it fails again, the route answers `502` and leaves the row pending with no due time; provider redelivery can send the notification again.
+- **An accepted non-owner notification** is written due now. When the host wires `notificationDispatchAllowed`, ingestion refuses an agent that does not declare `system` on `notification.dispatch` with `409` and `notification-dispatch-forbidden`. A keyed notification matching an owner row pending without a due time is refused with `409` and `notification-pending`. The host must run `createNotificationDispatchTick()`, which delivers each row individually as the dispatch principal; no Mastra delivery policy applies, neither the default nor a configured `notifications.deliveryPolicy`. On an idle thread the tick wakes a run whose principal and approval requester is the dispatch principal: the self-approval bar does not cover the notification's author, the row stores no author, and the run's permission projection and audit are `system`'s. Idle starts are limited only by `consultRunCap` where the host wires it. The tick counts a failed attempt when the run cap refuses the wake, when another principal's run holds the thread, when a host without `notificationDispatchAllowed` targets an agent that does not declare `system` on `notification.dispatch`, when that declaration is removed after ingestion, or when the host's automated-entry authorizer or required permissions refuse dispatch; the row is discarded after `maxDeliveryAttempts` failed attempts. The advanced starter runs the tick on an interval, so a row waits at least until the next tick, and longer while failed attempts back off. A host without the tick records these rows but never delivers them.
+- **An unbranded agent's owner notification** follows Mastra's delivery policy and receives `409` when the agent's own Mastra has no notifications store.
+
+When a host passes no `canPersist`, every principal is an owner, signal providers included, and a provider treats a `409` as a permanent drop.
+
+An owner row stays pending with neither `deliverAt` nor `summaryAt` when the isolate dies, the execution fence refuses a settle, or both delivered receipt writes fail. No dispatch pass selects it, and the `pending-notifications` inventory category counts it. A matching keyed non-owner notification receives `notification-pending`. Clear the residue with a direct write that sets it `discarded`, or delete it, as the [drain inventory](do-runner-design.md#http-surface-inside-the-object) describes for pending rows without a due time.
 
 The advanced starter makes these responsibilities visible in one host. The [Deployment reference](deployment-reference.md) lists bindings and configuration, and the [Operations runbook](operations-runbook.md) covers recovery and decommissioning.

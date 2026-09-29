@@ -1,6 +1,6 @@
 {
   "name": "@proofoftech/breakwater",
-  "version": "0.15.0",
+  "version": "0.16.0",
   "publishConfig": {
     "access": "public"
   },
@@ -44,7 +44,9 @@
     "test:packed-consumer": "node scripts/packed-consumer-test.mjs",
     "test:watch": "vitest",
     "lint": "pnpm -w exec biome check packages/breakwater",
-    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json",
+    "typecheck": "pnpm run typecheck:src && pnpm run typecheck:test",
+    "typecheck:src": "tsc --noEmit",
+    "typecheck:test": "tsc -p tsconfig.test.json",
     "prepack": "pnpm run clean && pnpm run build"
   },
   "peerDependencies": {

@@ -12,7 +12,6 @@ import {
   awaitReferenceIngress,
   createDirectInvocationClient,
   DIRECT_INVOCATION_FAILURE_DETAILS,
-  DIRECT_RECONCILIATION_INTERVAL_MS,
   DIRECT_RECONCILIATION_MAX_INTERVAL_MS,
   DIRECT_RECONCILIATION_MAX_REQUESTS,
   DirectInvocationError,
@@ -310,7 +309,7 @@ describeLinux('Node authenticated direct invocation', () => {
     expect(waits).toEqual(expectedWaits);
   });
 
-  it('polls production settings through the Worker deadline before the request cap', async () => {
+  it('bounds the production tail by the request cap', async () => {
     const f = await fixture();
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
     const requestTimes: number[] = [];
@@ -334,12 +333,16 @@ describeLinux('Node authenticated direct invocation', () => {
         sleep,
       }),
     ).resolves.toBe('unreachable');
-    expect(fetchRequest).toHaveBeenCalledTimes(26);
-    expect(requestTimes).toHaveLength(26);
-    expect(requestTimes.at(-1)).toBe(600_000);
-    expect(requestTimes.length).toBeLessThan(
-      DIRECT_RECONCILIATION_MAX_REQUESTS,
-    );
+    expect(fetchRequest).toHaveBeenCalledTimes(32);
+    expect(requestTimes).toEqual([
+      0, 250, 750, 1_750, 3_750, 7_750, 15_750, 31_750, 63_750, 95_750, 127_750,
+      159_750, 191_750, 223_750, 255_750, 287_750, 319_750, 351_750, 383_750,
+      415_750, 447_750, 479_750, 511_750, 543_750, 575_750, 600_000, 600_250,
+      600_500, 600_750, 601_000, 601_250, 601_500,
+    ]);
+    expect(requestTimes[25]).toBe(600_000);
+    expect(requestTimes.at(-1)).toBeLessThan(605_000);
+    expect(DIRECT_RECONCILIATION_MAX_REQUESTS).toBe(32);
   });
 
   it('observes a terminal answer at the Worker deadline', async () => {
@@ -373,6 +376,38 @@ describeLinux('Node authenticated direct invocation', () => {
     expect(requestTimes.at(-1)).toBe(600_000);
   });
 
+  it('observes a terminal write on the first tail request', async () => {
+    const f = await fixture();
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
+    const requestTimes: number[] = [];
+    const fetchRequest = vi.fn<typeof fetch>(async () => {
+      requestTimes.push(performance.now());
+      return reconciliationResponse(
+        f.prepared.configSha256,
+        performance.now() > 600_000 ? 'executed' : 'received',
+      );
+    });
+    const sleep = async (ms: number) => {
+      await vi.advanceTimersByTimeAsync(ms);
+    };
+
+    await expect(
+      reconcileDirectInvocation({
+        endpoint: `https://${f.prepared.names.referenceWorker}.attested-account.workers.dev${DIRECT_REFERENCE_PATH}`,
+        secret: SECRET,
+        configSha256: f.prepared.configSha256,
+        ordinal: 1,
+        requestSha256: 'a'.repeat(64),
+        workerDeadlineMs: 600_000,
+        fetch: fetchRequest,
+        sleep,
+      }),
+    ).resolves.toBe('executed');
+    expect(fetchRequest).toHaveBeenCalledTimes(27);
+    expect(requestTimes[25]).toBe(600_000);
+    expect(requestTimes[26]).toBe(600_250);
+  });
+
   it('returns a terminal answer after received reconciliation with exponential waits', async () => {
     const f = await fixture();
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
@@ -402,23 +437,40 @@ describeLinux('Node authenticated direct invocation', () => {
       }),
     ).resolves.toBe('executed');
     expect(fetchRequest).toHaveBeenCalledTimes(3);
-    expect(waits).toEqual([
-      DIRECT_RECONCILIATION_INTERVAL_MS,
-      DIRECT_RECONCILIATION_INTERVAL_MS * 2,
-    ]);
+    expect(waits).toEqual([250, 500]);
   });
 
-  it('ends received reconciliation at a shorter time bound', async () => {
+  it.each([
+    [
+      'after a wait clamped to it',
+      (_sentAt: number): number => 0,
+      [
+        1_000, 2_000, 4_000, 8_000, 16_000, 29_000, 1_000, 1_000, 1_000, 1_000,
+        1_000,
+      ],
+    ],
+    [
+      'when a response lands at it',
+      (sentAt: number): number => (sentAt === 64_000 ? 1_000 : 0),
+      [1_000, 2_000, 4_000, 8_000, 16_000, 29_000, 1_000, 1_000, 1_000, 1_000],
+    ],
+  ] as const)('ends received reconciliation at the time bound before the request cap %s', async (_name, latencyMs, expectedWaits) => {
     const f = await fixture();
-    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
+    // Only `performance` is fake: the abort timer runs on the real clock and
+    // cannot fire while the poll runs, so the loop's own time checks end it.
+    vi.useFakeTimers({ toFake: ['performance'] });
+    const requestTimes: number[] = [];
     const waits: number[] = [];
-    const sleep = vi.fn(async (ms: number) => {
-      waits.push(ms);
-      await vi.advanceTimersByTimeAsync(ms);
+    const fetchRequest = vi.fn<typeof fetch>(async () => {
+      const sentAt = performance.now();
+      requestTimes.push(sentAt);
+      vi.advanceTimersByTime(latencyMs(sentAt));
+      return reconciliationResponse(f.prepared.configSha256, 'received');
     });
-    const fetchRequest = vi.fn<typeof fetch>(async () =>
-      reconciliationResponse(f.prepared.configSha256, 'received'),
-    );
+    const sleep = async (ms: number) => {
+      waits.push(ms);
+      vi.advanceTimersByTime(ms);
+    };
     await expect(
       reconcileDirectInvocation({
         endpoint: `https://${f.prepared.names.referenceWorker}.attested-account.workers.dev${DIRECT_REFERENCE_PATH}`,
@@ -426,15 +478,21 @@ describeLinux('Node authenticated direct invocation', () => {
         configSha256: f.prepared.configSha256,
         ordinal: 1,
         requestSha256: 'a'.repeat(64),
-        workerDeadlineMs: 1,
-        deadlineMs: 100,
-        intervalMs: 1,
+        workerDeadlineMs: 60_000,
+        deadlineMs: 65_000,
+        intervalMs: 1_000,
         fetch: fetchRequest,
         sleep,
       }),
     ).resolves.toBe('unreachable');
-    expect(fetchRequest).toHaveBeenCalledTimes(2);
-    expect(waits).toEqual([1]);
+    expect(requestTimes).toEqual([
+      0, 1_000, 3_000, 7_000, 15_000, 31_000, 60_000, 61_000, 62_000, 63_000,
+      64_000,
+    ]);
+    expect(requestTimes.length).toBeLessThan(
+      DIRECT_RECONCILIATION_MAX_REQUESTS,
+    );
+    expect(waits).toEqual(expectedWaits);
   });
 
   it('rejects a reconciliation interval above its ceiling', async () => {

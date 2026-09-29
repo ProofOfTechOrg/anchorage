@@ -7,6 +7,7 @@ const API_BASE = 'https://api.cloudflare.com/client/v4';
 export const DIRECT_PROVIDER_MAX_REQUESTS = 512;
 const MAX_DURATION_MS = 300_000;
 const MAX_JSON_BYTES = 8 * 1024 * 1024;
+// The SDK's repeated type query parameters return no rows from the live API.
 const ZONE_TYPES = Object.freeze(['full', 'partial', 'secondary', 'internal']);
 const ERROR_CODES = new Set([
   'invalid-input',
@@ -422,8 +423,10 @@ export async function resolveDirectZone({
 export async function classifyDispatchNamespaces(single, selectors, bound) {
   const { APIError } = await import('cloudflare');
   try {
+    const page =
+      await single.workersForPlatforms.dispatch.namespaces.list(selectors);
     const namespaces = await inventory(
-      single.workersForPlatforms.dispatch.namespaces.list(selectors),
+      page,
       (row) => [
         `id:${identifier(row.namespace_id)}`,
         `name:${identifier(row.namespace_name)}`,
@@ -434,10 +437,13 @@ export async function classifyDispatchNamespaces(single, selectors, bound) {
       kind: namespaces.length ? 'enumerated' : 'empty',
       count: namespaces.length,
       names: namespaces.map((row) => row.namespace_name),
+      exhaustive: singlePageAttestations.get(page.result) ?? false,
     };
   } catch (error) {
+    // A 404 is no page the provider sent, so the empty reading it stands for
+    // is unattested.
     if (error instanceof APIError && error.status === 404)
-      return { kind: 'first-page-404', count: 0, names: [] };
+      return { kind: 'first-page-404', count: 0, names: [], exhaustive: false };
     throw error;
   }
 }

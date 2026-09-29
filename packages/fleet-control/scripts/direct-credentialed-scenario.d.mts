@@ -29,15 +29,11 @@ import type { DirectFixtureRole } from './direct-credentialed-spec.js';
 
 type Role = DirectFixtureRole;
 type NormalRole = DirectScenarioNormalRole;
-type RoleAWorkerVersionObservation = Omit<
-  DirectWorkerVersionObservation,
-  'role'
-> &
-  Readonly<{ role: 'a' }>;
-type RoleASettlementEffect = Omit<DirectSettlementEffect, 'role'> &
-  Readonly<{ role: 'a' }>;
-type RoleAVerifiedExport = Omit<DirectVerifiedExport, 'role'> &
-  Readonly<{ role: 'a' }>;
+type RoleBound<Value, Key extends Role> = Omit<Value, 'role'> &
+  Readonly<{ role: Key }>;
+type RoleKeyed<Value, Keys extends Role> = Readonly<{
+  [Key in Keys]: RoleBound<Value, Key> | null;
+}>;
 
 export type { DirectScenarioOperationSlot } from './direct-credentialed-scenario-checks.mjs';
 export type { DirectScenarioPhase };
@@ -59,10 +55,6 @@ interface ScenarioCall {
     step: string;
     itemsSha256: string;
   }> | null;
-  /**
-   * Settled force-terminal calls require a nullable before identity; prepared
-   * and other calls omit it. Declared last, as `callShape` persists it.
-   */
   readonly before?: Readonly<{ databaseId: string; scriptName: string }> | null;
   readonly witness?: Readonly<Record<string, unknown>>;
 }
@@ -101,7 +93,8 @@ interface ScenarioFenceReading {
   readonly requireMutationEpoch: boolean;
   readonly transitionRevision: number;
 }
-interface ScenarioFenceTransition {
+interface ScenarioFenceTransition<FenceRole extends NormalRole> {
+  readonly role: FenceRole;
   readonly before: ScenarioFenceReading;
   readonly after: ScenarioFenceReading | null;
   readonly ordinal: number | null;
@@ -116,53 +109,43 @@ interface ScenarioFenceSweep {
   readonly observedAt: number;
   readonly ordinal: number;
 }
+interface ScenarioFenceSweeps<FenceRole extends NormalRole> {
+  readonly role: FenceRole;
+  readonly first: ScenarioFenceSweep;
+  readonly second: ScenarioFenceSweep | null;
+  readonly intervalMs: number | null;
+}
+interface ScenarioFenceProbes<FenceRole extends NormalRole> {
+  readonly role: FenceRole;
+  readonly current: 'accepted';
+  readonly missing: 'missing';
+  readonly stale: 'stale';
+  readonly future: 'future';
+  readonly mutationEpoch: number;
+  readonly ordinal: number;
+}
 export interface DirectScenarioFenceProofs {
-  readonly drain: Readonly<Record<NormalRole, ScenarioFenceTransition | null>>;
-  readonly sweeps: Readonly<
-    Record<
-      NormalRole,
-      Readonly<{
-        first: ScenarioFenceSweep;
-        second: ScenarioFenceSweep | null;
-        intervalMs: number | null;
-      }> | null
-    >
-  >;
-  readonly reopen: Readonly<Record<NormalRole, ScenarioFenceTransition | null>>;
-  readonly probes: Readonly<
-    Record<
-      NormalRole,
-      Readonly<{
-        current: 'accepted';
-        missing: 'missing';
-        stale: 'stale';
-        future: 'future';
-        mutationEpoch: number;
-        ordinal: number;
-      }> | null
-    >
-  >;
+  readonly drain: Readonly<{
+    [FenceRole in NormalRole]: ScenarioFenceTransition<FenceRole> | null;
+  }>;
+  readonly sweeps: Readonly<{
+    [FenceRole in NormalRole]: ScenarioFenceSweeps<FenceRole> | null;
+  }>;
+  readonly reopen: Readonly<{
+    [FenceRole in NormalRole]: ScenarioFenceTransition<FenceRole> | null;
+  }>;
+  readonly probes: Readonly<{
+    [FenceRole in NormalRole]: ScenarioFenceProbes<FenceRole> | null;
+  }>;
 }
 export interface DirectScenarioProofs {
-  readonly initial: Readonly<
-    Record<Role, DirectWorkerVersionObservation | null>
-  >;
-  readonly candidate: Readonly<
-    Record<NormalRole, DirectWorkerVersionObservation | null>
-  >;
-  readonly final: Readonly<
-    Record<NormalRole, DirectWorkerVersionObservation | null>
-  >;
+  readonly initial: RoleKeyed<DirectWorkerVersionObservation, Role>;
+  readonly candidate: RoleKeyed<DirectWorkerVersionObservation, NormalRole>;
+  readonly final: RoleKeyed<DirectWorkerVersionObservation, NormalRole>;
   readonly identities: Readonly<Record<NormalRole, unknown | null>>;
-  readonly reprovision: Readonly<
-    Record<'a', RoleAWorkerVersionObservation | null>
-  >;
-  readonly reprovisionFinal: Readonly<
-    Record<'a', RoleAWorkerVersionObservation | null>
-  >;
-  readonly reprovisionSettlement: Readonly<
-    Record<'a', RoleASettlementEffect | null>
-  >;
+  readonly reprovision: RoleKeyed<DirectWorkerVersionObservation, 'a'>;
+  readonly reprovisionFinal: RoleKeyed<DirectWorkerVersionObservation, 'a'>;
+  readonly reprovisionSettlement: RoleKeyed<DirectSettlementEffect, 'a'>;
   readonly continuation: Readonly<
     Record<
       'started' | 'locked' | 'versionB' | 'refused' | 'reopened' | 'finished',
@@ -210,10 +193,8 @@ export interface DirectScenarioProofs {
   >[];
   readonly effects: readonly DirectSettlementEffect[];
   readonly cleanup: CleanupTerminalReceipt | null;
-  readonly exports: Readonly<Record<NormalRole, DirectVerifiedExport | null>>;
-  readonly reprovisionExports: Readonly<
-    Record<'a', RoleAVerifiedExport | null>
-  >;
+  readonly exports: RoleKeyed<DirectVerifiedExport, NormalRole>;
+  readonly reprovisionExports: RoleKeyed<DirectVerifiedExport, 'a'>;
   readonly exportVerifications: readonly (
     | Readonly<{
         role: NormalRole;

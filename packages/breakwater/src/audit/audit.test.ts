@@ -2,13 +2,19 @@
 import { RequestContext } from '@mastra/core/request-context';
 import { describe, expect, it } from 'vitest';
 
-import type { AuditEvent, AuditSink, MetricsRecorder } from './index.js';
+import type {
+  AuditEvent,
+  AuditLoggerOptions,
+  AuditSink,
+  MetricsRecorder,
+} from './index.js';
 import {
   AGENT_AUDIT_CONTEXT_KEY,
   AuditLogger,
   agentAuditContextFromRequestContext,
   agentAuditDetail,
   combineAuditSinks,
+  malformedAgentAuditContextEvent,
   metricsAuditSink,
 } from './index.js';
 
@@ -243,6 +249,117 @@ describe('AuditLogger', () => {
     // #then
     expect(sinkErrors).toHaveLength(1);
     expect(audit.events()).toHaveLength(1);
+  });
+
+  it.each<[string, unknown, string]>([
+    ['null', null, 'null'],
+    [
+      'a URL string',
+      'https://audit.example.com/ingest',
+      '"https://audit.example.com/ingest"',
+    ],
+    ['a plain object', {}, 'object'],
+    ['true', true, 'boolean'],
+    ['a number', 1, 'number'],
+    ['an empty list', [], 'object'],
+  ])('refuses %s as the sink, which would count as external and export nothing', (_label, sink, got) => {
+    // #when / #then
+    expect(() => new AuditLogger({ sink: sink as AuditSink })).toThrow(
+      new TypeError(
+        `AuditLogger: sink must be a function when provided (got ${got})`,
+      ),
+    );
+  });
+
+  it('refuses a non-function onSinkError', () => {
+    // #when / #then
+    expect(
+      () =>
+        new AuditLogger({
+          onSinkError: 'log' as unknown as AuditLoggerOptions['onSinkError'],
+        }),
+    ).toThrow(
+      new TypeError(
+        'AuditLogger: onSinkError must be a function when provided (got "log")',
+      ),
+    );
+  });
+
+  it('reports an external sink only for a function, and exports to it', () => {
+    // #given
+    const exported: AuditEvent[] = [];
+    const withSink = new AuditLogger({
+      sink: (event) => {
+        exported.push(event);
+      },
+    });
+    // #when
+    withSink.record({
+      actor: null,
+      action: 'a',
+      resource: 'r',
+      decision: 'allowed',
+    });
+    // #then
+    expect(withSink.hasExternalSink()).toBe(true);
+    expect(exported).toHaveLength(1);
+    expect(new AuditLogger().hasExternalSink()).toBe(false);
+  });
+
+  it.each<[string, unknown, string]>([
+    ['a negative number', -1, '-1'],
+    ['a fraction', 1.5, '1.5'],
+    ['NaN, which keeps every event', Number.NaN, 'NaN'],
+    ['Infinity', Number.POSITIVE_INFINITY, 'Infinity'],
+    ['an empty string', '', '""'],
+    ['an empty list', [], 'object'],
+    ['false', false, 'boolean'],
+  ])('refuses %s as maxBuffered', (_label, maxBuffered, got) => {
+    // #when / #then
+    expect(
+      () => new AuditLogger({ maxBuffered: maxBuffered as number }),
+    ).toThrow(
+      new TypeError(
+        `AuditLogger: maxBuffered must be a non-negative safe integer (got ${got})`,
+      ),
+    );
+  });
+
+  it('keeps no event under maxBuffered 0', () => {
+    // #given
+    const audit = new AuditLogger({ maxBuffered: 0 });
+    // #when
+    audit.record({
+      actor: null,
+      action: 'a',
+      resource: 'r',
+      decision: 'allowed',
+    });
+    // #then
+    expect(audit.events()).toEqual([]);
+  });
+
+  it('refuses a misspelled option, which would drop the sink it spells', () => {
+    // #when / #then
+    expect(
+      () => new AuditLogger({ sinks: () => undefined } as AuditLoggerOptions),
+    ).toThrow(
+      new TypeError(
+        'AuditLogger: options has unknown field "sinks" (valid fields: sink, onSinkError, maxBuffered)',
+      ),
+    );
+  });
+
+  it('constructs with every declared option', () => {
+    // #given — the Required type fails to compile while a declared option is
+    // missing here
+    const options: Required<AuditLoggerOptions> = {
+      sink: () => undefined,
+      onSinkError: () => undefined,
+      maxBuffered: 10,
+    };
+    // #when / #then
+    expect(new AuditLogger(options).hasExternalSink()).toBe(true);
   });
 });
 
@@ -547,5 +664,188 @@ describe('combineAuditSinks', () => {
 
     // #then
     expect(seen).toEqual([givenEvent]);
+  });
+
+  it('refuses no sinks, which would count as external and export nothing', () => {
+    // #given — a sink list from configuration that came back empty
+    const configured: AuditSink[] = [];
+
+    // #when / #then
+    for (const build of [
+      () => combineAuditSinks(),
+      () => combineAuditSinks(...configured),
+    ]) {
+      expect(build).toThrow(
+        new TypeError('combineAuditSinks: sinks must not be empty'),
+      );
+    }
+  });
+
+  it.each<[string, unknown[], string]>([
+    [
+      'undefined',
+      [undefined],
+      'sinks entry 0 must be a function (got undefined)',
+    ],
+    ['null', [null], 'sinks entry 0 must be a function (got null)'],
+    [
+      'a URL string',
+      ['https://audit.example.com/ingest'],
+      'sinks entry 0 must be a function (got "https://audit.example.com/ingest")',
+    ],
+    ['a plain object', [{}], 'sinks entry 0 must be a function (got object)'],
+    [
+      'a list passed instead of spread',
+      [[() => undefined]],
+      'sinks entry 0 must be a function (got an array)',
+    ],
+    [
+      'an unset second sink',
+      [() => undefined, undefined],
+      'sinks entry 1 must be a function (got undefined)',
+    ],
+  ])('refuses %s as a sink', (_label, sinks, message) => {
+    // #when / #then
+    expect(() => combineAuditSinks(...(sinks as AuditSink[]))).toThrow(
+      new TypeError(`combineAuditSinks: ${message}`),
+    );
+  });
+});
+
+describe('metricsAuditSink recorder', () => {
+  it.each<[string, unknown, string]>([
+    [
+      'undefined',
+      undefined,
+      'metrics must be an object with increment and observe functions (got undefined)',
+    ],
+    [
+      'a URL string',
+      'statsd://localhost:8125',
+      'metrics must be an object with increment and observe functions (got "statsd://localhost:8125")',
+    ],
+    [
+      'a plain object',
+      {},
+      'metrics.increment must be a function (got undefined)',
+    ],
+    [
+      'a misspelled increment',
+      { Increment: () => undefined, observe: () => undefined },
+      'metrics.increment must be a function (got undefined)',
+    ],
+    [
+      'a recorder without observe',
+      { increment: () => undefined },
+      'metrics.observe must be a function (got undefined)',
+    ],
+  ])('refuses %s, which would count as external and export nothing', (_label, metrics, message) => {
+    // #when / #then
+    expect(() => metricsAuditSink(metrics as MetricsRecorder)).toThrow(
+      new TypeError(`metricsAuditSink: ${message}`),
+    );
+  });
+
+  it('calls a class recorder with its own receiver', () => {
+    // #given
+    class Recorder implements MetricsRecorder {
+      readonly names: string[] = [];
+      increment(name: string): void {
+        this.names.push(name);
+      }
+      observe(name: string): void {
+        this.names.push(name);
+      }
+    }
+    const recorder = new Recorder();
+    const sink = metricsAuditSink(recorder);
+
+    // #when
+    sink(makeEvent({ detail: { durationSeconds: 1 } }));
+
+    // #then
+    expect(recorder.names).toEqual([
+      'breakwater.audit.decision',
+      'breakwater.audit.duration_seconds',
+    ]);
+  });
+});
+
+describe('malformedAgentAuditContextEvent', () => {
+  function contextWith(value: unknown): RequestContext {
+    const requestContext = new RequestContext();
+    requestContext.set(AGENT_AUDIT_CONTEXT_KEY, value);
+    return requestContext;
+  }
+  const valid = { agentId: 'agent-1', entryPath: 'http-start' };
+
+  it.each<[string, unknown, Record<string, unknown> | undefined]>([
+    ['a numeric tenant id', { ...valid, tenantId: 42 }, valid],
+    ['a misspelled tenant id', { ...valid, tenantID: 'acme' }, valid],
+    ['an empty tenant id', { ...valid, tenantId: '' }, valid],
+    ['a null optional field', { ...valid, purpose: null }, valid],
+    ['a numeric agent id', { ...valid, agentId: 42 }, undefined],
+    [
+      'a misspelled agent id',
+      { agentID: 'agent-1', entryPath: 'x' },
+      undefined,
+    ],
+    [
+      'a misspelled entry path',
+      { agentId: 'agent-1', entrypath: 'x' },
+      undefined,
+    ],
+    ['a JSON string', JSON.stringify(valid), undefined],
+    ['a list', [], undefined],
+    ['a number', 42, undefined],
+    ['null', null, undefined],
+  ])('builds an error event for %s, keeping the fields it accepts', (_label, value, detail) => {
+    // #when
+    const event = malformedAgentAuditContextEvent(
+      contextWith(value),
+      'connector.c1',
+      null,
+    );
+
+    // #then
+    expect(event).toEqual({
+      actor: null,
+      action: 'audit.context',
+      resource: 'connector.c1',
+      decision: 'error',
+      reason: "request context 'breakwater.auditContext' is malformed",
+      ...(detail === undefined ? {} : { detail }),
+    });
+  });
+
+  it('builds none for an absent key or a well-formed context', () => {
+    // #when / #then
+    expect(
+      malformedAgentAuditContextEvent(new RequestContext(), 'r', null),
+    ).toBeUndefined();
+    expect(
+      malformedAgentAuditContextEvent(contextWith(valid), 'r', null),
+    ).toBeUndefined();
+    expect(
+      malformedAgentAuditContextEvent(
+        contextWith({
+          ...valid,
+          tenantId: 'acme',
+          purpose: undefined,
+          principalKind: 'service',
+        }),
+        'r',
+        null,
+      ),
+    ).toBeUndefined();
+  });
+
+  it('keeps the reader copying the fields it accepts', () => {
+    // #when / #then
+    expect(
+      agentAuditContextFromRequestContext(
+        contextWith({ ...valid, tenantId: 42, runId: 'run-1', prompt: 'x' }),
+      ),
+    ).toEqual({ ...valid, runId: 'run-1' });
   });
 });

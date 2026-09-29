@@ -109,14 +109,17 @@ export function createSlackPoster(options: SlackPosterOptions) {
 Keep connector IDs stable and colon-free. Dotted IDs such as
 `slack.post-message` work with approval globs and cannot collide with the
 unchanged `[scope:]connector` rate-limit keys. `createConnector()` rejects an
-ID containing `:`. Idempotency uses a separate collision-proof v2 encoding.
+empty ID and an ID containing `:`, whitespace, or a control or format
+character such as a zero-width space. Idempotency uses a separate
+collision-proof v2 encoding.
 
 ## Understand the execution order
 
 Mastra validates the input schema before the connector wrapper runs. The
 wrapper then applies:
 
-1. The foreground-only `_background` override check.
+1. The foreground-only checks: a `_background` argument, and a call Mastra's
+   standard agent loop runs as a background task.
 2. The organization egress policy and custom evaluators, in registration
    order.
 3. The required-permissions authorization check, when declared.
@@ -158,12 +161,16 @@ degraded store or a stale idempotency reservation takeover.
 | `sideEffect` | The worst state change the connector can cause | `read` is read-only. `write`, `destructive`, and `idempotent` are write-class. `destructive` requires approval by default. Mastra MCP hints are derived from this value. |
 | `egress` | Every hostname the connector contacts | Entries must be bare hosts or leading `*.` wildcards. The organization policy gates the declared list. `runtime.fetch` gates actual HTTP(S) requests and redirect hops against the declaration. An empty or absent list means no network through that fetch. |
 | `egressEnforcement` | Whether the declared list binds actual traffic | `enforced` asserts every HTTP request leaves through `runtime.fetch`, and covers a connector that issues no HTTP request at all: it is a claim about HTTP traffic, not about platform bindings (D1, KV, R2, service bindings), which the guard never sees. `declaration-only` states a vendor SDK or child process carries its own transport. An omitted field resolves to `declaration-only`. `connectorEgressPosture()` reads the resolved value and every connector audit event carries it. |
-| `requiresApproval` | This connector always needs human approval | Real execution requires a matching structured grant in `breakwater.connectorGrants`, regardless of call path. Mastra's native approval pause is also enabled, but the grant remains the authorization token. |
-| `dryRun` | A side-effect-free simulation exists | Requires `dryRunExecute`. The wrapper rejects a `dryRunExecute` that the manifest does not declare. A dry-run request never falls through to real execution. |
-| `idempotencyKey` | Repeated operation identities must replay | Requires `policies.idempotencyStore` and a non-empty `breakwater.idempotencyKey` for each real call. |
+| `requiresApproval` | This connector always needs human approval | Real execution requires a matching structured grant in `breakwater.connectorGrants`, regardless of call path. Mastra's native approval pause is also enabled, but the grant remains the authorization token. Must be a boolean when present. |
+| `dryRun` | A side-effect-free simulation exists | Requires `dryRunExecute`. The wrapper rejects a `dryRunExecute` that the manifest does not declare. A dry-run request never falls through to real execution. Must be a boolean when present. |
+| `idempotencyKey` | Repeated operation identities must replay | Requires `policies.idempotencyStore` and a non-empty `breakwater.idempotencyKey` for each real call. Must be a boolean when present. |
 | `rateLimit` | Fixed-window execution budget | Uses `<count>/<unit>`, where unit is `s`, `sec`, `second`, `m`, `min`, `minute`, `h`, `hour`, `d`, or `day`. Requires `policies.rateLimitStore`. |
-| `background` | The connector permits a model background override | Allowed only on `read` connectors. Write-class connectors are foreground-only in v1. This permission does not itself configure Mastra background-task eligibility. |
+| `background` | The connector may run as a Mastra background task and receive a `_background` argument | Allowed only on `read` connectors, and must be a boolean. Without it, the wrapper refuses both; see [Run connectors in the background](#run-connectors-in-the-background) for where that refusal reaches and why it is not final. Write-class connectors are foreground-only in v1. This permission does not itself configure Mastra background-task eligibility. |
 | `requiredPermissions` | Server-derived permissions the principal must hold to invoke the connector at all | All-of list of canonical dotted identifiers, validated at construction. Every call — dry-runs included — requires a trusted `breakwater.principalPermissions` projection holding every identifier, checked before the approval grant so an approval cannot elevate an unauthorized principal. Missing or malformed projections fail closed. |
+
+A manifest field outside this table is refused at construction, as is a
+connector configuration field outside `ConnectorConfig`, so a misspelled
+requirement fails instead of being ignored.
 
 Classify by the worst operation reachable from `execute()`. A create-or-replace
 operation is destructive if it can overwrite existing state. An idempotent
@@ -180,13 +187,53 @@ the wrapper remains the enforcement boundary.
 `declaration-only` when the manifest omits it and returning `undefined` for
 a tool that `createConnector()` did not build.
 
-`background: true` only tells the breakwater wrapper that a read connector can
-accept background intent. Mastra owns whether an agent or tool is eligible for
-background execution. On the normal agent path, Mastra removes `_background`
-from tool arguments before dispatch and rejects backgrounding a tool that has
-not been enabled. The breakwater field and `backgroundExecution()` evaluator
-provide defense in depth for direct or nested calls whose raw arguments still
-contain `_background`.
+### Run connectors in the background
+
+`background: true` tells the breakwater wrapper that a read connector may run
+as a Mastra background task and accept a `_background` argument. Mastra owns
+whether an agent or tool is eligible for background execution: an agent's
+`backgroundTasks.tools: 'all'`, a per-tool entry, or an assigned
+`tool.background` makes a tool eligible, and Mastra then runs it as a deferred
+background task without any `_background` argument.
+
+For every connector whose manifest does not set `background: true`, the
+wrapper refuses a call that Mastra's standard agent loop runs as a background
+task in the process that dispatched it, with `BACKGROUND_TASK_DENIED`. The
+refusal does not reach:
+
+- Mastra's durable agent loop, which passes no background flag to the tool;
+- a task Mastra runs through a static executor, with no agent context. A
+  Mastra with background tasks enabled registers one for every tool of every
+  registered agent, and uses it when the dispatching process's task context is
+  gone: a task queued or recovered after a restart, or run on a separate
+  worker;
+- a connector called from inside background work, such as a background
+  sub-agent or workflow tool, or another tool's `execute`;
+- a Flowsafe `BackgroundTaskHost` executor.
+
+The refusal is not final. Mastra's task runner retries a refused task up to
+the task's retry count, and the model can raise that count through
+`_background.maxRetries`, which overrides the tool and manager settings. Each
+attempt records a denial. `BACKGROUND_TASK_DENIED` is not retryable only in
+Breakwater's sense: `retryable` is a flag for the caller, and Mastra's task
+runner does not read it. While the task is still running with retries left,
+or still queued, a Mastra that starts on the same storage with
+`recoverStaleTasksOnStart` (Mastra's default, `true`) recovers it through a
+static executor, which the refusal does not reach.
+`recoverStaleTasksOnStart: false` stops that recovery for every task.
+
+`createGuardedAgent()` disables background dispatch for its agent, and
+Flowsafe's `RunnerRuntime` and agent thread host run no background-task
+manager. On a raw Mastra agent, do not make a connector without
+`background: true` background-eligible, and do not register one as a
+`BackgroundTaskHost` executor.
+
+Mastra's standard agent loop removes a truthy `_background` from the tool
+arguments before dispatch. A falsy value stays in the arguments and reaches the
+wrapper, which refuses any call whose arguments carry `_background` on a
+connector without the opt-in, whatever the value. The `backgroundExecution()`
+evaluator applies the same presence test to write-class calls, for direct or
+nested calls whose raw arguments still contain `_background`.
 
 ## Configure policies and stores
 
@@ -194,15 +241,17 @@ contain `_background`.
 
 | Policy field | Purpose | Required when |
 | --- | --- | --- |
-| `networkEgress` | Organization allowlist for declared connector hosts | Optional. Omit it for no organization-level declaration gate. |
+| `networkEgress` | Organization allowlist for declared connector hosts | Optional. Omit it for no organization-level declaration gate. A present value must be an object. |
 | `writePermissions` | Connector-ID globs that require approval, plus the destructive default | Optional. `permissions.requiresApproval` works without it. |
-| `evaluators` | Additional `ToolPolicyEvaluator` instances | Optional. They run after `networkEgress` and before all execution branches. |
+| `evaluators` | Additional `ToolPolicyEvaluator` instances | Optional. They run after `networkEgress` and before all execution branches. A present value must be an array of evaluators, each with a string `name` and an `evaluate` function. |
 | `idempotencyStore` | Replay records and atomic reservations | `permissions.idempotencyKey` is true. |
 | `idempotencyKeyMigration` | Acknowledge that legacy writers sharing the store are stopped and drained | A missing legacy record may execute under the v2 key format. |
 | `rateLimitStore` | Atomic fixed-window counters | `permissions.rateLimit` is present. |
 | `audit` | Structured decision sink | Optional but recommended for every production deployment. |
 | `fetch` | Base fetch wrapped by `runtime.fetch` | Optional. Inject vendor mocks in tests or a platform fetch in nonstandard runtimes. |
 | `requireEgressEnforcement` | Refuse a connector whose posture is not `enforced` | Optional. Pass it on a call whose connector must not rely on a boundary outside `runtime.fetch`. |
+
+`policies` must be an object, and a field outside this table is refused.
 
 The included tool evaluators are:
 
@@ -211,17 +260,26 @@ The included tool evaluators are:
   runtime-minted workflow scope.
 - `tenantIsolation()` denies calls without a non-empty isolation scope,
   including dry runs.
-- `backgroundExecution()` denies direct or nested write-class calls that try
-  to enable `_background`.
+- `backgroundExecution()` denies a write-class call whose arguments carry
+  `_background`, whatever its value, and a call whose `sideEffect` is not a
+  side-effect member. A call Mastra runs as a background task carries no
+  `_background`; the wrapper refuses that call instead.
 
 `approvalRequired()` is the shared resolver used by the wrapper. It combines
 the connector's `requiresApproval`, destructive-by-default behavior, and
-organization `requireApproval` globs.
+organization `requireApproval` globs, and refuses a `manifest` field outside
+`PermissionManifest` and a present `requiresApproval`, `dryRun`,
+`idempotencyKey` or `background` that is not a boolean, as `createConnector()`
+does.
 
 `WritePermissionsPolicy.requireApproval` accepts connector-ID patterns whose
 only wildcard token is `*`, such as `salesforce.*`. Every other character is
-literal. `destructiveRequiresApproval` defaults to `true`; set it to `false`
-only when another explicit policy owns every destructive call.
+literal, and a pattern follows the connector-ID character rule, so a pattern
+with a trailing space or a zero-width character is refused instead of never
+matching. `destructiveRequiresApproval` defaults to `true`; set it to `false`
+only when another explicit policy owns every destructive call. A
+`writePermissions` field other than `requireApproval` and
+`destructiveRequiresApproval` is refused.
 
 ## Invoke a connector from a trusted host
 
@@ -277,9 +335,9 @@ const result = await invokeConnector(
 );
 ```
 
-`invokeConnector()` accepts only an unmodified connector returned by `createConnector()`. It calls the connector's public Mastra execution boundary, so input and output schemas and every Breakwater gate still run. It creates the required observation context and forwards an optional `RequestContext`, abort signal, observer, and trusted tool-call ID.
+`invokeConnector()` accepts only an unmodified connector returned by `createConnector()`. It calls the connector's public Mastra execution boundary, so input and output schemas and every Breakwater gate still run. It creates the required observation context and forwards an optional `RequestContext`, abort signal, observer, and trusted tool-call ID. Options that are not an object, an option other than those four, and a `requestContext` that is not a `RequestContext` are refused with `CONNECTOR_INVOCATION_OPTIONS_INVALID`, since a misspelled `requestContext` would drop a dry-run request and run the real side effect.
 
-This example shows the values a trusted runtime must produce. Application routes must not construct them from client data. Do not accept `CONNECTOR_GRANTS_CONTEXT_KEY`, `CONNECTOR_EXECUTION_CONTEXT_KEY`, `PRINCIPAL_PERMISSIONS_CONTEXT_KEY`, `ISOLATION_SCOPE_CONTEXT_KEY`, `runId`, or `WORKFLOW_SCOPE_CONTEXT_KEY` from clients. A multi-tenant host should also register `tenantIsolation()` so a missing scope becomes a denial instead of a shared cache or budget.
+This example shows the values a trusted runtime must produce. Application routes must not construct them from client data. Do not accept `CONNECTOR_GRANTS_CONTEXT_KEY`, `CONNECTOR_EXECUTION_CONTEXT_KEY`, `PRINCIPAL_PERMISSIONS_CONTEXT_KEY`, `ISOLATION_SCOPE_CONTEXT_KEY`, `runId`, or `WORKFLOW_SCOPE_CONTEXT_KEY` from clients. A multi-tenant host should also register `tenantIsolation()` so a missing scope becomes a denial instead of a shared cache or budget. The isolation scope is an opaque non-empty string; the wrapper denies any other present value with `ISOLATION_SCOPE_INVALID` before the evaluators, because reading it as no scope would share replay records, budgets and grant matches between tenants.
 
 For a `tool-call` grant, pass the exact runtime-owned identity separately:
 
@@ -305,14 +363,17 @@ requestContext.set(DRY_RUN_CONTEXT_KEY, true);
 A dry-run call does not need an approval grant or idempotency key. It still
 passes the organization egress and custom evaluator gates, and — when the
 manifest declares `requiredPermissions` — the authorization gate: a
-simulation still needs an authorized principal.
+simulation still needs an authorized principal. Only `true` requests a
+simulation and `false` requests a real call; any other present value, such as
+the string `'true'`, is denied with `DRY_RUN_INVALID` before any side effect.
 
 ## Use the right idempotency store
 
 `InMemoryIdempotencyStore` is bounded, atomic within one isolate, and suitable
 for tests or a single long-lived process. It cannot protect a write across
-isolates or restarts. Its optional `maxEntries` defaults to 1,000 completed
-records; pending reservations are not evicted.
+isolates or restarts. Its optional `maxEntries`, a positive safe integer,
+defaults to 1,000 completed records; pending reservations are not evicted. An
+option other than `maxEntries` is refused.
 
 `D1IdempotencyStore` provides:
 
@@ -345,7 +406,8 @@ is 900,000 ms. The Agent CLI wrapper checks this against its own timeout when
 both idempotency and a store exposing `pendingTtlMs` are configured. The
 constructor accepts only positive safe integers up to 8,640,000,000,000,000 ms.
 `D1IdempotencyStoreOptions.now` is a clock override for deterministic tests;
-production should use the default clock.
+production should use the default clock. An option outside
+`D1IdempotencyStoreOptions` is refused.
 
 Durable custom stores must implement `AtomicIdempotencyStore` and
 `InspectableIdempotencyStore`. The non-mutating `inspect()` call distinguishes
@@ -483,7 +545,8 @@ models only common response methods.
 
 If `redirect` is `manual`, the caller receives the 3xx and any follow-up fetch
 must go through the guard again. If it is `error`, the base fetch owns the
-redirect failure.
+redirect failure. A value other than `follow`, `manual` or `error` is refused
+with `EGRESS_INPUT_INVALID` before any request.
 
 The guard cannot see global `fetch`, a vendor SDK with its own transport, a raw
 socket, or child-process traffic. Pass `runtime.fetch` into SDKs that support a
@@ -575,13 +638,18 @@ flags do not sandbox the child process from the rest of its host.
 | --- | --- |
 | `exec` | Replace the default child-process runner with a container, remote executor, or test seam |
 | `binaryPath` | Replace the definition's binary name with a path or alternate command |
+| `cwd` | Fix the working directory from trusted host configuration, a non-empty string; removes `cwd` from the model's input schema. Recommended |
 | `timeoutMs` | Set the execution deadline, default 600,000 ms |
 | `maxOutputBytes` | Set the retained stdout and stderr tail per stream, default 1 MiB; applies only to the default runner |
-| `requiresApproval` | Override the default `true` approval requirement |
+| `requiresApproval` | Override the default `true` approval requirement with a boolean |
 | `rateLimit` | Add the connector manifest fixed-window budget |
-| `idempotencyKey` | Require keyed replay and a policy store |
+| `idempotencyKey` | Require keyed replay and a policy store; a boolean |
 | `id` | Override the connector ID for parallel configurations |
 | `policies` | Supply audit, organization policies, evaluators, and stores to `createConnector()` |
+
+An option outside this table, or a definition field outside
+`AgentCliDefinition`, is refused, and the definition's `egress` must be an
+array.
 
 ### Know the CLI runtime boundary
 
@@ -590,7 +658,8 @@ The default runner:
 - requires Node.js and resolves `node:child_process` at execution time;
 - spawns without a shell;
 - inherits the parent process environment and CLI authentication;
-- runs in the caller-supplied `cwd`;
+- runs in the connector's `cwd` option when it is set, and otherwise in the
+  `cwd` the call's input supplies, which the model chooses;
 - terminates the process tree after `timeoutMs`, default 600,000, using a
   dedicated POSIX process group or absolute
   `taskkill.exe /T /F` argv from a drive-absolute local `%SystemRoot%` or
@@ -616,7 +685,9 @@ boundary, so the surrounding container or host process limit remains required.
 connector construction, including when an injected `exec` would ignore them.
 
 The adapter does not sandbox the child. The CLI can read credentials, run
-commands, and modify everything available to its process and `cwd`. Run it in
+commands, and modify everything available to its process and working
+directory. Set `cwd` on the connector so the model cannot choose that
+directory. Run it in
 an appropriately scoped container or VM. `requiresApproval: false` removes the
 human gate; use it only when another trusted boundary makes real execution
 safe.
@@ -824,7 +895,7 @@ An egress-declaring connector needs an observed transport call somewhere in the 
 
 Audit witnesses come from this case's supplied logger, during its invocation, with a `decisionCode` and `resource` equal to the subject connector's id. Setup logs, agent-policy records, and another connector's decisions cannot establish the subject's audit wiring or change its result. This attribution separates ordinary composition; it does not authenticate an arbitrary logger caller. `decisionCodes` preserves invocation-window events for diagnosis, including nested connector codes and `undefined` for events without a code; like `guardedHosts`, it is empty for a case the eligibility rule above excludes.
 
-Egress is not separated the same way. Once a case binds its subject, the supplied base transport checks each host against that subject's registered `egress`, whatever code is holding it: a nested connector the subject composes, handed the subject's `policies.fetch`, reaches a host only its own manifest declares and the transport refuses it there, recorded with cause `host-not-declared`. Before that binding, a successfully parsed URL and host reached while the probe or a case factory is constructing finds no declaration to read and is refused with cause `no-egress-declaration`. Declare on the subject every host its composition reaches, or give the nested connector its own transport and accept that traffic through it is unobserved.
+Egress is not separated the same way. Once a case binds its subject, the supplied base transport checks each host against that subject's registered `egress`, whatever code is holding it: a nested connector the subject composes, handed the subject's `policies.fetch`, reaches a host only its own manifest declares and the transport refuses it there, recorded with cause `host-not-declared`. A successfully parsed URL and host is refused with cause `no-egress-declaration` whenever no subject is bound to the transport: through the probe's transport, which never binds one, and through a case's transport until it binds that case's subject, including while the factory is constructing. `createConnector()` registers an omitted `egress` as an empty list, so after binding every undeclared host is refused with `host-not-declared`. Declare on the subject every host its composition reaches, or give the nested connector its own transport and accept that traffic through it is unobserved.
 
 Input-schema failures and `invokeConnector` pre-flight refusals have no expectation arm. Test them in ordinary connector tests. Supplied here, they report `proved: 'nothing'` with `CASE_EXPECTATION_UNMET`, whatever the case declared, because the gate boundary was never reached. Cases refused before invocation by instrumentation, factory construction, registration, posture, or manifest checks, and cases with an invocation setup failure, never run their invocation and are ineligible under the eligibility rule above. These cases add no expectation or wiring failure. Any escape recorded during their setup still becomes `NETWORK_IO_OUTSIDE_RUNTIME_FETCH`.
 

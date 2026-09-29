@@ -4,20 +4,15 @@
 // onto ONE isolate. The DO IS the serialization lease Mastra otherwise wants
 // Redis for. These routes run AFTER ThreadDurableObject.fetch verifies the
 // deployment identity and decodes the server-stamped principal. The scope's
-// threadId and principal are trusted here; the ingestion gate (allowlist / size
-// cap / rate cap / audit) is the Worker-side createSignalRouter's job, the same
-// split createRunRouter (Worker gate) → DurableObjectRunner (execution) uses.
+// threadId and principal are trusted here; the ingestion gate is the
+// Worker-side createSignalRouter's job, the same split createRunRouter (Worker
+// gate) → DurableObjectRunner (execution) uses.
 //
-// AFFINITY IS THE PUBSUB. Core keys its in-process signal registry by the pubsub
-// instance passed to each agent method (`#statesByPubSub`, falling back to a
-// module-level `defaultAgentThreadPubSub`), so a send only drains into an active
-// loop when BOTH run in one isolate (the DO gives this) AND both use the SAME
-// pubsub. The agent resolves its pubsub from `agent.getPubSub()`, so these routes
-// stamp the DO's ONE identity (`scope.init.pubsub`) onto the agent before every
-// call — the exact reason durable-agent execution threads that identity into
-// createRun. Absent (host opted out) ⇒ core's module default, still one per
-// isolate, so affinity holds either way; a wired pubsub additionally makes
-// observe()/replay align (pubsub.ts).
+// Core keys its in-process signal registry by pub/sub identity. A runtime-driven
+// wrapper carries the thread Durable Object's pub/sub from construction; these
+// routes refuse a configured identity mismatch. Other agents receive the
+// thread's pub/sub before each call. Without a host pub/sub, other agents fall
+// back to core's module default and runtime-driven wrappers use their own stream bus.
 //
 // core's `agentThreadStreamRuntime` is NOT on the package exports map, so these
 // routes drive only the PUBLIC Agent methods, never a deep dist import across
@@ -45,6 +40,7 @@ import {
   type NotificationsStorage,
   type SendNotificationSignalInput,
   summarizeNotifications,
+  type UpdateNotificationInput,
 } from '@mastra/core/notifications';
 import { RequestContext } from '@mastra/core/request-context';
 import { FLOWSAFE_PERSISTENCE_FORBIDDEN } from '../agent-runner/durable-agent-runner.js';
@@ -219,6 +215,19 @@ export type SignalContentPolicy = (
   input: SignalContentPolicyInput,
 ) => SignalContentPolicyResult | Promise<SignalContentPolicyResult>;
 
+/** Stored options and trusted target identity for a threaded schedule fire. */
+export interface ScheduleProviderOptionsPolicyInput {
+  providerOptions: unknown;
+  agentId: string;
+  threadId: string;
+  resourceId: string;
+}
+
+/** Decides whether stored options may reach a threaded schedule signal. */
+export type ScheduleProviderOptionsPolicy = (
+  input: ScheduleProviderOptionsPolicyInput,
+) => SignalContentPolicyResult | Promise<SignalContentPolicyResult>;
+
 export interface ThreadSignalRoutesOptions {
   /**
    * The per-thread agent whose public signal methods these routes drive. Built
@@ -231,8 +240,7 @@ export interface ThreadSignalRoutesOptions {
    * persistence only when the principal may persist and the agent has memory;
    * otherwise the route returns `persistence-forbidden` or
    * `memory-unavailable`, and never escapes onto core's default execution
-   * engine. Trusted notification dispatch supplies the persisted agent id;
-   * other routes pass `undefined`.
+   * engine. Trusted notification dispatch supplies the persisted agent id.
    */
   resolveAgent: (
     scope: ThreadScope,
@@ -244,9 +252,7 @@ export interface ThreadSignalRoutesOptions {
    * threadId)` signal key, so it MUST match whatever the loop registered under
    * or a send never finds the active run. Server-derived (a memory id is
    * TCB-only — never a client field); the host mints it from the authenticated
-   * host. Absent ⇒ threadId-only keying (resourceId ''), which is consistent
-   * within this DO but only interoperates with a loop that also omits it — the
-   * binding expected by the registered durable run.
+   * host. Delivery routes refuse with 409 when no resourceId resolves.
    */
   resolveResourceId?: (scope: ThreadScope) => string | undefined;
   /** Run-cap seam for idle-thread wakes. Absent means wakes are unmetered. */
@@ -258,12 +264,21 @@ export interface ThreadSignalRoutesOptions {
    * `memory-unavailable`.
    */
   startIdleRun?: StartIdleRun;
-  /** Storage-backed thread occupancy, including runs surviving DO eviction. */
+  /**
+   * Storage-backed thread occupancy, including runs surviving DO eviction.
+   * `status` is the run's stored status when the host knows it. A delivery
+   * into a run that is not executing persists to memory because a queued
+   * delivery lives only in this isolate until the run drains it. A run that
+   * reports no status is treated as running.
+   */
   resolveBlockingRun?: (
     scope: ThreadScope,
   ) =>
-    | Promise<{ runId: string; principal: ExecutionPrincipal } | undefined>
-    | { runId: string; principal: ExecutionPrincipal }
+    | Promise<
+        | { runId: string; principal: ExecutionPrincipal; status?: RunStatus }
+        | undefined
+      >
+    | { runId: string; principal: ExecutionPrincipal; status?: RunStatus }
     | undefined;
   /**
    * Host-shared target-thread critical section. Required with
@@ -285,8 +300,17 @@ export interface ThreadSignalRoutesOptions {
     input: { scheduleId: string; dispatchId: string; runId: string },
   ) => Promise<AgentScheduleTarget | undefined>;
   /**
-   * Whether this principal owns the thread and may persist future input. Its
-   * effect is route-dependent; see `persistenceForbiddenResponse()`.
+   * Whether this principal owns the thread and may persist input for a later
+   * turn. Absent, every principal may, signal providers included. A principal
+   * that may not persist is answered `persistence-forbidden` where a route
+   * would persist its input, and its deliveries carry a marker that keeps the
+   * runner's terminal refusal from persisting them.
+   *
+   * For `/signal/notification`, an owner's notification to a runtime-driven
+   * agent is delivered at ingestion under the owner's principal, and a
+   * non-owner's is recorded for the notification dispatch tick, which this
+   * callback then judges as the dispatch principal. An unbranded agent's owner
+   * notification follows Mastra's delivery policy.
    */
   canPersist?: (scope: ThreadScope) => boolean | Promise<boolean>;
   /** Whether the registered schedule owner may persist to its fixed target. */
@@ -303,11 +327,23 @@ export interface ThreadSignalRoutesOptions {
   ) => boolean | Promise<boolean>;
   /**
    * Durable inbox used by the trusted due-notification dispatch route. Required
-   * for non-owner `/signal/notification` ingestion, which returns 409 without it.
+   * for `/signal/notification` ingestion to a runtime-driven agent or from a
+   * non-owner, which returns 409 without it.
    */
   resolveNotificationsStorage?: (
     scope: ThreadScope,
   ) => NotificationsStorage | Promise<NotificationsStorage>;
+  /**
+   * Consulted only for a non-owner `/signal/notification`. A false result
+   * answers 409 with `notification-dispatch-forbidden` before the inbox write.
+   * When absent, every non-owner notification is recorded for the dispatch
+   * tick. A true result does not guarantee dispatch: the host's automated-entry
+   * authorizer and required permissions still apply at the tick.
+   */
+  notificationDispatchAllowed?: (
+    scope: ThreadScope,
+    agentId: string,
+  ) => boolean | Promise<boolean>;
   /** Failed delivery rounds before a pending notification is discarded. */
   maxDeliveryAttempts?: number;
   /** Target-side lease and receipt store for at-least-once schedule fires. */
@@ -320,6 +356,13 @@ export interface ThreadSignalRoutesOptions {
    * opaque structural result and is never given a request body or storage row.
    */
   contentPolicy?: SignalContentPolicy;
+  /**
+   * Receives stored options and target identity on every threaded agent-schedule
+   * fire before signal creation. A denied result settles a discard; an error,
+   * throw, or malformed result leaves the lease for a later tick. Without the
+   * callback, stored options reach the signal unchecked.
+   */
+  scheduleProviderOptionsPolicy?: ScheduleProviderOptionsPolicy;
 }
 
 /**
@@ -378,7 +421,7 @@ async function readJson(
  * The wire surface accepts STRING contents only — the common case, and the one
  * the ingestion gate can size-cap and escape uniformly as defense in depth.
  * Core's multimodal `AgentSignalContents` array form (TextPart/FilePart) is a
- * documented residual, not exposed over this untrusted channel in v1.
+ * documented residual, not exposed over this untrusted channel.
  */
 function isContents(value: unknown): value is string {
   return typeof value === 'string';
@@ -392,9 +435,7 @@ function isContents(value: unknown): value is string {
  * into a 400 at the route, and an invalid attribute name into a dropped
  * attributes object (`isAttributes`), rather than a
  * throw at render time inside the agent turn. Kept byte-identical to core
- * (chunk `signalToXmlMarkup`: `/^[A-Za-z_][A-Za-z0-9_.-]*$/`); the render test
- * pins core's own neutralization of contents/attribute values so this
- * mirror and that layer are checked together.
+ * (chunk `signalToXmlMarkup`: `/^[A-Za-z_][A-Za-z0-9_.-]*$/`).
  */
 const XML_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_.-]*$/;
 
@@ -447,6 +488,24 @@ type InspectSignalContent = (
   runId?: string,
 ) => Promise<SignalContentInspection>;
 
+async function inspectPolicyResult(
+  invoke: () => SignalContentPolicyResult | Promise<SignalContentPolicyResult>,
+): Promise<SignalContentInspection> {
+  try {
+    const result = await invoke();
+    if (result?.allowed === true) return 'allowed';
+    if (
+      result?.allowed === false &&
+      (result.outcome === 'denied' || result.outcome === 'error')
+    ) {
+      return result.outcome;
+    }
+  } catch {
+    return 'error';
+  }
+  return 'error';
+}
+
 async function inspectSignalContent(
   policy: SignalContentPolicy,
   input: Omit<SignalContentPolicyInput, 'text' | 'runId'>,
@@ -465,23 +524,13 @@ async function inspectSignalContent(
   } catch {
     return 'error';
   }
-  try {
-    const result = await policy({
+  return inspectPolicyResult(() =>
+    policy({
       ...input,
       text,
       ...(runId !== undefined ? { runId } : {}),
-    });
-    if (result?.allowed === true) return 'allowed';
-    if (
-      result?.allowed === false &&
-      (result.outcome === 'denied' || result.outcome === 'error')
-    ) {
-      return result.outcome;
-    }
-  } catch {
-    return 'error';
-  }
-  return 'error';
+    }),
+  );
 }
 
 function signalContentPolicyResponse(
@@ -511,8 +560,10 @@ export function createThreadSignalRoutes(
     canPersist,
     canPersistSchedule,
     resolveNotificationsStorage,
+    notificationDispatchAllowed,
     resolveScheduleDispatchStore,
     contentPolicy,
+    scheduleProviderOptionsPolicy,
   } = options;
   if (resolveBlockingRun && !serializeDispatch) {
     throw new Error(
@@ -544,17 +595,13 @@ export function createThreadSignalRoutes(
     return next;
   };
 
-  const route: ThreadSignalRouter = async (request, scope) => {
-    if (request.method !== 'POST') return null;
-    const url = new URL(request.url);
+  const route = async (
+    url: URL,
+    scope: ThreadScope,
+    entryPath: AgentEntryPath,
+    body: Record<string, unknown>,
+  ): Promise<Response> => {
     const path = url.pathname;
-    if (path !== '/signal' && !path.startsWith('/signal/')) return null;
-    const entryPath = entryPathForSignalRoute(path);
-    if (entryPath === undefined) return json({ error: 'not found' }, 404);
-
-    const body = await readJson(request);
-    if (!body) return json({ error: 'a JSON body is required' }, 400);
-
     try {
       // The execution fence, read ONCE for this request and before any store
       // lookup. `migration-locked` refuses every signal route outright — the
@@ -563,7 +610,7 @@ export function createThreadSignalRoutes(
       // once the thread's active run is knowable.
       //
       // A read that fails throws ExecutionFenceUnreadableError, which the
-      // catch below answers as a 503 — degrade closed, never a silent open.
+      // catch below answers — degrade closed, never a silent open.
       const executionFence = await readExecutionFence(
         scope.init.executionFence,
       );
@@ -613,26 +660,33 @@ export function createThreadSignalRoutes(
         );
       }
 
-      // Affinity: stamp the DO's ONE pubsub identity onto the agent so its signal
-      // methods share the registry state the loop registered under. Keep host
-      // resolution inside this catch-all: construction/storage failures are
-      // internal and must not escape through the outer DO error response.
+      // Host resolution stays inside this catch-all so construction and storage
+      // failures use the route's internal error response.
       const agent = await resolveAgent(scope, requestedAgentId, entryPath);
       if (requestedAgentId !== undefined && agent.id !== requestedAgentId) {
         return json({ error: 'agent binding does not match' }, 404);
       }
       const runtimeDriven = isRuntimeDrivenAgent(agent);
       const pubsub = scope.init.pubsub;
-      if (pubsub) agent.__setPubSub(pubsub);
+      if (pubsub && !runtimeDriven) agent.__setPubSub(pubsub);
+      if (
+        runtimeDriven &&
+        pubsub !== undefined &&
+        (typeof agent.getPubSub !== 'function' || agent.getPubSub() !== pubsub)
+      ) {
+        return json(
+          { error: "agent pub/sub does not match this thread's" },
+          503,
+        );
+      }
 
       const resourceId = resolveResourceId?.(scope);
       const threadId = scope.threadId;
       // proof-only admits work on ONE run, so the gate lives here — the first
       // point where the run a signal would reach is knowable, and the only one
       // every route passes through. Deciding it inside handleWake would leave
-      // the lanes that never reach it (the persist routes, and a default
-      // non-wake delivery) ungated; handleWake keeps its own check for the
-      // wake path it owns.
+      // the lanes that never reach it ungated; handleWake keeps its own check
+      // for the wake path it owns.
       let proof: SignalProofGuard | undefined;
       if (executionFence.state === 'proof-only') {
         const runtime = scope.init.runtime;
@@ -787,7 +841,7 @@ export function createThreadSignalRoutes(
           proof,
         });
       }
-      // POST /signal — a system signal (ifActive/ifIdle deliver/persist/discard/wake).
+      // POST /signal — a system signal with its ifActive/ifIdle behaviors.
       if (path === '/signal') {
         return await handleSignal(
           agent,
@@ -843,6 +897,7 @@ export function createThreadSignalRoutes(
           store: await resolveScheduleDispatchStore(scope),
           completed: completedScheduleDispatches,
           inspectContent,
+          scheduleProviderOptionsPolicy,
           proof,
         });
       }
@@ -890,7 +945,7 @@ export function createThreadSignalRoutes(
           }),
         );
       }
-      // POST /signal/notification — the durable AGENT inbox (mastra_notifications).
+      // POST /signal/notification — the durable AGENT inbox.
       if (path === '/signal/notification') {
         return await serializeNotification(async () =>
           handleNotification(
@@ -901,14 +956,25 @@ export function createThreadSignalRoutes(
             resolveNotificationsStorage
               ? () => resolveNotificationsStorage(scope)
               : undefined,
-            { persistenceAllowed, runtimeDriven, inspectContent, proof },
+            {
+              principal: scope.principal,
+              blockingRun,
+              persistenceAllowed,
+              runtimeDriven,
+              memoryAvailable,
+              inspectContent,
+              notificationDispatchAllowed: notificationDispatchAllowed
+                ? () => notificationDispatchAllowed(scope, agent.id)
+                : undefined,
+              proof,
+            },
           ),
         );
       }
       return json({ error: 'not found' }, 404);
     } catch (error) {
-      // The fence refusing, or failing to answer. Surfaced with its own 503 and
-      // reason rather than the 502 below: a caller must be able to tell "this
+      // The fence refusing, or failing to answer. Surfaced with its own status
+      // and reason rather than the 502 below: a caller must be able to tell "this
       // deployment is deliberately not executing" (retry after the migration)
       // from "the model or a route is broken".
       if (isExecutionFenceRefusal(error)) {
@@ -935,15 +1001,19 @@ export function createThreadSignalRoutes(
       return internalErrorResponse('signals.thread', error, 502);
     }
   };
-  return (request, scope) => {
-    if (request.method !== 'POST') return Promise.resolve(null);
-    const path = new URL(request.url).pathname;
-    if (path !== '/signal' && !path.startsWith('/signal/')) {
-      return Promise.resolve(null);
-    }
+  return async (request, scope) => {
+    if (request.method !== 'POST') return null;
+    const url = new URL(request.url);
+    const path = url.pathname;
+    if (path !== '/signal' && !path.startsWith('/signal/')) return null;
+    const entryPath = entryPathForSignalRoute(path);
+    if (entryPath === undefined) return json({ error: 'not found' }, 404);
+    // A queued request keeps its parsed body if the sender disconnects.
+    const body = await readJson(request);
+    if (!body) return json({ error: 'a JSON body is required' }, 400);
     return serializeDispatch
-      ? serializeDispatch(scope, () => route(request, scope))
-      : route(request, scope);
+      ? serializeDispatch(scope, () => route(url, scope, entryPath, body))
+      : route(url, scope, entryPath, body);
   };
 }
 
@@ -983,7 +1053,12 @@ async function handleNotificationDispatch(options: {
     ids.length > MAX_NOTIFICATION_DISPATCH_IDS ||
     !ids.every((id): id is string => typeof id === 'string' && id.length > 0)
   ) {
-    return json({ error: 'notificationIds must contain 1-100 strings' }, 400);
+    return json(
+      {
+        error: `notificationIds must contain 1-${MAX_NOTIFICATION_DISPATCH_IDS} strings`,
+      },
+      400,
+    );
   }
   const uniqueIds = [...new Set(ids)];
   if (
@@ -998,15 +1073,7 @@ async function handleNotificationDispatch(options: {
     durableBlockingRun &&
     !samePrincipal(durableBlockingRun.principal, options.principal)
   ) {
-    return json(
-      {
-        error: 'notification principal does not match the active run',
-        reason: 'principal-mismatch',
-        runId: durableBlockingRun.runId,
-        retry: true,
-      },
-      409,
-    );
+    return notificationPrincipalMismatchResponse(durableBlockingRun.runId);
   }
   const now =
     typeof options.body.now === 'string'
@@ -1163,12 +1230,12 @@ async function handleNotificationDispatch(options: {
       persistenceAllowed: options.persistenceAllowed,
       memoryAvailable: options.memoryAvailable,
       signal: deliverableSignal,
-      deliverActive: (runId, activeMemoryAvailable) =>
+      deliverActive: (runId, activeMemoryAvailable, resolvedActiveBehavior) =>
         options.agent.sendSignal(deliverableSignal, {
           runId,
           threadId: options.threadId,
           resourceId,
-          ifActive: { behavior: 'deliver' },
+          ifActive: { behavior: resolvedActiveBehavior },
           ifIdle: {
             behavior:
               activeMemoryAvailable && options.persistenceAllowed
@@ -1219,7 +1286,9 @@ async function handleNotificationDispatch(options: {
     const result = options.agent.sendSignal(signal, {
       threadId: options.threadId,
       resourceId,
-      ifActive: { behavior: 'deliver' },
+      ifActive: {
+        behavior: activeBehaviorForRun('deliver', durableBlockingRun),
+      },
       ifIdle: { behavior: 'persist' },
     });
     await result.accepted;
@@ -1385,15 +1454,13 @@ async function handleNotificationDispatch(options: {
 }
 
 /**
- * Why a requested wake was refused. It degrades to a durable persist only when
- * the principal may persist and the agent has memory; otherwise the route
- * answers `persistence-forbidden` or `memory-unavailable`.
+ * Why a requested wake was refused.
  *
  * `execution-draining` is the fence's (do-runner/execution-fence.ts): a
- * draining deployment must mint no new run, and a signal is the one input a
- * drain cannot answer by refusing — the sender has nowhere to put it and the
- * migration would lose it. Degrading to the SAME persist branch the other two
- * refusals use keeps it durable for the deployment that takes over.
+ * draining deployment must mint no new run, and a drain cannot answer a signal
+ * by refusing — the sender has nowhere to put it and the migration would lose
+ * it. Degrading to the SAME persist branch the other refusals use keeps it
+ * durable for the deployment that takes over.
  */
 type WakeRefusal =
   | 'not-runtime-driven'
@@ -1403,14 +1470,8 @@ type WakeRefusal =
 type RouteDegradation = 'not-runtime-driven';
 
 /**
- * Resolve the idle behavior a body asked for. A `wake` STARTS a run, so it is
- * gated twice. A refused or capped wake degrades to a durable persist when the
- * principal may persist and the agent has memory; otherwise the route answers
- * `persistence-forbidden` or `memory-unavailable` instead of silently dropping
- * the signal:
- *   - the agent must be RUNTIME-DRIVEN (its stream re-enters RunnerRuntime, not
- *     the default engine) — else `wakeRefused:'not-runtime-driven'`;
- *   - the deployment run cap must allow it — otherwise `capped:true`.
+ * Resolve the idle behavior a body asked for. A `wake` STARTS a run, so
+ * handleWake gates it.
  */
 function requestedIdle(body: Record<string, unknown>): IdleBehavior {
   const requested = body.ifIdle;
@@ -1427,10 +1488,58 @@ interface WakeDelivery {
 }
 
 type BlockingRunResolver = () =>
-  | Promise<{ runId: string; principal: ExecutionPrincipal } | undefined>
-  | { runId: string; principal: ExecutionPrincipal }
+  | Promise<
+      | { runId: string; principal: ExecutionPrincipal; status?: RunStatus }
+      | undefined
+    >
+  | { runId: string; principal: ExecutionPrincipal; status?: RunStatus }
   | undefined;
 type MemoryAvailable = () => Promise<boolean>;
+
+/** See resolveBlockingRun for why a run that is not executing gets persist. */
+function activeBehaviorForRun(
+  requested: ActiveBehavior,
+  blockingRun: Awaited<ReturnType<BlockingRunResolver>>,
+): ActiveBehavior {
+  return requested === 'deliver' &&
+    blockingRun?.status !== undefined &&
+    blockingRun.status !== 'running'
+    ? 'persist'
+    : requested;
+}
+
+function deliverableActiveBehavior(
+  behavior: ActiveBehavior,
+  persistenceAllowed: boolean,
+): ActiveBehavior {
+  return behavior === 'persist' && !persistenceAllowed ? 'discard' : behavior;
+}
+
+function notificationPrincipalMismatchResponse(runId: string): Response {
+  return json(
+    {
+      error: 'notification principal does not match the active run',
+      reason: 'principal-mismatch',
+      runId,
+      retry: true,
+    },
+    409,
+  );
+}
+
+const OWNER_NOTIFICATION_REFUSALS = {
+  'memory-unavailable': 'notification delivery requires agent memory',
+  'notification-pending': 'a matching notification is already pending',
+  'notification-dispatch-forbidden':
+    'the target agent does not accept notification dispatch',
+  'thread-blocked': 'the thread is blocked by another run',
+} as const;
+
+function ownerNotificationRefusal(
+  reason: keyof typeof OWNER_NOTIFICATION_REFUSALS,
+): Response {
+  return json({ error: OWNER_NOTIFICATION_REFUSALS[reason], reason }, 409);
+}
 
 function principalMismatchResponse(runId: string): Response {
   return json({
@@ -1445,16 +1554,7 @@ function principalMismatchResponse(runId: string): Response {
 
 /**
  * Report a lazily computed missing-memory gate after content inspection, only
- * where a memory write would otherwise disappear. Wake-start and notification
- * inbox recording never use this response. On an active thread it is returned
- * for a persist outcome that would otherwise be silently dropped — an explicit
- * `ifActive: 'persist'`, or the stale-active-id idle fall-through — and by
- * `/state`, whose pre-send gate replaces core's hard memory requirement rather
- * than covering a dropped write. A default or `ifIdle: 'persist'` request to
- * `/signal/message` or `/signal` still delivers into an active run without
- * memory; the memory gate responds only when core's outcome for the request
- * replaced a persist (an idle discard substituted for a requested persist, or
- * an active persist that no memory could write).
+ * where a memory write would otherwise disappear.
  */
 function memoryUnavailableResponse(): Response {
   return json({
@@ -1462,18 +1562,7 @@ function memoryUnavailableResponse(): Response {
   });
 }
 
-/**
- * Report route-specific persistence authorization failures.
- * `/queue` and `/state` refuse every non-owner request before sending.
- * `/signal/message` and `/signal` refuse a default or requested `ifIdle: 'persist'`;
- * `/signal` also degrades a requested `ifActive: 'persist'`.
- * `/notification` never refuses because a non-owner is record-only for the
- * dispatcher.
- * Wake handling for `/signal/message`, `/signal`, `/signal/schedule`, and the
- * notification dispatch lane returns this response from `handleWake` when a
- * refused or capped wake, or a stale-active-id fall-through, would otherwise
- * persist for a non-owner.
- */
+/** Report route-specific persistence authorization failures. */
 function persistenceForbiddenResponse(options?: {
   capped?: boolean;
   wakeRefused?: WakeRefusal;
@@ -1510,21 +1599,23 @@ async function handleWake(options: {
   dispatchId?: string;
   safeContext?: Record<string, unknown>;
   /**
+   * The ONE fence reading this request took (never re-read per branch). The
+   * route resolves it before dispatch.
+   */
+  executionFence: ExecutionFenceReading;
+  proof?: SignalProofGuard;
+  /**
    * Treat an explicit active-branch discard as the caller's own outcome: it
    * suppresses both the memory-unavailable and the persistence-forbidden
    * attribution. A stale active id can still read a substituted discard as
    * the caller's, which core's bare discard result cannot distinguish.
    */
-  activeDiscardAllowed?: boolean;
-  /**
-   * The ONE fence reading this request took (never re-read per branch). The
-   * route resolves it before dispatch; this function is where it is applied,
-   * because only here is the run a delivery would land on known — which is
-   * exactly what proof-only admits by.
-   */
-  executionFence: ExecutionFenceReading;
-  proof?: SignalProofGuard;
-  deliverActive(runId: string, activeMemoryAvailable: boolean): WakeDelivery;
+  activeBehavior?: ActiveBehavior;
+  deliverActive(
+    runId: string,
+    activeMemoryAvailable: boolean,
+    resolvedActiveBehavior: ActiveBehavior,
+  ): WakeDelivery;
   persist(): WakeDelivery;
 }): Promise<Response> {
   return options.serializeWake(async () => {
@@ -1565,11 +1656,23 @@ async function handleWake(options: {
       const memoryAvailable = await options.memoryAvailable();
       await options.proof?.check(admitted);
       options.proof?.assertActive(admitted);
-      const delivered = options.deliverActive(activeRunId, memoryAvailable);
+      const activeBehavior = activeBehaviorForRun(
+        options.activeBehavior ?? 'deliver',
+        durableBlockingRun,
+      );
+      const deliveredActiveBehavior = deliverableActiveBehavior(
+        activeBehavior,
+        options.persistenceAllowed,
+      );
+      const delivered = options.deliverActive(
+        activeRunId,
+        memoryAvailable,
+        deliveredActiveBehavior,
+      );
       const decision = await delivered.accepted;
       if (delivered.persisted) await delivered.persisted;
       const action = recordValue(decision)?.action;
-      if (action === 'discard' && !options.activeDiscardAllowed) {
+      if (action === 'discard' && options.activeBehavior !== 'discard') {
         return options.persistenceAllowed
           ? memoryUnavailableResponse()
           : persistenceForbiddenResponse({ capped: false });
@@ -1621,13 +1724,13 @@ async function handleWake(options: {
         ? !(await options.consultRunCap())
         : false;
     if (refusal || capped) {
-      // The one place a drain can lose a signal, and it is the CALLER'S choice,
-      // not the fence's. `execution-draining` degrades a wake into a persist so
+      // A drain can lose a signal here, and it is the CALLER'S choice, not the
+      // fence's. `execution-draining` degrades a wake into a persist so
       // nothing is lost while a deployment finishes its work — but a caller who
       // said persistence is forbidden has already declared it does not want its
       // signal parked, and honouring the fence by parking it anyway would
       // override an authorization decision with an operational one. So it is
-      // discarded, deliberately, and the response SAYS SO: `wakeRefused:
+      // discarded, and the response SAYS SO: `wakeRefused:
       // 'execution-draining'` alongside `action: 'discard'` tells the caller
       // exactly which condition dropped it, so a sender that would rather wait
       // out the migration can retry instead of assuming delivery.
@@ -1767,6 +1870,7 @@ async function handleScheduleSignal(options: {
   store: ScheduleSignalDispatchStore;
   completed: Map<string, ScheduleAgentDispatchReceipt>;
   inspectContent?: InspectSignalContent;
+  scheduleProviderOptionsPolicy?: ThreadSignalRoutesOptions['scheduleProviderOptionsPolicy'];
   proof?: SignalProofGuard;
   /** The ONE fence reading this request took — see handleWake. */
   executionFence: ExecutionFenceReading;
@@ -1790,9 +1894,9 @@ async function handleScheduleSignal(options: {
   }
   const resourceId = options.resourceId;
 
-  // Every terminal "this fire will not be delivered" outcome settles the same
-  // canonical receipt, so a replay of the dispatch returns it instead of
-  // re-deciding. Settling is what lets the schedule advance; leaving the lease
+  // A terminal "this fire will not be delivered" outcome settles a canonical
+  // receipt, so a replay of the dispatch returns it instead of re-deciding.
+  // Settling is what lets the schedule advance; leaving the lease
   // unsettled is reserved for outcomes a later tick could still resolve.
   const settleDiscard = async (): Promise<Response> => {
     const receipt = createScheduleAgentDispatchReceipt('discard', {
@@ -1896,7 +2000,30 @@ async function handleScheduleSignal(options: {
     return await settleDiscard();
   }
 
-  const baseProviderOptions = target.providerOptions ?? {};
+  const storedProviderOptions = target.providerOptions;
+  const scheduleProviderOptionsPolicy = options.scheduleProviderOptionsPolicy;
+  if (scheduleProviderOptionsPolicy) {
+    const inspection = await inspectPolicyResult(() =>
+      scheduleProviderOptionsPolicy({
+        // The policy cannot change the options later delivered in the signal.
+        providerOptions: structuredClone(storedProviderOptions),
+        agentId: target.agentId,
+        threadId: options.threadId,
+        resourceId,
+      }),
+    );
+    if (inspection === 'denied') {
+      return await settleDiscard();
+    }
+    if (inspection === 'error') {
+      return json(
+        { error: 'schedule provider options policy unavailable' },
+        503,
+      );
+    }
+  }
+
+  const baseProviderOptions = storedProviderOptions ?? {};
   const baseMastra = recordValue(baseProviderOptions.mastra) ?? {};
   const signal: AgentSignal = {
     id: dispatchId,
@@ -1918,6 +2045,11 @@ async function handleScheduleSignal(options: {
     } as AgentSignal['providerOptions'],
   };
   const ifActive = target.ifActive ?? { behavior: 'deliver' as const };
+  const requestedActiveBehavior = ifActive.behavior ?? 'deliver';
+  const effectiveIfActive = {
+    ...ifActive,
+    behavior: activeBehaviorForRun(requestedActiveBehavior, durableBlockingRun),
+  };
   const ifIdle = target.ifIdle ?? { behavior: 'wake' as const };
   const localActiveRunId = activeThreadRunIdOf(
     options.agent,
@@ -1925,10 +2057,13 @@ async function handleScheduleSignal(options: {
     resourceId,
   );
   const persistenceRequested = localActiveRunId
-    ? (ifActive.behavior ?? 'deliver') === 'persist'
+    ? effectiveIfActive.behavior === 'persist'
     : (ifIdle.behavior ?? 'wake') === 'persist';
+  // Occupancy can change before the send, so either branch may persist.
   const persistenceAllowed =
-    persistenceRequested && options.schedulePersistenceAllowed
+    (effectiveIfActive.behavior === 'persist' ||
+      (ifIdle.behavior ?? 'wake') === 'persist') &&
+    options.schedulePersistenceAllowed
       ? await options.schedulePersistenceAllowed({
           scheduleId,
           dispatchId,
@@ -2002,8 +2137,20 @@ async function handleScheduleSignal(options: {
   const signalTarget: SendAgentSignalOptions = {
     threadId: options.threadId,
     resourceId,
-    ifActive,
-    ifIdle: signalIfIdle,
+    ifActive: {
+      ...effectiveIfActive,
+      behavior: deliverableActiveBehavior(
+        effectiveIfActive.behavior,
+        persistenceAllowed,
+      ),
+    },
+    ifIdle: {
+      ...signalIfIdle,
+      behavior:
+        signalIfIdle.behavior === 'persist' && !persistenceAllowed
+          ? 'discard'
+          : signalIfIdle.behavior,
+    },
   };
 
   let decision: unknown;
@@ -2039,17 +2186,21 @@ async function handleScheduleSignal(options: {
       persistenceAllowed,
       memoryAvailable: options.memoryAvailable,
       signal: idleSignal,
+      activeBehavior: requestedActiveBehavior,
       runId,
       scheduleId,
       dispatchId,
       safeContext: { ...requestContext, ...idleRequestContext },
-      activeDiscardAllowed: ifActive.behavior === 'discard',
-      deliverActive: (activeRunId, activeMemoryAvailable) =>
+      deliverActive: (
+        activeRunId,
+        activeMemoryAvailable,
+        resolvedActiveBehavior,
+      ) =>
         options.agent.sendSignal(deliverableSignal, {
           runId: activeRunId,
           threadId: options.threadId,
           resourceId,
-          ifActive,
+          ifActive: { ...ifActive, behavior: resolvedActiveBehavior },
           ifIdle: {
             behavior:
               activeMemoryAvailable && persistenceAllowed
@@ -2143,8 +2294,7 @@ async function handleMessage(
   const message = options.persistenceAllowed
     ? baseMessage
     : markPersistenceForbidden(baseMessage);
-  // sendMessage requires a resourceId+threadId target for its idle branch; when a
-  // host has not wired a resourceId, only the active/queue path is reachable.
+  // sendMessage requires a resourceId+threadId target for its idle branch.
   if (resourceId === undefined) {
     return json(
       {
@@ -2188,12 +2338,12 @@ async function handleMessage(
       persistenceAllowed: options.persistenceAllowed,
       memoryAvailable: options.memoryAvailable,
       message,
-      deliverActive: (runId, activeMemoryAvailable) =>
+      deliverActive: (runId, activeMemoryAvailable, resolvedActiveBehavior) =>
         agent.sendMessage(message, {
           runId,
           threadId,
           resourceId,
-          ifActive: { behavior: 'deliver' },
+          ifActive: { behavior: resolvedActiveBehavior },
           // A stale active id can disappear before core sends. Persist only
           // when both the memory and authorization gates allow the write.
           ifIdle: {
@@ -2214,28 +2364,30 @@ async function handleMessage(
   if (behavior === 'persist' && !options.persistenceAllowed) {
     return persistenceForbiddenResponse({ capped: false });
   }
-  const memoryAvailable = await options.memoryAvailable();
-  await options.proof?.check();
-  options.proof?.assertActive();
-  const result = agent.sendMessage(message, {
-    threadId,
-    resourceId,
-    ifIdle: { behavior: memoryAvailable ? behavior : 'discard' },
-  });
-  const decision = await result.accepted;
-  if (result.persisted) await result.persisted;
-  if (
-    behavior === 'persist' &&
-    !memoryAvailable &&
-    recordValue(decision)?.action === 'discard'
-  ) {
-    return memoryUnavailableResponse();
-  }
-  return json({
-    decision,
-    capped: false,
-    signalId: result.signal.id,
-  });
+  const activeBehavior = activeBehaviorForRun('deliver', durableBlockingRun);
+  const activePersistenceForbidden =
+    activeBehavior === 'persist' && !options.persistenceAllowed;
+  const deliveredActiveBehavior = deliverableActiveBehavior(
+    activeBehavior,
+    options.persistenceAllowed,
+  );
+  const sent = await sendWithoutWake(
+    agent,
+    (sendOptions) => agent.sendMessage(message, sendOptions),
+    {
+      threadId,
+      resourceId,
+      ifActive: deliveredActiveBehavior,
+      ifIdle: behavior,
+    },
+    options,
+  );
+  return noWakeResponse(
+    sent,
+    behavior,
+    deliveredActiveBehavior,
+    activePersistenceForbidden,
+  );
 }
 
 async function handleQueue(
@@ -2323,12 +2475,20 @@ async function handleSignal(
   // Route-level tagName defense: reject a non-XML-name tagName HERE with a
   // 400, rather than letting core's signalToXmlMarkup throw at render time inside
   // the agent turn. Core still escapes contents/attribute values and re-validates
-  // names; this is the ingest-time half the plan calls "route-level defense".
+  // names.
   if (
     typeof body.tagName === 'string' &&
     !XML_NAME_PATTERN.test(body.tagName)
   ) {
     return json({ error: 'tagName is not a valid XML name' }, 400);
+  }
+  if (resourceId === undefined) {
+    return json(
+      {
+        error: 'this thread has no resourceId wired; signal delivery needs one',
+      },
+      409,
+    );
   }
   const baseSignal: AgentSignal = {
     type: 'reactive',
@@ -2344,11 +2504,6 @@ async function handleSignal(
     (ACTIVE_BEHAVIORS as readonly string[]).includes(body.ifActive)
       ? (body.ifActive as ActiveBehavior)
       : 'deliver';
-  const activePersistenceForbidden =
-    activeBehavior === 'persist' && !options.persistenceAllowed;
-  const deliveredActiveBehavior: ActiveBehavior = activePersistenceForbidden
-    ? 'discard'
-    : activeBehavior;
   const durableBlockingRun = await options.blockingRun?.();
   if (
     durableBlockingRun &&
@@ -2362,22 +2517,16 @@ async function handleSignal(
     durableBlockingRun?.runId,
   );
   if (policyRefusal) return policyRefusal;
-  if (resourceId === undefined) {
-    // Active-only target: no idle branch available without a resourceId.
-    const runId = crypto.randomUUID();
-    if (!isPathSafeId(runId)) {
-      throw new Error('thread signal generated a non-path-safe run id');
-    }
-    await options.proof?.check();
-    options.proof?.assertActive();
-    const result = agent.sendSignal(signal, {
-      threadId,
-      runId,
-      ifActive: { behavior: deliveredActiveBehavior },
-    });
-    const decision = await result.accepted;
-    return json({ decision, signalId: result.signal.id });
-  }
+  const effectiveActiveBehavior = activeBehaviorForRun(
+    activeBehavior,
+    durableBlockingRun,
+  );
+  const activePersistenceForbidden =
+    effectiveActiveBehavior === 'persist' && !options.persistenceAllowed;
+  const deliveredActiveBehavior = deliverableActiveBehavior(
+    effectiveActiveBehavior,
+    options.persistenceAllowed,
+  );
   const behavior = requestedIdle(body);
   if (behavior === 'wake') {
     return handleWake({
@@ -2399,13 +2548,13 @@ async function handleSignal(
       persistenceAllowed: options.persistenceAllowed,
       memoryAvailable: options.memoryAvailable,
       signal,
-      activeDiscardAllowed: activeBehavior === 'discard',
-      deliverActive: (runId, activeMemoryAvailable) =>
+      activeBehavior,
+      deliverActive: (runId, activeMemoryAvailable, resolvedActiveBehavior) =>
         agent.sendSignal(signal, {
           runId,
           threadId,
           resourceId,
-          ifActive: { behavior: deliveredActiveBehavior },
+          ifActive: { behavior: resolvedActiveBehavior },
           ifIdle: {
             behavior:
               activeMemoryAvailable && options.persistenceAllowed
@@ -2425,19 +2574,32 @@ async function handleSignal(
   if (behavior === 'persist' && !options.persistenceAllowed) {
     return persistenceForbiddenResponse({ capped: false });
   }
-  const memoryAvailable = await options.memoryAvailable();
-  const wasActive =
-    activeThreadRunIdOf(agent, threadId, resourceId) !== undefined;
-  await options.proof?.check();
-  options.proof?.assertActive();
-  const result = agent.sendSignal(signal, {
-    threadId,
-    resourceId,
-    ifActive: { behavior: deliveredActiveBehavior },
-    ifIdle: { behavior: memoryAvailable ? behavior : 'discard' },
-  });
-  const decision = await result.accepted;
-  if (result.persisted) await result.persisted;
+  const sent = await sendWithoutWake(
+    agent,
+    (sendOptions) => agent.sendSignal(signal, sendOptions),
+    {
+      threadId,
+      resourceId,
+      ifActive: deliveredActiveBehavior,
+      ifIdle: behavior,
+    },
+    options,
+  );
+  return noWakeResponse(
+    sent,
+    behavior,
+    deliveredActiveBehavior,
+    activePersistenceForbidden,
+  );
+}
+
+function noWakeResponse(
+  sent: Awaited<ReturnType<typeof sendWithoutWake>>,
+  behavior: Exclude<IdleBehavior, 'wake'>,
+  deliveredActiveBehavior: ActiveBehavior,
+  activePersistenceForbidden: boolean,
+): Response {
+  const { decision, signal, wasActive, memoryAvailable } = sent;
   const action = recordValue(decision)?.action;
   if (action === 'persist' && !memoryAvailable) {
     return memoryUnavailableResponse();
@@ -2458,8 +2620,51 @@ async function handleSignal(
   return json({
     decision,
     capped: false,
-    signalId: result.signal.id,
+    signalId: signal.id,
   });
+}
+
+/**
+ * Send a signal or message that never wakes a run, behind the proof gate.
+ * Without agent memory the idle behavior becomes `discard`, because core's
+ * idle persist reports `persist` even when no memory wrote the signal.
+ */
+async function sendWithoutWake(
+  agent: Agent,
+  send: (sendOptions: {
+    threadId: string;
+    resourceId: string;
+    ifActive: { behavior: ActiveBehavior };
+    ifIdle: { behavior: Exclude<IdleBehavior, 'wake'> };
+  }) => WakeDelivery,
+  target: {
+    threadId: string;
+    resourceId: string;
+    ifActive: ActiveBehavior;
+    ifIdle: Exclude<IdleBehavior, 'wake'>;
+  },
+  options: { memoryAvailable: MemoryAvailable; proof?: SignalProofGuard },
+): Promise<{
+  decision: unknown;
+  signal: { id: string };
+  wasActive: boolean;
+  memoryAvailable: boolean;
+}> {
+  const memoryAvailable = await options.memoryAvailable();
+  const wasActive =
+    activeThreadRunIdOf(agent, target.threadId, target.resourceId) !==
+    undefined;
+  await options.proof?.check();
+  options.proof?.assertActive();
+  const result = send({
+    threadId: target.threadId,
+    resourceId: target.resourceId,
+    ifActive: { behavior: target.ifActive },
+    ifIdle: { behavior: memoryAvailable ? target.ifIdle : 'discard' },
+  });
+  const decision = await result.accepted;
+  if (result.persisted) await result.persisted;
+  return { decision, signal: result.signal, wasActive, memoryAvailable };
 }
 
 async function handleState(
@@ -2555,6 +2760,37 @@ async function handleState(
   });
 }
 
+function hasDueTime(row: NotificationRecord): boolean {
+  return row.deliverAt !== undefined || row.summaryAt !== undefined;
+}
+
+async function matchingPendingNotifications(
+  storage: NotificationsStorage,
+  notification: SendNotificationSignalInput,
+  threadId: string,
+  resourceId: string,
+  agentId: string,
+): Promise<NotificationRecord[]> {
+  if (!notification.dedupeKey && !notification.coalesceKey) return [];
+  const pending = await storage.listNotifications({
+    threadId,
+    status: 'pending',
+    source: notification.source,
+    agentId,
+    resourceId,
+  });
+  // Storage coalesces into a pending row with the same source, kind, agent,
+  // resource and key. D1 can match an empty key when the other key is truthy.
+  return pending.filter(
+    (row) =>
+      row.kind === notification.kind &&
+      ((notification.dedupeKey !== undefined &&
+        row.dedupeKey === notification.dedupeKey) ||
+        (notification.coalesceKey !== undefined &&
+          row.coalesceKey === notification.coalesceKey)),
+  );
+}
+
 async function handleNotification(
   agent: Agent,
   body: Record<string, unknown>,
@@ -2564,9 +2800,13 @@ async function handleNotification(
     | (() => NotificationsStorage | Promise<NotificationsStorage>)
     | undefined,
   options: {
+    principal: ExecutionPrincipal;
+    blockingRun: BlockingRunResolver | undefined;
     persistenceAllowed: boolean;
     runtimeDriven: boolean;
+    memoryAvailable: MemoryAvailable;
     inspectContent: InspectSignalContent | undefined;
+    notificationDispatchAllowed?: () => boolean | Promise<boolean>;
     proof?: SignalProofGuard;
   },
 ): Promise<Response> {
@@ -2597,33 +2837,40 @@ async function handleNotification(
       : {}),
     ...(isAttributes(body.attributes) ? { attributes: body.attributes } : {}),
   };
-  // Owners use core's delivery policy. The inbox row is the durable artifact,
-  // so this route has no memory gate: without agent memory, a model-visible
-  // persist is best-effort and the row stays pending. Non-owner notifications
-  // are record-only here: the host's createNotificationDispatchTick delivers
-  // them later (agent-starter runs it every 60 seconds). A host without that
-  // tick records but never delivers them; the spike intentionally has no tick
-  // and its provider probes assert only the inbox row. This branch bypasses an
-  // agent-level notifications.deliveryPolicy and
-  // __ensureNotificationDispatchReady; branded hosts cannot reach either seam
-  // through the wrapped agent anyway.
   // The target requires a resourceId because the inbox is keyed by its owner.
-  // Core's default policy does not summarize an idle thread immediately. A
-  // medium-priority delivery can sample active, then fall idle across its
-  // awaits. For a branded runner the resulting forced wake reaches the terminal
-  // refusal path while the created record stays pending with its summary signal
-  // id. An unbranded agent keeps core's own below-boundary run start; no shipped
-  // host uses that degraded configuration.
   if (resourceId === undefined) {
     return json(
       { error: 'this thread has no resourceId wired; notifications need one' },
       409,
     );
   }
-  // This gate is AUTHORITATIVE, not a preview: core can send an individual or
-  // summary signal before the record reaches the dispatcher's second gate.
-  // Storage owns the id, timestamps, and coalescing, so inspect a prospective
-  // record carrying every untrusted model-visible field instead.
+  // An owner's notification to a runtime-driven agent is recorded, then
+  // delivered at ingestion under the owner's principal: into the owner's
+  // running run, otherwise persisted to memory. It never wakes a run, and its
+  // row is never due, so the dispatcher, whose deliveries and wakes belong to
+  // the dispatch principal, never selects it. Core's sendNotificationSignal
+  // cannot serve it: its in-process delivery reads the notifications store
+  // from the agent's own Mastra, and the FlowSafe wrapper is registered on
+  // none. The branch keys on the brand rather than on Mastra registration
+  // because a registered wrapper still carries no delivery policy (see
+  // "DurableAgent does not forward the wrapped Agent's `notifications`" in
+  // agent-runner/durable-agent-runner.ts).
+  if (options.persistenceAllowed && options.runtimeDriven) {
+    return handleOwnerNotification(
+      agent,
+      notification,
+      threadId,
+      resourceId,
+      resolveNotificationsStorage,
+      options,
+    );
+  }
+  // On core's delivery path this gate is AUTHORITATIVE, not a preview: core can
+  // send an individual or summary signal before the record reaches the
+  // dispatcher's second gate. On the record-only branch it refuses the row
+  // before it is written. Storage owns the id, timestamps, and coalescing, so
+  // inspect a prospective record carrying every untrusted model-visible field
+  // instead.
   if (options.inspectContent) {
     const prospectiveRecord: NotificationRecord = {
       id: 'prospective',
@@ -2642,11 +2889,11 @@ async function handleNotification(
       createdAt: new Date(0),
       updatedAt: new Date(0),
     };
-    // Core picks between two renderings after an async boundary this route does
-    // not control, so inspect both — the same reason the schedule route inspects
-    // both delivery branches. The individual signal renders `status="delivered"`
-    // because that is the status core stamps on it when it sends; the summary
-    // renders from the row as stored, which is why it keeps `status:'pending'`.
+    // Core's delivery policy, or the dispatcher on a later tick, picks between
+    // two renderings, so inspect both. The individual signal renders
+    // `status="delivered"` because that is the status its sender stamps on it;
+    // the summary renders from the row as stored, which is why it keeps
+    // `status:'pending'`.
     for (const candidate of [
       createNotificationSignal({ ...prospectiveRecord, status: 'delivered' }),
       createNotificationSummarySignal(
@@ -2660,10 +2907,35 @@ async function handleNotification(
       if (policyRefusal) return policyRefusal;
     }
   }
+  // A non-owner's notification is record-only for any agent: the row is due
+  // now, and the host's createNotificationDispatchTick delivers it as the
+  // dispatch principal. A host without that tick records it but never
+  // delivers it. The record-only branch bypasses an agent-level
+  // notifications.deliveryPolicy and __ensureNotificationDispatchReady.
   if (!options.persistenceAllowed) {
     const storage = await resolveNotificationsStorage?.();
     if (!storage) {
       return json({ error: 'notifications storage unavailable' }, 409);
+    }
+    if (
+      options.notificationDispatchAllowed &&
+      !(await options.notificationDispatchAllowed())
+    ) {
+      return ownerNotificationRefusal('notification-dispatch-forbidden');
+    }
+    // Owner residue cannot become due under the dispatch principal.
+    if (
+      (
+        await matchingPendingNotifications(
+          storage,
+          notification,
+          threadId,
+          resourceId,
+          agent.id,
+        )
+      ).some((row) => !hasDueTime(row))
+    ) {
+      return ownerNotificationRefusal('notification-pending');
     }
     await options.proof?.check();
     options.proof?.assertActive();
@@ -2679,25 +2951,191 @@ async function handleNotification(
       delivery: { action: 'deferred', reason: 'dispatcher' },
     });
   }
+  // An unbranded agent's owner notification uses core's delivery policy, whose
+  // summary wake override can start a run below this boundary, outside
+  // RunnerRuntime, the host entry gate and the run cap (@mastra/core 1.67.0,
+  // agent-Dk0N0Nlg.js:38431, :38447). The inbox row is the durable artifact, so
+  // that path has no memory gate: without agent memory, a model-visible
+  // persist is best-effort and the row stays pending.
+  const notificationsStore = await agent
+    .getMastraInstance?.()
+    ?.getStorage()
+    ?.getStore('notifications');
+  if (!notificationsStore) {
+    return json({ error: 'notifications storage unavailable' }, 409);
+  }
   await options.proof?.check();
   options.proof?.assertActive();
   const result = await agent.sendNotificationSignal(notification, {
     threadId,
     resourceId,
-    ...(!options.runtimeDriven
-      ? { ifActive: { behavior: 'persist' as const } }
-      : {}),
+    ifActive: { behavior: 'persist' },
     ifIdle: { behavior: 'persist' },
   });
   if (result.persisted) await result.persisted;
   const response: {
     record: typeof result;
     delivery?: Awaited<NonNullable<typeof result.accepted>>;
-    degraded?: RouteDegradation;
+    degraded: RouteDegradation;
   } = {
     record: result,
-    ...(!options.runtimeDriven ? { degraded: 'not-runtime-driven' } : {}),
+    degraded: 'not-runtime-driven',
   };
   if (result.accepted) response.delivery = await result.accepted;
   return json(response);
+}
+
+async function handleOwnerNotification(
+  agent: Agent,
+  notification: SendNotificationSignalInput,
+  threadId: string,
+  resourceId: string,
+  resolveNotificationsStorage:
+    | (() => NotificationsStorage | Promise<NotificationsStorage>)
+    | undefined,
+  options: {
+    principal: ExecutionPrincipal;
+    blockingRun: BlockingRunResolver | undefined;
+    memoryAvailable: MemoryAvailable;
+    inspectContent: InspectSignalContent | undefined;
+    proof?: SignalProofGuard;
+  },
+): Promise<Response> {
+  const durableBlockingRun = await options.blockingRun?.();
+  if (
+    durableBlockingRun &&
+    !samePrincipal(durableBlockingRun.principal, options.principal)
+  ) {
+    return notificationPrincipalMismatchResponse(durableBlockingRun.runId);
+  }
+  const ifActive = activeBehaviorForRun('deliver', durableBlockingRun);
+  const memoryAvailable = await options.memoryAvailable();
+  if (
+    !memoryAvailable &&
+    (ifActive === 'persist' ||
+      activeThreadRunIdOf(agent, threadId, resourceId) === undefined)
+  ) {
+    return ownerNotificationRefusal('memory-unavailable');
+  }
+  const storage = await resolveNotificationsStorage?.();
+  if (!storage) {
+    return json({ error: 'notifications storage unavailable' }, 409);
+  }
+  if (
+    (
+      await matchingPendingNotifications(
+        storage,
+        notification,
+        threadId,
+        resourceId,
+        agent.id,
+      )
+    ).some(hasDueTime)
+  ) {
+    return ownerNotificationRefusal('notification-pending');
+  }
+  await options.proof?.check();
+  options.proof?.assertActive();
+  // No deliverAt or summaryAt, so no dispatch pass ever selects the row.
+  const stored = await storage.createNotification({
+    ...notification,
+    id: crypto.randomUUID(),
+    threadId,
+    resourceId,
+    agentId: agent.id,
+  });
+  const now = new Date();
+  let settled = false;
+  let accepted:
+    | { signalId: string; delivery: Record<string, unknown> }
+    | undefined;
+  // Every settle write passes the proof gate first. When the gate refuses, the
+  // row stays pending with no due time rather than bypass it.
+  const settle = async (
+    patch: Pick<
+      UpdateNotificationInput,
+      'status' | 'deliveredSignalId' | 'deliveryReason'
+    >,
+  ): Promise<NotificationRecord> => {
+    await options.proof?.check();
+    options.proof?.assertActive();
+    const record = await storage.updateNotification({
+      ...patch,
+      id: stored.id,
+      threadId: stored.threadId,
+      lastDeliveryAttemptAt: now,
+    });
+    settled = true;
+    return record;
+  };
+  try {
+    // Built from the stored row, which a coalesce may have merged, so the
+    // policy inspects exactly the signal that is sent.
+    const signal = createNotificationSignal({
+      ...stored,
+      status: 'delivered',
+      deliveredAt: now,
+    });
+    const inspection = options.inspectContent
+      ? await options.inspectContent(signal, durableBlockingRun?.runId)
+      : 'allowed';
+    if (inspection !== 'allowed') {
+      await settle({
+        status: 'discarded',
+        deliveryReason:
+          inspection === 'denied'
+            ? 'content-policy-denied'
+            : 'content-policy-error',
+      });
+      return signalContentPolicyResponse(inspection);
+    }
+    const sent = await sendWithoutWake(
+      agent,
+      (sendOptions) => agent.sendSignal(signal, sendOptions),
+      { threadId, resourceId, ifActive, ifIdle: 'persist' },
+      options,
+    );
+    const decision = recordValue(sent.decision);
+    const action = decision?.action;
+    if (
+      action === 'deliver' ||
+      (action === 'persist' && sent.memoryAvailable)
+    ) {
+      accepted = {
+        signalId: sent.signal.id,
+        delivery: { ...decision, signalId: sent.signal.id },
+      };
+      const record = await settle({
+        status: 'delivered',
+        deliveredSignalId: accepted.signalId,
+      });
+      return json({ record, delivery: accepted.delivery });
+    }
+    const cause =
+      (action === 'persist' || action === 'discard') && !sent.memoryAvailable
+        ? 'memory-unavailable'
+        : action === 'blocked'
+          ? 'thread-blocked'
+          : 'delivery-failed';
+    await settle({ status: 'discarded', deliveryReason: cause });
+    if (cause === 'delivery-failed') {
+      throw new Error(
+        `owner notification was not delivered (${String(action ?? 'unknown')})`,
+      );
+    }
+    return ownerNotificationRefusal(cause);
+  } catch (error) {
+    if (isExecutionFenceRefusal(error)) throw error;
+    if (accepted !== undefined) {
+      const record = await settle({
+        status: 'delivered',
+        deliveredSignalId: accepted.signalId,
+      });
+      return json({ record, delivery: accepted.delivery });
+    }
+    if (!settled) {
+      await settle({ status: 'discarded', deliveryReason: 'delivery-failed' });
+    }
+    throw error;
+  }
 }

@@ -13,7 +13,10 @@ import { describe, expect, it } from 'vitest';
 import { AuditLogger } from '../audit/index.js';
 import { HIGH_ENTROPY_CANDIDATE_RE } from './content-inspection.js';
 import {
+  type ClassifierPolicyOptions,
   classifierPolicy,
+  type PiiSecretsDetectorId,
+  type PiiSecretsOptions,
   type PolicyContext,
   PolicyEngine,
   piiSecrets,
@@ -21,6 +24,20 @@ import {
 import type { PolicyDecision } from './tool-policy.js';
 
 class Tripwire extends Error {}
+
+// A real array whose own container methods and iterator answer with
+// `answer`, never with its indexed entries.
+function answeringList<T>(entries: readonly T[], answer: readonly unknown[]) {
+  return Object.assign([...entries], {
+    map: () => [...answer],
+    some: () => answer.length > 0,
+    every: () => true,
+    includes: () => answer.length > 0,
+    [Symbol.iterator]: function* () {
+      yield* answer;
+    },
+  }) as T[];
+}
 
 function abortThrowing(reason?: string): never {
   throw new Tripwire(reason ?? 'aborted');
@@ -500,6 +517,75 @@ describe('piiSecrets', () => {
         reason: expect.stringContaining('highEntropy'),
       });
     });
+
+    // Every character of the candidate class once: the highest entropy a
+    // candidate can reach.
+    const everyCandidateCharacter =
+      'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/_=-';
+    // The entropy the detector computes for that candidate. log2(67) rounds a
+    // few units in the last place above it.
+    const maxEntropy = 6.066089190457767;
+
+    it.each<[string, unknown, string]>([
+      ["the string 'high'", 'high', '"high"'],
+      ["the string '4.5', without coercing it", '4.5', '"4.5"'],
+      ['a plain object', {}, 'object'],
+      ['NaN', Number.NaN, 'NaN'],
+      ['Infinity', Number.POSITIVE_INFINITY, 'Infinity'],
+      [
+        'log2(67), which the computed entropy never reaches',
+        Math.log2(67),
+        String(Math.log2(67)),
+      ],
+      ['a value just above log2(67)', 6.0661, '6.0661'],
+      ['7', 7, '7'],
+      ['0', 0, '0'],
+      ['a negative number', -1, '-1'],
+      ['false', false, 'boolean'],
+    ])('refuses %s as entropyThreshold', (_label, entropyThreshold, got) => {
+      // #when / #then — above the maximum the detector never fires
+      expect(() =>
+        piiSecrets({ entropyThreshold: entropyThreshold as number }),
+      ).toThrow(
+        new TypeError(
+          `piiSecrets: entropyThreshold must be a number greater than 0 and at most ${maxEntropy} (got ${got})`,
+        ),
+      );
+    });
+
+    it('detects the every-character candidate at the maximum accepted threshold', async () => {
+      // #given
+      const evaluator = piiSecrets({
+        detectors: ['highEntropy'],
+        entropyThreshold: maxEntropy,
+      });
+      // #when
+      const decision = await evaluator.evaluate(
+        context({ text: `token ${everyCandidateCharacter} end` }),
+      );
+      // #then
+      expect(decision).toMatchObject({
+        allowed: false,
+        reason: expect.stringContaining('highEntropy'),
+      });
+    });
+
+    it('detects the every-character candidate at a threshold near the maximum', async () => {
+      // #given
+      const evaluator = piiSecrets({
+        detectors: ['highEntropy'],
+        entropyThreshold: 6,
+      });
+      // #when
+      const decision = await evaluator.evaluate(
+        context({ text: everyCandidateCharacter }),
+      );
+      // #then
+      expect(decision).toMatchObject({
+        allowed: false,
+        reason: expect.stringContaining('highEntropy'),
+      });
+    });
   });
 
   describe('allowlist', () => {
@@ -568,6 +654,141 @@ describe('piiSecrets', () => {
       expect(first).toEqual({ allowed: true });
       expect(second).toEqual({ allowed: true });
     });
+
+    it.each<[string, unknown, string]>([
+      ['an object with its own test', { test: () => true }, 'object'],
+      [
+        'an object with its own exec',
+        { exec: () => Object.assign([''], { index: 0, input: '' }) },
+        'object',
+      ],
+      [
+        'a RegExp-tagged object',
+        {
+          [Symbol.toStringTag]: 'RegExp',
+          test: () => true,
+          source: '.',
+          flags: '',
+        },
+        'object',
+      ],
+      [
+        'an object whose prototype is RegExp.prototype',
+        Object.create(RegExp.prototype),
+        'object',
+      ],
+      [
+        'RegExp.prototype, whose copy matches everything',
+        RegExp.prototype,
+        'object',
+      ],
+      ['a String object', new String('support@example.com'), 'object'],
+      ['null', null, 'null'],
+    ])('refuses %s as an allowlist entry', (_label, entry, got) => {
+      // #when / #then — an allowlist entry that answers true exempts every match
+      expect(() =>
+        piiSecrets({
+          detectors: ['email'],
+          allowlist: ['support@example.com', entry as string],
+        }),
+      ).toThrow(
+        new TypeError(
+          `piiSecrets: allowlist entry 1 must be a string or a RegExp (got ${got})`,
+        ),
+      );
+    });
+
+    it('refuses an allowlist that is not an array', () => {
+      // #when / #then
+      expect(() =>
+        piiSecrets({
+          detectors: ['email'],
+          allowlist: 'support@example.com' as unknown as string[],
+        }),
+      ).toThrow(new TypeError('piiSecrets: allowlist must be an array'));
+    });
+
+    it.each<[string, () => RegExp]>([
+      ['its own test', () => Object.assign(/^support@/, { test: () => true })],
+      [
+        'its own exec',
+        () =>
+          Object.assign(/^support@/, {
+            exec: () => Object.assign([''], { index: 0, input: '' }),
+          }),
+      ],
+    ])('exempts by the RegExp it copied, not by %s', async (_label, entry) => {
+      // #given
+      const evaluator = piiSecrets({
+        detectors: ['email'],
+        allowlist: [entry()],
+      });
+      // #when / #then — only the copied pattern decides the exemption
+      expect(
+        await evaluator.evaluate(context({ text: 'mail other@example.com' })),
+      ).toMatchObject({ allowed: false });
+    });
+
+    it('keeps its copy when test is assigned to the caller RegExp after construction', async () => {
+      // #given
+      const entry = /^support@/;
+      const evaluator = piiSecrets({
+        detectors: ['email'],
+        allowlist: [entry],
+      });
+      entry.test = () => true;
+      // #when / #then
+      expect(
+        await evaluator.evaluate(context({ text: 'mail other@example.com' })),
+      ).toMatchObject({ allowed: false });
+    });
+
+    it('exempts from the entries it read by index, not the list its own map answers', async () => {
+      // #given — own map answers with an entry that exempts everything
+      const allowlist = answeringList(['support@example.com'], [/./]);
+      const evaluator = piiSecrets({ detectors: ['email'], allowlist });
+      // #when / #then
+      expect(
+        await evaluator.evaluate(context({ text: 'mail other@example.com' })),
+      ).toMatchObject({ allowed: false });
+    });
+  });
+
+  describe('detectors', () => {
+    it.each<[string, unknown, string]>([
+      ['an empty list', [], 'piiSecrets: detectors must not be empty'],
+      ['a string', 'email', 'piiSecrets: detectors must be an array'],
+      [
+        "the inherited name 'constructor'",
+        ['constructor'],
+        'piiSecrets: detectors entry 0 must be a PII_SECRETS_DETECTOR_IDS member (got "constructor")',
+      ],
+      [
+        'an unknown id',
+        ['email', 'Email'],
+        'piiSecrets: detectors entry 1 must be a PII_SECRETS_DETECTOR_IDS member (got "Email")',
+      ],
+      [
+        'a String object',
+        [new String('email')],
+        'piiSecrets: detectors entry 0 must be a PII_SECRETS_DETECTOR_IDS member (got object)',
+      ],
+    ])('refuses %s', (_label, detectors, message) => {
+      // #when / #then — a detector list that selects nothing never denies
+      expect(() =>
+        piiSecrets({ detectors: detectors as PiiSecretsDetectorId[] }),
+      ).toThrow(new TypeError(message));
+    });
+
+    it('runs the detectors it read by index, not the list its own map answers', async () => {
+      // #given — own map and iterator answer with no detector
+      const detectors = answeringList<PiiSecretsDetectorId>(['email'], []);
+      const evaluator = piiSecrets({ detectors });
+      // #when / #then
+      expect(
+        await evaluator.evaluate(context({ text: 'mail other@example.com' })),
+      ).toMatchObject({ allowed: false });
+    });
   });
 
   describe('reason format', () => {
@@ -618,6 +839,55 @@ describe('piiSecrets', () => {
       expect(
         piiSecrets({ detectors: ['ssn'], holdBackChars: 999 }).holdBackChars,
       ).toBe(999);
+    });
+
+    it.each<[string, unknown, string]>([
+      ['an empty string', '', '""'],
+      ['an empty list', [], 'object'],
+      ['false', false, 'boolean'],
+      ['a negative number', -1, '-1'],
+    ])('refuses %s as holdBackChars, which would release text unseen', (_label, holdBackChars, got) => {
+      // #when / #then
+      expect(() =>
+        piiSecrets({ holdBackChars: holdBackChars as number }),
+      ).toThrow(
+        new TypeError(
+          `piiSecrets: holdBackChars must be a number of at least 0, or Infinity (got ${got})`,
+        ),
+      );
+    });
+  });
+
+  describe('options', () => {
+    it.each<[string, unknown]>([
+      ['entropythreshold', 4],
+      ['channel', ['reasoning']],
+    ])('refuses the misspelled option %s', (key, value) => {
+      // #when / #then — a misspelled option would fall to its default
+      expect(() => piiSecrets({ [key]: value } as PiiSecretsOptions)).toThrow(
+        new TypeError(
+          `piiSecrets: options has unknown field ${JSON.stringify(key)} (valid fields: name, detectors, allowlist, entropyThreshold, phases, channels, holdBackChars)`,
+        ),
+      );
+    });
+
+    it('constructs with every declared option', () => {
+      // #given — the Required type fails to compile while a declared option is
+      // missing here
+      const options: Required<PiiSecretsOptions> = {
+        name: 'pii',
+        detectors: ['highEntropy'],
+        allowlist: ['build2024ReleaseCandidate7x'],
+        entropyThreshold: 4,
+        phases: ['output'],
+        channels: ['answer'],
+        holdBackChars: 300,
+      };
+      // #when / #then
+      expect(piiSecrets(options)).toMatchObject({
+        name: 'pii',
+        holdBackChars: 300,
+      });
     });
   });
 
@@ -709,6 +979,67 @@ describe('classifierPolicy', () => {
       expect(
         classifierPolicy({ classify: () => ({ allowed: true }) }).channels,
       ).toEqual(['answer']);
+    });
+  });
+
+  describe('options', () => {
+    const allow = () => ({ allowed: true }) as const;
+
+    it('refuses a misspelled option, which would fall to the answer-only default', () => {
+      // #when / #then
+      expect(() =>
+        classifierPolicy({
+          classify: allow,
+          channel: ['reasoning'],
+        } as ClassifierPolicyOptions),
+      ).toThrow(
+        new TypeError(
+          'classifierPolicy: options has unknown field "channel" (valid fields: name, classify, phases, channels, evaluateEveryChars, timeoutMs)',
+        ),
+      );
+    });
+
+    it('constructs with every declared option', () => {
+      // #given — the Required type fails to compile while a declared option is
+      // missing here
+      const options: Required<ClassifierPolicyOptions> = {
+        name: 'moderation',
+        classify: allow,
+        phases: ['output'],
+        channels: ['answer', 'reasoning'],
+        evaluateEveryChars: 64,
+        timeoutMs: 1_000,
+      };
+      // #when / #then
+      expect(classifierPolicy(options)).toMatchObject({
+        name: 'moderation',
+        channels: ['answer', 'reasoning'],
+      });
+    });
+
+    it.each<[string, unknown, string]>([
+      [
+        'Infinity, which never classifies a stream',
+        Number.POSITIVE_INFINITY,
+        'Infinity',
+      ],
+      ['0', 0, '0'],
+      ['a negative number', -1, '-1'],
+      ['a fraction', 1.5, '1.5'],
+      ['NaN', Number.NaN, 'NaN'],
+      ['a numeric string', '512', '"512"'],
+    ])('refuses %s as evaluateEveryChars', (_label, evaluateEveryChars, got) => {
+      // #when / #then
+      expect(() =>
+        classifierPolicy({
+          classify: allow,
+          evaluateEveryChars: evaluateEveryChars as number,
+        }),
+      ).toThrow(
+        new TypeError(
+          `classifierPolicy: evaluateEveryChars must be a positive safe integer (got ${got})`,
+        ),
+      );
     });
   });
 
@@ -932,5 +1263,59 @@ describe('classifierPolicy', () => {
       // an unhandled rejection here would surface as a process warning
       await new Promise((resolve) => setTimeout(resolve, 30));
     });
+  });
+});
+
+describe('content evaluator text', () => {
+  const SECRET = 'contact john.doe@example.com now';
+
+  it.each<[string, unknown, string]>([
+    ['an undefined text', undefined, 'undefined'],
+    ['an object text', { format: 2, parts: [SECRET] }, 'object'],
+    ['a text list', [SECRET], 'object'],
+  ])('piiSecrets refuses %s', async (_label, text, got) => {
+    // #given
+    const evaluator = piiSecrets();
+
+    // #when / #then
+    await expect(async () =>
+      evaluator.evaluate(context({ text: text as string })),
+    ).rejects.toThrow(
+      new TypeError(`piiSecrets: text must be a string (got ${got})`),
+    );
+  });
+
+  it('classifierPolicy refuses a non-string text before calling classify', async () => {
+    // #given
+    const seen: unknown[] = [];
+    const evaluator = classifierPolicy({
+      classify: (text) => {
+        seen.push(text);
+        return { allowed: true };
+      },
+    });
+
+    // #when / #then
+    await expect(async () =>
+      evaluator.evaluate(context({ text: [SECRET] as unknown as string })),
+    ).rejects.toThrow(
+      new TypeError('classifierPolicy: text must be a string (got object)'),
+    );
+    expect(seen).toEqual([]);
+  });
+
+  it('still denies the string text', async () => {
+    // #when / #then
+    expect(
+      await piiSecrets().evaluate(context({ text: SECRET })),
+    ).toMatchObject({ allowed: false });
+    expect(
+      await classifierPolicy({
+        classify: (text) =>
+          text.includes('john.doe')
+            ? { allowed: false, reason: 'pii' }
+            : { allowed: true },
+      }).evaluate(context({ text: SECRET })),
+    ).toMatchObject({ allowed: false });
   });
 });

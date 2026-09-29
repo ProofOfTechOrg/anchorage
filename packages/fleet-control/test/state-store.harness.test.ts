@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import { fileURLToPath } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   createTestHarness,
@@ -14,11 +15,10 @@ import {
   fleetInventoryOptionsDigest,
 } from '../src/fleet-inventory-state.js';
 
-const ROOT = new URL('..', import.meta.url).pathname;
-const PROBE = new URL(
-  './fixtures/fleet-state-harness-probe.ts',
-  import.meta.url,
-).pathname;
+const ROOT = fileURLToPath(new URL('..', import.meta.url));
+const PROBE = fileURLToPath(
+  new URL('./fixtures/fleet-state-harness-probe.ts', import.meta.url),
+);
 
 interface ProbeError {
   readonly name: string;
@@ -331,7 +331,7 @@ describe.sequential('D1FleetStateStore Wrangler harness', {
     expect(result.contenderRejected).toBe(true);
   });
 
-  it('allows DB-expired takeover and fences every stale state mutation', async () => {
+  it('allows DB-expired takeover and fences stale state mutations', async () => {
     const result = await probe<{
       stalePut: ProbeError;
       staleDelete: ProbeError;
@@ -1291,7 +1291,7 @@ describe.sequential('D1FleetStateStore Wrangler harness', {
     });
   });
 
-  it('preserves operation, heartbeat, and release errors for both lease types', async () => {
+  it('preserves operation, heartbeat, and release errors', async () => {
     const result = await probe<{
       deployment: ProbeError;
       platform: ProbeError;
@@ -2075,7 +2075,7 @@ describe.sequential('D1FleetStateStore Wrangler harness', {
     expect(result.historical.released).toEqual(requiresPin);
   });
 
-  it('admits one commit writer and converges the rest under concurrent batches', async () => {
+  it('admits one commit writer and conflicts the rest under concurrent batches', async () => {
     const result = await probe<{
       committed: number;
       converged: number;
@@ -2376,7 +2376,7 @@ describe.sequential('D1FleetStateStore Wrangler harness', {
     expect(result.leasesAfterRelease).toBe(0);
   });
 
-  it('initializes the six inventory tables under concurrent first reads on fresh D1 storage', async () => {
+  it('initializes the inventory tables under concurrent first reads on fresh D1 storage', async () => {
     await server.reset();
     worker = server.getWorker();
 
@@ -2748,7 +2748,7 @@ describe.sequential('D1FleetStateStore Wrangler harness', {
     });
   });
 
-  it('four-table cold+concurrent schema init', async () => {
+  it('cold+concurrent schema init', async () => {
     await server.reset();
     worker = server.getWorker();
     const result = await probe<{

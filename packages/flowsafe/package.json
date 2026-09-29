@@ -1,6 +1,6 @@
 {
   "name": "@proofoftech/flowsafe",
-  "version": "0.22.0",
+  "version": "0.23.0",
   "publishConfig": {
     "access": "public"
   },
@@ -75,10 +75,16 @@
     "test:watch": "vitest",
     "example:gtm": "vitest run examples/gtm-outbound.e2e.test.ts",
     "lint": "pnpm -w exec biome check packages/flowsafe",
-    "typecheck": "tsc -p tsconfig.test.json && tsc -p src/approval-ui/tsconfig.json --noEmit && tsc -p src/approval-ui/tsconfig.test.json && tsc -p spike/tsconfig.json && tsc -p deploy/tsconfig.json",
+    "typecheck": "pnpm run typecheck:test && pnpm run typecheck:approval-ui && pnpm run typecheck:approval-ui-test && pnpm run typecheck:spike && pnpm run typecheck:deploy",
+    "typecheck:test": "tsc -p tsconfig.test.json",
+    "typecheck:approval-ui": "tsc -p src/approval-ui/tsconfig.json --noEmit",
+    "typecheck:approval-ui-test": "tsc -p src/approval-ui/tsconfig.test.json",
+    "typecheck:spike": "tsc -p spike/tsconfig.json",
+    "typecheck:deploy": "tsc -p deploy/tsconfig.json",
     "typecheck:react18": "tsc -p scripts/react18-probe/tsconfig.json",
     "spike": "wrangler dev --config spike/wrangler.jsonc",
-    "spike:bundle-check": "pnpm --filter @proofoftech/breakwater build && wrangler deploy --dry-run --outdir .wrangler/bundle-check -c spike/wrangler.jsonc",
+    "spike:bundle": "wrangler deploy --dry-run --outdir .wrangler/bundle-check -c spike/wrangler.jsonc",
+    "spike:bundle-check": "pnpm --filter @proofoftech/breakwater build && pnpm run spike:bundle",
     "spike:verify": "node scripts/spike-verify.mjs",
     "spike:verify:llm": "node scripts/spike-verify-llm.mjs",
     "deploy:cf": "wrangler deploy --config deploy/wrangler.jsonc",
@@ -88,7 +94,7 @@
   },
   "peerDependencies": {
     "@mastra/core": "1.67.0",
-    "@proofoftech/breakwater": ">=0.15.0 <1.0.0",
+    "@proofoftech/breakwater": ">=0.16.0 <1.0.0",
     "react": ">=18 <20",
     "react-dom": ">=18 <20"
   },

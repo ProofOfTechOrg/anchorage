@@ -35,7 +35,7 @@ The factory fixes the step budget and tool choice, requires an audit logger, for
 The direct path authorizes before application processors run. Durable preparation lists the same gates in this order:
 
 ```text
-RBAC -> application input -> policy input
+RBAC -> application input -> input assets -> client tool output -> policy input
 model and tools
 application output -> policy output
 ```
@@ -52,8 +52,9 @@ The middleware answers one question:
 > May this actor's exact role begin this agent model turn?
 
 It uses an exact per-agent allowlist. There is no role inheritance. A missing,
-malformed, disallowed, or throwing actor lookup fails closed and can be
-audited.
+malformed, disallowed, or throwing actor lookup, or an undeclared principal
+kind, fails closed on both of Mastra's agent loops: the call is denied and
+an audit logger, when configured, records it.
 
 The middleware and guarded handle do not authenticate a request, choose a physical deployment, authorize an HTTP route, or decide an approval record. Use the authenticated Flowsafe agent host at HTTP and Durable Object boundaries.
 
@@ -67,8 +68,9 @@ The handle is a trusted in-process API. It reduces accidental bypass by hiding r
 - maximum input or output length;
 - PII and secret detection using patterns, entropy checks, Luhn validation,
   allowlists, and streaming windows;
-- a synchronous or asynchronous classifier seam with fail-closed timeout
-  behavior;
+- a synchronous or asynchronous classifier seam whose failure or timeout
+  stops the call at input and in-stream, and at the final result on Mastra's
+  standard loop;
 - answer, reasoning, and structured-object output channels;
 - optional per-segment hold-back so a streaming denial does not release the
   unsafe suffix first.

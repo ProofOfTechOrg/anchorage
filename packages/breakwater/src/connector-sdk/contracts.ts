@@ -3,10 +3,10 @@
 // reaching the barrel that imports them back: manifest, store, policy and
 // connector shapes that cross that edge.
 //
-// A type-only leaf, so the preset, the D1 stores, the key migration and the
-// conformance harness take these declarations without importing the barrel.
-// That need, or a reference from a declaration in this leaf, is the criterion
-// for what moves here; a declaration the barrel alone consumes stays there.
+// A type-only leaf, so a connector-sdk sibling takes these declarations
+// without importing the barrel. That need, or a reference from a declaration
+// in this leaf, is the criterion for what moves here; a declaration the barrel
+// alone consumes stays there.
 //
 // `AuditLogger` arrives from the `../audit/index.js` barrel rather than from a
 // leaf because audit publishes it as a class. The edge is admissible while
@@ -61,15 +61,20 @@ export interface PermissionManifest {
   /**
    * Caller must supply a per-call idempotency key
    * (IDEMPOTENCY_KEY_CONTEXT_KEY in requestContext). Replays of a stored
-   * key return the stored result without re-executing.
+   * key return the stored result without re-executing. A present value must
+   * be a boolean.
    */
   idempotencyKey?: boolean;
-  /** Always require human approval, regardless of org policy. */
+  /**
+   * Always require human approval, regardless of org policy. A present value
+   * must be a boolean.
+   */
   requiresApproval?: boolean;
   /**
    * Connector supports side-effect-free simulation: requires
    * `ConnectorConfig.dryRunExecute`. Callers request a simulation per call
-   * by setting requestContext DRY_RUN_CONTEXT_KEY to true.
+   * by setting requestContext DRY_RUN_CONTEXT_KEY to true. A present value
+   * must be a boolean.
    */
   dryRun?: boolean;
   /**
@@ -81,9 +86,12 @@ export interface PermissionManifest {
    */
   rateLimit?: string;
   /**
-   * Allow Mastra background intent for this connector. The default is
-   * foreground-only. Only a read-only connector may enable this field;
-   * write-class connectors fail at construction.
+   * Allow this connector to run as a Mastra background task and to receive a
+   * `_background` argument. The default is foreground-only: the wrapper
+   * refuses a call Mastra's standard agent loop runs as a background task, and
+   * any call whose arguments carry `_background`. Only a read-only connector
+   * may enable this field; write-class connectors fail at construction. A
+   * present value must be a boolean.
    */
   background?: boolean;
   /**
@@ -218,13 +226,17 @@ export interface RateLimitStore {
 
 /** Org-level policy bindings enforced by the connector's execute wrapper. */
 export interface ConnectorPolicies {
-  /** Organization allowlist applied to the manifest's declared hosts. */
+  /**
+   * Organization allowlist applied to the manifest's declared hosts. A present
+   * value must be an object.
+   */
   networkEgress?: NetworkEgressOptions;
   /** Organization approval rules for write-class connector IDs. */
   writePermissions?: WritePermissionsPolicy;
   /**
    * Custom tool-boundary evaluators, run pre-execute after the built-in
-   * network-egress gate, in registration order.
+   * network-egress gate, in registration order. A present value must be an
+   * array of evaluators, each with a string `name` and an `evaluate` function.
    */
   evaluators?: readonly ToolPolicyEvaluator[];
   /** Store used when the manifest requires an idempotency key. */
@@ -282,8 +294,10 @@ export interface ConnectorRuntime {
 /** Definition compiled by `createConnector()` into an enforced Mastra tool. */
 export interface ConnectorConfig<TInput = unknown, TOutput = unknown> {
   /**
-   * Stable, colon-free connector identifier. The colon restriction keeps the
-   * unchanged `[scope:]connector` rate-budget key injective.
+   * Stable, non-empty connector identifier with no colon, whitespace, or
+   * control or format character. The colon restriction keeps the unchanged
+   * `[scope:]connector` rate-budget key injective; approval patterns follow
+   * the same character rule.
    */
   id: string;
   /** Description presented to the model and tool consumers. */
@@ -327,9 +341,16 @@ export type Connector<TInput = unknown, TOutput = unknown> = Tool<
   execute: NonNullable<Tool<TInput, TOutput>['execute']>;
 };
 
-/** Trusted host context accepted by {@link invokeConnector}. */
+/**
+ * Trusted host context accepted by {@link invokeConnector}. An option this
+ * interface does not declare is refused with
+ * `CONNECTOR_INVOCATION_OPTIONS_INVALID`.
+ */
 export interface ConnectorInvocationOptions {
-  /** Request context carrying trusted policy, identity, and grant values. */
+  /**
+   * Request context carrying trusted policy, identity, and grant values. A
+   * present value must be a Mastra `RequestContext`.
+   */
   requestContext?: RequestContext;
   /** Abort signal forwarded to the connector execution context. */
   abortSignal?: AbortSignal;

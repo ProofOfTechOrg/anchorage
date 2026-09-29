@@ -50,7 +50,7 @@ Connector authors who define Zod schemas should also declare Zod directly:
 npm install zod
 ```
 
-The package supports the root import and six focused subpaths:
+The package supports the root import and these focused subpaths:
 
 ```typescript
 import { PolicyEngine } from '@proofoftech/breakwater';
@@ -67,7 +67,7 @@ import { denyPatterns } from '@proofoftech/breakwater/policy-engine';
 
 ## Guard an agent
 
-Use `createGuardedAgent()` for supported protected agent execution. The factory installs role-based access control (RBAC) before application input processors and policy, then installs policy after application output processors.
+Use `createGuardedAgent()` for supported protected agent execution. The factory installs role-based access control (RBAC) before application input processors, checks input asset URLs before the policy engine, then installs policy after application output processors.
 
 ```typescript
 import { RequestContext } from '@mastra/core/request-context';
@@ -116,15 +116,25 @@ const result = await agent.generate('Summarize the account.', {
 });
 ```
 
-The handle exposes only unstructured `generate()` and `stream()`. Each call requires `requestContext` and may accept only `runId`, `memory`, and `abortSignal`. The factory fixes `maxSteps` and `toolChoice`, forces streaming policy hold-back, disables background continuations, and rejects processor, model, and structured-output overrides.
+The handle exposes only unstructured `generate()` and `stream()`. Each call requires `requestContext` and may accept only `runId`, `memory`, and `abortSignal`. The factory fixes `maxSteps` and `toolChoice`, forces streaming policy hold-back, disables background continuations, and rejects processor, model, and structured-output overrides. It also rejects a configuration field that is neither one of its own options nor a Mastra `AgentConfig` field it keeps, so a misspelled option cannot reach Mastra unread.
+
+A guarded agent refuses any `Memory` a call resolves whose configuration enables thread title generation, including function-valued and inherited memory. It also checks a `Memory` instance at construction. The guarded agent never generates a thread title, including when a host starts the durable loop with call-level `memory.options.generateTitle`. Disable `generateTitle` on the guarded agent's `Memory`: Mastra's title model call bypasses the input and output policies.
+
+The guarded durable loop loads the agent's memory, including thread history, working memory, and semantic recall, as the standard loops do. A memory resolution failure or memory input processor error, such as a failed thread-history read, stops a durable call with `input processor failed` and one `agent.input.processor` error event naming the processor's id (`message-history` for history). On `generate()` and `stream()`, Mastra rejects a memory input processor error and Breakwater writes no audit event.
+
+The guarded `generate()` and `stream()` methods refuse a caller message with `role: 'system'` with a `TypeError`, at the top level or inside the one level of nested list that Mastra flattens, because Mastra would give it instruction authority outside the input policies; put system instructions in the agent's `instructions`. They refuse a list nested deeper than that level too. The input policies read the text Mastra renders into the model prompt from the call's own messages, through Mastra's own message conversion, and every stored model output those messages carry, so a replayed history in the call, including its tool calls, tool results, reasoning and signals, is checked like new input. For a client-only tool with `toModelOutput` and no `execute`, the guarded agent maps each replayed result part after application input processors and the input asset check, so the input policies read the mapped output the model receives. The mapper runs once per result part before the tool's `onOutput` hook. A mapper, tool-resolution, or mapped-output normalization error stops the call with `input processor failed` and one `agent.input.processor` error event whose detail names `breakwater-client-tool-output`. They also read what the agent's application input processors add to the prompt, or change in it, outside the call's messages: each such system message, with the provider options Mastra sends with it, and each such message of another source, such as a memory, context or response message or a history message a processor rewrites through any source, read as the call's messages are. A call the input chain refuses has its input, its response messages, and every other non-system message its application input processors added or changed, the refusing processor's own included, removed from Mastra's message list before it stops. It saves none of them to memory, Mastra's durable loop generates no thread title from them, and on `generate()` and `stream()` the result's `messages` and `rememberedMessages` omit them, a history message such a processor changed included. History that the agent's memory loads into a call, including the tool calls and tool results an earlier guarded call saved, and the agent's instructions are not evaluated unless an application input processor changes them, so check content where it is written to memory or returned by a tool. A caller message that carries a provider option a model adapter bundled with Mastra renders into its request as message content or role, such as any `openaiCompatible` option or an Anthropic document `title`, stops the call before the model. Provider options that replayed responses store as content, such as Anthropic citations, are read; provider metadata such as signatures, cache control and provider-held references like an OpenAI Responses `itemId` is not. A provider-executed tool result that Mastra places in an assistant message is read without the encrypted payload, file reference, base64 document or generated image that the provider returned, such as Anthropic web search's `encryptedContent`, where the root of the result has the shape a model adapter bundled with Mastra stores for that tool. The same field elsewhere in a result is read, such as in the tool definitions of an OpenAI Responses `tool_search` result, which that adapter sends as given when `store` is `false`, and so is the whole of a result that names a Google server-tool call or answers an Anthropic MCP call, which those adapters send on as content. Tool-call ids and binary file and image data are not inspected, and neither is the base64 data of a tool output's content items, which the adapters that send tool output as JSON text send as text. File and image media types and decoded `text/*` payloads, including `data:` URL payloads, are read as text; for `text/*` network URL data, the policies read the URL string, not the downloaded content. The Vercel AI Gateway forwards every provider option to a hosted service whose rendering Breakwater does not know. A caller message whose role, part type or tool-invocation state Breakwater does not classify, or that Mastra's conversion cannot read, stops the call before the model. Provider options given as a call option are outside what the input policies read, and the guarded handle refuses them. The `memory` call option takes only `thread`, a non-empty id or an object whose only field is that id, and `resource`, a non-empty string, and Mastra receives a frozen copy of them; set memory configuration and thread metadata on the agent's `Memory`.
+
+A host that starts a guarded agent's durable loop itself calls `assertNoGuardedSystemMessages()` on the call's messages and `assertAcceptedCallProviderOptions()` on its call-level provider options, as Flowsafe's agent host does. The call-level check accepts only a closed list of generation settings and refuses everything else.
+
+`allowedInputAssetOrigins` lists the `http(s)` origins user file and image parts may name as network URLs, whoever fetches them. The input asset check runs after application input processors and before the policy engine on `generate()`, `stream()`, and the durable loop; it checks the call's input, memory-loaded thread history, and processor additions. URLs inside a client tool's mapped result are not origin-checked; a model provider may fetch them. It refuses other network schemes, URLs with credentials, and origins not listed. An absent or empty list refuses every network URL, while `data:` URLs remain inline data. A refusal stops the call and records an `agent.input.asset` event without the URL. Input the step cannot read stops the call with `input message content is not classified` and one `agent.input.policy` error event, as the policy engine's reading does. A guarded agent that accepts remote file or image URLs, including URLs already stored in thread history, must list their origins. This option is independent of connector egress allowlists.
 
 Under the pinned Mastra version, parsed structured output bypasses the output-processor chain and reaches messages, persistence, and observability hooks before a wrapper could inspect it. Both guarded methods therefore reject `structuredOutput` before model execution. The factory also rejects object-only policies because no supported guarded invocation can expose their required channel. Structured-output support requires a future pre-persistence gate, not a post-generation wrapper.
 
-`allowedRoles` is an exact allowlist with no role hierarchy. Application input processors may implement only `processInput`. Application output processors must implement both `processOutputStream` and `processOutputResult`.
+`allowedRoles` is an exact allowlist with no role hierarchy. Application input processors may implement only `processInput`. The agent applies a processor's return value to the call's message list as Mastra's durable loop applies one, on both loops, so a `role: 'system'` entry in a returned array becomes a system message on `generate()` and `stream()` too. A processor that throws other than through its `abort` or a `TripWire`, returns a value that cannot be applied, adds or changes a system message whose content is not a string or a list of text parts or that holds one of those fields in an accessor, or adds or changes a message that `structuredClone` cannot copy stops the call with the reason `input processor failed` and an `agent.input.processor` error event. What it adds or changes outside the call's input is read by the input policies as described above, so a policy hit on host context a processor adds, or on a system message it edits, the agent's instructions included, refuses the call, and text a processor adds is read even when a later processor removes it. The agent compares the message list before each processor runs with the list once its returned promise settles, so a change the processor makes after that, or content it serves through a Proxy that shows the check other values than Mastra renders, is not read. A processor registered on a Mastra through the agent receives that Mastra, as a Mastra `BaseProcessor` expects. Application output processors must implement both `processOutputStream` and `processOutputResult`.
 
 ### Admit automated callers
 
-`Actor` carries an optional `kind` — `human`, `service`, `agent`, or `system`. An absent `kind` means `human`, so existing hosts are unaffected.
+`Actor` carries an optional `kind` — `human`, `service`, `agent`, or `system`. An absent `kind` means `human`, so existing hosts are unaffected. An actor value with a field other than `id`, `role` and `kind` resolves to no actor and is denied, so a misspelled `kind` cannot read as `human`.
 
 `createGuardedAgent()` and `RBACMiddleware` both accept `allowedPrincipalKinds`, which **defaults to `['human']`**. An agent written before this option denies every automated caller until you widen it:
 
@@ -148,8 +158,11 @@ The narrow handle prevents accidental use of raw Mastra execution methods. It is
 `input` or `output` phase and the output channels they inspect. Construction
 snapshots the policy list, selector arrays, names, hold-back hints, and
 evaluator callable so later replacement cannot change enforcement. Class-based
-evaluators retain their original receiver. Evaluator-owned instance or closure
-state remains application-owned and is not deep-cloned:
+evaluators retain their original receiver, so their instance fields, parameter
+properties and private fields keep working. Evaluator-owned instance or closure
+state remains application-owned and is not deep-cloned. A plain-object policy,
+such as a literal or a spread of a factory's output, may carry only the
+`PolicyEvaluator` fields:
 
 - `answer` is client-visible text and is also the only input channel.
 - `reasoning` is the model reasoning trace.
@@ -158,31 +171,51 @@ state remains application-owned and is not deep-cloned:
 Use `createContentPolicyGate()` when trusted host code must apply the same
 ordered input-policy contract before content enters a framework-owned path that
 does not traverse Mastra's input processors. The gate accepts the exact text
-the downstream model will see plus an optional trusted `RequestContext`. It
+the downstream model will see plus an optional trusted `RequestContext`. An
+input that is not an object with a string `text`, that carries another field,
+or whose `requestContext` is not a `RequestContext` returns the error state
+without reaching a policy. It
 returns only allowed, denied, or evaluator-error state; policy names, reasons,
 content, and thrown values remain confined to the configured audit sink. Every
 registered policy must be able to run on the input `answer` channel — one that
 could never be evaluated here is rejected at construction, not skipped. That
 includes `maxTextLength`, which defaults to the output phase: pass
-`maxTextLength(n, { phases: ['input'] })` to use it at this boundary.
+`maxTextLength(n, { phases: ['input'] })` to use it at this boundary. The gate
+needs at least one policy; an empty list is rejected, because a gate with no
+policy allows every input.
 
 The included policies are:
 
 | Policy | Default coverage | Purpose |
 | --- | --- | --- |
 | `denyPatterns(patterns)` | Input and output; answer, reasoning, and object | Deny case-insensitive string matches or caller-supplied regular expressions |
-| `maxTextLength(maxChars)` | Output answer | Cap accumulated output length |
+| `maxTextLength(maxChars)` | Output answer | Cap accumulated output length at `maxChars`, a finite number of at least 0 |
 | `piiSecrets(options)` | Input and output; answer, reasoning, and object | Detect email, SSN, phone, Luhn-valid cards, AWS keys, PEM headers, JWTs, secret assignments, and high-entropy tokens |
 | `classifierPolicy(options)` | Input and output answer | Delegate to a synchronous or asynchronous classifier, with cadence and timeout controls |
 
 `piiSecrets()` supports detector selection, exact or regular-expression
 allowlist exemptions, an entropy threshold, phase and channel selection, and a
-hold-back hint override. Its detectors and `denyPatterns()` are best-effort
+hold-back hint override. The `entropyThreshold` must be a number greater than
+0 and at most about 6.066 bits per character, the entropy of a candidate that
+uses each of the 67 characters a candidate is drawn from equally often, and so
+the highest entropy a candidate can reach; a threshold at that maximum still
+detects such a candidate. Its
+detectors and `denyPatterns()` are best-effort
 text inspection. Unicode tricks, alternate encodings, or deliberately shaped
-secrets can evade pattern-based controls.
+secrets can evade pattern-based controls. Each included policy throws when
+called with a `text` that is not a string, which the engine and the content
+gate turn into their error path.
 
-`classifierPolicy()` fails closed when the classifier throws or exceeds its
-configured timeout. It has no automatic hold-back window because a classifier
+`classifierPolicy()` fails closed when the classifier throws, returns no
+decision or exceeds its configured timeout: `PolicyEngine` records an error
+event and stops the call at input and in-stream on both of Mastra's agent
+loops, and rethrows at the final result, which stops Mastra's standard loop.
+On Mastra's durable loop, output policies stop the stream a subscriber receives,
+including hold-back's terminal classification. Mastra logs a result-phase
+refusal; the saved thread message and returned result come from model output
+and are not filtered by output policies.
+The classifier's `evaluateEveryChars` cadence must be a positive safe
+integer. It has no automatic hold-back window because a classifier
 has no bounded match length. To buffer a whole channel until classification
 finishes, set `holdBackChars: Number.POSITIVE_INFINITY` on the returned
 evaluator.
@@ -197,9 +230,19 @@ With `holdBack: true`, the engine retains each policy's declared trailing
 window and releases only evaluated text. String patterns and the built-in
 secret detectors provide bounded windows. A regular expression in
 `denyPatterns()` defaults to buffering the full segment unless
-`holdBackChars` supplies a safe bound. The guarantee is per stream segment;
+`holdBackChars` supplies a safe bound. A `holdBackChars` hint must be a number
+of at least 0, or `Infinity`. At a text or reasoning segment's end, or at
+`finish` when no end chunk arrives, hold-back classifies any text still below
+`classifierPolicy()`'s cadence before releasing the held tail. With
+`holdBackChars: Infinity`, a denied segment emits nothing. With a finite
+window, previously released text stays visible; the held suffix is released
+only after terminal classification. A host-written cadence evaluator does not
+receive this terminal classification behavior. The guarantee is per stream
+segment;
 text released at the end of an earlier segment cannot be withdrawn if a match
-completes in a later segment.
+completes in a later segment. A text or reasoning chunk whose text is not a
+string, or a step whose reasoning text is not a string, aborts the stream
+instead of passing unevaluated.
 
 Under the supported `@mastra/core` peer, only object chunks that traverse
 the processor chain reach a standalone engine. The engine validates those
@@ -252,12 +295,12 @@ const account = await invokeConnector(accountLookup, {
 });
 ```
 
-Pass a trusted `RequestContext` when the connector uses grants, identity, dry-run, idempotency, or isolation keys. `invokeConnector()` preserves Mastra schema validation and every Breakwater gate. It rejects plain tools and connectors whose ID, execution function, or schema surface changed after construction. Validation failures throw a redacted `ConnectorValidationError` with a stable kind/code, connector ID and `input` or `output` phase.
+Pass a trusted `RequestContext` when the connector uses grants, identity, dry-run, idempotency, or isolation keys. The options accept only `requestContext`, `abortSignal`, `observe` and `toolCallId`, and a present `requestContext` must be a `RequestContext`; anything else is refused with `CONNECTOR_INVOCATION_OPTIONS_INVALID`. `invokeConnector()` preserves Mastra schema validation and every Breakwater gate. It rejects plain tools and connectors whose ID, execution function, or schema surface changed after construction. Validation failures throw a redacted `ConnectorValidationError` with a stable kind/code, connector ID and `input` or `output` phase.
 
 The permission manifest is enforced:
 
 - `sideEffect` classifies the connector as `read`, `write`, `destructive`, or
-  `idempotent`.
+  `idempotent`; any other value fails at construction.
 - `egress` lists exact hosts or leading `*.` wildcards. The organization
   allowlist gates the declaration, and `runtime.fetch` gates each actual
   request and redirect hop.
@@ -269,12 +312,28 @@ The permission manifest is enforced:
   side-effect-free simulation.
 - `idempotencyKey` requires a per-call key and a configured store.
 - `rateLimit` declares a fixed-window budget and requires a configured store.
-- `background` permits background overrides only for read-only connectors.
-  Mastra still owns actual background-task eligibility.
+- `requiresApproval`, `dryRun`, `idempotencyKey` and `background` are
+  booleans when present, and a field outside `PermissionManifest` fails at
+  construction, so a misspelled requirement is refused rather than ignored.
+- `background` lets a read-only connector run as a Mastra background task and
+  receive `_background` overrides. Mastra still owns actual background-task
+  eligibility. Without the opt-in, the wrapper refuses a call Mastra's
+  standard agent loop runs as a background task in the dispatching process;
+  the refusal does not reach Mastra's durable loop, static background
+  executors, calls nested inside background work, or a Flowsafe
+  `BackgroundTaskHost` executor. The refusal is not final: Mastra retries a
+  refused task, and a Mastra that starts on the same storage can recover a
+  task that is still queued, or running with retries left, through a static
+  executor. `createGuardedAgent()` disables background dispatch. On a raw
+  Mastra agent, do not make a connector without the opt-in
+  background-eligible or register one as a `BackgroundTaskHost` executor; see
+  [Run connectors in the background](./CONNECTORS.md#run-connectors-in-the-background).
 
 Custom `ToolPolicyEvaluator` instances run before execution. Included
 evaluators cover declared network egress, cross-workflow scope, required
-tenant scope, and the direct-call background override defense. The
+tenant scope, and the direct-call background override defense. `policies`,
+like the connector configuration itself, accepts only its declared fields;
+`networkEgress` must be an object and `evaluators` an array of evaluators. The
 [connector authoring guide](./CONNECTORS.md) contains the complete manifest,
 storage, invocation, egress, and testing contract.
 
@@ -290,13 +349,13 @@ The connector wrapper reads these keys:
 
 | Constant | Runtime key | Value | Who should set it |
 | --- | --- | --- | --- |
-| `ACTOR_CONTEXT_KEY` | `breakwater.actor` | `{ id, role, kind? }` | Authenticated host or `getActor` |
+| `ACTOR_CONTEXT_KEY` | `breakwater.actor` | `{ id, role, kind? }` and no other field | Authenticated host or `getActor` |
 | `CONNECTOR_GRANTS_CONTEXT_KEY` | `breakwater.connectorGrants` | `ConnectorApprovalGrant[]` | Trusted approval service only |
 | `CONNECTOR_EXECUTION_CONTEXT_KEY` | `breakwater.connectorExecution` | `ConnectorExecutionIdentity` | Trusted runtime only |
 | `PRINCIPAL_PERMISSIONS_CONTEXT_KEY` | `breakwater.principalPermissions` | `PrincipalPermissions` or `null` | Trusted host resolver only |
-| `DRY_RUN_CONTEXT_KEY` | `breakwater.dryRun` | `true` | Caller requesting simulation |
+| `DRY_RUN_CONTEXT_KEY` | `breakwater.dryRun` | `true`; another present value but `false` is denied with `DRY_RUN_INVALID` | Caller requesting simulation |
 | `IDEMPOTENCY_KEY_CONTEXT_KEY` | `breakwater.idempotencyKey` | Non-empty string | Host-derived operation identity |
-| `ISOLATION_SCOPE_CONTEXT_KEY` | `breakwater.isolationScope` | Opaque non-empty string | Multi-tenant runtime only |
+| `ISOLATION_SCOPE_CONTEXT_KEY` | `breakwater.isolationScope` | Opaque non-empty string; another present value is denied with `ISOLATION_SCOPE_INVALID` | Multi-tenant runtime only |
 | `WORKFLOW_SCOPE_CONTEXT_KEY` | `breakwater.workflowScope` | Current workflow ID | Workflow runtime only |
 
 Approval, permission, and isolation values are capabilities. Never accept them from a request body, model output, tool result, or client-controlled header. Flowsafe derives structured approval grants from approved records, projects the server-resolved principal permissions, and mints the current execution identity, workflow scope, and run ID on each run leg. Its physical data plane reserves and drops the isolation scope.
@@ -312,7 +371,8 @@ The same durable tool-call attempt may retry with the same `toolCallId`. A new m
 Development stores keep state in one JavaScript isolate:
 
 - `InMemoryIdempotencyStore` provides atomic same-isolate reservations and
-  bounded replay storage.
+  bounded replay storage. Its `maxEntries` bound must be a positive safe
+  integer, and an option other than `maxEntries` is refused.
 - `InMemoryRateLimitStore` provides fixed windows per isolate.
 
 Production Cloudflare deployments can use:
@@ -381,13 +441,19 @@ const audit = new AuditLogger({
 });
 ```
 
-`AuditLogger` keeps an in-memory ring buffer, defaulting to 1,000 events.
-Synchronous and asynchronous sink failures do not abort the guarded operation;
-they are reported through `onSinkError`. `combineAuditSinks()` runs every sink
-and aggregates failures. `metricsAuditSink()` emits the
+`AuditLogger` keeps an in-memory ring buffer, defaulting to 1,000 events;
+`maxBuffered` must be a non-negative safe integer, and `sink` and
+`onSinkError` must be functions. `hasExternalSink()` answers `true` only for a
+sink function. Synchronous and asynchronous sink failures do not abort the
+guarded operation; they are reported through `onSinkError`.
+`combineAuditSinks()` runs every sink
+and aggregates failures; it needs at least one sink, and each must be a
+function. `metricsAuditSink()` emits the
 `breakwater.audit.decision` counter and observes
 `breakwater.audit.duration_seconds` when an event contains a finite,
-non-negative `detail.durationSeconds`.
+non-negative `detail.durationSeconds`; its recorder must have `increment` and
+`observe` functions. Both refuse other input when they are built, since the
+sink they return counts as external.
 
 Generic connector exceptions are rethrown to the caller, but their arbitrary
 messages are not copied into connector audit events. Audit reasons remain
@@ -396,7 +462,11 @@ static unless breakwater created a private, safe error summary.
 Connector audit events also use trusted `breakwater.auditContext` correlation.
 Host-derived agent, deployment (`tenantId`), run, thread, resource, entry-path,
 and principal fields override same-named decision detail. Unknown and
-non-scalar context fields remain excluded.
+non-scalar context fields remain excluded. A present value that is not an
+object, lacks a non-empty `agentId` or `entryPath`, carries an unknown field,
+or carries an optional field that is neither `undefined` nor a non-empty
+string makes each boundary record an `audit.context` error event before its
+decision; the decision itself is unchanged.
 
 For durable Cloudflare Queues to SIEM export, use the flowsafe
 [`audit-export`](https://github.com/ProofOfTechOrg/anchorage/tree/main/packages/flowsafe/src/audit-export)
@@ -415,7 +485,7 @@ import {
   invokeConnector,
 } from '@proofoftech/breakwater';
 
-const codex = createCodexConnector();
+const codex = createCodexConnector({ cwd: '/srv/workspace' });
 const requestContext = new RequestContext();
 requestContext.set(DRY_RUN_CONTEXT_KEY, true);
 
@@ -423,12 +493,17 @@ const preview = await invokeConnector(
   codex,
   {
     prompt: 'Add unit tests.',
-    cwd: '/srv/workspace',
     model: 'your-model-id',
   },
   { requestContext },
 );
 ```
+
+Set `cwd` on the connector from trusted host configuration; this is the
+recommended setup. The workspace is then fixed for every call, `cwd` leaves
+the input schema the model sees, and a `cwd` in a call's input is dropped by
+validation. Without the option, the model chooses the directory through its
+input, which the approver sees but no gate checks.
 
 The default runner is Node-only and:
 
@@ -454,7 +529,7 @@ failures, error messages, error metadata, and breakwater-generated audit
 reasons do not contain the prompt or captured stdout and stderr.
 
 The adapter does not sandbox the child. It inherits the parent environment and
-credentials, and `cwd` is the workspace the CLI may modify. Its manifest
+credentials, and its working directory is the workspace the CLI may modify. Its manifest
 declares provider hosts, but a child process does not use
 `ConnectorRuntime.fetch`; actual socket enforcement belongs in the container,
 VM, or host firewall. See the [CLI section of the connector guide](./CONNECTORS.md#wrap-an-agent-cli)
@@ -463,7 +538,8 @@ before enabling real execution.
 ## Know the egress boundary
 
 `runtime.fetch` accepts an absolute HTTP(S) URL string or URL object, not a
-`Request`. It checks the initial host and every followed redirect. It strips
+`Request`. It refuses an `init.redirect` other than `'follow'`, `'manual'` or
+`'error'`. It checks the initial host and every followed redirect. It strips
 `authorization`, `cookie`, and `proxy-authorization` on a cross-origin
 redirect, rewrites methods according to fetch redirect rules, refuses to
 replay one-shot bodies across 307 or 308 redirects, and defaults to 20 hops.
@@ -483,6 +559,21 @@ audit events record it as `detail.egressEnforcement`.
 ## Public API
 
 The root entry point re-exports the supported APIs from every subpath.
+
+### Guarded agent exports
+
+| Runtime exports | Purpose |
+| --- | --- |
+| `createGuardedAgent` | Construct a guarded agent with a narrow execution handle |
+| `isGuardedAgentHandle` | Check whether a value is a guarded handle |
+| `GUARDED_AGENT_HOST_PROTOCOL` | Read guarded host compatibility metadata |
+| `assertNoGuardedSystemMessages` | Refuse caller system messages before a host starts a durable loop |
+| `assertAcceptedCallProviderOptions` | Accept a closed list of call-level generation settings and refuse everything else |
+| `providerOptionsCarryContent` | Detect message-level provider options an input policy reads or refuses |
+
+Type exports: `GuardedAgentCallOptions`, `GuardedAgentConfig`,
+`GuardedAgentHandle`, `GuardedAgentHostProtocol`, `GuardedInputProcessor`,
+`GuardedOutputProcessor`, and `GuardedToolChoice`.
 
 ### Policy engine exports
 

@@ -31,6 +31,7 @@ import {
   createConnector,
 } from '../connector-sdk/index.js';
 import { replaceConnectorInvocation } from '../connector-sdk/invocation-registry.js';
+import { assertKnownFields, describeEntry } from '../host-input.js';
 import { createDefaultExec, DefaultExecFailure } from './default-exec.js';
 import type { AgentCliExec, AgentCliExecResult } from './exec-contract.js';
 
@@ -38,7 +39,11 @@ import type { AgentCliExec, AgentCliExecResult } from './exec-contract.js';
 export interface AgentCliInput {
   /** The task prompt handed to the agent CLI. */
   prompt: string;
-  /** Working directory the CLI runs in (the workspace it may modify). */
+  /**
+   * Working directory the CLI runs in (the workspace it may modify). Absent
+   * from the model's input schema when the connector sets
+   * {@link AgentCliConnectorOptions.cwd}.
+   */
   cwd?: string;
   /** Model override forwarded to the CLI. */
   model?: string;
@@ -91,6 +96,15 @@ export interface AgentCliConnectorOptions {
   exec?: AgentCliExec;
   /** Override the binary (absolute path or PATH name). */
   binaryPath?: string;
+  /**
+   * Working directory every call runs in: the workspace the CLI may modify,
+   * derived from trusted host configuration. When set, `cwd` leaves the
+   * model's input schema, and a `cwd` in the call's input is dropped by
+   * validation rather than reaching the spawn. When omitted, the model may
+   * choose the directory through its input. A present value must be a
+   * non-empty string.
+   */
+  cwd?: string;
   /**
    * Terminate the CLI process tree after this long. Default 600000 (10 min —
    * agent tasks run long). Must be an integer in [1, 2^31-1]: setTimeout treats NaN and
@@ -212,6 +226,28 @@ export class AgentCliError extends Error {
   }
 }
 
+const AGENT_CLI_DEFINITION_KEYS = {
+  id: true,
+  description: true,
+  binary: true,
+  egress: true,
+  buildFlags: true,
+  parseOutput: true,
+} satisfies Record<keyof AgentCliDefinition, true>;
+
+const AGENT_CLI_CONNECTOR_OPTION_KEYS = {
+  exec: true,
+  binaryPath: true,
+  cwd: true,
+  timeoutMs: true,
+  requiresApproval: true,
+  rateLimit: true,
+  idempotencyKey: true,
+  id: true,
+  policies: true,
+  maxOutputBytes: true,
+} satisfies Record<keyof AgentCliConnectorOptions, true>;
+
 const DEFAULT_TIMEOUT_MS = 600_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024;
 const REDACTED_PROMPT = '<prompt:redacted>';
@@ -310,6 +346,10 @@ const inputSchema = z.object({
   model: z.string().optional(),
 });
 
+// The schema a connector with a host `cwd` gives the model. Its object strips
+// an undeclared key, so a model-supplied `cwd` never reaches the command.
+const hostCwdInputSchema = inputSchema.omit({ cwd: true });
+
 const outputSchema = z.object({
   text: z.string(),
   exitCode: z.number(),
@@ -384,7 +424,32 @@ export function createAgentCliConnector(
   definition: AgentCliDefinition,
   options: AgentCliConnectorOptions = {},
 ): Connector<AgentCliInput, AgentCliOutput> {
+  assertKnownFields(
+    'agent CLI connector definition',
+    definition,
+    AGENT_CLI_DEFINITION_KEYS,
+  );
+  // createConnector() reads a missing or null egress as an empty list, which
+  // would pass the organization egress gate for a CLI that calls its vendor.
+  if (!Array.isArray(definition.egress)) {
+    throw new TypeError(
+      `agent CLI connector definition.egress must be an array (got ${describeEntry(definition.egress)})`,
+    );
+  }
+  assertKnownFields(
+    'agent CLI connector options',
+    options,
+    AGENT_CLI_CONNECTOR_OPTION_KEYS,
+  );
   const connectorId = options.id ?? definition.id;
+  if (
+    options.idempotencyKey !== undefined &&
+    typeof options.idempotencyKey !== 'boolean'
+  ) {
+    throw new TypeError(
+      `agent CLI connector ${connectorId}: idempotencyKey must be a boolean when provided (got ${describeEntry(options.idempotencyKey)})`,
+    );
+  }
   if (options.timeoutMs !== undefined) {
     assertIntegerOption(
       connectorId,
@@ -435,6 +500,15 @@ export function createAgentCliConnector(
       }
     }
   }
+  const hostCwd = options.cwd;
+  if (
+    hostCwd !== undefined &&
+    (typeof hostCwd !== 'string' || hostCwd.length === 0)
+  ) {
+    throw new TypeError(
+      `agent CLI connector ${connectorId}: cwd must be a non-empty string when provided (got ${describeEntry(hostCwd)})`,
+    );
+  }
   const exec =
     options.exec ??
     createDefaultExec(options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES);
@@ -475,7 +549,7 @@ export function createAgentCliConnector(
   const connector = createConnector<AgentCliInput, AgentCliOutput>({
     id: connectorId,
     description: definition.description,
-    inputSchema,
+    inputSchema: hostCwd === undefined ? inputSchema : hostCwdInputSchema,
     outputSchema,
     permissions: {
       // Write-class: the CLI mutates the workspace it runs in.
@@ -494,7 +568,10 @@ export function createAgentCliConnector(
       const { args, command } = commandLine(input);
       let result: AgentCliExecResult;
       try {
-        result = await exec(binary, args, { cwd: input.cwd, timeoutMs });
+        result = await exec(binary, args, {
+          cwd: hostCwd ?? input.cwd,
+          timeoutMs,
+        });
       } catch (error) {
         if (error instanceof DefaultExecFailure) {
           throw createAgentCliError(error.code, connectorId, {

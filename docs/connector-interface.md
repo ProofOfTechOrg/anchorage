@@ -82,6 +82,8 @@ const contact = await invokeConnector(createContact, input, {
 
 Omit `toolCallId` for suspension and run grants. For a tool-call grant, pass the exact runtime-owned ID. Never derive it from client input or store it in a shared `RequestContext`.
 
+The options accept only `requestContext`, `abortSignal`, `observe` and `toolCallId`, and a present `requestContext` must be a Mastra `RequestContext`. Options that are not an object, carry another field, or pass another kind of `requestContext` throw `ConnectorInvocationError` with `CONNECTOR_INVOCATION_OPTIONS_INVALID` before the connector runs.
+
 The helper accepts only an unmodified `Connector` created by `createConnector()`. It calls the public Mastra execution wrapper, so schema validation and every Breakwater gate remain active. Input or output validation throws `ConnectorValidationError`. The error identifies the connector and phase with a stable kind/code; it omits Mastra's raw message, schema issue text, invalid value, and cause.
 
 ## Permission manifest
@@ -99,6 +101,8 @@ interface PermissionManifest {
   requiredPermissions?: readonly Permission[];
 }
 ```
+
+A field the interface does not declare fails at construction, so a misspelled requirement is refused rather than ignored. The same holds for the connector definition's own fields.
 
 ### `sideEffect`
 
@@ -139,7 +143,7 @@ Set `policies.requireEgressEnforcement: true` to refuse construction unless the 
 
 ### `idempotencyKey`
 
-When `true`, every real call needs a non-empty key in `breakwater.idempotencyKey`. The wrapper stores the successful result and replays it on another call with the same scoped key.
+When `true`, every real call needs a non-empty key in `breakwater.idempotencyKey`. The wrapper stores the successful result and replays it on another call with the same scoped key. A present value must be a boolean.
 
 The application chooses the business key. Flowsafe does not invent a connector-specific idempotency key or mint an organization isolation scope. Its shared store keys are deployment-wide.
 
@@ -147,13 +151,13 @@ Breakwater stores only `{ result }`; it does not canonicalize arbitrary input or
 
 ### `requiresApproval`
 
-When `true`, every real call needs a structured grant in `breakwater.connectorGrants`. Breakwater compares the grant with the runtime-owned `breakwater.connectorExecution` identity and the connector's actual Mastra `toolCallId` when the grant uses `tool-call` scope.
+When `true`, every real call needs a structured grant in `breakwater.connectorGrants`. A present value must be a boolean. Breakwater compares the grant with the runtime-owned `breakwater.connectorExecution` identity and the connector's actual Mastra `toolCallId` when the grant uses `tool-call` scope.
 
 The same decision is compiled into Mastra's native `requireApproval` predicate so an agent can suspend. The native approval signal never replaces the request-context capability.
 
 ### `dryRun`
 
-When `true`, `dryRunExecute` is required. A caller sets `breakwater.dryRun` to `true`.
+When `true`, `dryRunExecute` is required. A present value must be a boolean. A caller sets `breakwater.dryRun` to `true`. `false` requests a real call; any other present value is denied with `DRY_RUN_INVALID` before any side effect.
 
 Dry-run:
 
@@ -179,11 +183,19 @@ Fixed windows can admit a burst near twice the nominal count across adjacent win
 
 ### `background`
 
-The default is foreground-only. `background: true` is allowed only for a read-only connector.
+The default is foreground-only. `background: true` is allowed only for a read-only connector, and a present value must be a boolean.
 
 A write, destructive, or idempotent-write connector cannot opt into Mastra background execution because moving it off the foreground path changes its timing and approval topology.
 
-The wrapper also rejects direct or passthrough `_background` overrides on connectors that did not opt in. Core may strip that field on schema-controlled agent paths; its own tool eligibility keeps the connector foreground there.
+Mastra owns background eligibility: an agent's `backgroundTasks.tools: 'all'`, a per-tool entry, or an assigned `tool.background` makes a tool eligible, and Mastra then runs it as a deferred background task without any `_background` argument. For every connector whose manifest does not set `background: true`, the wrapper refuses a call that Mastra's standard agent loop runs as a background task in the process that dispatched it, with `BACKGROUND_TASK_DENIED`.
+
+The refusal does not reach Mastra's durable agent loop, which passes no background flag; a task Mastra runs through a static executor, with no agent context, which a Mastra with background tasks enabled registers for every tool of every registered agent and uses when the dispatching process's task context is gone (a task queued or recovered after a restart, or run on a separate worker); a connector called from inside background work, such as a background sub-agent or workflow tool, or another tool's `execute`; or a Flowsafe `BackgroundTaskHost` executor.
+
+The refusal is not final. Mastra's task runner retries a refused task up to the task's retry count, and the model can raise that count through `_background.maxRetries`, which overrides the tool and manager settings; each attempt records a denial. The code's `retryable: false` is Breakwater's flag for the caller, which Mastra's task runner does not read. While the task is still running with retries left, or still queued, a Mastra that starts on the same storage with `recoverStaleTasksOnStart` (Mastra's default, `true`) recovers it through a static executor, which the refusal does not reach. `recoverStaleTasksOnStart: false` stops that recovery for every task.
+
+`createGuardedAgent()` disables background dispatch for its agent, and Flowsafe's `RunnerRuntime` and agent thread host run no background-task manager. On a raw Mastra agent, do not make a connector without `background: true` background-eligible, and do not register one as a `BackgroundTaskHost` executor.
+
+The wrapper also rejects any call whose arguments carry `_background` on a connector that did not opt in, whatever the value. Mastra's standard agent loop removes a truthy `_background` before dispatch; a falsy value stays in the arguments and reaches this check, as does the field on no-schema, passthrough, workflow, and direct calls.
 
 ### `requiredPermissions`
 
@@ -215,7 +227,7 @@ interface ConnectorPolicies {
 }
 ```
 
-The connector definition binds these values once. `fetch` is the underlying HTTP implementation wrapped by guarded fetch, and is the normal test seam.
+The connector definition binds these values once. `fetch` is the underlying HTTP implementation wrapped by guarded fetch, and is the normal test seam. `policies` must be an object carrying only these fields. A present `networkEgress` must be an object, and a present `evaluators` an array of evaluators, each with a string `name` and an `evaluate` function.
 
 ### Apply the physical-deployment preset
 
@@ -268,7 +280,9 @@ schema validation
   -> idempotency commit
 ```
 
-A denial throws `ConnectorPolicyError`; use its [decision code](#connector-decision-codes) for machine handling. Decisions that reach the configured audit wrapper retain their existing audit events. Connector decisions use `agentAuditDetail()`, so trusted `breakwater.auditContext` correlation overrides same-named decision detail.
+A denial throws `ConnectorPolicyError`; use its [decision code](#connector-decision-codes) for machine handling. Decisions that reach the configured audit wrapper retain their existing audit events. Connector decisions use `agentAuditDetail()`, so trusted `breakwater.auditContext` correlation overrides same-named decision detail. A present `breakwater.auditContext` that the reader cannot use whole makes the call record an `audit.context` error event first; the call is decided as it would be without it.
+
+Before the evaluators, the wrapper denies a present `breakwater.isolationScope` that is not an opaque non-empty string with `ISOLATION_SCOPE_INVALID`, and a present `breakwater.dryRun` that is not a boolean with `DRY_RUN_INVALID`.
 
 An arbitrary execution, store, evaluator, or parser throw is not copied verbatim into audit. Safe built-in errors can register a static reason and bounded metadata.
 
@@ -284,7 +298,7 @@ Import `CONNECTOR_DECISIONS`, `isConnectorDecisionCode`, `connectorDecisionRetry
 | `PERMISSION_GRANTED` | existing connector.authorize allow event | false |
 | `APPROVAL_GRANTED` | existing connector.approval allow event | false |
 | `IDEMPOTENCY_TAKEOVER` | existing separate stale-reservation takeover event; no new takeover behavior | false |
-| `EGRESS_INPUT_INVALID` | standalone guard received neither supported URL string nor URL-like object | false |
+| `EGRESS_INPUT_INVALID` | guard received neither a supported URL string nor a URL-like object, or an `init.redirect` other than `'follow'`, `'manual'` or `'error'` | false |
 | `EGRESS_URL_INVALID` | initial URL parsing refusal | false |
 | `EGRESS_SCHEME_NOT_ALLOWED` | initial non-http(s) scheme | false |
 | `EGRESS_HOST_NOT_DECLARED` | initial actual request host outside manifest | false |
@@ -305,11 +319,14 @@ Import `CONNECTOR_DECISIONS`, `isConnectorDecisionCode`, `connectorDecisionRetry
 | `IDEMPOTENCY_LEGACY_AMBIGUOUS` | ambiguous legacy tuple needs external association | false |
 | `IDEMPOTENCY_MIGRATION_REQUIRED` | legacy writer drain acknowledgement absent | false |
 | `DRY_RUN_UNSUPPORTED` | simulation requested without declared implementation | false |
+| `DRY_RUN_INVALID` | SDK refuses a present `breakwater.dryRun` that is not a boolean, before any side effect | false |
 | `WORKFLOW_SCOPE_MISSING` | crossWorkflowIsolation addresses workflow state without caller scope | false |
 | `CROSS_WORKFLOW_ACCESS_DENIED` | target differs from caller workflow | false |
 | `ISOLATION_SCOPE_MISSING` | tenantIsolation has no valid opaque scope | false |
+| `ISOLATION_SCOPE_INVALID` | SDK refuses a present `breakwater.isolationScope` that is not an opaque non-empty string, before the evaluators | false |
 | `BACKGROUND_OVERRIDE_DENIED` | SDK hard presence check rejects foreground-only argument override | false |
-| `BACKGROUND_EXECUTION_DENIED` | backgroundExecution evaluator rejects write-class enabled override | false |
+| `BACKGROUND_TASK_DENIED` | SDK refuses a call Mastra's standard agent loop runs as a background task on a connector whose manifest does not opt into background execution; Mastra's task runner still retries the refused task (see [`background`](#background)) | false |
+| `BACKGROUND_EXECUTION_DENIED` | backgroundExecution evaluator rejects a write-class call whose arguments carry `_background`, whatever its value, and a call whose `sideEffect` is not a side-effect member; a call Mastra runs as a background task carries no `_background`, and the SDK refuses it with `BACKGROUND_TASK_DENIED` on a connector without the opt-in | false |
 | `EVALUATOR_DENIED` | custom/legacy evaluator denial without more specific metadata | false |
 | `EVALUATOR_FAILED` | tool evaluator throws or returns invalid new decision metadata | false |
 | `STORE_UNAVAILABLE` | pre-execution increment/get/inspect/reserve exception | true |
@@ -320,11 +337,13 @@ Import `CONNECTOR_DECISIONS`, `isConnectorDecisionCode`, `connectorDecisionRetry
 | `CONNECTOR_OUTPUT_INVALID` | wrapper output validation audit and invokeConnector validation boundary | false |
 | `CONNECTOR_UNREGISTERED` | invokeConnector did not receive a registered connector | false |
 | `CONNECTOR_BOUNDARY_MODIFIED` | registered execution boundary fingerprint differs | false |
-| `CONNECTOR_INVOCATION_OPTIONS_INVALID` | explicit invalid toolCallId boundary | false |
+| `CONNECTOR_INVOCATION_OPTIONS_INVALID` | invokeConnector options that are not an object, carry an option outside `ConnectorInvocationOptions`, a `requestContext` that is not a `RequestContext`, or an invalid `toolCallId` | false |
 | `CONNECTOR_BOUNDARY_UNVERIFIABLE` | public execute returned without entering protected wrapper and was not recognized input validation | false |
 
 
 A retryable refusal permits another attempt after its condition clears, with the same logical operation and idempotency identity. It does not authorize a fresh key or prove that uncertain external effects can be repeated. Breakwater adds no automatic retries. A redirect refusal remains non-retryable because the preceding request may already have caused an effect.
+
+Retryability is a flag for the caller. Mastra's background task runner does not read it: it retries a refused task, `BACKGROUND_TASK_DENIED` included, up to the task's retry count.
 
 `ConnectorPolicyError` retains `connector`, `policy`, `reason` and its three-string constructor. It adds `kind: 'connector-policy'`, code, canonical category, retryability and code-specific details. A manually constructed legacy error receives `EVALUATOR_DENIED`; names never determine codes. Custom evaluators may still return `{ allowed: false, reason }`, or supply a denial code and its supported details. Invalid new metadata becomes `ConnectorEvaluatorError` with `EVALUATOR_FAILED`.
 
@@ -338,7 +357,7 @@ SDK-owned audit events carry `decisionCode`, `policyKind` and `retryable` from t
 
 ## Network egress
 
-Egress has two nested policies:
+Egress has nested policies:
 
 ```text
 actual request host <= connector declaration <= deployment allowlist
@@ -356,6 +375,7 @@ Omit the policy when the deployment intentionally does not restrict declarations
 
 - accepts HTTP and HTTPS only;
 - rejects invalid URLs;
+- refuses an `init.redirect` other than `'follow'`, `'manual'` or `'error'` before any request;
 - checks the initial request and every redirect hop;
 - follows redirects manually;
 - strips authorization, cookie, and proxy credential headers on a cross-origin redirect;
@@ -383,7 +403,7 @@ Inject `runtime.fetch` into compatible SDKs. Apply infrastructure network policy
 
 Flowsafe's approval provider reads approved D1 records and derives grants for each runtime leg, and its agent thread host projects the permission resolution the same way. A public resume body, signal, model output, workflow input, tool result, schedule row, or background task cannot supply any of these keys.
 
-Breakwater supports three explicit scopes:
+Breakwater supports these explicit scopes:
 
 - `tool-call`: connector, workflow, run, exact suspension, and Mastra `toolCallId`
 - `suspension`: connector, workflow, run, and exact suspension
@@ -413,7 +433,8 @@ The legacy v1 key was:
 
 The connector ID remains colon-free because rate-budget keys retain their
 `[isolationScope:]connectorId` shape to preserve active windows. The isolation
-prefix appears when the trusted host sets `breakwater.isolationScope`.
+prefix appears when the trusted host sets `breakwater.isolationScope`, an
+opaque non-empty string.
 
 Every call probes its exact v1 key before using v2:
 
@@ -467,7 +488,7 @@ rows remain a read-only replay fallback.
 
 ### In-memory store
 
-`InMemoryIdempotencyStore` supports atomic reservation and same-isolate in-flight joining. It is bounded and evictable. It does not protect two Worker isolates or two per-run Durable Objects.
+`InMemoryIdempotencyStore` supports atomic reservation and same-isolate in-flight joining. It is bounded and evictable; its `maxEntries` bound must be a positive safe integer, and an option other than `maxEntries` is refused. It does not protect two Worker isolates or two per-run Durable Objects.
 
 It also exposes non-mutating `inspect()` for migration tests and single-process
 upgrades.

@@ -8,7 +8,11 @@ import {
 } from '@mastra/core/agent';
 import type { MessageListInput } from '@mastra/core/agent/message-list';
 import { Mastra } from '@mastra/core/mastra';
-import { AuditLogger } from '@proofoftech/breakwater';
+import {
+  AuditLogger,
+  assertAcceptedCallProviderOptions,
+  providerOptionsCarryContent,
+} from '@proofoftech/breakwater';
 import {
   type AgentThreadStateStorage,
   createThreadAgentHost,
@@ -288,6 +292,20 @@ export class StarterThread extends ThreadDurableObject<Env> {
       return (
         owner?.kind === scope.principal.kind && owner.id === scope.principal.id
       );
+    },
+    notificationDispatchAllowed: (scope, agentId) =>
+      this.#host().notificationDispatchAllowed(scope, agentId),
+    scheduleProviderOptionsPolicy: ({ providerOptions }) => {
+      // Threaded fires use these as signal options and as call options on idle wake.
+      try {
+        if (providerOptionsCarryContent(providerOptions)) {
+          return { allowed: false, outcome: 'denied' };
+        }
+        assertAcceptedCallProviderOptions(providerOptions);
+        return { allowed: true };
+      } catch {
+        return { allowed: false, outcome: 'denied' };
+      }
     },
     canPersistSchedule: (scope, input) =>
       canPersistScheduledAgentSignal(

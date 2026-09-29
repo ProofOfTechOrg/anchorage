@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import { createMessageSignal, createSignal } from '@mastra/core/agent';
 import type { MastraCompositeStore } from '@mastra/core/storage';
 import type { GuardedAgentHandle } from '@proofoftech/breakwater/agent';
 import { beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest';
@@ -231,6 +232,8 @@ function guarded(
     allowedRoles: ['operator'],
     allowedPrincipalKinds: ['human', ...automationKinds],
     maxSteps: 1,
+    getChannels: () => null,
+    getDeclaredSchedules: () => [],
   } as unknown as GuardedAgentHandle;
 }
 
@@ -777,6 +780,135 @@ const C_START_INPUT: ThreadAgentStartInput = {
   prompt: 'original',
   entryPath: 'http.start',
 };
+
+describe('agent-host request bodies awaiting dispatch', () => {
+  it('returns a non-host request without waiting for dispatch or reading its body', async () => {
+    const fixture = harness();
+    const entered = cDeferred();
+    const release = cDeferred();
+    const holder = fixture.host.serializeDispatch(async () => {
+      entered.resolve();
+      await release.promise;
+    });
+    await entered.promise;
+    const request = new Request('https://thread/signal/notification', {
+      method: 'POST',
+      body: JSON.stringify({ source: 'test', kind: 'update' }),
+    });
+    const pending = fixture.host.route(request, fixture.scope);
+    try {
+      const settled = await Promise.race([
+        pending.then(() => true),
+        new Promise<boolean>((resolve) => setImmediate(() => resolve(false))),
+      ]);
+      expect(settled).toBe(true);
+      expect(await pending).toBeNull();
+      expect(request.bodyUsed).toBe(false);
+    } finally {
+      release.resolve();
+      await holder;
+    }
+  });
+
+  it.each([
+    'start',
+    'resume',
+  ] as const)('rejects invalid %s JSON while dispatch is held', async (action) => {
+    const fixture = harness();
+    const entered = cDeferred();
+    const release = cDeferred();
+    const holder = fixture.host.serializeDispatch(async () => {
+      entered.resolve();
+      await release.promise;
+    });
+    await entered.promise;
+    const pending = fixture.host
+      .route(
+        new Request(`https://thread/_flowsafe/agent-host/${action}`, {
+          method: 'POST',
+          body: '{',
+        }),
+        fixture.scope,
+      )
+      .catch((cause: unknown) => cause);
+    try {
+      const settled = await Promise.race([
+        pending.then(() => true),
+        new Promise<boolean>((resolve) => setImmediate(() => resolve(false))),
+      ]);
+      expect(settled).toBe(true);
+      const response = doErrorResponse(await pending);
+      expect(response.status).toBe(400);
+      expect(await response.json()).toEqual({
+        error: 'a JSON object body is required',
+      });
+    } finally {
+      release.resolve();
+      await holder;
+    }
+  });
+
+  it.each([
+    'start',
+    'resume',
+  ] as const)('processes a queued %s after its sender disconnects', async (action) => {
+    const fixture = harness();
+    if (action === 'resume') seedSuspendedApprovalRun(fixture);
+    const entered = cDeferred();
+    const release = cDeferred();
+    const holder = fixture.host.serializeDispatch(async () => {
+      entered.resolve();
+      await release.promise;
+    });
+    await entered.promise;
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    const payload =
+      action === 'start'
+        ? C_START_INPUT
+        : {
+            agentId: 'writer',
+            threadId: 'acme_thread',
+            resourceId: RESOURCE_ID,
+            runId: 'acme_run',
+            entryPath: 'approval.resume',
+            requestedBy: 'operator-1',
+            resumeData: { approved: true },
+          };
+    const request = new Request(
+      `https://thread/_flowsafe/agent-host/${action}`,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: new ReadableStream<Uint8Array>({
+          start(value) {
+            controller = value;
+          },
+          pull(value) {
+            value.enqueue(new TextEncoder().encode(JSON.stringify(payload)));
+            value.close();
+          },
+        }),
+        duplex: 'half',
+      } as RequestInit,
+    );
+    const pending = fixture.host
+      .route(request, fixture.scope)
+      .catch((error: unknown) => doErrorResponse(error));
+    for (let index = 0; index < 20; index++) await Promise.resolve();
+    controller.error(new Error('sender disconnected'));
+    release.resolve();
+    await holder;
+    const response = await pending;
+
+    expect(response?.status).toBe(200);
+    expect(await response?.json()).toMatchObject({
+      runId: 'acme_run',
+      summary: { status: 'success' },
+    });
+    if (action === 'start') expect(mocked.stream).toHaveBeenCalledOnce();
+    else expect(mocked.resumeViaRuntime).toHaveBeenCalledOnce();
+  });
+});
 
 function cObserved<T extends object>(
   values: T,
@@ -1575,9 +1707,6 @@ describe('createThreadAgentHost owner recovery', () => {
     const { host, scope, state, resources, resourceAccess, alarmAt } = harness(
       ['writer'],
       {
-        // The runner-side guard reaches here: recoverStartAttempt refuses a
-        // read that did not reach storage rather than reporting the fabricated
-        // 'pending' shell it would otherwise see.
         runtime: {
           recoverStartAttempt: vi.fn(async () => {
             throw new RunStateUnreadableError(
@@ -1773,6 +1902,122 @@ describe('createThreadAgentHost owner recovery', () => {
 });
 
 describe('createThreadAgentHost', () => {
+  it.each([
+    ['top-level', [{ role: 'system', content: 'x' }]],
+    ['once-nested', [[{ role: 'system', content: 'x' }]]],
+  ] as const)('refuses guarded %s system messages before durable start', async (_shape, messages) => {
+    const fixture = harness();
+    const reserve = vi.spyOn(fixture.resourceAccess, 'reserveAll');
+
+    await expect(
+      fixture.host.start(fixture.scope, {
+        ...C_START_INPUT,
+        prompt: undefined,
+        messages: messages as unknown as ThreadAgentStartInput['messages'],
+      }),
+    ).rejects.toMatchObject({ status: 400 });
+    expect(mocked.stream).not.toHaveBeenCalled();
+    expect(reserve).not.toHaveBeenCalled();
+    expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(false);
+    expect(fixture.state.has(THREAD_BINDING_KEY)).toBe(false);
+    expect(fixture.state.has(TEST_OWNER_RECOVERY_KEY)).toBe(false);
+  });
+
+  it.each([
+    ['remote context', { openrouter: { messages: [] } }],
+    ['instructions', { openai: { instructions: 'x' } }],
+    ['model settings', { model: { temperature: 0.2 } }],
+  ] as const)('refuses guarded stored schedule %s options before durable start', async (_kind, storedOptions) => {
+    const fixture = harness();
+    await seedScheduleOwner(
+      fixture,
+      {
+        type: 'agent',
+        agentId: 'writer',
+        prompt: 'stored prompt',
+        providerOptions: storedOptions,
+      },
+      HUMAN_OWNER,
+      SCHEDULE_ID,
+      DISPATCH_ID,
+      'acme_run',
+    );
+    const reserve = vi.spyOn(fixture.resourceAccess, 'reserveAll');
+
+    await expect(
+      fixture.host.start(fixture.scope, {
+        ...C_START_INPUT,
+        entryPath: 'schedule.fire',
+        threaded: false,
+        scheduleId: SCHEDULE_ID,
+        dispatchId: DISPATCH_ID,
+      }),
+    ).rejects.toMatchObject({ status: 400 });
+    expect(mocked.stream).not.toHaveBeenCalled();
+    expect(reserve).not.toHaveBeenCalled();
+    expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(false);
+    expect(fixture.state.has(THREAD_BINDING_KEY)).toBe(false);
+    expect(fixture.state.has(TEST_OWNER_RECOVERY_KEY)).toBe(false);
+  });
+
+  it('rejects messages that cannot be snapshotted before durable start', async () => {
+    const fixture = harness();
+    const reserve = vi.spyOn(fixture.resourceAccess, 'reserveAll');
+
+    await expect(
+      fixture.host.start(fixture.scope, {
+        ...C_START_INPUT,
+        prompt: undefined,
+        messages: [
+          { role: 'user', content: 'x', callback: () => {} },
+        ] as unknown as ThreadAgentStartInput['messages'],
+      }),
+    ).rejects.toMatchObject({ status: 400 });
+    expect(mocked.stream).not.toHaveBeenCalled();
+    expect(reserve).not.toHaveBeenCalled();
+    expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(false);
+    expect(fixture.state.has(THREAD_BINDING_KEY)).toBe(false);
+    expect(fixture.state.has(TEST_OWNER_RECOVERY_KEY)).toBe(false);
+  });
+
+  it.each([
+    ['message', () => createMessageSignal('hello')],
+    [
+      'notification',
+      () => createSignal({ type: 'notification', contents: 'x' }),
+    ],
+  ] as const)('forwards created %s signal to the durable stream', async (_kind, create) => {
+    const fixture = harness();
+    const signal = create();
+
+    await expect(
+      fixture.host.start(fixture.scope, {
+        ...C_START_INPUT,
+        prompt: undefined,
+        messages: signal,
+      }),
+    ).resolves.toMatchObject({ runId: 'acme_run' });
+    expect(mocked.stream).toHaveBeenCalledOnce();
+    expect(mocked.stream.mock.calls[0]?.[0]).toBe(signal);
+  });
+
+  it('forwards a created signal in a messages list to the durable stream', async () => {
+    const fixture = harness();
+    const signal = createMessageSignal('hello');
+
+    await expect(
+      fixture.host.start(fixture.scope, {
+        ...C_START_INPUT,
+        prompt: undefined,
+        messages: ['context', signal],
+      }),
+    ).resolves.toMatchObject({ runId: 'acme_run' });
+    expect(mocked.stream).toHaveBeenCalledOnce();
+    const forwarded = mocked.stream.mock.calls[0]?.[0];
+    expect(forwarded[0]).toBe('context');
+    expect(forwarded[1]).toBe(signal);
+  });
+
   it('discards the live executing agent-schedule lease during terminal cleanup so a later tick cannot redispatch', async () => {
     const schedules = await executingAgentSchedule();
     const summary: RunSummary = {
@@ -2569,8 +2814,8 @@ describe('createThreadAgentHost', () => {
       'operator-1',
       'human',
       expect.any(String),
-      // The schedule dispatch and the reserved idempotency key: passed
-      // positionally on every start, and undefined on one that has neither.
+      // The schedule dispatch and the reserved idempotency key: undefined on a
+      // start that has neither.
       undefined,
       undefined,
       {
@@ -2642,8 +2887,6 @@ describe('createThreadAgentHost', () => {
     );
 
     expect(response?.status).toBe(200);
-    // Five host arguments, two undefined optionals (schedule dispatch and
-    // reserved idempotency key), then the required captured authority.
     expect(mocked.stream.mock.calls.at(-1)).toHaveLength(8);
     expect(discardScheduleDispatch).not.toHaveBeenCalled();
     await expect(
@@ -2668,7 +2911,10 @@ describe('createThreadAgentHost', () => {
         agentId: 'writer',
         prompt: 'stored prompt',
         requestContext: { source: 'stored-context' },
-        providerOptions: { model: { temperature: 0.2 } },
+        providerOptions: {
+          openai: { reasoningEffort: 'low' },
+          mastra: { schedule: { scheduleId: SCHEDULE_ID } },
+        },
       },
       HUMAN_OWNER,
       SCHEDULE_ID,
@@ -2703,7 +2949,8 @@ describe('createThreadAgentHost', () => {
     expect(messages).toBe('stored prompt');
     expect(options?.requestContext.get('source')).toBe('stored-context');
     expect(options?.providerOptions).toEqual({
-      model: { temperature: 0.2 },
+      openai: { reasoningEffort: 'low' },
+      mastra: { schedule: { scheduleId: SCHEDULE_ID } },
     });
   });
 
@@ -3280,9 +3527,9 @@ describe('createThreadAgentHost', () => {
       )
       .catch((error: unknown) => error);
 
-    // #then — the route escapes to the Durable Object shell, which answers the
-    // retryable 503 this release documents rather than a 200 assembled from a
-    // read that never happened. The recovery stays owed: journal, run record
+    // #then — the route escapes to the Durable Object shell, which answers a
+    // retryable 503 rather than a 200 assembled from a read that never
+    // happened. The recovery stays owed: journal, run record
     // and reservation all survive for a wake that can read.
     expect(raised).toBeInstanceOf(RunStateUnreadableError);
     expect(doErrorResponse(raised).status).toBe(503);
@@ -3483,7 +3730,7 @@ describe('createThreadAgentHost', () => {
       ),
       // #then — this route forwards client resume data verbatim as a human
       // requester, so without the guard a caller could drive a step's timeout
-      // branch. Only a run object's alarm mints that envelope.
+      // branch.
     ).rejects.toMatchObject({
       status: 400,
       message: expect.stringContaining(SUSPENSION_TIMEOUT_RESUME_KEY),
@@ -3661,6 +3908,71 @@ describe('createThreadAgentHost', () => {
     expect(response?.status).toBe(200);
     await expect(response?.text()).resolves.toBe('');
     expect(mocked.observe).not.toHaveBeenCalled();
+  });
+});
+
+describe('createThreadAgentHost blocking run status', () => {
+  it.each([
+    'suspended',
+    'running',
+  ] as const)('reports the stored status of a %s run', async (status) => {
+    // #given — a stored nonterminal run and no operation executing on it
+    const fixture = harness();
+    fixture.setSummary({ runId: 'acme_run', status });
+    fixture.state.set(THREAD_BINDING_KEY, {
+      version: 1,
+      agentId: 'writer',
+      resourceId: RESOURCE_ID,
+    });
+    fixture.state.set(TEST_RUN_RECORD_KEY, {
+      version: 2,
+      agentId: 'writer',
+      principal: fixture.scope.principal,
+      originEntryPath: 'http.start',
+    });
+
+    // #when
+    const blocking = await fixture.host.blockingRun(fixture.scope);
+
+    // #then
+    expect(blocking).toEqual({
+      runId: 'acme_run',
+      principal: fixture.scope.principal,
+      status,
+    });
+  });
+
+  it('reports no status for a run with an operation executing in the isolate', async () => {
+    // #given — a start whose stream has not returned
+    const { host, scope } = harness();
+    let release: (() => void) | undefined;
+    mocked.stream.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          release = () => resolve({});
+        }),
+    );
+    const started = host.start(scope, {
+      agentId: 'writer',
+      threadId: 'acme_thread',
+      resourceId: RESOURCE_ID,
+      runId: 'acme_run',
+      prompt: 'go',
+      entryPath: 'http.start',
+    });
+    await vi.waitFor(() => expect(mocked.stream).toHaveBeenCalledOnce());
+
+    // #when
+    const blocking = await host.blockingRun(scope);
+
+    // #then — the run blocks the thread, and its status is left unreported
+    expect(blocking).toMatchObject({
+      runId: 'acme_run',
+      principal: scope.principal,
+    });
+    expect(blocking).not.toHaveProperty('status');
+    release?.();
+    await started;
   });
 });
 
@@ -4197,6 +4509,28 @@ describe('createThreadAgentHost permission authorization', () => {
 });
 
 describe('createThreadAgentHost automated entry', () => {
+  it('checks notification dispatch declarations without starting or auditing', async () => {
+    const denied = harness(['writer']);
+    expect(
+      await denied.host.notificationDispatchAllowed(denied.scope, 'writer'),
+    ).toBe(false);
+    expect(
+      await denied.host.notificationDispatchAllowed(denied.scope, 'missing'),
+    ).toBe(false);
+    const allowed = harness(['writer'], {
+      allowedAutomation: [
+        { kind: 'system', entryPaths: ['notification.dispatch'] },
+      ],
+    });
+    expect(
+      await allowed.host.notificationDispatchAllowed(allowed.scope, 'writer'),
+    ).toBe(true);
+    expect(allowed.auditEvents).toEqual([]);
+    expect(denied.auditEvents).toEqual([]);
+    expect(mocked.stream).not.toHaveBeenCalled();
+    expect(allowed.state.size).toBe(0);
+    expect(denied.state.size).toBe(0);
+  });
   const SCHEDULER: ExecutionPrincipal = {
     kind: 'system',
     id: 'flowsafe-scheduler',
@@ -4305,8 +4639,7 @@ describe('createThreadAgentHost automated entry', () => {
     // #when
     await host.start(scope, scheduledStart());
 
-    // #then — kind is what breakwater's mandatory gate authorizes on, and the
-    // projected role is the least-privileged one, never 'operator'.
+    // #then — the projected role is never 'operator'.
     const options = mocked.stream.mock.calls[0]?.[1];
     expect(options?.requestContext.get('breakwater.actor')).toEqual({
       id: 'flowsafe-scheduler',

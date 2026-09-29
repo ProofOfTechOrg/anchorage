@@ -5,6 +5,10 @@ import type {
   DirectRunSnapshot,
   DirectTeardownFailure,
 } from './direct-credentialed-run-state.mjs';
+import type {
+  DirectScenarioFailure,
+  DirectScenarioPhase,
+} from './direct-credentialed-scenario.mjs';
 import type { DirectTeardownOutcome } from './direct-credentialed-teardown.mjs';
 
 /** The modes that reach the provider, and therefore the modes evidence covers. */
@@ -75,12 +79,12 @@ export class DirectEvidenceWriteError extends Error {
   constructor();
 }
 export type DirectEvidenceScenarioFailure = Readonly<{
-  code: string;
+  code: DirectScenarioFailure;
   ordinal: number;
   detail: string | null;
 }>;
 export type DirectEvidenceScenario = Readonly<{
-  phase: string;
+  phase: DirectScenarioPhase;
   failure: DirectEvidenceScenarioFailure | null;
   invocationCount: number;
   sdkRequests: number | null;

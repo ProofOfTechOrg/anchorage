@@ -1,9 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-// FlowsafeDurableAgent pins the host-seam requester passed to runtime.start;
-// terminal refusal for an unregistered run; bounded, best-effort input
-// preservation plus its missing-thread and read-only-memory branches; live-id
-// refusal; and generate() rewrapping the core-reconstructed terminal refusal.
-//
 // The engine-leg-context-to-tool grant round-trip is proven end to end against
 // the real runtime, connector, and grant provider in
 // agent-gate-round-trip.test.ts.
@@ -12,7 +7,7 @@
 // "rejects re-entry after the host waiter settles while the run registry stays
 // live".
 
-import { Agent } from '@mastra/core/agent';
+import { Agent, createSignal } from '@mastra/core/agent';
 import {
   DurableAgent,
   type DurableAgenticWorkflowInput,
@@ -26,6 +21,7 @@ import {
 } from '@mastra/core/agent/message-list';
 import { EventEmitterPubSub } from '@mastra/core/events';
 import type { MastraModelConfig } from '@mastra/core/llm';
+import { Mastra } from '@mastra/core/mastra';
 import { MockMemory } from '@mastra/core/memory';
 import {
   type OutputResult,
@@ -33,6 +29,8 @@ import {
   ProcessorRunner,
 } from '@mastra/core/processors';
 import { RequestContext } from '@mastra/core/request-context';
+import { InMemoryStore } from '@mastra/core/storage';
+import type { AnyWorkflow } from '@mastra/core/workflows';
 import {
   ACTOR_CONTEXT_KEY,
   AuditLogger,
@@ -83,17 +81,15 @@ import {
   type AuthoritativeAgentStartState,
   createFlowsafeDurableAgent,
   DURABLE_AGENTIC_LOOP_WORKFLOW_ID,
-  type FlowsafeDurableAgent,
+  FlowsafeDurableAgent,
   isRuntimeDrivenAgent,
   type LegacyAgentRunState,
 } from './durable-agent-runner.js';
 
 // A fake runtime that records register() and start() and models the shared-id
 // registry so the idempotency path is exercised. The cast to RunnerRuntime
-// stands on what the literal below implements — registerAgent, register,
-// workflowIds, start, resume, and pubsub when an override supplies it; a
-// runner call to any other member of the interface reaches undefined here and
-// throws. `startResult` overrides the summary start() resolves to (e.g. a
+// stands on what the literal below implements; a runner call to any other
+// member of the interface reaches undefined here and throws. `startResult` overrides the summary start() resolves to (e.g. a
 // 'failed' run); `pubsub` exposes an identity for the inheritance test.
 function fakeRuntime(
   overrides: {
@@ -153,7 +149,7 @@ function fakeRuntime(
   };
 }
 
-function testAgent(id = 'writer'): Agent {
+function testAgent(id = 'writer', pubsub?: EventEmitterPubSub): Agent {
   return new Agent({
     id,
     name: id,
@@ -161,6 +157,7 @@ function testAgent(id = 'writer'): Agent {
     // A model-router id string (never invoked): executeWorkflow drives the
     // runtime, not the LLM, so the agent only has to construct.
     model: 'openai/gpt-4o-mini',
+    pubsub,
   });
 }
 
@@ -177,6 +174,8 @@ function guardedTestAgent(): Agent {
     toolChoice: 'auto',
   }) as unknown as Agent;
 }
+
+const UNOWNED_INPUT_MARK = 'MKUNOWNEDINPUT';
 
 function actorContext(role: Role = 'operator'): RequestContext {
   const context = new RequestContext();
@@ -265,8 +264,8 @@ async function runOutputResultProcessors(
   }
 }
 
-// executeWorkflow is protected — the durable loop calls it, and no route ever
-// does. Reach it through a cast for the drive/guard assertions.
+// executeWorkflow is protected. Reach it through a cast for the drive/guard
+// assertions.
 function drive(
   agent: FlowsafeDurableAgent,
   runId: unknown,
@@ -399,15 +398,15 @@ async function cRefusedAuthority(source: unknown, expected: Error) {
   ).resolves.toHaveLength(2);
 }
 
-function cLocalModel(onCall: () => void): MastraModelConfig {
+function cLocalModel(onCall: (prompt: unknown) => void): MastraModelConfig {
   const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
   return {
     specificationVersion: 'v2',
     provider: 'flowsafe-test',
     modelId: 'c-local-text',
     supportedUrls: {},
-    doGenerate: async () => {
-      onCall();
+    doGenerate: async (options) => {
+      onCall(options.prompt);
       return {
         content: [{ type: 'text', text: 'done' }],
         finishReason: 'stop',
@@ -415,8 +414,8 @@ function cLocalModel(onCall: () => void): MastraModelConfig {
         warnings: [],
       };
     },
-    doStream: async () => {
-      onCall();
+    doStream: async (options) => {
+      onCall(options.prompt);
       return {
         stream: new ReadableStream({
           start(controller) {
@@ -441,6 +440,7 @@ async function cRealBridge(
   provider?: RequestContextProvider,
   modelFault?: Error,
   threaded = false,
+  guarded?: { memory: MockMemory; prompts: unknown[] },
 ) {
   const sql = openSqlite() as ReturnType<typeof openSqlite> & { close(): void };
   const binding = sqliteUnitDatabase(sql) as ExecutionFenceDatabase;
@@ -494,17 +494,32 @@ async function cRealBridge(
       requestContextForRun: provider,
     },
   );
+  const model = cLocalModel((prompt) => {
+    counts.model++;
+    guarded?.prompts.push(prompt);
+    if (modelFault) throw modelFault;
+  });
   const agent = createFlowsafeDurableAgent({
-    agent: new Agent({
-      id: 'writer',
-      name: 'Writer',
-      instructions: 'Return done.',
-      ...(threaded ? { memory: new MockMemory() } : {}),
-      model: cLocalModel(() => {
-        counts.model++;
-        if (modelFault) throw modelFault;
-      }),
-    }),
+    agent: guarded
+      ? (createGuardedAgent({
+          id: 'writer',
+          name: 'Writer',
+          instructions: 'Return done.',
+          memory: guarded.memory,
+          model,
+          allowedRoles: ['operator'],
+          policies: [],
+          audit: new AuditLogger(),
+          maxSteps: 1,
+          toolChoice: 'auto',
+        }) as unknown as Agent)
+      : new Agent({
+          id: 'writer',
+          name: 'Writer',
+          instructions: 'Return done.',
+          ...(threaded ? { memory: new MockMemory() } : {}),
+          model,
+        }),
     runtime,
     cache: false,
     maxSteps: 1,
@@ -514,6 +529,77 @@ async function cRealBridge(
 }
 
 describe('C agent bridge capture', () => {
+  it('loads stored thread history into a guarded durable model prompt', async () => {
+    const memory = new MockMemory({ storage: new InMemoryStore() });
+    const createdAt = new Date(Date.now() - 60_000);
+    await memory.saveThread({
+      thread: {
+        id: 'thread-1',
+        resourceId: 'thread-1',
+        createdAt,
+        updatedAt: createdAt,
+        metadata: {},
+      },
+    });
+    await memory.saveMessages({
+      messages: [
+        {
+          id: 'stored-history',
+          role: 'user',
+          threadId: 'thread-1',
+          resourceId: 'thread-1',
+          createdAt,
+          content: {
+            format: 2,
+            parts: [{ type: 'text', text: 'earlier stored question' }],
+          },
+        },
+      ],
+    });
+    const prompts: unknown[] = [];
+    const f = await cRealBridge(
+      () => ({ [ACTOR_CONTEXT_KEY]: { id: 'actor-1', role: 'operator' } }),
+      undefined,
+      false,
+      { memory, prompts },
+    );
+    const runId = 'guarded-history';
+    let result:
+      | Awaited<ReturnType<typeof f.agent.streamUntilPersisted>>
+      | undefined;
+    try {
+      result = await f.agent.streamUntilPersisted(
+        'New question',
+        {
+          runId,
+          memory: { thread: 'thread-1', resource: 'thread-1' },
+          requestContext: actorContext(),
+          disableBackgroundTasks: true,
+        },
+        'operator-1',
+        'human',
+        'guarded-history-attempt',
+        undefined,
+        undefined,
+        { ...startAuthority(), agentStart: { threaded: true } },
+      );
+      expect(await result.output.text).toBe('done');
+      await globalRunRegistry.get(runId)?.workflowExecution;
+      expect(f.counts.model).toBe(1);
+      expect(prompts).toHaveLength(1);
+      expect(JSON.stringify(prompts[0])).toContain('earlier stored question');
+      expect(JSON.stringify(prompts[0])).toContain('New question');
+    } finally {
+      await globalRunRegistry
+        .get(runId)
+        ?.workflowExecution?.catch(() => undefined);
+      result?.cleanup();
+      globalRunRegistry.delete(runId);
+      f.start.mockRestore();
+      f.sql.close();
+    }
+  });
+
   it.each([
     null,
     '2',
@@ -1489,6 +1575,101 @@ describe('createFlowsafeDurableAgent', () => {
     expect(isRuntimeDrivenAgent(undefined)).toBe(false);
   });
 
+  it.each([
+    [
+      'channels configured',
+      () => {
+        const agent = testAgent();
+        agent.setChannels({ __setAgent() {}, __setLogger() {} } as never);
+        return agent;
+      },
+      'FlowsafeDurableAgent: the wrapped agent has channels configured: ',
+    ],
+    [
+      "the 'durable' option",
+      () =>
+        new Agent({
+          id: 'writer',
+          name: 'writer',
+          instructions: 'You are a test agent.',
+          model: 'openai/gpt-4o-mini',
+          durable: true,
+        }),
+      "FlowsafeDurableAgent: the wrapped agent sets the 'durable' option: ",
+    ],
+    [
+      'a Mastra DurableAgent',
+      () => new DurableAgent({ agent: testAgent() }) as unknown as Agent,
+      'FlowsafeDurableAgent: the wrapped agent is already a durable agent: ',
+    ],
+    [
+      'a FlowsafeDurableAgent',
+      () =>
+        createFlowsafeDurableAgent({
+          agent: testAgent(),
+          runtime: fakeRuntime().runtime,
+        }) as unknown as Agent,
+      'FlowsafeDurableAgent: the wrapped agent is already a durable agent: ',
+    ],
+    [
+      'declared schedules',
+      () => {
+        const agent = testAgent();
+        agent.__setDeclaredSchedules([{} as never]);
+        return agent;
+      },
+      'FlowsafeDurableAgent: the wrapped agent declares schedules: ',
+    ],
+  ])('refuses to wrap an agent with %s before registering anything', (_label, wrapped, message) => {
+    // #given a runtime with nothing registered
+    const { runtime, register, registerAgent } = fakeRuntime();
+    const viaFactory = () =>
+      createFlowsafeDurableAgent({ agent: wrapped(), runtime });
+    const direct = () =>
+      new FlowsafeDurableAgent({ agent: wrapped(), runtime });
+
+    // #when / #then the factory and direct construction both refuse with a
+    // TypeError naming what the agent carries, and the runtime registers
+    // nothing
+    expect(viaFactory).toThrow(TypeError);
+    expect(viaFactory).toThrow(message);
+    expect(direct).toThrow(TypeError);
+    expect(direct).toThrow(message);
+    expect(registerAgent).not.toHaveBeenCalled();
+    expect(register).not.toHaveBeenCalled();
+  });
+
+  it('refuses status and start once the loop is added to another Mastra', async () => {
+    // #given a wrapper on a real runtime whose first operation built its Mastra
+    const { runtime } = init(
+      { storage: new InMemoryStore() },
+      { executionFence: 'none', startIdempotency: 'none' },
+    );
+    const durable = createFlowsafeDurableAgent({ agent: testAgent(), runtime });
+    await expect(
+      runtime.status(DURABLE_AGENTIC_LOOP_WORKFLOW_ID, 'first-read'),
+    ).resolves.toBeNull();
+
+    // #when the loop the wrapper hands out is added to another Mastra
+    new Mastra({
+      storage: new InMemoryStore(),
+      logger: false,
+      workflows: { loop: durable.getWorkflow() as unknown as AnyWorkflow },
+    });
+
+    // #then the runtime refuses the loop rather than read that Mastra's storage
+    const refusal = `RunnerRuntime: workflow '${DURABLE_AGENTIC_LOOP_WORKFLOW_ID}' is not registered on this runtime's Mastra`;
+    await expect(
+      runtime.status(DURABLE_AGENTIC_LOOP_WORKFLOW_ID, 'first-read'),
+    ).rejects.toThrow(refusal);
+    await expect(
+      runtime.start(DURABLE_AGENTIC_LOOP_WORKFLOW_ID, {
+        runId: 'after-repoint',
+        inputData: {},
+      } as StartRunOptions),
+    ).rejects.toThrow(refusal);
+  });
+
   it('rejects structured durable methods for a guarded agent before core dispatch', async () => {
     const { runtime } = fakeRuntime();
     const durable = createFlowsafeDurableAgent({
@@ -1722,6 +1903,92 @@ describe('FlowsafeDurableAgent.executeWorkflow', () => {
     expect(saveMessages).not.toHaveBeenCalled();
   });
 
+  it.each([
+    [
+      'the RBAC gate refuses it for a missing actor',
+      `${UNOWNED_INPUT_MARK} text`,
+      undefined,
+      'agent.input.authorize',
+    ],
+    [
+      'an input policy refuses it',
+      `${UNOWNED_INPUT_MARK} text`,
+      actorContext,
+      'agent.input.policy',
+    ],
+    [
+      'the RBAC gate refuses a created signal streamed with a request context',
+      createSignal({ type: 'user', contents: `${UNOWNED_INPUT_MARK} text` }),
+      () => new RequestContext(),
+      'agent.input.authorize',
+    ],
+  ] as const)('saves none of a direct unowned stream input when %s', async (_label, input, requestContext, refusingAction) => {
+    // #given — a guarded agent whose input policy denies the marker, over a
+    // thread that exists
+    const { runtime, start } = fakeRuntime();
+    const memory = new MockMemory();
+    await memory.saveThread({
+      thread: {
+        id: 'thread-1',
+        resourceId: 'resource-1',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        metadata: {},
+      },
+    });
+    const audit = new AuditLogger();
+    const agent = createFlowsafeDurableAgent({
+      agent: createGuardedAgent({
+        id: 'writer',
+        name: 'Writer',
+        instructions: 'Answer the request.',
+        model: 'openai/gpt-4o-mini',
+        memory,
+        allowedRoles: ['operator'],
+        policies: [denyPatterns([UNOWNED_INPUT_MARK])],
+        audit,
+        maxSteps: 2,
+        toolChoice: 'auto',
+      }) as unknown as Agent,
+      runtime,
+      cache: false,
+    });
+    const saveMessages = vi.spyOn(memory, 'saveMessages');
+    const emitError = vi.spyOn(
+      agent as unknown as {
+        emitError: (id: string, error: Error) => Promise<void>;
+      },
+      'emitError',
+    );
+
+    // #when — a caller streams its own input past the host start seam
+    await agent.stream(input, {
+      runId: 'run-1',
+      memory: { thread: 'thread-1', resource: 'resource-1' },
+      ...(requestContext ? { requestContext: requestContext() } : {}),
+    });
+    await vi.waitFor(() =>
+      expect(emitError).toHaveBeenCalledWith(
+        'run-1',
+        expect.any(InvalidRunRequestError),
+      ),
+    );
+
+    // #then — the named gate refused the call, and memory holds none of it
+    expect(
+      audit
+        .events()
+        .some(
+          (event) =>
+            event.action === refusingAction && event.decision === 'denied',
+        ),
+    ).toBe(true);
+    expect(start).not.toHaveBeenCalled();
+    expect(saveMessages).not.toHaveBeenCalled();
+    const { messages } = await memory.recall({ threadId: 'thread-1' });
+    expect(JSON.stringify(messages)).not.toContain(UNOWNED_INPUT_MARK);
+  });
+
   it('publishes the terminal error when unowned input persistence times out', async () => {
     vi.useFakeTimers();
     vi.spyOn(console, 'error').mockImplementation(() => undefined);
@@ -1809,7 +2076,7 @@ describe('FlowsafeDurableAgent.executeWorkflow', () => {
     expect(start).not.toHaveBeenCalled();
   });
 
-  it('rejects a non-path-safe runId (INV-1 posture identical to RunnerRuntime.start)', async () => {
+  it('rejects a non-path-safe runId (INV-1)', async () => {
     // #given
     const { runtime, start } = fakeRuntime();
     const agent = createFlowsafeDurableAgent({ agent: testAgent(), runtime });
@@ -2223,8 +2490,8 @@ describe('FlowsafeDurableAgent INV-1 boundary (stream/generate)', () => {
   });
 });
 
-// prepare() is the THIRD inherited minting entry point (stream/generate are the
-// other two): it forwards options?.runId into core's prepareForDurableExecution,
+// prepare() is an inherited minting entry point: it forwards options?.runId
+// into core's prepareForDurableExecution,
 // which mints an unowned crypto.randomUUID() AND registers a run under it when
 // runId is absent (@mastra/core 1.50.0 agent/durable/index.js:5980 -> :589 ->
 // :5984). PATH_SAFE_ID_PATTERN accepts a bare UUID, so no downstream guard
@@ -2296,7 +2563,7 @@ describe('FlowsafeDurableAgent INV-1 boundary (prepare)', () => {
   });
 });
 
-describe('FlowsafeDurableAgent pubsub identity (DL-001)', () => {
+describe('FlowsafeDurableAgent pubsub identity', () => {
   it("defaults the agent's stream pubsub to the runtime's identity", () => {
     // #given a runtime carrying a pubsub identity, and no explicit pubsub option
     const pubsub = new EventEmitterPubSub();
@@ -2312,6 +2579,37 @@ describe('FlowsafeDurableAgent pubsub identity (DL-001)', () => {
     // observe()/emitError align (no dead feed) without the host wiring it twice
     expect(agent.pubsub).toBe(pubsub);
   });
+
+  it('refuses a wrapped agent with a different pubsub of its own', () => {
+    const ownPubsub = new EventEmitterPubSub();
+    const { runtime } = fakeRuntime({ pubsub: new EventEmitterPubSub() });
+    const rawAgent = testAgent('writer', ownPubsub);
+
+    expect(() =>
+      createFlowsafeDurableAgent({ agent: rawAgent, runtime }),
+    ).toThrow(TypeError);
+  });
+
+  it('accepts a wrapped agent sharing the runtime pubsub', () => {
+    const pubsub = new EventEmitterPubSub();
+    const { runtime } = fakeRuntime({ pubsub });
+    const rawAgent = testAgent('writer', pubsub);
+
+    const agent = createFlowsafeDurableAgent({ agent: rawAgent, runtime });
+    expect(agent.getPubSub()).toBe(pubsub);
+  });
+
+  it('accepts a registered agent using its Mastra pubsub fallback', () => {
+    const pubsub = new EventEmitterPubSub();
+    const mastra = new Mastra({ agents: { writer: testAgent() }, pubsub });
+    const rawAgent = mastra.getAgentById('writer');
+    const agent = createFlowsafeDurableAgent({
+      agent: rawAgent,
+      runtime: fakeRuntime({ pubsub }).runtime,
+    });
+
+    expect(agent.getPubSub()).toBe(pubsub);
+  });
 });
 
 describe('FlowsafeDurableAgent thread runtime registration and rehydration', () => {
@@ -2320,73 +2618,73 @@ describe('FlowsafeDurableAgent thread runtime registration and rehydration', () 
     vi.restoreAllMocks();
   });
 
-  it('registers a started stream output under the same pubsub and memory options', async () => {
+  it('registers a resumed run on the agent pubsub with the default cache', async () => {
     const pubsub = new EventEmitterPubSub();
-    const { runtime } = fakeRuntime({ pubsub });
-    const registerRun = vi.fn(async () => undefined);
+    const { runtime, resume } = fakeRuntime({
+      pubsub,
+      resumeContext: actorContext(),
+    });
+    const registerRun = vi.fn(async (..._args: unknown[]) => undefined);
     const agent = createFlowsafeDurableAgent({
-      agent: testAgent(),
+      agent: guardedTestAgent(),
       runtime,
-      cache: false,
       threadRuntime: { registerRun } as never,
     });
-    const output = { id: 'output' };
-    vi.spyOn(DurableAgent.prototype, 'stream').mockResolvedValue({
-      output,
-    } as never);
-    const options = {
+    await agent.prepare('initial request', {
       runId: 'run-1',
+      requestContext: actorContext(),
       memory: { thread: 'thread-1', resource: 'resource-1' },
-    } as never;
+    });
+    registryFor(agent).clear();
+    globalRunRegistry.clear();
+    const output = { id: 'rehydrated' };
+    const memory = { thread: 'thread-1', resource: 'resource-1' };
+    vi.spyOn(agent, 'observe').mockResolvedValue({ output } as never);
 
-    await agent.stream('hello', options);
+    await agent.resumeViaRuntime({
+      runId: 'run-1',
+      requestedBy: 'reviewer-1',
+      memory,
+    });
 
-    expect(registerRun).toHaveBeenCalledWith(agent, output, options, pubsub);
+    expect(resume).toHaveBeenCalledOnce();
+    expect(registerRun).toHaveBeenCalledOnce();
+    expect(registerRun).toHaveBeenCalledWith(
+      agent,
+      expect.objectContaining(output),
+      { runId: 'run-1', memory },
+      agent.getPubSub(),
+    );
+    expect(agent.getPubSub()).toBe(pubsub);
   });
 
-  it.each([
-    ['boolean true', true],
-    ['object-valued untilIdle', { maxWaitMs: 1000 }],
-  ])('does not register the outer aggregate stream for %s', async (_label, untilIdle) => {
-    const pubsub = new EventEmitterPubSub();
-    const { runtime } = fakeRuntime({ pubsub });
-    const registerRun = vi.fn(async () => undefined);
+  it('keeps private-field getters readable on a registered resumed output', async () => {
+    // Core's stream output keeps `status` in a private field, and the thread
+    // runtime reads it to decide whether the run blocks its thread.
+    class PrivateStatusOutput {
+      readonly #status = 'running';
+      get status(): string {
+        return this.#status;
+      }
+    }
+    const { runtime } = fakeRuntime({ resumeContext: actorContext() });
+    let registeredOutput: { status: string } | undefined;
     const agent = createFlowsafeDurableAgent({
       agent: testAgent(),
       runtime,
-      cache: false,
-      threadRuntime: { registerRun } as never,
+      threadRuntime: {
+        registerRun: vi.fn(async (_agent, output) => {
+          registeredOutput = output as typeof registeredOutput;
+        }),
+      } as never,
     });
-    vi.spyOn(DurableAgent.prototype, 'stream').mockResolvedValue({
-      output: { id: 'aggregate' },
+    vi.spyOn(agent, 'observe').mockResolvedValue({
+      output: new PrivateStatusOutput(),
     } as never);
 
-    await agent.stream('hello', {
-      runId: 'run-1',
-      untilIdle,
-    } as never);
+    await agent.resumeViaRuntime({ runId: 'run-1', requestedBy: 'reviewer-1' });
 
-    expect(registerRun).not.toHaveBeenCalled();
-  });
-
-  it('registers a concrete stream when untilIdle is explicitly false', async () => {
-    const { runtime } = fakeRuntime();
-    const registerRun = vi.fn(async () => undefined);
-    const agent = createFlowsafeDurableAgent({
-      agent: testAgent(),
-      runtime,
-      threadRuntime: { registerRun } as never,
-    });
-    vi.spyOn(DurableAgent.prototype, 'stream').mockResolvedValue({
-      output: { id: 'concrete' },
-    } as never);
-
-    await agent.stream('hello', {
-      runId: 'run-1',
-      untilIdle: false,
-    } as never);
-
-    expect(registerRun).toHaveBeenCalledTimes(1);
+    expect(registeredOutput?.status).toBe('running');
   });
 
   it('rehydrates guarded registries without replaying application input processors', async () => {
@@ -2454,11 +2752,15 @@ describe('FlowsafeDurableAgent thread runtime registration and rehydration', () 
     expect(instanceEntry?.inputProcessors?.map(({ id }) => id)).toEqual([
       'breakwater-rbac',
       'application-input',
+      'breakwater-input-assets',
+      'breakwater-client-tool-output',
       'breakwater-policy-engine',
     ]);
     expect(globalEntry?.inputProcessors?.map(({ id }) => id)).toEqual([
       'breakwater-rbac',
       'application-input',
+      'breakwater-input-assets',
+      'breakwater-client-tool-output',
       'breakwater-policy-engine',
     ]);
     expect(
@@ -2483,6 +2785,105 @@ describe('FlowsafeDurableAgent thread runtime registration and rehydration', () 
       ),
     ).rejects.toThrow('matched blocked pattern blocked-resume-output');
     expect(outputInvocation).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['an allowed actor', 'operator' as const],
+    ['a disallowed actor', 'viewer' as const],
+  ])('keeps a resumed guarded leg closed on memory resolution failure for %s', async (_label, role) => {
+    const memory = new MockMemory();
+    const audit = new AuditLogger();
+    const { runtime, resume } = fakeRuntime();
+    const modelCall = vi.fn();
+    const agent = createFlowsafeDurableAgent({
+      agent: createGuardedAgent({
+        id: 'writer',
+        name: 'Writer',
+        instructions: 'Answer the request.',
+        model: cLocalModel(modelCall),
+        memory,
+        allowedRoles: ['operator'],
+        policies: [],
+        audit,
+        maxSteps: 2,
+        toolChoice: 'auto',
+      }) as unknown as Agent,
+      runtime,
+      cache: false,
+    });
+    await agent.prepare('initial request', {
+      runId: 'run-1',
+      requestContext: actorContext(),
+      memory: { thread: 'thread-1', resource: 'resource-1' },
+    });
+    vi.spyOn(memory, 'getInputProcessors').mockRejectedValue(
+      new Error('private memory failure'),
+    );
+    registryFor(agent).clear();
+    globalRunRegistry.clear();
+    vi.spyOn(agent, 'observe').mockResolvedValue({
+      output: { id: 'rehydrated' },
+    } as never);
+    let restoredInputProcessors: string[] | undefined;
+    resume.mockImplementation(async (_workflowId, runId, options) => {
+      await options?.prepareExecution?.(actorContext(role));
+      const entry = globalRunRegistry.get(runId);
+      assert(entry);
+      restoredInputProcessors = entry.inputProcessors?.map(({ id }) => id);
+      const messageList = new MessageList();
+      messageList.add('follow-up', 'input');
+      const runner = new ProcessorRunner({
+        inputProcessors: entry.inputProcessors,
+        logger: {} as never,
+        agentName: 'Writer',
+        processorStates: entry.processorStates,
+      });
+      await runner.runProcessInputStep({
+        messageList,
+        stepNumber: 1,
+        steps: [],
+        model: entry.model as never,
+        requestContext: actorContext(role),
+      });
+      modelCall();
+      return { runId, status: 'success' as const };
+    });
+
+    await expect(
+      agent.resumeViaRuntime({
+        runId: 'run-1',
+        requestedBy: 'reviewer-1',
+        memory: { thread: 'thread-1', resource: 'resource-1' },
+      }),
+    ).rejects.toThrow(
+      role === 'operator'
+        ? 'input processor failed'
+        : /^Durable agent registry rehydration denied: /,
+    );
+
+    expect(modelCall).not.toHaveBeenCalled();
+    expect(resume).toHaveBeenCalledOnce();
+    if (role === 'operator') {
+      expect(restoredInputProcessors).toEqual([
+        'breakwater-rbac',
+        'breakwater-memory',
+      ]);
+      expect(
+        audit
+          .events()
+          .filter((event) => event.action === 'agent.input.processor'),
+      ).toMatchObject([
+        { decision: 'error', detail: { processor: 'breakwater-memory' } },
+      ]);
+    } else {
+      expect(registryFor(agent).has('run-1')).toBe(false);
+      expect(globalRunRegistry.has('run-1')).toBe(false);
+      expect(
+        audit
+          .events()
+          .filter((event) => event.action === 'agent.input.processor'),
+      ).toEqual([]);
+    }
   });
 
   it('preserves raw-agent step and LLM-request processors without replaying processInput', async () => {

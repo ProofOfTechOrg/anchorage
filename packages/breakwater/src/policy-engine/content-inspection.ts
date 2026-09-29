@@ -6,12 +6,99 @@
 // model call) evaluated on a streaming cadence. Both are best-effort — see
 // each export's doc for its accepted evasion surface.
 
+import {
+  assertKnownFields,
+  describeEntry,
+  readFrozenList,
+  readNumberInRange,
+} from '../host-input.js';
 import type {
   OutputChannel,
   PolicyEvaluator,
   PolicyPhase,
 } from './evaluator-contract.js';
 import type { PolicyDecision } from './tool-policy.js';
+
+// Captured at load: calling the intrinsic getter is the brand check. It throws
+// for any object without RegExp's internal slot except RegExp.prototype
+// itself, whereas `Object.prototype.toString` reads `Symbol.toStringTag` and
+// `instanceof` reads the prototype chain, both of which the caller controls.
+const regExpSourceGetter = Object.getOwnPropertyDescriptor(
+  RegExp.prototype,
+  'source',
+)?.get;
+
+function carriesRegExpSlot(value: unknown): value is RegExp {
+  if (
+    typeof value !== 'object' ||
+    value === null ||
+    value === RegExp.prototype ||
+    regExpSourceGetter === undefined
+  ) {
+    return false;
+  }
+  try {
+    Reflect.apply(regExpSourceGetter, value, []);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * @internal Copy a RegExp entry of a host-supplied pattern list, refusing any
+ * value without RegExp's internal slot. The policy keeps the copy, so no
+ * method assigned to the caller's object before or after construction answers
+ * for it. The flags come from the copy and drop 'g' and 'y': those flags
+ * carry `lastIndex` between `test()` calls, so a shared evaluator would skip a
+ * match on the next request.
+ */
+export function copyRegExpEntry(
+  subject: string,
+  entry: unknown,
+  index: number,
+): RegExp {
+  if (!carriesRegExpSlot(entry)) {
+    throw new TypeError(
+      `${subject} entry ${index} must be a string or a RegExp (got ${describeEntry(entry)})`,
+    );
+  }
+  const copy = new RegExp(entry);
+  return copy.global || copy.sticky
+    ? new RegExp(copy.source, copy.flags.replace(/[gy]/g, ''))
+    : copy;
+}
+
+/**
+ * @internal Read a hold-back hint: a number of at least 0, `Infinity`
+ * included. The engine sizes each window with `Math.max`, which coerces, so an
+ * empty string, `false` or a negative number would count as 0 and release
+ * text the policy has not yet seen whole.
+ */
+export function readHoldBackChars(subject: string, value: unknown): number {
+  return readNumberInRange(
+    subject,
+    value,
+    (hint) => hint >= 0,
+    'a number of at least 0, or Infinity',
+  );
+}
+
+/**
+ * @internal Refuse a policy context `text` that is not a string. The engine
+ * passes strings, but a host can call an evaluator directly, and a detector
+ * that coerces or skips a value it cannot read allows it.
+ */
+export function assertPolicyText(
+  subject: string,
+  text: unknown,
+): asserts text is string {
+  if (typeof text !== 'string') {
+    throw new TypeError(
+      `${subject}: text must be a string (got ${describeEntry(text)})`,
+    );
+  }
+}
 
 // ---------------------------------------------------------------------------
 // piiSecrets — regex + entropy + Luhn detectors
@@ -28,6 +115,30 @@ const JWT_RE =
   /\beyJ[A-Za-z0-9_-]{8,256}\.[A-Za-z0-9_-]{8,256}\.[A-Za-z0-9_-]{8,256}\b/g;
 const SECRET_ASSIGNMENT_RE =
   /(?:api[_-]?key|secret|token|passw(?:or)?d|credential)["']?\s*[:=]\s*["']?[A-Za-z0-9+/_=-]{12,128}/gi;
+
+// The characters a highEntropy candidate is drawn from.
+const HIGH_ENTROPY_CANDIDATE_CLASS = '[A-Za-z0-9+/_=-]';
+
+// Every range in the candidate class is ASCII, so the ASCII code points that
+// match it are its members.
+function asciiMembers(characterClass: string): string {
+  const member = new RegExp(`^${characterClass}$`);
+  let members = '';
+  for (let code = 0; code < 0x80; code += 1) {
+    const character = String.fromCharCode(code);
+    if (member.test(character)) members += character;
+  }
+  return members;
+}
+
+// A candidate's per-character Shannon entropy is highest when every member of
+// its class appears equally often, so a threshold above this can never fire.
+// It is the entropy the detector computes for that candidate, not log2 of the
+// member count, which rounds a few units in the last place higher.
+const MAX_CANDIDATE_ENTROPY = shannonEntropy(
+  asciiMembers(HIGH_ENTROPY_CANDIDATE_CLASS),
+);
+
 // DEFAULT-threshold candidate matcher (zero-alloc fast path). Floor 23 is
 // candidateFloorForThreshold(DEFAULT_ENTROPY_THRESHOLD): the shortest length
 // whose maximum Shannon entropy log2(23) ~= 4.52 reaches the 4.5 bits/char
@@ -37,7 +148,10 @@ const SECRET_ASSIGNMENT_RE =
 // back down to floor 20, a 5.0 bar up to 32), so this constant is the default
 // only — see candidateFloorForThreshold. Exported only for the white-box
 // candidate-floor invariant test — not part of the public API.
-export const HIGH_ENTROPY_CANDIDATE_RE = /[A-Za-z0-9+/_=-]{23,256}/g;
+export const HIGH_ENTROPY_CANDIDATE_RE = new RegExp(
+  `${HIGH_ENTROPY_CANDIDATE_CLASS}{23,256}`,
+  'g',
+);
 
 // secretAssignment's `\s*` around the separator has no regex-level upper
 // bound; for the streaming rescan window (see holdBackChars below) a
@@ -205,15 +319,14 @@ function secretAssignmentDetector(): Detector {
 
 // Smallest candidate length whose MAXIMUM achievable Shannon entropy — log2(L),
 // reached only when every char is distinct — still meets `threshold` bits/char,
-// floored at the original baseline 20 so a lowered bar never widens the net
-// past it. This is an EXTRACTION floor only; the per-candidate entropy check
-// (shannonEntropy >= threshold) is unchanged — deliberately NOT the rejected
-// per-candidate clamp min(threshold, log2(len)) (RA-004), which would flag any
-// all-distinct run regardless of the configured bar. DL-005 (F5) set the {23}
-// floor for a 4.5 threshold; hardcoding it silently drops the 20..22-char
-// candidates a lower configured threshold can still legitimately flag
-// (4.0 -> floor 20 -> log2(20)=4.32 >= 4.0). Examples:
-//   4.5 -> max(20, ceil(2^4.5)=23) = 23   (default; byte-identical to DL-005)
+// floored at 20 so a lowered bar never widens the net past it. This is an
+// EXTRACTION floor only; each candidate still passes the entropy check
+// (shannonEntropy >= threshold), not a per-candidate clamp
+// min(threshold, log2(len)), which would flag any all-distinct run regardless
+// of the configured bar. A fixed {23} floor, the one a 4.5 threshold needs,
+// would drop the 20..22-char candidates a lower configured threshold can still
+// flag (4.0 -> floor 20 -> log2(20)=4.32 >= 4.0). Examples:
+//   4.5 -> max(20, ceil(2^4.5)=23) = 23   (default)
 //   4.0 -> max(20, ceil(2^4.0)=16) = 20
 //   5.0 -> max(20, ceil(2^5.0)=32) = 32
 function candidateFloorForThreshold(threshold: number): number {
@@ -225,14 +338,16 @@ function highEntropyDetector(entropyThreshold: number): Detector {
   // not the hardcoded default. The default reuses the shared module RE
   // (zero-alloc fast path); a non-default threshold compiles a one-time RE here
   // at detector construction (never per scan). Clamp the floor to the 256 max
-  // span so an out-of-range threshold (floor > 256 — unreachable anyway for a
-  // 66-symbol alphabet, max entropy log2(66) ~= 6.04) can't build an
-  // out-of-order {min,256} quantifier and throw at construction.
+  // span so the {min,256} quantifier stays in order. piiSecrets refuses a
+  // threshold above MAX_CANDIDATE_ENTROPY, whose floor is far below 256.
   const floor = candidateFloorForThreshold(entropyThreshold);
   const candidateRe =
     floor === candidateFloorForThreshold(DEFAULT_ENTROPY_THRESHOLD)
       ? HIGH_ENTROPY_CANDIDATE_RE
-      : new RegExp(`[A-Za-z0-9+/_=-]{${Math.min(floor, 256)},256}`, 'g');
+      : new RegExp(
+          `${HIGH_ENTROPY_CANDIDATE_CLASS}{${Math.min(floor, 256)},256}`,
+          'g',
+        );
   return {
     id: 'highEntropy',
     maxSpan: 256,
@@ -250,18 +365,12 @@ function highEntropyDetector(entropyThreshold: number): Detector {
 
 type CompiledAllowlistEntry = string | RegExp;
 
-// Strip g/y flags once, like denyPatterns' pattern compilation: a shared
-// evaluator reusing a caller-supplied g/y-flagged RegExp across many calls
-// would let its mutated lastIndex skip matches on alternating calls.
-function compileAllowlist(
-  entries: readonly (string | RegExp)[],
-): readonly CompiledAllowlistEntry[] {
-  return entries.map((entry) => {
-    if (typeof entry === 'string') return entry.toLowerCase();
-    return entry.global || entry.sticky
-      ? new RegExp(entry.source, entry.flags.replace(/[gy]/g, ''))
-      : entry;
-  });
+function compileAllowlist(entries: unknown): readonly CompiledAllowlistEntry[] {
+  return readFrozenList('piiSecrets: allowlist', entries, (entry, index) =>
+    typeof entry === 'string'
+      ? entry.toLowerCase()
+      : copyRegExpEntry('piiSecrets: allowlist', entry, index),
+  );
 }
 
 function isAllowlisted(
@@ -303,22 +412,46 @@ function scanForDenial(
 export interface PiiSecretsOptions {
   /** Policy name used in denials and audit records. */
   name?: string;
-  /** Subset of detector ids to run. Default: all. */
+  /**
+   * Subset of detector ids to run. Default: all. A present list must be a
+   * non-empty array of {@link PII_SECRETS_DETECTOR_IDS} members.
+   */
   detectors?: readonly PiiSecretsDetectorId[];
   /**
    * Exemptions: a match is skipped when its text equals (case-insensitive) an
-   * allowlist string, or tests true against an allowlist RegExp.
+   * allowlist string, or tests true against an allowlist RegExp. Each entry
+   * must be a string or a RegExp; construction keeps its own copy of each
+   * RegExp.
    */
   allowlist?: readonly (string | RegExp)[];
-  /** Minimum bits/char for the highEntropy detector. Default 4.5. */
+  /**
+   * Minimum bits/char for the highEntropy detector. Default 4.5. A present
+   * value must be a number greater than 0 and at most the entropy of a
+   * candidate that uses each character of the 67-character candidate alphabet
+   * equally often (about 6.066), the highest entropy a candidate can reach. A
+   * threshold at that maximum still detects such a candidate.
+   */
   entropyThreshold?: number;
   /** Agent lifecycle phases to inspect. Default: both input and output. */
   phases?: readonly PolicyPhase[];
   /** Default: ['answer', 'reasoning', 'object'] — leak prevention, matching denyPatterns' default. */
   channels?: readonly OutputChannel[];
-  /** Override the computed hold-back hint (maxEnabledSpan - 1). */
+  /**
+   * Override the computed hold-back hint (maxEnabledSpan - 1). A present value
+   * must be a number of at least 0, or `Infinity`.
+   */
   holdBackChars?: number;
 }
+
+const PII_SECRETS_OPTION_KEYS = {
+  name: true,
+  detectors: true,
+  allowlist: true,
+  entropyThreshold: true,
+  phases: true,
+  channels: true,
+  holdBackChars: true,
+} satisfies Record<keyof PiiSecretsOptions, true>;
 
 /**
  * Deny when the gated text contains PII or a credential-shaped secret:
@@ -342,8 +475,15 @@ export interface PiiSecretsOptions {
  * ever produce an extra scan, never hide a real match, so it fails closed.
  */
 export function piiSecrets(options: PiiSecretsOptions = {}): PolicyEvaluator {
-  const entropyThreshold =
-    options.entropyThreshold ?? DEFAULT_ENTROPY_THRESHOLD;
+  assertKnownFields('piiSecrets: options', options, PII_SECRETS_OPTION_KEYS);
+  // A threshold that is not a finite number, or is above the maximum, never
+  // fires; one at or below 0 flags every candidate of secret shape.
+  const entropyThreshold = readNumberInRange(
+    'piiSecrets: entropyThreshold',
+    options.entropyThreshold ?? DEFAULT_ENTROPY_THRESHOLD,
+    (threshold) => threshold > 0 && threshold <= MAX_CANDIDATE_ENTROPY,
+    `a number greater than 0 and at most ${MAX_CANDIDATE_ENTROPY}`,
+  );
   const registry: Record<PiiSecretsDetectorId, Detector> = {
     email: emailDetector(),
     ssn: ssnDetector(),
@@ -355,26 +495,50 @@ export function piiSecrets(options: PiiSecretsOptions = {}): PolicyEvaluator {
     secretAssignment: secretAssignmentDetector(),
     highEntropy: highEntropyDetector(entropyThreshold),
   };
-  const detectors = (options.detectors ?? PII_SECRETS_DETECTOR_IDS).map(
-    (id) => registry[id],
-  );
+  const configuredDetectors = options.detectors;
+  const detectors =
+    configuredDetectors === undefined
+      ? PII_SECRETS_DETECTOR_IDS.map((id) => registry[id])
+      : readFrozenList(
+          'piiSecrets: detectors',
+          configuredDetectors,
+          (entry, index) => {
+            // Own keys only: an inherited name such as 'constructor' is no
+            // detector.
+            if (typeof entry !== 'string' || !Object.hasOwn(registry, entry)) {
+              throw new TypeError(
+                `piiSecrets: detectors entry ${index} must be a PII_SECRETS_DETECTOR_IDS member (got ${describeEntry(entry)})`,
+              );
+            }
+            return registry[entry as PiiSecretsDetectorId];
+          },
+          true,
+        );
   const maxEnabledSpan = detectors.reduce(
     (max, detector) => Math.max(max, detector.maxSpan),
     0,
   );
-  const allowlist = compileAllowlist(options.allowlist ?? []);
+  const configuredAllowlist = options.allowlist;
+  const allowlist = compileAllowlist(
+    configuredAllowlist === undefined ? [] : configuredAllowlist,
+  );
   return {
     name: options.name ?? 'pii-secrets',
     phases: options.phases,
     channels: options.channels ?? LEAK_PREVENTION_CHANNELS,
-    holdBackChars: options.holdBackChars ?? Math.max(0, maxEnabledSpan - 1),
+    holdBackChars: readHoldBackChars(
+      'piiSecrets: holdBackChars',
+      options.holdBackChars ?? Math.max(0, maxEnabledSpan - 1),
+    ),
     evaluate({ text, channel, streamState }): PolicyDecision {
+      assertPolicyText('piiSecrets', text);
       // Incremental scan, mirroring denyPatterns' cursor — never for the
       // object channel, whose text is a REPLACED snapshot, not append-only.
       if (streamState && channel !== 'object') {
         const cursorKey = `scannedUpTo:${channel}`;
         const cursor = streamState[cursorKey];
         const scannedUpTo = typeof cursor === 'number' ? cursor : 0;
+        if (text.length <= scannedUpTo) return { allowed: true };
         const window = text.slice(
           Math.max(0, scannedUpTo - (maxEnabledSpan - 1)),
         );
@@ -408,11 +572,26 @@ export interface ClassifierPolicyOptions {
   phases?: readonly PolicyPhase[];
   /** Default: ['answer']. */
   channels?: readonly OutputChannel[];
-  /** Streaming cadence: classify once accumulated text grows by this many chars. Default 512. */
+  /**
+   * Streaming cadence: classify once accumulated text grows by this many
+   * chars. Default 512. A present value must be a positive safe integer.
+   */
   evaluateEveryChars?: number;
-  /** Optional; a classify call exceeding this throws (fails closed) instead of hanging. */
+  /**
+   * Optional; a classify call exceeding this throws instead of hanging, which
+   * `PolicyEngine` handles as an evaluator failure.
+   */
   timeoutMs?: number;
 }
+
+const CLASSIFIER_POLICY_OPTION_KEYS = {
+  name: true,
+  classify: true,
+  phases: true,
+  channels: true,
+  evaluateEveryChars: true,
+  timeoutMs: true,
+} satisfies Record<keyof ClassifierPolicyOptions, true>;
 
 // Structural, unconditional Node/Workers/browser globals — no import, no
 // @types/node, no DOM lib needed to typecheck (mirrors agent-cli/index.ts's
@@ -480,20 +659,33 @@ async function runClassify(
 }
 
 /**
+ * @internal The engine marks each policy's stream state during one terminal
+ * evaluation. This stays outside public `streamState` because a host evaluator
+ * can write that object and could set a field itself.
+ */
+export const terminalPassStreamStates = new WeakSet<object>();
+
+/**
  * Delegate gating to a pluggable, possibly-async classifier (e.g. a
  * moderation model or an external safety API). Streaming calls `classify`
  * only once accumulated text since the last call has grown by
  * `evaluateEveryChars` (a `classifiedUpTo:${channel}` cursor in
  * `streamState`, per-channel); the object channel classifies every snapshot,
  * since it is a replaced snapshot rather than append-only text. Input and
- * result phases have no `streamState` and therefore always classify — the
- * result phase is the authoritative gate, so a stream whose tail never
- * crossed the cadence still gets classified there.
+ * result phases have no `streamState` and therefore always classify. With
+ * hold-back, the engine classifies text left below the cadence at a channel
+ * end or stream finish before releasing it. On Mastra's durable loop, output
+ * policies stop the stream a subscriber receives, including terminal
+ * classification under hold-back. Mastra logs a result-phase refusal; the
+ * saved thread message and returned result come from model output and are
+ * not filtered by output policies.
  *
- * A `timeoutMs` classify call that does not settle in time THROWS (the
- * PolicyEngine's evaluator-crash path audits it and fails closed — aborting
- * in-stream, rethrowing at input/result); fail-open is deliberately not
- * offered. Omit `timeoutMs` to let `classify` run unbounded.
+ * A `classify` call that throws, resolves to no decision, or does not settle
+ * within `timeoutMs` is an evaluator failure. `PolicyEngine` records an error
+ * event for it and aborts at input and in-stream, on both of Mastra's agent
+ * loops, and rethrows at the final result, which stops Mastra's standard
+ * loop. Fail-open is deliberately not offered. Omit `timeoutMs` to let
+ * `classify` run unbounded.
  *
  * The returned evaluator carries no `holdBackChars` hint (engine default:
  * 0) — an async classifier has no bounded straddle window to report, unlike
@@ -504,9 +696,20 @@ async function runClassify(
 export function classifierPolicy(
   options: ClassifierPolicyOptions,
 ): PolicyEvaluator {
+  assertKnownFields(
+    'classifierPolicy: options',
+    options,
+    CLASSIFIER_POLICY_OPTION_KEYS,
+  );
   const name = options.name ?? 'classifier';
-  const evaluateEveryChars =
-    options.evaluateEveryChars ?? DEFAULT_EVALUATE_EVERY_CHARS;
+  // Infinity leaves unheld streams unclassified; durable result refusals
+  // are logged, not enforced.
+  const evaluateEveryChars = readNumberInRange(
+    'classifierPolicy: evaluateEveryChars',
+    options.evaluateEveryChars ?? DEFAULT_EVALUATE_EVERY_CHARS,
+    (cadence) => Number.isSafeInteger(cadence) && cadence >= 1,
+    'a positive safe integer',
+  );
   return {
     name,
     phases: options.phases,
@@ -517,11 +720,15 @@ export function classifierPolicy(
       text,
       streamState,
     }): PolicyDecision | Promise<PolicyDecision> {
+      assertPolicyText('classifierPolicy', text);
       if (streamState && channel !== 'object') {
         const cursorKey = `classifiedUpTo:${channel}`;
         const cursor = streamState[cursorKey];
         const classifiedUpTo = typeof cursor === 'number' ? cursor : 0;
-        if (text.length - classifiedUpTo < evaluateEveryChars) {
+        if (
+          text.length - classifiedUpTo <
+          (terminalPassStreamStates.has(streamState) ? 1 : evaluateEveryChars)
+        ) {
           return { allowed: true };
         }
         streamState[cursorKey] = text.length;

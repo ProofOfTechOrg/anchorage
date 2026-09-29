@@ -1145,7 +1145,11 @@ assert.throws(() => signals.createNotificationDispatchTick({ ...notificationTick
 let unsupportedNotificationReads = 0;
 let notificationSends = 0;
 const unsupportedNotificationRoutes = signals.createThreadSignalRoutes({
-  resolveAgent: () => ({ id: 'writer', sendNotificationSignal: async () => { notificationSends++; return { id: 'sent' }; } }),
+  resolveAgent: () => ({
+    id: 'writer',
+    getMastraInstance: () => ({ getStorage: () => ({ getStore: async (name) => name === 'notifications' ? coreNotificationStore : undefined }) }),
+    sendNotificationSignal: async () => { notificationSends++; return { id: 'sent' }; },
+  }),
   resolveResourceId: () => 'notification-thread',
   resolveNotificationsStorage: () => ({
     getNotification: async () => { unsupportedNotificationReads++; return null; },
@@ -1166,10 +1170,9 @@ const unsupportedNotificationResponse = await withSuppressedErrors(() => unsuppo
 assert.equal(unsupportedNotificationResponse.status, 502);
 assert.deepEqual(await unsupportedNotificationResponse.json(), { error: 'internal error' });
 assert.equal(unsupportedNotificationReads, 0);
-// Ingestion needs no storage method the dispatch route above is missing: it
-// hands the record to the fixture's sender, and the non-runtime-driven agent
-// is what the degraded field reports. The send count separates a real delivery
-// from a route that answered without reaching the sender.
+// Ingestion needs the agent's Mastra notifications store, whose absence of the
+// conditional-delivery method required by dispatch does not affect this route.
+// The send count confirms the fixture's sender receives the notification.
 const ingestionResponse = await unsupportedNotificationRoutes(new Request('https://thread/signal/notification', {
   method: 'POST', body: JSON.stringify({ source: 'packed', kind: 'changed', summary: 'ingested' }),
 }), { threadId: 'notification-thread', principal: notificationContext.principal, init: doRunner.init({ storage: new InMemoryStore() }, { executionFence: 'none', startIdempotency: 'none' }) });

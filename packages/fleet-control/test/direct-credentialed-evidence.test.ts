@@ -9,11 +9,14 @@ import {
   DIRECT_EVIDENCE_IDENTITY_PATHS,
   DIRECT_EVIDENCE_KEYS,
   DIRECT_EVIDENCE_LITERALS,
+  type DirectEvidenceScenario,
+  type DirectEvidenceScenarioFailure,
   directSourceHashRelationship,
   inspectDirectEvidence,
   writeDirectEvidence,
 } from '../scripts/direct-credentialed-evidence.mjs';
 import { DIRECT_RESIDUAL_SURFACES } from '../scripts/direct-credentialed-reference-vocabulary.mjs';
+import type { DIRECT_SCENARIO_FAILURES } from '../scripts/direct-credentialed-run-state.mjs';
 import { DIRECT_SCENARIO_PHASES } from '../scripts/direct-credentialed-scenario-budget.mjs';
 import {
   abandonedScenario,
@@ -106,11 +109,30 @@ async function evidenceFixture() {
 }
 
 describe.sequential('direct evidence', () => {
+  it('binds evidence scenario declarations to the runtime vocabularies', () => {
+    // Typecheck carries this case.
+    type Equal<Left, Right> =
+      (<Value>() => Value extends Left ? 1 : 2) extends <
+        Value,
+      >() => Value extends Right ? 1 : 2
+        ? true
+        : false;
+    const bound: [
+      Equal<
+        DirectEvidenceScenario['phase'],
+        (typeof DIRECT_SCENARIO_PHASES)[number]
+      >,
+      Equal<
+        DirectEvidenceScenarioFailure['code'],
+        (typeof DIRECT_SCENARIO_FAILURES)[number]
+      >,
+    ] = [true, true];
+    void bound;
+  });
+
   it('covers every projected key with the admission vocabulary', async () => {
     const { evidence } = await evidenceFixture();
     const vocabulary = new Set(DIRECT_EVIDENCE_KEYS);
-    // Array elements are addressed by index rather than by a projected name;
-    // admission covers those through its digits-only rule instead.
     const walk = (value: unknown, found: Set<string>) => {
       if (Array.isArray(value)) for (const child of value) walk(child, found);
       else if (value && typeof value === 'object')
@@ -673,8 +695,7 @@ describe.sequential('direct evidence', () => {
 
   it('reports the empty path for a credential no member span carries', async () => {
     const separated = { version: 1, mode: 'run' };
-    // The sentinel spans the comma between two members, so it belongs to the
-    // document's structure and to no member of it.
+    // The sentinel spans the comma between two members.
     expect(
       inspectDirectEvidence(separated, {
         secrets: ['1,"mode"'],
@@ -684,7 +705,6 @@ describe.sequential('direct evidence', () => {
       hit: { sentinelClass: 'env-secret', keyPath: '' },
       serialized: '{"version":1,"mode":"run"}\n',
     });
-    // A sentinel a member does carry is named by that member instead.
     expect(
       inspected(separated, { secrets: ['"mode":"run"'], literals: [] }),
     ).toEqual({ sentinelClass: 'env-secret', keyPath: 'mode' });
@@ -885,9 +905,8 @@ describe.sequential('direct evidence', () => {
   it('guards the identity-path leaves and excludes the prefix-derived and scenario-charset ones', async () => {
     const { evidence } = await evidenceFixture();
     expect(Object.isFrozen(DIRECT_EVIDENCE_IDENTITY_PATHS)).toBe(true);
-    // Every guarded path resolves to a projected identity leaf, so a renamed
-    // or moved projection key fails here rather than leaving a guard that
-    // never matches again.
+    // A renamed or moved projection key fails here rather than leaving a
+    // guard that never matches again.
     expect(
       DIRECT_EVIDENCE_IDENTITY_PATHS.filter((keyPath) => {
         const leaf = leafAt(evidence, keyPath);
@@ -901,9 +920,7 @@ describe.sequential('direct evidence', () => {
       'scenario.terminalForce.a.scriptName',
     ])
       expect(DIRECT_EVIDENCE_IDENTITY_PATHS).not.toContain(keyPath);
-    // So are the scenario paths: the journal decodes each with `scenarioId`,
-    // whose charset is strictly wider than the identity shape, so a guard here
-    // refuses values the journal admits.
+    // So are the scenario paths.
     for (const keyPath of [
       'scenario.initial.a.versionId',
       'scenario.candidate.b.versionId',
@@ -921,8 +938,7 @@ describe.sequential('direct evidence', () => {
     'scenario.terminalForce.a.databaseId',
   ])('publishes a scenario-charset identity at %s', async (keyPath) => {
     const { f, evidence } = await evidenceFixture();
-    // `a:b` is outside the identity shape and inside `scenarioId`, so the
-    // journal admits it and the evidence boundary no longer refuses it.
+    // `a:b` is outside the identity shape and inside `scenarioId`.
     const carried = JSON.parse(JSON.stringify(evidence)) as Record<
       string,
       unknown

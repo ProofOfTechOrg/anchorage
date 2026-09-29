@@ -23,10 +23,9 @@ export interface EgressResponseHeaders {
 /**
  * Response subset a guarded fetch resolves to — members every fetch
  * implementation provides. The guard returns the base fetch's response
- * OBJECT untouched (it only reads status + the location header off
- * intermediate 3xx hops), so a connector needing more (streaming body,
- * clone) can safely cast back to its own runtime's Response type — the
- * underlying value IS that Response, nothing is wrapped or consumed.
+ * OBJECT untouched, so a connector needing more (streaming body, clone) can
+ * safely cast back to its own runtime's Response type — the underlying value
+ * IS that Response, nothing is wrapped or consumed.
  */
 export interface EgressResponse {
   /** Numeric HTTP status code. */
@@ -48,9 +47,11 @@ export interface EgressResponse {
 }
 
 /**
- * RequestInit subset the guarded fetch understands. Members it does not
- * model (cache, credentials, cf, duplex, …) pass through to the base fetch
- * untouched via the index signature.
+ * RequestInit subset the guarded fetch understands. The guard forwards own
+ * enumerable members and the standard and Workers request-init members it
+ * defines, whether own or inherited, reading each once per call. Class
+ * instances, Object.create objects, and Requests passed as init retain their
+ * method, headers, body, and signal. Redirect is replaced by the checked mode.
  */
 export interface EgressRequestInit {
   /** HTTP method. Defaults to the base fetch implementation's default. */
@@ -59,6 +60,7 @@ export interface EgressRequestInit {
    * 'follow' (default) follows redirects with a per-hop allowlist check.
    * 'manual' and 'error' pass straight through to the base fetch — no hop
    * happens here, so nothing escapes the initial check.
+   * Any other value is refused with EGRESS_INPUT_INVALID before any request.
    */
   redirect?: 'follow' | 'error' | 'manual';
   /** Header initializer forwarded to the base fetch. */
@@ -68,6 +70,40 @@ export interface EgressRequestInit {
   /** Cancellation signal forwarded to the base fetch. */
   signal?: unknown;
   [key: string]: unknown;
+}
+
+// Spread copies only own enumerable members; Requests and class instances carry
+// request-init members on their prototypes.
+const REQUEST_INIT_MEMBERS = [
+  'method',
+  'headers',
+  'body',
+  'redirect',
+  'signal',
+  'cache',
+  'credentials',
+  'integrity',
+  'keepalive',
+  'mode',
+  'referrer',
+  'referrerPolicy',
+  'window',
+  'duplex',
+  'priority',
+  'cf',
+  'fetcher',
+  'encodeResponseBody',
+] as const;
+
+function forwardedInit(init: EgressRequestInit | undefined): EgressRequestInit {
+  const snapshot: EgressRequestInit = { ...init };
+  if (init == null) return snapshot;
+  for (const key of REQUEST_INIT_MEMBERS) {
+    if (Object.hasOwn(snapshot, key)) continue;
+    const value = init[key];
+    if (value !== undefined) (snapshot as Record<string, unknown>)[key] = value;
+  }
+  return snapshot;
 }
 
 /**
@@ -94,7 +130,10 @@ export type EgressFetchBase = (...args: never[]) => Promise<unknown>;
  * can contain secrets, so diagnostic fields use the hostname.
  */
 export interface EgressDenial {
-  /** Stable request refusal code; omitted by legacy manual construction. */
+  /**
+   * Stable request refusal code; absent when a caller constructs a denial
+   * without one.
+   */
   readonly code?: Exclude<
     Extract<ConnectorDenialCode, `EGRESS_${string}`>,
     'EGRESS_HOST_NOT_ALLOWED_BY_ORG'
@@ -208,8 +247,8 @@ export interface EgressFetchOptions {
 }
 
 // Internal view of the base fetch: what the guard actually sends and the
-// members it actually reads (status + headers.get on redirect statuses).
-// The seam cast from EgressFetchBase is confined to construction.
+// members it actually reads. The seam cast from EgressFetchBase is confined
+// to construction.
 type InternalFetch = (
   input: string,
   init?: Record<string, unknown>,
@@ -287,15 +326,13 @@ function isOneShotBody(body: unknown): boolean {
   );
 }
 
-// Release a redirect response the loop is discarding. Manual following reads
-// only status + the Location header off each 3xx, then follows it or throws —
-// either way the caller never sees that response again, but its body is a live
-// stream over a connection (Node/Undici, workerd). Left unconsumed it keeps the
-// connection checked out until GC finalizes the stream, so sustained redirected
-// traffic can exhaust the pool and an unbounded 3xx body can stay live
-// indefinitely. cancel() releases the connection WITHOUT draining the body.
-// EgressResponse omits `body` (its consumers read only status + headers), so
-// the stream is reached structurally — the same discipline as isOneShotBody.
+// Release a redirect response the loop is discarding. The caller never sees
+// that response again, but its body is a live stream over a connection
+// (Node/Undici, workerd). Left unconsumed it keeps the connection checked out
+// until GC finalizes the stream, so sustained redirected traffic can exhaust
+// the pool and an unbounded 3xx body can stay live indefinitely. cancel()
+// releases the connection WITHOUT draining the body. EgressResponse omits
+// `body`, so the stream is reached structurally.
 // cancel() is best-effort and guarded on both axes: a conformant stream
 // cancel() rejects when locked/errored (swallowed via .catch), and an injected
 // vendor body (the policies.fetch transport seam) could supply a cancel() that
@@ -319,24 +356,23 @@ function releaseResponse(response: EgressResponse): void {
 
 /**
  * Wrap a fetch so every request — redirect hops included — must resolve to
- * an allowed host (exact or `*.wildcard`, the same matcher as the
- * networkEgress policy) over http(s), or the call throws before the base
- * fetch is invoked. An empty allowlist denies everything: no declared
- * egress means no network.
+ * an allowed host (exact or `*.wildcard`) over http(s), or the call throws
+ * before the base fetch is invoked. An empty allowlist denies everything: no
+ * declared egress means no network.
  */
 export function egressFetch(
   allowedHosts: readonly string[],
   options: EgressFetchOptions = {},
 ): EgressGuardedFetch {
-  assertEgressHostList(
+  const hosts = assertEgressHostList(
+    'egressFetch: allowedHosts',
     allowedHosts,
     (entry) =>
       `egressFetch: allowed host '${entry}' must be a bare hostname ('api.example.com') or wildcard ('*.example.com')`,
   );
   // Normalize the allowlist ONCE per guard; only the incoming host is
-  // normalized per hop (checkUrl), via the same matcher the declaration gate
-  // uses.
-  const normalizedHosts = allowedHosts.map(normalizeDomain);
+  // normalized per hop (checkUrl).
+  const normalizedHosts = hosts.map(normalizeDomain);
   const UrlCtor = requireGlobal<UrlConstructor>('URL');
   const denied: (denial: AuthoredEgressDenial) => Error =
     options.denied ?? ((denial: EgressDenial) => new EgressDeniedError(denial));
@@ -421,17 +457,31 @@ export function egressFetch(
       });
     }
     let url = checkUrl(raw, 0);
-    if (init?.redirect !== undefined && init.redirect !== 'follow') {
+    const requestInit = forwardedInit(init);
+    // The base fetch reads and converts `redirect` again, so the guard reads it
+    // once and sends the string it checked: a value that converts to 'follow',
+    // or a getter that answers differently, would otherwise make the base
+    // follow redirects without a hop check.
+    const mode: unknown = requestInit.redirect;
+    if (mode !== undefined && mode !== 'follow') {
+      if (mode !== 'manual' && mode !== 'error') {
+        throw denied({
+          code: 'EGRESS_INPUT_INVALID',
+          host: url.hostname,
+          reason: "init.redirect must be 'follow', 'manual' or 'error'",
+          hop: 0,
+        });
+      }
       // 'manual' hands the 3xx back to the caller (any follow-up fetch goes
       // through this guard again); 'error' fails on it at the base.
-      return base(url.href, init);
+      return base(url.href, { ...requestInit, redirect: mode });
     }
 
-    let method = (init?.method ?? 'GET').toUpperCase();
-    let body = init?.body ?? null;
+    let method = (requestInit.method ?? 'GET').toUpperCase();
+    let body = requestInit.body ?? null;
     let headers: HeadersLike | undefined; // built on the first hop only
     let response = await base(url.href, {
-      ...(init ?? {}),
+      ...requestInit,
       redirect: 'manual',
     });
 
@@ -462,7 +512,7 @@ export function egressFetch(
       }
       const nextUrl = checkUrl(location, hop, url);
       headers ??= new (requireGlobal<HeadersConstructor>('Headers'))(
-        init?.headers,
+        requestInit.headers,
       );
       const nextMethod = redirectMethod(status, method);
       if (nextMethod !== method) {
@@ -483,7 +533,7 @@ export function egressFetch(
       method = nextMethod;
       url = nextUrl;
       response = await base(url.href, {
-        ...(init ?? {}),
+        ...requestInit,
         method,
         headers,
         body,

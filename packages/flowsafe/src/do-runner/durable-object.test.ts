@@ -618,6 +618,48 @@ async function cRequireEpoch2(fence: ExecutionFenceStore | undefined) {
 }
 
 describe('C workflow ingress capture', () => {
+  it('starts a queued run after its sender disconnects', async () => {
+    const fixture = cWorkflowFixture();
+    const hold = await cHoldWorkflowFifo(fixture);
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    const request = deploymentIdentityRequest('http://do/runs', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        [EXECUTION_PRINCIPAL_HEADER]: encodeExecutionPrincipal(OWNER_PRINCIPAL),
+      },
+      body: new ReadableStream<Uint8Array>({
+        start(value) {
+          controller = value;
+        },
+        pull(value) {
+          value.enqueue(
+            new TextEncoder().encode(JSON.stringify(C_WORKFLOW_BODY)),
+          );
+          value.close();
+        },
+      }),
+      duplex: 'half',
+    } as RequestInit);
+    const observation = cObserveFifo();
+    const pending = fixture.runner.fetch(request);
+    try {
+      await observation.enqueued;
+      controller.error(new Error('sender disconnected'));
+    } finally {
+      observation.restore();
+      hold.release.resolve();
+      await hold.holder;
+    }
+    const response = await pending;
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      runId: 'c-run',
+      status: 'suspended',
+    });
+    expect(fixture.start).toHaveBeenCalledOnce();
+  });
+
   it.each(
     (['human', 'service', 'system'] as const).flatMap((kind) =>
       (['alternate', 'second-throw'] as const).flatMap((mode) =>
@@ -1156,7 +1198,7 @@ describe('C workflow ingress capture', () => {
         ]),
       ).toBe('queued');
       expect(observation.count()).toBe(1);
-      expect(body).not.toHaveBeenCalled();
+      expect(body).toHaveBeenCalledTimes(1);
       expect(fixture.start).not.toHaveBeenCalled();
       request.headers.set(
         EXECUTION_PRINCIPAL_HEADER,

@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import type { bootstrapDirectConformance } from './direct-credentialed-bootstrap.mjs';
+import type {
+  bootstrapDirectConformance,
+  DirectBootstrapErrorCode,
+} from './direct-credentialed-bootstrap.mjs';
 import type { preflightDirectConformance } from './direct-credentialed-conformance-preflight.mjs';
 import type {
   DirectLiveMode,
@@ -8,6 +11,7 @@ import type {
 } from './direct-credentialed-evidence.mjs';
 import type { reconcileDirectInvocation } from './direct-credentialed-invocation.mjs';
 import type {
+  DirectRunStateErrorCode,
   inspectDirectRunState,
   openDirectRunState,
 } from './direct-credentialed-run-state.mjs';
@@ -33,8 +37,15 @@ export const DIRECT_LIVE_MODES: readonly DirectLiveMode[];
 export function isDirectLiveMode(
   mode: DirectConformanceMode | null,
 ): mode is DirectLiveMode;
-export const DIRECT_CREDENTIAL_VARIABLES: readonly string[];
-export const DIRECT_ADMISSION_VARIABLES: readonly string[];
+export const DIRECT_CREDENTIAL_VARIABLES: readonly [
+  'CLOUDFLARE_API_TOKEN',
+  'FLEET_DIRECT_CONFORMANCE_INVOKE_SECRET',
+];
+export const DIRECT_ADMISSION_VARIABLES: readonly [
+  'CLOUDFLARE_ACCOUNT_ID',
+  'CLOUDFLARE_API_TOKEN',
+  'FLEET_DIRECT_CONFORMANCE_INVOKE_SECRET',
+];
 export const DIRECT_CONFORMANCE_CODES: Readonly<{
   belowScenarioFloor: 'below-scenario-floor';
   distMissing: 'dist-missing';
@@ -46,6 +57,13 @@ export const DIRECT_CONFORMANCE_CODES: Readonly<{
 }>;
 export type DirectConformanceCode =
   (typeof DIRECT_CONFORMANCE_CODES)[keyof typeof DIRECT_CONFORMANCE_CODES];
+export type DirectConformanceSummaryCode =
+  | DirectConformanceCode
+  | DirectRunStateErrorCode
+  | DirectBootstrapErrorCode;
+export type DirectConformanceSummaryVariable =
+  | 'FLEET_DIRECT_CONFORMANCE_CONFIG'
+  | (typeof DIRECT_ADMISSION_VARIABLES)[number];
 export const DIRECT_CONFORMANCE_EXIT_CODES: Readonly<{
   success: 0;
   failed: 1;
@@ -89,8 +107,8 @@ export function resolveDirectExitCode(
  * bootstrap error carried one.
  */
 export type DirectConformanceSummary = Readonly<{
-  code?: string;
-  variable?: string;
+  code?: DirectConformanceSummaryCode;
+  variable?: DirectConformanceSummaryVariable;
   evidenceWritten?: boolean;
 }> &
   Readonly<Record<string, unknown>>;

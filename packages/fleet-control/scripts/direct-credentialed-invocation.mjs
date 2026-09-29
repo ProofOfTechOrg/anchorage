@@ -26,13 +26,17 @@ const INGRESS_INTERVAL_MS = 2_000;
  * first contract answer; consecutive probes span the latter window.
  */
 const INGRESS_STABLE_PROBES = 3;
-// The Worker aborts each request at invocationTimeoutMs. This margin lets its
-// terminal ledger write and response reach the client before polling expires.
+// The margin is the response budget for a request sent at `pollBy`, enforced
+// by the abort timer at `deadlineMs`. Restart latency covers the terminal
+// write, and any fixed-interval tail polls, up to the request cap, cover a
+// write that settles just after `pollBy`.
 export const DIRECT_RECONCILIATION_MARGIN_MS = 5_000;
 export const DIRECT_RECONCILIATION_INTERVAL_MS = 250;
 export const DIRECT_RECONCILIATION_MAX_INTERVAL_MS = 32_000;
-// The cap guards a shorter interval override. At the production interval the
-// time bound ends polling first.
+// The cap bounds the requests one reconciliation sends. The poll ends at the
+// cap or at the time bound, whichever it reaches first. With a long enough
+// Worker deadline the cap leaves no tail poll, and with a longer one it ends
+// the poll before `pollBy`.
 export const DIRECT_RECONCILIATION_MAX_REQUESTS = 32;
 export const DIRECT_INVOCATION_FAILURE_DETAILS = Object.freeze([
   'platform-page',
@@ -355,6 +359,7 @@ export async function reconcileDirectInvocation(input) {
   const deadline = new AbortController();
   const signal = deadline.signal;
   const expiresAt = performance.now() + deadlineMs;
+  // `pollBy` is the instant the Worker's own invocation deadline elapses.
   const pollBy = expiresAt - (deadlineMs - workerDeadlineMs);
   const timer = setTimeout(() => deadline.abort(), deadlineMs);
   let requestsSent = 0;
@@ -427,9 +432,11 @@ export async function reconcileDirectInvocation(input) {
       }
       if (requestsSent >= DIRECT_RECONCILIATION_MAX_REQUESTS)
         return 'unreachable';
-      const remaining = pollBy - performance.now();
+      const now = performance.now();
+      const tail = now >= pollBy;
+      const remaining = (tail ? expiresAt : pollBy) - now;
       if (remaining <= 0) return 'unreachable';
-      const sleepMs = Math.min(waitMs, remaining);
+      const sleepMs = Math.min(tail ? intervalMs : waitMs, remaining);
       try {
         await new Promise((resolve, reject) => {
           const abort = () => reject(signal.reason);
@@ -448,7 +455,8 @@ export async function reconcileDirectInvocation(input) {
       } catch {
         return 'unreachable';
       }
-      waitMs = Math.min(waitMs * 2, DIRECT_RECONCILIATION_MAX_INTERVAL_MS);
+      if (!tail)
+        waitMs = Math.min(waitMs * 2, DIRECT_RECONCILIATION_MAX_INTERVAL_MS);
     }
   } finally {
     clearTimeout(timer);

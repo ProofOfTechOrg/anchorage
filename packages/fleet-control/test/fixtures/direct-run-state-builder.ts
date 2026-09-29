@@ -386,7 +386,8 @@ export function maximalScenario(
     requireMutationEpoch: false,
     transitionRevision: MAX_COUNT,
   });
-  const fenceTransition = () => ({
+  const fenceTransition = (role: 'a' | 'b') => ({
+    role,
     before: fenceReading(),
     after: fenceReading(),
     ordinal: 3,
@@ -400,12 +401,14 @@ export function maximalScenario(
     observedAt: MAX_COUNT,
     ordinal: 3,
   });
-  const fenceSweeps = () => ({
+  const fenceSweeps = (role: 'a' | 'b') => ({
+    role,
     first: fenceSweep(),
     second: fenceSweep(),
     intervalMs: MAX_COUNT,
   });
-  const fenceProbes = () => ({
+  const fenceProbes = (role: 'a' | 'b') => ({
+    role,
     current: 'accepted' as const,
     missing: 'missing' as const,
     stale: 'stale' as const,
@@ -661,10 +664,10 @@ export function maximalScenario(
       inventories: { before: inventoryProof(), after: inventoryProof() },
       audits: { before: auditProof(), after: auditProof() },
       fence: {
-        drain: { a: fenceTransition(), b: fenceTransition() },
-        sweeps: { a: fenceSweeps(), b: fenceSweeps() },
-        reopen: { a: fenceTransition(), b: fenceTransition() },
-        probes: { a: fenceProbes(), b: fenceProbes() },
+        drain: { a: fenceTransition('a'), b: fenceTransition('b') },
+        sweeps: { a: fenceSweeps('a'), b: fenceSweeps('b') },
+        reopen: { a: fenceTransition('a'), b: fenceTransition('b') },
+        probes: { a: fenceProbes('a'), b: fenceProbes('b') },
       },
       restart: {
         process: { ...PROCESS },
