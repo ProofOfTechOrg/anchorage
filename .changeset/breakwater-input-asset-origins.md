@@ -1,9 +1,0 @@
----
-"@proofoftech/breakwater": minor
----
-
-`createGuardedAgent()` accepts `allowedInputAssetOrigins` for user file and image network URLs. After application input processors and before input policy, the reserved `breakwater-input-assets` step checks the call's input, memory-loaded history, and processor additions. It refuses non-`http(s)` network schemes, URLs with credentials, and origins not listed; absent or empty origins refuse every network URL, while `data:` URLs remain inline data. Entries must resolve to `http(s)` origins without paths, credentials, queries, fragments, or wildcards. A refusal stops the call and records one `agent.input.asset` event without the URL, using `input asset URL scheme is not allowed`, `input asset URL credentials are not allowed`, or `input asset URL origin is not allowed`. Input the step cannot read stops the call with `input message content is not classified` and one `agent.input.policy` error event, as the policy engine's reading does. Guarded agents that accept remote file or image URLs, including URLs stored in thread history, must list their origins. This option is independent of connector egress allowlists.
-
-Input policies, raw `PolicyEngine` instances, and `extractMessageText()` read file and image media types and decoded `text/*` payloads as text, including `data:` URL payloads. For network URL data declared as `text/*`, they read the URL string rather than the downloaded content. Binary file and image data remain unread; an undecodable `text/*` payload stops input as unclassified content, and `extractMessageText()` throws a `TypeError`.
-
-Security: without these checks, a caller's file or image URL can make the host fetch any address, including host-internal addresses such as `169.254.169.254` and `127.0.0.1`, after the input policies allow the call. A downloaded or inline `text/*` payload can reach the model as user text that the input policies never read.
