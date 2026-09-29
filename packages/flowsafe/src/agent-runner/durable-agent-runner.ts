@@ -727,18 +727,18 @@ function bindThreadCompletion<T extends object>(
   completion: Promise<void>,
 ): T {
   return new Proxy(output, {
-    get(target, property, receiver) {
+    get(target, property) {
+      // Core's output getters read private fields, which a proxy receiver lacks.
+      const value = Reflect.get(target, property, target);
       if (property === '_waitUntilFinished') {
-        const wait = Reflect.get(target, property, target);
         return () =>
-          typeof wait === 'function'
+          typeof value === 'function'
             ? Promise.race([
-                Promise.resolve(wait.call(target) as unknown),
+                Promise.resolve(value.call(target) as unknown),
                 completion,
               ])
             : completion;
       }
-      const value = Reflect.get(target, property, receiver);
       return typeof value === 'function' ? value.bind(target) : value;
     },
   });

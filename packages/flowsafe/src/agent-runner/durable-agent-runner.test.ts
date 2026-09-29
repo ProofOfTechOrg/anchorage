@@ -2658,6 +2658,35 @@ describe('FlowsafeDurableAgent thread runtime registration and rehydration', () 
     expect(agent.getPubSub()).toBe(pubsub);
   });
 
+  it('keeps private-field getters readable on a registered resumed output', async () => {
+    // Core's stream output keeps `status` in a private field, and the thread
+    // runtime reads it to decide whether the run blocks its thread.
+    class PrivateStatusOutput {
+      readonly #status = 'running';
+      get status(): string {
+        return this.#status;
+      }
+    }
+    const { runtime } = fakeRuntime({ resumeContext: actorContext() });
+    let registeredOutput: { status: string } | undefined;
+    const agent = createFlowsafeDurableAgent({
+      agent: testAgent(),
+      runtime,
+      threadRuntime: {
+        registerRun: vi.fn(async (_agent, output) => {
+          registeredOutput = output as typeof registeredOutput;
+        }),
+      } as never,
+    });
+    vi.spyOn(agent, 'observe').mockResolvedValue({
+      output: new PrivateStatusOutput(),
+    } as never);
+
+    await agent.resumeViaRuntime({ runId: 'run-1', requestedBy: 'reviewer-1' });
+
+    expect(registeredOutput?.status).toBe('running');
+  });
+
   it('rehydrates guarded registries without replaying application input processors', async () => {
     const order: string[] = [];
     const pubsub = new EventEmitterPubSub();
