@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import { createMessageSignal, createSignal } from '@mastra/core/agent';
 import type { MastraCompositeStore } from '@mastra/core/storage';
 import type { GuardedAgentHandle } from '@proofoftech/breakwater/agent';
 import { beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest';
@@ -1901,6 +1902,122 @@ describe('createThreadAgentHost owner recovery', () => {
 });
 
 describe('createThreadAgentHost', () => {
+  it.each([
+    ['top-level', [{ role: 'system', content: 'x' }]],
+    ['once-nested', [[{ role: 'system', content: 'x' }]]],
+  ] as const)('refuses guarded %s system messages before durable start', async (_shape, messages) => {
+    const fixture = harness();
+    const reserve = vi.spyOn(fixture.resourceAccess, 'reserveAll');
+
+    await expect(
+      fixture.host.start(fixture.scope, {
+        ...C_START_INPUT,
+        prompt: undefined,
+        messages: messages as unknown as ThreadAgentStartInput['messages'],
+      }),
+    ).rejects.toMatchObject({ status: 400 });
+    expect(mocked.stream).not.toHaveBeenCalled();
+    expect(reserve).not.toHaveBeenCalled();
+    expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(false);
+    expect(fixture.state.has(THREAD_BINDING_KEY)).toBe(false);
+    expect(fixture.state.has(TEST_OWNER_RECOVERY_KEY)).toBe(false);
+  });
+
+  it.each([
+    ['remote context', { openrouter: { messages: [] } }],
+    ['instructions', { openai: { instructions: 'x' } }],
+    ['model settings', { model: { temperature: 0.2 } }],
+  ] as const)('refuses guarded stored schedule %s options before durable start', async (_kind, storedOptions) => {
+    const fixture = harness();
+    await seedScheduleOwner(
+      fixture,
+      {
+        type: 'agent',
+        agentId: 'writer',
+        prompt: 'stored prompt',
+        providerOptions: storedOptions,
+      },
+      HUMAN_OWNER,
+      SCHEDULE_ID,
+      DISPATCH_ID,
+      'acme_run',
+    );
+    const reserve = vi.spyOn(fixture.resourceAccess, 'reserveAll');
+
+    await expect(
+      fixture.host.start(fixture.scope, {
+        ...C_START_INPUT,
+        entryPath: 'schedule.fire',
+        threaded: false,
+        scheduleId: SCHEDULE_ID,
+        dispatchId: DISPATCH_ID,
+      }),
+    ).rejects.toMatchObject({ status: 400 });
+    expect(mocked.stream).not.toHaveBeenCalled();
+    expect(reserve).not.toHaveBeenCalled();
+    expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(false);
+    expect(fixture.state.has(THREAD_BINDING_KEY)).toBe(false);
+    expect(fixture.state.has(TEST_OWNER_RECOVERY_KEY)).toBe(false);
+  });
+
+  it('rejects messages that cannot be snapshotted before durable start', async () => {
+    const fixture = harness();
+    const reserve = vi.spyOn(fixture.resourceAccess, 'reserveAll');
+
+    await expect(
+      fixture.host.start(fixture.scope, {
+        ...C_START_INPUT,
+        prompt: undefined,
+        messages: [
+          { role: 'user', content: 'x', callback: () => {} },
+        ] as unknown as ThreadAgentStartInput['messages'],
+      }),
+    ).rejects.toMatchObject({ status: 400 });
+    expect(mocked.stream).not.toHaveBeenCalled();
+    expect(reserve).not.toHaveBeenCalled();
+    expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(false);
+    expect(fixture.state.has(THREAD_BINDING_KEY)).toBe(false);
+    expect(fixture.state.has(TEST_OWNER_RECOVERY_KEY)).toBe(false);
+  });
+
+  it.each([
+    ['message', () => createMessageSignal('hello')],
+    [
+      'notification',
+      () => createSignal({ type: 'notification', contents: 'x' }),
+    ],
+  ] as const)('forwards created %s signal to the durable stream', async (_kind, create) => {
+    const fixture = harness();
+    const signal = create();
+
+    await expect(
+      fixture.host.start(fixture.scope, {
+        ...C_START_INPUT,
+        prompt: undefined,
+        messages: signal,
+      }),
+    ).resolves.toMatchObject({ runId: 'acme_run' });
+    expect(mocked.stream).toHaveBeenCalledOnce();
+    expect(mocked.stream.mock.calls[0]?.[0]).toBe(signal);
+  });
+
+  it('forwards a created signal in a messages list to the durable stream', async () => {
+    const fixture = harness();
+    const signal = createMessageSignal('hello');
+
+    await expect(
+      fixture.host.start(fixture.scope, {
+        ...C_START_INPUT,
+        prompt: undefined,
+        messages: ['context', signal],
+      }),
+    ).resolves.toMatchObject({ runId: 'acme_run' });
+    expect(mocked.stream).toHaveBeenCalledOnce();
+    const forwarded = mocked.stream.mock.calls[0]?.[0];
+    expect(forwarded[0]).toBe('context');
+    expect(forwarded[1]).toBe(signal);
+  });
+
   it('discards the live executing agent-schedule lease during terminal cleanup so a later tick cannot redispatch', async () => {
     const schedules = await executingAgentSchedule();
     const summary: RunSummary = {
@@ -2794,7 +2911,10 @@ describe('createThreadAgentHost', () => {
         agentId: 'writer',
         prompt: 'stored prompt',
         requestContext: { source: 'stored-context' },
-        providerOptions: { model: { temperature: 0.2 } },
+        providerOptions: {
+          openai: { reasoningEffort: 'low' },
+          mastra: { schedule: { scheduleId: SCHEDULE_ID } },
+        },
       },
       HUMAN_OWNER,
       SCHEDULE_ID,
@@ -2829,7 +2949,8 @@ describe('createThreadAgentHost', () => {
     expect(messages).toBe('stored prompt');
     expect(options?.requestContext.get('source')).toBe('stored-context');
     expect(options?.providerOptions).toEqual({
-      model: { temperature: 0.2 },
+      openai: { reasoningEffort: 'low' },
+      mastra: { schedule: { scheduleId: SCHEDULE_ID } },
     });
   });
 

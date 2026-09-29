@@ -215,6 +215,19 @@ export type SignalContentPolicy = (
   input: SignalContentPolicyInput,
 ) => SignalContentPolicyResult | Promise<SignalContentPolicyResult>;
 
+/** Stored options and trusted target identity for a threaded schedule fire. */
+export interface ScheduleProviderOptionsPolicyInput {
+  providerOptions: unknown;
+  agentId: string;
+  threadId: string;
+  resourceId: string;
+}
+
+/** Decides whether stored options may reach a threaded schedule signal. */
+export type ScheduleProviderOptionsPolicy = (
+  input: ScheduleProviderOptionsPolicyInput,
+) => SignalContentPolicyResult | Promise<SignalContentPolicyResult>;
+
 export interface ThreadSignalRoutesOptions {
   /**
    * The per-thread agent whose public signal methods these routes drive. Built
@@ -343,6 +356,13 @@ export interface ThreadSignalRoutesOptions {
    * opaque structural result and is never given a request body or storage row.
    */
   contentPolicy?: SignalContentPolicy;
+  /**
+   * Receives stored options and target identity on every threaded agent-schedule
+   * fire before signal creation. A denied result settles a discard; an error,
+   * throw, or malformed result leaves the lease for a later tick. Without the
+   * callback, stored options reach the signal unchecked.
+   */
+  scheduleProviderOptionsPolicy?: ScheduleProviderOptionsPolicy;
 }
 
 /**
@@ -468,6 +488,24 @@ type InspectSignalContent = (
   runId?: string,
 ) => Promise<SignalContentInspection>;
 
+async function inspectPolicyResult(
+  invoke: () => SignalContentPolicyResult | Promise<SignalContentPolicyResult>,
+): Promise<SignalContentInspection> {
+  try {
+    const result = await invoke();
+    if (result?.allowed === true) return 'allowed';
+    if (
+      result?.allowed === false &&
+      (result.outcome === 'denied' || result.outcome === 'error')
+    ) {
+      return result.outcome;
+    }
+  } catch {
+    return 'error';
+  }
+  return 'error';
+}
+
 async function inspectSignalContent(
   policy: SignalContentPolicy,
   input: Omit<SignalContentPolicyInput, 'text' | 'runId'>,
@@ -486,23 +524,13 @@ async function inspectSignalContent(
   } catch {
     return 'error';
   }
-  try {
-    const result = await policy({
+  return inspectPolicyResult(() =>
+    policy({
       ...input,
       text,
       ...(runId !== undefined ? { runId } : {}),
-    });
-    if (result?.allowed === true) return 'allowed';
-    if (
-      result?.allowed === false &&
-      (result.outcome === 'denied' || result.outcome === 'error')
-    ) {
-      return result.outcome;
-    }
-  } catch {
-    return 'error';
-  }
-  return 'error';
+    }),
+  );
 }
 
 function signalContentPolicyResponse(
@@ -535,6 +563,7 @@ export function createThreadSignalRoutes(
     notificationDispatchAllowed,
     resolveScheduleDispatchStore,
     contentPolicy,
+    scheduleProviderOptionsPolicy,
   } = options;
   if (resolveBlockingRun && !serializeDispatch) {
     throw new Error(
@@ -868,6 +897,7 @@ export function createThreadSignalRoutes(
           store: await resolveScheduleDispatchStore(scope),
           completed: completedScheduleDispatches,
           inspectContent,
+          scheduleProviderOptionsPolicy,
           proof,
         });
       }
@@ -1840,6 +1870,7 @@ async function handleScheduleSignal(options: {
   store: ScheduleSignalDispatchStore;
   completed: Map<string, ScheduleAgentDispatchReceipt>;
   inspectContent?: InspectSignalContent;
+  scheduleProviderOptionsPolicy?: ThreadSignalRoutesOptions['scheduleProviderOptionsPolicy'];
   proof?: SignalProofGuard;
   /** The ONE fence reading this request took — see handleWake. */
   executionFence: ExecutionFenceReading;
@@ -1969,7 +2000,30 @@ async function handleScheduleSignal(options: {
     return await settleDiscard();
   }
 
-  const baseProviderOptions = target.providerOptions ?? {};
+  const storedProviderOptions = target.providerOptions;
+  const scheduleProviderOptionsPolicy = options.scheduleProviderOptionsPolicy;
+  if (scheduleProviderOptionsPolicy) {
+    const inspection = await inspectPolicyResult(() =>
+      scheduleProviderOptionsPolicy({
+        // The policy cannot change the options later delivered in the signal.
+        providerOptions: structuredClone(storedProviderOptions),
+        agentId: target.agentId,
+        threadId: options.threadId,
+        resourceId,
+      }),
+    );
+    if (inspection === 'denied') {
+      return await settleDiscard();
+    }
+    if (inspection === 'error') {
+      return json(
+        { error: 'schedule provider options policy unavailable' },
+        503,
+      );
+    }
+  }
+
+  const baseProviderOptions = storedProviderOptions ?? {};
   const baseMastra = recordValue(baseProviderOptions.mastra) ?? {};
   const signal: AgentSignal = {
     id: dispatchId,

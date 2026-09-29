@@ -21,7 +21,139 @@ import {
   piiSecrets,
 } from '../policy-engine/index.js';
 import { ACTOR_CONTEXT_KEY } from '../rbac/index.js';
-import { createGuardedAgent } from './index.js';
+import {
+  assertAcceptedCallProviderOptions,
+  createGuardedAgent,
+  providerOptionsCarryContent,
+} from './index.js';
+
+describe('guarded host provider options', () => {
+  it.each<[string, unknown]>([
+    ['omitted options', undefined],
+    ['empty options', {}],
+    ['OpenAI generation settings', { openai: { reasoningEffort: 'low' } }],
+    ['Mastra schedule metadata', { mastra: { schedule: { scheduleId: 's' } } }],
+    ['an omitted namespace', { openai: undefined }],
+    ['an omitted key', { openai: { instructions: undefined } }],
+    [
+      'a null prototype',
+      Object.assign(Object.create(null), {
+        openai: { reasoningEffort: 'low' },
+      }),
+    ],
+  ])('accepts %s at the call boundary', (_label, options) => {
+    expect(() => assertAcceptedCallProviderOptions(options)).not.toThrow();
+  });
+
+  it.each<[string, unknown, string]>([
+    [
+      'OpenRouter messages',
+      { openrouter: { messages: [] } },
+      'GuardedAgent: providerOptions namespace "openrouter" is not accepted',
+    ],
+    [
+      'OpenAI instructions',
+      { openai: { instructions: 'x' } },
+      'GuardedAgent: providerOptions "openai" key "instructions" is not accepted',
+    ],
+    [
+      'Anthropic MCP servers',
+      { anthropic: { mcpServers: [] } },
+      'GuardedAgent: providerOptions "anthropic" key "mcpServers" is not accepted',
+    ],
+    [
+      'model settings',
+      { model: { temperature: 0.2 } },
+      'GuardedAgent: providerOptions namespace "model" is not accepted',
+    ],
+    [
+      'Together settings',
+      { togetherai: { top_k: 5 } },
+      'GuardedAgent: providerOptions namespace "togetherai" is not accepted',
+    ],
+    [
+      'OpenAI chat templates',
+      { openai: { chat_template: 'x' } },
+      'GuardedAgent: providerOptions "openai" key "chat_template" is not accepted',
+    ],
+    [
+      'Anthropic fallbacks',
+      { anthropic: { fallbacks: 'default' } },
+      'GuardedAgent: providerOptions "anthropic" key "fallbacks" is not accepted',
+    ],
+    [
+      'OpenAI allowed tools',
+      { openai: { allowedTools: {} } },
+      'GuardedAgent: providerOptions "openai" key "allowedTools" is not accepted',
+    ],
+    [
+      'a non-object Mastra namespace',
+      { mastra: 'x' },
+      'GuardedAgent: providerOptions namespace "mastra" must be a plain object',
+    ],
+    [
+      'unknown Mastra metadata',
+      { mastra: { other: 1 } },
+      'GuardedAgent: providerOptions "mastra" key "other" is not accepted',
+    ],
+    [
+      'a prototype-named namespace',
+      JSON.parse('{"__proto__":{}}'),
+      'GuardedAgent: providerOptions namespace "__proto__" is not accepted',
+    ],
+    [
+      'an array namespace',
+      { openai: [] },
+      'GuardedAgent: providerOptions namespace "openai" must be a plain object',
+    ],
+    [
+      'a prototype with an inherited namespace',
+      Object.create({ openrouter: { messages: [] } }),
+      'GuardedAgent: providerOptions must be a plain object',
+    ],
+    [
+      'a prototype with an inherited key',
+      { openai: Object.create({ instructions: 'x' }) },
+      'GuardedAgent: providerOptions namespace "openai" must be a plain object',
+    ],
+    [
+      'a class prototype',
+      new (class {
+        openai = { reasoningEffort: 'low' };
+      })(),
+      'GuardedAgent: providerOptions must be a plain object',
+    ],
+    ['a string', 'x', 'GuardedAgent: providerOptions must be a plain object'],
+    ['an array', [], 'GuardedAgent: providerOptions must be a plain object'],
+    ['null', null, 'GuardedAgent: providerOptions must be a plain object'],
+  ])('refuses %s at the call boundary', (_label, options, message) => {
+    expect(() => assertAcceptedCallProviderOptions(options)).toThrow(TypeError);
+    expect(() => assertAcceptedCallProviderOptions(options)).toThrow(message);
+  });
+
+  it.each<[string, unknown, boolean]>([
+    ['a refused adapter namespace', { openaiCompatible: {} }, true],
+    ['a refused Anthropic key', { anthropic: { title: 'x' } }, true],
+    ['Anthropic citations', { anthropic: { citations: [] } }, true],
+    [
+      'OpenRouter reasoning details',
+      { openrouter: { reasoning_details: [] } },
+      true,
+    ],
+    ['a non-object namespace value', { vendor: 'x' }, true],
+    ['omitted options', undefined, false],
+    ['empty options', {}, false],
+    ['plain unknown settings', { model: { temperature: 0.2 } }, false],
+    ['Mastra schedule metadata', { mastra: { schedule: {} } }, false],
+    [
+      'Anthropic cache control',
+      { anthropic: { cacheControl: { type: 'ephemeral' } } },
+      false,
+    ],
+  ])('classifies %s at the message boundary', (_label, options, expected) => {
+    expect(providerOptionsCarryContent(options)).toBe(expected);
+  });
+});
 
 // Each row drives a model adapter that `@mastra/core` bundles, selected through
 // Mastra's public model router or gateways, on Mastra's standard agent loop,

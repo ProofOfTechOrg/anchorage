@@ -75,6 +75,7 @@ import {
   convertedPrompt,
   UNCLASSIFIED_INPUT_CONTENT,
 } from './prompt-media.js';
+import { isPlainRecord, providerOptionValues } from './provider-options.js';
 import type { PolicyDecision } from './tool-policy.js';
 
 export type {
@@ -179,73 +180,6 @@ function readEachPromptValues(
     const memberValues = readPromptValues(readers, member);
     if (memberValues === undefined) return undefined;
     values.push(...memberValues);
-  }
-  return values;
-}
-
-function isPlainRecord(
-  value: unknown,
-): value is Readonly<Record<string, unknown>> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-// JSON text of a provider-option value without the named keys, at any depth.
-function jsonWithoutKeys(
-  ...keys: readonly string[]
-): (value: unknown) => readonly unknown[] {
-  return (value) => [
-    JSON.stringify(value, (key, member: unknown) =>
-      keys.includes(key) ? undefined : member,
-    ),
-  ];
-}
-
-type ProviderOptionRule = 'refuse' | ((value: unknown) => readonly unknown[]);
-
-// Provider options that a model adapter bundled with the supported
-// `@mastra/core` renders into the request as message content, role, text,
-// tool input or tool output. What no genuine stored replay carries is refused;
-// what a provider's responses store on the parts Mastra replays is read, less
-// its signatures, ids and encrypted values. Every other namespace and key is
-// replay metadata, such as signatures, item ids and cache control, and is not
-// read: an entropy detector would deny the replays that carry it.
-const PROVIDER_CONTENT_OPTIONS: Readonly<
-  Record<string, 'refuse' | Readonly<Record<string, ProviderOptionRule>>>
-> = {
-  openaiCompatible: 'refuse',
-  anthropic: {
-    title: 'refuse',
-    context: 'refuse',
-    citations: jsonWithoutKeys('encrypted_index'),
-  },
-  openrouter: {
-    filename: 'refuse',
-    annotations: 'refuse',
-    reasoning_details: jsonWithoutKeys('data', 'signature', 'id'),
-  },
-};
-
-// The text a provider-options object carries to the model, or undefined when
-// it holds an entry this module refuses or a value that is not an object.
-function providerOptionValues(
-  options: unknown,
-): readonly unknown[] | undefined {
-  if (options === undefined) return [];
-  if (!isPlainRecord(options)) return undefined;
-  const values: unknown[] = [];
-  for (const [namespace, entries] of Object.entries(options)) {
-    if (entries === undefined) continue;
-    const rules = Object.hasOwn(PROVIDER_CONTENT_OPTIONS, namespace)
-      ? PROVIDER_CONTENT_OPTIONS[namespace]
-      : undefined;
-    if (rules === 'refuse' || !isPlainRecord(entries)) return undefined;
-    if (rules === undefined) continue;
-    for (const [key, value] of Object.entries(entries)) {
-      if (value === undefined || !Object.hasOwn(rules, key)) continue;
-      const rule = rules[key];
-      if (rule === 'refuse') return undefined;
-      if (rule !== undefined) values.push(...rule(value));
-    }
   }
   return values;
 }

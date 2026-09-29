@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import type { Agent } from '@mastra/core/agent';
+import { type Agent, isCreatedAgentSignal } from '@mastra/core/agent';
 import {
   AGENT_STREAM_TOPIC,
   globalRunRegistry,
 } from '@mastra/core/agent/durable';
 import { Mastra } from '@mastra/core/mastra';
 import type { MastraCompositeStore } from '@mastra/core/storage';
+import {
+  assertAcceptedCallProviderOptions,
+  assertNoGuardedSystemMessages,
+} from '@proofoftech/breakwater/agent';
 import { isPrincipalPermissions } from '@proofoftech/breakwater/rbac';
 import {
   AgentRunSelectorMismatchError,
@@ -195,6 +199,11 @@ export interface ThreadAgentStartInput {
   resourceId: string;
   runId: string;
   prompt?: string;
+  /**
+   * Created signals, alone or as list items, pass through unchanged. Every
+   * other input must be structured-cloneable (use string file and image URLs),
+   * or start answers 400.
+   */
   messages?: Parameters<FlowsafeDurableAgent['stream']>[0];
   entryPath: AgentEntryPath;
   threaded?: boolean;
@@ -2053,6 +2062,33 @@ export function createThreadAgentHost(
       const resolvedProviderOptions = source.target
         ? source.target.providerOptions
         : input.providerOptions;
+      // This host bypasses the guarded handle, so checks run on forwarded
+      // snapshots before state writes.
+      let providerOptionsSnapshot: Record<string, unknown> | undefined;
+      let messagesSnapshot: typeof messages;
+      try {
+        providerOptionsSnapshot = providerOptions(resolvedProviderOptions);
+        // Created signals carry methods that structuredClone cannot copy.
+        messagesSnapshot = isCreatedAgentSignal(messages)
+          ? messages
+          : Array.isArray(messages)
+            ? messages.map((item) =>
+                isCreatedAgentSignal(item) ? item : structuredClone(item),
+              )
+            : structuredClone(messages);
+      } catch (error) {
+        if (error instanceof AgentHostRequestError) throw error;
+        throw new AgentHostRequestError(400, 'agent input must be cloneable');
+      }
+      try {
+        assertNoGuardedSystemMessages(messagesSnapshot);
+        assertAcceptedCallProviderOptions(providerOptionsSnapshot);
+      } catch (error) {
+        if (error instanceof TypeError) {
+          throw new AgentHostRequestError(400, error.message);
+        }
+        throw error;
+      }
       const { current, module, principalPermissions } = await authorize(
         scope,
         ref.agentId,
@@ -2210,8 +2246,8 @@ export function createThreadAgentHost(
               : {}),
             maxSteps: module.agent.maxSteps,
             disableBackgroundTasks: true,
-            ...(resolvedProviderOptions !== undefined
-              ? { providerOptions: providerOptions(resolvedProviderOptions) }
+            ...(providerOptionsSnapshot !== undefined
+              ? { providerOptions: providerOptionsSnapshot }
               : {}),
           };
           const scheduleDispatch =
@@ -2223,7 +2259,7 @@ export function createThreadAgentHost(
               : undefined;
           try {
             await durable.streamUntilPersisted(
-              messages,
+              messagesSnapshot,
               streamOptions,
               principal.id,
               principal.kind,

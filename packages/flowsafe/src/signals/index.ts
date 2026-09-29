@@ -49,6 +49,8 @@ export {
   IDLE_BEHAVIORS,
   type IdleBehavior,
   type RunCapConsult,
+  type ScheduleProviderOptionsPolicy,
+  type ScheduleProviderOptionsPolicyInput,
   type ScheduleSignalDispatchStore,
   type SignalContentPolicy,
   type SignalContentPolicyInput,

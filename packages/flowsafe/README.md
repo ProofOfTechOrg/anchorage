@@ -27,7 +27,7 @@ Compatibility:
 - TypeScript `moduleResolution: "NodeNext"`, `"Node16"`, or `"Bundler"`
 - `@mastra/core` `1.67.0`
 - `react` and `react-dom` `>=18 <20` (React 18 or 19) for the optional approval UI
-- `@proofoftech/breakwater` `>=0.15.0 <1.0.0` when used
+- `@proofoftech/breakwater` `>=0.16.0 <1.0.0` when used
 - host-provided Wrangler `>=4.118 <5` for the optional `flowsafe-provision` CLI
 
 ## Choose an export
@@ -462,7 +462,9 @@ import { RequestContext } from '@mastra/core/request-context';
 import {
   ACTOR_CONTEXT_KEY,
   AGENT_AUDIT_CONTEXT_KEY,
+  assertAcceptedCallProviderOptions,
   createContentPolicyGate,
+  providerOptionsCarryContent,
 } from '@proofoftech/breakwater';
 import {
   breakwaterActorFor,
@@ -498,6 +500,17 @@ const signalRoutes = createThreadSignalRoutes({
   // Existing server-owned resolvers and dispatch seams.
   notificationDispatchAllowed: (scope, agentId) =>
     host.notificationDispatchAllowed(scope, agentId),
+  scheduleProviderOptionsPolicy: ({ providerOptions }) => {
+    try {
+      if (providerOptionsCarryContent(providerOptions)) {
+        return { allowed: false, outcome: 'denied' };
+      }
+      assertAcceptedCallProviderOptions(providerOptions);
+      return { allowed: true };
+    } catch {
+      return { allowed: false, outcome: 'denied' };
+    }
+  },
   contentPolicy: (input) =>
     inspectContent({
       text: input.text,

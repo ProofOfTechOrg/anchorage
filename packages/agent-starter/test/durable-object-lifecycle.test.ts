@@ -111,6 +111,43 @@ describe('starter run lifecycle wiring', () => {
     }
   });
 
+  it('wires the schedule provider options policy to Breakwater classification', () => {
+    const db = sqliteUnitDatabase(openSqlite()) as Env['DB'];
+    const state = {
+      id: { name: 'starter-policy-thread' },
+      storage: {},
+    } as unknown as DurableObjectState;
+    const env = {
+      DB: db,
+      DEPLOYMENT_TENANT: 'acme',
+      DEPLOYMENT_IDENTITY_SECRET: 'starter-policy-identity-secret-0001',
+      MODEL_ID: 'test/unreachable',
+      MODEL_API_KEY: 'test-key',
+    } as Env;
+    new StarterThread(state, env);
+    const policy = vi.mocked(createThreadSignalRoutes).mock.lastCall?.[0]
+      .scheduleProviderOptionsPolicy;
+
+    expect(policy).toBeTypeOf('function');
+    if (!policy) throw new Error('schedule provider options policy is missing');
+    const identity = {
+      agentId: 'anchorage-agent',
+      threadId: 'acme_t1',
+      resourceId: 'acme_t1',
+    };
+    for (const [providerOptions, expected] of [
+      [{ model: { temperature: 0.2 } }, { allowed: false, outcome: 'denied' }],
+      [{ openai: { user: 'u' } }, { allowed: false, outcome: 'denied' }],
+      [{ openaiCompatible: {} }, { allowed: false, outcome: 'denied' }],
+      [{ anthropic: { title: 'x' } }, { allowed: false, outcome: 'denied' }],
+      [{ openai: { reasoningEffort: 'low' } }, { allowed: true }],
+      [{ mastra: { schedule: { scheduleId: 's' } } }, { allowed: true }],
+      [undefined, { allowed: true }],
+    ] as const) {
+      expect(policy({ ...identity, providerOptions })).toEqual(expected);
+    }
+  });
+
   it('marks only a fully identified idle-run dispatch as lease-held', () => {
     expect(
       idleRunScheduleDispatch({

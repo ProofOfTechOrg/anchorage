@@ -616,6 +616,42 @@ describe('createScheduleTick', () => {
     );
   });
 
+  it('records a confirmed agent start refusal as failed and advances the schedule', async () => {
+    const store = new FakeStore();
+    store.seed(
+      workflowSchedule({
+        id: 'agent_refused',
+        target: { type: 'agent', agentId: 'a1', prompt: 'go' },
+        ownerType: 'agent',
+        ownerId: 'a1',
+      }),
+    );
+    const startAgent = vi.fn(async () => {
+      throw Object.assign(new Error('guarded start refused'), { status: 400 });
+    });
+    const status = vi.fn(async () => undefined);
+
+    const result = await createScheduleTick({
+      store,
+      start: vi.fn(),
+      startAgent,
+      status,
+      now: () => NOW,
+    })();
+
+    expect(result).toMatchObject({ fired: 0, failed: 1, deferred: 0 });
+    expect(startAgent).toHaveBeenCalledOnce();
+    expect(status).toHaveBeenCalledOnce();
+    expect(store.triggers).toHaveLength(1);
+    expect(store.triggers[0]).toMatchObject({
+      outcome: 'failed',
+      metadata: { reason: 'start-error-confirmed' },
+    });
+    expect(store.schedules.get('agent_refused')?.nextFireAt).toBeGreaterThan(
+      NOW,
+    );
+  });
+
   it('dispatches arbitrary path-safe stored memory ids within the deployment', async () => {
     const store = new FakeStore();
     store.seed(

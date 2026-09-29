@@ -22,6 +22,7 @@ import {
 } from '../policy-engine/index.js';
 import { ACTOR_CONTEXT_KEY, type PrincipalKind } from '../rbac/index.js';
 import {
+  assertNoGuardedSystemMessages,
   createGuardedAgent,
   GUARDED_AGENT_HOST_PROTOCOL,
   type GuardedAgentCallOptions,
@@ -332,6 +333,36 @@ describe('guarded caller messages', () => {
     'GuardedAgent: a message list nested more than one level deep is not accepted',
   );
   const METHODS = ['generate', 'stream'] as const;
+
+  it.each<[string, unknown, TypeError | undefined]>([
+    [
+      'a flat system message',
+      [{ role: 'system', content: SECRET }],
+      SYSTEM_REFUSAL,
+    ],
+    [
+      'a system message in one nested list',
+      [[{ role: 'system', content: SECRET }]],
+      SYSTEM_REFUSAL,
+    ],
+    ['a list nested two levels deep', [[['hi']]], NESTING_REFUSAL],
+    [
+      'user and assistant messages',
+      [
+        { role: 'user', content: 'hi' },
+        { role: 'assistant', content: 'hello' },
+      ],
+      undefined,
+    ],
+    ['a string', 'hi', undefined],
+  ])('applies the handle system-message check to %s', (_label, messages, refusal) => {
+    if (refusal === undefined) {
+      expect(() => assertNoGuardedSystemMessages(messages)).not.toThrow();
+      return;
+    }
+    expect(() => assertNoGuardedSystemMessages(messages)).toThrow(TypeError);
+    expect(() => assertNoGuardedSystemMessages(messages)).toThrow(refusal);
+  });
 
   interface GuardedRun {
     modelPrompts: unknown[];

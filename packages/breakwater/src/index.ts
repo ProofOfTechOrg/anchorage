@@ -22,9 +22,12 @@ export type {
   GuardedToolChoice,
 } from './agent/index.js';
 export {
+  assertAcceptedCallProviderOptions,
+  assertNoGuardedSystemMessages,
   createGuardedAgent,
   GUARDED_AGENT_HOST_PROTOCOL,
   isGuardedAgentHandle,
+  providerOptionsCarryContent,
 } from './agent/index.js';
 export type {
   AgentCliConnectorOptions,

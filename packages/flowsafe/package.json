@@ -94,7 +94,7 @@
   },
   "peerDependencies": {
     "@mastra/core": "1.67.0",
-    "@proofoftech/breakwater": ">=0.15.0 <1.0.0",
+    "@proofoftech/breakwater": ">=0.16.0 <1.0.0",
     "react": ">=18 <20",
     "react-dom": ">=18 <20"
   },

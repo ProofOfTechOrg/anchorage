@@ -30,6 +30,8 @@ import type { SignalDatabase } from './d1-shared.js';
 import { D1NotificationsStorage } from './notifications-d1.js';
 import {
   createThreadSignalRoutes,
+  type ScheduleProviderOptionsPolicy,
+  type ScheduleProviderOptionsPolicyInput,
   type SignalContentPolicy,
   type SignalContentPolicyInput,
   type SignalContentPolicyResult,
@@ -4701,6 +4703,134 @@ describe('createThreadSignalRoutes — signal content policy', () => {
       expect(input.text).toContain('origin="schedule"');
       expect(input.text).toContain('scheduled instruction');
     }
+  });
+
+  it('discards content-bearing stored schedule options before active-run delivery', async () => {
+    // #given
+    const { agent } = mockAgent();
+    (
+      agent as unknown as { getActiveThreadRunId: () => string }
+    ).getActiveThreadRunId = () => 'active-run';
+    const sendSignal = vi.spyOn(agent, 'sendSignal');
+    const settle = vi.fn(async () => undefined);
+    const providerOptions = { openaiCompatible: { instruction: 'hidden' } };
+    const scheduleProviderOptionsPolicy = vi.fn(() => DENIED);
+
+    // #when
+    const response = await dispatchSchedule(
+      {
+        resolveAgent: () => agent,
+        resolveResourceId: () => 'acme_t1',
+        resolveScheduleTarget: async () => scheduleTarget({ providerOptions }),
+        resolveScheduleDispatchStore: () => ({
+          begin: async () => ({ state: 'ready' as const }),
+          settle,
+        }),
+        scheduleProviderOptionsPolicy,
+      },
+      { scheduleId: 'schedule_1', dispatchId: 'dispatch_1', runId: 'run_1' },
+    );
+
+    // #then
+    const receipt = {
+      action: 'discard',
+      outcome: 'discarded',
+      signalId: 'dispatch_1',
+    };
+    expect(response?.status).toBe(200);
+    expect(await response?.json()).toEqual({ receipt });
+    expect(settle).toHaveBeenCalledWith('schedule_1', 'dispatch_1', receipt);
+    expect(sendSignal).not.toHaveBeenCalled();
+    expect(scheduleProviderOptionsPolicy).toHaveBeenCalledWith({
+      providerOptions,
+      agentId: 'agent',
+      threadId: 'acme_t1',
+      resourceId: 'acme_t1',
+    });
+  });
+
+  it('delivers stored schedule options despite policy argument mutation', async () => {
+    // #given
+    const { agent } = mockAgent();
+    (
+      agent as unknown as { getActiveThreadRunId: () => string }
+    ).getActiveThreadRunId = () => 'active-run';
+    const sendSignal = vi.spyOn(agent, 'sendSignal');
+    const providerOptions = { openai: { reasoningEffort: 'low' } };
+    const scheduleProviderOptionsPolicy = vi.fn(
+      (input: ScheduleProviderOptionsPolicyInput) => {
+        (input.providerOptions as Record<string, unknown>).openaiCompatible = {
+          instruction: 'x',
+        };
+        return { allowed: true as const };
+      },
+    );
+
+    // #when
+    const response = await dispatchSchedule(
+      {
+        resolveAgent: () => agent,
+        resolveResourceId: () => 'acme_t1',
+        resolveScheduleTarget: async () => scheduleTarget({ providerOptions }),
+        resolveScheduleDispatchStore: () => ({
+          begin: async () => ({ state: 'ready' as const }),
+          settle: async () => undefined,
+        }),
+        scheduleProviderOptionsPolicy,
+      },
+      { scheduleId: 'schedule_1', dispatchId: 'dispatch_1', runId: 'run_1' },
+    );
+
+    // #then
+    expect(response?.status).toBe(200);
+    expect(sendSignal).toHaveBeenCalledOnce();
+    expect(sendSignal.mock.calls[0]?.[0].providerOptions).toEqual({
+      openai: { reasoningEffort: 'low' },
+      mastra: {
+        schedule: { scheduleId: 'schedule_1', threadId: 'acme_t1' },
+      },
+    });
+  });
+
+  it.each([
+    ['an error outcome', () => ERRORED],
+    [
+      'a synchronous throw',
+      () => {
+        throw new Error('policy unavailable');
+      },
+    ],
+    ['a malformed result', () => ({ allowed: 'maybe' })],
+  ])('keeps the schedule lease unsettled when the options policy encounters %s', async (_case, scheduleProviderOptionsPolicy) => {
+    // #given
+    const { agent } = mockAgent();
+    const sendSignal = vi.spyOn(agent, 'sendSignal');
+    const settle = vi.fn(async () => undefined);
+
+    // #when
+    const response = await dispatchSchedule(
+      {
+        resolveAgent: () => agent,
+        resolveResourceId: () => 'acme_t1',
+        resolveScheduleTarget: async () =>
+          scheduleTarget({ providerOptions: { openaiCompatible: {} } }),
+        resolveScheduleDispatchStore: () => ({
+          begin: async () => ({ state: 'ready' as const }),
+          settle,
+        }),
+        scheduleProviderOptionsPolicy:
+          scheduleProviderOptionsPolicy as unknown as ScheduleProviderOptionsPolicy,
+      },
+      { scheduleId: 'schedule_1', dispatchId: 'dispatch_1', runId: 'run_1' },
+    );
+
+    // #then
+    expect(response?.status).toBe(503);
+    expect(await response?.json()).toEqual({
+      error: 'schedule provider options policy unavailable',
+    });
+    expect(settle).not.toHaveBeenCalled();
+    expect(sendSignal).not.toHaveBeenCalled();
   });
 
   it('leaves a schedule lease recoverable when the policy fails', async () => {

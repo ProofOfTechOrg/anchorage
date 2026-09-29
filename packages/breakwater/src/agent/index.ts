@@ -49,6 +49,11 @@ import {
   clientToolOutputProcessor,
 } from './client-tool-output.js';
 
+export {
+  assertAcceptedCallProviderOptions,
+  providerOptionsCarryContent,
+} from '../policy-engine/provider-options.js';
+
 const RESERVED_PROCESSOR_IDS = new Set([
   'breakwater-rbac',
   'breakwater-input-assets',
@@ -961,7 +966,11 @@ function guardedMemoryOption(
 // instructions belong in the agent's `instructions`. The entries are
 // normalized as Mastra's `MessageList.add` normalizes them: it flattens one
 // nested list and throws on a deeper one, which is refused here first.
-function assertNoSystemMessages(messages: unknown): void {
+/**
+ * Refuse caller system messages and lists nested deeper than Mastra flattens.
+ * Hosts starting a guarded durable loop apply this check before preparation.
+ */
+export function assertNoGuardedSystemMessages(messages: unknown): void {
   const entries: unknown[] = Array.isArray(messages)
     ? messages.flat()
     : [messages];
@@ -1130,7 +1139,7 @@ class GuardedAgent<
     // biome-ignore lint/suspicious/noExplicitAny: the protected subclass must remain override-compatible with every inherited structured-output overload; runtime validation rejects structured output and the factory narrows the public handle to undefined.
   ): Promise<FullOutput<any>> {
     const options = guardedCallOptions(rawOptions);
-    assertNoSystemMessages(messages);
+    assertNoGuardedSystemMessages(messages);
     this.#preauthorize(options.requestContext);
     return super.generate(messages, this.#executionOptions(options));
   }
@@ -1141,7 +1150,7 @@ class GuardedAgent<
     // biome-ignore lint/suspicious/noExplicitAny: the protected subclass must remain override-compatible with every inherited structured-output overload; runtime validation rejects structured output and the factory narrows the public handle to undefined.
   ): Promise<MastraModelOutput<any>> {
     const options = guardedCallOptions(rawOptions);
-    assertNoSystemMessages(messages);
+    assertNoGuardedSystemMessages(messages);
     this.#preauthorize(options.requestContext);
     return super.stream(messages, this.#executionOptions(options));
   }
