@@ -36,6 +36,8 @@ Availability is secondary to these properties. When context, storage, identity, 
 | Audit and metrics stream | Memory, Logs, Queue, SIEM | Evidence loss or organization-sensitive metadata disclosure |
 | Agent CLI prompt and workspace | Child-process argv and filesystem | Source, secret, or code-integrity compromise |
 
+After RBAC, memory input processors such as semantic recall's embedder receive the caller's text before input policies on every guarded loop; a memory resolution failure fails closed. A memory input processor error, such as a failed thread-history read, stops a durable call with `input processor failed` and one `agent.input.processor` error event naming the processor's id (`message-history` for history); on `generate()` and `stream()`, Mastra rejects the call and Breakwater writes no audit event.
+
 ## Trust boundaries
 
 ### Public client to Worker

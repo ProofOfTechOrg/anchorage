@@ -37,6 +37,7 @@ import {
 } from '../rbac/index.js';
 import {
   createGuardedAgent,
+  type GuardedAgentConfig,
   type GuardedAgentHandle,
   type GuardedInputProcessor,
 } from './index.js';
@@ -179,7 +180,7 @@ function guardedAgent(settings: {
   audit: AuditLogger;
   policies?: readonly PolicyEvaluator[];
   processors?: readonly GuardedInputProcessor[];
-  memory?: MockMemory;
+  memory?: GuardedAgentConfig['memory'];
   instructions?: string;
   model?: MastraModelConfig;
   tools?: ToolsInput;
@@ -779,9 +780,7 @@ describe('guarded input asset URL origins', () => {
     expect(JSON.stringify(events)).not.toContain(new URL(url).hostname);
   });
 
-  it.each(
-    STANDARD,
-  )('refuses a URL in stored history on %s (the durable loop loads no history)', async (loop) => {
+  it.each(LOOPS)('refuses a URL in stored history on %s', async (loop) => {
     const url = 'https://unlisted.example/a.png';
     const fetch = stubFetch();
     const memory = await threadMemory();
@@ -1480,15 +1479,10 @@ const THREAD = { thread: 't1', resource: 'r1' } as const;
 const WAIT_MS = 1000;
 
 async function threadMemory(
-  options: {
-    title?: boolean;
-    generateTitle?: boolean;
-    workingMemoryTemplate?: string;
-  } = {},
+  options: { title?: boolean; workingMemoryTemplate?: string } = {},
 ): Promise<MockMemory> {
   const memory = new MockMemory({
     storage: new InMemoryStore(),
-    ...(options.generateTitle ? { options: { generateTitle: true } } : {}),
     ...(options.workingMemoryTemplate !== undefined
       ? {
           options: {
@@ -1582,13 +1576,266 @@ async function historyMemory(
   return memory;
 }
 
+describe('durable memory preparation', () => {
+  function semanticMemory() {
+    const memory = new (class extends MockMemory {
+      enableSemanticRecall() {
+        this.threadConfig.semanticRecall = true;
+      }
+    })({ storage: new InMemoryStore() });
+    const doEmbed = vi.fn(async ({ values }: { values: string[] }) => ({
+      embeddings: values.map(() => [1]),
+    }));
+    memory.setEmbedder({ modelId: 'test-embedder', doEmbed } as never);
+    memory.setVector({
+      indexSeparator: '_',
+      createIndex: async () => undefined,
+      query: async () => [],
+      upsert: async () => [],
+    } as never);
+    memory.enableSemanticRecall();
+    return { memory, doEmbed };
+  }
+
+  it('keeps a denied caller text out of semantic recall embeddings', async () => {
+    const { memory, doEmbed } = semanticMemory();
+    const prompts: unknown[] = [];
+    const agent = guardedAgent({ prompts, audit: new AuditLogger(), memory });
+    const deniedText = 'private denied caller text';
+
+    expect(
+      await drive(agent, 'durable', [deniedText], {
+        requestContext: actorContext('viewer'),
+        memory: THREAD,
+      }),
+    ).toMatch(/role 'viewer'/);
+    expect(prompts).toEqual([]);
+    expect(doEmbed.mock.calls.flatMap(([args]) => args.values)).not.toContain(
+      deniedText,
+    );
+  });
+
+  it.each(
+    LOOPS,
+  )('shows the input policy only caller text with semantic recall on %s', async (loop) => {
+    const { memory } = semanticMemory();
+    const evaluated: string[] = [];
+    const prompts: unknown[] = [];
+    const agent = guardedAgent({
+      prompts,
+      audit: new AuditLogger(),
+      memory,
+      policies: [
+        {
+          name: 'input-observer',
+          phases: ['input'],
+          evaluate: ({ text }) => {
+            evaluated.push(text);
+            return { allowed: true };
+          },
+        },
+      ],
+    });
+
+    expect(
+      await drive(agent, loop, ['caller text'], {
+        requestContext: actorContext(),
+        memory: THREAD,
+      }),
+    ).toBeUndefined();
+    expect(evaluated).toEqual(['caller text']);
+  });
+
+  it('aborts without a model call when memory input processors fail', async () => {
+    const memory = await threadMemory();
+    vi.spyOn(memory, 'getInputProcessors').mockRejectedValue(
+      new Error('private memory failure'),
+    );
+    const prompts: unknown[] = [];
+    const audit = new AuditLogger();
+    const agent = guardedAgent({ prompts, audit, memory });
+
+    expect(
+      await drive(agent, 'durable', ['hello'], {
+        requestContext: actorContext(),
+        memory: THREAD,
+      }),
+    ).toBe(PROCESSOR_FAILED);
+    expect(prompts).toEqual([]);
+    expect(eventsOf(audit, 'agent.input.processor', 'error')).toMatchObject([
+      { detail: { processor: 'breakwater-memory' } },
+    ]);
+  });
+
+  it('aborts when a durable memory history read fails', async () => {
+    const memory = await threadMemory();
+    const store = await memory.storage.getStore('memory');
+    if (!store) throw new Error('memory store unavailable');
+    vi.spyOn(store, 'listMessages').mockRejectedValue(
+      new Error('private storage read failure'),
+    );
+    const prompts: unknown[] = [];
+    const audit = new AuditLogger();
+    const agent = guardedAgent({ prompts, audit, memory });
+
+    expect(
+      await drive(agent, 'durable', markedInput(), {
+        requestContext: actorContext(),
+        memory: THREAD,
+      }),
+    ).toBe(PROCESSOR_FAILED);
+    expect(prompts).toEqual([]);
+    expect(eventsOf(audit, 'agent.input.processor', 'error')).toMatchObject([
+      { detail: { processor: 'message-history' } },
+    ]);
+  });
+
+  it.each(
+    LOOPS,
+  )('runs a memory processor state signal under its state id on %s', async (loop) => {
+    const memory = await threadMemory();
+    const original = memory.getInputProcessors.bind(memory);
+    const invoked: unknown[] = [];
+    const processor = {
+      id: 'memory-signal',
+      stateId: 'memory-state',
+      computeStateSignal() {
+        invoked.push(this);
+        return { cacheKey: 'state-v1', contents: 'memory state' };
+      },
+    };
+    vi.spyOn(memory, 'getInputProcessors').mockImplementation(
+      async (...args) => [...(await original(...args)), processor],
+    );
+    const prompts: unknown[] = [];
+    const agent = guardedAgent({ prompts, audit: new AuditLogger(), memory });
+
+    expect(
+      await drive(agent, loop, ['hello'], {
+        requestContext: actorContext(),
+        memory: THREAD,
+      }),
+    ).toBeUndefined();
+    expect(invoked).toEqual([processor]);
+    const thread = await memory.getThreadById({ threadId: THREAD.thread });
+    expect(thread?.metadata).toMatchObject({
+      mastra: {
+        stateSignals: { 'memory-state': { currentCacheKey: 'state-v1' } },
+      },
+    });
+    expect(thread?.metadata).not.toHaveProperty(
+      'mastra.stateSignals.memory-signal',
+    );
+  });
+
+  it('runs the output policy when the secondary memory lookup fails', async () => {
+    const memory = await threadMemory();
+    const original = memory.getInputProcessors.bind(memory);
+    let calls = 0;
+    vi.spyOn(memory, 'getInputProcessors').mockImplementation((...args) => {
+      if (++calls === 2) throw new Error('secondary memory failure');
+      return original(...args);
+    });
+    const evaluated: string[] = [];
+    const prompts: unknown[] = [];
+    const agent = guardedAgent({
+      prompts,
+      audit: new AuditLogger(),
+      memory,
+      policies: [
+        {
+          name: 'output-observer',
+          phases: ['output'],
+          evaluate: ({ phase }) => {
+            evaluated.push(phase);
+            return { allowed: true };
+          },
+        },
+      ],
+    });
+
+    expect(
+      await drive(agent, 'durable', ['hello'], {
+        requestContext: actorContext(),
+        memory: THREAD,
+      }),
+    ).toBeUndefined();
+    expect(prompts).toHaveLength(1);
+    expect(evaluated).toContain('output');
+  });
+
+  it('refuses title-enabled dynamic memory before the durable model call', async () => {
+    const prompts: unknown[] = [];
+    const memory = new MockMemory({ options: { generateTitle: true } });
+    const audit = new AuditLogger();
+    const agent = guardedAgent({
+      prompts,
+      audit,
+      policies: [],
+      memory: async () => memory,
+    });
+
+    expect(
+      await drive(agent, 'durable', ['hello'], {
+        requestContext: actorContext(),
+        memory: THREAD,
+      }),
+    ).toBe(PROCESSOR_FAILED);
+    expect(prompts).toEqual([]);
+    expect(eventsOf(audit, 'agent.input.processor', 'error')).toMatchObject([
+      { detail: { processor: 'breakwater-memory' } },
+    ]);
+  });
+
+  it.each(
+    LOOPS,
+  )('does not generate a title when dynamic memory changes between resolutions on %s', async (loop) => {
+    const disabled = await threadMemory({ title: false });
+    const enabled = new MockMemory({
+      storage: new InMemoryStore(),
+      options: { generateTitle: true },
+    });
+    const prompts: unknown[] = [];
+    let calls = 0;
+    const agent = createGuardedAgent({
+      id: 'writer',
+      name: 'Writer',
+      instructions: 'Answer the request.',
+      model: recordingModel(prompts),
+      allowedRoles: ['operator'],
+      policies: [denyPatterns(['never-present'])],
+      audit: new AuditLogger(),
+      maxSteps: 1,
+      toolChoice: 'auto',
+      memory: async () => {
+        calls++;
+        return loop === 'durable'
+          ? calls === 1
+            ? enabled
+            : disabled
+          : calls === 1
+            ? disabled
+            : enabled;
+      },
+    });
+
+    expect(
+      await drive(agent, loop, ['hello'], {
+        requestContext: actorContext(),
+        memory: THREAD,
+      }),
+    ).toBeUndefined();
+    expect(prompts).toHaveLength(1);
+    expect(await titleWithin(enabled)).toBe('');
+  });
+});
+
 async function threadTitle(memory: MockMemory): Promise<string> {
   const thread = await memory.getThreadById({ threadId: THREAD.thread });
   return thread?.title ?? '';
 }
 
-// Mastra's durable finish titles a thread after its stream drains, so the
-// thread is read until it has a title or the wait ends.
+// Mastra may finish title generation after the stream drains, so wait for a possible title.
 async function titleWithin(memory: MockMemory): Promise<string> {
   const deadline = Date.now() + WAIT_MS;
   let title = await threadTitle(memory);
@@ -1599,8 +1846,7 @@ async function titleWithin(memory: MockMemory): Promise<string> {
   return title;
 }
 
-// A context message and a memory message, both user messages carrying the
-// marker, which Mastra's durable finish would title a thread from.
+// Adds marked context and memory messages to the input list.
 function addMarkedMessages(args: ProcessInputArgs): void {
   args.messageList.add(
     userMessage('app-context', `${MARK} context`),
@@ -1799,55 +2045,29 @@ describe('a call refused on the input chain saves none of its input', () => {
       expect(JSON.stringify(prompts)).not.toContain(MARK);
     }
   });
+});
 
-  it('generates no thread title from a refused durable call', async () => {
-    // #given — the thread has no title, and memory titles new threads
-    const memory = await threadMemory({ title: false, generateTitle: true });
-    const prompts: unknown[] = [];
-    const agent = guardedAgent({ prompts, audit: new AuditLogger(), memory });
-
-    // #when
-    const tripwire = await drive(agent, 'durable', markedInput(), {
-      requestContext: actorContext(),
-      memory: THREAD,
-    });
-    await storedWithin(memory, MARK);
-
-    // #then — no model call at all, so no title was generated from the input
-    expect(tripwire).toMatch(/^deny-patterns: /);
-    expect(prompts).toEqual([]);
-    const thread = await memory.getThreadById({ threadId: THREAD.thread });
-    expect(thread?.title ?? '').toBe('');
+it.each(
+  LOOPS,
+)('leaves an accepted %s call without a thread title with default Memory settings', async (loop) => {
+  const memory = await threadMemory({ title: false });
+  const prompts: unknown[] = [];
+  const agent = guardedAgent({
+    prompts,
+    audit: new AuditLogger(),
+    memory,
+    policies: [denyPatterns(['never-present'])],
   });
 
-  it.each(
-    ADDED_THEN_REFUSED,
-  )('titles no thread from, and stores none of, the context and memory messages processors added to a durable call when %s', async (_label, processors) => {
-    // #given — the thread has no title, and memory titles new threads
-    const memory = await threadMemory({ title: false, generateTitle: true });
-    const prompts: unknown[] = [];
-    const agent = guardedAgent({
-      prompts,
-      audit: new AuditLogger(),
-      memory,
-      processors: processors(),
-    });
-
-    // #when
-    const tripwire = await drive(agent, 'durable', ['hello'], {
-      requestContext: actorContext(),
-      memory: THREAD,
-    });
-    const title = await titleWithin(memory);
-
-    // #then — the model, title calls included, never ran
-    expect({
-      refused: tripwire !== undefined,
-      prompts: prompts.map(promptLines),
-      title,
-      stored: (await storedText(memory)).includes(MARK),
-    }).toEqual({ refused: true, prompts: [], title: '', stored: false });
+  const tripwire = await drive(agent, loop, ['hello'], {
+    requestContext: actorContext(),
+    memory: THREAD,
   });
+  const title = await titleWithin(memory);
+
+  expect(tripwire).toBeUndefined();
+  expect(prompts).toHaveLength(1);
+  expect(title).toBe('');
 });
 
 describe('a refused standard-loop call', () => {
@@ -2106,15 +2326,13 @@ interface Answered {
   readonly input?: readonly string[];
   readonly instructions?: string;
   readonly memory?: () => Promise<MockMemory>;
-  readonly loops?: readonly Loop[];
   readonly present: readonly string[];
   readonly absent: readonly string[];
 }
 
 async function expectAnswered(row: Answered): Promise<void> {
-  const loops = row.loops ?? LOOPS;
   const outcomes: unknown[] = [];
-  for (const loop of loops) {
+  for (const loop of LOOPS) {
     // #given
     const memory = await (row.memory ?? historyMemory)();
     const prompts: unknown[] = [];
@@ -2148,7 +2366,7 @@ async function expectAnswered(row: Answered): Promise<void> {
 
   // #then
   expect(outcomes).toEqual(
-    loops.map((loop) => ({
+    LOOPS.map((loop) => ({
       loop,
       tripwire: undefined,
       failure: undefined,
@@ -2297,7 +2515,6 @@ describe('the value an application input processor returns', () => {
       'its input messages alone, without the thread history',
       {
         processors: () => [app((args) => splitInput(args).own)],
-        loops: STANDARD,
         present: ['user: plain request'],
         absent: ['earlier question', 'earlier answer'],
       },
@@ -2318,13 +2535,11 @@ interface Moved {
   readonly input?: readonly unknown[];
   readonly instructions?: string;
   readonly unsaved?: true;
-  readonly loops?: readonly Loop[];
 }
 
 async function expectStoppedOnPolicy(row: Moved): Promise<void> {
-  const loops = row.loops ?? LOOPS;
   const outcomes: unknown[] = [];
-  for (const loop of loops) {
+  for (const loop of LOOPS) {
     // #given
     const memory = await historyMemory();
     const prompts: unknown[] = [];
@@ -2357,7 +2572,7 @@ async function expectStoppedOnPolicy(row: Moved): Promise<void> {
 
   // #then
   expect(outcomes).toEqual(
-    loops.map((loop) => ({
+    LOOPS.map((loop) => ({
       loop,
       tripwire: expect.stringMatching(/^deny-patterns: /),
       failure: undefined,
@@ -2700,30 +2915,25 @@ describe('what application input processors add or change, read by the input pol
   });
 
   // Mastra keeps a message's id in its memory set when a processor replaces
-  // that message, or merges into it, with source `input`. The guarded durable
-  // loop loads no history, so only a memory message the processor adds itself
-  // is there to replace.
+  // that message, or merges into it, with source `input`.
   const UNDER_MEMORY_IDS: ReadonlyArray<[string, Moved]> = [
     [
-      'the input re-added under a history id by a processor that returns the list, on generate and stream',
+      'the input re-added under a history id by a processor that returns the list',
       {
-        loops: STANDARD,
         unsaved: true,
         processors: () => [asHistoryMessage('the list')],
       },
     ],
     [
-      'the input re-added under a history id by a processor that returns nothing, on generate and stream',
+      'the input re-added under a history id by a processor that returns nothing',
       {
-        loops: STANDARD,
         unsaved: true,
         processors: () => [asHistoryMessage('nothing')],
       },
     ],
     [
-      'an assistant input message merged into the last history message by a processor that re-adds the input, on generate and stream',
+      'an assistant input message merged into the last history message by a processor that re-adds the input',
       {
-        loops: STANDARD,
         unsaved: true,
         input: [
           { role: 'assistant', content: `${MARK} payload` },
@@ -2802,7 +3012,6 @@ describe('what application input processors add or change, read by the input pol
       'history that carries the marker, returned unchanged as copies',
       {
         input: ['hello'],
-        loops: STANDARD,
         memory: () => historyMemory(`earlier ${MARK} question`),
         processors: () => [
           app(({ messages }) => messages.map((message) => ({ ...message }))),
@@ -2827,7 +3036,6 @@ describe('what application input processors add or change, read by the input pol
       'a working-memory template that carries the marker',
       {
         input: ['hello'],
-        loops: STANDARD,
         memory: () =>
           threadMemory({
             workingMemoryTemplate: `# Notes\n- ${MARK} working memory`,
@@ -2917,9 +3125,9 @@ describe('what application input processors add or change, read by the input pol
     );
   });
 
-  it("answers a call whose history Mastra's UnicodeNormalizer returns as it was, without evaluating that history, on generate and stream", async () => {
+  it("answers a call whose history Mastra's UnicodeNormalizer returns as it was, without evaluating that history, on every loop", async () => {
     const outcomes: unknown[] = [];
-    for (const loop of STANDARD) {
+    for (const loop of LOOPS) {
       // #given — history the normalizer leaves as it is, carrying an email
       const evaluated: string[] = [];
       const prompts: unknown[] = [];
@@ -2956,7 +3164,7 @@ describe('what application input processors add or change, read by the input pol
 
     // #then
     expect(outcomes).toEqual(
-      STANDARD.map((loop) => ({
+      LOOPS.map((loop) => ({
         loop,
         tripwire: undefined,
         failure: undefined,

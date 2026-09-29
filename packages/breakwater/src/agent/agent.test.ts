@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 
 import { Agent, createSignal } from '@mastra/core/agent';
+import { MessageList } from '@mastra/core/agent/message-list';
 import type { MastraModelConfig } from '@mastra/core/llm';
 import { MockMemory } from '@mastra/core/memory';
 import type {
@@ -38,6 +39,8 @@ const usage = {
   outputTokens: 1,
   totalTokens: 2,
 };
+const TITLE_GENERATION_DISABLED =
+  "createGuardedAgent: disable generateTitle on the guarded agent's Memory";
 
 class PrivateFieldPolicy implements PolicyEvaluator {
   readonly name = 'private-field-policy';
@@ -1605,6 +1608,66 @@ describe('guarded construction and processor validation', () => {
     );
   });
 
+  it.each([
+    ['true', true],
+    ['an object', { model: testModel() }],
+  ] as const)('memory title generation refuses %s at construction', (_label, generateTitle) => {
+    expect(() =>
+      guarded({ memory: new MockMemory({ options: { generateTitle } }) }),
+    ).toThrow(new TypeError(TITLE_GENERATION_DISABLED));
+  });
+
+  it.each([
+    ['default', () => new MockMemory()],
+    ['false', () => new MockMemory({ options: { generateTitle: false } })],
+  ])('memory title generation accepts %s at construction', (_label, memory) => {
+    expect(() => guarded({ memory: memory() })).not.toThrow();
+  });
+
+  it.each([
+    'generate',
+    'stream',
+  ] as const)('memory title generation refuses dynamic memory on %s before the model', async (method) => {
+    const modelCall = vi.fn();
+    const memory = new MockMemory({ options: { generateTitle: true } });
+    const agent = guarded({
+      model: testModel('unreachable', modelCall),
+      memory: async () => memory,
+    });
+
+    await expect(
+      agent[method]('hello', {
+        requestContext: actorContext(),
+        memory: { thread: 't1', resource: 'r1' },
+      }),
+    ).rejects.toThrow(new TypeError(TITLE_GENERATION_DISABLED));
+    expect(modelCall).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    'generate',
+    'stream',
+  ] as const)('memory title generation accepts disabled dynamic memory on %s', async (method) => {
+    const modelCall = vi.fn();
+    const agent = guarded({
+      model: testModel('generated', modelCall),
+      memory: async () => new MockMemory({ options: { generateTitle: false } }),
+    });
+
+    const output = await agent[method]('hello', {
+      requestContext: actorContext(),
+      memory: { thread: 't1', resource: 'r1' },
+    });
+    const text =
+      method === 'generate'
+        ? (output as Awaited<ReturnType<GuardedAgentHandle['generate']>>).text
+        : await (output as Awaited<ReturnType<GuardedAgentHandle['stream']>>)
+            .text;
+
+    expect(text).toBe('generated');
+    expect(modelCall).toHaveBeenCalledTimes(1);
+  });
+
   it('validates roles, step budgets, and fixed tool choice', () => {
     expect(() => guarded({ allowedRoles: [] })).toThrow(/non-empty/);
     expect(() => guarded({ allowedRoles: ['operator', 'operator'] })).toThrow(
@@ -1693,6 +1756,7 @@ describe('guarded construction and processor validation', () => {
     'breakwater-rbac',
     'breakwater-input-assets',
     'breakwater-client-tool-output',
+    'breakwater-memory',
     'breakwater-policy-engine',
   ])("rejects reserved application processor id '%s'", (id) => {
     expect(() =>
@@ -1823,7 +1887,51 @@ const GUARDED_CONFIG_FIELDS = [
 ].join(', ');
 
 describe('guarded durable interop and brand', () => {
-  it('lists mandatory processors around application processors', async () => {
+  it.each([
+    [
+      'without memory',
+      undefined,
+      [
+        'breakwater-rbac',
+        'application-input',
+        'breakwater-input-assets',
+        'breakwater-client-tool-output',
+        'breakwater-policy-engine',
+      ],
+      ['application-output', 'breakwater-policy-engine'],
+    ],
+    [
+      'with memory',
+      () => {
+        const memory = new MockMemory();
+        vi.spyOn(memory, 'getInputProcessors').mockResolvedValue([
+          {
+            id: 'memory-input',
+            processInput: (args: ProcessInputArgs) => args.messages,
+          },
+        ]);
+        vi.spyOn(memory, 'getOutputProcessors').mockResolvedValue([
+          {
+            id: 'memory-output',
+            processOutputStream: async (args: ProcessOutputStreamArgs) =>
+              args.part,
+            processOutputResult: (args: ProcessOutputResultArgs) =>
+              args.messages,
+          },
+        ]);
+        return memory;
+      },
+      [
+        'breakwater-rbac',
+        'memory-input',
+        'application-input',
+        'breakwater-input-assets',
+        'breakwater-client-tool-output',
+        'breakwater-policy-engine',
+      ],
+      ['application-output', 'breakwater-policy-engine', 'memory-output'],
+    ],
+  ] as const)('lists mandatory processors around application processors %s', async (_label, createMemory, expectedInput, expectedOutput) => {
     const input: GuardedInputProcessor = {
       id: 'application-input',
       processInput: (args) => args.messages,
@@ -1833,27 +1941,156 @@ describe('guarded durable interop and brand', () => {
       processOutputStream: async (args) => args.part,
       processOutputResult: (args) => args.messages,
     };
-    const handle = guarded({
+    const raw = guarded({
+      ...(createMemory ? { memory: createMemory() } : {}),
       applicationInputProcessors: [input],
       applicationOutputProcessors: [output],
+    }) as unknown as Agent;
+    const context = actorContext();
+
+    expect(
+      (await raw.listInputProcessors(context)).map((processor) => processor.id),
+    ).toEqual(expectedInput);
+    expect(
+      (await raw.listOutputProcessors(context)).map(
+        (processor) => processor.id,
+      ),
+    ).toEqual(expectedOutput);
+  });
+
+  it('filters observational memory processors from inherited durable memory', async () => {
+    const memory = new MockMemory();
+    vi.spyOn(memory, 'getInputProcessors').mockResolvedValue([
+      {
+        id: 'observational-memory',
+        processInput: (args) => args.messages,
+      },
+      { id: 'memory-input', processInput: (args) => args.messages },
+    ]);
+    vi.spyOn(memory, 'getOutputProcessors').mockResolvedValue([
+      {
+        id: 'observational-memory',
+        processOutputResult: (args) => args.messages,
+      },
+      { id: 'memory-output', processOutputResult: (args) => args.messages },
+    ]);
+    const raw = guarded() as unknown as Agent;
+    const context = actorContext();
+    context.setRaw('mastra__inheritedMemory', {
+      agentId: raw.id,
+      memory,
     });
-    const raw = handle as unknown as Agent;
+
+    expect(
+      (await raw.listInputProcessors(context)).map((processor) => processor.id),
+    ).toEqual([
+      'breakwater-rbac',
+      'memory-input',
+      'breakwater-input-assets',
+      'breakwater-client-tool-output',
+      'breakwater-policy-engine',
+    ]);
+    expect(
+      (await raw.listOutputProcessors(context)).map(
+        (processor) => processor.id,
+      ),
+    ).toEqual(['breakwater-policy-engine', 'memory-output']);
+  });
+
+  it('keeps mandatory processors after memory resolution fails and retries a reused context', async () => {
+    const memory = new MockMemory();
+    const getInput = vi
+      .spyOn(memory, 'getInputProcessors')
+      .mockRejectedValueOnce(new Error('transient memory failure'))
+      .mockResolvedValue([]);
+    const raw = guarded({ memory }) as unknown as Agent;
+    const context = actorContext();
+
+    expect(
+      (await raw.listInputProcessors(context)).map((processor) => processor.id),
+    ).toEqual(['breakwater-rbac', 'breakwater-memory']);
+    expect(
+      (await raw.listOutputProcessors(context)).map(
+        (processor) => processor.id,
+      ),
+    ).toEqual(['breakwater-policy-engine']);
+    expect(
+      (await raw.listInputProcessors(context)).map((processor) => processor.id),
+    ).toEqual([
+      'breakwater-rbac',
+      'breakwater-input-assets',
+      'breakwater-client-tool-output',
+      'breakwater-policy-engine',
+    ]);
+    expect(getInput).toHaveBeenCalledTimes(2);
+  });
+
+  it('returns no LLM request processors when memory resolution fails', async () => {
+    const memory = new MockMemory();
+    vi.spyOn(memory, 'getInputProcessors').mockRejectedValue(
+      new Error('memory failure'),
+    );
+    const raw = guarded({ memory }) as unknown as Agent;
+    await expect(
+      raw.__listLLMRequestProcessors(actorContext()),
+    ).resolves.toEqual([]);
+  });
+
+  it('audits and aborts a resumed memory error step', async () => {
+    const memory = new MockMemory();
+    vi.spyOn(memory, 'getInputProcessors').mockRejectedValue(
+      new Error('private memory failure'),
+    );
+    const audit = new AuditLogger();
+    const raw = guarded({ memory, audit }) as unknown as Agent;
+    const context = actorContext();
+    const processors = await raw.listInputProcessors(context);
+    const errorStep = processors.find(
+      (processor) => processor.id === 'breakwater-memory',
+    );
+    if (!errorStep || !('processInputStep' in errorStep)) {
+      throw new Error('memory error processor has no step hook');
+    }
+    const abort = vi.fn(() => {
+      throw new Error('input processor failed');
+    });
+
+    expect(() =>
+      errorStep.processInputStep?.({
+        messageList: new MessageList(),
+        requestContext: context,
+        abort,
+      } as never),
+    ).toThrow('input processor failed');
+    expect(abort).toHaveBeenCalledWith('input processor failed');
+    expect(
+      audit
+        .events()
+        .filter((event) => event.action === 'agent.input.processor'),
+    ).toMatchObject([
+      { decision: 'error', detail: { processor: 'breakwater-memory' } },
+    ]);
+  });
+
+  it.each([
+    'generate',
+    'stream',
+  ] as const)('rejects inherited title-enabled memory on %s before the model', async (method) => {
+    const modelCall = vi.fn();
+    const raw = guarded({ model: testModel('unreachable', modelCall) });
+    const context = actorContext();
+    context.setRaw('mastra__inheritedMemory', {
+      agentId: raw.id,
+      memory: new MockMemory({ options: { generateTitle: true } }),
+    });
 
     await expect(
-      raw.listInputProcessors(actorContext()),
-    ).resolves.toMatchObject([
-      { id: 'breakwater-rbac' },
-      { id: 'application-input' },
-      { id: 'breakwater-input-assets' },
-      { id: 'breakwater-client-tool-output' },
-      { id: 'breakwater-policy-engine' },
-    ]);
-    await expect(
-      raw.listOutputProcessors(actorContext()),
-    ).resolves.toMatchObject([
-      { id: 'application-output' },
-      { id: 'breakwater-policy-engine' },
-    ]);
+      raw[method]('hello', {
+        requestContext: context,
+        memory: { thread: 't1', resource: 'r1' },
+      }),
+    ).rejects.toThrow(new TypeError(TITLE_GENERATION_DISABLED));
+    expect(modelCall).not.toHaveBeenCalled();
   });
 
   it('uses an unforgeable package-local brand', () => {

@@ -398,15 +398,15 @@ async function cRefusedAuthority(source: unknown, expected: Error) {
   ).resolves.toHaveLength(2);
 }
 
-function cLocalModel(onCall: () => void): MastraModelConfig {
+function cLocalModel(onCall: (prompt: unknown) => void): MastraModelConfig {
   const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
   return {
     specificationVersion: 'v2',
     provider: 'flowsafe-test',
     modelId: 'c-local-text',
     supportedUrls: {},
-    doGenerate: async () => {
-      onCall();
+    doGenerate: async (options) => {
+      onCall(options.prompt);
       return {
         content: [{ type: 'text', text: 'done' }],
         finishReason: 'stop',
@@ -414,8 +414,8 @@ function cLocalModel(onCall: () => void): MastraModelConfig {
         warnings: [],
       };
     },
-    doStream: async () => {
-      onCall();
+    doStream: async (options) => {
+      onCall(options.prompt);
       return {
         stream: new ReadableStream({
           start(controller) {
@@ -440,6 +440,7 @@ async function cRealBridge(
   provider?: RequestContextProvider,
   modelFault?: Error,
   threaded = false,
+  guarded?: { memory: MockMemory; prompts: unknown[] },
 ) {
   const sql = openSqlite() as ReturnType<typeof openSqlite> & { close(): void };
   const binding = sqliteUnitDatabase(sql) as ExecutionFenceDatabase;
@@ -493,17 +494,32 @@ async function cRealBridge(
       requestContextForRun: provider,
     },
   );
+  const model = cLocalModel((prompt) => {
+    counts.model++;
+    guarded?.prompts.push(prompt);
+    if (modelFault) throw modelFault;
+  });
   const agent = createFlowsafeDurableAgent({
-    agent: new Agent({
-      id: 'writer',
-      name: 'Writer',
-      instructions: 'Return done.',
-      ...(threaded ? { memory: new MockMemory() } : {}),
-      model: cLocalModel(() => {
-        counts.model++;
-        if (modelFault) throw modelFault;
-      }),
-    }),
+    agent: guarded
+      ? (createGuardedAgent({
+          id: 'writer',
+          name: 'Writer',
+          instructions: 'Return done.',
+          memory: guarded.memory,
+          model,
+          allowedRoles: ['operator'],
+          policies: [],
+          audit: new AuditLogger(),
+          maxSteps: 1,
+          toolChoice: 'auto',
+        }) as unknown as Agent)
+      : new Agent({
+          id: 'writer',
+          name: 'Writer',
+          instructions: 'Return done.',
+          ...(threaded ? { memory: new MockMemory() } : {}),
+          model,
+        }),
     runtime,
     cache: false,
     maxSteps: 1,
@@ -513,6 +529,77 @@ async function cRealBridge(
 }
 
 describe('C agent bridge capture', () => {
+  it('loads stored thread history into a guarded durable model prompt', async () => {
+    const memory = new MockMemory({ storage: new InMemoryStore() });
+    const createdAt = new Date(Date.now() - 60_000);
+    await memory.saveThread({
+      thread: {
+        id: 'thread-1',
+        resourceId: 'thread-1',
+        createdAt,
+        updatedAt: createdAt,
+        metadata: {},
+      },
+    });
+    await memory.saveMessages({
+      messages: [
+        {
+          id: 'stored-history',
+          role: 'user',
+          threadId: 'thread-1',
+          resourceId: 'thread-1',
+          createdAt,
+          content: {
+            format: 2,
+            parts: [{ type: 'text', text: 'earlier stored question' }],
+          },
+        },
+      ],
+    });
+    const prompts: unknown[] = [];
+    const f = await cRealBridge(
+      () => ({ [ACTOR_CONTEXT_KEY]: { id: 'actor-1', role: 'operator' } }),
+      undefined,
+      false,
+      { memory, prompts },
+    );
+    const runId = 'guarded-history';
+    let result:
+      | Awaited<ReturnType<typeof f.agent.streamUntilPersisted>>
+      | undefined;
+    try {
+      result = await f.agent.streamUntilPersisted(
+        'New question',
+        {
+          runId,
+          memory: { thread: 'thread-1', resource: 'thread-1' },
+          requestContext: actorContext(),
+          disableBackgroundTasks: true,
+        },
+        'operator-1',
+        'human',
+        'guarded-history-attempt',
+        undefined,
+        undefined,
+        { ...startAuthority(), agentStart: { threaded: true } },
+      );
+      expect(await result.output.text).toBe('done');
+      await globalRunRegistry.get(runId)?.workflowExecution;
+      expect(f.counts.model).toBe(1);
+      expect(prompts).toHaveLength(1);
+      expect(JSON.stringify(prompts[0])).toContain('earlier stored question');
+      expect(JSON.stringify(prompts[0])).toContain('New question');
+    } finally {
+      await globalRunRegistry
+        .get(runId)
+        ?.workflowExecution?.catch(() => undefined);
+      result?.cleanup();
+      globalRunRegistry.delete(runId);
+      f.start.mockRestore();
+      f.sql.close();
+    }
+  });
+
   it.each([
     null,
     '2',
@@ -2669,6 +2756,105 @@ describe('FlowsafeDurableAgent thread runtime registration and rehydration', () 
       ),
     ).rejects.toThrow('matched blocked pattern blocked-resume-output');
     expect(outputInvocation).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['an allowed actor', 'operator' as const],
+    ['a disallowed actor', 'viewer' as const],
+  ])('keeps a resumed guarded leg closed on memory resolution failure for %s', async (_label, role) => {
+    const memory = new MockMemory();
+    const audit = new AuditLogger();
+    const { runtime, resume } = fakeRuntime();
+    const modelCall = vi.fn();
+    const agent = createFlowsafeDurableAgent({
+      agent: createGuardedAgent({
+        id: 'writer',
+        name: 'Writer',
+        instructions: 'Answer the request.',
+        model: cLocalModel(modelCall),
+        memory,
+        allowedRoles: ['operator'],
+        policies: [],
+        audit,
+        maxSteps: 2,
+        toolChoice: 'auto',
+      }) as unknown as Agent,
+      runtime,
+      cache: false,
+    });
+    await agent.prepare('initial request', {
+      runId: 'run-1',
+      requestContext: actorContext(),
+      memory: { thread: 'thread-1', resource: 'resource-1' },
+    });
+    vi.spyOn(memory, 'getInputProcessors').mockRejectedValue(
+      new Error('private memory failure'),
+    );
+    registryFor(agent).clear();
+    globalRunRegistry.clear();
+    vi.spyOn(agent, 'observe').mockResolvedValue({
+      output: { id: 'rehydrated' },
+    } as never);
+    let restoredInputProcessors: string[] | undefined;
+    resume.mockImplementation(async (_workflowId, runId, options) => {
+      await options?.prepareExecution?.(actorContext(role));
+      const entry = globalRunRegistry.get(runId);
+      assert(entry);
+      restoredInputProcessors = entry.inputProcessors?.map(({ id }) => id);
+      const messageList = new MessageList();
+      messageList.add('follow-up', 'input');
+      const runner = new ProcessorRunner({
+        inputProcessors: entry.inputProcessors,
+        logger: {} as never,
+        agentName: 'Writer',
+        processorStates: entry.processorStates,
+      });
+      await runner.runProcessInputStep({
+        messageList,
+        stepNumber: 1,
+        steps: [],
+        model: entry.model as never,
+        requestContext: actorContext(role),
+      });
+      modelCall();
+      return { runId, status: 'success' as const };
+    });
+
+    await expect(
+      agent.resumeViaRuntime({
+        runId: 'run-1',
+        requestedBy: 'reviewer-1',
+        memory: { thread: 'thread-1', resource: 'resource-1' },
+      }),
+    ).rejects.toThrow(
+      role === 'operator'
+        ? 'input processor failed'
+        : /^Durable agent registry rehydration denied: /,
+    );
+
+    expect(modelCall).not.toHaveBeenCalled();
+    expect(resume).toHaveBeenCalledOnce();
+    if (role === 'operator') {
+      expect(restoredInputProcessors).toEqual([
+        'breakwater-rbac',
+        'breakwater-memory',
+      ]);
+      expect(
+        audit
+          .events()
+          .filter((event) => event.action === 'agent.input.processor'),
+      ).toMatchObject([
+        { decision: 'error', detail: { processor: 'breakwater-memory' } },
+      ]);
+    } else {
+      expect(registryFor(agent).has('run-1')).toBe(false);
+      expect(globalRunRegistry.has('run-1')).toBe(false);
+      expect(
+        audit
+          .events()
+          .filter((event) => event.action === 'agent.input.processor'),
+      ).toEqual([]);
+    }
   });
 
   it('preserves raw-agent step and LLM-request processors without replaying processInput', async () => {

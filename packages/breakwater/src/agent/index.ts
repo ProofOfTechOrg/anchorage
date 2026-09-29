@@ -12,15 +12,21 @@ import type {
   MastraDBMessage,
   MessageListInput,
 } from '@mastra/core/agent/message-list';
+import type { MastraMemory } from '@mastra/core/memory';
 import type {
+  ComputeStateSignalArgs,
   InputProcessor,
   InputProcessorOrWorkflow,
   OutputProcessorOrWorkflow,
   ProcessInputArgs,
   ProcessInputResult,
+  ProcessInputStepArgs,
   Processor,
 } from '@mastra/core/processors';
-import { RequestContext } from '@mastra/core/request-context';
+import {
+  MASTRA_INHERITED_MEMORY_KEY,
+  RequestContext,
+} from '@mastra/core/request-context';
 import type { FullOutput, MastraModelOutput } from '@mastra/core/stream';
 
 import { type AuditLogger, agentAuditDetail } from '../audit/index.js';
@@ -56,6 +62,7 @@ export {
 
 const RESERVED_PROCESSOR_IDS = new Set([
   'breakwater-rbac',
+  'breakwater-memory',
   'breakwater-input-assets',
   CLIENT_TOOL_OUTPUT_PROCESSOR_ID,
   'breakwater-policy-engine',
@@ -483,6 +490,15 @@ function assertConstructionOptions(options: object): void {
   }
 }
 
+function assertGuardedMemoryTitleDisabled(memory: MastraMemory): void {
+  const { generateTitle } = memory.getMergedThreadConfig();
+  if (generateTitle !== undefined && generateTitle !== false) {
+    throw new TypeError(
+      "createGuardedAgent: disable generateTitle on the guarded agent's Memory",
+    );
+  }
+}
+
 function readAllowedInputAssetOrigins(value: unknown): readonly string[] {
   if (value === undefined) return Object.freeze([]);
   const subject = 'createGuardedAgent: allowedInputAssetOrigins';
@@ -691,8 +707,7 @@ function applyInputMessages(
 // the steps of Mastra's durable runner, which keeps a system entry's id in the
 // input. Mastra's standard loop removes that id, so a processor returning its
 // input as system entries would leave the input policies an empty input.
-// `before` holds the ids of the processor's `messages`, which on the standard
-// loop include the thread history, as the standard loop's own deletion does.
+// `before` holds the ids of the processor's `messages`, including thread history.
 function applyInputResult(
   messageList: MessageList,
   result: unknown,
@@ -720,7 +735,7 @@ function applyInputResult(
 
 // The members of `inner` that the wrapper carries.
 function forwardedMembers(
-  inner: GuardedInputProcessor,
+  inner: GuardedInputProcessor | InputProcessor,
 ): Record<string, unknown> {
   const members: Record<string, unknown> = {};
   for (const member of FORWARDED_PROCESSOR_MEMBERS) {
@@ -736,7 +751,10 @@ function forwardedMembers(
 }
 
 function failInputProcessor(
-  args: ProcessInputArgs,
+  args: Pick<
+    ProcessInputArgs | ProcessInputStepArgs,
+    'messageList' | 'abort' | 'requestContext'
+  >,
   resource: string,
   audit: AuditLogger,
   processorId: string,
@@ -758,6 +776,75 @@ function failInputProcessor(
   }
 }
 
+function isForwardedAbortOrTripWire(
+  error: unknown,
+  abortErrors: WeakSet<object>,
+): boolean {
+  return (
+    (isObjectValue(error) && abortErrors.has(error)) ||
+    error instanceof TripWire
+  );
+}
+
+function forwardingProcessorAbort(incomingAbort: ProcessInputArgs['abort']): {
+  abort: ProcessInputArgs['abort'];
+  abortErrors: WeakSet<object>;
+} {
+  // Every error the forwarded abort threw, so a processor that aborts
+  // twice is still recognised.
+  const abortErrors = new WeakSet<object>();
+  const abort: ProcessInputArgs['abort'] = (reason, options) => {
+    try {
+      return incomingAbort(reason, options);
+    } catch (error) {
+      if (isObjectValue(error)) abortErrors.add(error);
+      throw error;
+    }
+  };
+  return { abort, abortErrors };
+}
+
+function guardMemoryInputProcessor(
+  inner: InputProcessor,
+  resource: string,
+  audit: AuditLogger,
+): InputProcessor {
+  const processInput = inner.processInput?.bind(inner);
+  const processInputStep = inner.processInputStep?.bind(inner);
+  const computeStateSignal = inner.computeStateSignal?.bind(inner);
+  const run = async (
+    args: ProcessInputArgs | ProcessInputStepArgs | ComputeStateSignalArgs,
+    hook: (args: never) => unknown,
+  ): Promise<unknown> => {
+    const { abort, abortErrors } = forwardingProcessorAbort(args.abort);
+    try {
+      return await hook({ ...args, abort } as never);
+    } catch (error) {
+      if (isForwardedAbortOrTripWire(error, abortErrors)) throw error;
+      return failInputProcessor(args, resource, audit, inner.id);
+    }
+  };
+  return {
+    ...forwardedMembers(inner),
+    ...(inner.stateId !== undefined ? { stateId: inner.stateId } : {}),
+    ...(processInput
+      ? { processInput: (args: ProcessInputArgs) => run(args, processInput) }
+      : {}),
+    ...(processInputStep
+      ? {
+          processInputStep: (args: ProcessInputStepArgs) =>
+            run(args, processInputStep),
+        }
+      : {}),
+    ...(computeStateSignal
+      ? {
+          computeStateSignal: (args: ComputeStateSignalArgs) =>
+            run(args, computeStateSignal),
+        }
+      : {}),
+  } as InputProcessor;
+}
+
 // Mastra's durable preparation logs an input processor's error, unless it is
 // a tripwire, and runs the model past every later processor, the policy
 // engine included. The wrapper applies the processor's return value itself
@@ -775,31 +862,24 @@ function guardInputProcessor(
   return {
     ...forwardedMembers(inner),
     async processInput(args: ProcessInputArgs): Promise<ProcessInputResult> {
-      // Every error the forwarded abort threw, so a processor that aborts
-      // twice is still recognised.
-      const abortErrors = new WeakSet<object>();
-      const abort: ProcessInputArgs['abort'] = (reason, options) => {
-        try {
-          return args.abort(reason, options);
-        } catch (error) {
-          if (isObjectValue(error)) abortErrors.add(error);
-          throw error;
-        }
-      };
+      const { abort, abortErrors } = forwardingProcessorAbort(args.abort);
       let snapshot: PromptSnapshot | undefined;
       try {
         const { messageList } = args;
-        const inputIds = args.messages.map(({ id }) => id);
+        // Durable preparation passes input-only args.messages; the list includes loaded history.
+        const messages = messageList.get.all.db();
+        const beforeIds = messages.map(({ id }) => id);
         const check = messageList.makeMessageSourceChecker();
         snapshot = snapshotPromptMessages(messageList);
-        const result: unknown = await inner.processInput({ ...args, abort });
-        applyInputResult(messageList, result, inputIds, check);
+        const result: unknown = await inner.processInput({
+          ...args,
+          messages,
+          abort,
+        });
+        applyInputResult(messageList, result, beforeIds, check);
         recordProcessorAdditions(messageList, snapshot);
       } catch (error) {
-        if (
-          (isObjectValue(error) && abortErrors.has(error)) ||
-          error instanceof TripWire
-        ) {
+        if (isForwardedAbortOrTripWire(error, abortErrors)) {
           return stopWithoutCallMessages(args.messageList, { snapshot }, () => {
             throw error;
           });
@@ -1006,13 +1086,18 @@ class GuardedAgent<
   readonly maxSteps: number;
   readonly [GUARDED_AGENT_HOST_PROTOCOL]: GuardedAgentHostProtocol;
   readonly #audit: AuditLogger;
-  readonly #applicationInputProcessors: readonly InputProcessor[];
-  readonly #applicationOutputProcessors: readonly GuardedOutputProcessor[];
-  readonly #inputAssets: InputProcessor;
-  readonly #clientToolOutput: InputProcessor;
-  readonly #policy: PolicyEngine;
+  readonly #guardedInput: readonly InputProcessor[];
+  readonly #guardedOutput: readonly OutputProcessorOrWorkflow[];
   readonly #rbac: RBACMiddleware;
   readonly #toolChoice: GuardedToolChoice;
+  readonly #memoryError: InputProcessor;
+  readonly #memoryResolutions = new WeakMap<
+    RequestContext,
+    Promise<
+      | { input: InputProcessor[]; output: OutputProcessorOrWorkflow[] }
+      | undefined
+    >
+  >();
 
   constructor(options: GuardedAgentConfig<TAgentId, TTools, TRequestContext>) {
     assertConstructionOptions(options);
@@ -1031,6 +1116,13 @@ class GuardedAgent<
     }
     if (!Array.isArray(options.policies)) {
       throw new TypeError('createGuardedAgent: policies must be an array');
+    }
+    const configuredMemory = options.memory;
+    if (
+      configuredMemory !== undefined &&
+      typeof configuredMemory !== 'function'
+    ) {
+      assertGuardedMemoryTitleDisabled(configuredMemory);
     }
     const allowedRoles = readAllowedRoles(
       'createGuardedAgent',
@@ -1112,12 +1204,9 @@ class GuardedAgent<
       supportsDurableStructuredOutput: false,
     });
     this.#audit = audit;
-    this.#applicationInputProcessors = applicationInputProcessors;
-    this.#applicationOutputProcessors = applicationOutputProcessors;
-    this.#inputAssets = inputAssets;
     // Core's execution assembly applies renamed keys and converted tool types
     // that its own client-output mapper reads.
-    this.#clientToolOutput = clientToolOutputProcessor(
+    const clientToolOutput = clientToolOutputProcessor(
       (toolOptions) => this.getToolsForExecution(toolOptions),
       (args) =>
         failInputProcessor(
@@ -1127,10 +1216,76 @@ class GuardedAgent<
           CLIENT_TOOL_OUTPUT_PROCESSOR_ID,
         ),
     );
-    this.#policy = policy;
     this.#rbac = rbac;
     this.#toolChoice = toolChoice;
+    this.#guardedInput = Object.freeze([
+      ...applicationInputProcessors,
+      inputAssets,
+      clientToolOutput,
+      policy,
+    ]);
+    this.#guardedOutput = Object.freeze([
+      ...applicationOutputProcessors,
+      policy,
+    ]);
+    const failMemory = (args: ProcessInputArgs | ProcessInputStepArgs) =>
+      failInputProcessor(
+        args,
+        `agent:${this.id}`,
+        this.#audit,
+        'breakwater-memory',
+      );
+    this.#memoryError = {
+      id: 'breakwater-memory',
+      processInput: failMemory,
+      // A resumed leg skips processInput; each durable step runs processInputStep.
+      processInputStep: failMemory,
+    };
     this.disableBackgroundTasks();
+  }
+
+  async #assertResolvedMemoryTitleDisabled(
+    requestContext: RequestContext,
+  ): Promise<void> {
+    const memory = await this.getMemory({ requestContext });
+    if (memory) assertGuardedMemoryTitleDisabled(memory);
+  }
+
+  async #resolveMemoryProcessors(requestContext: RequestContext) {
+    try {
+      const memory = await this.getMemory({ requestContext });
+      if (!memory) return { input: [], output: [] };
+      assertGuardedMemoryTitleDisabled(memory);
+      const input = await memory.getInputProcessors(
+        [...this.#guardedInput],
+        requestContext,
+      );
+      const output = await memory.getOutputProcessors(
+        [...this.#guardedOutput],
+        requestContext,
+      );
+      // Core's resolveInputProcessors and listResolvedOutputProcessors omit inherited observational-memory.
+      const inherited = requestContext.getRaw(MASTRA_INHERITED_MEMORY_KEY);
+      const inheritedMemory =
+        inherited !== null &&
+        typeof inherited === 'object' &&
+        'agentId' in inherited &&
+        inherited.agentId === this.id &&
+        'memory' in inherited
+          ? inherited.memory
+          : undefined;
+      if (!inheritedMemory) return { input, output };
+      return {
+        input: input.filter(
+          (processor) => processor.id !== 'observational-memory',
+        ),
+        output: output.filter(
+          (processor) => processor.id !== 'observational-memory',
+        ),
+      };
+    } catch {
+      return undefined;
+    }
   }
 
   override async generate(
@@ -1141,6 +1296,7 @@ class GuardedAgent<
     const options = guardedCallOptions(rawOptions);
     assertNoGuardedSystemMessages(messages);
     this.#preauthorize(options.requestContext);
+    await this.#assertResolvedMemoryTitleDisabled(options.requestContext);
     return super.generate(messages, this.#executionOptions(options));
   }
 
@@ -1152,25 +1308,53 @@ class GuardedAgent<
     const options = guardedCallOptions(rawOptions);
     assertNoGuardedSystemMessages(messages);
     this.#preauthorize(options.requestContext);
+    await this.#assertResolvedMemoryTitleDisabled(options.requestContext);
     return super.stream(messages, this.#executionOptions(options));
   }
 
   override async listInputProcessors(
-    _requestContext?: RequestContext,
+    requestContext: RequestContext = new RequestContext(),
   ): Promise<InputProcessorOrWorkflow[]> {
+    const resolution = this.#resolveMemoryProcessors(requestContext);
+    this.#memoryResolutions.set(requestContext, resolution);
+    const result = await resolution;
+    if (!result) return [this.#rbac, this.#memoryError];
     return [
       this.#rbac,
-      ...this.#applicationInputProcessors,
-      this.#inputAssets,
-      this.#clientToolOutput,
-      this.#policy,
+      ...result.input.map((processor) =>
+        guardMemoryInputProcessor(processor, `agent:${this.id}`, this.#audit),
+      ),
+      ...this.#guardedInput,
     ];
   }
 
   override async listOutputProcessors(
-    _requestContext?: RequestContext,
+    requestContext: RequestContext = new RequestContext(),
   ): Promise<OutputProcessorOrWorkflow[]> {
-    return [...this.#applicationOutputProcessors, this.#policy];
+    const resolution =
+      this.#memoryResolutions.get(requestContext) ??
+      this.#resolveMemoryProcessors(requestContext);
+    this.#memoryResolutions.delete(requestContext);
+    const result = await resolution;
+    return [...this.#guardedOutput, ...(result?.output ?? [])];
+  }
+
+  override resolveTitleGenerationConfig(
+    _config: Parameters<Agent['resolveTitleGenerationConfig']>[0],
+  ): ReturnType<Agent['resolveTitleGenerationConfig']> {
+    // Core calls this at each finish, even when memory resolves again after the refusal.
+    return { shouldGenerate: false };
+  }
+
+  override async __listLLMRequestProcessors(
+    requestContext?: RequestContext,
+  ): Promise<InputProcessorOrWorkflow[]> {
+    try {
+      return await super.__listLLMRequestProcessors(requestContext);
+    } catch {
+      // Durable preparation keeps its output processors when this secondary memory lookup fails.
+      return [];
+    }
   }
 
   #preauthorize(requestContext: RequestContext): void {
@@ -1200,13 +1384,8 @@ class GuardedAgent<
       maxSteps: this.maxSteps,
       toolChoice: this.#toolChoice,
       disableBackgroundTasks: true,
-      inputProcessors: [
-        ...this.#applicationInputProcessors,
-        this.#inputAssets,
-        this.#clientToolOutput,
-        this.#policy,
-      ],
-      outputProcessors: [...this.#applicationOutputProcessors, this.#policy],
+      inputProcessors: [...this.#guardedInput],
+      outputProcessors: [...this.#guardedOutput],
     };
   }
 }

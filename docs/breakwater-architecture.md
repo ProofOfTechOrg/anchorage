@@ -90,13 +90,13 @@ The factory constructs a protected `Agent` subclass but returns `GuardedAgentHan
 Direct calls preauthorize the `breakwater.actor`, then pass exact application and mandatory processor arrays to Mastra. Initial durable preparation uses the subclass processor listing. Approval resume after isolate eviction uses Flowsafe's registry rehydration path, which authorizes the fresh trusted resume context without replaying initial application or policy input. These paths have these orders:
 
 ```text
-direct: RBAC preauthorization -> app input -> input assets -> client tool output -> policy input
-initial durable: RBAC processor -> app input -> input assets -> client tool output -> policy input
+direct: RBAC preauthorization -> memory input -> app input -> input assets -> client tool output -> policy input
+initial durable: RBAC processor -> memory input -> app input -> input assets -> client tool output -> policy input
 durable resume processInput during rehydration: RBAC only
-output: model/tools -> app output -> policy output
+output: model/tools -> app output -> policy output -> memory output
 ```
 
-The durable resume line describes which `processInput` hook runs during rehydration. Before installing the registries, Flowsafe restores the complete input and LLM-request processor lists for later loop hooks. It also restores the same tools, memory, model, application output processors, and mandatory policy output processor as initial preparation. An RBAC denial stops rehydration before registry installation or resumed tool execution.
+The durable resume line describes which `processInput` hook runs during rehydration. Before installing the registries, Flowsafe restores the captured lists for later loop hooks. An RBAC denial stops rehydration before registry installation or resumed tool execution. When memory resolution fails, the input list contains RBAC followed by `breakwater-memory`, which aborts with an audited `agent.input.processor` error; the output list retains application output processors and the policy. A memory input processor error, such as a failed thread-history read, stops a durable call with `input processor failed` and one `agent.input.processor` error event naming the processor's id (`message-history` for history); on `generate()` and `stream()`, Mastra rejects the call and Breakwater writes no audit event.
 
 The call allowlist contains `requestContext`, `runId`, `memory`, and `abortSignal`. Calls are copied into frozen allowlisted snapshots, and unknown own properties fail even when their value is `undefined`. `memory` carries only the thread, as an id or an object holding only its id, and the resource: Mastra takes memory configuration from the call and saves thread fields such as metadata, which working memory renders into the system prompt outside the input policies, so both belong on the agent's `Memory`. The guarded handle's `generate()` and `stream()` refuse a caller message with `role: 'system'`, and Flowsafe's durable start applies the same check through `assertNoGuardedSystemMessages()`, at the top level or in the nested list Mastra flattens, because Mastra would pass it to the model outside the input policies; system instructions belong in the agent's `instructions`. A list nested deeper than Mastra accepts is refused too. Call-level provider options are checked at Flowsafe's durable start through `assertAcceptedCallProviderOptions()`, not by the handle, which accepts none. Construction fixes `maxSteps` and `toolChoice`, enables policy hold-back, and disables background continuations. Mastra's per-call durable `clientTools` and `toolsets` are outside the client tool output step; the guarded handle refuses both options, and Flowsafe's thread host passes neither.
 
@@ -133,6 +133,8 @@ context, then must stop before model, persistence, wake, or run-start side
 effects on denial or evaluator failure.
 
 Under the supported Mastra version, structured objects parsed by `generate()` and the chunks core's `StructuredOutputProcessor` emits never pass through the agent's output processors. Mastra also copies a parsed value into messages and may send it to persistence and observability hooks before `generate()` returns. A post-generation wrapper gate is therefore not a containment boundary. The guarded agent rejects structured output before execution and rejects object-only policies at construction. A standalone `PolicyEngine` validates processor-visible object chunks as JSON, evaluates their canonical snapshots, forwards the same canonical clones, and aborts at the result boundary when an object-only policy saw no such chunk.
+
+Mastra's thread title model call also bypasses input and output processing. A guarded agent therefore refuses `Memory` configuration that enables title generation, at construction for a `Memory` instance and when a call resolves function-valued or inherited memory. The guarded agent never generates a thread title, even when a host starts the durable loop with call-level `memory.options.generateTitle`.
 
 The guarded handle also carries a versioned host protocol. Flowsafe checks that protocol before durable wrapping and rejects guarded structured output on every durable entry point, preserving the narrow handle's refusal even though Mastra's durable runner invokes the raw agent through processor lists.
 
