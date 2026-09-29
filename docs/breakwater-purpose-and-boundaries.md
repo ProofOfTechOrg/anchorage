@@ -35,7 +35,7 @@ The factory fixes the step budget and tool choice, requires an audit logger, for
 The direct path authorizes before application processors run. Durable preparation lists the same gates in this order:
 
 ```text
-RBAC -> application input -> policy input
+RBAC -> application input -> input assets -> client tool output -> policy input
 model and tools
 application output -> policy output
 ```

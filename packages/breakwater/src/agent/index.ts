@@ -44,10 +44,15 @@ import {
 } from '../rbac/index.js';
 import { assertPrincipalKinds, type PrincipalKind } from '../rbac/principal.js';
 import { readAllowedRoles } from '../rbac/roles.js';
+import {
+  CLIENT_TOOL_OUTPUT_PROCESSOR_ID,
+  clientToolOutputProcessor,
+} from './client-tool-output.js';
 
 const RESERVED_PROCESSOR_IDS = new Set([
   'breakwater-rbac',
   'breakwater-input-assets',
+  CLIENT_TOOL_OUTPUT_PROCESSOR_ID,
   'breakwater-policy-engine',
 ]);
 
@@ -55,6 +60,8 @@ const INPUT_ASSET_SCHEME_DENIED = 'input asset URL scheme is not allowed';
 const INPUT_ASSET_CREDENTIALS_DENIED =
   'input asset URL credentials are not allowed';
 const INPUT_ASSET_ORIGIN_DENIED = 'input asset URL origin is not allowed';
+/** The reason a call stops when an input processor fails. */
+const INPUT_PROCESSOR_FAILED = 'input processor failed';
 
 // Exhaustive over GuardedAgentCallOptions: a member the interface gains is a
 // missing property here, one it drops an excess property.
@@ -339,7 +346,8 @@ export type GuardedAgentConfig<
   /**
    * Origins user file and image parts may name as network URLs, regardless of
    * who fetches them. Absent or empty refuses all network URLs; data: URLs
-   * are inline data. This is independent of connector egress allowlists.
+   * are inline data. URLs in mapped client tool results are not checked.
+   * This is independent of connector egress allowlists.
    */
   allowedInputAssetOrigins?: readonly string[];
   /** Mandatory input and output policies, evaluated in array order. */
@@ -634,9 +642,6 @@ function validateInputProcessors(
   return Object.freeze([...processors]);
 }
 
-/** The reason a call stops when an application input processor fails. */
-const INPUT_PROCESSOR_FAILED = 'input processor failed';
-
 const INPUT_RESULT_NOT_APPLICABLE =
   'an application input processor returned a value that cannot be applied';
 
@@ -725,6 +730,29 @@ function forwardedMembers(
   return members;
 }
 
+function failInputProcessor(
+  args: ProcessInputArgs,
+  resource: string,
+  audit: AuditLogger,
+  processorId: string,
+  snapshot?: PromptSnapshot,
+): never {
+  try {
+    audit.record({
+      actor: actorFromRequestContext(args.requestContext) ?? null,
+      action: 'agent.input.processor',
+      resource,
+      decision: 'error',
+      reason: INPUT_PROCESSOR_FAILED,
+      detail: agentAuditDetail(args.requestContext, { processor: processorId }),
+    });
+  } finally {
+    stopWithoutCallMessages(args.messageList, { snapshot }, () =>
+      args.abort(INPUT_PROCESSOR_FAILED),
+    );
+  }
+}
+
 // Mastra's durable preparation logs an input processor's error, unless it is
 // a tripwire, and runs the model past every later processor, the policy
 // engine included. The wrapper applies the processor's return value itself
@@ -739,25 +767,6 @@ function guardInputProcessor(
   resource: string,
   audit: AuditLogger,
 ): InputProcessor {
-  const fail = (
-    args: ProcessInputArgs,
-    snapshot: PromptSnapshot | undefined,
-  ): never => {
-    try {
-      audit.record({
-        actor: actorFromRequestContext(args.requestContext) ?? null,
-        action: 'agent.input.processor',
-        resource,
-        decision: 'error',
-        reason: INPUT_PROCESSOR_FAILED,
-        detail: agentAuditDetail(args.requestContext, { processor: inner.id }),
-      });
-    } finally {
-      stopWithoutCallMessages(args.messageList, { snapshot }, () =>
-        args.abort(INPUT_PROCESSOR_FAILED),
-      );
-    }
-  };
   return {
     ...forwardedMembers(inner),
     async processInput(args: ProcessInputArgs): Promise<ProcessInputResult> {
@@ -790,7 +799,7 @@ function guardInputProcessor(
             throw error;
           });
         }
-        return fail(args, snapshot);
+        return failInputProcessor(args, resource, audit, inner.id, snapshot);
       }
       return args.messageList;
     },
@@ -991,6 +1000,7 @@ class GuardedAgent<
   readonly #applicationInputProcessors: readonly InputProcessor[];
   readonly #applicationOutputProcessors: readonly GuardedOutputProcessor[];
   readonly #inputAssets: InputProcessor;
+  readonly #clientToolOutput: InputProcessor;
   readonly #policy: PolicyEngine;
   readonly #rbac: RBACMiddleware;
   readonly #toolChoice: GuardedToolChoice;
@@ -1096,6 +1106,18 @@ class GuardedAgent<
     this.#applicationInputProcessors = applicationInputProcessors;
     this.#applicationOutputProcessors = applicationOutputProcessors;
     this.#inputAssets = inputAssets;
+    // Core's execution assembly applies renamed keys and converted tool types
+    // that its own client-output mapper reads.
+    this.#clientToolOutput = clientToolOutputProcessor(
+      (toolOptions) => this.getToolsForExecution(toolOptions),
+      (args) =>
+        failInputProcessor(
+          args,
+          `agent:${options.id}`,
+          audit,
+          CLIENT_TOOL_OUTPUT_PROCESSOR_ID,
+        ),
+    );
     this.#policy = policy;
     this.#rbac = rbac;
     this.#toolChoice = toolChoice;
@@ -1131,6 +1153,7 @@ class GuardedAgent<
       this.#rbac,
       ...this.#applicationInputProcessors,
       this.#inputAssets,
+      this.#clientToolOutput,
       this.#policy,
     ];
   }
@@ -1171,6 +1194,7 @@ class GuardedAgent<
       inputProcessors: [
         ...this.#applicationInputProcessors,
         this.#inputAssets,
+        this.#clientToolOutput,
         this.#policy,
       ],
       outputProcessors: [...this.#applicationOutputProcessors, this.#policy],

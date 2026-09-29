@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import { Agent, TripWire } from '@mastra/core/agent';
+import { Agent, type ToolsInput, TripWire } from '@mastra/core/agent';
 import { createDurableAgent } from '@mastra/core/agent/durable';
 import {
   type MastraDBMessage,
@@ -17,7 +17,9 @@ import {
 } from '@mastra/core/processors';
 import { RequestContext } from '@mastra/core/request-context';
 import { InMemoryStore } from '@mastra/core/storage';
+import { createTool } from '@mastra/core/tools';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { z } from 'zod';
 
 import { AuditLogger } from '../audit/index.js';
 import {
@@ -180,6 +182,7 @@ function guardedAgent(settings: {
   memory?: MockMemory;
   instructions?: string;
   model?: MastraModelConfig;
+  tools?: ToolsInput;
   allowedInputAssetOrigins?: readonly string[];
 }): GuardedAgentHandle {
   return createGuardedAgent({
@@ -199,6 +202,7 @@ function guardedAgent(settings: {
     audit: settings.audit,
     maxSteps: 1,
     toolChoice: 'auto',
+    ...(settings.tools ? { tools: settings.tools } : {}),
     ...(settings.processors
       ? { applicationInputProcessors: settings.processors }
       : {}),
@@ -318,6 +322,210 @@ function promptLines(prompt: unknown): string[] {
       }`,
   );
 }
+
+describe('client-only tool output before guarded input policies', () => {
+  const raw = { first: MARK.slice(0, 9), second: MARK.slice(9) };
+  const concatenateOutput = (value: unknown) => ({
+    type: 'text',
+    value: (value as typeof raw).first + (value as typeof raw).second,
+  });
+  const messages = (name: string, output: unknown) => [
+    {
+      id: 'u1',
+      role: 'user',
+      parts: [{ type: 'text', text: 'look up status' }],
+    },
+    {
+      id: 'a1',
+      role: 'assistant',
+      parts: [
+        {
+          type: `tool-${name}`,
+          toolCallId: 'call-1',
+          state: 'output-available',
+          input: {},
+          output,
+        },
+      ],
+    },
+    { id: 'u2', role: 'user', parts: [{ type: 'text', text: 'and now?' }] },
+  ];
+  const run = async (
+    loop: Loop,
+    output: unknown,
+    mapper: (value: unknown) => unknown,
+    toolName = 'lookup',
+    configuredKey = toolName,
+  ) => {
+    const prompts: unknown[] = [];
+    const audit = new AuditLogger();
+    const toModelOutput = vi.fn(mapper);
+    const lookup = createTool({
+      id: toolName,
+      description: 'Look up status',
+      inputSchema: z.object({}),
+      toModelOutput,
+    } as never);
+    const agent = guardedAgent({
+      prompts,
+      audit,
+      tools: { [configuredKey]: lookup },
+    });
+    const outcome = await outcomeOf(
+      drive(agent, loop, messages(toolName, output), {
+        requestContext: actorContext(),
+      }),
+    );
+    return { outcome, prompts, audit, toModelOutput };
+  };
+
+  it.each(LOOPS)('refuses mapped denied text on %s', async (loop) => {
+    const { outcome, prompts, audit, toModelOutput } = await run(
+      loop,
+      raw,
+      concatenateOutput,
+    );
+    expect.soft(outcome).toEqual({
+      tripwire: expect.stringMatching(/^deny-patterns: /),
+      failure: undefined,
+    });
+    expect.soft(prompts).toEqual([]);
+    expect(eventsOf(audit, 'agent.input.policy', 'denied')).toHaveLength(1);
+    expect(toModelOutput).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(
+    LOOPS,
+  )('passes one clean mapped output to the model on %s', async (loop) => {
+    const { outcome, prompts, toModelOutput } = await run(
+      loop,
+      { status: 'active' },
+      () => ({ type: 'text', value: 'status: active' }),
+    );
+    expect(outcome).toEqual({ tripwire: undefined, failure: undefined });
+    expect(prompts).toHaveLength(1);
+    expect(JSON.stringify(prompts[0])).toContain('status: active');
+    expect(JSON.stringify(prompts[0])).not.toContain('"status":"active"');
+    expect(toModelOutput).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(
+    LOOPS,
+  )('keeps raw output when the mapper returns null on %s', async (loop) => {
+    const { outcome, prompts, toModelOutput } = await run(
+      loop,
+      { status: 'active' },
+      () => null,
+    );
+    expect(outcome).toEqual({ tripwire: undefined, failure: undefined });
+    expect(prompts).toHaveLength(1);
+    expect(JSON.stringify(prompts[0])).toContain('active');
+    expect(toModelOutput).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(LOOPS)('stops when the mapper throws on %s', async (loop) => {
+    const { outcome, prompts, audit, toModelOutput } = await run(
+      loop,
+      { status: 'active' },
+      () => {
+        throw new Error('private mapper failure');
+      },
+    );
+    expect
+      .soft(outcome)
+      .toEqual({ tripwire: PROCESSOR_FAILED, failure: undefined });
+    expect.soft(prompts).toEqual([]);
+    expect(eventsOf(audit, 'agent.input.processor', 'error')).toMatchObject([
+      {
+        reason: PROCESSOR_FAILED,
+        detail: { processor: 'breakwater-client-tool-output' },
+      },
+    ]);
+    expect(eventsOf(audit, 'agent.input.policy')).toEqual([]);
+    expect(toModelOutput).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(
+    LOOPS,
+  )('refuses mapped text under a renamed tool key on %s', async (loop) => {
+    const { outcome, prompts, audit, toModelOutput } = await run(
+      loop,
+      raw,
+      concatenateOutput,
+      'docs_lookup',
+      'docs.lookup',
+    );
+    expect.soft(outcome).toEqual({
+      tripwire: expect.stringMatching(/^deny-patterns: /),
+      failure: undefined,
+    });
+    expect.soft(prompts).toEqual([]);
+    expect(eventsOf(audit, 'agent.input.policy', 'denied')).toHaveLength(1);
+    expect(toModelOutput).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(LOOPS)('refuses mapped memory tool output on %s', async (loop) => {
+    const prompts: unknown[] = [];
+    const audit = new AuditLogger();
+    const toModelOutput = vi.fn(concatenateOutput);
+    const lookup = createTool({
+      id: 'lookup',
+      description: 'Look up status',
+      inputSchema: z.object({}),
+      toModelOutput,
+    } as never);
+    const memory = new (class extends MockMemory {
+      override listTools() {
+        return { lookup };
+      }
+    })({ storage: new InMemoryStore() });
+    const agent = guardedAgent({ prompts, audit, memory });
+    const outcome = await outcomeOf(
+      drive(agent, loop, messages('lookup', raw), {
+        requestContext: actorContext(),
+        memory: { thread: 't1', resource: 'r1' },
+      }),
+    );
+    expect.soft(outcome).toEqual({
+      tripwire: expect.stringMatching(/^deny-patterns: /),
+      failure: undefined,
+    });
+    expect.soft(prompts).toEqual([]);
+    expect(eventsOf(audit, 'agent.input.policy', 'denied')).toHaveLength(1);
+    expect(toModelOutput).toHaveBeenCalledTimes(1);
+  });
+
+  // Durable preparation awaits input processors before resolving tools; standard preparation can resolve tools first.
+  it.each([
+    'durable',
+  ] as const)('stops when client tool resolution fails on %s', async (loop) => {
+    const prompts: unknown[] = [];
+    const audit = new AuditLogger();
+    const memory = new (class extends MockMemory {
+      override listTools(): Record<string, never> {
+        throw new Error('private tool resolution failure');
+      }
+    })({ storage: new InMemoryStore() });
+    const agent = guardedAgent({ prompts, audit, memory });
+    const outcome = await outcomeOf(
+      drive(agent, loop, messages('lookup', raw), {
+        requestContext: actorContext(),
+        memory: { thread: 't1', resource: 'r1' },
+      }),
+    );
+    expect
+      .soft(outcome)
+      .toEqual({ tripwire: PROCESSOR_FAILED, failure: undefined });
+    expect.soft(prompts).toEqual([]);
+    expect(eventsOf(audit, 'agent.input.processor', 'error')).toMatchObject([
+      {
+        reason: PROCESSOR_FAILED,
+        detail: { processor: 'breakwater-client-tool-output' },
+      },
+    ]);
+    expect(eventsOf(audit, 'agent.input.policy')).toEqual([]);
+  });
+});
 
 describe('guarded input asset URL origins', () => {
   const originReason = 'input asset URL origin is not allowed';

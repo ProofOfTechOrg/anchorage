@@ -1661,6 +1661,7 @@ describe('guarded construction and processor validation', () => {
   it.each([
     'breakwater-rbac',
     'breakwater-input-assets',
+    'breakwater-client-tool-output',
     'breakwater-policy-engine',
   ])("rejects reserved application processor id '%s'", (id) => {
     expect(() =>
@@ -1813,6 +1814,7 @@ describe('guarded durable interop and brand', () => {
       { id: 'breakwater-rbac' },
       { id: 'application-input' },
       { id: 'breakwater-input-assets' },
+      { id: 'breakwater-client-tool-output' },
       { id: 'breakwater-policy-engine' },
     ]);
     await expect(

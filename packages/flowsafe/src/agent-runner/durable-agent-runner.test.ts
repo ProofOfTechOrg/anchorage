@@ -2637,12 +2637,14 @@ describe('FlowsafeDurableAgent thread runtime registration and rehydration', () 
       'breakwater-rbac',
       'application-input',
       'breakwater-input-assets',
+      'breakwater-client-tool-output',
       'breakwater-policy-engine',
     ]);
     expect(globalEntry?.inputProcessors?.map(({ id }) => id)).toEqual([
       'breakwater-rbac',
       'application-input',
       'breakwater-input-assets',
+      'breakwater-client-tool-output',
       'breakwater-policy-engine',
     ]);
     expect(
