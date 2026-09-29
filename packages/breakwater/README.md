@@ -210,7 +210,11 @@ gate turn into their error path.
 decision or exceeds its configured timeout: `PolicyEngine` records an error
 event and stops the call at input and in-stream on both of Mastra's agent
 loops, and rethrows at the final result, which stops Mastra's standard loop.
-Its `evaluateEveryChars` cadence must be a positive safe
+On Mastra's durable loop, output policies stop the stream a subscriber receives,
+including hold-back's terminal classification. Mastra logs a result-phase
+refusal; the saved thread message and returned result come from model output
+and are not filtered by output policies.
+The classifier's `evaluateEveryChars` cadence must be a positive safe
 integer. It has no automatic hold-back window because a classifier
 has no bounded match length. To buffer a whole channel until classification
 finishes, set `holdBackChars: Number.POSITIVE_INFINITY` on the returned
@@ -227,7 +231,14 @@ window and releases only evaluated text. String patterns and the built-in
 secret detectors provide bounded windows. A regular expression in
 `denyPatterns()` defaults to buffering the full segment unless
 `holdBackChars` supplies a safe bound. A `holdBackChars` hint must be a number
-of at least 0, or `Infinity`. The guarantee is per stream segment;
+of at least 0, or `Infinity`. At a text or reasoning segment's end, or at
+`finish` when no end chunk arrives, hold-back classifies any text still below
+`classifierPolicy()`'s cadence before releasing the held tail. With
+`holdBackChars: Infinity`, a denied segment emits nothing. With a finite
+window, previously released text stays visible; the held suffix is released
+only after terminal classification. A host-written cadence evaluator does not
+receive this terminal classification behavior. The guarantee is per stream
+segment;
 text released at the end of an earlier segment cannot be withdrawn if a match
 completes in a later segment. A text or reasoning chunk whose text is not a
 string, or a step whose reasoning text is not a string, aborts the stream

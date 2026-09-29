@@ -143,6 +143,8 @@ Each stream line contains the next reconnect cursor and one event. Replay depend
 
 Approval records store an `agent-thread` target with the agent, thread, resource, and original authorized principal. `createAgentApprovalResumer()` re-authorizes that stored principal against the current catalog: a human against the agent's roles and an automated principal against its `allowedAutomation` declaration on the `approval.resume` entry path. The thread host then enforces any `requiredPermissions` through the current resolver policy. It reconstructs the guarded module after eviction and resumes as the original principal. Before resume, the wrapper rebuilds Mastra's local and global run registries from fresh trusted context. It invokes only Breakwater's reserved RBAC `processInput` hook during rehydration, then installs the complete input, LLM-request, and output processor lists for resumed loop execution. It does not replay application or policy `processInput` hooks. An authorization denial stops before registry installation, observation, or tool execution. The reviewer identity remains attached to the approval decision.
 
+On Mastra's durable loop, output policies, including hold-back's terminal classification, stop the stream a subscriber receives. Mastra logs a result-phase refusal. The thread message it saves and the result it returns come from model output and are not filtered by output policies.
+
 ## Use the lower-level durable wrapper
 
 `createFlowsafeDurableAgent()` is available for compatibility. Create an ordinary Mastra `Agent`, then wrap it:

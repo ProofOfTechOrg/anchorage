@@ -538,6 +538,7 @@ export function piiSecrets(options: PiiSecretsOptions = {}): PolicyEvaluator {
         const cursorKey = `scannedUpTo:${channel}`;
         const cursor = streamState[cursorKey];
         const scannedUpTo = typeof cursor === 'number' ? cursor : 0;
+        if (text.length <= scannedUpTo) return { allowed: true };
         const window = text.slice(
           Math.max(0, scannedUpTo - (maxEnabledSpan - 1)),
         );
@@ -658,15 +659,26 @@ async function runClassify(
 }
 
 /**
+ * @internal The engine marks each policy's stream state during one terminal
+ * evaluation. This stays outside public `streamState` because a host evaluator
+ * can write that object and could set a field itself.
+ */
+export const terminalPassStreamStates = new WeakSet<object>();
+
+/**
  * Delegate gating to a pluggable, possibly-async classifier (e.g. a
  * moderation model or an external safety API). Streaming calls `classify`
  * only once accumulated text since the last call has grown by
  * `evaluateEveryChars` (a `classifiedUpTo:${channel}` cursor in
  * `streamState`, per-channel); the object channel classifies every snapshot,
  * since it is a replaced snapshot rather than append-only text. Input and
- * result phases have no `streamState` and therefore always classify — the
- * result phase is the authoritative gate, so a stream whose tail never
- * crossed the cadence still gets classified there.
+ * result phases have no `streamState` and therefore always classify. With
+ * hold-back, the engine classifies text left below the cadence at a channel
+ * end or stream finish before releasing it. On Mastra's durable loop, output
+ * policies stop the stream a subscriber receives, including terminal
+ * classification under hold-back. Mastra logs a result-phase refusal; the
+ * saved thread message and returned result come from model output and are
+ * not filtered by output policies.
  *
  * A `classify` call that throws, resolves to no decision, or does not settle
  * within `timeoutMs` is an evaluator failure. `PolicyEngine` records an error
@@ -690,7 +702,8 @@ export function classifierPolicy(
     CLASSIFIER_POLICY_OPTION_KEYS,
   );
   const name = options.name ?? 'classifier';
-  // Infinity is no cadence: a stream would reach the result phase unclassified.
+  // Infinity leaves unheld streams unclassified; durable result refusals
+  // are logged, not enforced.
   const evaluateEveryChars = readNumberInRange(
     'classifierPolicy: evaluateEveryChars',
     options.evaluateEveryChars ?? DEFAULT_EVALUATE_EVERY_CHARS,
@@ -712,7 +725,10 @@ export function classifierPolicy(
         const cursorKey = `classifiedUpTo:${channel}`;
         const cursor = streamState[cursorKey];
         const classifiedUpTo = typeof cursor === 'number' ? cursor : 0;
-        if (text.length - classifiedUpTo < evaluateEveryChars) {
+        if (
+          text.length - classifiedUpTo <
+          (terminalPassStreamStates.has(streamState) ? 1 : evaluateEveryChars)
+        ) {
           return { allowed: true };
         }
         streamState[cursorKey] = text.length;

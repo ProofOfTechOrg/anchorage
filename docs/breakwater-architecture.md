@@ -142,7 +142,7 @@ The guarded handle also carries a versioned host protocol. Flowsafe checks that 
 
 The engine accumulates each output channel independently. Built-in incremental policies keep scan cursors so work grows with the new data rather than rescanning the entire stream.
 
-With `holdBack: true`, the engine retains the largest trailing window requested by policies on each answer or reasoning segment. Clean text behind the window is released; the tail is reprocessed at the channel end. Structured-object intermediate snapshots are withheld until a passing result.
+With `holdBack: true`, the engine retains the largest trailing window requested by policies on each answer or reasoning segment. Clean text behind the window is released; at the channel end or stream finish, the engine evaluates any held tail before releasing it. Structured-object intermediate snapshots are withheld until a passing result. On Mastra's durable loop, output policies, including hold-back's terminal classification, stop the stream a subscriber receives. Mastra logs a result-phase refusal; the saved thread message and returned result come from model output and are not filtered by output policies.
 
 The guarantee is per stream segment. A custom policy participates only when it supplies an appropriate `holdBackChars` hint. An asynchronous classifier has no natural bounded window; use `Infinity` when the full segment must remain buffered until classification.
 

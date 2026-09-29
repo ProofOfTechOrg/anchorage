@@ -6,8 +6,9 @@
 //
 // Output is gated per chunk and at the final result so agent.stream() cannot
 // leak forbidden text: processOutputStream gates each streamed chunk against
-// the output accumulated so far, and processOutputResult is the authoritative
-// final processor gate (and the only one for non-streaming agent.generate()).
+// the output accumulated so far. processOutputResult is the final gate on
+// Mastra's standard loop; the durable loop logs its refusal without stopping
+// the returned result or saved thread message.
 // Structured objects that Mastra returns outside the processor chain are not
 // covered; the guarded agent therefore rejects structured output.
 //
@@ -63,6 +64,7 @@ import {
   assertPolicyText,
   copyRegExpEntry,
   readHoldBackChars,
+  terminalPassStreamStates,
 } from './content-inspection.js';
 import type {
   OutputChannel,
@@ -852,10 +854,12 @@ type DeltaChunk = Extract<
 >;
 
 interface HeldChannel {
-  /** Evaluated-clean text not yet emitted (the trailing window + backlog). */
+  /** Text not yet emitted (the trailing window + backlog). */
   pending: string;
   /** Last delta chunk of this channel — template for coalesced emissions. */
   shape: DeltaChunk;
+  /** Prevents repeated evaluation of a second channel on a re-driven finish. */
+  terminalEvaluated?: boolean;
 }
 
 type HoldState = Partial<Record<HoldableChannel, HeldChannel>>;
@@ -1086,14 +1090,12 @@ async function evaluatePoliciesInOrder(
     evaluated.push(policy.name);
     let decision: ReadPolicyDecision;
     try {
+      const streamState = streamAccumulator
+        ? policyStreamStateOf(streamAccumulator, index)
+        : undefined;
       decision = readPolicyDecision(
         await policy.evaluate(
-          streamAccumulator
-            ? {
-                ...context,
-                streamState: policyStreamStateOf(streamAccumulator, index),
-              }
-            : context,
+          streamState ? { ...context, streamState } : context,
         ),
       );
     } catch (error) {
@@ -1307,14 +1309,16 @@ export interface PolicyEngineOptions {
    * end chunk ('text-end'/'reasoning-end') and, as a backstop for streams
    * without end chunks, at 'finish' — both through the runner's reprocess
    * convention, so the flush precedes its end marker. The guarantee is
-   * therefore PER SEGMENT: everything flushed at an end chunk was evaluated
-   * clean against all channel text so far, but a match completing across
-   * segment boundaries (multi-step or multi-text-block runs) aborts the
-   * stream after earlier segments were already released — bounded by the
-   * window for string patterns, the whole prior segment for RegExp
-   * (Infinity) policies. Default false — evaluated chunks flow through
-   * unmodified, and already-emitted earlier chunks of a violating span may
-   * have leaked by abort time.
+   * therefore PER SEGMENT: before release, every applicable output policy
+   * evaluates the channel's whole text once more, including the held tail.
+   * A host evaluator receives this call even when the text is unchanged;
+   * a host cadence evaluator must decide for itself whether to classify.
+   * A match completing across segment boundaries (multi-step or
+   * multi-text-block runs) aborts the stream after earlier segments were
+   * already released — bounded by the window for string patterns or the
+   * whole prior segment for RegExp (Infinity) policies. Default false —
+   * evaluated chunks flow through unmodified, and already-emitted earlier
+   * chunks of a violating span may have leaked by abort time.
    */
   holdBack?: boolean;
 }
@@ -1542,12 +1546,9 @@ export class PolicyEngine implements Processor<'breakwater-policy-engine'> {
   // it — aborted before that chunk is emitted. Without holdBack the residual
   // limit is that already-emitted earlier chunks of a violating span have
   // leaked by abort time; with holdBack on, each channel's trailing window
-  // stays unemitted, so evaluation always runs on text the client has not
-  // fully seen and the abort lands before ANY char of the span is emitted.
-  // Ungated chunk types pass through untouched. Either way,
-  // processOutputResult remains the authoritative final gate — a driver that
-  // never emits 'finish' can truncate hold-back tail emission, but can never
-  // leak ungated text.
+  // stays unemitted, so evaluation runs before the held suffix is released.
+  // Ungated chunk types pass through untouched. A driver that never emits
+  // 'finish' can truncate hold-back tail emission.
   async processOutputStream(
     args: ProcessOutputStreamArgs,
   ): Promise<ChunkType | null | undefined> {
@@ -1602,25 +1603,7 @@ export class PolicyEngine implements Processor<'breakwater-policy-engine'> {
     } else {
       return this.#holdBack ? this.#forwardUngated(args) : part;
     }
-    const actor = actorFromRequestContext(args.requestContext) ?? null;
-    // No terminal "allowed" record here: one per chunk would flood the audit
-    // log. processOutputResult emits the single terminal record at stream end.
-    // abortOnError=true: Mastra's stream driver emits the chunk on a raw throw
-    // and only suppresses it on a TripWire (abort), so an evaluator crash here
-    // must abort, not rethrow.
-    const evaluated = await this.#evaluate(
-      {
-        phase: 'output',
-        channel,
-        messages: [],
-        text: texts[channel],
-        requestContext: args.requestContext,
-      },
-      actor,
-      args.abort,
-      true,
-      args.state,
-    );
+    const evaluated = await this.#evaluateStreamChannel(args, channel);
     if (evaluated.length > 0) {
       const streamedEvaluated = streamEvaluatedPoliciesOf(args.state);
       for (const name of evaluated) {
@@ -1646,11 +1629,10 @@ export class PolicyEngine implements Processor<'breakwater-policy-engine'> {
   }
 
   // Hold-back release for a just-evaluated delta. The full accumulated
-  // channel text (INCLUDING the held tail) was evaluated clean above, so a
-  // violation straddling the emission frontier would already have aborted —
-  // everything except the trailing window is therefore releasable, returned
-  // as a MODIFIED chunk carrying the releasable prefix; the tail stays
-  // pending (null when nothing is releasable yet).
+  // channel text (INCLUDING the held tail) was passed to applicable policies
+  // above. Text behind the largest declared window lies outside every
+  // applicable policy's window and is returned as a MODIFIED chunk carrying
+  // the prefix; the tail stays pending (null when nothing is releasable yet).
   #releaseHeld(
     args: ProcessOutputStreamArgs,
     channel: HoldableChannel,
@@ -1669,6 +1651,7 @@ export class PolicyEngine implements Processor<'breakwater-policy-engine'> {
     }
     entry.shape = part;
     entry.pending += part.payload.text;
+    entry.terminalEvaluated = false;
     const releaseLength = Math.max(0, entry.pending.length - window);
     if (releaseLength === 0) return null;
     const releasable = entry.pending.slice(0, releaseLength);
@@ -1681,11 +1664,11 @@ export class PolicyEngine implements Processor<'breakwater-policy-engine'> {
   // without end chunks) — both via the reprocess convention, returning the
   // coalesced flush and stashing the trigger part for the runner to re-drive
   // through the chain until nothing is pending. 'error'/'abort' drop
-  // pending: the stream is dead, and emitting evaluated-clean tail text
+  // pending: the stream is dead, and emitting held tail text
   // after the failure the client already saw would reorder the stream.
   // Everything else passes through with pending untouched (per-delta release
   // already respects the window, so no mid-stream flush is needed).
-  #forwardUngated(args: ProcessOutputStreamArgs): ChunkType {
+  async #forwardUngated(args: ProcessOutputStreamArgs): Promise<ChunkType> {
     const { part } = args;
     const hold = holdStateOf(args.state);
     if (part.type === 'error' || part.type === 'abort') {
@@ -1696,9 +1679,7 @@ export class PolicyEngine implements Processor<'breakwater-policy-engine'> {
     // A channel's end chunk closes its segment: flush the held tail FIRST,
     // then re-drive the end chunk — otherwise the tail would surface after
     // its end marker (or only at finish), reordering the stream for clean
-    // runs. The tail was already evaluated clean against the full
-    // accumulated channel text, so nothing unvetted is released; the
-    // zero-leak guarantee is per segment (see PolicyEngineOptions.holdBack).
+    // runs.
     const endedChannel =
       part.type === 'text-end'
         ? ('answer' as const)
@@ -1706,14 +1687,65 @@ export class PolicyEngine implements Processor<'breakwater-policy-engine'> {
           ? ('reasoning' as const)
           : undefined;
     if (endedChannel) {
+      await this.#evaluateHeldTail(args, endedChannel);
       return this.#flushHeld(hold[endedChannel], part, args.state) ?? part;
     }
     if (part.type !== 'finish') return part;
+    for (const channel of ['answer', 'reasoning'] as const) {
+      await this.#evaluateHeldTail(args, channel);
+    }
     for (const channel of ['answer', 'reasoning'] as const) {
       const flush = this.#flushHeld(hold[channel], part, args.state);
       if (flush) return flush;
     }
     return part;
+  }
+
+  async #evaluateStreamChannel(
+    args: ProcessOutputStreamArgs,
+    channel: OutputChannel,
+  ): Promise<string[]> {
+    // Stream passes emit no terminal "allowed" record: per-pass records
+    // would flood the audit log. processOutputResult emits one at stream end.
+    // abortOnError=true: Mastra emits a chunk on a raw throw but suppresses
+    // it on a TripWire, so errors abort on delta and held-tail passes.
+    return this.#evaluate(
+      {
+        phase: 'output',
+        channel,
+        messages: [],
+        text: channelTextsOf(args.state)[channel],
+        requestContext: args.requestContext,
+      },
+      actorFromRequestContext(args.requestContext) ?? null,
+      args.abort,
+      true,
+      args.state,
+    );
+  }
+
+  async #evaluateHeldTail(
+    args: ProcessOutputStreamArgs,
+    channel: HoldableChannel,
+  ): Promise<void> {
+    const held = holdStateOf(args.state)[channel];
+    if (!held || held.pending === '' || held.terminalEvaluated) return;
+    // A pending suffix can remain below the classifier cadence when its
+    // channel ends.
+    const streamStates = this.#policies.map((_, index) =>
+      policyStreamStateOf(args.state, index),
+    );
+    for (const streamState of streamStates) {
+      terminalPassStreamStates.add(streamState);
+    }
+    try {
+      await this.#evaluateStreamChannel(args, channel);
+      held.terminalEvaluated = true;
+    } finally {
+      for (const streamState of streamStates) {
+        terminalPassStreamStates.delete(streamState);
+      }
+    }
   }
 
   // Coalesce a channel's pending tail into a single delta, stash the
@@ -1916,6 +1948,7 @@ export function denyPatterns(
         const cursorKey = `scannedUpTo:${channel}`;
         const cursor = streamState[cursorKey];
         const scannedUpTo = typeof cursor === 'number' ? cursor : 0;
+        if (text.length <= scannedUpTo) return { allowed: true };
         const window = text
           .slice(Math.max(0, scannedUpTo - (maxPatternLength - 1)))
           .toLowerCase();

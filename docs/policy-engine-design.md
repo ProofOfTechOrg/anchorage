@@ -141,15 +141,15 @@ const moderation = classifierPolicy({
 });
 ```
 
-Input and final-result phases always classify. During append-only streaming, the evaluator runs when accumulated text grows by the configured cadence, `evaluateEveryChars`, a positive safe integer; object snapshots classify individually.
+Input and final-result phases always classify. During append-only streaming, the evaluator runs when accumulated text grows by the configured cadence, `evaluateEveryChars`, a positive safe integer; object snapshots classify individually. Under hold-back, a text or reasoning segment's end, or `finish` without an end chunk, also classifies text left below the cadence before releasing it.
 
-A timeout, a classifier failure or a classifier that returns no decision fails closed at input and in-stream on both of Mastra's agent loops, and at the final result on Mastra's standard loop. No fail-open option is provided.
+A timeout, a classifier failure or a classifier that returns no decision fails closed at input and in-stream on both of Mastra's agent loops, and at the final result on Mastra's standard loop. On Mastra's durable loop, output policies, including hold-back's terminal classification, stop the stream a subscriber receives. Mastra logs a result-phase refusal; the saved thread message and returned result come from model output and are not filtered by output policies. No fail-open option is provided.
 
 ## Hold-back and leakage
 
 Without hold-back, a streaming policy can detect a violation only after enough of the matching span has arrived. Earlier clean-looking characters may already have reached the client.
 
-`new PolicyEngine({ holdBack: true, ... })` retains a trailing window per answer and reasoning channel. The largest `holdBackChars` hint among applicable policies wins. Once a passing buffer exceeds the window, the older portion is emitted. The tail is reprocessed at the channel end or stream finish.
+`new PolicyEngine({ holdBack: true, ... })` retains a trailing window per answer and reasoning channel. The largest `holdBackChars` hint among applicable policies wins. Once a passing buffer exceeds the window, the older portion is emitted. At a channel end or stream finish, the engine classifies any text still below `classifierPolicy()`'s cadence before releasing the held tail. With `holdBackChars: Infinity`, a denied segment emits nothing; with a finite window, text already released remains visible and only the held suffix waits for terminal classification. A host-written cadence evaluator does not receive this terminal classification behavior.
 
 Object snapshots are replacement values rather than append-only text, so intermediate snapshots are suppressed and only a passing result is emitted.
 

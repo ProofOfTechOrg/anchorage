@@ -19,6 +19,7 @@ import {
   type ContentPolicyGate,
   type ContentPolicyGateInput,
   type ContentPolicyGateOptions,
+  classifierPolicy,
   createContentPolicyGate,
   denyPatterns,
   extractMessageText,
@@ -2302,6 +2303,243 @@ describe('PolicyEngine hold-back buffering', () => {
       ?.id;
   }
 
+  it.each([
+    {
+      label: 'text-end',
+      delta: textDelta('fine'),
+      end: textEnd(),
+      holdBackChars: Infinity,
+      emitted: '',
+      calls: ['fine'],
+    },
+    {
+      label: 'reasoning-end',
+      delta: reasoningDelta('fine'),
+      end: reasoningEnd(),
+      holdBackChars: Infinity,
+      emitted: '',
+      calls: ['fine'],
+    },
+    {
+      label: 'finish without an end marker',
+      delta: textDelta('fine'),
+      end: finishChunk(),
+      holdBackChars: Infinity,
+      emitted: '',
+      calls: ['fine'],
+    },
+    {
+      label: 'text-end with a finite window',
+      delta: textDelta('finebad'),
+      end: textEnd(),
+      holdBackChars: 3,
+      emitted: 'fine',
+      calls: ['finebad'],
+    },
+  ])('terminal classifier denies held text at $label', async ({
+    delta,
+    end,
+    holdBackChars,
+    emitted: expectedEmitted,
+    calls: expectedCalls,
+  }) => {
+    const calls: string[] = [];
+    const engine = new PolicyEngine({
+      policies: [
+        {
+          ...classifierPolicy({
+            channels: ['answer', 'reasoning'],
+            evaluateEveryChars: 100,
+            classify: async (text) => {
+              calls.push(text);
+              return { allowed: false, reason: 'denied segment' };
+            },
+          }),
+          holdBackChars,
+        },
+      ],
+      holdBack: true,
+    });
+    const state: Record<string, unknown> = {};
+    const initial = await engine.processOutputStream(
+      makeStreamArgs([delta], state),
+    );
+    let emitted = textOf(initial);
+    let aborted = false;
+    try {
+      emitted += textOf(
+        await engine.processOutputStream(makeStreamArgs([delta, end], state)),
+      );
+    } catch (error) {
+      aborted = error instanceof Tripwire;
+    }
+
+    expect(emitted).toBe(expectedEmitted);
+    expect(aborted).toBe(true);
+    expect(calls).toEqual(expectedCalls);
+  });
+
+  it.each([
+    'denies',
+    'throws',
+  ] as const)('does not flush either held channel when reasoning $0 at finish', async (outcome) => {
+    const calls: string[] = [];
+    const engine = new PolicyEngine({
+      policies: [
+        {
+          ...classifierPolicy({
+            channels: ['answer', 'reasoning'],
+            evaluateEveryChars: 100,
+            classify: async (_text, { channel }) => {
+              calls.push(channel);
+              if (channel === 'reasoning') {
+                if (outcome === 'throws') throw new Error('classifier failed');
+                return { allowed: false, reason: 'denied segment' };
+              }
+              return { allowed: true };
+            },
+          }),
+          holdBackChars: Infinity,
+        },
+      ],
+      holdBack: true,
+    });
+    const state: Record<string, unknown> = {};
+    const answer = await engine.processOutputStream(
+      makeStreamArgs([textDelta('answer')], state),
+    );
+    const reasoning = await engine.processOutputStream(
+      makeStreamArgs([reasoningDelta('reasoning')], state),
+    );
+    let aborted = false;
+    let finish: ChunkType | null | undefined;
+    try {
+      finish = await engine.processOutputStream(
+        makeStreamArgs([finishChunk()], state),
+      );
+    } catch (error) {
+      aborted = error instanceof Tripwire;
+    }
+
+    expect(textOf(answer) + textOf(reasoning) + textOf(finish)).toBe('');
+    expect(aborted).toBe(true);
+    expect(calls).toEqual(['answer', 'reasoning']);
+  });
+
+  it.each([
+    { evaluateEveryChars: 100, callsAfterDelta: [] },
+    { evaluateEveryChars: 4, callsAfterDelta: ['fine'] },
+  ])('classifies a clean held segment once before its end marker at cadence $evaluateEveryChars', async ({
+    evaluateEveryChars,
+    callsAfterDelta,
+  }) => {
+    const calls: string[] = [];
+    const engine = new PolicyEngine({
+      policies: [
+        {
+          ...classifierPolicy({
+            evaluateEveryChars,
+            classify: async (text) => {
+              calls.push(text);
+              return { allowed: true };
+            },
+          }),
+          holdBackChars: Infinity,
+        },
+      ],
+      holdBack: true,
+    });
+    const state: Record<string, unknown> = {};
+    const delta = textDelta('fine');
+    const end = textEnd();
+    const initial = await engine.processOutputStream(
+      makeStreamArgs([delta], state),
+    );
+    expect(initial).toBeNull();
+    expect(calls).toEqual(callsAfterDelta);
+
+    const flush = await engine.processOutputStream(
+      makeStreamArgs([delta, end], state),
+    );
+    expect(textOf(flush)).toBe('fine');
+    expect(calls).toEqual(['fine']);
+    expect(state[REPROCESS_KEY]).toBe(end);
+    delete state[REPROCESS_KEY];
+    await expect(
+      engine.processOutputStream(makeStreamArgs([delta, end], state)),
+    ).resolves.toBe(end);
+    await expect(
+      engine.processOutputStream(makeStreamArgs([finishChunk()], state)),
+    ).resolves.toMatchObject({ type: 'finish' });
+    expect(calls).toEqual(['fine']);
+  });
+
+  it('does not deny unchanged held text whose rescan window would split a token', async () => {
+    const policy = piiSecrets({ phases: ['output'] });
+    const maxEnabledSpan = (policy.holdBackChars ?? 0) + 1;
+    const prefix = 'a123-45-6789';
+    // Exact span length starts a rescan at index 1, dropping the 'a'.
+    const text = prefix + ' '.repeat(maxEnabledSpan - prefix.length);
+    const engine = new PolicyEngine({ policies: [policy], holdBack: true });
+    const state: Record<string, unknown> = {};
+    const delta = textDelta(text);
+    const first = await engine.processOutputStream(
+      makeStreamArgs([delta], state),
+    );
+    const tail = await engine.processOutputStream(
+      makeStreamArgs([delta, textEnd()], state),
+    );
+
+    expect(textOf(first) + textOf(tail)).toBe(text);
+  });
+
+  it('classifies a second held segment at its end after a clean first segment', async () => {
+    const calls: string[] = [];
+    const engine = new PolicyEngine({
+      policies: [
+        {
+          ...classifierPolicy({
+            evaluateEveryChars: 100,
+            classify: async (text) => {
+              calls.push(text);
+              return text.includes('bad')
+                ? { allowed: false, reason: 'denied segment' }
+                : { allowed: true };
+            },
+          }),
+          holdBackChars: Infinity,
+        },
+      ],
+      holdBack: true,
+    });
+    const state: Record<string, unknown> = {};
+    const fine = textDelta('fine');
+    const firstEnd = textEnd();
+    const initial = await engine.processOutputStream(
+      makeStreamArgs([fine], state),
+    );
+    const firstFlush = await engine.processOutputStream(
+      makeStreamArgs([fine, firstEnd], state),
+    );
+    expect(initial).toBeNull();
+    expect(textOf(firstFlush)).toBe('fine');
+    expect(state[REPROCESS_KEY]).toBe(firstEnd);
+    delete state[REPROCESS_KEY];
+    await expect(
+      engine.processOutputStream(makeStreamArgs([fine, firstEnd], state)),
+    ).resolves.toBe(firstEnd);
+
+    const bad = textDelta('bad');
+    const second = [fine, firstEnd, bad];
+    expect(
+      await engine.processOutputStream(makeStreamArgs(second, state)),
+    ).toBeNull();
+    await expect(
+      engine.processOutputStream(makeStreamArgs([...second, textEnd()], state)),
+    ).rejects.toBeInstanceOf(Tripwire);
+    expect(calls).toEqual(['fine', 'finebad']);
+  });
+
   it('emits no char of a violating span: pattern split across three chunks', async () => {
     // #given — holdBack on; "secret" (window 5) straddles chunks 1-3
     const engine = new PolicyEngine({
@@ -2523,8 +2761,20 @@ describe('PolicyEngine hold-back buffering', () => {
 
   it('drains multiple held channels over successive finish re-drives', async () => {
     // #given — pending text on both answer and reasoning (Infinity windows)
+    const calls: OutputChannel[] = [];
     const engine = new PolicyEngine({
-      policies: [denyPatterns([/x-\d/], { phases: ['output'] })],
+      policies: [
+        {
+          name: 'counting-evaluator',
+          phases: ['output'],
+          channels: ['answer', 'reasoning'],
+          holdBackChars: Infinity,
+          evaluate: ({ channel }) => {
+            calls.push(channel);
+            return { allowed: true };
+          },
+        },
+      ],
       holdBack: true,
     });
     const state: Record<string, unknown> = {};
@@ -2534,6 +2784,7 @@ describe('PolicyEngine hold-back buffering', () => {
     await engine.processOutputStream(
       makeStreamArgs([reasoningDelta('the trace')], state),
     );
+    expect(calls).toEqual(['answer', 'reasoning']);
 
     // #when — the first finish pass flushes the answer channel (on the
     // channel's own chunk shape) and stashes finish
@@ -2544,6 +2795,7 @@ describe('PolicyEngine hold-back buffering', () => {
     expect(flushAnswer).toMatchObject({ type: 'text-delta' });
     expect(textOf(flushAnswer)).toBe('final answer');
     expect(state[REPROCESS_KEY]).toBe(finish);
+    expect(calls).toEqual(['answer', 'reasoning', 'answer', 'reasoning']);
 
     // #when — the runner re-drives the stashed finish: reasoning flushes
     delete state[REPROCESS_KEY];
@@ -2553,12 +2805,14 @@ describe('PolicyEngine hold-back buffering', () => {
     expect(flushReasoning).toMatchObject({ type: 'reasoning-delta' });
     expect(textOf(flushReasoning)).toBe('the trace');
     expect(state[REPROCESS_KEY]).toBe(finish);
+    expect(calls).toEqual(['answer', 'reasoning', 'answer', 'reasoning']);
 
     // #then — the third pass has nothing pending; finish flows through
     delete state[REPROCESS_KEY];
     await expect(
       engine.processOutputStream(makeStreamArgs([finish], state)),
     ).resolves.toBe(finish);
+    expect(calls).toEqual(['answer', 'reasoning', 'answer', 'reasoning']);
   });
 
   it('flushes the held tail before text-end and re-drives the end chunk', async () => {
