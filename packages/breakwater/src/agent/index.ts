@@ -24,9 +24,13 @@ import { RequestContext } from '@mastra/core/request-context';
 import type { FullOutput, MastraModelOutput } from '@mastra/core/stream';
 
 import { type AuditLogger, agentAuditDetail } from '../audit/index.js';
-import { assertKnownFields } from '../host-input.js';
+import { assertKnownFields, readFrozenList } from '../host-input.js';
 import { stopWithoutCallMessages } from '../input-refusal.js';
 import { PolicyEngine, type PolicyEvaluator } from '../policy-engine/index.js';
+import {
+  inputAssetUrls,
+  UNCLASSIFIED_INPUT_CONTENT,
+} from '../policy-engine/prompt-media.js';
 import {
   type PromptSnapshot,
   recordProcessorAdditions,
@@ -43,8 +47,14 @@ import { readAllowedRoles } from '../rbac/roles.js';
 
 const RESERVED_PROCESSOR_IDS = new Set([
   'breakwater-rbac',
+  'breakwater-input-assets',
   'breakwater-policy-engine',
 ]);
+
+const INPUT_ASSET_SCHEME_DENIED = 'input asset URL scheme is not allowed';
+const INPUT_ASSET_CREDENTIALS_DENIED =
+  'input asset URL credentials are not allowed';
+const INPUT_ASSET_ORIGIN_DENIED = 'input asset URL origin is not allowed';
 
 // Exhaustive over GuardedAgentCallOptions: a member the interface gains is a
 // missing property here, one it drops an excess property.
@@ -326,6 +336,12 @@ export type GuardedAgentConfig<
    * every scheduled, signal, service, and agent-delegated entry.
    */
   allowedPrincipalKinds?: readonly PrincipalKind[];
+  /**
+   * Origins user file and image parts may name as network URLs, regardless of
+   * who fetches them. Absent or empty refuses all network URLs; data: URLs
+   * are inline data. This is independent of connector egress allowlists.
+   */
+  allowedInputAssetOrigins?: readonly string[];
   /** Mandatory input and output policies, evaluated in array order. */
   policies: readonly PolicyEvaluator[];
   /** Required failure-isolated audit logger for every mandatory gate. */
@@ -347,6 +363,7 @@ export type GuardedAgentConfig<
 const GUARDED_AGENT_CONFIG_KEYS = {
   allowedRoles: true,
   allowedPrincipalKinds: true,
+  allowedInputAssetOrigins: true,
   policies: true,
   audit: true,
   maxSteps: true,
@@ -451,6 +468,91 @@ function assertConstructionOptions(options: object): void {
       );
     }
   }
+}
+
+function readAllowedInputAssetOrigins(value: unknown): readonly string[] {
+  if (value === undefined) return Object.freeze([]);
+  const subject = 'createGuardedAgent: allowedInputAssetOrigins';
+  return readFrozenList(subject, value, (entry, index) => {
+    const prefix = `${subject}[${index}]`;
+    if (typeof entry !== 'string') {
+      throw new TypeError(`${prefix} must be a string`);
+    }
+    if (entry.includes('*')) {
+      throw new TypeError(
+        `${prefix}: wildcards are not supported; list each origin`,
+      );
+    }
+    if (/[@?#]/.test(entry)) {
+      throw new TypeError(
+        `${prefix} must not contain userinfo, query, or fragment`,
+      );
+    }
+    let url: URL;
+    try {
+      url = new URL(entry);
+    } catch {
+      throw new TypeError(`${prefix} must be a URL origin`);
+    }
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+      throw new TypeError(`${prefix} must use http or https`);
+    }
+    if (entry.includes('\\') || !/^https?:\/\/[^/]+\/?$/i.test(entry)) {
+      throw new TypeError(`${prefix} must be an origin without a path`);
+    }
+    return url.origin;
+  });
+}
+
+// Mastra downloads user asset URLs after input processors, including history
+// on every call (message-list-DCUwKHqe.js:11191-11226). Its durable runner
+// skips a non-tripwire processor error (create-durable-agent-DFHwqN2K.js:1336-1342).
+function inputAssetProcessor(
+  origins: readonly string[],
+  resource: string,
+  audit: AuditLogger,
+): InputProcessor {
+  const allowed = new Set(origins);
+  return {
+    id: 'breakwater-input-assets',
+    processInput(args) {
+      let reason: string | undefined;
+      let decision: 'denied' | 'error' = 'denied';
+      try {
+        for (const url of inputAssetUrls(args.messageList.get.all.db())) {
+          if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+            reason = INPUT_ASSET_SCHEME_DENIED;
+          } else if (url.username || url.password) {
+            reason = INPUT_ASSET_CREDENTIALS_DENIED;
+          } else if (!allowed.has(url.origin)) {
+            reason = INPUT_ASSET_ORIGIN_DENIED;
+          }
+          if (reason !== undefined) break;
+        }
+      } catch {
+        // An unreadable asset prompt has the same audit result as unreadable policy input.
+        reason = UNCLASSIFIED_INPUT_CONTENT;
+        decision = 'error';
+      }
+      const refusalReason = reason;
+      if (refusalReason === undefined) return args.messageList;
+      try {
+        audit.record({
+          actor: actorFromRequestContext(args.requestContext) ?? null,
+          action:
+            decision === 'error' ? 'agent.input.policy' : 'agent.input.asset',
+          resource,
+          decision,
+          reason: refusalReason,
+          detail: agentAuditDetail(args.requestContext),
+        });
+      } finally {
+        stopWithoutCallMessages(args.messageList, {}, () =>
+          args.abort(refusalReason),
+        );
+      }
+    },
+  };
 }
 
 function assertToolChoice(toolChoice: GuardedToolChoice): GuardedToolChoice {
@@ -888,6 +990,7 @@ class GuardedAgent<
   readonly #audit: AuditLogger;
   readonly #applicationInputProcessors: readonly InputProcessor[];
   readonly #applicationOutputProcessors: readonly GuardedOutputProcessor[];
+  readonly #inputAssets: InputProcessor;
   readonly #policy: PolicyEngine;
   readonly #rbac: RBACMiddleware;
   readonly #toolChoice: GuardedToolChoice;
@@ -918,6 +1021,9 @@ class GuardedAgent<
       options.allowedPrincipalKinds,
       'createGuardedAgent',
     );
+    const allowedInputAssetOrigins = readAllowedInputAssetOrigins(
+      options.allowedInputAssetOrigins,
+    );
     const maxSteps = options.maxSteps;
     const toolChoice = assertToolChoice(options.toolChoice);
     // Wrapped before any hand-off to Mastra: its standard loop runs the
@@ -934,6 +1040,7 @@ class GuardedAgent<
     const {
       allowedRoles: _allowedRoles,
       allowedPrincipalKinds: _allowedPrincipalKinds,
+      allowedInputAssetOrigins: _allowedInputAssetOrigins,
       policies,
       audit,
       maxSteps: _maxSteps,
@@ -959,6 +1066,11 @@ class GuardedAgent<
       audit,
       resource: `agent:${options.id}`,
     });
+    const inputAssets = inputAssetProcessor(
+      allowedInputAssetOrigins,
+      `agent:${options.id}`,
+      audit,
+    );
     super({
       ...agentConfig,
       inputProcessors: [
@@ -983,6 +1095,7 @@ class GuardedAgent<
     this.#audit = audit;
     this.#applicationInputProcessors = applicationInputProcessors;
     this.#applicationOutputProcessors = applicationOutputProcessors;
+    this.#inputAssets = inputAssets;
     this.#policy = policy;
     this.#rbac = rbac;
     this.#toolChoice = toolChoice;
@@ -1014,7 +1127,12 @@ class GuardedAgent<
   override async listInputProcessors(
     _requestContext?: RequestContext,
   ): Promise<InputProcessorOrWorkflow[]> {
-    return [this.#rbac, ...this.#applicationInputProcessors, this.#policy];
+    return [
+      this.#rbac,
+      ...this.#applicationInputProcessors,
+      this.#inputAssets,
+      this.#policy,
+    ];
   }
 
   override async listOutputProcessors(
@@ -1050,7 +1168,11 @@ class GuardedAgent<
       maxSteps: this.maxSteps,
       toolChoice: this.#toolChoice,
       disableBackgroundTasks: true,
-      inputProcessors: [...this.#applicationInputProcessors, this.#policy],
+      inputProcessors: [
+        ...this.#applicationInputProcessors,
+        this.#inputAssets,
+        this.#policy,
+      ],
       outputProcessors: [...this.#applicationOutputProcessors, this.#policy],
     };
   }

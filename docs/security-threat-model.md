@@ -365,6 +365,8 @@ The handle rejects unknown call options even when a key is present with `undefin
 
 This boundary protects trusted application code from accidental or unsupported invocation paths. It is not a sandbox against hostile code running in the same process; such code can import Mastra, construct another agent, access host credentials, or bypass the supported HTTP topology.
 
+The guarded agent admits user file and image network URLs only from the `http(s)` origins listed in `allowedInputAssetOrigins`; `data:` URLs are inline data. Mastra or a model provider may fetch an admitted URL. The host trusts listed origins: input policies do not read downloaded content, and Mastra follows redirects, so an open redirect on a listed origin reaches its target. Signals Mastra drains into a running loop after input processing do not pass through this check. A refusal records an `agent.input.asset` event without the URL. Input the step cannot read stops the call with `input message content is not classified` and one `agent.input.policy` error event, as the policy engine's reading does.
+
 ## RBAC model
 
 Breakwater exports these role labels:

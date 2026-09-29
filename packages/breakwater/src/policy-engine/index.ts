@@ -20,13 +20,12 @@
 // storage-layer property, shipped as flowsafe's purgeExpiredWorkflowRuns —
 // see docs/policy-engine-design.md.
 
-import {
-  type AIV5Type,
-  type AIV6Type,
-  convertMessages,
-  type MastraDBMessage,
-  type MastraMessagePart,
-  type MastraToolInvocation,
+import type {
+  AIV5Type,
+  AIV6Type,
+  MastraDBMessage,
+  MastraMessagePart,
+  MastraToolInvocation,
 } from '@mastra/core/agent/message-list';
 import type {
   ProcessInputArgs,
@@ -71,6 +70,11 @@ import type {
   PolicyEvaluator,
   PolicyPhase,
 } from './evaluator-contract.js';
+import {
+  classifyPromptMedia,
+  convertedPrompt,
+  UNCLASSIFIED_INPUT_CONTENT,
+} from './prompt-media.js';
 import type { PolicyDecision } from './tool-policy.js';
 
 export type {
@@ -81,9 +85,6 @@ export type {
 } from './evaluator-contract.js';
 
 const DEFAULT_CHANNELS: readonly OutputChannel[] = ['answer'];
-
-/** The reason input evaluation stops on message content it does not classify. */
-const UNCLASSIFIED_INPUT_CONTENT = 'input message content is not classified';
 
 // A table below that `satisfies` a type built on a union Mastra declares fails
 // to compile when a Mastra release adds a member, until the member is
@@ -263,7 +264,7 @@ function withProviderOptionValues(
 
 // The adapters that send a content output as JSON text send every field of
 // every item to the model, so each item is read whole. Base64 `data` is not
-// read, as file data is not; those adapters send it as tool text too.
+// read, as binary file data is not; those adapters send it as tool text too.
 function contentItemValues(fields: object): readonly unknown[] | undefined {
   const options: unknown = (fields as { providerOptions?: unknown })
     .providerOptions;
@@ -303,9 +304,43 @@ const TOOL_RESULT_OUTPUT_VALUES = {
   },
 } satisfies PromptValueReaders<PromptToolResultOutput>;
 
+// Text media payloads contribute decoded text; binary payloads stay unread.
+function promptMediaValues(
+  part: object,
+  data: unknown,
+  declaredMediaType: unknown,
+  initialValues: readonly unknown[],
+): readonly unknown[] | undefined {
+  const media = classifyPromptMedia(data, declaredMediaType);
+  if (media === undefined) return undefined;
+  const values: unknown[] = [...initialValues];
+  if (typeof declaredMediaType === 'string') values.push(declaredMediaType);
+  if (media.mediaType !== undefined && media.mediaType !== declaredMediaType) {
+    values.push(media.mediaType);
+  }
+  if (media.mediaType !== undefined && /^text\//i.test(media.mediaType)) {
+    try {
+      if (media.kind === 'network-url') {
+        values.push(media.url.toString());
+      } else {
+        const bytes =
+          media.kind === 'inline-bytes'
+            ? media.bytes
+            : Uint8Array.from(
+                atob(media.payload.replace(/-/g, '+').replace(/_/g, '/')),
+                (byte) => byte.codePointAt(0) as number,
+              );
+        values.push(new TextDecoder().decode(bytes));
+      }
+    } catch {
+      return undefined;
+    }
+  }
+  return withProviderOptionValues(part, values);
+}
+
 // Tool-call ids are provider pairing keys, often random enough that an
-// entropy detector would deny every replay that carries one; they, and file
-// and image data, are not read.
+// entropy detector would deny every replay that carries one.
 const PROMPT_PART_VALUES = {
   text: (part) => withProviderOptionValues(part, [part.text]),
   reasoning: (part) => withProviderOptionValues(part, [part.text]),
@@ -317,8 +352,9 @@ const PROMPT_PART_VALUES = {
       ? undefined
       : withProviderOptionValues(part, [part.toolName, ...output]);
   },
-  file: (part) => withProviderOptionValues(part, [part.filename]),
-  image: (part) => withProviderOptionValues(part, []),
+  file: (part) =>
+    promptMediaValues(part, part.data, part.mediaType, [part.filename]),
+  image: (part) => promptMediaValues(part, part.image, part.mediaType, []),
 } satisfies PromptValueReaders<PromptContentPart>;
 
 type PromptToolResultPart = Extract<PromptContentPart, { type: 'tool-result' }>;
@@ -630,10 +666,7 @@ function inputPromptText(
   messages: readonly MastraDBMessage[],
 ): string | undefined {
   if (!messages.every(isClassifiedInputMessage)) return undefined;
-  // The conversion merges into and rewrites the message objects it is given.
-  const converted = convertMessages(structuredClone([...messages])).to(
-    'AIV5.Model',
-  );
+  const converted = convertedPrompt(messages);
   const stored = storedModelOutputs(messages);
   const { prompt, placed } = withStoredModelOutputs(converted, stored);
   const assistantReaders = assistantPartValues(mcpToolCallIds(prompt));
@@ -742,13 +775,15 @@ function callerInput(
  * Policy text of format-2 messages: the text Mastra renders into the model
  * prompt from them, and every stored model output they carry, joined for
  * policy matching. Tool-call ids, provider metadata such as signatures and
- * item ids, and file and image data are not included. Nor is the encrypted
- * payload, file reference or file data of a provider-executed tool result in
- * an assistant message, where the root of the result's value has the shape a
- * model adapter bundled with Mastra stores for that tool; the same field
- * anywhere else is included, and so is the whole of a result that names a
- * Google server-tool call or answers an Anthropic MCP call, which those
- * adapters send on as content.
+ * item ids, and binary file and image data are not included. File and image
+ * media types and decoded text/* payloads, including data: URL payloads, are
+ * included. A text/* network URL contributes its URL string; its target is
+ * not read. Nor is the encrypted payload, file reference or file data of a
+ * provider-executed tool result in an assistant message, where the root of
+ * the result's value has the shape a model adapter bundled with Mastra stores
+ * for that tool; the same field anywhere else is included, and so is the
+ * whole of a result that names a Google server-tool call or answers an
+ * Anthropic MCP call, which those adapters send on as content.
  *
  * @throws TypeError when a message's role, part type, tool-invocation state,
  * rendered prompt part or provider option is outside what this function

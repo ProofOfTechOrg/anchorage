@@ -23,6 +23,7 @@ import { AuditLogger } from '../audit/index.js';
 import {
   classifierPolicy,
   denyPatterns,
+  extractMessageText,
   PolicyEngine,
   type PolicyEvaluator,
   piiSecrets,
@@ -179,6 +180,7 @@ function guardedAgent(settings: {
   memory?: MockMemory;
   instructions?: string;
   model?: MastraModelConfig;
+  allowedInputAssetOrigins?: readonly string[];
 }): GuardedAgentHandle {
   return createGuardedAgent({
     id: 'writer',
@@ -190,6 +192,9 @@ function guardedAgent(settings: {
       ? { model: settings.model, maxRetries: 0 }
       : { model: recordingModel(settings.prompts) }),
     allowedRoles: ['operator'],
+    ...(settings.allowedInputAssetOrigins !== undefined
+      ? { allowedInputAssetOrigins: settings.allowedInputAssetOrigins }
+      : {}),
     policies: settings.policies ?? [denyPatterns([MARK])],
     audit: settings.audit,
     maxSteps: 1,
@@ -272,6 +277,23 @@ function userMessage(id: string, text: string): MastraDBMessage {
   };
 }
 
+const modelFile = (
+  data: string | URL | Uint8Array,
+  mediaType = 'text/plain',
+) => [{ role: 'user', content: [{ type: 'file', data, mediaType }] }];
+
+const dbFile = (data: string, mimeType?: string) => [
+  {
+    id: 'asset-db',
+    role: 'user',
+    createdAt: new Date(),
+    content: {
+      format: 2,
+      parts: [{ type: 'file', data, ...(mimeType ? { mimeType } : {}) }],
+    },
+  },
+];
+
 // The instructions entry, whose content Mastra stores as a string.
 const instructionsOf = (args: ProcessInputArgs) =>
   args.systemMessages[0] as {
@@ -296,6 +318,398 @@ function promptLines(prompt: unknown): string[] {
       }`,
   );
 }
+
+describe('guarded input asset URL origins', () => {
+  const originReason = 'input asset URL origin is not allowed';
+  const schemeReason = 'input asset URL scheme is not allowed';
+  const credentialsReason = 'input asset URL credentials are not allowed';
+  const stubFetch = () =>
+    vi.spyOn(globalThis, 'fetch').mockImplementation(
+      async () =>
+        new Response(new Uint8Array([137, 80, 78, 71]), {
+          headers: { 'content-type': 'image/png' },
+        }),
+    );
+  const networkCalls = (fetch: ReturnType<typeof stubFetch>) =>
+    fetch.mock.calls
+      .map(([input]) => String(input))
+      .filter((url) => !url.toLowerCase().startsWith('data:'));
+  const modelImage = (image: string | URL) => [
+    { role: 'user', content: [{ type: 'image', image }] },
+  ];
+  const uiFile = (url: string) => [
+    {
+      id: 'asset-ui',
+      role: 'user',
+      parts: [{ type: 'file', mediaType: 'image/png', url }],
+    },
+  ];
+
+  afterEach(() => vi.restoreAllMocks());
+
+  const refused: ReadonlyArray<{
+    name: string;
+    url: string;
+    origins?: readonly string[];
+    messages?: () => unknown[];
+    reason: string;
+  }> = [
+    {
+      name: 'metadata IP',
+      url: 'http://169.254.169.254/latest/meta-data/',
+      reason: originReason,
+    },
+    {
+      name: 'Docker loopback',
+      url: 'http://127.0.0.1:2375/containers/json',
+      reason: originReason,
+    },
+    {
+      name: 'unlisted HTTPS',
+      url: 'https://unlisted.example/a.png',
+      reason: originReason,
+    },
+    {
+      name: 'different scheme',
+      url: 'http://assets.example/a.png',
+      origins: ['https://assets.example'],
+      reason: originReason,
+    },
+    {
+      name: 'subdomain',
+      url: 'https://cdn.assets.example/a.png',
+      origins: ['https://assets.example'],
+      reason: originReason,
+    },
+    {
+      name: 'nondefault port',
+      url: 'https://assets.example:8443/a.png',
+      origins: ['https://assets.example'],
+      reason: originReason,
+    },
+    {
+      name: 'credentials',
+      url: 'https://user:pw@assets.example/a.png',
+      origins: ['https://assets.example'],
+      reason: credentialsReason,
+    },
+    { name: 'gs scheme', url: 'gs://bucket/a.png', reason: schemeReason },
+    { name: 's3 scheme', url: 's3://bucket/a.png', reason: schemeReason },
+    { name: 'file scheme', url: 'file:///etc/passwd', reason: schemeReason },
+    {
+      name: 'ftp scheme',
+      url: 'ftp://assets.example/a.png',
+      reason: schemeReason,
+    },
+    {
+      name: 'URL object',
+      url: 'http://169.254.169.254/latest/meta-data/',
+      messages: () =>
+        modelImage(new URL('http://169.254.169.254/latest/meta-data/')),
+      reason: originReason,
+    },
+    {
+      name: 'file part',
+      url: 'http://169.254.169.254/latest/meta-data/',
+      messages: () =>
+        modelFile('http://169.254.169.254/latest/meta-data/', 'image/png'),
+      reason: originReason,
+    },
+    {
+      name: 'upper-case DB URL',
+      url: 'HTTP://169.254.169.254/x',
+      messages: () => dbFile('HTTP://169.254.169.254/x', 'image/png'),
+      reason: originReason,
+    },
+    {
+      name: 'upper-case UI URL',
+      url: 'HTTP://169.254.169.254/x',
+      messages: () => uiFile('HTTP://169.254.169.254/x'),
+      reason: originReason,
+    },
+    {
+      name: 'UI attachment',
+      url: 'https://unlisted.example/a.png',
+      messages: () => [
+        {
+          role: 'user',
+          parts: [{ type: 'text', text: 'Describe' }],
+          experimental_attachments: [
+            { url: 'https://unlisted.example/a.png', contentType: 'image/png' },
+          ],
+        },
+      ],
+      reason: originReason,
+    },
+  ];
+
+  it.each(
+    refused,
+  )('refuses $name on generate, stream and the durable loop', async (row) => {
+    for (const loop of LOOPS) {
+      const fetch = stubFetch();
+      const prompts: unknown[] = [];
+      const audit = new AuditLogger();
+      const agent = guardedAgent({
+        prompts,
+        audit,
+        allowedInputAssetOrigins: row.origins,
+      });
+      const outcome = await outcomeOf(
+        drive(agent, loop, row.messages?.() ?? modelImage(row.url), {
+          requestContext: actorContext(),
+        }),
+      );
+      expect({ loop, ...outcome, prompts }).toEqual({
+        loop,
+        tripwire: row.reason,
+        failure: undefined,
+        prompts: [],
+      });
+      expect(networkCalls(fetch)).not.toContain(new URL(row.url).toString());
+      const events = eventsOf(audit, 'agent.input.asset');
+      expect(events).toEqual([
+        expect.objectContaining({ decision: 'denied', reason: row.reason }),
+      ]);
+      expect(JSON.stringify(events)).not.toContain(row.url);
+      const hostname = new URL(row.url).hostname;
+      if (hostname) expect(JSON.stringify(events)).not.toContain(hostname);
+      fetch.mockRestore();
+    }
+  });
+
+  it.each([
+    ['listed', 'https://assets.example', 'https://assets.example/a.png'],
+    [
+      'listed default port',
+      'https://assets.example:443',
+      'https://assets.example/a.png',
+    ],
+    [
+      'candidate default port',
+      'https://assets.example',
+      'https://assets.example:443/a.png',
+    ],
+  ])('allows %s on generate, stream and the durable loop', async (_name, origin, url) => {
+    for (const loop of LOOPS) {
+      const fetch = stubFetch();
+      const prompts: unknown[] = [];
+      const agent = guardedAgent({
+        prompts,
+        audit: new AuditLogger(),
+        allowedInputAssetOrigins: [origin],
+      });
+      expect(
+        await outcomeOf(
+          drive(agent, loop, modelImage(url), {
+            requestContext: actorContext(),
+          }),
+        ),
+      ).toEqual({ tripwire: undefined, failure: undefined });
+      expect(prompts).toHaveLength(1);
+      expect(networkCalls(fetch)).toContain(new URL(url).toString());
+      fetch.mockRestore();
+    }
+  });
+
+  it.each([
+    ['data URL', () => modelImage('data:image/png;base64,iVBORw0KGgo=')],
+    [
+      'upper-case data URL',
+      () => dbFile('DATA:text/plain;base64,aGVsbG8=', 'image/png'),
+    ],
+    ['unparseable http prefix', () => modelFile('http://', 'image/png')],
+  ])('allows inline %s on generate, stream and the durable loop', async (_name, messages) => {
+    for (const loop of LOOPS) {
+      const fetch = stubFetch();
+      const prompts: unknown[] = [];
+      const agent = guardedAgent({ prompts, audit: new AuditLogger() });
+      expect(
+        await outcomeOf(
+          drive(agent, loop, messages(), { requestContext: actorContext() }),
+        ),
+      ).toEqual({ tripwire: undefined, failure: undefined });
+      expect(prompts).toHaveLength(1);
+      expect(networkCalls(fetch)).toEqual([]);
+      fetch.mockRestore();
+    }
+  });
+
+  it.each(LOOPS)('refuses an application-added URL on %s', async (loop) => {
+    const url = 'https://unlisted.example/a.png';
+    const fetch = stubFetch();
+    const prompts: unknown[] = [];
+    const audit = new AuditLogger();
+    const agent = guardedAgent({
+      prompts,
+      audit,
+      processors: [
+        app((args) => {
+          args.messageList.add(
+            {
+              role: 'user',
+              content: [{ type: 'file', data: url, mediaType: 'image/png' }],
+            },
+            'response',
+          );
+          return args.messageList;
+        }),
+      ],
+    });
+    expect(
+      await outcomeOf(
+        drive(agent, loop, ['hello'], { requestContext: actorContext() }),
+      ),
+    ).toEqual({ tripwire: originReason, failure: undefined });
+    expect(networkCalls(fetch)).not.toContain(url);
+    expect(prompts).toEqual([]);
+    const events = eventsOf(audit, 'agent.input.asset');
+    expect(events).toEqual([
+      expect.objectContaining({ decision: 'denied', reason: originReason }),
+    ]);
+    expect(JSON.stringify(events)).not.toContain(url);
+    expect(JSON.stringify(events)).not.toContain(new URL(url).hostname);
+  });
+
+  it.each(
+    STANDARD,
+  )('refuses a URL in stored history on %s (the durable loop loads no history)', async (loop) => {
+    const url = 'https://unlisted.example/a.png';
+    const fetch = stubFetch();
+    const memory = await threadMemory();
+    await memory.saveMessages({
+      messages: [
+        {
+          ...dbFile(url, 'image/png')[0],
+          id: 'asset-history',
+          threadId: THREAD.thread,
+          resourceId: THREAD.resource,
+        },
+      ] as never,
+    });
+    const prompts: unknown[] = [];
+    const audit = new AuditLogger();
+    const agent = guardedAgent({ prompts, audit, memory });
+    expect(
+      await outcomeOf(
+        drive(agent, loop, ['hello'], {
+          requestContext: actorContext(),
+          memory: THREAD,
+        }),
+      ),
+    ).toEqual({ tripwire: originReason, failure: undefined });
+    expect(networkCalls(fetch)).not.toContain(url);
+    expect(prompts).toEqual([]);
+    const events = eventsOf(audit, 'agent.input.asset');
+    expect(events).toEqual([
+      expect.objectContaining({ decision: 'denied', reason: originReason }),
+    ]);
+    expect(JSON.stringify(events)).not.toContain(url);
+    expect(JSON.stringify(events)).not.toContain(new URL(url).hostname);
+  });
+});
+
+describe('file and image prompt media policy text', () => {
+  const encoded = Buffer.from(MARK).toString('base64');
+
+  const ROWS: ReadonlyArray<{
+    name: string;
+    messages: () => unknown[];
+    decision: 'denied' | 'error' | 'allowed';
+    reason?: string;
+  }> = [
+    {
+      name: 'model file inline bytes',
+      messages: () => modelFile(new TextEncoder().encode(MARK)),
+      decision: 'denied',
+    },
+    {
+      name: 'model file inline base64',
+      messages: () => modelFile(encoded),
+      decision: 'denied',
+    },
+    {
+      name: 'stored file data URL',
+      messages: () => dbFile(`data:text/plain;base64,${encoded}`, 'text/plain'),
+      decision: 'denied',
+    },
+    {
+      name: 'stored file data URL without declared media type',
+      messages: () => dbFile(`data:text/plain;base64,${encoded}`),
+      decision: 'denied',
+    },
+    {
+      name: 'model image with a text media type',
+      messages: () => [
+        {
+          role: 'user',
+          content: [{ type: 'image', image: encoded, mediaType: 'text/plain' }],
+        },
+      ],
+      decision: 'denied',
+    },
+    {
+      name: 'stored file upper-case data URL scheme',
+      messages: () => dbFile(`DATA:text/plain;base64,${encoded}`, 'text/plain'),
+      decision: 'denied',
+    },
+    {
+      name: 'file declared media type',
+      messages: () => modelFile('aGVsbG8=', `application/x-${MARK}`),
+      decision: 'denied',
+    },
+    {
+      name: 'invalid inline base64 stops classification',
+      messages: () => dbFile('%%%', 'text/plain'),
+      decision: 'error',
+      reason: 'input message content is not classified',
+    },
+    {
+      name: 'binary file payload stays unread',
+      messages: () => modelFile(encoded, 'application/octet-stream'),
+      decision: 'allowed',
+    },
+  ];
+
+  it.each(
+    ROWS,
+  )('$name on generate, stream and the durable loop', async (row) => {
+    if (row.decision === 'error') {
+      expect(() =>
+        extractMessageText(row.messages() as MastraDBMessage[]),
+      ).toThrow(row.reason);
+    }
+    for (const loop of LOOPS) {
+      const prompts: unknown[] = [];
+      const audit = new AuditLogger();
+      const agent = guardedAgent({ prompts, audit });
+
+      const outcome = await outcomeOf(
+        drive(agent, loop, row.messages(), { requestContext: actorContext() }),
+      );
+
+      if (row.decision === 'allowed') {
+        expect({ loop, ...outcome, prompts: prompts.length }).toEqual({
+          loop,
+          tripwire: undefined,
+          failure: undefined,
+          prompts: 1,
+        });
+        expect(promptLines(prompts[0])).toContain('user: <file>');
+      } else {
+        expect({ loop, ...outcome, prompts }).toEqual({
+          loop,
+          tripwire: row.reason ?? expect.stringMatching(/^deny-patterns: /),
+          failure: undefined,
+          prompts: [],
+        });
+        expect(eventsOf(audit, 'agent.input.policy')).toEqual([
+          expect.objectContaining({ decision: row.decision }),
+        ]);
+      }
+    }
+  });
+});
 
 describe('input evaluator failures on both agent loops', () => {
   const FAILING: ReadonlyArray<[string, () => PolicyEvaluator]> = [

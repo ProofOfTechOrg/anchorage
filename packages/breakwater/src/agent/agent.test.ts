@@ -1514,6 +1514,44 @@ describe('guarded call-option boundary', () => {
 
 describe('guarded construction and processor validation', () => {
   it.each([
+    ['non-array', 'https://a.example'],
+    ['number entry', [42]],
+    ['boxed string entry', [new String('https://a.example')]],
+    ['path', ['https://a.example/x']],
+    ['normalizing path', ['https://a.example/private/..']],
+    ['dot path', ['https://a.example/./']],
+    ['backslash path', ['https://a.example\\x']],
+    ['query', ['https://a.example/?q=1']],
+    ['empty query', ['https://a.example/?']],
+    ['fragment', ['https://a.example#']],
+    ['userinfo', ['https://u:p@a.example']],
+    ['empty userinfo', ['https://@a.example']],
+    ['ftp', ['ftp://a.example']],
+    ['data', ['data:text/plain,x']],
+    ['wildcard', ['https://*.example.com']],
+    ['unparseable', ['not a url']],
+  ])('refuses invalid asset origin %s', (_name, value) => {
+    expect(() => guarded({ allowedInputAssetOrigins: value as never })).toThrow(
+      TypeError,
+    );
+    expect(() => guarded({ allowedInputAssetOrigins: value as never })).toThrow(
+      new RegExp(
+        Array.isArray(value)
+          ? 'allowedInputAssetOrigins\\[0\\]'
+          : 'allowedInputAssetOrigins must be an array',
+      ),
+    );
+  });
+
+  it.each([
+    'https://a.example',
+    'https://a.example/',
+    'https://A.Example:443',
+  ])('accepts exact asset origin %s', (origin) => {
+    expect(() => guarded({ allowedInputAssetOrigins: [origin] })).not.toThrow();
+  });
+
+  it.each([
     'agent',
     'inputProcessors',
     'outputProcessors',
@@ -1622,6 +1660,7 @@ describe('guarded construction and processor validation', () => {
 
   it.each([
     'breakwater-rbac',
+    'breakwater-input-assets',
     'breakwater-policy-engine',
   ])("rejects reserved application processor id '%s'", (id) => {
     expect(() =>
@@ -1674,6 +1713,7 @@ describe('guarded construction and processor validation', () => {
     const config: Record<keyof GuardedAgentConfig<'writer'>, unknown> = {
       allowedRoles: ['operator'],
       allowedPrincipalKinds: ['human'],
+      allowedInputAssetOrigins: [],
       policies: [],
       audit: new AuditLogger(),
       maxSteps: 2,
@@ -1717,6 +1757,7 @@ describe('guarded construction and processor validation', () => {
 const GUARDED_CONFIG_FIELDS = [
   'allowedRoles',
   'allowedPrincipalKinds',
+  'allowedInputAssetOrigins',
   'policies',
   'audit',
   'maxSteps',
@@ -1771,6 +1812,7 @@ describe('guarded durable interop and brand', () => {
     ).resolves.toMatchObject([
       { id: 'breakwater-rbac' },
       { id: 'application-input' },
+      { id: 'breakwater-input-assets' },
       { id: 'breakwater-policy-engine' },
     ]);
     await expect(

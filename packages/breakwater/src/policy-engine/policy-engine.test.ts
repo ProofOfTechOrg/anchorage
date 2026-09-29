@@ -2992,7 +2992,7 @@ describe('extractMessageText', () => {
     expect(text).toBe('lookup\n{}\nlookup\nsummary for the model');
   });
 
-  it('leaves out tool-call ids, provider metadata and file data', () => {
+  it('leaves out tool-call ids and provider metadata while reading text file data', () => {
     // #given
     const message = toolResultMessage('result text', {
       openai: { itemId: 'provider-option-text' },
@@ -3014,7 +3014,9 @@ describe('extractMessageText', () => {
     const text = extractMessageText([message, file]);
 
     // #then
-    expect(text).toBe('lookup\n{}\nlookup\nresult text\nhi');
+    expect(text).toBe(
+      'lookup\n{}\nlookup\nresult text\ntext/plain\nfile-data\nhi',
+    );
   });
 
   const UNCLASSIFIED: Array<[string, MastraDBMessage]> = [
