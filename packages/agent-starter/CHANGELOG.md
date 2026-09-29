@@ -1,5 +1,32 @@
 # anchorage-agent-starter
 
+## 0.0.19
+
+### Patch Changes
+
+- Updated dependencies [11e8080]
+- Updated dependencies [def857f]
+- Updated dependencies [d8846de]
+- Updated dependencies [d8846de]
+- Updated dependencies [850f95b]
+- Updated dependencies [2dbe0a5]
+- Updated dependencies [f15367f]
+- Updated dependencies [a885488]
+- Updated dependencies [8c519ee]
+- Updated dependencies [ccffeca]
+- Updated dependencies [20cabc3]
+- Updated dependencies [68c4c61]
+- Updated dependencies [23eee3f]
+- Updated dependencies [850f95b]
+- Updated dependencies [ad61e7a]
+- Updated dependencies [84bb66a]
+- Updated dependencies [ccffeca]
+- Updated dependencies [52cc784]
+- Updated dependencies [cf7ad72]
+- Updated dependencies [20cabc3]
+  - @proofoftech/breakwater@0.16.0
+  - @proofoftech/flowsafe@0.23.0
+
 ## 0.0.18
 
 ### Patch Changes
