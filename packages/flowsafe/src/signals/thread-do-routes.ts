@@ -316,7 +316,10 @@ export interface ThreadSignalRoutesOptions {
    * notification follows Mastra's delivery policy.
    */
   canPersist?: (scope: ThreadScope) => boolean | Promise<boolean>;
-  /** Whether the registered schedule owner may persist to its fixed target. */
+  /**
+   * Whether the registered schedule owner may persist to its fixed target.
+   * When set, its answer is used in place of `canPersist`'s answer for schedule fires.
+   */
   canPersistSchedule?: (
     scope: ThreadScope,
     input: {
@@ -2062,20 +2065,18 @@ async function handleScheduleSignal(options: {
   const persistenceRequested = localActiveRunId
     ? effectiveIfActive.behavior === 'persist'
     : (ifIdle.behavior ?? 'wake') === 'persist';
-  // Occupancy can change before the send, so either branch may persist.
-  const persistenceAllowed =
-    (effectiveIfActive.behavior === 'persist' ||
-      (ifIdle.behavior ?? 'wake') === 'persist') &&
-    options.schedulePersistenceAllowed
-      ? await options.schedulePersistenceAllowed({
-          scheduleId,
-          dispatchId,
-          runId,
-          agentId: target.agentId,
-          threadId: options.threadId,
-          resourceId,
-        })
-      : options.persistenceAllowed;
+  // A wake or a delivery can still end in persistence, so the schedule's
+  // authorization governs every fire.
+  const persistenceAllowed = options.schedulePersistenceAllowed
+    ? await options.schedulePersistenceAllowed({
+        scheduleId,
+        dispatchId,
+        runId,
+        agentId: target.agentId,
+        threadId: options.threadId,
+        resourceId,
+      })
+    : options.persistenceAllowed;
   if (persistenceRequested && !persistenceAllowed) {
     return await settleDiscard();
   }
