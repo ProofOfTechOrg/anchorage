@@ -54,9 +54,9 @@ import {
 import { stopWithoutCallMessages } from '../input-refusal.js';
 import {
   additionsToRead,
+  callerMessages,
   type ProcessorAddition,
   type RecordedSystemMessage,
-  rememberedIds,
   takeProcessorAdditions,
 } from '../processor-additions.js';
 import { type Actor, actorFromRequestContext } from '../rbac/index.js';
@@ -682,22 +682,17 @@ interface CallerInput {
   readonly text: string;
 }
 
-// The input policies evaluate the call's own messages. Memory adds a thread's
-// stored history to the same message list, which records each message's
-// source; that history came from earlier calls and is not re-evaluated.
-// Without a message list, as in a direct `processInput` call, every message
-// is the caller's. What a guarded agent's application input processors added
-// or changed outside the input is evaluated with it.
+// Input policies read caller messages and client tool outcomes merged into
+// remembered messages, together with application processor additions.
+// Without a message list, every message is the caller's.
 function callerInput(
   args: ProcessInputArgs,
   additions: readonly ProcessorAddition[],
 ): CallerInput | undefined {
-  const remembered =
-    args.messageList == null ? undefined : rememberedIds(args.messageList);
   const messages =
-    remembered === undefined || remembered.size === 0
+    args.messageList == null
       ? args.messages
-      : args.messages.filter((message) => !remembered.has(message.id));
+      : callerMessages(args.messageList, args.messages);
   const text = inputPromptText(messages);
   const added = processorAdditionText(additionsToRead(additions, messages));
   if (text === undefined || added === undefined) return undefined;

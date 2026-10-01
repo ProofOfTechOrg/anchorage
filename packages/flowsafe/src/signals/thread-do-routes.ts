@@ -2959,12 +2959,10 @@ async function handleNotification(
       delivery: { action: 'deferred', reason: 'dispatcher' },
     });
   }
-  // An unbranded agent's owner notification uses core's delivery policy, whose
-  // summary wake override can start a run below this boundary, outside
-  // RunnerRuntime, the host entry gate and the run cap (@mastra/core 1.67.0,
-  // agent-Dk0N0Nlg.js:38431, :38447). The inbox row is the durable artifact, so
-  // that path has no memory gate: without agent memory, a model-visible
-  // persist is best-effort and the row stays pending.
+  // Agent.sendNotificationSignal can wake a notification summary through the
+  // thread runtime outside RunnerRuntime, the host entry gate and the run cap.
+  // The inbox row is durable without agent memory; model-visible persistence
+  // is best-effort and the row stays pending when memory is unavailable.
   const notificationsStore = await agent
     .getMastraInstance?.()
     ?.getStorage()

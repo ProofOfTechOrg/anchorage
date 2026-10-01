@@ -957,11 +957,10 @@ describe('isReadableRunSummary', () => {
     expect(isReadableRunSummary({ runId: 'run-1', status: 'running' })).toBe(
       true,
     );
-    // Including the shape this predicate cannot catch: Mastra's in-memory
-    // fallback reports the Run object's own status, and that is 'pending' for
-    // a run which has never been resumed — the dominant degraded read. Only
-    // the isFromInMemory marker inside RunnerRuntime.authoritativeStatus tells
-    // it from a run that genuinely has not started executing yet.
+    // A never-started Run's in-memory fallback reports pending; other retained
+    // Runs report their lifecycle status. authoritativeStatus rejects the
+    // isFromInMemory marker even when this self-consistency check accepts the
+    // projection.
     expect(isReadableRunSummary({ runId: 'run-1', status: 'pending' })).toBe(
       true,
     );

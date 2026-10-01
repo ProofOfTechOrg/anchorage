@@ -2254,10 +2254,10 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
       return this.#withOperationLock(async () => {
         const owner = await this.runOwnership(this.env).owner('run', runId);
         if (action === 'terminate-replay') {
-          // Degrades CLOSED: the in-memory fallback reports 'pending', which
-          // is neither terminal status, so a replay during a degraded read is
-          // refused with UnknownRunError rather than replayed against a run
-          // whose terminal state could not be read.
+          // The in-memory fallback has no requestContext for lifecycle
+          // projection, and core's statuses include neither cancelled nor
+          // timed_out. It cannot authorize a terminal replay during a degraded
+          // read.
           const summary = await runtime.status(workflowId, runId);
           if (
             summary?.status !== 'cancelled' &&
@@ -2319,12 +2319,10 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
       return this.#withOperationLock(async () => {
         const owner = await this.runOwnership(this.env).owner('run', runId);
         if (!owner) {
-          // Degrades CLOSED, same as the replay guard: 'pending' is not
-          // 'timed_out', so the throw stands. It costs more here — this route
-          // is driven by the maintenance sweep, and the throw fails the whole
-          // sweep pass for that interval — but the next pass retries it, so a
-          // degraded read delays the sweep rather than timing out a run whose
-          // state nothing could read.
+          // The in-memory fallback has no lifecycle requestContext and core
+          // has no timed_out status, so it cannot authorize this ownerless
+          // deadline route. A degraded read fails the maintenance sweep pass,
+          // which retries on the next interval.
           const summary = await runtime.status(workflowId, runId);
           if (summary?.status !== 'timed_out') {
             throw new UnknownRunError(workflowId, runId);

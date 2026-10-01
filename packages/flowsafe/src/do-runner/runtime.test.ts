@@ -1703,7 +1703,7 @@ describe('summary compatibility', () => {
     try {
       await expect(
         runtime.status('summary-fallback-workflow', started.runId),
-      ).resolves.toMatchObject({ status: 'pending' });
+      ).resolves.toMatchObject({ status: 'suspended' });
       await expect(
         runtime.authoritativeStatus('summary-fallback-workflow', started.runId),
       ).rejects.toBeInstanceOf(RunStateUnreadableError);
@@ -7281,12 +7281,8 @@ describe('per-suspension deadline contract', () => {
   });
 
   it('refuses to answer authoritatively from Mastra in-memory fallback state', async () => {
-    // Tripwire on the marker the whole wake discipline keys on, pinned the way
-    // __workflow_meta is: against the REAL producer. Mastra answers a state
-    // read from the in-memory Run it still holds whenever the row lookup comes
-    // back empty, and stamps `isFromInMemory` on exactly that answer. A rename
-    // or a dropped stamp would let the wake conclude things from a read that
-    // never reached storage, so it fails here rather than there.
+    // The fallback reports the in-memory run's lifecycle status without its
+    // suspended paths. Authoritative reads refuse it through isFromInMemory.
     const { runtime, storage, workflow, start } =
       timedGateRuntime('marker-gate');
     const started = await start();
@@ -7294,13 +7290,11 @@ describe('per-suspension deadline contract', () => {
 
     const restore = await blindWorkflowRow(storage);
     try {
-      // #then — with the row read blinded, the state Mastra hands back is the
-      // in-memory Run it still holds, carrying the marker
       const state = (await workflow.getWorkflowRunById(
         started.runId,
       )) as Record<string, unknown>;
       expect(state.isFromInMemory).toBe(true);
-      expect(state.status).toBe('pending');
+      expect(state.status).toBe('suspended');
       expect(state.requestContext).toBeUndefined();
       const fallback = (await runtime.status(
         'marker-gate',
@@ -7310,8 +7304,6 @@ describe('per-suspension deadline contract', () => {
         (fallback as unknown as { isFromInMemory?: boolean }).isFromInMemory,
       ).toBeUndefined();
 
-      // #then — the authoritative read refuses it, naming both ids and NO
-      // cause
       await expect(
         runtime.authoritativeStatus('marker-gate', started.runId),
       ).rejects.toBeInstanceOf(RunStateUnreadableError);
@@ -7323,17 +7315,13 @@ describe('per-suspension deadline contract', () => {
         ),
       );
 
-      // #then — while status() still serves the fabricated summary, which is
-      // 'pending' for a run that has never been resumed and so passes the
-      // self-consistency backstop.
-      expect(fallback.status).toBe('pending');
-      expect(fallback.suspended).toBeUndefined();
-      expect(isReadableRunSummary(fallback)).toBe(true);
+      expect(fallback.status).toBe('suspended');
+      expect(fallback.suspended).toEqual([]);
+      expect(isReadableRunSummary(fallback)).toBe(false);
     } finally {
       restore();
     }
 
-    // #then — and the run was suspended the whole time
     const healed = await runtime.status('marker-gate', started.runId);
     expect(healed?.status).toBe('suspended');
     expect(healed?.suspended).toEqual([['gate']]);

@@ -5,6 +5,8 @@ import type { InputProcessor, ProcessInputArgs } from '@mastra/core/processors';
 import type { RequestContext } from '@mastra/core/request-context';
 import type { CoreTool } from '@mastra/core/tools';
 
+import { callerMessages } from '../processor-additions.js';
+
 export const CLIENT_TOOL_OUTPUT_PROCESSOR_ID = 'breakwater-client-tool-output';
 
 function unwrapToolOutput(
@@ -80,11 +82,13 @@ export function clientToolOutputProcessor(
     id: CLIENT_TOOL_OUTPUT_PROCESSOR_ID,
     async processInput(args) {
       try {
-        // Mirrors core's applyClientToolModelOutput (agent-Dk0N0Nlg.js:30887-30919)
-        // before its legacy standard (30975-30994), standard (32650-32660), and durable
-        // (create-durable-agent-DFHwqN2K.js:1371-1379) call sites; onOutput runs later.
+        // Mirrors core's applyClientToolModelOutput for caller parts so policies
+        // read mapped outputs before core renders them into the model prompt.
         const candidates: MastraToolInvocationPart[] = [];
-        for (const message of args.messageList.get.input.db()) {
+        for (const message of callerMessages(
+          args.messageList,
+          args.messageList.get.input.db(),
+        )) {
           if (
             message.role !== 'assistant' ||
             message.content?.format !== 2 ||

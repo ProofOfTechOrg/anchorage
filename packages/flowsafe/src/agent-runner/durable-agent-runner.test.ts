@@ -17,6 +17,7 @@ import {
 } from '@mastra/core/agent/durable';
 import {
   type MastraDBMessage,
+  type MastraToolInvocation,
   MessageList,
 } from '@mastra/core/agent/message-list';
 import { EventEmitterPubSub } from '@mastra/core/events';
@@ -30,10 +31,12 @@ import {
 } from '@mastra/core/processors';
 import { RequestContext } from '@mastra/core/request-context';
 import { InMemoryStore } from '@mastra/core/storage';
+import { createTool } from '@mastra/core/tools';
 import type { AnyWorkflow } from '@mastra/core/workflows';
 import {
   ACTOR_CONTEXT_KEY,
   AuditLogger,
+  classifierPolicy,
   createGuardedAgent,
   denyPatterns,
   type Role,
@@ -403,6 +406,7 @@ async function expectAuthorityRefusedBeforeStream(
 
 function localModelFixture(
   onCall: (prompt: unknown) => void,
+  chunks: readonly string[] = ['done'],
 ): MastraModelConfig {
   const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
   return {
@@ -413,7 +417,7 @@ function localModelFixture(
     doGenerate: async (options) => {
       onCall(options.prompt);
       return {
-        content: [{ type: 'text', text: 'done' }],
+        content: [{ type: 'text', text: chunks.join('') }],
         finishReason: 'stop',
         usage,
         warnings: [],
@@ -426,11 +430,9 @@ function localModelFixture(
           start(controller) {
             controller.enqueue({ type: 'stream-start', warnings: [] });
             controller.enqueue({ type: 'text-start', id: 'text-1' });
-            controller.enqueue({
-              type: 'text-delta',
-              id: 'text-1',
-              delta: 'done',
-            });
+            for (const delta of chunks) {
+              controller.enqueue({ type: 'text-delta', id: 'text-1', delta });
+            }
             controller.enqueue({ type: 'text-end', id: 'text-1' });
             controller.enqueue({ type: 'finish', finishReason: 'stop', usage });
             controller.close();
@@ -445,7 +447,13 @@ async function realAgentBridgeFixture(
   provider?: RequestContextProvider,
   modelFault?: Error,
   threaded = false,
-  guarded?: { memory: MockMemory; prompts: unknown[] },
+  guarded?: {
+    memory: MockMemory;
+    prompts: unknown[];
+    policies?: ReturnType<typeof denyPatterns>[];
+    chunks?: readonly string[];
+    tools?: Record<string, ReturnType<typeof createTool>>;
+  },
 ) {
   const sql = openSqlite() as ReturnType<typeof openSqlite> & { close(): void };
   const binding = sqliteUnitDatabase(sql) as ExecutionFenceDatabase;
@@ -503,7 +511,7 @@ async function realAgentBridgeFixture(
     counts.model++;
     guarded?.prompts.push(prompt);
     if (modelFault) throw modelFault;
-  });
+  }, guarded?.chunks);
   const agent = createFlowsafeDurableAgent({
     agent: guarded
       ? (createGuardedAgent({
@@ -513,7 +521,8 @@ async function realAgentBridgeFixture(
           memory: guarded.memory,
           model,
           allowedRoles: ['operator'],
-          policies: [],
+          policies: guarded.policies ?? [],
+          ...(guarded.tools ? { tools: guarded.tools } : {}),
           audit: new AuditLogger(),
           maxSteps: 1,
           toolChoice: 'auto',
@@ -532,6 +541,411 @@ async function realAgentBridgeFixture(
   const start = vi.spyOn(runtime, 'start');
   return { sql, fence, workflows, counts, runtime, agent, start };
 }
+
+const OUTCOME_MARKER = 'MKCLIENTOUTCOME';
+const CLEAN_OUTCOME = 'clean client result';
+const APPROVAL = { id: 'approval_1' };
+
+function clientToolOutcome(
+  state: MastraToolInvocation['state'],
+  fields: Record<string, unknown> = {},
+) {
+  return {
+    type: 'tool-invocation' as const,
+    toolInvocation: {
+      toolCallId: 'call_1',
+      toolName: 'crm_lookup',
+      args: { account: 'acme' },
+      state,
+      ...fields,
+    },
+  };
+}
+
+function assistantMessage(parts: unknown[], role = 'assistant') {
+  return {
+    id: 'm2',
+    role,
+    createdAt: new Date('2026-01-01T00:00:02Z'),
+    content: { format: 2, parts },
+  };
+}
+
+function pendingClientCall(approval = false) {
+  return clientToolOutcome(
+    approval ? 'approval-requested' : 'call',
+    approval ? { approval: APPROVAL } : {},
+  );
+}
+
+async function outcomeMemory({
+  approval = false,
+  storedResult,
+}: {
+  approval?: boolean;
+  storedResult?: ReturnType<typeof clientToolOutcome>;
+} = {}) {
+  const memory = new MockMemory({ storage: new InMemoryStore() });
+  const createdAt = new Date('2026-01-01T00:00:00Z');
+  await memory.saveThread({
+    thread: {
+      id: 'thread-1',
+      resourceId: 'thread-1',
+      createdAt,
+      updatedAt: createdAt,
+      metadata: {},
+    },
+  });
+  await memory.saveMessages({
+    messages: [
+      {
+        id: 'm1',
+        role: 'user',
+        threadId: 'thread-1',
+        resourceId: 'thread-1',
+        createdAt: new Date('2026-01-01T00:00:01Z'),
+        content: {
+          format: 2,
+          parts: [{ type: 'text', text: 'Who owns acme?' }],
+        },
+      },
+      {
+        ...assistantMessage([
+          ...(storedResult ? [storedResult] : []),
+          pendingClientCall(approval),
+        ]),
+        threadId: 'thread-1',
+        resourceId: 'thread-1',
+      } as never,
+    ],
+  });
+  return memory;
+}
+
+async function savedClientCall(memory: MockMemory) {
+  const { messages } = await memory.recall({
+    threadId: 'thread-1',
+    resourceId: 'thread-1',
+  });
+  const savedPart = messages
+    .find(({ id }) => id === 'm2')
+    ?.content.parts.find(
+      (part) =>
+        part.type === 'tool-invocation' &&
+        part.toolInvocation.toolCallId === 'call_1',
+    );
+  return savedPart?.type === 'tool-invocation'
+    ? savedPart.toolInvocation
+    : undefined;
+}
+
+async function runGuarded({
+  memory,
+  messages,
+  runId,
+  policies,
+  tools,
+  chunks,
+  readSubscriber = false,
+  threaded = true,
+}: Omit<
+  NonNullable<Parameters<typeof realAgentBridgeFixture>[3]>,
+  'prompts'
+> & {
+  messages: Parameters<FlowsafeDurableAgent['streamUntilPersisted']>[0];
+  runId: string;
+  readSubscriber?: boolean;
+  threaded?: boolean;
+}) {
+  const prompts: unknown[] = [];
+  const f = await realAgentBridgeFixture(
+    () => ({ [ACTOR_CONTEXT_KEY]: { id: 'actor-1', role: 'operator' } }),
+    undefined,
+    false,
+    { memory, prompts, policies, tools, chunks },
+  );
+  const saveMessages = vi.spyOn(memory, 'saveMessages');
+  const nativeStream = f.agent.stream.bind(f.agent);
+  let subscriber: Awaited<ReturnType<typeof f.agent.stream>> | undefined;
+  const stream = vi
+    .spyOn(f.agent, 'stream')
+    .mockImplementation(async (...args) => {
+      const output = await nativeStream(...args);
+      subscriber = output;
+      return output;
+    });
+  let result:
+    | Awaited<ReturnType<typeof f.agent.streamUntilPersisted>>
+    | undefined;
+  try {
+    result = await f.agent.streamUntilPersisted(
+      messages,
+      {
+        runId,
+        ...(threaded
+          ? { memory: { thread: 'thread-1', resource: 'thread-1' } }
+          : {}),
+        requestContext: actorContext(),
+        disableBackgroundTasks: true,
+      },
+      'operator-1',
+      'human',
+      `${runId}-attempt`,
+      undefined,
+      undefined,
+      { ...startAuthority(), agentStart: { threaded } },
+    );
+    let subscriberOutput:
+      | {
+          receivedText: string;
+          text: string;
+          result: Awaited<ReturnType<typeof result.output.getFullOutput>>;
+        }
+      | undefined;
+    if (readSubscriber) {
+      assert(subscriber);
+      const received: string[] = [];
+      for await (const chunk of subscriber.fullStream) {
+        if (chunk.type === 'text-delta') received.push(chunk.payload.text);
+      }
+      subscriberOutput = {
+        receivedText: received.join(''),
+        text: await subscriber.output.text,
+        result: await subscriber.output.getFullOutput(),
+      };
+    }
+    const text = await result.output.text;
+    const tripwire = (await result.output.tripwire)?.reason;
+    await globalRunRegistry.get(runId)?.workflowExecution;
+    return {
+      prompts,
+      tripwire,
+      saves: saveMessages.mock.calls.length,
+      counts: f.counts,
+      text,
+      subscriber: subscriberOutput,
+    };
+  } finally {
+    await globalRunRegistry
+      .get(runId)
+      ?.workflowExecution?.catch(() => undefined);
+    result?.cleanup();
+    registryFor(f.agent).clear();
+    globalRunRegistry.delete(runId);
+    stream.mockRestore();
+    saveMessages.mockRestore();
+    f.start.mockRestore();
+    f.sql.close();
+  }
+}
+
+async function runClientOutcome({
+  memory,
+  parts,
+  role = 'assistant',
+  mapped = false,
+  tools,
+}: {
+  memory: MockMemory;
+  parts: unknown[];
+  role?: string;
+  mapped?: boolean;
+  tools?: Record<string, ReturnType<typeof createTool>>;
+}) {
+  return runGuarded({
+    memory,
+    messages: [assistantMessage(parts, role)] as never,
+    runId: 'client-outcome',
+    policies: [denyPatterns([OUTCOME_MARKER])],
+    tools: {
+      crm_lookup: createTool({
+        id: 'crm_lookup',
+        description: 'Look up an account on the client',
+        inputSchema: z.object({ account: z.string() }),
+        ...(mapped
+          ? {
+              toModelOutput: () => ({
+                type: 'text',
+                value: OUTCOME_MARKER,
+              }),
+            }
+          : {}),
+      } as never),
+      ...tools,
+    },
+  });
+}
+
+describe('durable client tool outcomes merged into memory', () => {
+  type OutcomeCase = {
+    carries: string;
+    state: MastraToolInvocation['state'];
+    fields: Record<string, unknown>;
+    approval?: boolean;
+    role?: string;
+    mapped?: boolean;
+  };
+  const DENIED: OutcomeCase[] = [
+    {
+      carries: 'a DB result',
+      state: 'result',
+      fields: { result: OUTCOME_MARKER },
+    },
+    {
+      carries: 'an output-error errorText',
+      state: 'output-error',
+      fields: { errorText: OUTCOME_MARKER },
+    },
+    {
+      carries: 'an output-denied approval reason',
+      state: 'output-denied',
+      fields: {
+        approval: {
+          ...APPROVAL,
+          approved: false,
+          reason: OUTCOME_MARKER,
+        },
+      },
+      approval: true,
+    },
+    {
+      carries: 'a user-role client result',
+      state: 'result',
+      fields: { result: OUTCOME_MARKER },
+      role: 'user',
+    },
+    {
+      carries: 'a clean result mapped to denied text',
+      state: 'result',
+      fields: { result: CLEAN_OUTCOME },
+      mapped: true,
+    },
+  ];
+
+  it.each(
+    DENIED,
+  )('denies $carries before the model and leaves the stored call pending on the durable loop', async (row) => {
+    const memory = await outcomeMemory({ approval: row.approval });
+    const run = await runClientOutcome({
+      memory,
+      parts: [clientToolOutcome(row.state, row.fields)],
+      role: row.role,
+      mapped: row.mapped,
+    });
+    expect(run.tripwire).toMatch(/^deny-patterns:/);
+    expect(run.prompts).toEqual([]);
+    expect(run.saves).toBe(0);
+    expect(await savedClientCall(memory)).toEqual(
+      pendingClientCall(row.approval).toolInvocation,
+    );
+  });
+
+  it('refuses duplicate client tool outcomes before the model and leaves the stored call pending on the durable loop', async () => {
+    const memory = await outcomeMemory();
+    const run = await runClientOutcome({
+      memory,
+      parts: [
+        clientToolOutcome('result', { result: CLEAN_OUTCOME }),
+        clientToolOutcome('output-error', { errorText: 'failed' }),
+      ],
+    });
+    expect(run.tripwire).toBe('input processor failed');
+    expect(run.prompts).toEqual([]);
+    expect(run.saves).toBe(0);
+    expect(await savedClientCall(memory)).toEqual(
+      pendingClientCall().toolInvocation,
+    );
+  });
+
+  it('allows a clean caller result beside an unsent stored denied result and saves the client tool outcome on the durable loop', async () => {
+    const memory = await outcomeMemory({
+      storedResult: clientToolOutcome('result', {
+        toolCallId: 'call_0',
+        toolName: 'historical_lookup',
+        args: {},
+        result: OUTCOME_MARKER,
+      }),
+    });
+    const run = await runClientOutcome({
+      memory,
+      parts: [clientToolOutcome('result', { result: CLEAN_OUTCOME })],
+      tools: {
+        historical_lookup: createTool({
+          id: 'historical_lookup',
+          description: 'Look up historical data on the client',
+          inputSchema: z.object({}),
+          toModelOutput: () => {
+            throw new Error('unsent stored-result mapper called');
+          },
+        } as never),
+      },
+    });
+    expect(
+      run.tripwire,
+      'unsent stored-result mapper throws if selected',
+    ).toBeUndefined();
+    expect(run.prompts).toHaveLength(1);
+    expect(JSON.stringify(run.prompts[0])).toContain(CLEAN_OUTCOME);
+    expect(JSON.stringify(run.prompts[0])).toContain(OUTCOME_MARKER);
+    expect(await savedClientCall(memory)).toMatchObject({
+      state: 'result',
+      result: CLEAN_OUTCOME,
+    });
+  });
+});
+
+describe('durable caller-visible text', () => {
+  it.each([
+    [
+      'excludes stream-denied output and following text from the subscriber result',
+      false,
+      'clean p',
+    ],
+    [
+      'on denial at the end of the stream equals received text without the held tail',
+      true,
+      'clean prefix ',
+    ],
+  ] as const)('%s', async (_label, terminalDenied, expectedText) => {
+    const run = await runGuarded({
+      memory: new MockMemory(),
+      messages: 'hello',
+      runId: terminalDenied ? 'terminal-denied-text' : 'stream-denied-text',
+      threaded: false,
+      readSubscriber: true,
+      chunks: terminalDenied
+        ? ['clean prefix ', 'blocked']
+        : ['clean prefix ', 'blocked', ' after denial'],
+      policies: terminalDenied
+        ? [
+            {
+              ...classifierPolicy({
+                name: 'deny-terminal-output',
+                phases: ['output'],
+                evaluateEveryChars: 1000,
+                classify: async (text) =>
+                  text.endsWith('blocked')
+                    ? { allowed: false, reason: 'terminal output denied' }
+                    : { allowed: true },
+              }),
+              holdBackChars: 7,
+            },
+          ]
+        : [denyPatterns(['blocked'], { phases: ['output'] })],
+    });
+    assert(run.subscriber);
+    expect(run.subscriber.receivedText).toBe(expectedText);
+    expect(run.subscriber.text).toBe(expectedText);
+    expect(run.subscriber.result.text).toBe(expectedText);
+    expect(run.subscriber.result.tripwire).toMatchObject({
+      processorId: 'breakwater-policy-engine',
+      reason: terminalDenied
+        ? 'deny-terminal-output: terminal output denied'
+        : expect.stringMatching(/^deny-patterns:/),
+    });
+    expect(run.subscriber.result.finishReason).toBe('other');
+  });
+});
 
 describe('agent bridge capture', () => {
   it('loads stored thread history into a guarded durable model prompt', async () => {
@@ -561,48 +975,16 @@ describe('agent bridge capture', () => {
         },
       ],
     });
-    const prompts: unknown[] = [];
-    const f = await realAgentBridgeFixture(
-      () => ({ [ACTOR_CONTEXT_KEY]: { id: 'actor-1', role: 'operator' } }),
-      undefined,
-      false,
-      { memory, prompts },
-    );
-    const runId = 'guarded-history';
-    let result:
-      | Awaited<ReturnType<typeof f.agent.streamUntilPersisted>>
-      | undefined;
-    try {
-      result = await f.agent.streamUntilPersisted(
-        'New question',
-        {
-          runId,
-          memory: { thread: 'thread-1', resource: 'thread-1' },
-          requestContext: actorContext(),
-          disableBackgroundTasks: true,
-        },
-        'operator-1',
-        'human',
-        'guarded-history-attempt',
-        undefined,
-        undefined,
-        { ...startAuthority(), agentStart: { threaded: true } },
-      );
-      expect(await result.output.text).toBe('done');
-      await globalRunRegistry.get(runId)?.workflowExecution;
-      expect(f.counts.model).toBe(1);
-      expect(prompts).toHaveLength(1);
-      expect(JSON.stringify(prompts[0])).toContain('earlier stored question');
-      expect(JSON.stringify(prompts[0])).toContain('New question');
-    } finally {
-      await globalRunRegistry
-        .get(runId)
-        ?.workflowExecution?.catch(() => undefined);
-      result?.cleanup();
-      globalRunRegistry.delete(runId);
-      f.start.mockRestore();
-      f.sql.close();
-    }
+    const run = await runGuarded({
+      memory,
+      messages: 'New question',
+      runId: 'guarded-history',
+    });
+    expect(run.text).toBe('done');
+    expect(run.counts.model).toBe(1);
+    expect(run.prompts).toHaveLength(1);
+    expect(JSON.stringify(run.prompts[0])).toContain('earlier stored question');
+    expect(JSON.stringify(run.prompts[0])).toContain('New question');
   });
 
   it.each([
@@ -1720,6 +2102,26 @@ describe('createFlowsafeDurableAgent', () => {
     expect(superGenerate).not.toHaveBeenCalled();
   });
 
+  it('refuses guarded durable errorProcessors before registering the run', async () => {
+    const durable = createFlowsafeDurableAgent({
+      agent: guardedTestAgent(),
+      runtime: fakeRuntime().runtime,
+      cache: false,
+    });
+    const probe = { id: 'call-error-probe', processAPIError: vi.fn() };
+    const runId = 'guarded-error-override';
+
+    await expect(
+      durable.prepare('hello', {
+        runId,
+        requestContext: actorContext(),
+        errorProcessors: [probe],
+      }),
+    ).rejects.toThrow(/errorProcessors is not supported.*guarded agent/is);
+    expect(registryFor(durable).has(runId)).toBe(false);
+    expect(globalRunRegistry.has(runId)).toBe(false);
+  });
+
   it('snapshots durable call options before delegating to core', async () => {
     const { runtime } = fakeRuntime();
     const durable = createFlowsafeDurableAgent({
@@ -2626,6 +3028,23 @@ describe('FlowsafeDurableAgent thread runtime registration and rehydration', () 
     vi.restoreAllMocks();
   });
 
+  it('prepares guarded durable registries without error processors', async () => {
+    const agent = createFlowsafeDurableAgent({
+      agent: guardedTestAgent(),
+      runtime: fakeRuntime().runtime,
+      cache: false,
+    });
+    const runId = 'guarded-no-error-processors';
+
+    await agent.prepare('hello', {
+      runId,
+      requestContext: actorContext(),
+    });
+
+    expect(registryFor(agent).get(runId)?.errorProcessors).toEqual([]);
+    expect(globalRunRegistry.get(runId)?.errorProcessors).toEqual([]);
+  });
+
   it('registers a resumed run on the agent pubsub with the default cache', async () => {
     const pubsub = new EventEmitterPubSub();
     const { runtime, resume } = fakeRuntime({
@@ -2759,6 +3178,7 @@ describe('FlowsafeDurableAgent thread runtime registration and rehydration', () 
     const globalEntry = globalRunRegistry.get('run-1');
     expect(instanceEntry?.inputProcessors?.map(({ id }) => id)).toEqual([
       'breakwater-rbac',
+      'breakwater-client-tool-outcome-recorder',
       'application-input',
       'breakwater-input-assets',
       'breakwater-client-tool-output',
@@ -2766,6 +3186,7 @@ describe('FlowsafeDurableAgent thread runtime registration and rehydration', () 
     ]);
     expect(globalEntry?.inputProcessors?.map(({ id }) => id)).toEqual([
       'breakwater-rbac',
+      'breakwater-client-tool-outcome-recorder',
       'application-input',
       'breakwater-input-assets',
       'breakwater-client-tool-output',
@@ -2773,9 +3194,9 @@ describe('FlowsafeDurableAgent thread runtime registration and rehydration', () 
     ]);
     expect(
       instanceEntry?.llmRequestInputProcessors?.map(({ id }) => id),
-    ).toEqual(['application-input']);
+    ).toEqual(['breakwater-client-tool-outcome-recorder', 'application-input']);
     expect(globalEntry?.llmRequestInputProcessors?.map(({ id }) => id)).toEqual(
-      ['application-input'],
+      ['breakwater-client-tool-outcome-recorder', 'application-input'],
     );
     expect(instanceEntry?.outputProcessors?.map(({ id }) => id)).toEqual([
       'application-output',

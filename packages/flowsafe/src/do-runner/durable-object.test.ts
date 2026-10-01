@@ -4037,11 +4037,10 @@ describe('DurableObjectRunner suspension deadlines', () => {
       restore();
     }
 
-    // #then — nothing concluded from a read that never reached storage. The
-    // fallback reports 'pending' for a run that has never been resumed, so the
-    // self-consistency backstop calls it readable: reconciling from it derived
-    // nothing and DELETED the record and the alarm of a run that is still
-    // suspended, silently.
+    // The in-memory fallback reports the Run's lifecycle status without
+    // suspended paths; reconciling from it cannot reconstruct this wake state.
+    // The isFromInMemory guard preserves the record and alarm independently of
+    // the summary's self-consistency.
     expect(storedDeadlines(values)?.entries).toEqual(armed);
     expect(events).not.toContain('deleteAlarm');
     expect(events.filter((event) => event.startsWith('delete:'))).toEqual([]);
@@ -6124,8 +6123,8 @@ describe('DurableObjectRunner suspension deadlines', () => {
   it('keeps the record and its wake when a nothing-due wake reads a degraded summary', async () => {
     const { state, values, alarms } = durableKeyValueStorageFixture();
     const env = makeProductionEnv();
-    // Mastra's in-memory fallback: storage unavailable while the isolate still
-    // holds the run — 'suspended' with no suspended paths and no fences.
+    // A retained suspended Run's in-memory fallback lacks paths and
+    // requestContext, so this projection has no suspension fences to reconcile.
     const reads = statusStub(async () => ({
       runId: 'run-degraded',
       status: 'suspended',

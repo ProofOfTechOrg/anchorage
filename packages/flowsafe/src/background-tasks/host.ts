@@ -2,31 +2,24 @@
 // Host a Mastra BackgroundTaskManager on a Durable Object and survive eviction
 // BY CONSTRUCTION.
 //
-// THE RECOVERY SEAM, pinned against @mastra/core 1.50.0 dist.
-// `recoverStaleTasks()` and `handleResume` are PRIVATE, and `getStorage()` is
-// async, so the alarm CANNOT call `recoverStaleTasks()` directly. It does not
-// need to: the PUBLIC async `manager.init(pubsub)` fires `recoverStaleTasks()`
-// internally. Its manager.d.ts:21 -> chunk .init path awaits
-// `this.recoverStaleTasks()`, guarded by its own initPromise so it runs once
-// per manager INSTANCE. A DO evicted mid-task leaves its task row
-// 'running'/'pending' in D1. When the DO is next instantiated with a FRESH
-// manager, `boot()` re-registers the static tool executors, starts the workflow
-// workers, and only then calls `init(pubsub)`. Init's recovery resets a
-// stranded 'running' task (maxRetries > 0) to 'pending' and re-dispatches it;
-// starting workers first guarantees that the workflow event has a subscriber.
-// Its workflow step resolves the executor by tool name via the re-registered
-// static registry: the cross-process path core ships `registerStaticExecutor`
-// for this. The DO ALARM WAKES an evicted DO so this happens without waiting
-// for a request. No private method is ever called; the seam is
-// `registerStaticExecutor` + `startWorkers()` + `init(pubsub)`, all public.
+// BackgroundTaskManager.init awaits its private recoverStaleTasks once per
+// manager instance, so boot uses the public initialization seam. Static
+// executors and workflow workers must be registered first so recovered
+// dispatches can resolve tools and reach a workflow subscriber.
 //
-// THE FENCE SPLITS THAT SEAM IN TWO. `registerStaticExecutor` claims
-// nothing and always runs; `startWorkers()` + `init(pubsub)` are what make this
-// instance a dispatcher, and behind a closed deployment execution fence they
-// are held back entirely — init's recovery would otherwise fail every stranded
-// row outright and re-claim every pending one. The held-back phase is retried
-// on every later boot (request or alarm), so reopening the fence is all it
-// takes to resume. See #ensureDispatching.
+// BackgroundTaskManager claims tasks with an owner id and lease expiry, renews
+// its leases, and aborts a run when another owner takes its lease. Suspension
+// clears the lease; recovery skips live leases and reclaims expired or absent
+// leases, resetting retryable running tasks to pending and failing the rest.
+//
+// An alarm wakes an evicted Durable Object to boot a fresh manager and recover
+// stranded tasks without waiting for a request. Recovery re-dispatches pending
+// tasks subject to concurrency limits and schedules a scan for lease expiry.
+//
+// registerStaticExecutor claims no task, while startWorkers and init enable
+// dispatch and lease-aware recovery. #ensureDispatching holds that phase behind
+// a closed execution fence and retries it on later boots, preventing recovery
+// from failing stranded tasks or claiming pending ones before admission.
 //
 // v1 policy: connectors are foreground-only, so approval-carrying
 // tools never enter this suspend/resume topology. Background suspend/resume
@@ -536,21 +529,17 @@ export class BackgroundTaskHost {
   /**
    * THE gate that matters: whether this instance becomes a DISPATCHER at all.
    *
-   * `manager.init(pubsub)` is the only thing that subscribes `handleDispatch`,
-   * and `handleDispatch` is what writes `status: 'running'` — the CLAIM. It
-   * also runs `recoverStaleTasks()`, which on @mastra/core 1.67.0 does two
-   * destructive things behind a closed fence:
+   * BackgroundTaskManager.init subscribes handleDispatch, which claims tasks
+   * with an owner and lease, and runs recoverStaleTasks. Recovery skips live
+   * leases but fails non-retryable running tasks with expired or absent leases
+   * and re-dispatches pending tasks subject to concurrency limits, so it must
+   * not run behind a closed fence.
    *
-   *   1. every stranded `running` row with `maxRetries === 0` (the DEFAULT) is
-   *      marked `failed` outright, before any executor is consulted; and
-   *   2. pending rows are re-dispatched subject to the manager's concurrency
-   *      limit.
-   *
-   * Neither is reachable from inside an executor, which is why the gate lives
-   * here and not there. Skipping init leaves pending rows pending and stranded
-   * rows stranded — untouched, uncharged, and still visible to any nonterminal
-   * census — and the published dispatch event simply has no subscriber. One
-   * fence read per boot PASS, never memoized on refusal.
+   * Neither the claim nor recovery is reachable from inside an executor, which
+   * is why the gate lives here and not there. Skipping init leaves pending rows
+   * pending and stranded rows stranded — untouched, uncharged, and still visible
+   * to any nonterminal census — and the published dispatch event simply has no
+   * subscriber. One fence read per boot PASS, never memoized on refusal.
    *
    * `draining` still dispatches: the queue is exactly the work a drain exists
    * to finish.

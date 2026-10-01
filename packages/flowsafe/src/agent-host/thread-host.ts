@@ -3,6 +3,7 @@
 import { type Agent, isCreatedAgentSignal } from '@mastra/core/agent';
 import {
   AGENT_STREAM_TOPIC,
+  type DurableAgentStreamOptions,
   globalRunRegistry,
 } from '@mastra/core/agent/durable';
 import { Mastra } from '@mastra/core/mastra';
@@ -422,12 +423,17 @@ function safeContext(value: unknown): Record<string, unknown> {
   throw new AgentHostRequestError(400, 'safeContext must be an object');
 }
 
-function providerOptions(value: unknown): Record<string, unknown> | undefined {
+function providerOptions(
+  value: unknown,
+): DurableAgentStreamOptions['providerOptions'] {
   if (value === undefined) return undefined;
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
     throw new AgentHostRequestError(400, 'providerOptions must be an object');
   }
-  return structuredClone(value as Record<string, unknown>);
+  // The closed provider-options check validates this snapshot's namespaces and keys before use; the model provider validates the values when it parses its options.
+  return structuredClone(
+    value as NonNullable<DurableAgentStreamOptions['providerOptions']>,
+  );
 }
 
 function record(value: unknown): Record<string, unknown> | undefined {
@@ -2069,7 +2075,7 @@ export function createThreadAgentHost(
         : input.providerOptions;
       // This host bypasses the guarded handle, so checks run on forwarded
       // snapshots before state writes.
-      let providerOptionsSnapshot: Record<string, unknown> | undefined;
+      let providerOptionsSnapshot: DurableAgentStreamOptions['providerOptions'];
       let messagesSnapshot: typeof messages;
       try {
         providerOptionsSnapshot = providerOptions(resolvedProviderOptions);

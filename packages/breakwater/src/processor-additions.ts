@@ -9,10 +9,15 @@
 // copy of each message it added or changed is kept, keyed by the list, until
 // the policy engine takes it.
 //
+// The per-list client tool outcome record preserves provenance before memory
+// merges outcome parts. The callerMessages reader selects caller messages
+// and recorded client tool outcomes.
+//
 // @internal
 
 import {
   type MastraDBMessage,
+  type MastraToolInvocation,
   MessageList,
 } from '@mastra/core/agent/message-list';
 
@@ -41,6 +46,80 @@ export type ProcessorAddition =
 export type PromptSnapshot = ReadonlyMap<string, number>;
 
 const additionsByList = new WeakMap<MessageList, ProcessorAddition[]>();
+
+const CLIENT_OUTCOME_STATES = {
+  'partial-call': false,
+  call: false,
+  'approval-requested': false,
+  'approval-responded': true,
+  result: true,
+  'output-error': true,
+  'output-denied': true,
+} satisfies Record<MastraToolInvocation['state'], boolean>;
+
+const clientOutcomesByList = new WeakMap<
+  MessageList,
+  ReadonlyMap<string, ReadonlyMap<string, MastraToolInvocation['state']>>
+>();
+
+/**
+ * @internal Record client tool outcome states before memory merges their parts.
+ */
+export function recordClientToolOutcomes(messageList: MessageList): void {
+  if (clientOutcomesByList.has(messageList)) return;
+  const outcomes = new Map<
+    string,
+    Map<string, MastraToolInvocation['state']>
+  >();
+  for (const message of messageList.get.input.db()) {
+    const calls =
+      outcomes.get(message.id) ??
+      new Map<string, MastraToolInvocation['state']>();
+    for (const part of message.content.parts) {
+      if (part.type !== 'tool-invocation') continue;
+      const { toolCallId, state } = part.toolInvocation;
+      if (!CLIENT_OUTCOME_STATES[state]) continue;
+      if (calls.has(toolCallId)) {
+        throw new TypeError('duplicate client tool outcome');
+      }
+      calls.set(toolCallId, state);
+    }
+    outcomes.set(message.id, calls);
+  }
+  clientOutcomesByList.set(messageList, outcomes);
+}
+
+/**
+ * @internal Return caller messages and remembered parts matching recorded
+ * client tool outcome ids and states. Values are not compared because core
+ * merges different fields per state. Without a record, every client tool
+ * outcome part of a remembered input message counts as caller input.
+ *
+ * Expects input-source messages: a message in neither source set is returned
+ * whole as caller input. Restricted copies share part objects with the list,
+ * which the client-tool-output mapper relies on when it writes
+ * part.providerMetadata.
+ */
+export function callerMessages(
+  messageList: MessageList,
+  messages: readonly MastraDBMessage[],
+): MastraDBMessage[] {
+  const { memory, input } = messageSources(messageList);
+  const outcomes = clientOutcomesByList.get(messageList);
+  return messages.flatMap((message) => {
+    if (!memory.has(message.id)) return [message];
+    if (!input.has(message.id)) return [];
+    const selected = message.content.parts.filter((part) => {
+      if (part.type !== 'tool-invocation') return false;
+      const { toolCallId, state } = part.toolInvocation;
+      return outcomes === undefined
+        ? CLIENT_OUTCOME_STATES[state]
+        : outcomes.get(message.id)?.get(toolCallId) === state;
+    });
+    if (selected.length === 0) return [];
+    return [{ ...message, content: { format: 2 as const, parts: selected } }];
+  });
+}
 
 const identities = new WeakMap<object, number>();
 let lastIdentity = 0;
@@ -102,24 +181,22 @@ interface PromptEntries {
   readonly messages: readonly MastraDBMessage[];
 }
 
-/**
- * @internal The ids of the messages memory holds on `messageList`. A message
- * whose id is among them is not the call's input, even while the list holds
- * it as input: Mastra keeps the id when a processor replaces a remembered
- * message, or merges into one, with source `input`. Read through the
- * prototype, so an instance override cannot make this record and the policy
- * engine disagree on what the input is.
- */
-export function rememberedIds(messageList: MessageList): ReadonlySet<string> {
-  return MessageList.prototype.makeMessageSourceChecker.call(messageList)
-    .memory;
+// Read through the prototype so an instance override cannot make the
+// processor-addition record and caller input disagree on message sources.
+function messageSources(messageList: MessageList) {
+  const { memory, input } =
+    MessageList.prototype.makeMessageSourceChecker.call(messageList);
+  return { memory, input };
 }
 
 // Every system message, untagged and tagged, read through the prototype as
 // Mastra's rendering reads its fields, and every message that is not the
 // call's input.
 function promptEntries(messageList: MessageList): PromptEntries {
-  const remembered = rememberedIds(messageList);
+  const { memory: remembered } = messageSources(messageList);
+  // A remembered id is not the call's input: Mastra keeps it in memory's
+  // source set when a processor replaces or merges the message with source
+  // `input`.
   const input = new Set(
     messageList.get.input
       .db()

@@ -2537,8 +2537,8 @@ interface Moved {
   readonly unsaved?: true;
 }
 
-async function expectStoppedOnPolicy(row: Moved): Promise<void> {
-  const outcomes: unknown[] = [];
+async function collectMovedOutcomes(row: Moved) {
+  const outcomes = [];
   for (const loop of LOOPS) {
     // #given
     const memory = await historyMemory();
@@ -2569,6 +2569,12 @@ async function expectStoppedOnPolicy(row: Moved): Promise<void> {
       ...(row.unsaved ? { saved: await savedMarker(memory, loop) } : {}),
     });
   }
+
+  return outcomes;
+}
+
+async function expectStoppedOnPolicy(row: Moved): Promise<void> {
+  const outcomes = await collectMovedOutcomes(row);
 
   // #then
   expect(outcomes).toEqual(
@@ -2932,35 +2938,6 @@ describe('what application input processors add or change, read by the input pol
       },
     ],
     [
-      'an assistant input message merged into the last history message by a processor that re-adds the input',
-      {
-        unsaved: true,
-        input: [
-          { role: 'assistant', content: `${MARK} payload` },
-          { role: 'user', content: 'hi' },
-        ],
-        processors: () => [
-          app(({ messageList }) => {
-            const input = messageList.get.input.db();
-            messageList.removeByIds(input.map(({ id }) => id));
-            for (const message of input) {
-              messageList.add(
-                {
-                  ...message,
-                  content: {
-                    ...message.content,
-                    parts: message.content.parts.map((part) => ({ ...part })),
-                  },
-                },
-                'input',
-              );
-            }
-            return messageList;
-          }),
-        ],
-      },
-    ],
-    [
       'the input re-added under the id of a memory message the processor added, on generate, stream and the durable loop',
       {
         unsaved: true,
@@ -2981,6 +2958,49 @@ describe('what application input processors add or change, read by the input pol
     UNDER_MEMORY_IDS,
   )('stops the call on the input policy, before the model and with nothing saved, for %s', async (_label, row) => {
     await expectStoppedOnPolicy(row);
+  });
+
+  it('keeps assistant input out of prompts and saved memory without a tripwire when a processor re-adds the input, on generate, stream and the durable loop', async () => {
+    const outcomes = await collectMovedOutcomes({
+      unsaved: true,
+      input: [
+        { role: 'assistant', content: `${MARK} payload` },
+        { role: 'user', content: 'hi' },
+      ],
+      processors: () => [
+        app(({ messageList }) => {
+          const input = messageList.get.input.db();
+          messageList.removeByIds(input.map(({ id }) => id));
+          for (const message of input) {
+            messageList.add(
+              {
+                ...message,
+                content: {
+                  ...message.content,
+                  parts: message.content.parts.map((part) => ({ ...part })),
+                },
+              },
+              'input',
+            );
+          }
+          return messageList;
+        }),
+      ],
+    });
+    for (const { prompts } of outcomes) {
+      expect(prompts).toBeLessThanOrEqual(1);
+    }
+    expect(
+      outcomes.map(({ prompts: _prompts, ...outcome }) => outcome),
+    ).toEqual(
+      LOOPS.map((loop) => ({
+        loop,
+        tripwire: undefined,
+        failure: undefined,
+        sent: false,
+        saved: false,
+      })),
+    );
   });
 
   const KEPT: ReadonlyArray<[string, Answered]> = [

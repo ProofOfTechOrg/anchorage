@@ -192,6 +192,15 @@ Protected keyed replay reads the actual wrapper's workflow once and pairs its pu
 
 The wrapper fixes its agent-level pub/sub at construction to `pubsub ?? runtime.pubsub`, or its own stream bus when both are absent. From its first start, every threaded run registers on the state that signal delivery and the run's drain read. A resumed run registers there when `threadRuntime` is passed. The constructor throws a `TypeError` when the wrapped agent has a pub/sub of its own that differs. The wrapper sets the wrapped agent's pub/sub, so that pub/sub follows the last wrapper constructed over the agent: do not wrap one agent in two thread Durable Objects that are live at once.
 
+### Durable call options
+
+For a guarded agent, `stream()`, `streamUntilPersisted()`, `generate()`, and `prepare()` refuse these call-level options before Mastra runs:
+
+- `structuredOutput`: parsed output bypasses the policy chain
+- `errorProcessors`: error handling can change model requests after the guarded input chain
+
+The guarded agent retains Breakwater's [input policy coverage](../packages/breakwater/README.md#input-policy-coverage), [input policies and memory](../packages/breakwater/README.md#input-policies-and-memory), [application processor rules](../packages/breakwater/README.md#application-processors), and [streaming rules](../packages/breakwater/README.md#understand-streaming-hold-back).
+
 This wrapper does not add the guarded-agent brand or catalog authorization to a raw agent. Use `agent-host` for the supported protected public surface. Route clients through its authenticated run routes, which start each run at the host start seam. Direct `stream()` with an unregistered id resolves to a failed output; direct `generate()` rejects. `stream()`, `generate()`, `prepare()`, and `streamUntilPersisted()` synchronously refuse a live id. A successful `prepare({ runId: X })` keeps `X` live until core cleans up that prepared run.
 
 The wrapper's constructor throws a `TypeError` when the agent it wraps has channels configured, declares Mastra agent schedules, sets the `durable` option, or is already a durable agent, such as a Mastra `DurableAgent` or another Flowsafe wrapper. Channels dispatch inbound messages and tool approval decisions to the wrapped agent outside `RunnerRuntime`, a Mastra schedule worker fires declared schedules on it outside `RunnerRuntime`, and a Mastra that registers a Mastra `DurableAgent`, or an agent with the `durable` option, exposes that agent's own recovery and run listing, which the runner does not guard. The guarded agent catalog applies the same checks to each module, so the thread host refuses such a module before its Mastra registers the agent. The wrapper itself cannot be registered on any Mastra; the Mastra host features that register it are listed after the grounds below.

@@ -14,11 +14,16 @@
 // Without a host pub/sub, init() passes undefined to the runtime; the wrapper
 // still installs its own bus.
 
+// First: stores core's events nonce; workerd refuses module-scope UUIDs.
+import './core-events-nonce.js';
 import { EventEmitterPubSub, type PubSub } from '@mastra/core/events';
 
 /**
- * The pubsub seam do-runner passes around — core's `PubSub` base, so a host may
- * substitute any implementation (CachingPubSub, a custom bus) for the default.
+ * The pub/sub seam do-runner passes around: core's `PubSub`, so a host may
+ * substitute its own implementation. While core generates its events nonce at
+ * module scope, a Worker whose code loads `@mastra/core/events` (for example
+ * for `CachingPubSub`) before Flowsafe's do-runner fails startup; such a Worker
+ * builds its bus with `createHostPubSub()`.
  */
 export type HostPubSub = PubSub;
 

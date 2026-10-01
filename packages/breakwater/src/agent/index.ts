@@ -15,8 +15,10 @@ import type {
 import type { MastraMemory } from '@mastra/core/memory';
 import type {
   ComputeStateSignalArgs,
+  ErrorProcessorOrWorkflow,
   InputProcessor,
   InputProcessorOrWorkflow,
+  LLMRequestProcessorOrWorkflow,
   OutputProcessorOrWorkflow,
   ProcessInputArgs,
   ProcessInputResult,
@@ -39,6 +41,7 @@ import {
 } from '../policy-engine/prompt-media.js';
 import {
   type PromptSnapshot,
+  recordClientToolOutcomes,
   recordProcessorAdditions,
   snapshotPromptMessages,
 } from '../processor-additions.js';
@@ -60,11 +63,20 @@ export {
   providerOptionsCarryContent,
 } from '../policy-engine/provider-options.js';
 
+const CLIENT_TOOL_OUTCOME_RECORDER_PROCESSOR_ID =
+  'breakwater-client-tool-outcome-recorder';
+
+const baseResolveInputProcessors = Reflect.get(
+  Agent.prototype,
+  'resolveInputProcessors',
+);
+
 const RESERVED_PROCESSOR_IDS = new Set([
   'breakwater-rbac',
   'breakwater-memory',
   'breakwater-input-assets',
   CLIENT_TOOL_OUTPUT_PROCESSOR_ID,
+  CLIENT_TOOL_OUTCOME_RECORDER_PROCESSOR_ID,
   'breakwater-policy-engine',
 ]);
 
@@ -105,6 +117,7 @@ const UNSAFE_CONSTRUCTION_KEYS = new Set([
   'inputProcessors',
   'outputProcessors',
   'errorProcessors',
+  'errorProcessorDefaults',
   'maxProcessorRetries',
   'defaultGenerateOptionsLegacy',
   'defaultStreamOptionsLegacy',
@@ -133,6 +146,7 @@ type ProcessorHook = Extract<
   | 'processOutputResult'
   | 'processOutputStep'
   | 'processAPIError'
+  | 'processToolResult'
 >;
 
 // The hooks an application input processor must implement.
@@ -175,6 +189,7 @@ const INPUT_PROCESSOR_FORBIDDEN_HOOK_SET: Record<
   processOutputResult: true,
   processOutputStep: true,
   processAPIError: true,
+  processToolResult: true,
 };
 
 const INPUT_PROCESSOR_FORBIDDEN_HOOKS = Object.keys(
@@ -193,6 +208,7 @@ const OUTPUT_PROCESSOR_FORBIDDEN_HOOK_SET: Record<
   processLLMResponse: true,
   processOutputStep: true,
   processAPIError: true,
+  processToolResult: true,
 };
 
 const OUTPUT_PROCESSOR_FORBIDDEN_HOOKS = Object.keys(
@@ -216,8 +232,6 @@ const PROCESSOR_MEMBER_FORWARDING = {
   spanAttributes: 'forward',
   onViolation: 'forward',
   __registerMastra: 'forward',
-  // An output-phase hook, which Mastra never runs on an input processor.
-  processToolResult: 'omit',
   // Read for output streams only.
   processDataParts: 'omit',
   // Read with computeStateSignal only, which validation refuses.
@@ -242,8 +256,8 @@ const BOUND_PROCESSOR_MEMBERS: ReadonlySet<ProcessorMember> = new Set([
  * Application input processor accepted by {@link createGuardedAgent}.
  *
  * It can transform or reject the initial input only. Per-step, provider,
- * output, and error hooks are unavailable because they can mutate execution
- * after the mandatory input gates have run.
+ * output, tool-result, and error hooks are unavailable because they can mutate
+ * execution after the mandatory input gates have run.
  *
  * Its return value is applied to the call's message list as Mastra's durable
  * runner applies one, on every loop. A processor that throws other than
@@ -289,6 +303,7 @@ export interface GuardedInputProcessor {
   processOutputResult?: never;
   processOutputStep?: never;
   processAPIError?: never;
+  processToolResult?: never;
 }
 
 /**
@@ -312,7 +327,16 @@ export interface GuardedOutputProcessor {
   processOutputResult: NonNullable<Processor['processOutputResult']>;
   processOutputStep?: never;
   processAPIError?: never;
+  processToolResult?: never;
 }
+
+type AssertNever<T extends never> = T;
+type _GuardedInputProcessorDeclaresForbiddenHooks = AssertNever<
+  Exclude<InputProcessorForbiddenHook, keyof GuardedInputProcessor>
+>;
+type _GuardedOutputProcessorDeclaresForbiddenHooks = AssertNever<
+  Exclude<OutputProcessorForbiddenHook, keyof GuardedOutputProcessor>
+>;
 
 /** Fixed tool-selection behavior for every guarded execution. */
 export type GuardedToolChoice = NonNullable<
@@ -334,6 +358,7 @@ export type GuardedAgentConfig<
   | 'inputProcessors'
   | 'outputProcessors'
   | 'errorProcessors'
+  | 'errorProcessorDefaults'
   | 'maxProcessorRetries'
   | 'defaultGenerateOptionsLegacy'
   | 'defaultStreamOptionsLegacy'
@@ -533,9 +558,9 @@ function readAllowedInputAssetOrigins(value: unknown): readonly string[] {
   });
 }
 
-// Mastra downloads user asset URLs after input processors, including history
-// on every call (message-list-DCUwKHqe.js:11191-11226). Its durable runner
-// skips a non-tripwire processor error (create-durable-agent-DFHwqN2K.js:1336-1342).
+// MessageList.all.aiV5.llmPrompt downloads asset URLs after input processors,
+// including history on each call. prepareForDurableExecution logs and skips
+// non-tripwire input-processor errors, so refusals must use a tripwire.
 function inputAssetProcessor(
   origins: readonly string[],
   resource: string,
@@ -1091,6 +1116,7 @@ class GuardedAgent<
   readonly #rbac: RBACMiddleware;
   readonly #toolChoice: GuardedToolChoice;
   readonly #memoryError: InputProcessor;
+  readonly #clientToolOutcomeRecorder: InputProcessor;
   readonly #memoryResolutions = new WeakMap<
     RequestContext,
     Promise<
@@ -1099,7 +1125,32 @@ class GuardedAgent<
     >
   >();
 
+  static {
+    // Core's TS-private resolveInputProcessors rules out a method override.
+    Object.defineProperty(GuardedAgent.prototype, 'resolveInputProcessors', {
+      async value(
+        this: GuardedAgent<string, ToolsInput, unknown>,
+        ...args: unknown[]
+      ): Promise<InputProcessorOrWorkflow[]> {
+        const recorder = this.#clientToolOutcomeRecorder;
+        const processors = (await Reflect.apply(
+          baseResolveInputProcessors,
+          this,
+          args,
+        )) as InputProcessorOrWorkflow[];
+        // Memory merges client tool outcomes into stored parts without
+        // preserving their provenance.
+        return [recorder, ...processors];
+      },
+    });
+  }
+
   constructor(options: GuardedAgentConfig<TAgentId, TTools, TRequestContext>) {
+    if (typeof baseResolveInputProcessors !== 'function') {
+      throw new TypeError(
+        'GuardedAgent: incompatible @mastra/core; Agent.resolveInputProcessors is unavailable',
+      );
+    }
     assertConstructionOptions(options);
     assertKnownFields(
       'createGuardedAgent: config',
@@ -1184,6 +1235,10 @@ class GuardedAgent<
     );
     super({
       ...agentConfig,
+      // Core's default error processors rewrite model requests and retry with
+      // a fixed continuation signal after Breakwater's input chain, which the
+      // guarded agent keeps closed.
+      errorProcessorDefaults: false,
       inputProcessors: [
         ...applicationInputProcessors,
       ] as InputProcessorOrWorkflow[],
@@ -1204,6 +1259,22 @@ class GuardedAgent<
       supportsDurableStructuredOutput: false,
     });
     this.#audit = audit;
+    this.#clientToolOutcomeRecorder = {
+      id: CLIENT_TOOL_OUTCOME_RECORDER_PROCESSOR_ID,
+      processInput: (args) => {
+        try {
+          recordClientToolOutcomes(args.messageList);
+          return args.messageList;
+        } catch {
+          return failInputProcessor(
+            args,
+            `agent:${options.id}`,
+            audit,
+            CLIENT_TOOL_OUTCOME_RECORDER_PROCESSOR_ID,
+          );
+        }
+      },
+    };
     // Core's execution assembly applies renamed keys and converted tool types
     // that its own client-output mapper reads.
     const clientToolOutput = clientToolOutputProcessor(
@@ -1321,6 +1392,7 @@ class GuardedAgent<
     if (!result) return [this.#rbac, this.#memoryError];
     return [
       this.#rbac,
+      this.#clientToolOutcomeRecorder,
       ...result.input.map((processor) =>
         guardMemoryInputProcessor(processor, `agent:${this.id}`, this.#audit),
       ),
@@ -1346,9 +1418,15 @@ class GuardedAgent<
     return { shouldGenerate: false };
   }
 
+  /**
+   * Error processor overrides add processors after Breakwater's input chain to
+   * the LLM-request lane, which the guarded agent keeps closed. Guarded agents
+   * refuse call-level errorProcessors, so no guarded call supplies an override.
+   */
   override async __listLLMRequestProcessors(
     requestContext?: RequestContext,
-  ): Promise<InputProcessorOrWorkflow[]> {
+    _errorProcessorOverrides?: ErrorProcessorOrWorkflow[],
+  ): Promise<LLMRequestProcessorOrWorkflow[]> {
     try {
       return await super.__listLLMRequestProcessors(requestContext);
     } catch {
@@ -1384,6 +1462,9 @@ class GuardedAgent<
       maxSteps: this.maxSteps,
       toolChoice: this.#toolChoice,
       disableBackgroundTasks: true,
+      // A step's server tools start after its stream policies judge the later
+      // chunks in that step.
+      eagerToolExecution: false,
       inputProcessors: [...this.#guardedInput],
       outputProcessors: [...this.#guardedOutput],
     };

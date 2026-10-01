@@ -2,10 +2,8 @@
 // Track D (M-006), CI-M-006-001 — the D1 schedules storage domain over
 // TABLE_SCHEDULES ('mastra_schedules') and TABLE_SCHEDULE_TRIGGERS
 // ('mastra_schedule_triggers'), mirroring core's abstract SchedulesStorage +
-// InMemorySchedulesStorage reference. @mastra/cloudflare-d1 1.3.2 ships NO
-// schedules domain (only background-tasks/memory/scores/workflows), so — as with
-// Track C's notifications/thread-state — this is hand-written to core's contract,
-// NOT reimplementing something the adapter owns.
+// InMemorySchedulesStorage reference. @mastra/cloudflare-d1 has no schedules
+// domain, so this implementation follows core's storage contract.
 //
 // Core's SchedulesStorage is ONE domain covering BOTH tables (createSchedule …
 // recordTrigger/listTriggers all on one class), and its InMemory reference is a

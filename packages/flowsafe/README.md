@@ -9,7 +9,7 @@ Flowsafe runs Mastra workflows and agents through Cloudflare Durable Objects, st
 ## Install
 
 ```bash
-npm install @mastra/core@1.67.0 @proofoftech/flowsafe
+npm install @mastra/core@1.73.0 @proofoftech/flowsafe
 ```
 
 Install `@proofoftech/breakwater` when resumed steps call approval-protected connectors:
@@ -18,6 +18,8 @@ Install `@proofoftech/breakwater` when resumed steps call approval-protected con
 npm install @proofoftech/breakwater
 ```
 
+Guarded durable calls follow the [durable call-option restrictions](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/durable-agents.md#durable-call-options).
+
 Install React and React DOM only when you import `@proofoftech/flowsafe/approval-ui`.
 
 Compatibility:
@@ -25,9 +27,9 @@ Compatibility:
 - Node.js 22.13.0 or later (engine range `>=22.13.0`)
 - ESM only
 - TypeScript `moduleResolution: "NodeNext"`, `"Node16"`, or `"Bundler"`
-- `@mastra/core` `1.67.0`
+- `@mastra/core` `1.73.0`
 - `react` and `react-dom` `>=18 <20` (React 18 or 19) for the optional approval UI
-- `@proofoftech/breakwater` `>=0.16.0 <1.0.0` when used
+- `@proofoftech/breakwater` `>=0.17.0 <1.0.0` when used
 - host-provided Wrangler `>=4.118 <5` for the optional `flowsafe-provision` CLI
 
 ## Choose an export
@@ -103,7 +105,9 @@ export class AppRunner extends DurableObjectRunner<Env> {
 }
 ```
 
-`init()` creates D1-backed Mastra storage from the conventional `DB` binding unless you inject storage. Workflow definitions use the same `createWorkflow()` and `createStep()` shape as Mastra. Flowsafe pins `@mastra/cloudflare-d1` 1.3.2 because the shipped D1 storage is written against that release's domain surface: it subclasses the adapter's background-tasks domain to apply the `TaskFilter.resourceId` predicate the adapter accepts but omits from its SQL builder, and hand-writes the schedules, notifications, and thread-state domains the adapter does not ship at all. `D1StorageOptions.domains` accepts host-supplied `workflowDefinitions` and `knowledge` domains, which have no D1-backed defaults. The pin also holds the adapter on its `@cloudflare/workers-types` v4 peer, which is the major Flowsafe still builds against.
+`init()` creates D1-backed Mastra storage from the conventional `DB` binding unless you inject storage. Workflow definitions use the same `createWorkflow()` and `createStep()` shape as Mastra. Flowsafe pins `@mastra/cloudflare-d1` `1.4.0` because the shipped D1 storage is written against that release's domain surface: it subclasses the adapter's background-tasks domain to apply the `TaskFilter.resourceId` predicate the adapter accepts but omits from its SQL builder, and hand-writes the schedules, notifications, and thread-state domains the adapter does not ship at all. `D1StorageOptions.domains` accepts host-supplied `workflowDefinitions` and `knowledge` domains, which have no D1-backed defaults. The pin also holds the adapter on its `@cloudflare/workers-types` v4 peer, which is the major Flowsafe still builds against.
+
+Storage initialization (`init()`) adds `ownerId` and `leaseExpiresAt` to `mastra_background_tasks` with additive `ALTER TABLE … ADD COLUMN` statements. No manual migration is needed. Mastra's background-task manager claims tasks with a lease, renews it while running, skips live leases during recovery, and clears the lease on suspension. Recovery reclaims running tasks with expired or absent leases. Flowsafe continues applying the `resourceId` filter that the D1 adapter's `listTasks` omits.
 
 If the deployment uses a table prefix, pass one shared constant to storage and host maintenance:
 

@@ -2223,16 +2223,11 @@ export class RunnerRuntime {
    * status() for a caller about to CONCLUDE something irreversible from what it
    * reads — delete a wake record, spend an abandonment budget, resume a run.
    *
-   * Mastra answers a state read from an in-memory Run whenever storage is
-   * unavailable or the row lookup comes back empty while this isolate still
-   * holds the run, and that fallback reports the Run object's own status
-   * ('pending' until something updates it) with no suspended paths and no
-   * requestContext at all. Projecting it is indistinguishable from evidence
-   * about the run. Mastra stamps `isFromInMemory` on it at its single
-   * construction site and the persisted branch builds its result field by
-   * field without ever copying the marker, so this throws on exactly the reads
-   * that did not reach storage. `null` still means the read SUCCEEDED and
-   * found nothing.
+   * Workflow.getInMemoryRunAsWorkflowState reports the retained Run's lifecycle
+   * status with isFromInMemory: true, without suspended paths or requestContext.
+   * Refusing that marker prevents an approximation from authorizing an
+   * irreversible action; after non-suspended completion the Run leaves the
+   * in-memory map, so the fallback is null.
    *
    * A valid v2 pending row is refused before lifecycle projection; it has no
    * durable execution outcome yet.

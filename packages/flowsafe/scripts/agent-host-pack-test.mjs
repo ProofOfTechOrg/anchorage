@@ -1,7 +1,7 @@
 // Packs flowsafe and breakwater and proves the published surface against a
 // clean consumer installed from the packed tarballs.
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import {
   existsSync,
   mkdirSync,
@@ -14,11 +14,13 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { createRequire } from 'node:module';
+import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { ModuleKind, ScriptTarget, transpile } from 'typescript';
 import { parse as parseYaml } from 'yaml';
+import { createWorkerdServerLifecycle } from '../../../scripts/workerd-server-lifecycle.mjs';
 import { specifiersIn } from '../test-support/module-edges.ts';
 import { assertAttwEsmPackage } from './attw-pack-check.mjs';
 
@@ -26,9 +28,10 @@ const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const repositoryRoot = resolve(packageRoot, '..', '..');
 const temporary = mkdtempSync(join(tmpdir(), 'flowsafe-agent-host-'));
 
-function run(command, args, cwd = packageRoot) {
+function run(command, args, cwd = packageRoot, env = process.env) {
   execFileSync(command, args, {
     cwd,
+    env,
     encoding: 'utf8',
     stdio: 'pipe',
   });
@@ -1538,10 +1541,12 @@ assert.equal(
   run(process.execPath, ['runtime.mjs'], consumer);
   writeFileSync(
     join(consumer, 'worker.mjs'),
-    `import { createD1Storage } from '@proofoftech/flowsafe/do-runner';
+    `import { createD1Storage, createHostPubSub } from '@proofoftech/flowsafe/do-runner';
 
 export default {
-  fetch() {
+  async fetch() {
+    const bus = createHostPubSub();
+    await bus.publish('packed-startup', { type: 'packed-startup', runId: 'packed-startup', data: {} });
     return new Response(typeof createD1Storage === 'function' ? 'ok' : 'unavailable');
   },
 };
@@ -1556,6 +1561,11 @@ export default {
       compatibility_flags: ['nodejs_compat'],
     }),
   );
+  const wranglerEnv = {
+    ...process.env,
+    WRANGLER_SEND_METRICS: 'false',
+    WRANGLER_HIDE_BANNER: 'true',
+  };
   run(
     'pnpm',
     [
@@ -1569,9 +1579,95 @@ export default {
       'bundle',
     ],
     consumer,
+    wranglerEnv,
   );
+  const portServer = createServer();
+  await new Promise((onListening, reject) => {
+    portServer.once('error', reject);
+    portServer.listen(0, '127.0.0.1', onListening);
+  });
+  const { port } = portServer.address();
+  await new Promise((onClosed, reject) => {
+    portServer.close((error) => (error ? reject(error) : onClosed()));
+  });
+  const lifecycle = createWorkerdServerLifecycle({ port });
+  const chunks = [];
+  const onSignal = () => {
+    lifecycle
+      .cleanup(() => rmSync(temporary, { recursive: true, force: true }))
+      .catch((error) => console.error(error))
+      .finally(() => process.exit(130));
+  };
+  for (const signal of ['SIGINT', 'SIGTERM']) {
+    process.once(signal, onSignal);
+  }
+  try {
+    try {
+      await lifecycle.preflight();
+      await lifecycle.start('packed Worker', () => {
+        const child = spawn(
+          join(consumer, 'node_modules', '.bin', 'wrangler'),
+          [
+            'dev',
+            '--local',
+            '--config',
+            'wrangler.jsonc',
+            '--ip',
+            '127.0.0.1',
+            '--port',
+            String(port),
+            '--inspector-port',
+            '0',
+          ],
+          {
+            cwd: consumer,
+            env: wranglerEnv,
+            detached: true,
+            stdio: ['ignore', 'pipe', 'pipe'],
+          },
+        );
+        const server = { child };
+        child.stdout.on('data', (chunk) => chunks.push(chunk.toString()));
+        child.stderr.on('data', (chunk) => chunks.push(chunk.toString()));
+        child.once('error', (error) => {
+          server.spawnError = error;
+        });
+        return server;
+      });
+    } catch (error) {
+      throw new Error(
+        `LAUNCH-FAILED: packed Worker: ${error.message}\n${chunks.join('')}`,
+        { cause: error },
+      );
+    }
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/`, {
+        signal: AbortSignal.timeout(10_000),
+      });
+      assert.equal(
+        response.status,
+        200,
+        'packed Worker responds with HTTP 200',
+      );
+      assert.equal(
+        await response.text(),
+        'ok',
+        'packed do-runner exports createD1Storage',
+      );
+    } catch (error) {
+      throw new Error(
+        `RESPONSE-FAILED: packed Worker: ${error.message}\n${chunks.join('')}`,
+        { cause: error },
+      );
+    }
+  } finally {
+    for (const signal of ['SIGINT', 'SIGTERM']) {
+      process.removeListener(signal, onSignal);
+    }
+    await lifecycle.stop();
+  }
   console.log(
-    `packed agent-host clean core-${corePeer} import and bundle passed`,
+    `packed agent-host clean core-${corePeer} import, bundle and Worker startup passed`,
   );
 } finally {
   rmSync(temporary, { recursive: true, force: true });

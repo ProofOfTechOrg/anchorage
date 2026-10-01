@@ -398,19 +398,10 @@ export function suspensionDeadlinesOf(summary: RunSummary): {
 }
 
 /**
- * Whether a summary is self-consistent enough to reconcile from: a suspended
- * run always has at least one suspended path, so a 'suspended' status with
- * none describes no suspension anyone could act on. Reconciling from it would
- * derive nothing and wipe the stored record of a run that is still suspended.
- *
- * The SECOND line of defence, not the primary one. It rejects that projection
- * whatever produced it, but it does not cover Mastra's in-memory fallback in
- * general: the fallback reports the Run object's own status, which is
- * 'pending' for a run that has never been resumed — the dominant case, and one
- * this predicate calls readable. The primary guard is the `isFromInMemory`
- * marker check inside `RunnerRuntime.authoritativeStatus`, which is keyed on
- * the read having reached storage rather than on the shape it returned. The
- * two signals are independent, so both are kept.
+ * Reject a suspended summary without paths so reconciliation cannot erase
+ * durable wake state from a suspension it cannot reconstruct. This also
+ * rejects a suspended in-memory fallback, while authoritativeStatus's
+ * isFromInMemory guard rejects fallback reads regardless of lifecycle status.
  */
 export function isReadableRunSummary(summary: RunSummary): boolean {
   return !(
