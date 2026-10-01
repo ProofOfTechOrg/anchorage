@@ -85,6 +85,16 @@ import {
   reportNotificationDeliveryError,
 } from './notification-dispatch.js';
 
+// The schedule tick settles a threaded fire as failed when this route answers
+// one of the permanent statuses `ScheduleTickSignalAgent` documents, so a
+// transient condition must not answer with one of them.
+const SIGNAL_ROUTE_REFUSAL_MESSAGES: Partial<Record<number, string>> = {
+  400: 'bad request',
+  403: 'forbidden',
+  404: 'not found',
+  409: 'conflict',
+};
+
 /**
  * The idle-thread delivery behavior a send may ask for. `wake` starts a run
  * after consulting the run cap; `persist` writes the signal to the durable
@@ -989,17 +999,11 @@ export function createThreadSignalRoutes(
           error.status,
         );
       }
-      if (
-        error instanceof DoStatusError &&
-        (error.status === 403 || error.status === 404 || error.status === 409)
-      ) {
-        const message =
-          error.status === 403
-            ? 'forbidden'
-            : error.status === 404
-              ? 'not found'
-              : 'conflict';
-        return json({ error: message }, error.status);
+      if (error instanceof DoStatusError) {
+        const message = SIGNAL_ROUTE_REFUSAL_MESSAGES[error.status];
+        if (message !== undefined) {
+          return json({ error: message }, error.status);
+        }
       }
       // A send that cannot be routed at all (e.g. an idle wake whose stream setup
       // throws — no model) rejects `accepted`; surface it as a 502 rather than a

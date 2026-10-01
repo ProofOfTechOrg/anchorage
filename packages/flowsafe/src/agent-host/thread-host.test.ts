@@ -4200,8 +4200,8 @@ describe('createThreadAgentHost permission authorization', () => {
     });
 
     await expect(host.start(scope, startInput)).rejects.toMatchObject({
-      status: 403,
-      message: 'forbidden',
+      status: 503,
+      message: 'permission resolution unavailable',
     });
 
     expect(mocked.stream).not.toHaveBeenCalled();

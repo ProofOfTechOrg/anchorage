@@ -1566,15 +1566,8 @@ export class D1SchedulesStorage extends SchedulesStorage {
   }
 
   async recordTrigger(trigger: ScheduleTrigger): Promise<void> {
-    await this.#ensureSchema();
-    const batch = this.#db.batch?.bind(this.#db);
-    if (!batch) {
-      throw new Error(
-        'D1SchedulesStorage requires database.batch() for atomic trigger settlement',
-      );
-    }
     const id = trigger.id ?? crypto.randomUUID();
-    await batch([
+    await this.#settleTrigger(trigger.scheduleId, () =>
       this.#db
         .prepare(
           `INSERT OR REPLACE INTO ${this.#triggers} (
@@ -1597,6 +1590,25 @@ export class D1SchedulesStorage extends SchedulesStorage {
           jsonOrNull(trigger.metadata),
           trigger.scheduleId,
         ),
+    );
+  }
+
+  async #settleTrigger(scheduleId: string, build: () => ScheduleStatement) {
+    await this.#ensureSchema();
+    const batch = this.#db.batch?.bind(this.#db);
+    if (!batch) {
+      throw new Error(
+        'D1SchedulesStorage requires database.batch() for atomic trigger settlement',
+      );
+    }
+    return batch([
+      build(),
+      ...this.#completePendingDeletionStatements(scheduleId),
+    ]);
+  }
+
+  #completePendingDeletionStatements(scheduleId: string): ScheduleStatement[] {
+    return [
       this.#db
         .prepare(
           `DELETE FROM ${this.#triggers}
@@ -1610,7 +1622,7 @@ export class D1SchedulesStorage extends SchedulesStorage {
                WHERE scheduleId = ? AND outcome = 'deferred'
              )`,
         )
-        .bind(trigger.scheduleId, trigger.scheduleId, trigger.scheduleId),
+        .bind(scheduleId, scheduleId, scheduleId),
       this.#db
         .prepare(
           `DELETE FROM ${this.#schedules}
@@ -1620,15 +1632,15 @@ export class D1SchedulesStorage extends SchedulesStorage {
                WHERE scheduleId = ? AND outcome = 'deferred'
              )`,
         )
-        .bind(trigger.scheduleId, trigger.scheduleId),
+        .bind(scheduleId, scheduleId),
       this.#db
         .prepare(
           `DELETE FROM ${RESOURCE_OWNERSHIP_TABLE}
            WHERE resource_kind = 'schedule' AND resource_id = ?
              AND NOT EXISTS (SELECT 1 FROM ${this.#schedules} WHERE id = ?)`,
         )
-        .bind(trigger.scheduleId, trigger.scheduleId),
-    ]);
+        .bind(scheduleId, scheduleId),
+    ];
   }
 
   /**
@@ -1643,17 +1655,53 @@ export class D1SchedulesStorage extends SchedulesStorage {
     metadata: Record<string, unknown>,
   ): Promise<void> {
     await this.#ensureSchema();
-    await this.#db
+    await this.#updateDeferredTriggerStatement(
+      id,
+      scheduleId,
+      error,
+      metadata,
+      'deferred',
+    ).run();
+  }
+
+  async failDeferredTrigger(
+    id: string,
+    scheduleId: string,
+    error: string,
+    metadata: Record<string, unknown>,
+  ): Promise<boolean> {
+    const [result] = await this.#settleTrigger(scheduleId, () =>
+      this.#updateDeferredTriggerStatement(
+        id,
+        scheduleId,
+        error,
+        metadata,
+        'failed',
+        { excludeSettledReceipt: true },
+      ),
+    );
+    return scheduleChanges(captureScheduleResult(result), false) === 1;
+  }
+
+  #updateDeferredTriggerStatement(
+    id: string,
+    scheduleId: string,
+    error: string | undefined,
+    metadata: Record<string, unknown>,
+    outcome: 'deferred' | 'failed',
+    { excludeSettledReceipt = false }: { excludeSettledReceipt?: boolean } = {},
+  ): ScheduleStatement {
+    return this.#db
       .prepare(
         `UPDATE ${this.#triggers}
-         SET error = ?, metadata = json_patch(
+         SET outcome = ?, error = ?, metadata = json_patch(
            COALESCE(metadata, '{}'),
            json(?)
          )
-         WHERE id = ? AND scheduleId = ? AND outcome = 'deferred'`,
+         WHERE id = ? AND scheduleId = ? AND outcome = 'deferred'
+           ${excludeSettledReceipt ? `AND COALESCE(json_extract(metadata, '$.dispatchState'), '') <> 'settled'` : ''}`,
       )
-      .bind(error ?? null, JSON.stringify(metadata), id, scheduleId)
-      .run();
+      .bind(outcome, error ?? null, JSON.stringify(metadata), id, scheduleId);
   }
 
   async listTriggers(

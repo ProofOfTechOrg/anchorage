@@ -2354,6 +2354,7 @@ describe('createThreadSignalRoutes', () => {
   });
 
   it.each([
+    [400, 'bad request'],
     [403, 'forbidden'],
     [404, 'not found'],
     [409, 'conflict'],

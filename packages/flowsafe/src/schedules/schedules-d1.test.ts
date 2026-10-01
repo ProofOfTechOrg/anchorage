@@ -27,6 +27,7 @@ import {
   ScheduleMutationOutcomeUnknownError,
 } from './mutation-contract.js';
 import {
+  createScheduleAgentDispatchReceipt,
   D1SchedulesStorage,
   parseScheduleAgentDispatchReceipt,
   type ScheduleDatabase,
@@ -622,6 +623,117 @@ describe('D1SchedulesStorage', () => {
       metadata: { reason: 'dispatch-reconciled' },
     });
     expect(await store.listDeferredTriggers()).toEqual([]);
+  });
+
+  it('fails a deferred trigger with merged metadata and leaves a delivered trigger unchanged', async () => {
+    const { store } = storeOver();
+    await store.createSchedule(workflowSchedule());
+    await store.recordTrigger({
+      id: 'pending',
+      scheduleId: 'schedule_a',
+      runId: 'run_pending',
+      scheduledFireAt: NOW,
+      actualFireAt: NOW,
+      outcome: 'deferred',
+      error: 'first',
+      metadata: { dispatchState: 'prepared', retained: 'keep' },
+    });
+    await store.recordTrigger({
+      id: 'delivered',
+      scheduleId: 'schedule_a',
+      runId: 'active_run',
+      scheduledFireAt: NOW,
+      actualFireAt: NOW + 1,
+      outcome: 'delivered',
+      metadata: { dispatchState: 'settled', retained: 'keep' },
+    });
+    const delivered = (await store.listTriggers('schedule_a')).find(
+      (trigger) => trigger.id === 'delivered',
+    );
+
+    await expect(
+      store.failDeferredTrigger('pending', 'schedule_a', 'gone', {
+        reason: 'dispatch-refused',
+      }),
+    ).resolves.toBe(true);
+    expect(
+      (await store.listTriggers('schedule_a')).find(
+        (trigger) => trigger.id === 'pending',
+      ),
+    ).toMatchObject({
+      outcome: 'failed',
+      error: 'gone',
+      metadata: {
+        dispatchState: 'prepared',
+        retained: 'keep',
+        reason: 'dispatch-refused',
+      },
+    });
+    await expect(
+      store.failDeferredTrigger('delivered', 'schedule_a', 'refused', {
+        reason: 'dispatch-refused',
+      }),
+    ).resolves.toBe(false);
+    expect(
+      (await store.listTriggers('schedule_a')).find(
+        (trigger) => trigger.id === 'delivered',
+      ),
+    ).toEqual(delivered);
+  });
+
+  it('rejects a deferred failure write without change evidence', async () => {
+    const f = await mutationFixture();
+    await f.store.recordTrigger({
+      id: 'deferred',
+      scheduleId: 'schedule_a',
+      runId: 'run-a',
+      scheduledFireAt: NOW,
+      actualFireAt: NOW,
+      outcome: 'deferred',
+    });
+    f.hooks.afterBatch = (results) =>
+      results.map((result) => {
+        const { meta: _meta, ...withoutMeta } = result as Record<
+          string,
+          unknown
+        >;
+        return withoutMeta;
+      });
+
+    await expect(
+      f.store.failDeferredTrigger('deferred', 'schedule_a', 'refused', {
+        reason: 'dispatch-refused',
+      }),
+    ).rejects.toThrow('schedule mutation changes contradict its evidence');
+  });
+
+  it('preserves a deferred trigger holding a settled receipt against a late refusal', async () => {
+    const { store } = storeOver();
+    await store.createSchedule(workflowSchedule());
+    const receipt = createScheduleAgentDispatchReceipt('deliver', {
+      runId: 'active_run',
+      signalId: 'signal_1',
+    });
+    await store.recordTrigger({
+      id: 'settled',
+      scheduleId: 'schedule_a',
+      runId: 'active_run',
+      scheduledFireAt: NOW,
+      actualFireAt: NOW,
+      outcome: 'deferred',
+      metadata: { dispatchState: 'settled', dispatchReceipt: receipt },
+    });
+    const before = await store.listTriggers('schedule_a');
+
+    await expect(
+      store.failDeferredTrigger('settled', 'schedule_a', 'refused', {
+        reason: 'dispatch-refused',
+      }),
+    ).resolves.toBe(false);
+    expect(await store.listTriggers('schedule_a')).toEqual(before);
+    await expect(
+      store.agentScheduleDispatchState('schedule_a', 'settled'),
+    ).resolves.toEqual({ state: 'settled', receipt });
   });
 
   it('resolves only the exact prepared schedule fire tuple', async () => {
@@ -1777,6 +1889,27 @@ describe('schedule deletion, preparation and compatibility', () => {
     });
     expect(rawScheduleState(f)).toEqual([[], [], []]);
     await f.store.recordTrigger({ ...trigger, outcome: 'failed' });
+    expect(rawScheduleState(f)).toEqual([[], [], []]);
+  });
+
+  it('a confirmed failure of the last deferred trigger completes pending schedule deletion', async () => {
+    const f = await mutationFixture();
+    await f.store.recordTrigger({
+      id: 'deferred',
+      scheduleId: 'schedule_a',
+      runId: 'run-a',
+      scheduledFireAt: NOW,
+      actualFireAt: NOW,
+      outcome: 'deferred',
+    });
+    await expect(f.store.deleteOwnedSchedule('schedule_a')).resolves.toBe(
+      'pending',
+    );
+    await expect(
+      f.store.failDeferredTrigger('deferred', 'schedule_a', 'refused', {
+        reason: 'dispatch-refused',
+      }),
+    ).resolves.toBe(true);
     expect(rawScheduleState(f)).toEqual([[], [], []]);
   });
 

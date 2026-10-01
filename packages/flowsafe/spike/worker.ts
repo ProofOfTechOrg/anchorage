@@ -2732,7 +2732,8 @@ async function handleScheduleProbe(
           },
         );
         if (!response.ok) {
-          throw new Error(
+          throw new RunRouteError(
+            response.status,
             `agent schedule signal failed with status ${response.status}`,
           );
         }

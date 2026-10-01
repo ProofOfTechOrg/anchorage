@@ -103,6 +103,17 @@ export interface ScheduleTickStore {
     error: string | undefined,
     metadata: Record<string, unknown>,
   ): Promise<void>;
+  /**
+   * Records a confirmed failure while the trigger is deferred, merges `metadata`
+   * into stored metadata, and resolves true when a row changes. A trigger whose
+   * target has settled a receipt stays unchanged.
+   */
+  failDeferredTrigger(
+    id: string,
+    scheduleId: string,
+    error: string,
+    metadata: Record<string, unknown>,
+  ): Promise<boolean>;
   listDeferredTriggers(limit?: number): Promise<ScheduleTrigger[]>;
 }
 
@@ -165,7 +176,16 @@ export interface ScheduleTickSignalAgentInput
   threaded: true;
 }
 
-/** Target-thread signal dispatch. Direct starts are reserved for threadless targets. */
+/**
+ * Target-thread signal dispatch. Direct starts are reserved for threadless targets.
+ * A signalAgent that throws for a non-2xx response carries the status answered by
+ * the thread Durable Object's signal route as a numeric `status` property.
+ * An adapter that reaches the route through another hop must not forward that
+ * hop's own status as a refusal. Statuses 400, 403 and 404 fail this fire, and
+ * the schedule keeps firing. Any other failure is retried on a later pass. The 404
+ * classification assumes D1 reads see the tick's own writes, using the default
+ * primary-consistent D1 access without read-replication sessions.
+ */
 export type ScheduleTickSignalAgent = (
   input: ScheduleTickSignalAgentInput,
 ) => Promise<ScheduleAgentDispatchReceipt>;
@@ -296,7 +316,7 @@ export interface ScheduleTickOptions {
   start: ScheduleTickStart;
   /** Runtime-driven agent start. Absent preserves the guarded skip. */
   startAgent?: ScheduleTickStartAgent;
-  /** Thread-targeted agent signal dispatch with a durable target receipt. */
+  /** Thread-targeted dispatch through {@link ScheduleTickSignalAgent}. */
   signalAgent?: ScheduleTickSignalAgent;
   /** Authoritative target status used after a lost/failed dispatch response. */
   status: ScheduleTickStatus;
@@ -647,6 +667,16 @@ export function createScheduleStartSource(
   };
 }
 
+function isPermanentSignalDispatchError(error: unknown): boolean {
+  try {
+    if (error === null || typeof error !== 'object') return false;
+    const { status } = error as { status?: unknown };
+    return status === 400 || status === 403 || status === 404;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Build the schedule tick: a `() => Promise<ScheduleTickResult>` a host slots
  * into its alarm dispatch as its OWN failure-isolated duty (own try/catch, own
@@ -676,6 +706,21 @@ export function createScheduleTick(
         : {}),
       ...event,
     });
+  };
+
+  const logBookkeepingError = (
+    scheduleId: string,
+    runId: string | undefined,
+    error: unknown,
+  ): void => {
+    console.error(
+      JSON.stringify({
+        type: 'schedule-tick-bookkeeping-error',
+        scheduleId,
+        runId,
+        error: error instanceof Error ? error.message : String(error),
+      }),
+    );
   };
 
   const triggerMetadata = (
@@ -729,15 +774,43 @@ export function createScheduleTick(
         ...(published ? {} : { reason: 'start-error-confirmed' }),
       });
     } catch (error) {
-      console.error(
-        JSON.stringify({
-          type: 'schedule-tick-bookkeeping-error',
-          scheduleId: ref.scheduleId,
-          runId: ref.runId,
-          error: error instanceof Error ? error.message : String(error),
-        }),
-      );
+      logBookkeepingError(ref.scheduleId, ref.runId, error);
     }
+  };
+
+  const recordConfirmedSignalFailure = async (
+    ref: ScheduleTickDispatchRef,
+    trigger: ScheduleTrigger,
+    error: unknown,
+    result: ScheduleTickResult,
+  ): Promise<boolean> => {
+    let changed: boolean;
+    try {
+      changed = await store.failDeferredTrigger(
+        trigger.id ?? '',
+        trigger.scheduleId,
+        error instanceof Error ? error.message : String(error),
+        triggerMetadata({ dispatchRef: ref, reason: 'dispatch-refused' }),
+      );
+    } catch (bookkeepingError) {
+      result.deferred += 1;
+      logBookkeepingError(ref.scheduleId, ref.runId, bookkeepingError);
+      return false;
+    }
+    if (!changed) return false;
+    result.failed += 1;
+    try {
+      await audit({
+        scheduleId: ref.scheduleId,
+        target: ref.target,
+        outcome: 'failed',
+        reason: 'dispatch-refused',
+        runId: ref.runId,
+      });
+    } catch (bookkeepingError) {
+      logBookkeepingError(ref.scheduleId, ref.runId, bookkeepingError);
+    }
+    return true;
   };
 
   const reconcileDeferred = async (
@@ -803,6 +876,19 @@ export function createScheduleTick(
             );
             continue;
           } catch (retryError) {
+            if (isPermanentSignalDispatchError(retryError)) {
+              if (
+                await recordConfirmedSignalFailure(
+                  ref,
+                  trigger,
+                  retryError,
+                  result,
+                )
+              ) {
+                result.reconciled += 1;
+              }
+              continue;
+            }
             pendingError = retryError;
           }
         }
@@ -836,17 +922,7 @@ export function createScheduleTick(
             }),
           );
         } catch (bookkeepingError) {
-          console.error(
-            JSON.stringify({
-              type: 'schedule-tick-bookkeeping-error',
-              scheduleId: ref.scheduleId,
-              runId: ref.runId,
-              error:
-                bookkeepingError instanceof Error
-                  ? bookkeepingError.message
-                  : String(bookkeepingError),
-            }),
-          );
+          logBookkeepingError(ref.scheduleId, ref.runId, bookkeepingError);
         }
       }
     }
@@ -862,6 +938,14 @@ export function createScheduleTick(
       const summary = await options.status(ref);
       await recordResolvedDispatch(ref, trigger, summary, result);
     } catch (statusError) {
+      if (
+        ref.target === 'agent' &&
+        ref.mode === 'signal' &&
+        isPermanentSignalDispatchError(error)
+      ) {
+        await recordConfirmedSignalFailure(ref, trigger, error, result);
+        return;
+      }
       result.deferred += 1;
       try {
         await store.touchDeferredTrigger(
@@ -887,17 +971,7 @@ export function createScheduleTick(
           reason: 'dispatch-indeterminate',
         });
       } catch (bookkeepingError) {
-        console.error(
-          JSON.stringify({
-            type: 'schedule-tick-bookkeeping-error',
-            scheduleId: ref.scheduleId,
-            runId: ref.runId,
-            error:
-              bookkeepingError instanceof Error
-                ? bookkeepingError.message
-                : String(bookkeepingError),
-          }),
-        );
+        logBookkeepingError(ref.scheduleId, ref.runId, bookkeepingError);
       }
     }
   };
@@ -920,14 +994,7 @@ export function createScheduleTick(
       return true;
     } catch (error) {
       result.deferred += 1;
-      console.error(
-        JSON.stringify({
-          type: 'schedule-tick-bookkeeping-error',
-          scheduleId: ref.scheduleId,
-          runId: ref.runId,
-          error: error instanceof Error ? error.message : String(error),
-        }),
-      );
+      logBookkeepingError(ref.scheduleId, ref.runId, error);
       return false;
     }
   };
@@ -1213,14 +1280,7 @@ export function createScheduleTick(
             ...(receipt.runId !== undefined ? { runId: receipt.runId } : {}),
           });
         } catch (error) {
-          console.error(
-            JSON.stringify({
-              type: 'schedule-tick-bookkeeping-error',
-              scheduleId: schedule.id,
-              runId: receipt.runId ?? firedRunId,
-              error: error instanceof Error ? error.message : String(error),
-            }),
-          );
+          logBookkeepingError(schedule.id, receipt.runId ?? firedRunId, error);
         }
         return;
       }
@@ -1319,14 +1379,7 @@ export function createScheduleTick(
           runId: dispatchedRunId,
         });
       } catch (error) {
-        console.error(
-          JSON.stringify({
-            type: 'schedule-tick-bookkeeping-error',
-            scheduleId: schedule.id,
-            runId: dispatchedRunId,
-            error: error instanceof Error ? error.message : String(error),
-          }),
-        );
+        logBookkeepingError(schedule.id, dispatchedRunId, error);
       }
       return;
     }
@@ -1430,14 +1483,7 @@ export function createScheduleTick(
         runId: dispatchedRunId,
       });
     } catch (error) {
-      console.error(
-        JSON.stringify({
-          type: 'schedule-tick-bookkeeping-error',
-          scheduleId: schedule.id,
-          runId: dispatchedRunId,
-          error: error instanceof Error ? error.message : String(error),
-        }),
-      );
+      logBookkeepingError(schedule.id, dispatchedRunId, error);
     }
   };
 

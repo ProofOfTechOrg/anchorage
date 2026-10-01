@@ -821,6 +821,11 @@ export function createThreadAgentHost(
       },
     });
     if (!module) throw new AgentHostRequestError(404, 'agent not found');
+    // A resolver failure is an operational fault, not a denial; a retryable
+    // status lets automated callers retry.
+    if (decision === 'error') {
+      throw new AgentHostRequestError(503, 'permission resolution unavailable');
+    }
     if (!granted) throw new AgentHostRequestError(403, 'forbidden');
     return { current, module, principalPermissions };
   };
