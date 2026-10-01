@@ -1355,7 +1355,7 @@ describe('createScheduleTick and the deployment execution fence', () => {
   });
 });
 
-describe('FS8 D3 host activation pending schedule status', () => {
+describe('host activation pending schedule status', () => {
   it('retains a deferred signal without resending or publishing finality while initial admission is pending', async () => {
     const store = new FakeStore();
     store.seed(

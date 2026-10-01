@@ -60,9 +60,8 @@ export interface InitOptions {
    * defaults a fresh emitter per createRun, and two such feeds never see each
    * other's events — see pubsub.ts).
    *
-   * OPT-IN: absent, InitResult.pubsub is undefined and no consumer has one to
-   * pass, so the host is byte-identical to before this seam existed (polling
-   * stays the fallback).
+   * Without a host pub/sub, InitResult.pubsub and the runtime's pub/sub are
+   * undefined; a durable agent wrapper installs its own bus at construction.
    */
   pubsub?: HostPubSub;
   /**

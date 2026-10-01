@@ -509,7 +509,7 @@ function keyedHarness(
   };
 }
 
-function cDeferred() {
+function deferredSignal() {
   let resolve = () => {};
   const promise = new Promise<void>((done) => {
     resolve = done;
@@ -517,12 +517,12 @@ function cDeferred() {
   return { promise, resolve };
 }
 
-describe('C agent topology capture', () => {
+describe('agent topology capture', () => {
   it.each([
     'persisted',
     'live',
     'unclaimed',
-  ] as const)('C topology keeps captured authority and methods on the winning reservation: %s', async (state) => {
+  ] as const)('topology keeps captured authority and methods on the winning reservation: %s', async (state) => {
     const fixture = keyedHarness();
     const scoped = context();
     Object.assign(scoped.value, { mutationEpoch: 2 });
@@ -553,8 +553,8 @@ describe('C agent topology capture', () => {
       fixture.runsByThread.set('winner-run', 'winner-thread');
     }
     if (state === 'live') fixture.inFlight.add('winner-run');
-    const entered = cDeferred();
-    const release = cDeferred();
+    const entered = deferredSignal();
+    const release = deferredSignal();
     const reserve = fixture.store.reserve.bind(fixture.store);
     vi.spyOn(fixture.store, 'reserve').mockImplementationOnce(
       async (...args) => {
@@ -643,15 +643,15 @@ describe('C agent topology capture', () => {
   it.each([
     ['access', false],
     ['access', true],
-    ['F3', false],
-    ['F3', true],
-  ] as const)('C topology captures absent and supplied run IDs before F3: %s supplied=%s', async (boundary, supplied) => {
+    ['reservation', false],
+    ['reservation', true],
+  ] as const)('topology captures absent and supplied run IDs before the %s wait: supplied=%s', async (boundary, supplied) => {
     const fixture = keyedHarness();
     const scoped = context();
     Object.assign(scoped.value, { mutationEpoch: 2 });
     const principal = scoped.value.principal;
-    const entered = cDeferred();
-    const release = cDeferred();
+    const entered = deferredSignal();
+    const release = deferredSignal();
     vi.spyOn(scoped.value, 'canAccessResource').mockImplementationOnce(
       async () => {
         if (boundary === 'access') {
@@ -665,7 +665,7 @@ describe('C agent topology capture', () => {
     const reserved = vi
       .spyOn(fixture.store, 'reserve')
       .mockImplementationOnce(async (...args) => {
-        if (boundary === 'F3') {
+        if (boundary === 'reservation') {
           entered.resolve();
           await release.promise;
         }
@@ -1124,7 +1124,7 @@ describe('createAgentThreadTopology — idempotent start', () => {
   });
 });
 
-describe('FS8 D3 agent reclaim liveness transport', () => {
+describe('agent reclaim liveness transport', () => {
   async function retry(
     liveness: () => Promise<Response>,
     state: 'reserved' | 'started' = 'reserved',
@@ -1294,7 +1294,7 @@ describe('FS8 D3 agent reclaim liveness transport', () => {
   });
 });
 
-describe('FS8 D3 protected replay agent wire', () => {
+describe('protected replay agent wire', () => {
   const execution = {
     tablePrefix: 'private_',
     workflowId: 'actual-agent-workflow',

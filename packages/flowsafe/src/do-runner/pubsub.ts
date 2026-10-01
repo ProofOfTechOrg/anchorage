@@ -1,30 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
-// The host DO's ONE pubsub identity (DL-001).
+// The host Durable Object shares one pub/sub identity across its consumers.
 //
-// Core creates a fresh EventEmitterPubSub per createRun() when none is passed,
-// so two call sites that each let it default publish to DIFFERENT emitters:
-// events published on one are invisible to an observe()/replay on the other,
-// and a reconnecting stream silently replays nothing. The fix is identity, not
-// configuration — ONE instance per host DO, constructed here and taken from
-// init()'s InitResult by every consumer rather than each building its own.
+// A configured instance passes through init() to RunnerRuntime, which passes it
+// to core when creating runs and Mastra. Consumers in the same isolate use the
+// instance from InitResult so publishing and replay share a feed.
 //
-// SCOPE (Track 0): this establishes the identity and the seam that carries it.
-// Nothing hands it to core yet — RunnerRuntime's two createRun sites still let
-// core default their emitter, and Track A threads this instance into them
-// (CI-M-002-002). Until then a configured pubsub is an identity the host holds,
-// not a feed core publishes on.
+// FlowsafeDurableAgent installs its own `pubsub` option, else the runtime's
+// pub/sub, else its own stream bus on the wrapped agent at construction.
 //
-// A Durable Object IS the scope that makes an in-process emitter sufficient:
-// every leg of a run (or of a thread's agent loop) is serialized onto one
-// instance by idFromName, so publisher and subscriber are already in the same
-// isolate — the reason no Redis/cross-process bus is needed (DL-002). A host
-// that needs a durable or cache-backed feed injects its own PubSub (e.g. core's
-// CachingPubSub) through the same seam.
+// A Durable Object keeps its publisher and subscriber in the same isolate. A
+// host that needs a durable or cache-backed feed injects its own PubSub.
 //
-// OPT-IN: absent, init() resolves no pubsub, nothing is passed to core, and
-// every host behaves byte-identically to before this module existed — polling
-// stays the fallback, the same posture HUB + STREAM_TICKET_SECRET take for
-// live streaming.
+// Without a host pub/sub, init() passes undefined to the runtime; the wrapper
+// still installs its own bus.
 
 import { EventEmitterPubSub, type PubSub } from '@mastra/core/events';
 

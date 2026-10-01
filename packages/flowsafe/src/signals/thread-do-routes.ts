@@ -241,6 +241,9 @@ export interface ThreadSignalRoutesOptions {
    * otherwise the route returns `persistence-forbidden` or
    * `memory-unavailable`, and never escapes onto core's default execution
    * engine. Trusted notification dispatch supplies the persisted agent id.
+   * When the thread's init() has a pub/sub, a runtime-driven agent must return
+   * that same instance from getPubSub() or the routes answer 503. The routes
+   * install the thread's pub/sub on a non-runtime-driven agent.
    */
   resolveAgent: (
     scope: ThreadScope,

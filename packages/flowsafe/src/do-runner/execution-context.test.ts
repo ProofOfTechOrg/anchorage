@@ -76,7 +76,7 @@ describe('execution-context trust boundary', () => {
   });
 });
 
-describe('FS8 D3 protected replay stored authority boundary', () => {
+describe('protected replay stored authority boundary', () => {
   it('strips a top-level original-claim lookalike while preserving application payloads', () => {
     const payload = { startReservation: { key: 'application-key' } };
     const context = {

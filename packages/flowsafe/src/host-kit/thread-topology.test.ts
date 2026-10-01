@@ -66,8 +66,8 @@ function harness() {
   };
 }
 
-describe('C thread epoch transport', () => {
-  it('C thread send deletes an absent epoch header', async () => {
+describe('thread epoch transport', () => {
+  it('thread send deletes an absent epoch header', async () => {
     const { topology, hits } = harness();
     await topology.send(context(), 'thread-1', '/start', {
       method: 'POST',
@@ -83,7 +83,7 @@ describe('C thread epoch transport', () => {
     expect(hits[0]?.init?.body).toBe('{"prompt":"hello"}');
   });
 
-  it('C thread forward deletes an absent epoch header', async () => {
+  it('thread forward deletes an absent epoch header', async () => {
     const { topology, hits } = harness();
     const request = new Request('https://host/stream', {
       headers: {
@@ -102,7 +102,7 @@ describe('C thread epoch transport', () => {
   it.each([
     0,
     Number.MAX_SAFE_INTEGER,
-  ])('C stamps both thread transports with canonical epoch %s', async (mutationEpoch) => {
+  ])('stamps both thread transports with canonical epoch %s', async (mutationEpoch) => {
     const { topology, hits } = harness();
     const trusted = { ...context(), mutationEpoch };
     await topology.send(trusted, 'thread-1', '/start', {
@@ -138,7 +138,7 @@ describe('C thread epoch transport', () => {
     NaN,
     Infinity,
     Number.MAX_SAFE_INTEGER + 1,
-  ])('C invalid thread epoch refuses before namespace lookup (%s)', async (mutationEpoch) => {
+  ])('invalid thread epoch refuses before namespace lookup (%s)', async (mutationEpoch) => {
     const { topology, namespace, hits } = harness();
     const get = vi.spyOn(namespace, 'get');
     const trusted = { ...context(), mutationEpoch } as ActorContext;

@@ -3418,7 +3418,7 @@ describe('createThreadSignalRoutes', () => {
     (
       agent as unknown as { getActiveThreadRunId: () => string }
     ).getActiveThreadRunId = () => 'dispatch-run';
-    const sendSignal = vi.fn((_signal, target: AgentCall['target']) => {
+    const sendSignal = vi.fn((_signal, _target: AgentCall['target']) => {
       return {
         signal: { id: 'persisted-signal' },
         accepted: Promise.resolve({ action: 'persist' as const }),
@@ -4131,7 +4131,6 @@ describe('createThreadSignalRoutes', () => {
   it('keeps an unbranded de-duped state response free of degradation metadata', async () => {
     // #given — an unbranded agent reports an unchanged snapshot
     const agent = {
-      __setPubSub: () => {},
       getMemory: () => ({ saveMessages: vi.fn() }),
       sendStateSignal: async () => ({
         skipped: true as const,
@@ -5702,7 +5701,7 @@ describe('createThreadSignalRoutes and the deployment execution fence', () => {
   });
 });
 
-describe('FS8 D3 proof activation signal boundaries', () => {
+describe('proof activation signal boundaries', () => {
   async function modern() {
     const sqlite = openSqlite();
     const db = sqliteUnitDatabase(sqlite) as ExecutionFenceDatabase;

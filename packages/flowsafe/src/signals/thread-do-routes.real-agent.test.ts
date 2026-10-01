@@ -1837,7 +1837,7 @@ describe('thread signal routes with a real durable agent', () => {
   }, 15_000);
 });
 
-describe('FS8 D3 proof activation actual agent authority', () => {
+describe('proof activation actual agent authority', () => {
   it('uses the actual wrapper workflow and refuses a replaced generation after content inspection', async () => {
     const sqlite = openSqlite();
     const db = sqliteUnitDatabase(sqlite) as ExecutionFenceDatabase;

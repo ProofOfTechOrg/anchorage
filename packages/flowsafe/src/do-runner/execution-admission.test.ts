@@ -350,7 +350,7 @@ describe('execution identity and epoch helpers', () => {
   });
 });
 
-describe('FS8 D3 Runtime activation', () => {
+describe('Runtime activation', () => {
   it('recognizes pending structurally and safely without granting generic HTTP errors authority', async () => {
     const { RunStartPendingError, isRunStartPendingError } = await import(
       './execution-admission.js'

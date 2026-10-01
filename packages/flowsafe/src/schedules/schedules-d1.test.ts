@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Track D (M-006) — fast schedule SQL units over node:sqlite. The Wrangler
+// Fast schedule SQL units over node:sqlite. The Wrangler
 // harness owns real-D1 CAS, concurrency, ownership, and rollback evidence.
 
 import type { Schedule } from '@mastra/core/storage';

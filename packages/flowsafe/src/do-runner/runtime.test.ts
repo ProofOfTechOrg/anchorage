@@ -192,7 +192,7 @@ async function d1Fixture(
   };
 }
 
-describe('FS8 D1 authoritative start state', () => {
+describe('authoritative start state', () => {
   it.each([
     'default',
     'prefixed',
@@ -729,8 +729,8 @@ describe('FS8 D1 authoritative start state', () => {
   ] as const)('captures the original D1 source across held-read %s replacement', async (replacement) => {
     const f = await d1Fixture();
     const other = await d1Fixture('prefixed');
-    const held = cDeferred();
-    const release = cDeferred();
+    const held = deferredSignal();
+    const release = deferredSignal();
     try {
       await f.seed();
       await other.seed();
@@ -791,8 +791,8 @@ describe('FS8 D1 authoritative start state', () => {
 
   it('captures the custom domain method and receiver before a held read', async () => {
     const f = await d1Fixture('unfenced');
-    const held = cDeferred();
-    const release = cDeferred();
+    const held = deferredSignal();
+    const release = deferredSignal();
     try {
       await f.seed();
       const read = f.workflows.getWorkflowRunById;
@@ -913,25 +913,27 @@ describe('FS8 D1 authoritative start state', () => {
   });
 
   it('keeps nested collisions root-local against a frozen v1 twin and raw payload', async () => {
-    const f = d0Fixture();
-    d0Collision(f);
+    const f = rootSummaryFixture();
+    rootSummaryCollisionWorkflow(f);
     try {
-      await f.runtime.start('d0-root', d0Start);
-      const twin = structuredClone(await f.runtime.status('d0-root', 'd0-run'));
+      await f.runtime.start('summary-root-workflow', rootSummaryStartOptions);
+      const twin = structuredClone(
+        await f.runtime.status('summary-root-workflow', 'summary-run'),
+      );
       const row = f.row();
       const snapshot = JSON.parse(row.snapshot) as WorkflowRunState;
       assert(snapshot.requestContext);
       snapshot.requestContext['flowsafe.runProvenance'].version = 2;
       f.replaceSnapshot(snapshot);
       const selectedRow = f.row();
-      f.changeChild('a', 'd0-run', 'b', 123456);
+      f.changeChild('a', 'summary-run', 'b', 123456);
       f.reads.length = 0;
       const selected = await f.runtime.authoritativeStartState(
-        'd0-root',
-        'd0-run',
+        'summary-root-workflow',
+        'summary-run',
       );
       expect(selected?.summary).toEqual(twin);
-      d0AssertRootSummary(selected?.summary ?? null, selectedRow);
+      assertRootSummary(selected?.summary ?? null, selectedRow);
       expect(selected?.summary?.suspendPayload).toHaveProperty('a.b', {
         reason: 'root a.b',
         [SUSPENSION_DEADLINE_PAYLOAD_KEY]: 900_000,
@@ -939,7 +941,7 @@ describe('FS8 D1 authoritative start state', () => {
       expect(f.reads).toHaveLength(1);
       assert(selected?.summary);
       expect(suspensionDeadlinesOf(selected.summary)).toEqual(
-        d0DeadlineRefusal,
+        rootSummaryDeadlineRefusal,
       );
     } finally {
       f.close();
@@ -1032,11 +1034,11 @@ describe('FS8 D1 authoritative start state', () => {
   });
 });
 
-interface D0Snapshot {
+interface RootSummarySnapshot {
   status: RunSummary['status'];
   result?: unknown;
   error?: unknown;
-  context: Record<string, D0Step | D0Step[]>;
+  context: Record<string, RootSummaryStep | RootSummaryStep[]>;
   suspendedPaths?: Record<string, number[]>;
   requestContext?: Record<string, unknown> & {
     'flowsafe.runProvenance'?: {
@@ -1049,13 +1051,13 @@ interface D0Snapshot {
   };
 }
 
-interface D0Step {
+interface RootSummaryStep {
   suspendPayload?: unknown;
   suspendedAt?: number;
   resumedAt?: number;
 }
 
-function d0Fixture(requestContextForRun?: RequestContextProvider) {
+function rootSummaryFixture(requestContextForRun?: RequestContextProvider) {
   const sqlite = openSqlite() as ReturnType<typeof openSqlite> & {
     close(): void;
   };
@@ -1095,7 +1097,7 @@ function d0Fixture(requestContextForRun?: RequestContextProvider) {
           : suspend({ reason, [SUSPENSION_DEADLINE_PAYLOAD_KEY]: 900_000 });
       },
     });
-  const row = (workflowId = 'd0-root', runId = 'd0-run') =>
+  const row = (workflowId = 'summary-root-workflow', runId = 'summary-run') =>
     prepare(
       'SELECT * FROM mastra_workflow_snapshot WHERE workflow_name = ? AND run_id = ?',
     ).get(workflowId, runId) as {
@@ -1111,18 +1113,18 @@ function d0Fixture(requestContextForRun?: RequestContextProvider) {
     gate,
     row,
     reads,
-    snapshot: (workflowId = 'd0-root', runId = 'd0-run') =>
-      JSON.parse(row(workflowId, runId).snapshot) as D0Snapshot,
+    snapshot: (workflowId = 'summary-root-workflow', runId = 'summary-run') =>
+      JSON.parse(row(workflowId, runId).snapshot) as RootSummarySnapshot,
     replaceSnapshot(snapshot: WorkflowRunState) {
       prepare(
         'UPDATE mastra_workflow_snapshot SET snapshot = ? WHERE workflow_name = ? AND run_id = ?',
-      ).run(JSON.stringify(snapshot), 'd0-root', 'd0-run');
+      ).run(JSON.stringify(snapshot), 'summary-root-workflow', 'summary-run');
     },
     changeChild(workflowId: string, runId: string, step: string, time: number) {
       const snapshot = JSON.parse(
         row(workflowId, runId).snapshot,
-      ) as D0Snapshot;
-      const entry = snapshot.context[step] as D0Step;
+      ) as RootSummarySnapshot;
+      const entry = snapshot.context[step] as RootSummaryStep;
       entry.suspendedAt = time;
       entry.suspendPayload = { reason: 'CHILD ONLY CHANGE' };
       prepare(
@@ -1136,7 +1138,9 @@ function d0Fixture(requestContextForRun?: RequestContextProvider) {
   };
 }
 
-function d0Collision(f: ReturnType<typeof d0Fixture>) {
+function rootSummaryCollisionWorkflow(
+  f: ReturnType<typeof rootSummaryFixture>,
+) {
   const child = f
     .createWorkflow({
       id: 'a',
@@ -1147,7 +1151,7 @@ function d0Collision(f: ReturnType<typeof d0Fixture>) {
     .commit();
   return f
     .createWorkflow({
-      id: 'd0-root',
+      id: 'summary-root-workflow',
       inputSchema: f.schema,
       outputSchema: f.schema,
     })
@@ -1155,11 +1159,11 @@ function d0Collision(f: ReturnType<typeof d0Fixture>) {
     .commit();
 }
 
-function d0AssertRootSummary(
+function assertRootSummary(
   summary: RunSummary | null,
-  row: ReturnType<ReturnType<typeof d0Fixture>['row']>,
+  row: ReturnType<ReturnType<typeof rootSummaryFixture>['row']>,
 ) {
-  const snapshot = JSON.parse(row.snapshot) as D0Snapshot;
+  const snapshot = JSON.parse(row.snapshot) as RootSummarySnapshot;
   const keys = Object.keys(snapshot.suspendedPaths ?? {});
   const entry = (key: string) => {
     const value = snapshot.context[key];
@@ -1199,15 +1203,15 @@ function d0AssertRootSummary(
   expect(summary).not.toHaveProperty('attemptToken');
 }
 
-const d0Start = {
-  runId: 'd0-run',
+const rootSummaryStartOptions = {
+  runId: 'summary-run',
   inputData: {},
-  attemptToken: 'd0-attempt',
+  attemptToken: 'summary-attempt',
   requestedBy: 'owner',
   requestedByKind: 'human',
 } as const;
 
-const d0DeadlineRefusal = {
+const rootSummaryDeadlineRefusal = {
   entries: [],
   rejected: [
     { step: 'a.b', reason: 'ambiguous suspended step path' },
@@ -1215,16 +1219,16 @@ const d0DeadlineRefusal = {
   ],
 };
 
-describe('D0 root-local stored summaries', () => {
+describe('root-local stored summaries', () => {
   it.each([
     'status',
     'authoritativeStatus',
     'recoverStartAttempt',
-  ] as const)('D0 projects the selected root for summary reads: %s', async (method) => {
-    const f = d0Fixture();
-    d0Collision(f);
+  ] as const)('projects the selected root for summary reads: %s', async (method) => {
+    const f = rootSummaryFixture();
+    rootSummaryCollisionWorkflow(f);
     try {
-      await f.runtime.start('d0-root', d0Start);
+      await f.runtime.start('summary-root-workflow', rootSummaryStartOptions);
       const parent = f.row();
       const read = () =>
         method === 'recoverStartAttempt'
@@ -1232,42 +1236,45 @@ describe('D0 root-local stored summaries', () => {
               .recoverStartAttempt(
                 {
                   tablePrefix: '',
-                  workflowId: 'd0-root',
-                  runId: 'd0-run',
+                  workflowId: 'summary-root-workflow',
+                  runId: 'summary-run',
                   startToken: f.snapshot().requestContext?.[
                     'flowsafe.runProvenance'
                   ]?.startToken as string,
                 },
-                { attemptToken: 'd0-attempt', isOwnerQuiescent: () => true },
+                {
+                  attemptToken: 'summary-attempt',
+                  isOwnerQuiescent: () => true,
+                },
               )
               .then((value) =>
                 value?.kind === 'ordinary'
                   ? value.summary
                   : (value?.transition.summary ?? null),
               )
-          : f.runtime[method]('d0-root', 'd0-run');
+          : f.runtime[method]('summary-root-workflow', 'summary-run');
       f.reads.length = 0;
       const first = await read();
-      d0AssertRootSummary(first, parent);
+      assertRootSummary(first, parent);
       expect(f.reads).toEqual([
         method === 'recoverStartAttempt'
-          ? ['d0-root', 'd0-run']
-          : ['d0-run', 'd0-root'],
+          ? ['summary-root-workflow', 'summary-run']
+          : ['summary-run', 'summary-root-workflow'],
       ]);
       expect(suspensionDeadlinesOf(first as RunSummary)).toEqual(
-        d0DeadlineRefusal,
+        rootSummaryDeadlineRefusal,
       );
-      const rootTime = (f.snapshot().context['a.b'] as D0Step)
+      const rootTime = (f.snapshot().context['a.b'] as RootSummaryStep)
         .suspendedAt as number;
-      f.changeChild('a', 'd0-run', 'b', rootTime + 1234);
+      f.changeChild('a', 'summary-run', 'b', rootTime + 1234);
       expect(f.row()).toEqual(parent);
       f.reads.length = 0;
       const second = await read();
       expect(second).toEqual(first);
       expect(f.reads).toEqual([
         method === 'recoverStartAttempt'
-          ? ['d0-root', 'd0-run']
-          : ['d0-run', 'd0-root'],
+          ? ['summary-root-workflow', 'summary-run']
+          : ['summary-run', 'summary-root-workflow'],
       ]);
       expect(f.effects).toHaveBeenCalledTimes(2);
     } finally {
@@ -1275,9 +1282,9 @@ describe('D0 root-local stored summaries', () => {
     }
   });
 
-  it('D0 recovers a stored start result without child projection', async () => {
-    const f = d0Fixture();
-    const flow = d0Collision(f);
+  it('recovers a stored start result without child projection', async () => {
+    const f = rootSummaryFixture();
+    const flow = rootSummaryCollisionWorkflow(f);
     const create = flow.createRun.bind(flow);
     const spy = vi
       .spyOn(flow, 'createRun')
@@ -1288,7 +1295,7 @@ describe('D0 root-local stored summaries', () => {
           try {
             await start(input);
             f.reads.length = 0;
-            throw new Error('D0 lost native start receipt');
+            throw new Error('native start receipt lost');
           } finally {
             run.start = start;
           }
@@ -1296,9 +1303,12 @@ describe('D0 root-local stored summaries', () => {
         return run;
       });
     try {
-      const result = await f.runtime.start('d0-root', d0Start);
-      d0AssertRootSummary(result, f.row());
-      expect(f.reads).toEqual([['d0-root', 'd0-run']]);
+      const result = await f.runtime.start(
+        'summary-root-workflow',
+        rootSummaryStartOptions,
+      );
+      assertRootSummary(result, f.row());
+      expect(f.reads).toEqual([['summary-root-workflow', 'summary-run']]);
       expect(f.effects).toHaveBeenCalledTimes(2);
       expect(
         f.snapshot().requestContext?.['flowsafe.runProvenance'],
@@ -1313,13 +1323,13 @@ describe('D0 root-local stored summaries', () => {
     }
   });
 
-  it('D0 projects lifecycle completion from one root read', async () => {
-    const f = d0Fixture();
-    const flow = d0Collision(f);
+  it('projects lifecycle completion from one root read', async () => {
+    const f = rootSummaryFixture();
+    const flow = rootSummaryCollisionWorkflow(f);
     const windows: unknown[][][] = [];
     let spy: { mockRestore(): void } | undefined;
     try {
-      await f.runtime.start('d0-root', d0Start);
+      await f.runtime.start('summary-root-workflow', rootSummaryStartOptions);
       const domain = (await flow.mastra
         ?.getStorage()
         ?.getStore('workflows')) as FencedWorkflowsStorageD1;
@@ -1342,16 +1352,16 @@ describe('D0 root-local stored summaries', () => {
       const parent = f.row();
       const principal = { kind: 'human', id: 'owner' } as const;
       const missed = await f.runtime.timeOut(
-        'd0-root',
-        'd0-run',
+        'summary-root-workflow',
+        'summary-run',
         { expectedRevision: 1 },
         100,
       );
       expect(missed).toMatchObject({ transitioned: false, casMatched: false });
-      d0AssertRootSummary(missed.summary, parent);
+      assertRootSummary(missed.summary, parent);
       const terminal = await f.runtime.terminateAsPrincipal(
-        'd0-root',
-        'd0-run',
+        'summary-root-workflow',
+        'summary-run',
         principal,
         principal,
         101,
@@ -1363,8 +1373,8 @@ describe('D0 root-local stored summaries', () => {
         cleanup: { cleanupCompleted: false, revision: 1 },
       });
       const retry = await f.runtime.terminateAsPrincipal(
-        'd0-root',
-        'd0-run',
+        'summary-root-workflow',
+        'summary-run',
         principal,
         principal,
         102,
@@ -1375,22 +1385,24 @@ describe('D0 root-local stored summaries', () => {
         cleanup: terminal.cleanup,
       });
       const completed = await f.runtime.completeTerminalCleanup(
-        'd0-root',
-        'd0-run',
+        'summary-root-workflow',
+        'summary-run',
         terminal.cleanup.revision,
         103,
       );
       expect(completed.status).toBe('cancelled');
       await expect(
         f.runtime.completeTerminalCleanup(
-          'd0-root',
-          'd0-run',
+          'summary-root-workflow',
+          'summary-run',
           terminal.cleanup.revision,
           104,
         ),
       ).resolves.toEqual(completed);
       expect(windows).toEqual(
-        Array.from({ length: 5 }, () => [['d0-root', 'd0-run']]),
+        Array.from({ length: 5 }, () => [
+          ['summary-root-workflow', 'summary-run'],
+        ]),
       );
       expect(f.effects).toHaveBeenCalledTimes(2);
     } finally {
@@ -1399,11 +1411,11 @@ describe('D0 root-local stored summaries', () => {
     }
   });
 
-  it('D0 preserves detailed nested resume preparation', async () => {
+  it('preserves detailed nested resume preparation', async () => {
     const legs: RunLeg[] = [];
-    const f = d0Fixture((_workflowId, _runId, leg) => {
+    const f = rootSummaryFixture((_workflowId, _runId, leg) => {
       legs.push(leg);
-      return { d0Provider: true };
+      return { rootSummaryProvider: true };
     });
     const child = f
       .createWorkflow({
@@ -1415,7 +1427,7 @@ describe('D0 root-local stored summaries', () => {
       .commit();
     const flow = f
       .createWorkflow({
-        id: 'd0-root',
+        id: 'summary-root-workflow',
         inputSchema: f.schema,
         outputSchema: f.schema,
       })
@@ -1423,16 +1435,20 @@ describe('D0 root-local stored summaries', () => {
       .commit();
     const spy = vi.spyOn(flow, 'getWorkflowRunById');
     try {
-      await f.runtime.start('d0-root', d0Start);
-      f.changeChild('nested', 'd0-run', 'approval', 12345);
+      await f.runtime.start('summary-root-workflow', rootSummaryStartOptions);
+      f.changeChild('nested', 'summary-run', 'approval', 12345);
       legs.length = 0;
       spy.mockClear();
-      const result = await f.runtime.resume('d0-root', 'd0-run', {
-        step: ['nested', 'approval'],
-        resumeData: { approve: true },
-        requestedBy: 'reviewer',
-        requestedByKind: 'human',
-      });
+      const result = await f.runtime.resume(
+        'summary-root-workflow',
+        'summary-run',
+        {
+          step: ['nested', 'approval'],
+          resumeData: { approve: true },
+          requestedBy: 'reviewer',
+          requestedByKind: 'human',
+        },
+      );
       expect(result.status).toBe('success');
       expect(legs).toEqual([
         {
@@ -1452,7 +1468,7 @@ describe('D0 root-local stored summaries', () => {
       expect(context.get('breakwater.connectorExecution')).toMatchObject({
         suspension: { stepPath: ['nested', 'approval'], suspendedAt: 12345 },
       });
-      expect(context.get('d0Provider')).toBe(true);
+      expect(context.get('rootSummaryProvider')).toBe(true);
       expect(
         f.snapshot().requestContext?.['flowsafe.runProvenance'],
       ).toMatchObject({
@@ -1469,7 +1485,7 @@ describe('D0 root-local stored summaries', () => {
   });
 });
 
-describe('D0 summary compatibility', () => {
+describe('summary compatibility', () => {
   it.each([
     'success',
     'failure',
@@ -1482,11 +1498,11 @@ describe('D0 summary compatibility', () => {
     'nested-2',
     'plain-dots',
     'unattributed',
-  ] as const)('D0 preserves root summary fields: %s', async (mode) => {
-    const f = d0Fixture();
+  ] as const)('preserves root summary fields: %s', async (mode) => {
+    const f = rootSummaryFixture();
     const root = () =>
       f.createWorkflow({
-        id: 'd0-root',
+        id: 'summary-root-workflow',
         inputSchema: f.schema,
         outputSchema: f.schema,
       });
@@ -1499,7 +1515,8 @@ describe('D0 summary compatibility', () => {
             inputSchema: f.schema,
             outputSchema: f.schema,
             execute: async ({ inputData: input }) => {
-              if (mode === 'failure') throw new Error('D0 expected failure');
+              if (mode === 'failure')
+                throw new Error('expected workflow failure');
               return input;
             },
           }),
@@ -1508,7 +1525,7 @@ describe('D0 summary compatibility', () => {
       inputData = { value: 'root result' };
     } else if (mode === 'foreach-1' || mode === 'foreach-3') {
       f.createWorkflow({
-        id: 'd0-root',
+        id: 'summary-root-workflow',
         inputSchema: z.array(f.schema),
         outputSchema: z.array(f.schema),
       })
@@ -1561,13 +1578,13 @@ describe('D0 summary compatibility', () => {
     } else root().then(f.gate('gate', 'first')).commit();
     try {
       await f.runtime.start(
-        'd0-root',
+        'summary-root-workflow',
         mode === 'unattributed'
-          ? { runId: 'd0-run', inputData }
-          : { ...d0Start, inputData },
+          ? { runId: 'summary-run', inputData }
+          : { ...rootSummaryStartOptions, inputData },
       );
       if (mode === 'resuspension')
-        await f.runtime.resume('d0-root', 'd0-run', {
+        await f.runtime.resume('summary-root-workflow', 'summary-run', {
           step: 'gate',
           resumeData: { again: true },
           requestedBy: 'reviewer',
@@ -1576,11 +1593,14 @@ describe('D0 summary compatibility', () => {
       const before = f.row();
       for (const method of ['status', 'authoritativeStatus'] as const) {
         f.reads.length = 0;
-        const summary = await f.runtime[method]('d0-root', 'd0-run');
-        d0AssertRootSummary(summary, before);
-        expect(f.reads).toEqual([['d0-run', 'd0-root']]);
+        const summary = await f.runtime[method](
+          'summary-root-workflow',
+          'summary-run',
+        );
+        assertRootSummary(summary, before);
+        expect(f.reads).toEqual([['summary-run', 'summary-root-workflow']]);
         if (mode === 'failure')
-          expect(summary?.error).toContain('D0 expected failure');
+          expect(summary?.error).toContain('expected workflow failure');
         if (mode === 'resuspension')
           expect(summary?.resumeCount).toEqual({ gate: 1 });
         if (mode === 'plain-dots')
@@ -1605,36 +1625,38 @@ describe('D0 summary compatibility', () => {
     }
   });
 
-  it('D0 preserves genuine missing-run and recovery mismatch behavior', async () => {
-    const f = d0Fixture();
-    d0Collision(f);
+  it('preserves genuine missing-run and recovery mismatch behavior', async () => {
+    const f = rootSummaryFixture();
+    rootSummaryCollisionWorkflow(f);
     try {
-      await expect(f.runtime.status('d0-root', 'absent')).resolves.toBeNull();
       await expect(
-        f.runtime.authoritativeStatus('d0-root', 'absent'),
+        f.runtime.status('summary-root-workflow', 'absent'),
+      ).resolves.toBeNull();
+      await expect(
+        f.runtime.authoritativeStatus('summary-root-workflow', 'absent'),
       ).resolves.toBeNull();
       await expect(
         f.runtime.recoverStartAttempt(
           {
             tablePrefix: '',
-            workflowId: 'd0-root',
+            workflowId: 'summary-root-workflow',
             runId: 'absent',
             startToken: 'absent',
           },
-          { attemptToken: 'd0-attempt', isOwnerQuiescent: () => true },
+          { attemptToken: 'summary-attempt', isOwnerQuiescent: () => true },
         ),
       ).resolves.toBeNull();
-      await f.runtime.start('d0-root', d0Start);
+      await f.runtime.start('summary-root-workflow', rootSummaryStartOptions);
       const before = f.row();
       await expect(
         f.runtime.recoverStartAttempt(
           {
             tablePrefix: '',
-            workflowId: 'd0-root',
-            runId: 'd0-run',
+            workflowId: 'summary-root-workflow',
+            runId: 'summary-run',
             startToken: 'wrong',
           },
-          { attemptToken: 'd0-attempt', isOwnerQuiescent: () => true },
+          { attemptToken: 'summary-attempt', isOwnerQuiescent: () => true },
         ),
       ).rejects.toThrow('run start recovery is unresolved');
       expect(f.row()).toEqual(before);
@@ -1644,7 +1666,7 @@ describe('D0 summary compatibility', () => {
     }
   });
 
-  it('D0 preserves fallback refusal before recovery deletion', async () => {
+  it('preserves fallback refusal before recovery deletion', async () => {
     const storage = new InMemoryStore();
     const { runtime, createStep, createWorkflow } = init(
       { storage },
@@ -1654,7 +1676,7 @@ describe('D0 summary compatibility', () => {
       },
     );
     const workflow = createWorkflow({
-      id: 'd0-fallback',
+      id: 'summary-fallback-workflow',
       inputSchema: z.object({}),
       outputSchema: z.object({}),
     })
@@ -1667,29 +1689,29 @@ describe('D0 summary compatibility', () => {
         }),
       )
       .commit();
-    const started = await runtime.start('d0-fallback', {
-      runId: 'd0-run',
+    const started = await runtime.start('summary-fallback-workflow', {
+      runId: 'summary-run',
       inputData: {},
     });
     const remove = vi.spyOn(workflow, 'deleteWorkflowRunById');
     const domain = await storage.getStore('workflows');
-    if (!domain) throw new Error('D0 workflows domain missing');
+    if (!domain) throw new Error('workflows domain missing');
     const blind = vi
       .spyOn(domain, 'getWorkflowRunById')
       .mockResolvedValue(null);
     const restore = () => blind.mockRestore();
     try {
       await expect(
-        runtime.status('d0-fallback', started.runId),
+        runtime.status('summary-fallback-workflow', started.runId),
       ).resolves.toMatchObject({ status: 'pending' });
       await expect(
-        runtime.authoritativeStatus('d0-fallback', started.runId),
+        runtime.authoritativeStatus('summary-fallback-workflow', started.runId),
       ).rejects.toBeInstanceOf(RunStateUnreadableError);
       await expect(
         runtime.recoverStartAttempt(
           {
             tablePrefix: '',
-            workflowId: 'd0-fallback',
+            workflowId: 'summary-fallback-workflow',
             runId: started.runId,
             startToken: 'valid',
           },
@@ -1702,7 +1724,7 @@ describe('D0 summary compatibility', () => {
       remove.mockRestore();
     }
     await expect(
-      runtime.authoritativeStatus('d0-fallback', started.runId),
+      runtime.authoritativeStatus('summary-fallback-workflow', started.runId),
     ).resolves.toHaveProperty('status', 'suspended');
   });
 });
@@ -1793,7 +1815,7 @@ function buildRuntime(storage: InMemoryStore): {
   return { runtime, counters };
 }
 
-function cDeferred() {
+function deferredSignal() {
   let resolve!: () => void;
   const promise = new Promise<void>((done) => {
     resolve = done;
@@ -1801,7 +1823,7 @@ function cDeferred() {
   return { promise, resolve };
 }
 
-async function cOwnedRuntime(
+async function ownedRuntimeFixture(
   domain: 'default' | 'background' = 'default',
   provider?: RequestContextProvider,
 ) {
@@ -1897,7 +1919,7 @@ async function cOwnedRuntime(
   };
 }
 
-function cOptions(runId = 'c-run'): StartRunOptions {
+function capturedStartOptions(runId = 'c-run'): StartRunOptions {
   return {
     runId,
     inputData: { value: 'original' },
@@ -1924,7 +1946,7 @@ function cOptions(runId = 'c-run'): StartRunOptions {
   };
 }
 
-function cPrimitive(
+function observedPrimitive(
   value: string,
   mode: 'stable' | 'alternating' | 'second-throw',
 ) {
@@ -1937,7 +1959,7 @@ function cPrimitive(
     });
 }
 
-function cObservedOptions(values: StartRunOptions) {
+function observedStartOptions(values: StartRunOptions) {
   const getters = Object.fromEntries(
     Object.entries(values).map(([key, value]) => [key, vi.fn(() => value)]),
   );
@@ -1951,7 +1973,7 @@ function cObservedOptions(values: StartRunOptions) {
   return { source, getters };
 }
 
-type CEconomicShape =
+type EconomicOperationsShape =
   | 'leading'
   | 'interior'
   | 'trailing'
@@ -1960,7 +1982,7 @@ type CEconomicShape =
   | 'inherited'
   | 'empty';
 
-function cEconomicArray(shape: CEconomicShape) {
+function economicOperationsArray(shape: EconomicOperationsShape) {
   const operations: Array<{ id: string; settlementState: string }> =
     shape === 'all-hole'
       ? new Array(3)
@@ -1986,27 +2008,27 @@ function cEconomicArray(shape: CEconomicShape) {
   return operations;
 }
 
-describe('C economic format safety', () => {
+describe('economic format safety', () => {
   it.each(
     (['default', 'background'] as const).flatMap((domain) =>
       (['leading', 'interior', 'trailing', 'all-hole'] as const).map(
         (shape) => ({ domain, shape }),
       ),
     ),
-  )('C refuses sparse economic operations before start effects ($domain, $shape)', async ({
+  )('refuses sparse economic operations before start effects ($domain, $shape)', async ({
     domain,
     shape,
   }) => {
     const provider = vi.fn(() => ({}));
-    const f = await cOwnedRuntime(domain, provider);
+    const f = await ownedRuntimeFixture(domain, provider);
     const read = vi.spyOn(f.fence, 'read');
     const create = vi.spyOn(f.workflow, 'createRun');
     const persist = vi.spyOn(f.workflows, 'persistWorkflowSnapshot');
     try {
       const error = await f.runtime
         .start('c-workflow', {
-          ...cOptions(),
-          economicOperations: cEconomicArray(shape),
+          ...capturedStartOptions(),
+          economicOperations: economicOperationsArray(shape),
         })
         .catch((cause: unknown) => cause);
       expect(error).toBeInstanceOf(Error);
@@ -2028,8 +2050,8 @@ describe('C economic format safety', () => {
     }
   });
 
-  it('C refuses sparse capture before reading later economic entries', async () => {
-    const f = await cOwnedRuntime();
+  it('refuses sparse capture before reading later economic entries', async () => {
+    const f = await ownedRuntimeFixture();
     const later = vi.fn(() => {
       throw new Error('later entry must not be read');
     });
@@ -2042,7 +2064,10 @@ describe('C economic format safety', () => {
     };
     try {
       const error = await f.runtime
-        .start('c-workflow', { ...cOptions(), economicOperations: operations })
+        .start('c-workflow', {
+          ...capturedStartOptions(),
+          economicOperations: operations,
+        })
         .catch((cause: unknown) => cause);
       expect(error).toEqual(new Error('stored run lifecycle is malformed'));
       expect(later).not.toHaveBeenCalled();
@@ -2059,17 +2084,17 @@ describe('C economic format safety', () => {
         shape,
       })),
     ),
-  )('C round-trips dense economic arrays on owned storage ($domain, $shape)', async ({
+  )('round-trips dense economic arrays on owned storage ($domain, $shape)', async ({
     domain,
     shape,
   }) => {
-    const f = await cOwnedRuntime(domain);
-    const operations = cEconomicArray(shape);
+    const f = await ownedRuntimeFixture(domain);
+    const operations = economicOperationsArray(shape);
     const expected = JSON.parse(JSON.stringify(operations));
     try {
       await expect(
         f.runtime.start('c-workflow', {
-          ...cOptions(),
+          ...capturedStartOptions(),
           economicOperations: operations,
         }),
       ).resolves.toMatchObject({ status: 'success' });
@@ -2095,12 +2120,12 @@ describe('C economic format safety', () => {
         (shape) => ({ domain, shape }),
       ),
     ),
-  )('C sparse resume preserves the readable suspended snapshot ($domain, $shape)', async ({
+  )('sparse resume preserves the readable suspended snapshot ($domain, $shape)', async ({
     domain,
     shape,
   }) => {
     const provider = vi.fn(() => ({}));
-    const f = await cOwnedRuntime(domain, provider);
+    const f = await ownedRuntimeFixture(domain, provider);
     const resumed = vi.fn();
     const schema = z.object({ value: z.string() });
     const workflow = f
@@ -2145,7 +2170,7 @@ describe('C economic format safety', () => {
         .resume(workflow.id, 'resume-run', {
           step: 'gate',
           resumeData: { ok: true },
-          economicOperations: cEconomicArray(shape),
+          economicOperations: economicOperationsArray(shape),
         })
         .catch((cause: unknown) => cause);
       expect(error).toBeInstanceOf(Error);
@@ -2169,7 +2194,7 @@ describe('C economic format safety', () => {
           await f.runtime.resume(workflow.id, 'resume-run', {
             step: 'gate',
             resumeData: { ok: true },
-            economicOperations: cEconomicArray('dense'),
+            economicOperations: economicOperationsArray('dense'),
           })
         ).status,
       ).toBe('success');
@@ -2179,16 +2204,16 @@ describe('C economic format safety', () => {
   });
 });
 
-describe('C Runtime capture', () => {
+describe('Runtime capture', () => {
   it.each(
     (['default', 'background'] as const).flatMap((domain) =>
       [undefined, 1, 2, 3].map((epoch) => ({ domain, epoch })),
     ),
-  )('C enforces active mutation epoch at Runtime start ($domain, $epoch)', async ({
+  )('enforces active mutation epoch at Runtime start ($domain, $epoch)', async ({
     domain,
     epoch,
   }) => {
-    const f = await cOwnedRuntime(domain);
+    const f = await ownedRuntimeFixture(domain);
     try {
       expect(await f.fence.read()).toMatchObject({
         state: 'open',
@@ -2197,7 +2222,7 @@ describe('C Runtime capture', () => {
       });
       const runId = `epoch-${epoch ?? 'missing'}`;
       const options = {
-        ...cOptions(runId),
+        ...capturedStartOptions(runId),
         onPreparedStartIdentity: f.callback,
       };
       if (epoch === undefined)
@@ -2228,7 +2253,7 @@ describe('C Runtime capture', () => {
         requestedByKind: 'human',
         startToken: expect.any(String),
         mutationEpoch: 2,
-        startIdentity: cOptions().startIdentity,
+        startIdentity: capturedStartOptions().startIdentity,
         attemptToken: 'attempt-original',
         resumeCounts: [],
       });
@@ -2254,20 +2279,17 @@ describe('C Runtime capture', () => {
   });
 
   for (const [title, counter] of [
-    ['C invokes preparation only after provider success', 'callback'],
-    ['C admits each prepared start through the owned capability', 'admission'],
-    [
-      'C keeps terminalization exclusively in owning recovery',
-      'terminalization',
-    ],
+    ['invokes preparation only after provider success', 'callback'],
+    ['admits each prepared start through the owned capability', 'admission'],
+    ['keeps terminalization exclusively in owning recovery', 'terminalization'],
   ] as const) {
     it.each([
       'default',
       'background',
     ] as const)(`${title} (%s)`, async (domain) => {
       let failProvider = false;
-      const failure = new Error('C provider failure');
-      const f = await cOwnedRuntime(domain, () => {
+      const failure = new Error('provider failure');
+      const f = await ownedRuntimeFixture(domain, () => {
         if (failProvider) throw failure;
         return {};
       });
@@ -2304,7 +2326,7 @@ describe('C Runtime capture', () => {
           let outcome: RunSummary | undefined;
           try {
             const pending = f.runtime.start('c-workflow', {
-              ...cOptions(runId),
+              ...capturedStartOptions(runId),
               onPreparedStartIdentity: f.callback,
             });
             if (phase === 'failure')
@@ -2339,7 +2361,7 @@ describe('C Runtime capture', () => {
               requestedByKind: 'human',
               startToken: expect.any(String),
               mutationEpoch: 2,
-              startIdentity: cOptions().startIdentity,
+              startIdentity: capturedStartOptions().startIdentity,
               attemptToken: 'attempt-original',
               resumeCounts: [],
             });
@@ -2357,16 +2379,16 @@ describe('C Runtime capture', () => {
     });
   }
 
-  it('C captures Runtime options before the fence wait', async () => {
-    const providerEntered = cDeferred();
-    const providerRelease = cDeferred();
-    const f = await cOwnedRuntime('default', async () => {
+  it('captures Runtime options before the fence wait', async () => {
+    const providerEntered = deferredSignal();
+    const providerRelease = deferredSignal();
+    const f = await ownedRuntimeFixture('default', async () => {
       providerEntered.resolve();
       await providerRelease.promise;
       return {};
     });
-    const entered = cDeferred();
-    const release = cDeferred();
+    const entered = deferredSignal();
+    const release = deferredSignal();
     const read = f.fence.read.bind(f.fence);
     const fenceRead = vi
       .spyOn(f.fence, 'read')
@@ -2376,7 +2398,7 @@ describe('C Runtime capture', () => {
         return read();
       });
     const clock = vi.spyOn(Date, 'now').mockReturnValue(1000);
-    const { source, getters } = cObservedOptions(cOptions());
+    const { source, getters } = observedStartOptions(capturedStartOptions());
     const pending = f.runtime.start('c-workflow', source);
     void pending.catch(() => undefined);
     try {
@@ -2432,18 +2454,18 @@ describe('C Runtime capture', () => {
     }
   });
 
-  it('C captures Runtime options before waiting for the run lock', async () => {
-    const entered = cDeferred();
-    const release = cDeferred();
-    const f = await cOwnedRuntime('default', async () => {
+  it('captures Runtime options before waiting for the run lock', async () => {
+    const entered = deferredSignal();
+    const release = deferredSignal();
+    const f = await ownedRuntimeFixture('default', async () => {
       entered.resolve();
       await release.promise;
       return {};
     });
-    const first = f.runtime.start('c-workflow', cOptions());
+    const first = f.runtime.start('c-workflow', capturedStartOptions());
     void first.catch(() => undefined);
     await entered.promise;
-    const queued = cDeferred();
+    const queued = deferredSignal();
     const nativeSet = Map.prototype.set;
     const set = vi.spyOn(Map.prototype, 'set').mockImplementation(function (
       this: Map<unknown, unknown>,
@@ -2454,7 +2476,7 @@ describe('C Runtime capture', () => {
         queued.resolve();
       return nativeSet.call(this, key, value);
     });
-    const { source, getters } = cObservedOptions(cOptions());
+    const { source, getters } = observedStartOptions(capturedStartOptions());
     const second = f.runtime.start('c-workflow', source);
     void second.catch(() => undefined);
     try {
@@ -2529,14 +2551,14 @@ describe('C Runtime capture', () => {
     ['deadline', { deadlineMs: -1 }, InvalidRunRequestError],
     ['dispatch', { scheduleDispatch: [] }, Error],
     ['operations', { economicOperations: [null] }, Error],
-  ] as const)('C validates supplied fields before fence and storage (%s)', async (_label, changes, errorType) => {
-    const f = await cOwnedRuntime();
+  ] as const)('validates supplied fields before fence and storage (%s)', async (_label, changes, errorType) => {
+    const f = await ownedRuntimeFixture();
     const read = vi.spyOn(f.fence, 'read');
     const create = vi.spyOn(f.workflow, 'createRun');
     try {
       const error = await f.runtime
         .start('c-workflow', {
-          ...cOptions(),
+          ...capturedStartOptions(),
           ...changes,
         } as StartRunOptions)
         .catch((cause: unknown) => cause);
@@ -2608,15 +2630,18 @@ describe('C Runtime capture', () => {
         ],
       },
     ],
-  ] as const)('C rejects malformed lifecycle input with the exact legacy error before effects: %s', async (_label, changes) => {
+  ] as const)('rejects malformed lifecycle input with the exact legacy error before effects: %s', async (_label, changes) => {
     const provider = vi.fn(() => ({}));
-    const f = await cOwnedRuntime('default', provider);
+    const f = await ownedRuntimeFixture('default', provider);
     const read = vi.spyOn(f.fence, 'read');
     const create = vi.spyOn(f.workflow, 'createRun');
     const persist = vi.spyOn(f.workflows, 'persistWorkflowSnapshot');
     try {
       const error = await f.runtime
-        .start('c-workflow', { ...cOptions(), ...changes } as StartRunOptions)
+        .start('c-workflow', {
+          ...capturedStartOptions(),
+          ...changes,
+        } as StartRunOptions)
         .catch((cause: unknown) => cause);
       expect(error).toBeInstanceOf(Error);
       expect(Object.getPrototypeOf(error)).toBe(Error.prototype);
@@ -2640,19 +2665,22 @@ describe('C Runtime capture', () => {
     NaN,
     Infinity,
     Number.MAX_SAFE_INTEGER,
-  ])('C rejects malformed economic array length before effects: %s', async (length) => {
+  ])('rejects malformed economic array length before effects: %s', async (length) => {
     const provider = vi.fn(() => ({}));
-    const f = await cOwnedRuntime('default', provider);
+    const f = await ownedRuntimeFixture('default', provider);
     const read = vi.spyOn(f.fence, 'read');
     const create = vi.spyOn(f.workflow, 'createRun');
-    const operations = new Proxy(cEconomicArray('dense'), {
+    const operations = new Proxy(economicOperationsArray('dense'), {
       get(target, key, receiver) {
         return key === 'length' ? length : Reflect.get(target, key, receiver);
       },
     });
     try {
       const error = await f.runtime
-        .start('c-workflow', { ...cOptions(), economicOperations: operations })
+        .start('c-workflow', {
+          ...capturedStartOptions(),
+          economicOperations: operations,
+        })
         .catch((cause: unknown) => cause);
       expect(error).toBeInstanceOf(Error);
       expect(Object.getPrototypeOf(error)).toBe(Error.prototype);
@@ -2666,8 +2694,8 @@ describe('C Runtime capture', () => {
     }
   });
 
-  it('C keeps unattributed unkeyed starts and first getter faults without effects', async () => {
-    const f = await cOwnedRuntime();
+  it('keeps unattributed unkeyed starts and first getter faults without effects', async () => {
+    const f = await ownedRuntimeFixture();
     const read = vi.spyOn(f.fence, 'read');
     const fault = new Error('first Runtime read');
     try {
@@ -2699,7 +2727,10 @@ describe('C Runtime capture', () => {
         },
       ])
         await expect(
-          f.runtime.start('c-workflow', { ...cOptions(), ...changes }),
+          f.runtime.start('c-workflow', {
+            ...capturedStartOptions(),
+            ...changes,
+          }),
         ).rejects.toBe(fault);
       expect(read).not.toHaveBeenCalled();
       expect(
@@ -2721,10 +2752,10 @@ describe('C Runtime capture', () => {
     'stable',
     'alternating',
     'second-throw',
-  ] as const)('C captures each schedule dispatch primitive once before canonicalization: %s', async (mode) => {
+  ] as const)('captures each schedule dispatch primitive once before canonicalization: %s', async (mode) => {
     const { runtime } = buildRuntime(new InMemoryStore());
-    const scheduleId = cPrimitive('schedule-original', mode);
-    const dispatchId = cPrimitive('dispatch-original', mode);
+    const scheduleId = observedPrimitive('schedule-original', mode);
+    const dispatchId = observedPrimitive('dispatch-original', mode);
     const pending = runtime.start('echo', {
       runId: 'capture-dispatch',
       inputData: { value: 'original' },
@@ -2742,7 +2773,7 @@ describe('C Runtime capture', () => {
     expect(dispatchId).toHaveBeenCalledTimes(1);
   });
 
-  it('C captures economic entries without invoking caller array methods', async () => {
+  it('captures economic entries without invoking caller array methods', async () => {
     const { runtime } = buildRuntime(new InMemoryStore());
     const id = vi.fn(() => 'operation-original');
     const settlementState = vi.fn(() => 'settled');
@@ -2777,10 +2808,10 @@ describe('C Runtime capture', () => {
     'stable',
     'alternating',
     'second-throw',
-  ] as const)('C captures each economic operation primitive once before canonicalization: %s', async (mode) => {
+  ] as const)('captures each economic operation primitive once before canonicalization: %s', async (mode) => {
     const { runtime } = buildRuntime(new InMemoryStore());
-    const id = cPrimitive('operation-original', mode);
-    const settlementState = cPrimitive('settled', mode);
+    const id = observedPrimitive('operation-original', mode);
+    const settlementState = observedPrimitive('settled', mode);
     const pending = runtime.start('echo', {
       runId: 'capture-operations',
       inputData: { value: 'original' },
@@ -4078,7 +4109,7 @@ describe('RunnerRuntime ownership changes during operations', () => {
   }
 
   it('refuses start repointed after entry before storage capture', async () => {
-    const f = await d3RuntimeFixture('custom');
+    const f = await runtimeActivationFixture('custom');
     const runId = 'start-after-entry';
     try {
       const pending = f.runtime.start(f.workflow.id, f.options(runId));
@@ -4091,7 +4122,7 @@ describe('RunnerRuntime ownership changes during operations', () => {
   });
 
   it('refuses resume repointed after entry before storage capture', async () => {
-    const f = await d3RuntimeFixture('custom');
+    const f = await runtimeActivationFixture('custom');
     const runId = 'resume-after-entry';
     try {
       await f.runtime.start(f.workflow.id, {
@@ -4110,12 +4141,12 @@ describe('RunnerRuntime ownership changes during operations', () => {
   });
 
   it('refuses start recovery repointed after entry before storage capture', async () => {
-    const f = await d3RuntimeFixture('fenced');
+    const f = await runtimeActivationFixture('fenced');
     try {
       await f.runtime.start(f.workflow.id, f.options());
       const state = await f.runtime.authoritativeStartState(
         f.workflow.id,
-        'd3-run',
+        'activation-run',
       );
       assert(state?.storage === 'd1');
       const pending = f.runtime.recoverStartAttempt(state.execution, {
@@ -4128,7 +4159,7 @@ describe('RunnerRuntime ownership changes during operations', () => {
       await expectRefusedWithoutForeignStorage(
         (result as Error & { cause?: Error }).cause,
         foreign,
-        'd3-run',
+        'activation-run',
       );
     } finally {
       f.close();
@@ -4136,7 +4167,7 @@ describe('RunnerRuntime ownership changes during operations', () => {
   });
 
   it('refuses unfenced start repointed after storage capture before createRun', async () => {
-    const f = await d3RuntimeFixture('custom');
+    const f = await runtimeActivationFixture('custom');
     const runId = 'start-after-capture';
     let foreign: ReturnType<typeof repoint> | undefined;
     try {
@@ -4155,7 +4186,7 @@ describe('RunnerRuntime ownership changes during operations', () => {
   });
 
   it('refuses fenced start repointed after storage capture before createRun', async () => {
-    const f = await d3RuntimeFixture('fenced');
+    const f = await runtimeActivationFixture('fenced');
     let foreign: ReturnType<typeof repoint> | undefined;
     try {
       const result = await f.runtime
@@ -4166,14 +4197,18 @@ describe('RunnerRuntime ownership changes during operations', () => {
           },
         })
         .catch((error: unknown) => error);
-      await expectRefusedWithoutForeignStorage(result, foreign, 'd3-run');
+      await expectRefusedWithoutForeignStorage(
+        result,
+        foreign,
+        'activation-run',
+      );
     } finally {
       f.close();
     }
   });
 
   it('refuses resume repointed after storage capture before createRun', async () => {
-    const f = await d3RuntimeFixture('custom');
+    const f = await runtimeActivationFixture('custom');
     const runId = 'resume-after-capture';
     let foreign: ReturnType<typeof repoint> | undefined;
     try {
@@ -4196,7 +4231,7 @@ describe('RunnerRuntime ownership changes during operations', () => {
   });
 
   it('refuses resume repointed during capture before its state read', async () => {
-    const f = await d3RuntimeFixture('custom');
+    const f = await runtimeActivationFixture('custom');
     const runId = 'resume-during-capture';
     try {
       await f.runtime.start(f.workflow.id, {
@@ -7324,7 +7359,7 @@ describe('per-suspension deadline contract', () => {
   });
 });
 
-async function d3RuntimeFixture(
+async function runtimeActivationFixture(
   mode: 'fenced' | 'prefixed' | 'custom' = 'fenced',
   provider?: RequestContextProvider,
 ) {
@@ -7333,7 +7368,7 @@ async function d3RuntimeFixture(
   const storage =
     mode === 'custom'
       ? new InMemoryStore()
-      : createD1Storage({ binding, tablePrefix: 'd3_' });
+      : createD1Storage({ binding, tablePrefix: 'activation_' });
   await storage.init();
   const fence = new ExecutionFenceStore(binding as ExecutionFenceDatabase);
   await fence.seed('open');
@@ -7352,7 +7387,7 @@ async function d3RuntimeFixture(
   const schema = z.looseObject({});
   const workflow = app
     .createWorkflow({
-      id: 'd3-workflow',
+      id: 'activation-workflow',
       inputSchema: schema,
       outputSchema: schema,
     })
@@ -7384,14 +7419,14 @@ async function d3RuntimeFixture(
       writable: true,
       configurable: true,
     });
-  const options = (runId = 'd3-run'): StartRunOptions => ({
+  const options = (runId = 'activation-run'): StartRunOptions => ({
     runId,
     inputData: {},
     attemptToken: 'H',
     requestedBy: 'owner',
     requestedByKind: 'human',
   });
-  const claim = async (runId = 'd3-run', key = 'd3-key') => {
+  const claim = async (runId = 'activation-run', key = 'activation-key') => {
     const reserved = await reservations.reserve({
       key,
       owner: { kind: 'human', id: 'owner' },
@@ -7405,7 +7440,7 @@ async function d3RuntimeFixture(
     assert(claimed);
     return claimed;
   };
-  const row = (runId = 'd3-run') =>
+  const row = (runId = 'activation-run') =>
     workflows.loadWorkflowSnapshot({ workflowName: workflow.id, runId });
   return {
     ...app,
@@ -7426,7 +7461,7 @@ async function d3RuntimeFixture(
 
 describe('Runtime final fence structural admission', () => {
   async function structuralFixture(proof: boolean) {
-    const f = await d3RuntimeFixture();
+    const f = await runtimeActivationFixture();
     assert(f.capability);
     const owner = { kind: 'human' as const, id: 'owner' };
     const resources = new D1ResourceOwnershipStore(
@@ -7434,7 +7469,7 @@ describe('Runtime final fence structural admission', () => {
     );
     expect(
       await resources.reserveAll(
-        [{ kind: 'run', resourceId: 'd3-run' }],
+        [{ kind: 'run', resourceId: 'activation-run' }],
         owner,
         'H',
       ),
@@ -7460,7 +7495,9 @@ describe('Runtime final fence structural admission', () => {
       startOptions,
       database: f.capability.database,
       snapshots: () =>
-        f.sql.prepare('SELECT * FROM d3_mastra_workflow_snapshot').all(),
+        f.sql
+          .prepare('SELECT * FROM activation_mastra_workflow_snapshot')
+          .all(),
       owners: () =>
         f.sql.prepare('SELECT * FROM flowsafe_resource_owners').all(),
       proofRows: () =>
@@ -7525,8 +7562,10 @@ describe('Runtime final fence structural admission', () => {
       expect(f.effects).not.toHaveBeenCalled();
       expect(f.owners()).toEqual(ownersBefore);
       expect(f.proofRows()).toEqual(changedFence);
-      expect(f.runtime.isRunActive(f.workflow.id, 'd3-run')).toBe(false);
-      expect(f.workflow.runs.has('d3-run')).toBe(false);
+      expect(f.runtime.isRunActive(f.workflow.id, 'activation-run')).toBe(
+        false,
+      );
+      expect(f.workflow.runs.has('activation-run')).toBe(false);
       if (f.claim)
         expect(
           await f.reservations.readForAdmission(f.claim.key),
@@ -7573,7 +7612,9 @@ describe('Runtime final fence structural admission', () => {
           reservation.binding.execution,
         );
       } else expect(reading.reading.proofExecution).toBeUndefined();
-      expect(f.runtime.isRunActive(f.workflow.id, 'd3-run')).toBe(false);
+      expect(f.runtime.isRunActive(f.workflow.id, 'activation-run')).toBe(
+        false,
+      );
     } finally {
       f.close();
     }
@@ -7617,16 +7658,18 @@ describe('Runtime final fence structural admission', () => {
           proof_start_token: null,
         }),
       ]);
-      expect(f.runtime.isRunActive(f.workflow.id, 'd3-run')).toBe(false);
+      expect(f.runtime.isRunActive(f.workflow.id, 'activation-run')).toBe(
+        false,
+      );
     } finally {
       f.close();
     }
   });
 });
 
-describe('FS8 D3 Runtime activation', () => {
-  it('R01 independently mints S when H repeats and retains immutable owner and epoch on resume', async () => {
-    const f = await d3RuntimeFixture('fenced', () => ({
+describe('Runtime activation', () => {
+  it('independently mints S when H repeats and retains immutable owner and epoch on resume', async () => {
+    const f = await runtimeActivationFixture('fenced', () => ({
       'flowsafe.runProvenance': { version: 2, startToken: 'forged' },
     }));
     try {
@@ -7637,7 +7680,7 @@ describe('FS8 D3 Runtime activation', () => {
       });
       const first = await f.runtime.authoritativeStartState(
         f.workflow.id,
-        'd3-run',
+        'activation-run',
       );
       assert(first);
       await f.runtime.start(f.workflow.id, f.options('second'));
@@ -7648,7 +7691,7 @@ describe('FS8 D3 Runtime activation', () => {
       expect(second?.execution.startToken).not.toBe(first.execution.startToken);
       expect(first.execution.startToken).not.toBe('H');
       await expect(
-        f.runtime.resume(f.workflow.id, 'd3-run', {
+        f.runtime.resume(f.workflow.id, 'activation-run', {
           resumeData: { go: true },
           requestedBy: 'reviewer',
           requestedByKind: 'service',
@@ -7656,7 +7699,7 @@ describe('FS8 D3 Runtime activation', () => {
       ).resolves.toMatchObject({ status: 'success', requestedBy: 'reviewer' });
       const resumed = await f.runtime.authoritativeStartState(
         f.workflow.id,
-        'd3-run',
+        'activation-run',
       );
       expect(resumed?.provenance).toMatchObject({
         version: 2,
@@ -7675,8 +7718,8 @@ describe('FS8 D3 Runtime activation', () => {
   it.each([
     'prefixed',
     'custom',
-  ] as const)('R05 binds the original claim before ordinary create with the actual %s namespace', async (mode) => {
-    const f = await d3RuntimeFixture(mode);
+  ] as const)('binds the original claim before ordinary create with the actual %s namespace', async (mode) => {
+    const f = await runtimeActivationFixture(mode);
     try {
       const claim = await f.claim();
       const create = f.workflow.createRun.bind(f.workflow);
@@ -7695,7 +7738,7 @@ describe('FS8 D3 Runtime activation', () => {
       expect(beforeCreate).toMatchObject({
         binding: {
           kind: 'bound',
-          execution: { tablePrefix: mode === 'custom' ? null : 'd3_' },
+          execution: { tablePrefix: mode === 'custom' ? null : 'activation_' },
         },
       });
       expect((await f.reservations.readForAdmission(claim.key))?.state).toBe(
@@ -7710,8 +7753,8 @@ describe('FS8 D3 Runtime activation', () => {
   it.each([
     'missing',
     'foreign',
-  ] as const)('R03 requires its positive witness before engine entry: %s', async (mode) => {
-    const f = await d3RuntimeFixture();
+  ] as const)('requires its positive witness before engine entry: %s', async (mode) => {
+    const f = await runtimeActivationFixture();
     assert(f.capability);
     const original = f.capability.withInitialAdmission;
     let prepared: D1RunExecutionIdentity | undefined;
@@ -7748,14 +7791,14 @@ describe('FS8 D3 Runtime activation', () => {
       ).toMatchObject({ kind: 'bound', execution: prepared });
       expect(f.effects).not.toHaveBeenCalled();
       expect(outcome).toBeInstanceOf(RunStateUnreadableError);
-      expect(f.workflow.runs.has('d3-run')).toBe(true);
+      expect(f.workflow.runs.has('activation-run')).toBe(true);
     } finally {
       f.close();
     }
   });
 
-  it('R03 clears only its captured new cache entry after a definitive same-S refusal', async () => {
-    const f = await d3RuntimeFixture();
+  it('clears only its captured new cache entry after a definitive same-S refusal', async () => {
+    const f = await runtimeActivationFixture();
     try {
       const claim = await f.claim();
       const result = await f.runtime
@@ -7769,7 +7812,7 @@ describe('FS8 D3 Runtime activation', () => {
         })
         .catch((error) => error);
       expect(await f.row()).toBeNull();
-      expect(f.workflow.runs.has('d3-run')).toBe(false);
+      expect(f.workflow.runs.has('activation-run')).toBe(false);
       expect((await f.reservations.readForAdmission(claim.key))?.state).toBe(
         'reserved',
       );
@@ -7786,10 +7829,10 @@ describe('FS8 D3 Runtime activation', () => {
     'engine',
     'terminal',
     'terminal-repair',
-  ] as const)('R04 retains its active frame during the %s wait', async (phase) => {
-    const entered = cDeferred(),
-      release = cDeferred();
-    const f = await d3RuntimeFixture(
+  ] as const)('retains its active frame during the %s wait', async (phase) => {
+    const entered = deferredSignal(),
+      release = deferredSignal();
+    const f = await runtimeActivationFixture(
       'fenced',
       phase === 'provider'
         ? async () => {
@@ -7842,10 +7885,12 @@ describe('FS8 D3 Runtime activation', () => {
             : undefined,
       });
       await entered.promise;
-      expect(f.runtime.isRunActive(f.workflow.id, 'd3-run')).toBe(true);
+      expect(f.runtime.isRunActive(f.workflow.id, 'activation-run')).toBe(true);
       release.resolve();
       await expect(waiting).resolves.toMatchObject({ status: 'success' });
-      expect(f.runtime.isRunActive(f.workflow.id, 'd3-run')).toBe(false);
+      expect(f.runtime.isRunActive(f.workflow.id, 'activation-run')).toBe(
+        false,
+      );
     } finally {
       release.resolve();
       await waiting?.catch(() => undefined);
@@ -7857,8 +7902,8 @@ describe('FS8 D3 Runtime activation', () => {
     'preflight',
     'callback',
     'unknown-create',
-  ] as const)('R06 releases only local preflight with the original claim: %s', async (phase) => {
-    const f = await d3RuntimeFixture(
+  ] as const)('releases only local preflight with the original claim: %s', async (phase) => {
+    const f = await runtimeActivationFixture(
       phase === 'unknown-create' ? 'prefixed' : 'fenced',
     );
     try {
@@ -7900,8 +7945,8 @@ describe('FS8 D3 Runtime activation', () => {
     'v1',
     'tokenless',
     'pending',
-  ] as const)('R07 does not recover a replacement %s after a lost engine result with repeated H', async (replacement) => {
-    const f = await d3RuntimeFixture();
+  ] as const)('does not recover a replacement %s after a lost engine result with repeated H', async (replacement) => {
+    const f = await runtimeActivationFixture();
     const fault = new Error('lost original result');
     try {
       const create = f.workflow.createRun.bind(f.workflow);
@@ -7922,7 +7967,7 @@ describe('FS8 D3 Runtime activation', () => {
           if (replacement === 'pending') snapshot.status = 'pending';
           await f.workflows.persistWorkflowSnapshot({
             workflowName: f.workflow.id,
-            runId: 'd3-run',
+            runId: 'activation-run',
             snapshot,
           });
           throw fault;
@@ -7952,13 +7997,13 @@ describe('FS8 D3 Runtime activation', () => {
     undefined,
     1,
     'yes',
-  ])('R08 requires awaited literal true owning quiescence: %s', async (quiescent) => {
-    const f = await d3RuntimeFixture();
+  ])('requires awaited literal true owning quiescence: %s', async (quiescent) => {
+    const f = await runtimeActivationFixture();
     try {
       await f.runtime.start(f.workflow.id, f.options());
       const state = await f.runtime.authoritativeStartState(
         f.workflow.id,
-        'd3-run',
+        'activation-run',
       );
       assert(state?.storage === 'd1');
       const before = await f.row();
@@ -7976,8 +8021,8 @@ describe('FS8 D3 Runtime activation', () => {
     }
   });
 
-  it('R08 recovers a progressed same-S resume with its new leg H', async () => {
-    const f = await d3RuntimeFixture();
+  it('recovers a progressed same-S resume with its new leg H', async () => {
+    const f = await runtimeActivationFixture();
     try {
       await f.runtime.start(f.workflow.id, {
         ...f.options(),
@@ -7985,10 +8030,10 @@ describe('FS8 D3 Runtime activation', () => {
       });
       const initial = await f.runtime.authoritativeStartState(
         f.workflow.id,
-        'd3-run',
+        'activation-run',
       );
       assert(initial?.storage === 'd1');
-      await f.runtime.resume(f.workflow.id, 'd3-run', {
+      await f.runtime.resume(f.workflow.id, 'activation-run', {
         resumeData: { go: true },
       });
       await expect(
@@ -8010,8 +8055,8 @@ describe('FS8 D3 Runtime activation', () => {
     'fenced',
     'prefixed',
     'custom',
-  ] as const)('R13 rejects normal start pending from captured %s storage before settlement', async (mode) => {
-    const f = await d3RuntimeFixture(mode);
+  ] as const)('rejects normal start pending from captured %s storage before settlement', async (mode) => {
+    const f = await runtimeActivationFixture(mode);
     let prepared: D1RunExecutionIdentity | undefined;
     try {
       const claim = await f.claim();
@@ -8041,7 +8086,9 @@ describe('FS8 D3 Runtime activation', () => {
       );
       expect(f.effects).toHaveBeenCalledOnce();
       expect(result).toBeInstanceOf(RunStartPendingError);
-      expect(f.runtime.isRunActive(f.workflow.id, 'd3-run')).toBe(false);
+      expect(f.runtime.isRunActive(f.workflow.id, 'activation-run')).toBe(
+        false,
+      );
       if (prepared)
         expect(
           (await f.reservations.readForAdmission(claim.key))?.binding,
@@ -8051,8 +8098,8 @@ describe('FS8 D3 Runtime activation', () => {
     }
   });
 
-  it('R13 rejects normal resume pending even when terminal repair acknowledges the write', async () => {
-    const f = await d3RuntimeFixture();
+  it('rejects normal resume pending even when terminal repair acknowledges the write', async () => {
+    const f = await runtimeActivationFixture();
     try {
       await f.runtime.start(f.workflow.id, {
         ...f.options(),
@@ -8067,7 +8114,7 @@ describe('FS8 D3 Runtime activation', () => {
           }),
       );
       const result = await f.runtime
-        .resume(f.workflow.id, 'd3-run', { resumeData: { go: true } })
+        .resume(f.workflow.id, 'activation-run', { resumeData: { go: true } })
         .catch((error) => error);
       expect((await f.row())?.status).toBe('pending');
       expect(f.effects).toHaveBeenCalledTimes(2);
@@ -8078,8 +8125,8 @@ describe('FS8 D3 Runtime activation', () => {
   });
 });
 
-async function d3PreparedPending(
-  f: Awaited<ReturnType<typeof d3RuntimeFixture>>,
+async function preparedPendingFixture(
+  f: Awaited<ReturnType<typeof runtimeActivationFixture>>,
 ) {
   assert(f.capability);
   const admit = f.capability.withInitialAdmission;
@@ -8107,12 +8154,12 @@ async function d3PreparedPending(
   }
 }
 
-describe('FS8 D3 Runtime activation', () => {
-  it('R02 captures the actual alternate prefixed domain and method receivers through preparation', async () => {
-    const nominal = await d3RuntimeFixture('prefixed'),
-      actual = await d3RuntimeFixture('prefixed');
-    const entered = cDeferred(),
-      release = cDeferred();
+describe('Runtime activation', () => {
+  it('captures the actual alternate prefixed domain and method receivers through preparation', async () => {
+    const nominal = await runtimeActivationFixture('prefixed'),
+      actual = await runtimeActivationFixture('prefixed');
+    const entered = deferredSignal(),
+      release = deferredSignal();
     let pending: Promise<RunSummary> | undefined;
     try {
       const nominalMastra = nominal.workflow.mastra;
@@ -8152,7 +8199,7 @@ describe('FS8 D3 Runtime activation', () => {
       pending = standalone.start(nominal.workflow.id, {
         ...nominal.options(),
         onPreparedStartIdentity: async (identity) => {
-          expect(identity.tablePrefix).toBe('d3_');
+          expect(identity.tablePrefix).toBe('activation_');
           entered.resolve();
           await release.promise;
         },
@@ -8176,10 +8223,10 @@ describe('FS8 D3 Runtime activation', () => {
     }
   });
 
-  it('R08 terminalizes the original selected pending bytes and returns B2 S1 after a later S2 write', async () => {
-    const f = await d3RuntimeFixture();
+  it('terminalizes the original selected pending bytes and returns recovered S1 after a later S2 write', async () => {
+    const f = await runtimeActivationFixture();
     try {
-      const { execution, claim } = await d3PreparedPending(f);
+      const { execution, claim } = await preparedPendingFixture(f);
       assert(f.capability);
       const original = f.capability.terminalizeInitialAdmission;
       const read = vi.spyOn(f.capability, 'readSnapshot');
@@ -8191,7 +8238,7 @@ describe('FS8 D3 Runtime activation', () => {
           later.result = { foreign: true };
           await f.workflows.persistWorkflowSnapshot({
             workflowName: f.workflow.id,
-            runId: 'd3-run',
+            runId: 'activation-run',
             snapshot: later,
           });
         }
@@ -8221,11 +8268,11 @@ describe('FS8 D3 Runtime activation', () => {
     }
   });
 
-  it('R08 preserves the captured source across owning quiescence and read replacement', async () => {
-    const f = await d3RuntimeFixture(),
-      other = await d3RuntimeFixture();
+  it('preserves the captured source across owning quiescence and read replacement', async () => {
+    const f = await runtimeActivationFixture(),
+      other = await runtimeActivationFixture();
     try {
-      const { execution, claim } = await d3PreparedPending(f);
+      const { execution, claim } = await preparedPendingFixture(f);
       assert(f.capability);
       assert(other.capability);
       const foreign = vi.spyOn(other.capability, 'terminalizeInitialAdmission');
@@ -8262,10 +8309,10 @@ describe('FS8 D3 Runtime activation', () => {
     'resumed',
     'different-H',
     'conflict',
-  ] as const)('R10 keeps uncertain initial %s nonreplayable', async (mode) => {
-    const f = await d3RuntimeFixture();
+  ] as const)('keeps uncertain initial %s nonreplayable', async (mode) => {
+    const f = await runtimeActivationFixture();
     try {
-      const { execution, claim } = await d3PreparedPending(f);
+      const { execution, claim } = await preparedPendingFixture(f);
       assert(f.capability);
       const snapshot = await f.row();
       assert(snapshot);
@@ -8276,7 +8323,7 @@ describe('FS8 D3 Runtime activation', () => {
       if (mode === 'different-H') provenance.attemptToken = 'other';
       await f.workflows.persistWorkflowSnapshot({
         workflowName: f.workflow.id,
-        runId: 'd3-run',
+        runId: 'activation-run',
         snapshot,
       });
       if (mode === 'conflict')
@@ -8306,10 +8353,10 @@ describe('FS8 D3 Runtime activation', () => {
     }
   });
 
-  it('R09 blocks keyed terminal recovery when exact settlement fails and retries that settlement', async () => {
-    const f = await d3RuntimeFixture();
+  it('blocks keyed terminal recovery when exact settlement fails and retries that settlement', async () => {
+    const f = await runtimeActivationFixture();
     try {
-      const { execution, claim } = await d3PreparedPending(f);
+      const { execution, claim } = await preparedPendingFixture(f);
       const settle = vi
         .spyOn(f.reservations, 'settleExecution')
         .mockRejectedValueOnce(new Error('settle unavailable'));
@@ -8349,10 +8396,10 @@ describe('FS8 D3 Runtime activation', () => {
     'wrong-owner',
     'wrong-target',
     'missing-store',
-  ] as const)('R09 refuses keyed recovery with %s authority', async (mode) => {
-    const f = await d3RuntimeFixture();
+  ] as const)('refuses keyed recovery with %s authority', async (mode) => {
+    const f = await runtimeActivationFixture();
     try {
-      const { execution, claim } = await d3PreparedPending(f);
+      const { execution, claim } = await preparedPendingFixture(f);
       const runtime =
         mode === 'missing-store'
           ? init(
@@ -8391,11 +8438,11 @@ describe('FS8 D3 Runtime activation', () => {
     'preparation',
     'create',
     'fence-wait',
-  ] as const)('R12 retains the originally admitted proof S through the %s wait', async (phase) => {
-    const entered = cDeferred(),
-      release = cDeferred();
+  ] as const)('retains the originally admitted proof S through the %s wait', async (phase) => {
+    const entered = deferredSignal(),
+      release = deferredSignal();
     let resumePhase = false;
-    const f = await d3RuntimeFixture(
+    const f = await runtimeActivationFixture(
       'fenced',
       phase === 'provider'
         ? async () => {
@@ -8447,7 +8494,7 @@ describe('FS8 D3 Runtime activation', () => {
           return result;
         });
       }
-      pending = f.runtime.resume(f.workflow.id, 'd3-run', {
+      pending = f.runtime.resume(f.workflow.id, 'activation-run', {
         resumeData: { go: true },
         prepareExecution:
           phase === 'preparation'
@@ -8463,7 +8510,7 @@ describe('FS8 D3 Runtime activation', () => {
       before.requestContext['flowsafe.runProvenance'].startToken = 'S2';
       await f.workflows.persistWorkflowSnapshot({
         workflowName: f.workflow.id,
-        runId: 'd3-run',
+        runId: 'activation-run',
         snapshot: before,
       });
       release.resolve();
@@ -8481,14 +8528,14 @@ describe('FS8 D3 Runtime activation', () => {
   });
 });
 
-describe('FS8 D3 Runtime activation', () => {
+describe('Runtime activation', () => {
   it.each([
     'cancelled',
     'timed_out',
-  ] as const)('R10 recovers saved %s intent as a lifecycle descriptor and preserves completed cleanup', async (status) => {
-    const f = await d3RuntimeFixture();
+  ] as const)('recovers saved %s intent as a lifecycle descriptor and preserves completed cleanup', async (status) => {
+    const f = await runtimeActivationFixture();
     try {
-      const { execution, claim } = await d3PreparedPending(f);
+      const { execution, claim } = await preparedPendingFixture(f);
       const snapshot = await f.row();
       assert(snapshot?.requestContext);
       snapshot.requestContext['flowsafe.runLifecycle'] = {
@@ -8502,7 +8549,7 @@ describe('FS8 D3 Runtime activation', () => {
       };
       await f.workflows.persistWorkflowSnapshot({
         workflowName: f.workflow.id,
-        runId: 'd3-run',
+        runId: 'activation-run',
         snapshot,
       });
       const result = await f.runtime.recoverStartAttempt(execution, {
@@ -8527,7 +8574,7 @@ describe('FS8 D3 Runtime activation', () => {
       assert(result?.kind === 'lifecycle');
       await f.runtime.completeTerminalCleanup(
         f.workflow.id,
-        'd3-run',
+        'activation-run',
         result.transition.cleanup.revision,
       );
       await expect(
@@ -8548,10 +8595,10 @@ describe('FS8 D3 Runtime activation', () => {
     }
   });
 
-  it('R10 preserves a raw pending row with terminal-looking metadata on public status reads', async () => {
-    const f = await d3RuntimeFixture();
+  it('preserves a raw pending row with terminal-looking metadata on public status reads', async () => {
+    const f = await runtimeActivationFixture();
     try {
-      await d3PreparedPending(f);
+      await preparedPendingFixture(f);
       const snapshot = await f.row();
       assert(snapshot?.requestContext);
       snapshot.requestContext['flowsafe.runLifecycle'] = {
@@ -8566,17 +8613,17 @@ describe('FS8 D3 Runtime activation', () => {
       };
       await f.workflows.persistWorkflowSnapshot({
         workflowName: f.workflow.id,
-        runId: 'd3-run',
+        runId: 'activation-run',
         snapshot,
       });
       const before = await f.row();
       for (const method of ['status', 'authoritativeStatus'] as const)
         await expect(
-          f.runtime[method](f.workflow.id, 'd3-run'),
+          f.runtime[method](f.workflow.id, 'activation-run'),
         ).rejects.toBeInstanceOf(RunStartPendingError);
       const observation = await f.runtime.authoritativeStartState(
         f.workflow.id,
-        'd3-run',
+        'activation-run',
       );
       expect(await f.row()).toEqual(before);
       expect(f.effects).not.toHaveBeenCalled();
@@ -8587,8 +8634,8 @@ describe('FS8 D3 Runtime activation', () => {
     }
   });
 
-  it('R13 permits capable no-fence initial pending omission followed by a real nonpending result', async () => {
-    const f = await d3RuntimeFixture('prefixed');
+  it('permits capable no-fence initial pending omission followed by a real nonpending result', async () => {
+    const f = await runtimeActivationFixture('prefixed');
     try {
       f.workflow.options.shouldPersistSnapshot = ({ workflowStatus }) =>
         workflowStatus !== 'pending';
@@ -8609,12 +8656,12 @@ describe('FS8 D3 Runtime activation', () => {
   });
 });
 
-describe('FS8 D3 Runtime activation', () => {
+describe('Runtime activation', () => {
   it.each([
     'start',
     'resume',
-  ] as const)('R13 does not replace a selected pending normal %s observation with a later readable result', async (leg) => {
-    const f = await d3RuntimeFixture();
+  ] as const)('does not replace a selected pending normal %s observation with a later readable result', async (leg) => {
+    const f = await runtimeActivationFixture();
     try {
       if (leg === 'resume')
         await f.runtime.start(f.workflow.id, {
@@ -8634,7 +8681,7 @@ describe('FS8 D3 Runtime activation', () => {
         });
       const result = await (leg === 'start'
         ? f.runtime.start(f.workflow.id, f.options())
-        : f.runtime.resume(f.workflow.id, 'd3-run', {
+        : f.runtime.resume(f.workflow.id, 'activation-run', {
             resumeData: { go: true },
           })
       ).catch((error) => error);
@@ -8648,14 +8695,14 @@ describe('FS8 D3 Runtime activation', () => {
   });
 });
 
-describe('FS8 D3 Runtime activation', () => {
+describe('Runtime activation', () => {
   it.each([
     'skip',
     'swallow',
     'reject',
     'response-loss',
-  ] as const)('R03 prevents unwitnessed engine entry and preserves response-loss evidence: %s', async (mode) => {
-    const f = await d3RuntimeFixture();
+  ] as const)('prevents unwitnessed engine entry and preserves response-loss evidence: %s', async (mode) => {
+    const f = await runtimeActivationFixture();
     try {
       const claim = await f.claim();
       assert(f.capability);
@@ -8700,11 +8747,13 @@ describe('FS8 D3 Runtime activation', () => {
     }
   });
 
-  it('R03 preserves a replacement cache and tokenless row after its own no-insert refusal', async () => {
-    const f = await d3RuntimeFixture(),
-      other = await d3RuntimeFixture('prefixed');
+  it('preserves a replacement cache and tokenless row after its own no-insert refusal', async () => {
+    const f = await runtimeActivationFixture(),
+      other = await runtimeActivationFixture('prefixed');
     try {
-      const replacement = await other.workflow.createRun({ runId: 'd3-run' });
+      const replacement = await other.workflow.createRun({
+        runId: 'activation-run',
+      });
       assert(f.capability);
       const native = f.capability.withInitialAdmission;
       f.capability.withInitialAdmission = async (input, create) => {
@@ -8715,10 +8764,10 @@ describe('FS8 D3 Runtime activation', () => {
           assert(tokenless);
           await f.workflows.persistWorkflowSnapshot({
             workflowName: f.workflow.id,
-            runId: 'd3-run',
+            runId: 'activation-run',
             snapshot: tokenless,
           });
-          f.workflow.runs.set('d3-run', replacement);
+          f.workflow.runs.set('activation-run', replacement);
           throw error;
         }
       };
@@ -8735,7 +8784,7 @@ describe('FS8 D3 Runtime activation', () => {
         .catch((error) => error);
       expect((await f.row())?.status).toBe('pending');
       expect((await f.row())?.requestContext).toBeUndefined();
-      expect(f.workflow.runs.get('d3-run')).toBe(replacement);
+      expect(f.workflow.runs.get('activation-run')).toBe(replacement);
       expect(f.effects).not.toHaveBeenCalled();
       expect(result).toBeInstanceOf(Error);
     } finally {
@@ -8744,12 +8793,12 @@ describe('FS8 D3 Runtime activation', () => {
     }
   });
 
-  it('R04 installs the frame before the existence read and keeps it during result recovery', async () => {
-    const entered = cDeferred(),
-      release = cDeferred(),
-      reading = cDeferred(),
-      readRelease = cDeferred();
-    const f = await d3RuntimeFixture();
+  it('installs the frame before the existence read and keeps it during result recovery', async () => {
+    const entered = deferredSignal(),
+      release = deferredSignal(),
+      reading = deferredSignal(),
+      readRelease = deferredSignal();
+    const f = await runtimeActivationFixture();
     let pending: Promise<RunSummary> | undefined;
     try {
       const existing = f.workflow.getWorkflowRunById.bind(f.workflow);
@@ -8779,13 +8828,15 @@ describe('FS8 D3 Runtime activation', () => {
       };
       pending = f.runtime.start(f.workflow.id, f.options());
       await entered.promise;
-      expect(f.runtime.isRunActive(f.workflow.id, 'd3-run')).toBe(true);
+      expect(f.runtime.isRunActive(f.workflow.id, 'activation-run')).toBe(true);
       release.resolve();
       await reading.promise;
-      expect(f.runtime.isRunActive(f.workflow.id, 'd3-run')).toBe(true);
+      expect(f.runtime.isRunActive(f.workflow.id, 'activation-run')).toBe(true);
       readRelease.resolve();
       await expect(pending).resolves.toMatchObject({ status: 'success' });
-      expect(f.runtime.isRunActive(f.workflow.id, 'd3-run')).toBe(false);
+      expect(f.runtime.isRunActive(f.workflow.id, 'activation-run')).toBe(
+        false,
+      );
     } finally {
       release.resolve();
       readRelease.resolve();
@@ -8794,9 +8845,9 @@ describe('FS8 D3 Runtime activation', () => {
     }
   });
 
-  it('R12 refuses a replacement after early proof selection before invoking the resume provider', async () => {
+  it('refuses a replacement after early proof selection before invoking the resume provider', async () => {
     const provider = vi.fn(() => ({}));
-    const f = await d3RuntimeFixture('fenced', provider);
+    const f = await runtimeActivationFixture('fenced', provider);
     try {
       const claim = await f.claim();
       await f.fence.transition({
@@ -8821,14 +8872,14 @@ describe('FS8 D3 Runtime activation', () => {
           snapshot.requestContext['flowsafe.runProvenance'].startToken = 'S2';
           await f.workflows.persistWorkflowSnapshot({
             workflowName: f.workflow.id,
-            runId: 'd3-run',
+            runId: 'activation-run',
             snapshot,
           });
           return original;
         },
       );
       const result = await f.runtime
-        .resume(f.workflow.id, 'd3-run', { resumeData: { go: true } })
+        .resume(f.workflow.id, 'activation-run', { resumeData: { go: true } })
         .catch((error) => error);
       expect(
         (await f.row())?.requestContext?.['flowsafe.runProvenance'].startToken,
@@ -8842,10 +8893,10 @@ describe('FS8 D3 Runtime activation', () => {
   });
 });
 
-describe('FS8 D3 Runtime activation', () => {
-  it('R09 keeps lifecycle terminal persistence and settlement on the selected source across load replacement', async () => {
-    const f = await d3RuntimeFixture(),
-      other = await d3RuntimeFixture();
+describe('Runtime activation', () => {
+  it('keeps lifecycle terminal persistence and settlement on the selected source across load replacement', async () => {
+    const f = await runtimeActivationFixture(),
+      other = await runtimeActivationFixture();
     try {
       await f.runtime.start(f.workflow.id, {
         ...f.options(),
@@ -8866,7 +8917,7 @@ describe('FS8 D3 Runtime activation', () => {
           return selected;
         },
       );
-      const result = await f.runtime.terminate(f.workflow.id, 'd3-run');
+      const result = await f.runtime.terminate(f.workflow.id, 'activation-run');
       expect((await f.row())?.status).toBe('cancelled');
       expect(await other.row()).toEqual(foreignBefore);
       expect(f.effects).toHaveBeenCalledOnce();
@@ -8878,9 +8929,9 @@ describe('FS8 D3 Runtime activation', () => {
   });
 });
 
-describe('FS8 D3 Runtime activation', () => {
-  it('R13 refuses a Core pending result after a real positive initial admission witness', async () => {
-    const f = await d3RuntimeFixture();
+describe('Runtime activation', () => {
+  it('refuses a Core pending result after a real positive initial admission witness', async () => {
+    const f = await runtimeActivationFixture();
     try {
       const claim = await f.claim();
       const create = f.workflow.createRun.bind(f.workflow);
@@ -8920,8 +8971,8 @@ describe('FS8 D3 Runtime activation', () => {
     'fenced',
     'prefixed',
     'custom',
-  ] as const)('R07 permits missing-provenance terminal repair only for no-fence %s execution', async (mode) => {
-    const f = await d3RuntimeFixture(mode);
+  ] as const)('permits missing-provenance terminal repair only for no-fence %s execution', async (mode) => {
+    const f = await runtimeActivationFixture(mode);
     try {
       const persist = f.workflows.persistWorkflowSnapshot.bind(f.workflows);
       let stripped = false;
@@ -8956,9 +9007,9 @@ describe('FS8 D3 Runtime activation', () => {
   });
 });
 
-describe('FS8 D3 Runtime activation', () => {
-  it('R04 invokes the engine synchronously before a cancellation queued during initial persistence enters the lifecycle lock', async () => {
-    const f = await d3RuntimeFixture();
+describe('Runtime activation', () => {
+  it('invokes the engine synchronously before a cancellation queued during initial persistence enters the lifecycle lock', async () => {
+    const f = await runtimeActivationFixture();
     let cancellation: Promise<unknown> | undefined;
     let engineEntered = false;
     let readBeforeEngine = false;
@@ -8989,9 +9040,12 @@ describe('FS8 D3 Runtime activation', () => {
             onInitialWriteAttempt: () => {
               input.onInitialWriteAttempt();
               cancellation = f.runtime
-                .cancelActiveExecution(f.workflow.id, 'd3-run', 'cancelled', [
-                  { kind: 'human', id: 'owner' },
-                ])
+                .cancelActiveExecution(
+                  f.workflow.id,
+                  'activation-run',
+                  'cancelled',
+                  [{ kind: 'human', id: 'owner' }],
+                )
                 .catch((error) => error);
             },
           },
@@ -9011,15 +9065,15 @@ describe('FS8 D3 Runtime activation', () => {
   });
 });
 
-describe('FS8 D3 Runtime activation', () => {
+describe('Runtime activation', () => {
   it.each([
     'cancel',
     'terminate',
     'cleanup',
     'resume',
     'repair',
-  ] as const)('R09 preserves the selected row when its internal run id contradicts the %s address', async (operation) => {
-    const f = await d3RuntimeFixture();
+  ] as const)('preserves the selected row when its internal run id contradicts the %s address', async (operation) => {
+    const f = await runtimeActivationFixture();
     try {
       await f.runtime.start(f.workflow.id, {
         ...f.options(),
@@ -9027,8 +9081,9 @@ describe('FS8 D3 Runtime activation', () => {
       });
       let cleanupRevision = 1;
       if (operation === 'cleanup')
-        cleanupRevision = (await f.runtime.terminate(f.workflow.id, 'd3-run'))
-          .cleanup.revision;
+        cleanupRevision = (
+          await f.runtime.terminate(f.workflow.id, 'activation-run')
+        ).cleanup.revision;
       if (operation === 'repair') {
         const persist = f.workflows.persistWorkflowSnapshot.bind(f.workflows);
         vi.spyOn(f.workflows, 'persistWorkflowSnapshot').mockImplementation(
@@ -9050,7 +9105,7 @@ describe('FS8 D3 Runtime activation', () => {
         snapshot.runId = 'foreign-run';
         await f.workflows.persistWorkflowSnapshot({
           workflowName: f.workflow.id,
-          runId: 'd3-run',
+          runId: 'activation-run',
           snapshot,
         });
       }
@@ -9061,19 +9116,19 @@ describe('FS8 D3 Runtime activation', () => {
         operation === 'cancel'
           ? f.runtime.cancelActiveExecution(
               f.workflow.id,
-              'd3-run',
+              'activation-run',
               'cancelled',
               [{ kind: 'human', id: 'owner' }],
             )
           : operation === 'terminate'
-            ? f.runtime.terminate(f.workflow.id, 'd3-run')
+            ? f.runtime.terminate(f.workflow.id, 'activation-run')
             : operation === 'cleanup'
               ? f.runtime.completeTerminalCleanup(
                   f.workflow.id,
-                  'd3-run',
+                  'activation-run',
                   cleanupRevision,
                 )
-              : f.runtime.resume(f.workflow.id, 'd3-run', {
+              : f.runtime.resume(f.workflow.id, 'activation-run', {
                   resumeData: { go: true },
                 });
       const result = await pending.catch((error) => error);
@@ -9096,8 +9151,8 @@ describe('FS8 D3 Runtime activation', () => {
   });
 });
 
-async function d3UnkeyedTargetPending(
-  f: Awaited<ReturnType<typeof d3RuntimeFixture>>,
+async function unkeyedTargetPendingFixture(
+  f: Awaited<ReturnType<typeof runtimeActivationFixture>>,
   kind: 'agent' | 'workflow' = 'agent',
 ) {
   assert(f.capability);
@@ -9132,7 +9187,7 @@ async function d3UnkeyedTargetPending(
   }
 }
 
-function d3ExpectedAgentTarget() {
+function expectedAgentTarget() {
   return {
     kind: 'agent' as const,
     id: 'writer',
@@ -9142,7 +9197,7 @@ function d3ExpectedAgentTarget() {
   };
 }
 
-function d3ReplaceRecoveryTarget(
+function replaceRecoveryTarget(
   provenance: NonNullable<WorkflowRunState['requestContext']>[string],
   mismatch: string,
 ) {
@@ -9158,7 +9213,10 @@ function d3ReplaceRecoveryTarget(
     provenance.startIdentity.target.threadId = 'other-thread';
   else if (mismatch === 'mode') provenance.agentStart.threaded = true;
   else if (mismatch === 'workflow-role') {
-    provenance.startIdentity.target = { kind: 'workflow', id: 'd3-workflow' };
+    provenance.startIdentity.target = {
+      kind: 'workflow',
+      id: 'activation-workflow',
+    };
     delete provenance.agentStart;
   } else if (mismatch === 'missing-identity') {
     delete provenance.startIdentity;
@@ -9168,7 +9226,7 @@ function d3ReplaceRecoveryTarget(
   }
 }
 
-describe('FS8 D3 Runtime activation', () => {
+describe('Runtime activation', () => {
   it.each(
     (['initial', 'result'] as const).flatMap((phase) =>
       [
@@ -9181,16 +9239,16 @@ describe('FS8 D3 Runtime activation', () => {
         'missing-identity',
       ].map((mismatch) => ({ phase, mismatch })),
     ),
-  )('R09 managed agent recovery validates its single $phase observation before mutation: $mismatch', async ({
+  )('managed agent recovery validates its single $phase observation before mutation: $mismatch', async ({
     phase,
     mismatch,
   }) => {
-    const f = await d3RuntimeFixture();
+    const f = await runtimeActivationFixture();
     try {
-      const execution = await d3UnkeyedTargetPending(f);
+      const execution = await unkeyedTargetPendingFixture(f);
       const snapshot = await f.row();
       assert(snapshot?.requestContext);
-      d3ReplaceRecoveryTarget(
+      replaceRecoveryTarget(
         snapshot.requestContext['flowsafe.runProvenance'],
         mismatch,
       );
@@ -9201,14 +9259,14 @@ describe('FS8 D3 Runtime activation', () => {
         });
       await f.workflows.persistWorkflowSnapshot({
         workflowName: f.workflow.id,
-        runId: 'd3-run',
+        runId: 'activation-run',
         snapshot,
       });
       assert(f.capability);
       const rawRead = f.capability.readSnapshot;
       const before = await rawRead({
         workflowId: f.workflow.id,
-        runId: 'd3-run',
+        runId: 'activation-run',
       });
       const read = vi.spyOn(f.capability, 'readSnapshot');
       const terminalize = vi.spyOn(f.capability, 'terminalizeInitialAdmission');
@@ -9217,11 +9275,11 @@ describe('FS8 D3 Runtime activation', () => {
         .recoverStartAttempt(execution, {
           attemptToken: 'H',
           isOwnerQuiescent: () => true,
-          expectedTarget: d3ExpectedAgentTarget(),
+          expectedTarget: expectedAgentTarget(),
         })
         .catch((error) => error);
       expect(
-        await rawRead({ workflowId: f.workflow.id, runId: 'd3-run' }),
+        await rawRead({ workflowId: f.workflow.id, runId: 'activation-run' }),
       ).toEqual(before);
       expect(read).toHaveBeenCalledOnce();
       expect(terminalize).not.toHaveBeenCalled();
@@ -9237,10 +9295,10 @@ describe('FS8 D3 Runtime activation', () => {
     'agent-role',
     'foreign-workflow',
     'missing-identity',
-  ] as const)('R09 managed workflow recovery refuses a same-S %s before B2', async (mismatch) => {
-    const f = await d3RuntimeFixture();
+  ] as const)('managed workflow recovery refuses a same-S %s before terminalization', async (mismatch) => {
+    const f = await runtimeActivationFixture();
     try {
-      const execution = await d3UnkeyedTargetPending(
+      const execution = await unkeyedTargetPendingFixture(
         f,
         mismatch === 'agent-role' ? 'agent' : 'workflow',
       );
@@ -9251,13 +9309,13 @@ describe('FS8 D3 Runtime activation', () => {
           'flowsafe.runProvenance'
         ].startIdentity.target.id = 'other-workflow';
       if (mismatch === 'missing-identity')
-        d3ReplaceRecoveryTarget(
+        replaceRecoveryTarget(
           snapshot.requestContext['flowsafe.runProvenance'],
           mismatch,
         );
       await f.workflows.persistWorkflowSnapshot({
         workflowName: f.workflow.id,
-        runId: 'd3-run',
+        runId: 'activation-run',
         snapshot,
       });
       const before = await f.row();
@@ -9286,15 +9344,15 @@ describe('FS8 D3 Runtime activation', () => {
   it.each([
     'quiescence',
     'read',
-  ] as const)('R08 freezes recovery expectation values and owner before the %s wait', async (phase) => {
-    const entered = cDeferred(),
-      release = cDeferred();
-    const f = await d3RuntimeFixture();
+  ] as const)('freezes recovery expectation values and owner before the %s wait', async (phase) => {
+    const entered = deferredSignal(),
+      release = deferredSignal();
+    const f = await runtimeActivationFixture();
     let pending: Promise<unknown> | undefined;
     try {
-      const execution = await d3UnkeyedTargetPending(f);
+      const execution = await unkeyedTargetPendingFixture(f);
       assert(f.capability);
-      const expectedTarget = d3ExpectedAgentTarget();
+      const expectedTarget = expectedAgentTarget();
       const originalRead = f.capability.readSnapshot;
       const read = vi
         .spyOn(f.capability, 'readSnapshot')
@@ -9367,13 +9425,13 @@ describe('FS8 D3 Runtime activation', () => {
         'missing-identity',
       ].map((mismatch) => ({ kind, mismatch })),
     ),
-  )('R09 rejects a contradictory B2 $kind returned target before settlement: $mismatch', async ({
+  )('rejects a contradictory $kind target returned by terminalization before settlement: $mismatch', async ({
     kind,
     mismatch,
   }) => {
-    const f = await d3RuntimeFixture();
+    const f = await runtimeActivationFixture();
     try {
-      const execution = await d3UnkeyedTargetPending(f);
+      const execution = await unkeyedTargetPendingFixture(f);
       assert(f.capability);
       const native = f.capability.terminalizeInitialAdmission;
       const terminalize = vi
@@ -9382,7 +9440,7 @@ describe('FS8 D3 Runtime activation', () => {
           const result = await native(input);
           assert(result.kind !== 'conflict');
           const snapshot = JSON.parse(result.row.snapshot);
-          d3ReplaceRecoveryTarget(
+          replaceRecoveryTarget(
             snapshot.requestContext['flowsafe.runProvenance'],
             mismatch,
           );
@@ -9398,7 +9456,7 @@ describe('FS8 D3 Runtime activation', () => {
         .recoverStartAttempt(execution, {
           attemptToken: 'H',
           isOwnerQuiescent: () => true,
-          expectedTarget: d3ExpectedAgentTarget(),
+          expectedTarget: expectedAgentTarget(),
         })
         .catch((error) => error);
       expect((await f.row())?.status).toBe('failed');
@@ -9422,8 +9480,8 @@ describe('FS8 D3 Runtime activation', () => {
     }
   });
 
-  it('R08 accepts a managed agent progressed result with a changed current-leg H and requester', async () => {
-    const f = await d3RuntimeFixture();
+  it('accepts a managed agent progressed result with a changed current-leg H and requester', async () => {
+    const f = await runtimeActivationFixture();
     try {
       await f.runtime.start(f.workflow.id, {
         ...f.options(),
@@ -9436,10 +9494,10 @@ describe('FS8 D3 Runtime activation', () => {
       });
       const original = await f.runtime.authoritativeStartState(
         f.workflow.id,
-        'd3-run',
+        'activation-run',
       );
       assert(original?.storage === 'd1');
-      await f.runtime.resume(f.workflow.id, 'd3-run', {
+      await f.runtime.resume(f.workflow.id, 'activation-run', {
         resumeData: { go: true },
         requestedBy: 'reviewer',
         requestedByKind: 'service',
@@ -9449,7 +9507,7 @@ describe('FS8 D3 Runtime activation', () => {
       const result = await f.runtime.recoverStartAttempt(original.execution, {
         attemptToken: 'H',
         isOwnerQuiescent: () => true,
-        expectedTarget: d3ExpectedAgentTarget(),
+        expectedTarget: expectedAgentTarget(),
       });
       expect(
         (await f.row())?.requestContext?.['flowsafe.runProvenance']
@@ -9470,10 +9528,10 @@ describe('FS8 D3 Runtime activation', () => {
     }
   });
 
-  it('R09 workflow expectation preserves the initiating owner without a source-owner assertion', async () => {
-    const f = await d3RuntimeFixture();
+  it('workflow expectation preserves the initiating owner without a source-owner assertion', async () => {
+    const f = await runtimeActivationFixture();
     try {
-      const execution = await d3UnkeyedTargetPending(f, 'workflow');
+      const execution = await unkeyedTargetPendingFixture(f, 'workflow');
       await expect(
         f.runtime.recoverStartAttempt(execution, {
           attemptToken: 'H',
@@ -9497,7 +9555,7 @@ describe('FS8 D3 Runtime activation', () => {
   it.each([
     'inherited',
     'unattributed',
-  ] as const)('R08 direct generic recovery stays role-neutral for %s results', async (kind) => {
+  ] as const)('direct generic recovery stays role-neutral for %s results', async (kind) => {
     const f = await d1Fixture();
     try {
       const snapshot = d1Snapshot();
@@ -9544,8 +9602,8 @@ describe('FS8 D3 Runtime activation', () => {
       owner: { kind: 'human', id: 'owner' },
       threaded: 'false',
     },
-  ])('R09 rejects malformed recovery expectation %j before I/O', async (expectedTarget) => {
-    const f = await d3RuntimeFixture();
+  ])('rejects malformed recovery expectation %j before I/O', async (expectedTarget) => {
+    const f = await runtimeActivationFixture();
     try {
       assert(f.capability);
       const read = vi.spyOn(f.capability, 'readSnapshot'),
@@ -9553,9 +9611,9 @@ describe('FS8 D3 Runtime activation', () => {
       const result = await f.runtime
         .recoverStartAttempt(
           {
-            tablePrefix: 'd3_',
+            tablePrefix: 'activation_',
             workflowId: f.workflow.id,
-            runId: 'd3-run',
+            runId: 'activation-run',
             startToken: 'S',
           },
           {
@@ -9576,15 +9634,15 @@ describe('FS8 D3 Runtime activation', () => {
   });
 });
 
-describe('FS8 D3 Runtime activation', () => {
+describe('Runtime activation', () => {
   it.each([
     'agent-role',
     'foreign-workflow',
     'missing-identity',
-  ] as const)('R09 rejects B2 returned workflow expectation mismatch %s before settlement', async (mismatch) => {
-    const f = await d3RuntimeFixture();
+  ] as const)('rejects a workflow expectation mismatch returned by terminalization before settlement: %s', async (mismatch) => {
+    const f = await runtimeActivationFixture();
     try {
-      const execution = await d3UnkeyedTargetPending(f, 'workflow');
+      const execution = await unkeyedTargetPendingFixture(f, 'workflow');
       assert(f.capability);
       const native = f.capability.terminalizeInitialAdmission;
       vi.spyOn(f.capability, 'terminalizeInitialAdmission').mockImplementation(
@@ -9602,7 +9660,7 @@ describe('FS8 D3 Runtime activation', () => {
             provenance.agentStart = { threaded: false };
           } else if (mismatch === 'foreign-workflow')
             provenance.startIdentity.target.id = 'other-workflow';
-          else d3ReplaceRecoveryTarget(provenance, 'missing-identity');
+          else replaceRecoveryTarget(provenance, 'missing-identity');
           return {
             ...result,
             kind: 'progressed',
@@ -9639,8 +9697,8 @@ describe('FS8 D3 Runtime activation', () => {
     { owner: null },
     { id: 'bad/agent' },
     { threadId: 'bad/thread' },
-  ])('R09 uses the existing identity normalizer for invalid managed recovery target %j', async (invalid) => {
-    const f = await d3RuntimeFixture();
+  ])('uses the existing identity normalizer for invalid managed recovery target %j', async (invalid) => {
+    const f = await runtimeActivationFixture();
     try {
       assert(f.capability);
       const read = vi.spyOn(f.capability, 'readSnapshot'),
@@ -9648,15 +9706,15 @@ describe('FS8 D3 Runtime activation', () => {
       const result = await f.runtime
         .recoverStartAttempt(
           {
-            tablePrefix: 'd3_',
+            tablePrefix: 'activation_',
             workflowId: f.workflow.id,
-            runId: 'd3-run',
+            runId: 'activation-run',
             startToken: 'S',
           },
           {
             attemptToken: 'H',
             isOwnerQuiescent: quiescent,
-            expectedTarget: { ...d3ExpectedAgentTarget(), ...invalid } as never,
+            expectedTarget: { ...expectedAgentTarget(), ...invalid } as never,
           },
         )
         .catch((error) => error);
@@ -9671,14 +9729,14 @@ describe('FS8 D3 Runtime activation', () => {
   });
 });
 
-describe('FS8 D3 Runtime activation', () => {
-  it('R08 freezes workflow recovery kind before owning quiescence', async () => {
-    const f = await d3RuntimeFixture(),
-      entered = cDeferred(),
-      release = cDeferred();
+describe('Runtime activation', () => {
+  it('freezes workflow recovery kind before owning quiescence', async () => {
+    const f = await runtimeActivationFixture(),
+      entered = deferredSignal(),
+      release = deferredSignal();
     let pending: Promise<unknown> | undefined;
     try {
-      const execution = await d3UnkeyedTargetPending(f, 'workflow');
+      const execution = await unkeyedTargetPendingFixture(f, 'workflow');
       const expectedTarget = { kind: 'workflow' as const };
       pending = f.runtime
         .recoverStartAttempt(execution, {
@@ -9693,7 +9751,7 @@ describe('FS8 D3 Runtime activation', () => {
         .catch((error) => error);
       await entered.promise;
       expect(Object.isFrozen(expectedTarget)).toBe(false);
-      Object.assign(expectedTarget, d3ExpectedAgentTarget());
+      Object.assign(expectedTarget, expectedAgentTarget());
       release.resolve();
       const result = await pending;
       expect((await f.row())?.status).toBe('failed');
@@ -9714,7 +9772,7 @@ describe('FS8 D3 Runtime activation', () => {
   });
 });
 
-function d3LegacySnapshot(
+function legacySnapshotFixture(
   version: 'v1' | 'absent',
   status: RunSummary['status'] = 'success',
 ) {
@@ -9730,7 +9788,7 @@ function d3LegacySnapshot(
   return snapshot;
 }
 
-describe('FS8 D3 fix R1 legacy Runtime observations', () => {
+describe('legacy Runtime observations', () => {
   it.each(
     (['default', 'prefixed', 'unfenced'] as const).flatMap((storage) =>
       (['v1', 'absent'] as const).flatMap((version) =>
@@ -9748,7 +9806,7 @@ describe('FS8 D3 fix R1 legacy Runtime observations', () => {
   }) => {
     const f = await d1Fixture(storage);
     try {
-      const snapshot = d3LegacySnapshot(version, status);
+      const snapshot = legacySnapshotFixture(version, status);
       await f.seed(snapshot);
       const read =
         storage === 'unfenced'
@@ -9862,7 +9920,7 @@ describe('FS8 D3 fix R1 legacy Runtime observations', () => {
   ] as const)('retains authoritative unreadability instead of a legacy fallback after %s', async (fault) => {
     const f = await d1Fixture();
     try {
-      await f.seed(d3LegacySnapshot('v1'));
+      await f.seed(legacySnapshotFixture('v1'));
       const native = f.capability.readSnapshot;
       const read = vi
         .spyOn(f.capability, 'readSnapshot')
@@ -9897,12 +9955,12 @@ describe('FS8 D3 fix R1 legacy Runtime observations', () => {
   ] as const)('captures actual %s source, method and legacy option before the selected read waits', async (storage) => {
     const nominal = await d1Fixture(),
       actual = await d1Fixture(storage),
-      entered = cDeferred(),
-      release = cDeferred();
+      entered = deferredSignal(),
+      release = deferredSignal();
     let pending: Promise<unknown> | undefined;
     try {
       await nominal.seed(d1Snapshot());
-      await actual.seed(d3LegacySnapshot('v1'));
+      await actual.seed(legacySnapshotFixture('v1'));
       const nominalMastra = nominal.workflow.mastra;
       assert(nominalMastra);
       vi.spyOn(nominalMastra, 'getStorage').mockReturnValue(actual.storage);
@@ -9966,7 +10024,7 @@ describe('FS8 D3 fix R1 legacy Runtime observations', () => {
     const f = await d1Fixture();
     try {
       await f.workflow.createRun({ runId: 'd1-run' });
-      await f.seed(d3LegacySnapshot('v1'));
+      await f.seed(legacySnapshotFixture('v1'));
       f.sql
         .prepare(
           'DELETE FROM mastra_workflow_snapshot WHERE workflow_name = ? AND run_id = ?',
@@ -9990,7 +10048,7 @@ describe('FS8 D3 fix R1 legacy Runtime observations', () => {
   it('keeps raw legacy pending visible even when lifecycle projection looks terminal', async () => {
     const f = await d1Fixture();
     try {
-      const snapshot = d3LegacySnapshot('v1', 'pending');
+      const snapshot = legacySnapshotFixture('v1', 'pending');
       snapshot.requestContext['flowsafe.runLifecycle'] = {
         version: 1,
         revision: 1,
@@ -10019,7 +10077,7 @@ describe('FS8 D3 fix R1 legacy Runtime observations', () => {
   });
 
   it('preserves changed v1 current requester during native authorized resume without creating v2 identity', async () => {
-    const f = await d3RuntimeFixture();
+    const f = await runtimeActivationFixture();
     try {
       await f.runtime.start(f.workflow.id, {
         ...f.options(),
@@ -10036,11 +10094,11 @@ describe('FS8 D3 fix R1 legacy Runtime observations', () => {
       };
       await f.workflows.persistWorkflowSnapshot({
         workflowName: f.workflow.id,
-        runId: 'd3-run',
+        runId: 'activation-run',
         snapshot,
       });
       await expect(
-        f.runtime.resume(f.workflow.id, 'd3-run', {
+        f.runtime.resume(f.workflow.id, 'activation-run', {
           resumeData: { go: true },
           requestedBy: 'reviewer',
           requestedByKind: 'service',
@@ -10048,7 +10106,7 @@ describe('FS8 D3 fix R1 legacy Runtime observations', () => {
       ).resolves.toMatchObject({ status: 'success', requestedBy: 'reviewer' });
       const result = await f.runtime.authoritativeStartState(
         f.workflow.id,
-        'd3-run',
+        'activation-run',
         { includeLegacy: true },
       );
       expect(result).toMatchObject({
@@ -10070,7 +10128,7 @@ describe('FS8 D3 fix R1 legacy Runtime observations', () => {
       expect(result).not.toHaveProperty('execution');
       expect(f.effects).toHaveBeenCalledTimes(2);
       await expect(
-        f.runtime.authoritativeStartState(f.workflow.id, 'd3-run'),
+        f.runtime.authoritativeStartState(f.workflow.id, 'activation-run'),
       ).rejects.toBeInstanceOf(RunStateUnreadableError);
     } finally {
       f.close();
@@ -10097,14 +10155,14 @@ describe('FS8 D3 fix R1 legacy Runtime observations', () => {
   });
 });
 
-describe('FS8 D3 fix R1 legacy Runtime observations', () => {
+describe('legacy Runtime observations', () => {
   it.each([
     'v1',
     'absent',
   ] as const)('does not admit %s to private recovery or proof through the opt-in capability', async (version) => {
     const f = await d1Fixture('default', 'fence');
     try {
-      await f.seed(d3LegacySnapshot(version));
+      await f.seed(legacySnapshotFixture(version));
       const fence = f.runtime.executionFence;
       assert(fence);
       await fence.seed('open');
@@ -10154,7 +10212,7 @@ describe('FS8 D3 fix R1 legacy Runtime observations', () => {
   });
 
   it('refuses a legacy-shaped initial witness without losing the actual modern pending row', async () => {
-    const f = await d3RuntimeFixture();
+    const f = await runtimeActivationFixture();
     try {
       assert(f.capability);
       const native = f.capability.withInitialAdmission;
@@ -10184,10 +10242,10 @@ describe('FS8 D3 fix R1 legacy Runtime observations', () => {
     }
   });
 
-  it('refuses a legacy-shaped B2 returned row before modern reservation settlement', async () => {
-    const f = await d3RuntimeFixture();
+  it('refuses a legacy-shaped row returned by terminalization before modern reservation settlement', async () => {
+    const f = await runtimeActivationFixture();
     try {
-      const { execution, claim } = await d3PreparedPending(f);
+      const { execution, claim } = await preparedPendingFixture(f);
       assert(f.capability);
       const native = f.capability.terminalizeInitialAdmission;
       f.capability.terminalizeInitialAdmission = async (input) => {

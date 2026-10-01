@@ -341,7 +341,10 @@ function bridgeDeferred() {
   return { promise, resolve };
 }
 
-async function cRefusedAuthority(source: unknown, expected: Error) {
+async function expectAuthorityRefusedBeforeStream(
+  source: unknown,
+  expected: Error,
+) {
   const f = bridgeFixture();
   const nativeSet = Map.prototype.set;
   const installed: unknown[] = [];
@@ -398,7 +401,9 @@ async function cRefusedAuthority(source: unknown, expected: Error) {
   ).resolves.toHaveLength(2);
 }
 
-function cLocalModel(onCall: (prompt: unknown) => void): MastraModelConfig {
+function localModelFixture(
+  onCall: (prompt: unknown) => void,
+): MastraModelConfig {
   const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
   return {
     specificationVersion: 'v2',
@@ -436,7 +441,7 @@ function cLocalModel(onCall: (prompt: unknown) => void): MastraModelConfig {
   };
 }
 
-async function cRealBridge(
+async function realAgentBridgeFixture(
   provider?: RequestContextProvider,
   modelFault?: Error,
   threaded = false,
@@ -494,7 +499,7 @@ async function cRealBridge(
       requestContextForRun: provider,
     },
   );
-  const model = cLocalModel((prompt) => {
+  const model = localModelFixture((prompt) => {
     counts.model++;
     guarded?.prompts.push(prompt);
     if (modelFault) throw modelFault;
@@ -528,7 +533,7 @@ async function cRealBridge(
   return { sql, fence, workflows, counts, runtime, agent, start };
 }
 
-describe('C agent bridge capture', () => {
+describe('agent bridge capture', () => {
   it('loads stored thread history into a guarded durable model prompt', async () => {
     const memory = new MockMemory({ storage: new InMemoryStore() });
     const createdAt = new Date(Date.now() - 60_000);
@@ -557,7 +562,7 @@ describe('C agent bridge capture', () => {
       ],
     });
     const prompts: unknown[] = [];
-    const f = await cRealBridge(
+    const f = await realAgentBridgeFixture(
       () => ({ [ACTOR_CONTEXT_KEY]: { id: 'actor-1', role: 'operator' } }),
       undefined,
       false,
@@ -609,8 +614,8 @@ describe('C agent bridge capture', () => {
     NaN,
     Infinity,
     Number.MAX_SAFE_INTEGER + 1,
-  ])('C bridge refuses malformed epoch before stream and permits clean retry: %s', async (epoch) => {
-    await cRefusedAuthority(
+  ])('bridge refuses malformed epoch before stream and permits clean retry: %s', async (epoch) => {
+    await expectAuthorityRefusedBeforeStream(
       { ...startAuthority(), mutationEpoch: epoch },
       new InvalidMutationEpochError(),
     );
@@ -699,8 +704,8 @@ describe('C agent bridge capture', () => {
       },
       'target.threadId',
     ],
-  ] as const)('C bridge refuses malformed identity before stream and permits clean retry: %s', async (_label, startIdentity, field) => {
-    await cRefusedAuthority(
+  ] as const)('bridge refuses malformed identity before stream and permits clean retry: %s', async (_label, startIdentity, field) => {
+    await expectAuthorityRefusedBeforeStream(
       { ...startAuthority(), startIdentity },
       new InvalidExecutionIdentityError(field),
     );
@@ -712,7 +717,7 @@ describe('C agent bridge capture', () => {
     'guard-owner',
     'guard-id',
     'guard-token',
-  ] as const)('C bridge preserves nested first getter faults before map installation: %s', async (location) => {
+  ] as const)('bridge preserves nested first getter faults before map installation: %s', async (location) => {
     const fault = new Error(`first ${location} read`);
     const source = startAuthority();
     if (location === 'identity-owner')
@@ -749,10 +754,13 @@ describe('C agent bridge capture', () => {
           throw fault;
         },
       });
-    await cRefusedAuthority({ ...source, runOwnerGuard: guard }, fault);
+    await expectAuthorityRefusedBeforeStream(
+      { ...source, runOwnerGuard: guard },
+      fault,
+    );
   });
 
-  it('C bridge captures each owner-guard primitive once', async () => {
+  it('bridge captures each owner-guard primitive once', async () => {
     const f = bridgeFixture();
     const once = <T extends string>(value: T) =>
       vi
@@ -796,9 +804,9 @@ describe('C agent bridge capture', () => {
     1,
     2,
     3,
-  ])('C real agent bridge enforces active mutation epoch at Runtime: %s', async (epoch) => {
+  ])('real agent bridge enforces active mutation epoch at Runtime: %s', async (epoch) => {
     const { sql, fence, workflows, counts, runtime, agent, start } =
-      await cRealBridge();
+      await realAgentBridgeFixture();
     const runId = `real-epoch-${epoch ?? 'missing'}`;
     const attemptToken = `attempt-${epoch ?? 'missing'}`;
     const authority: AgentStartAuthority = {
@@ -894,9 +902,9 @@ describe('C agent bridge capture', () => {
     'provider-failure',
     'model-failure',
     'lost-receipt',
-  ] as const)('C real agent failure and terminal recovery keep the verified v2 generation: %s', async (phase) => {
-    const fault = new Error(`C real ${phase}`);
-    const f = await cRealBridge(
+  ] as const)('real agent failure and terminal recovery keep the verified v2 generation: %s', async (phase) => {
+    const fault = new Error(`real ${phase}`);
+    const f = await realAgentBridgeFixture(
       phase === 'provider-failure'
         ? () => {
             throw fault;
@@ -965,7 +973,7 @@ describe('C agent bridge capture', () => {
         expect(await result.output.text).toBe('done');
       } else if (phase === 'provider-failure')
         await expect(pending).rejects.toBe(fault);
-      else await expect(pending).rejects.toThrow('C real model-failure');
+      else await expect(pending).rejects.toThrow('real model-failure');
       const execution = globalRunRegistry.get(runId)?.workflowExecution;
       if (execution) await execution.catch(() => undefined);
       else expect(globalRunRegistry.has(runId)).toBe(false);
@@ -1034,7 +1042,7 @@ describe('C agent bridge capture', () => {
     vi.restoreAllMocks();
   });
 
-  it('C bridge forwards a frozen authority captured before stream', async () => {
+  it('bridge forwards a frozen authority captured before stream', async () => {
     const f = bridgeFixture();
     const entered = bridgeDeferred();
     const release = bridgeDeferred();
@@ -1118,7 +1126,7 @@ describe('C agent bridge capture', () => {
     }
   });
 
-  it('C bridge never rereads authority after stream handoff', async () => {
+  it('bridge never rereads authority after stream handoff', async () => {
     const f = bridgeFixture();
     const authority = startAuthority();
     const reads = new Map<string, number>();
@@ -1180,7 +1188,7 @@ describe('C agent bridge capture', () => {
     }
   });
 
-  it('C bridge captures schedule dispatch before installing stream state', async () => {
+  it('bridge captures schedule dispatch before installing stream state', async () => {
     const f = bridgeFixture();
     const ids = {
       scheduleId: 'schedule-original',
@@ -1210,7 +1218,7 @@ describe('C agent bridge capture', () => {
     expect(dispatchId).toHaveBeenCalledTimes(1);
   });
 
-  it('C copies Core payload without rereading runId or agentId', async () => {
+  it('copies Core payload without rereading runId or agentId', async () => {
     const f = bridgeFixture();
     const runId = vi
       .fn()
@@ -1242,7 +1250,7 @@ describe('C agent bridge capture', () => {
     expect(f.start.mock.calls[0]?.[1]).toMatchObject({ inputData: INPUT });
   });
 
-  it('C bridge rejects authority supplied only through stream options', async () => {
+  it('bridge rejects authority supplied only through stream options', async () => {
     const f = bridgeFixture();
     const options = { runId: 'run-1', authority: startAuthority() };
     f.stream.mockImplementation(async () => {
@@ -1267,7 +1275,7 @@ describe('C agent bridge capture', () => {
     await f.startHost();
   });
 
-  it('C bridge rejects authority supplied only through Core input', async () => {
+  it('bridge rejects authority supplied only through Core input', async () => {
     const f = bridgeFixture();
     const nativeSet = Map.prototype.set;
     const spy = vi.spyOn(Map.prototype, 'set').mockImplementation(function (
@@ -1309,7 +1317,7 @@ describe('C agent bridge capture', () => {
     'stream-throw',
     'onError',
     'runtime-refusal',
-  ] as const)('C bridge removes authority on every exit and isolates same-run retries (%s)', async (exit) => {
+  ] as const)('bridge removes authority on every exit and isolates same-run retries (%s)', async (exit) => {
     const f = bridgeFixture();
     const nativeSet = Map.prototype.set;
     const nativeDelete = Map.prototype.delete;
@@ -1396,7 +1404,7 @@ describe('C agent bridge capture', () => {
         target: { kind: 'workflow', id: 'writer' },
       },
     },
-  ])('C refuses malformed authority before stream and permits clean retry %#', async (authority) => {
+  ])('refuses malformed authority before stream and permits clean retry %#', async (authority) => {
     const f = bridgeFixture();
     await expect(
       f.agent.streamUntilPersisted(
@@ -1415,7 +1423,7 @@ describe('C agent bridge capture', () => {
     await Promise.all([f.startHost(), drive(f.agent, 'run-1', INPUT)]);
   });
 
-  it('C refuses missing and inherited callback properties and preserves capture faults', async () => {
+  it('refuses missing and inherited callback properties and preserves capture faults', async () => {
     const f = bridgeFixture();
     const { onPreparedStartIdentity: _callback, ...missing } = startAuthority();
     const inherited = Object.assign(
@@ -1453,7 +1461,7 @@ describe('C agent bridge capture', () => {
     'core-agent',
     'wrapped-agent',
     'first-read',
-  ] as const)('C refuses mismatched Core correlation and preserves first faults (%s)', async (kind) => {
+  ] as const)('refuses mismatched Core correlation and preserves first faults (%s)', async (kind) => {
     const f = bridgeFixture();
     const fault = new Error('first Core read');
     const input = {
@@ -1493,7 +1501,7 @@ describe('C agent bridge capture', () => {
     }
   });
 
-  it('C isolates interleaved different-run authorities and uses the actual workflow id', async () => {
+  it('isolates interleaved different-run authorities and uses the actual workflow id', async () => {
     const f = bridgeFixture();
     const workflow = f.agent.getWorkflow();
     const originalId = Object.getOwnPropertyDescriptor(workflow, 'id');
@@ -1567,7 +1575,7 @@ describe('createFlowsafeDurableAgent', () => {
     const { runtime } = fakeRuntime();
     const durable = createFlowsafeDurableAgent({ agent: testAgent(), runtime });
     // #then the brand distinguishes the runtime-driven agent from a plain one —
-    // the property Track C's thread-DO wake gate requires (a plain Agent's wake
+    // the property the thread-DO wake gate requires (a plain Agent's wake
     // would run the loop OFF the runtime).
     expect(isRuntimeDrivenAgent(durable)).toBe(true);
     expect(isRuntimeDrivenAgent(testAgent())).toBe(false);
@@ -2065,7 +2073,7 @@ describe('FlowsafeDurableAgent.executeWorkflow', () => {
     expect(globalRunRegistry.has('run-1')).toBe(false);
   });
 
-  it('rejects an absent runId (INV-1: no crypto.randomUUID fallback)', async () => {
+  it('rejects an absent runId without a crypto.randomUUID fallback', async () => {
     // #given
     const { runtime, start } = fakeRuntime();
     const agent = createFlowsafeDurableAgent({ agent: testAgent(), runtime });
@@ -2076,7 +2084,7 @@ describe('FlowsafeDurableAgent.executeWorkflow', () => {
     expect(start).not.toHaveBeenCalled();
   });
 
-  it('rejects a non-path-safe runId (INV-1)', async () => {
+  it('rejects a non-path-safe runId', async () => {
     // #given
     const { runtime, start } = fakeRuntime();
     const agent = createFlowsafeDurableAgent({ agent: testAgent(), runtime });
@@ -2408,10 +2416,10 @@ describe('FlowsafeDurableAgent.streamUntilPersisted', () => {
 
 // The public entry points a host actually calls. The inherited stream()/generate()
 // take an OPTIONAL runId; without the override, core mints an unowned
-// crypto.randomUUID() upstream of executeWorkflow's guard (INV-1 violation).
+// crypto.randomUUID() upstream of executeWorkflow's guard.
 // These pin that the boundary refuses an absent/non-path-safe runId before any
 // run is registered.
-describe('FlowsafeDurableAgent INV-1 boundary (stream/generate)', () => {
+describe('FlowsafeDurableAgent runId boundary (stream/generate)', () => {
   afterEach(() => {
     vi.restoreAllMocks();
   });
@@ -2496,11 +2504,11 @@ describe('FlowsafeDurableAgent INV-1 boundary (stream/generate)', () => {
 // runId is absent (@mastra/core 1.50.0 agent/durable/index.js:5980 -> :589 ->
 // :5984). PATH_SAFE_ID_PATTERN accepts a bare UUID, so no downstream guard
 // (executeWorkflow's re-guard, RunnerRuntime.start) can catch it — the override
-// must refuse an absent/non-INV-1 runId BEFORE super.prepare mints or registers
+// must refuse an absent/non-path-safe runId BEFORE super.prepare mints or registers
 // anything. super.prepare is spied so the accept path proves delegation without
 // driving core's real preparation (which resolves model/tools and touches the
 // registry) — and so the reject paths prove it is never reached.
-describe('FlowsafeDurableAgent INV-1 boundary (prepare)', () => {
+describe('FlowsafeDurableAgent runId boundary (prepare)', () => {
   afterEach(() => {
     vi.restoreAllMocks();
   });
@@ -2554,7 +2562,7 @@ describe('FlowsafeDurableAgent INV-1 boundary (prepare)', () => {
     const superPrepare = vi
       .spyOn(DurableAgent.prototype, 'prepare')
       .mockResolvedValue(prepared);
-    // #when — a caller-minted INV-1 runId
+    // #when — a caller-minted runId
     const result = await agent.prepare('Hello!', { runId: 'run-1' });
     // #then — the guard passed and the call reached super unchanged
     expect(superPrepare).toHaveBeenCalledTimes(1);
@@ -2800,7 +2808,7 @@ describe('FlowsafeDurableAgent thread runtime registration and rehydration', () 
         id: 'writer',
         name: 'Writer',
         instructions: 'Answer the request.',
-        model: cLocalModel(modelCall),
+        model: localModelFixture(modelCall),
         memory,
         allowedRoles: ['operator'],
         policies: [],
@@ -3228,8 +3236,8 @@ describe('FlowsafeDurableAgent.executeWorkflow failed run', () => {
   });
 });
 
-async function d3AgentObservationFixture(threaded: boolean, customIds = false) {
-  const f = await cRealBridge();
+async function agentObservationFixture(threaded: boolean, customIds = false) {
+  const f = await realAgentBridgeFixture();
   const workflow = f.agent.getWorkflow();
   if (customIds) {
     Object.defineProperty(f.agent, 'id', { value: 'display-agent' });
@@ -3238,9 +3246,9 @@ async function d3AgentObservationFixture(threaded: boolean, customIds = false) {
       workflow as unknown as import('@mastra/core/workflows').AnyWorkflow,
     );
   }
-  await f.runtime.status(workflow.id, 'd3-agent');
+  await f.runtime.status(workflow.id, 'observed-agent-run');
   const snapshot = {
-    runId: 'd3-agent',
+    runId: 'observed-agent-run',
     status: 'pending',
     context: {},
     requestContext: {
@@ -3270,7 +3278,7 @@ async function d3AgentObservationFixture(threaded: boolean, customIds = false) {
   const seed = () =>
     f.workflows.persistWorkflowSnapshot({
       workflowName: workflow.id,
-      runId: 'd3-agent',
+      runId: 'observed-agent-run',
       snapshot:
         snapshot as unknown as import('@mastra/core/workflows').WorkflowRunState,
     });
@@ -3278,18 +3286,22 @@ async function d3AgentObservationFixture(threaded: boolean, customIds = false) {
   return { ...f, workflow, snapshot, seed };
 }
 
-describe('FS8 D3 agent observation', () => {
+describe('agent observation', () => {
   it.each([
     false,
     true,
-  ])('R11 reads initial mode %s without input or optional pruned context', async (threaded) => {
-    const f = await d3AgentObservationFixture(threaded, true);
+  ])('reads initial mode %s without input or optional pruned context', async (threaded) => {
+    const f = await agentObservationFixture(threaded, true);
     try {
       const capability = f.workflows[FENCED_WORKFLOW_STORAGE];
       assert(capability);
       const read = vi.spyOn(capability, 'readSnapshot');
       const state = await f.agent
-        .authoritativeAgentStartState(f.runtime, 'thread-1', 'd3-agent')
+        .authoritativeAgentStartState(
+          f.runtime,
+          'thread-1',
+          'observed-agent-run',
+        )
         .catch((error) => error);
       expect(state).toMatchObject({
         kind: 'initial',
@@ -3305,11 +3317,11 @@ describe('FS8 D3 agent observation', () => {
       expect(read).toHaveBeenCalledOnce();
       expect(f.counts.model).toBe(0);
       await expect(
-        f.agent.proofExecutionFor(f.runtime, 'thread-1', 'd3-agent'),
+        f.agent.proofExecutionFor(f.runtime, 'thread-1', 'observed-agent-run'),
       ).resolves.toEqual({
         tablePrefix: '',
         workflowId: 'actual-agent-loop',
-        runId: 'd3-agent',
+        runId: 'observed-agent-run',
         startToken: 'S1',
       });
     } finally {
@@ -3325,8 +3337,8 @@ describe('FS8 D3 agent observation', () => {
     'input',
     'memory',
     'audit',
-  ] as const)('R11 refuses present %s disagreements without engine work', async (corruption) => {
-    const f = await d3AgentObservationFixture(true);
+  ] as const)('refuses present %s disagreements without engine work', async (corruption) => {
+    const f = await agentObservationFixture(true);
     try {
       if (corruption === 'agent')
         f.snapshot.requestContext[
@@ -3352,7 +3364,7 @@ describe('FS8 D3 agent observation', () => {
         .authoritativeAgentStartState(
           corruption === 'runtime' ? ({} as RunnerRuntime) : f.runtime,
           corruption === 'thread' ? 'wrong' : 'thread-1',
-          'd3-agent',
+          'observed-agent-run',
         )
         .catch((error) => error);
       expect(f.counts.model).toBe(0);
@@ -3368,8 +3380,8 @@ describe('FS8 D3 agent observation', () => {
     }
   });
 
-  it('R11 returns S1 and its selected value when S2 replaces storage after the read', async () => {
-    const f = await d3AgentObservationFixture(false);
+  it('returns S1 and its selected value when S2 replaces storage after the read', async () => {
+    const f = await agentObservationFixture(false);
     try {
       Object.assign(f.snapshot, {
         status: 'success',
@@ -3391,7 +3403,7 @@ describe('FS8 D3 agent observation', () => {
       const state = await f.agent.authoritativeAgentStartState(
         f.runtime,
         'thread-1',
-        'd3-agent',
+        'observed-agent-run',
       );
       expect(state).toMatchObject({
         kind: 'result',
@@ -3409,8 +3421,8 @@ describe('FS8 D3 agent observation', () => {
   it.each([
     false,
     true,
-  ])('R13 rejects the agent persistence waiter when mode %s only persists pending after engine completion', async (threaded) => {
-    const f = await cRealBridge(undefined, undefined, threaded);
+  ])('rejects the agent persistence waiter when mode %s only persists pending after engine completion', async (threaded) => {
+    const f = await realAgentBridgeFixture(undefined, undefined, threaded);
     const runId = `agent-pending-${threaded}`;
     const streams: Array<Awaited<ReturnType<typeof f.agent.stream>>> = [];
     const stream = f.agent.stream.bind(f.agent);
@@ -3474,11 +3486,8 @@ describe('FS8 D3 agent observation', () => {
   });
 });
 
-async function d3LegacyAgentFixture(
-  version: 'v1' | 'absent',
-  threaded: boolean,
-) {
-  const f = await d3AgentObservationFixture(threaded, true);
+async function legacyAgentFixture(version: 'v1' | 'absent', threaded: boolean) {
+  const f = await agentObservationFixture(threaded, true);
   const snapshot = structuredClone(
     f.snapshot,
   ) as unknown as import('@mastra/core/workflows').WorkflowRunState;
@@ -3486,7 +3495,7 @@ async function d3LegacyAgentFixture(
   snapshot.result = { legacy: true };
   snapshot.context.input = {
     agentId: 'writer',
-    runId: 'd3-agent',
+    runId: 'observed-agent-run',
     messageListState: {
       memoryInfo: threaded
         ? { threadId: 'thread-1', resourceId: 'thread-1' }
@@ -3494,7 +3503,7 @@ async function d3LegacyAgentFixture(
     },
   };
   snapshot.requestContext = {
-    runId: 'd3-agent',
+    runId: 'observed-agent-run',
     threadId: 'thread-1',
     resourceId: 'thread-1',
     'breakwater.auditContext': {
@@ -3514,7 +3523,7 @@ async function d3LegacyAgentFixture(
   const seed = () =>
     f.workflows.persistWorkflowSnapshot({
       workflowName: f.workflow.id,
-      runId: 'd3-agent',
+      runId: 'observed-agent-run',
       snapshot,
     });
   await seed();
@@ -3530,7 +3539,7 @@ describe('agent selector mismatch classification', () => {
     ['success', false, true, 'thread'],
     ['pending', true, true, 'both'],
   ] as const)('classifies a coherent foreign modern tuple from one row (%s threaded=%s metadata=%s %s)', async (status, threaded, metadata, foreign) => {
-    const f = await d3AgentObservationFixture(threaded);
+    const f = await agentObservationFixture(threaded);
     try {
       const agentId = foreign === 'thread' ? 'writer' : 'other-agent';
       const threadId = foreign === 'agent' ? 'thread-1' : 'other-thread';
@@ -3542,7 +3551,7 @@ describe('agent selector mismatch classification', () => {
       );
       if (metadata) {
         Object.assign(f.snapshot.requestContext, {
-          runId: 'd3-agent',
+          runId: 'observed-agent-run',
           threadId,
           resourceId: threadId,
           'breakwater.auditContext': {
@@ -3554,7 +3563,7 @@ describe('agent selector mismatch classification', () => {
         Object.assign(f.snapshot.context, {
           input: {
             agentId,
-            runId: 'd3-agent',
+            runId: 'observed-agent-run',
             messageListState: {
               memoryInfo: threaded ? { threadId, resourceId: threadId } : null,
             },
@@ -3567,7 +3576,11 @@ describe('agent selector mismatch classification', () => {
       const read = vi.spyOn(capability, 'readSnapshot');
       const ordinary = vi.spyOn(f.workflows, 'loadWorkflowSnapshot');
       const outcome = await f.agent
-        .authoritativeAgentStartState(f.runtime, 'thread-1', 'd3-agent')
+        .authoritativeAgentStartState(
+          f.runtime,
+          'thread-1',
+          'observed-agent-run',
+        )
         .catch((error) => error);
       expect(outcome).toBeInstanceOf(AgentRunSelectorMismatchError);
       expect(outcome).toBeInstanceOf(RunStateUnreadableError);
@@ -3576,7 +3589,7 @@ describe('agent selector mismatch classification', () => {
       expect(ordinary).not.toHaveBeenCalled();
       read.mockClear();
       await expect(
-        f.agent.proofExecutionFor(f.runtime, 'thread-1', 'd3-agent'),
+        f.agent.proofExecutionFor(f.runtime, 'thread-1', 'observed-agent-run'),
       ).rejects.toBeInstanceOf(AgentRunSelectorMismatchError);
       expect(read).toHaveBeenCalledOnce();
       expect(f.counts.model).toBe(0);
@@ -3592,7 +3605,7 @@ describe('agent selector mismatch classification', () => {
     ['absent', true, 'both'],
     ['absent', false, 'agent'],
   ] as const)('classifies a coherent foreign legacy tuple (%s threaded=%s %s)', async (version, threaded, foreign) => {
-    const f = await d3LegacyAgentFixture(version, threaded);
+    const f = await legacyAgentFixture(version, threaded);
     try {
       const agentId = foreign === 'thread' ? 'writer' : 'other-agent';
       const threadId = foreign === 'agent' ? 'thread-1' : 'other-thread';
@@ -3612,9 +3625,14 @@ describe('agent selector mismatch classification', () => {
       assert(capability);
       const read = vi.spyOn(capability, 'readSnapshot');
       const outcome = await f.agent
-        .authoritativeAgentStartState(f.runtime, 'thread-1', 'd3-agent', {
-          includeLegacy: true,
-        })
+        .authoritativeAgentStartState(
+          f.runtime,
+          'thread-1',
+          'observed-agent-run',
+          {
+            includeLegacy: true,
+          },
+        )
         .catch((error) => error);
       expect(outcome).toBeInstanceOf(AgentRunSelectorMismatchError);
       expect(outcome).toBeInstanceOf(RunStateUnreadableError);
@@ -3634,8 +3652,8 @@ describe('agent selector mismatch classification', () => {
   ] as const)('checks internal coherence before foreign lookup classification: %s', async (version) => {
     const f =
       version === 'modern'
-        ? await d3AgentObservationFixture(true)
-        : await d3LegacyAgentFixture(version, true);
+        ? await agentObservationFixture(true)
+        : await legacyAgentFixture(version, true);
     try {
       Object.assign(f.snapshot.requestContext ?? {}, {
         'breakwater.auditContext': { agentId: 'contradiction' },
@@ -3645,9 +3663,14 @@ describe('agent selector mismatch classification', () => {
       assert(capability);
       const read = vi.spyOn(capability, 'readSnapshot');
       const outcome = await f.agent
-        .authoritativeAgentStartState(f.runtime, 'other-thread', 'd3-agent', {
-          includeLegacy: true,
-        })
+        .authoritativeAgentStartState(
+          f.runtime,
+          'other-thread',
+          'observed-agent-run',
+          {
+            includeLegacy: true,
+          },
+        )
         .catch((error) => error);
       expect(outcome).toBeInstanceOf(RunStateUnreadableError);
       expect(outcome).not.toBeInstanceOf(AgentRunSelectorMismatchError);
@@ -3665,8 +3688,8 @@ describe('agent selector mismatch classification', () => {
   ] as const)('classifies the selected foreign row when replacement storage matches the selector: %s', async (version) => {
     const f =
       version === 'modern'
-        ? await d3AgentObservationFixture(false)
-        : await d3LegacyAgentFixture(version, false);
+        ? await agentObservationFixture(false)
+        : await legacyAgentFixture(version, false);
     try {
       const capability = f.workflows[FENCED_WORKFLOW_STORAGE];
       assert(capability);
@@ -3697,7 +3720,7 @@ describe('agent selector mismatch classification', () => {
         .authoritativeAgentStartState(
           f.runtime,
           'replacement-thread',
-          'd3-agent',
+          'observed-agent-run',
           { includeLegacy: true },
         )
         .catch((error) => error);
@@ -3715,7 +3738,7 @@ describe('agent selector mismatch classification', () => {
     'error',
     'unknown run',
   ] as const)('keeps failed selected sources unreadable rather than classifying a lookup miss: %s', async (failure) => {
-    const f = await d3AgentObservationFixture(false);
+    const f = await agentObservationFixture(false);
     try {
       const source = vi.spyOn(f.runtime, 'authoritativeStartState');
       if (failure === 'undefined') source.mockResolvedValue(undefined as never);
@@ -3723,12 +3746,17 @@ describe('agent selector mismatch classification', () => {
         source.mockRejectedValue(
           failure === 'error'
             ? new Error('source failed')
-            : new UnknownRunError(f.workflow.id, 'd3-agent'),
+            : new UnknownRunError(f.workflow.id, 'observed-agent-run'),
         );
       const outcome = await f.agent
-        .authoritativeAgentStartState(f.runtime, 'other-thread', 'd3-agent', {
-          includeLegacy: true,
-        })
+        .authoritativeAgentStartState(
+          f.runtime,
+          'other-thread',
+          'observed-agent-run',
+          {
+            includeLegacy: true,
+          },
+        )
         .catch((error) => error);
       expect(outcome).toBeInstanceOf(RunStateUnreadableError);
       expect(outcome).not.toBeInstanceOf(AgentRunSelectorMismatchError);
@@ -3741,7 +3769,7 @@ describe('agent selector mismatch classification', () => {
   });
 });
 
-describe('FS8 D3 fix R1 legacy agent observations', () => {
+describe('legacy agent observations', () => {
   it.each(
     (['v1', 'absent'] as const).flatMap((version) =>
       [false, true].map((threaded) => ({ version, threaded })),
@@ -3750,7 +3778,7 @@ describe('FS8 D3 fix R1 legacy agent observations', () => {
     version,
     threaded,
   }) => {
-    const f = await d3LegacyAgentFixture(version, threaded);
+    const f = await legacyAgentFixture(version, threaded);
     try {
       const capability = f.workflows[FENCED_WORKFLOW_STORAGE];
       assert(capability);
@@ -3759,7 +3787,7 @@ describe('FS8 D3 fix R1 legacy agent observations', () => {
       const pending = f.agent.authoritativeAgentStartState(
         f.runtime,
         'thread-1',
-        'd3-agent',
+        'observed-agent-run',
         { includeLegacy: true },
       );
       await expect(pending).resolves.toMatchObject({
@@ -3768,7 +3796,7 @@ describe('FS8 D3 fix R1 legacy agent observations', () => {
         address: {
           tablePrefix: '',
           workflowId: 'actual-agent-loop',
-          runId: 'd3-agent',
+          runId: 'observed-agent-run',
         },
         threaded,
         summary: { status: 'success', result: { legacy: true } },
@@ -3784,10 +3812,14 @@ describe('FS8 D3 fix R1 legacy agent observations', () => {
           requestedByKind: 'service',
         });
       await expect(
-        f.agent.authoritativeAgentStartState(f.runtime, 'thread-1', 'd3-agent'),
+        f.agent.authoritativeAgentStartState(
+          f.runtime,
+          'thread-1',
+          'observed-agent-run',
+        ),
       ).rejects.toBeInstanceOf(RunStateUnreadableError);
       await expect(
-        f.agent.proofExecutionFor(f.runtime, 'thread-1', 'd3-agent'),
+        f.agent.proofExecutionFor(f.runtime, 'thread-1', 'observed-agent-run'),
       ).rejects.toBeInstanceOf(RunStateUnreadableError);
     } finally {
       f.start.mockRestore();
@@ -3807,7 +3839,7 @@ describe('FS8 D3 fix R1 legacy agent observations', () => {
     'memory-thread',
     'missing-input',
   ] as const)('rejects legacy %s contradictions in its one selected snapshot', async (field) => {
-    const f = await d3LegacyAgentFixture('v1', true);
+    const f = await legacyAgentFixture('v1', true);
     try {
       const context = f.snapshot.requestContext;
       assert(context);
@@ -3837,9 +3869,14 @@ describe('FS8 D3 fix R1 legacy agent observations', () => {
       assert(capability);
       const read = vi.spyOn(capability, 'readSnapshot');
       const result = await f.agent
-        .authoritativeAgentStartState(f.runtime, 'thread-1', 'd3-agent', {
-          includeLegacy: true,
-        })
+        .authoritativeAgentStartState(
+          f.runtime,
+          'thread-1',
+          'observed-agent-run',
+          {
+            includeLegacy: true,
+          },
+        )
         .catch((error) => error);
       expect(read).toHaveBeenCalledOnce();
       expect(f.counts.model).toBe(0);
@@ -3852,7 +3889,7 @@ describe('FS8 D3 fix R1 legacy agent observations', () => {
   });
 
   it('captures the legacy option and keeps the selected S1-era value when storage advances during a read', async () => {
-    const f = await d3LegacyAgentFixture('v1', false),
+    const f = await legacyAgentFixture('v1', false),
       entered = bridgeDeferred(),
       release = bridgeDeferred();
     let pending: Promise<unknown> | undefined;
@@ -3873,7 +3910,7 @@ describe('FS8 D3 fix R1 legacy agent observations', () => {
         .authoritativeAgentStartState(
           f.runtime,
           'thread-1',
-          'd3-agent',
+          'observed-agent-run',
           options,
         )
         .catch((error) => error);
@@ -3898,7 +3935,7 @@ describe('FS8 D3 fix R1 legacy agent observations', () => {
   });
 
   it('rejects a different expected Runtime before legacy source I/O', async () => {
-    const f = await d3LegacyAgentFixture('absent', false);
+    const f = await legacyAgentFixture('absent', false);
     try {
       const capability = f.workflows[FENCED_WORKFLOW_STORAGE];
       assert(capability);
@@ -3907,7 +3944,7 @@ describe('FS8 D3 fix R1 legacy agent observations', () => {
         .authoritativeAgentStartState(
           {} as RunnerRuntime,
           'thread-1',
-          'd3-agent',
+          'observed-agent-run',
           { includeLegacy: true },
         )
         .catch((error) => error);
@@ -3921,7 +3958,7 @@ describe('FS8 D3 fix R1 legacy agent observations', () => {
   });
 
   it('does not fall back to another snapshot when the selected legacy-capable read fails', async () => {
-    const f = await d3LegacyAgentFixture('v1', false);
+    const f = await legacyAgentFixture('v1', false);
     try {
       const capability = f.workflows[FENCED_WORKFLOW_STORAGE];
       assert(capability);
@@ -3930,9 +3967,14 @@ describe('FS8 D3 fix R1 legacy agent observations', () => {
         .mockRejectedValue(new Error('source failed'));
       const ordinary = vi.spyOn(f.workflows, 'loadWorkflowSnapshot');
       const result = await f.agent
-        .authoritativeAgentStartState(f.runtime, 'thread-1', 'd3-agent', {
-          includeLegacy: true,
-        })
+        .authoritativeAgentStartState(
+          f.runtime,
+          'thread-1',
+          'observed-agent-run',
+          {
+            includeLegacy: true,
+          },
+        )
         .catch((error) => error);
       expect(read).toHaveBeenCalledOnce();
       expect(ordinary).not.toHaveBeenCalled();
@@ -3945,11 +3987,11 @@ describe('FS8 D3 fix R1 legacy agent observations', () => {
   });
 
   it('keeps its default strict even if a Runtime override returns a legacy arm without opt-in', async () => {
-    const f = await d3LegacyAgentFixture('v1', false);
+    const f = await legacyAgentFixture('v1', false);
     try {
       const legacy = await f.runtime.authoritativeStartState(
         f.workflow.id,
-        'd3-agent',
+        'observed-agent-run',
         { includeLegacy: true },
       );
       assert(legacy?.kind === 'legacy');
@@ -3957,7 +3999,11 @@ describe('FS8 D3 fix R1 legacy agent observations', () => {
         .spyOn(f.runtime, 'authoritativeStartState')
         .mockResolvedValue(legacy as never);
       const result = await f.agent
-        .authoritativeAgentStartState(f.runtime, 'thread-1', 'd3-agent')
+        .authoritativeAgentStartState(
+          f.runtime,
+          'thread-1',
+          'observed-agent-run',
+        )
         .catch((error) => error);
       expect(read).toHaveBeenCalledOnce();
       expect(f.counts.model).toBe(0);

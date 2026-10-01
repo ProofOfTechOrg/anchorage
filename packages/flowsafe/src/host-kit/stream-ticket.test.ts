@@ -236,7 +236,7 @@ describe('verifyStreamTicket fail-closed', () => {
     ).toBeUndefined();
   });
 
-  it('returns undefined (never throws) on a validly-signed JSON null payload (F5)', async () => {
+  it('returns undefined (never throws) on a validly-signed JSON null payload', async () => {
     // #given — a null payload signed with the real secret. `typeof null` is
     // 'object', so a bare object check would slip it past and throw on claims.exp.
     const token = await new CompactSign(encoder.encode(JSON.stringify(null)))

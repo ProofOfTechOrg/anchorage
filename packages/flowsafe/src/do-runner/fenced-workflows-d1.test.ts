@@ -1848,7 +1848,7 @@ function claim(input: InitialRunAdmission) {
   return input.reservation;
 }
 
-describe('FS8 D2 dormant reservation primitives', () => {
+describe('dormant reservation primitives', () => {
   async function modernClaim() {
     const h = await fixture({ keyed: true, state: 'proof-only' });
     const store = h.input.reservationStore;

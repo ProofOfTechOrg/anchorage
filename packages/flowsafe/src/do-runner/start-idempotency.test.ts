@@ -50,7 +50,7 @@ import {
 const OWNER = { kind: 'human', id: 'operator-1' } as const;
 const OTHER_OWNER = { kind: 'human', id: 'operator-2' } as const;
 
-describe('FS8 D2 exact reservation primitives', () => {
+describe('exact reservation primitives', () => {
   const execution: StartExecutionIdentity = {
     tablePrefix: '',
     workflowId: 'payout',
@@ -2708,7 +2708,7 @@ async function settleObserved(store: StartIdempotencyStore, key: string) {
   return store.settleExecution(execution);
 }
 
-describe('FS8 D3 F3 activation', () => {
+describe('beginIdempotentStart admission against existing and new reservations', () => {
   it.each([
     ['same-tick clock', 1_000],
     ['backward clock', 900],

@@ -665,11 +665,11 @@ describe('grant derivation — exact run binding', () => {
     });
   });
 
-  it('mints from ALL approved records past the list cap — a run with >MAX approvals still unlocks the newest connector (D3 grant-path paging)', async () => {
-    // #given — more approved records for one run than the D3 bare-list cap:
+  it('mints from ALL approved records past the list cap — a run with >MAX approvals still unlocks the newest connector', async () => {
+    // #given — more approved records for one run than the bare-list cap:
     // MAX run-scoped 'noise' records, then a NEWEST run-scoped record carrying
-    // 'newest-connector'. A single bounded FIFO page (the D3 store
-    // default) returns the oldest MAX and DROPS the newest, failing the grant
+    // 'newest-connector'. A single bounded FIFO page at the store's
+    // default limit returns the oldest MAX and DROPS the newest, failing the grant
     // CLOSED. connectorGrantsForLeg must page the complete set instead.
     const store = new InMemoryApprovalStore();
     for (let index = 0; index < MAX_APPROVAL_LIST_LIMIT; index += 1) {

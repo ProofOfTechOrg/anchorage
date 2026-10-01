@@ -714,10 +714,10 @@ export interface RunnerRuntimeOptions {
    * here by init() alongside storage so a host that configures it
    * reaches the runtime with no host change.
    *
-   * PASSED TO CORE at `workflow.createRun({ runId, pubsub })` — the only place
-   * core accepts one; the `pubsub` getter still exposes the held identity so an
-   * agent runner sharing this isolate takes THIS instance rather than building
-   * a second feed. Absent ⇒ undefined ⇒ core defaults a fresh emitter per run.
+   * Passed to core at `workflow.createRun({ runId, pubsub })` and to Mastra
+   * at construction. The `pubsub` getter exposes the held identity so an
+   * agent runner sharing this isolate uses the same feed. When absent, core
+   * defaults a fresh emitter per run.
    */
   pubsub?: HostPubSub;
   /**
@@ -1171,8 +1171,8 @@ export class RunnerRuntime {
   readonly #activeRuns = new Map<string, ActiveRun>();
   readonly #terminalAbortIntents = new Map<string, RunTerminalStatus>();
   readonly #lifecycleLocks = new Map<string, Promise<unknown>>();
-  // The host DO's pubsub identity (RunnerRuntimeOptions.pubsub), threaded into
-  // createRun so a configured host publishes and replays on ONE shared feed.
+  // The host DO's pubsub identity (RunnerRuntimeOptions.pubsub) is passed to
+  // Mastra and each createRun so a configured host shares one feed.
   // Undefined ⇒ core defaults a fresh emitter per run.
   readonly #pubsub?: HostPubSub;
   readonly #executionFence?: ExecutionFenceStore;

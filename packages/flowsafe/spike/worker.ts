@@ -2864,7 +2864,7 @@ async function handleExecutionCountProbe(
   }
 }
 
-// --- Execution fence control probe (F1) ------------------------------------
+// --- Execution fence control probe -----------------------------------------
 // LOCAL-ONLY worker-level fence control channel, in the same shape the
 // published admin route serves (`GET`/`POST /admin/execution-fence`, CAS on
 // `expected`).
@@ -2907,7 +2907,7 @@ async function handleExecutionFenceProbe(
   }
 }
 
-// --- Drain inventory probe (F2) --------------------------------------------
+// --- Drain inventory probe -------------------------------------------------
 // LOCAL-ONLY worker-level read of the deployment's outstanding work, in the
 // same shape the published `GET /admin/inventory` route serves (index with no
 // category, keyset page with one). Spike-local for the same reason the fence

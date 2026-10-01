@@ -53,7 +53,7 @@ import { D1State, providerWorld } from './fixtures/provider-world.js';
 
 const RECEIPT_AUTHORITY = 'memory://fleet-exports/receipts/v1';
 
-it('seeds optional FS8 metadata through string-bound provider SQL', async () => {
+it('seeds optional execution-fence metadata through string-bound provider SQL', async () => {
   const api = new PlainWorkerProvisioningApiFake('per-request');
   const d1 = new D1State();
   const query = api.queryDatabase.bind(api);

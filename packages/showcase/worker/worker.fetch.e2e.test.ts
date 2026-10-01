@@ -500,7 +500,7 @@ describe('showcase worker fetch(): the live-stream stage', () => {
     expect(forwarded.record.id).toBe('apr-stream-1');
   });
 
-  it('contains a failing HUB publish: the mutation still succeeds and the failure is only logged (DL-011)', async () => {
+  it('contains a failing HUB publish: the mutation still succeeds and the failure is only logged', async () => {
     // #given a seeded pending approval, and a HUB stub whose /internal/event
     // THROWS — a hard transport failure, not merely a non-2xx status
     const sqlite = openSqlite();

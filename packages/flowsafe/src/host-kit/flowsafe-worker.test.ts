@@ -182,7 +182,7 @@ function retentionContext(): MaintenancePurgeDutyContext {
   return context;
 }
 
-function cWorkerDeferred() {
+function workerDeferredSignal() {
   let release!: () => void;
   const promise = new Promise<void>((resolve) => {
     release = resolve;
@@ -190,12 +190,12 @@ function cWorkerDeferred() {
   return { promise, release };
 }
 
-describe('C Worker epoch capture', () => {
+describe('Worker epoch capture', () => {
   it.each([
     '/runs',
     '/healthz',
     '/admin/maintenance-status',
-  ])('C captures Worker epoch before identity SQL for %s', async (path) => {
+  ])('captures Worker epoch before identity SQL for %s', async (path) => {
     type EpochEnv = FlowsafeWorkerEnv & { epoch: number };
     const order: string[] = [];
     const observed: Array<number | undefined> = [];
@@ -224,8 +224,8 @@ describe('C Worker epoch capture', () => {
     for (const epoch of [0, Number.MAX_SAFE_INTEGER]) {
       const h = makeEnv();
       const env: EpochEnv = { ...h.env, epoch };
-      const entered = cWorkerDeferred();
-      const hold = cWorkerDeferred();
+      const entered = workerDeferredSignal();
+      const hold = workerDeferredSignal();
       const nativePrepare = env.DB.prepare.bind(env.DB);
       let held = false;
       const prepare = vi.spyOn(env.DB, 'prepare').mockImplementation((sql) => {
@@ -282,10 +282,10 @@ describe('C Worker epoch capture', () => {
     expect(source).toHaveBeenCalledTimes(2);
   });
 
-  it('C Worker epoch remains captured through authentication', async () => {
+  it('Worker epoch remains captured through authentication', async () => {
     const h = makeEnv();
-    const entered = cWorkerDeferred();
-    const hold = cWorkerDeferred();
+    const entered = workerDeferredSignal();
+    const hold = workerDeferredSignal();
     let epoch = 2;
     const seen: unknown[] = [];
     const worker = makeWorker({
@@ -331,7 +331,7 @@ describe('C Worker epoch capture', () => {
     NaN,
     Infinity,
     Number.MAX_SAFE_INTEGER + 1,
-  ])('C Worker rejects invalid scalar setup and callback without effects (%s)', async (value) => {
+  ])('Worker rejects invalid scalar setup and callback without effects (%s)', async (value) => {
     expect(() => makeWorker({ mutationEpoch: value as number })).toThrow(
       InvalidMutationEpochError,
     );
@@ -359,7 +359,7 @@ describe('C Worker epoch capture', () => {
   it.each([
     'promise',
     'thenable',
-  ] as const)('C Worker never awaits an epoch callback result (%s)', async (kind) => {
+  ] as const)('Worker never awaits an epoch callback result (%s)', async (kind) => {
     const then = vi.fn();
     const value = kind === 'promise' ? Promise.resolve(2) : { then };
     const h = makeEnv();
@@ -383,7 +383,7 @@ describe('C Worker epoch capture', () => {
       reason: { code: 'INVALID_MUTATION_EPOCH' },
       message: 'private sentinel',
     },
-  ])('C Worker keeps generic callback errors redacted', async (error) => {
+  ])('Worker keeps generic callback errors redacted', async (error) => {
     capturedLogs();
     const h = makeEnv();
     const prepare = vi.spyOn(h.env.DB, 'prepare');
@@ -1199,8 +1199,8 @@ describe('createFlowsafeWorker fetch pipeline', () => {
       expectedMutationEpoch: draining.mutationEpoch,
       expectedRevision: draining.transitionRevision,
     });
-    const entered = cWorkerDeferred();
-    const hold = cWorkerDeferred();
+    const entered = workerDeferredSignal();
+    const hold = workerDeferredSignal();
     let epoch = 1;
     const verify = vi.fn(async () => {
       entered.release();
@@ -3338,7 +3338,7 @@ describe('createFlowsafeWorker drain inventory', () => {
   });
 });
 
-describe('FS8 D3 proof activation Worker composition', () => {
+describe('proof activation Worker composition', () => {
   it.each([
     '',
     'PROOF_',

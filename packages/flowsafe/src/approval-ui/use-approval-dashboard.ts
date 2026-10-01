@@ -273,7 +273,7 @@ export function subscribeApprovalStream({
     scheduleReconnect();
   };
 
-  // Liveness heartbeat (F1): a browser cannot detect a silently half-open socket
+  // Liveness heartbeat: a browser cannot detect a silently half-open socket
   // (sleep/wake, NAT drop) — it never fires onclose — so a broadcast-only run
   // channel would sit paused on stale state indefinitely. Ping on an interval;
   // ANY inbound frame (the DO answers 'ping' with 'pong', which parseStreamFrame
@@ -333,7 +333,7 @@ export function subscribeApprovalStream({
     } catch (cause) {
       if (isPermanentStreamError(cause)) {
         // Streaming is not mounted / not permitted here — stop retrying and stay
-        // cleanly poll-only (F4), never hammering the ticket route forever.
+        // cleanly poll-only, never hammering the ticket route forever.
         active = false;
         clearHeartbeat();
         return;
@@ -584,12 +584,12 @@ export function useApprovalDashboard(
     } else if (frame.type === 'presence') {
       setPresence(presenceReducer(frame.roster));
     }
-    // 'run' frames carry the wholesale RunSummary for the per-run view (M-008);
+    // 'run' frames carry the wholesale RunSummary for the per-run view;
     // this queue-focused dashboard holds no run state, so it ignores them.
   }, []);
 
   // Live subscription — additive to the poll, which keeps running as the queue
-  // reconciler (DL-021). Narrow deps (guideline 5.7): re-subscribe only when the
+  // reconciler. Narrow deps (guideline 5.7): re-subscribe only when the
   // injected transport/ticket identity changes (a new client/auth), never on a
   // state or filter change. Absent stream ⇒ no subscription (poll-only).
   const streamTransport = stream?.transport;
@@ -667,7 +667,7 @@ export function useApprovalDashboard(
           }
           pendingRef.current = map;
         } catch (cause) {
-          // Wholesale batch failure (F3): clear every optimistic pending for
+          // Wholesale batch failure: clear every optimistic pending for
           // these ids so none can later raise a spurious conflict, and resync the
           // greyed rows from the server (covers pollIntervalMs <= 0).
           const rest = { ...pendingRef.current };
@@ -708,7 +708,7 @@ export function useApprovalDashboard(
             record: result.record,
           }).pending;
         } catch (cause) {
-          // Roll back the optimistic decision on failure (F3): clear the pending
+          // Roll back the optimistic decision on failure: clear the pending
           // entry so a later authoritative 'decided' event for this record does
           // NOT read as a spurious conflict, and resync the greyed row from the
           // server (covers pollIntervalMs <= 0, where no interval poll un-greys it).

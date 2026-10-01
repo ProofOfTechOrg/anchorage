@@ -3942,7 +3942,7 @@ describe('atomic idempotency (reserve path)', () => {
     expect(store.put).toHaveBeenCalledTimes(1);
     expect(store.get).not.toHaveBeenCalled();
     expect(execute).toHaveBeenCalledTimes(1);
-    // the lease minted by reserve() is exactly the token handed to put() (D2)
+    // the lease minted by reserve() is exactly the token handed to put()
     const reservation = store.reserve.mock.results[0]?.value as
       | IdempotencyReservation
       | undefined;
@@ -4490,7 +4490,7 @@ describe('atomic idempotency (reserve path)', () => {
   });
 
   it('audits a dedicated event when the reservation came from a stale-pending takeover', async () => {
-    // #given — a store reporting a takeover (audit D2)
+    // #given — a store reporting a takeover
     const audit = new AuditLogger();
     const store: AtomicIdempotencyStore = {
       get: () => undefined,
@@ -4520,7 +4520,7 @@ describe('atomic idempotency (reserve path)', () => {
   });
 
   // A store whose reserve() outcome is settled manually by the test — models
-  // an async store (D1) where the claimed row is visible to other callers
+  // an async store where the claimed row is visible to other callers
   // before the claimer's own promise resumes.
   function deferredReserveStore() {
     let settleReserve!: {
@@ -5214,7 +5214,7 @@ describe('InMemoryIdempotencyStore', () => {
     });
   });
 
-  it('binds release/put to the reservation token — a stale token cannot delete or finalize a live reservation (audit D2)', () => {
+  it('binds release/put to the reservation token — a stale token cannot delete or finalize a live reservation', () => {
     // #given — a live reservation holding its lease token
     const store = new InMemoryIdempotencyStore();
     const reservation = store.reserve('k1');
@@ -6017,7 +6017,7 @@ describe('createConnector egress-fetch runtime', () => {
   });
 });
 
-describe('_background model-override defense (DL-005)', () => {
+describe('_background model-override defense', () => {
   // These connectors declare NO stripping inputSchema, so a `_background` arg
   // reaches gatedExecute.
   function bgWriteConnector(audit?: AuditLogger) {

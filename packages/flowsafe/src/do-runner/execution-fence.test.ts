@@ -767,7 +767,7 @@ describe('versioned execution fence persistence', () => {
     });
   });
 
-  it('refuses a missing row once any FS8 column exists', async () => {
+  it('refuses a missing row once any execution-fence column exists', async () => {
     for (let stage = 1; stage <= 7; stage += 1) {
       const { sqlite, db } = fenceFixture();
       sqlite.exec(EXECUTION_FENCE_DDL);
@@ -2292,7 +2292,7 @@ function fencedRuntime(fence: ExecutionFenceStore): RunnerRuntime {
 }
 
 describe('RunnerRuntime enforcement', () => {
-  it('FS8 D3 proof activation binds current Runtime provenance and refuses string-only proof', async () => {
+  it('proof activation binds current Runtime provenance and refuses string-only proof', async () => {
     const { sqlite, db } = fenceFixture();
     const {
       createStep,
@@ -2562,7 +2562,7 @@ describe('RunnerRuntime enforcement', () => {
   });
 });
 
-describe('FS8 D3 proof activation', () => {
+describe('proof activation', () => {
   const execution = {
     tablePrefix: 'proof_',
     workflowId: 'workflow',

@@ -1467,20 +1467,20 @@ describe('ApprovalService cross-gate separation of duties', () => {
     harness.advance(1000);
 
     // #when — ray decides both
-    const d1 = await harness.service.decide(
+    const firstDecision = await harness.service.decide(
       gate1.id,
       { decision: 'approve' },
       REVIEWER,
     );
-    const d2 = await harness.service.decide(
+    const secondDecision = await harness.service.decide(
       gate2.id,
       { decision: 'approve' },
       REVIEWER,
     );
 
     // #then — both clear: independent parallel gates are not over-blocked
-    expect(d1.record.status).toBe('approved');
-    expect(d2.record.status).toBe('approved');
+    expect(firstDecision.record.status).toBe('approved');
+    expect(secondDecision.record.status).toBe('approved');
   });
 
   it('a prior same-actor REJECTION does not bar a later re-review gate (approved-only scope)', async () => {
@@ -2685,7 +2685,7 @@ describe('ApprovalService.decide and the deployment execution fence', () => {
   });
 });
 
-describe('FS8 D3 proof activation approval decisions', () => {
+describe('proof activation approval decisions', () => {
   async function modern(prefix: string | undefined) {
     const sqlite = openSqlite();
     const db = sqliteUnitDatabase(sqlite) as ApprovalDatabase;

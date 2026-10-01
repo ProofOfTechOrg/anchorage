@@ -196,7 +196,7 @@ function statusStub(read: RunnerRuntime['status']) {
   };
 }
 
-async function hostR1WorkflowFixture(
+async function hostWorkflowLifecycleFixture(
   mode: 'custom-null' | 'actual-prefix',
   wired = true,
 ) {
@@ -207,7 +207,7 @@ async function hostR1WorkflowFixture(
   const storage =
     mode === 'custom-null'
       ? new InMemoryStore()
-      : createD1Storage({ binding, tablePrefix: 'host_r1_' });
+      : createD1Storage({ binding, tablePrefix: 'host_lifecycle_' });
   await storage.init();
   const reservations = new StartIdempotencyStore(binding);
   const app = init(
@@ -217,7 +217,7 @@ async function hostR1WorkflowFixture(
   let effects = 0;
   app
     .createWorkflow({
-      id: 'host-r1',
+      id: 'host-lifecycle-workflow',
       inputSchema: z.object({}),
       outputSchema: z.object({}),
     })
@@ -484,7 +484,7 @@ async function startGated(runner: TestRunner): Promise<RunSummary> {
   return (await response.json()) as RunSummary;
 }
 
-function cDeferred() {
+function deferredSignal() {
   let resolve = () => {};
   const promise = new Promise<void>((done) => {
     resolve = done;
@@ -492,7 +492,10 @@ function cDeferred() {
   return { promise, resolve };
 }
 
-function cWorkflowFixture(owned = false, provider?: RequestContextProvider) {
+function workflowIngressFixture(
+  owned = false,
+  provider?: RequestContextProvider,
+) {
   const events: string[] = [];
   const journal = durableKeyValueStorageFixture(events);
   const env = makeProductionEnv();
@@ -511,9 +514,9 @@ function cWorkflowFixture(owned = false, provider?: RequestContextProvider) {
   return { events, journal, env, storage, runtime, runner, start, reserve };
 }
 
-function cHoldWorkflowVerification(env: TestEnv) {
-  const entered = cDeferred();
-  const release = cDeferred();
+function holdWorkflowVerification(env: TestEnv) {
+  const entered = deferredSignal();
+  const release = deferredSignal();
   const identity = deploymentIdentityDatabase();
   env.DB = {
     prepare(query) {
@@ -532,27 +535,29 @@ function cHoldWorkflowVerification(env: TestEnv) {
   return { entered, release };
 }
 
-const C_WORKFLOW_BODY = {
+const WORKFLOW_START_BODY = {
   workflowId: 'gated',
   runId: 'c-run',
   inputData: { topic: 'original' },
 };
-const C_REPLACEMENT_PRINCIPAL: ExecutionPrincipal = {
+const REPLACEMENT_PRINCIPAL: ExecutionPrincipal = {
   kind: 'service',
   id: 'replacement',
   purpose: 'replacement start',
 };
 
-async function cWorkflowBarrier(runner: TestRunner) {
+async function workflowIngressBarrier(runner: TestRunner) {
   const response = await runner.fetch(
     deploymentIdentityRequest('http://do/runs/gated/c-run/start-liveness'),
   );
   expect(response.status).toBe(200);
 }
 
-async function cHoldWorkflowFifo(fixture: ReturnType<typeof cWorkflowFixture>) {
-  const entered = cDeferred();
-  const release = cDeferred();
+async function holdWorkflowFifo(
+  fixture: ReturnType<typeof workflowIngressFixture>,
+) {
+  const entered = deferredSignal();
+  const release = deferredSignal();
   const nativeStatus = fixture.runtime.status.bind(fixture.runtime);
   const status = vi
     .spyOn(fixture.runtime, 'status')
@@ -568,9 +573,9 @@ async function cHoldWorkflowFifo(fixture: ReturnType<typeof cWorkflowFixture>) {
   return { release, holder, status };
 }
 
-function cObserveFifo() {
+function observeWorkflowFifo() {
   const NativePromise = Promise;
-  const signal = cDeferred();
+  const signal = deferredSignal();
   let count = 0;
   const Observed = new Proxy(NativePromise, {
     construct(target, args) {
@@ -591,7 +596,9 @@ function cObserveFifo() {
   };
 }
 
-async function cRequireEpoch2(fence: ExecutionFenceStore | undefined) {
+async function requireSecondMutationEpoch(
+  fence: ExecutionFenceStore | undefined,
+) {
   if (!fence) throw new Error('missing managed execution fence');
   await fence.seed('open');
   for (let index = 0; index < 2; index++) {
@@ -617,10 +624,10 @@ async function cRequireEpoch2(fence: ExecutionFenceStore | undefined) {
   });
 }
 
-describe('C workflow ingress capture', () => {
+describe('workflow ingress capture', () => {
   it('starts a queued run after its sender disconnects', async () => {
-    const fixture = cWorkflowFixture();
-    const hold = await cHoldWorkflowFifo(fixture);
+    const fixture = workflowIngressFixture();
+    const hold = await holdWorkflowFifo(fixture);
     let controller!: ReadableStreamDefaultController<Uint8Array>;
     const request = deploymentIdentityRequest('http://do/runs', {
       method: 'POST',
@@ -634,14 +641,14 @@ describe('C workflow ingress capture', () => {
         },
         pull(value) {
           value.enqueue(
-            new TextEncoder().encode(JSON.stringify(C_WORKFLOW_BODY)),
+            new TextEncoder().encode(JSON.stringify(WORKFLOW_START_BODY)),
           );
           value.close();
         },
       }),
       duplex: 'half',
     } as RequestInit);
-    const observation = cObserveFifo();
+    const observation = observeWorkflowFifo();
     const pending = fixture.runner.fetch(request);
     try {
       await observation.enqueued;
@@ -670,24 +677,24 @@ describe('C workflow ingress capture', () => {
         })),
       ),
     ),
-  )('C workflow DO captures body and distinct source owner before waits ($kind, $mode, scheduled=$scheduled)', async ({
+  )('workflow DO captures body and distinct source owner before waits ($kind, $mode, scheduled=$scheduled)', async ({
     kind,
     mode,
     scheduled,
   }) => {
-    const fixture = cWorkflowFixture();
+    const fixture = workflowIngressFixture();
     const principal: ExecutionPrincipal =
       kind === 'human'
         ? { kind, id: 'initiator', role: 'operator' }
         : { kind, id: `${kind}-initiator`, purpose: 'schedule execution' };
     const fence = fixture.env.fence;
     if (!fence) throw new Error('missing workflow test fence');
-    const fenceEntered = cDeferred();
-    const fenceRelease = cDeferred();
-    const sourceEntered = cDeferred();
-    const sourceRelease = cDeferred();
-    const copied = cDeferred();
-    const copyRelease = cDeferred();
+    const fenceEntered = deferredSignal();
+    const fenceRelease = deferredSignal();
+    const sourceEntered = deferredSignal();
+    const sourceRelease = deferredSignal();
+    const copied = deferredSignal();
+    const copyRelease = deferredSignal();
     const readFence = fence.read.bind(fence);
     vi.spyOn(fence, 'read').mockImplementationOnce(async () => {
       fenceEntered.resolve();
@@ -776,7 +783,7 @@ describe('C workflow ingress capture', () => {
           return values[key];
         },
       });
-    const request = post('/runs', C_WORKFLOW_BODY, principal);
+    const request = post('/runs', WORKFLOW_START_BODY, principal);
     request.headers.set(MUTATION_EPOCH_HEADER, '2');
     vi.spyOn(request, 'json').mockResolvedValue(body);
     const writes: Array<[string, unknown]> = [];
@@ -914,17 +921,17 @@ describe('C workflow ingress capture', () => {
       'runOwnerGuard',
       'onPreparedStartIdentity',
     ].flatMap((field) => [null, 2].map((value) => ({ field, value }))),
-  )('C workflow DO refuses internal JSON authority before effects ($field, $value)', async ({
+  )('workflow DO refuses internal JSON authority before effects ($field, $value)', async ({
     field,
     value,
   }) => {
-    const fixture = cWorkflowFixture();
+    const fixture = workflowIngressFixture();
     const build = vi.spyOn(
       fixture.runner as unknown as { build: () => RunnerRuntime },
       'build',
     );
     const response = await fixture.runner.fetch(
-      post('/runs', { ...C_WORKFLOW_BODY, [field]: value }),
+      post('/runs', { ...WORKFLOW_START_BODY, [field]: value }),
     );
     expect(response.status).toBe(400);
     expect(await response.json()).toEqual({
@@ -936,7 +943,7 @@ describe('C workflow ingress capture', () => {
     expect(fixture.events).toEqual([]);
     expect(fixture.journal.values.size).toBe(0);
     expect(
-      (await fixture.runner.fetch(post('/runs', C_WORKFLOW_BODY))).status,
+      (await fixture.runner.fetch(post('/runs', WORKFLOW_START_BODY))).status,
     ).toBe(200);
     expect(fixture.start).toHaveBeenCalledOnce();
   });
@@ -945,9 +952,9 @@ describe('C workflow ingress capture', () => {
     'normal',
     'failure',
     'recovery',
-  ] as const)('FS8 D3 host activation workflow preparation and ownership: %s', async (phase) => {
-    const failure = new Error('C managed provider failed');
-    const fixture = cWorkflowFixture(
+  ] as const)('host activation workflow preparation and ownership: %s', async (phase) => {
+    const failure = new Error('managed provider failed');
+    const fixture = workflowIngressFixture(
       true,
       phase === 'failure'
         ? () => {
@@ -956,7 +963,7 @@ describe('C workflow ingress capture', () => {
         : undefined,
     );
     await fixture.storage.init();
-    await cRequireEpoch2(fixture.env.fence);
+    await requireSecondMutationEpoch(fixture.env.fence);
     const workflows = (await fixture.storage.getStore(
       'workflows',
     )) as FencedWorkflowsStorageD1;
@@ -993,10 +1000,10 @@ describe('C workflow ingress capture', () => {
       vi.spyOn(fixture.env.owners, 'settleReservation').mockImplementationOnce(
         async (...args) => {
           await settle(...args);
-          throw new Error('C lost settlement receipt');
+          throw new Error('settlement receipt lost');
         },
       );
-    const request = post('/runs', C_WORKFLOW_BODY);
+    const request = post('/runs', WORKFLOW_START_BODY);
     request.headers.set(MUTATION_EPOCH_HEADER, '2');
     try {
       const response = await fixture.runner.fetch(request);
@@ -1084,11 +1091,11 @@ describe('C workflow ingress capture', () => {
     1,
     2,
     3,
-  ])('FS8 D3 host activation enforces active mutation epoch at workflow start: %s', async (epoch) => {
-    const fixture = cWorkflowFixture(true);
+  ])('host activation enforces active mutation epoch at workflow start: %s', async (epoch) => {
+    const fixture = workflowIngressFixture(true);
     await fixture.storage.init();
-    await cRequireEpoch2(fixture.env.fence);
-    const request = post('/runs', C_WORKFLOW_BODY);
+    await requireSecondMutationEpoch(fixture.env.fence);
+    const request = post('/runs', WORKFLOW_START_BODY);
     if (epoch !== undefined)
       request.headers.set(MUTATION_EPOCH_HEADER, String(epoch));
     const response = await fixture.runner.fetch(request);
@@ -1130,7 +1137,7 @@ describe('C workflow ingress capture', () => {
     expect(snapshot?.requestContext).not.toHaveProperty(
       'flowsafe.initialAdmission',
     );
-    await cWorkflowBarrier(fixture.runner);
+    await workflowIngressBarrier(fixture.runner);
   });
 
   it.each([
@@ -1138,10 +1145,10 @@ describe('C workflow ingress capture', () => {
     0,
     2,
     Number.MAX_SAFE_INTEGER,
-  ])('C captures workflow headers before deployment verification: %s', async (epoch) => {
-    const fixture = cWorkflowFixture();
-    const hold = cHoldWorkflowVerification(fixture.env);
-    const request = post('/runs', C_WORKFLOW_BODY);
+  ])('captures workflow headers before deployment verification: %s', async (epoch) => {
+    const fixture = workflowIngressFixture();
+    const hold = holdWorkflowVerification(fixture.env);
+    const request = post('/runs', WORKFLOW_START_BODY);
     if (epoch !== undefined)
       request.headers.set(MUTATION_EPOCH_HEADER, String(epoch));
     const pending = fixture.runner.fetch(request);
@@ -1151,7 +1158,7 @@ describe('C workflow ingress capture', () => {
       expect(fixture.events).toEqual([]);
       request.headers.set(
         EXECUTION_PRINCIPAL_HEADER,
-        encodeExecutionPrincipal(C_REPLACEMENT_PRINCIPAL),
+        encodeExecutionPrincipal(REPLACEMENT_PRINCIPAL),
       );
       request.headers.set(MUTATION_EPOCH_HEADER, '3');
     } finally {
@@ -1181,14 +1188,14 @@ describe('C workflow ingress capture', () => {
   it.each([
     undefined,
     2,
-  ])('C preserves queued workflow authority through the operation FIFO: %s', async (epoch) => {
-    const fixture = cWorkflowFixture();
-    const hold = await cHoldWorkflowFifo(fixture);
-    const request = post('/runs', C_WORKFLOW_BODY);
+  ])('preserves queued workflow authority through the operation FIFO: %s', async (epoch) => {
+    const fixture = workflowIngressFixture();
+    const hold = await holdWorkflowFifo(fixture);
+    const request = post('/runs', WORKFLOW_START_BODY);
     if (epoch !== undefined)
       request.headers.set(MUTATION_EPOCH_HEADER, String(epoch));
     const body = vi.spyOn(request, 'json');
-    const observation = cObserveFifo();
+    const observation = observeWorkflowFifo();
     const pending = fixture.runner.fetch(request);
     try {
       expect(
@@ -1202,7 +1209,7 @@ describe('C workflow ingress capture', () => {
       expect(fixture.start).not.toHaveBeenCalled();
       request.headers.set(
         EXECUTION_PRINCIPAL_HEADER,
-        encodeExecutionPrincipal(C_REPLACEMENT_PRINCIPAL),
+        encodeExecutionPrincipal(REPLACEMENT_PRINCIPAL),
       );
       request.headers.set(MUTATION_EPOCH_HEADER, '3');
     } finally {
@@ -1222,14 +1229,14 @@ describe('C workflow ingress capture', () => {
   it.each([
     null,
     'invalid',
-  ])('C refuses invalid workflow principal before joining the FIFO: %s', async (principal) => {
-    const fixture = cWorkflowFixture();
-    const hold = await cHoldWorkflowFifo(fixture);
-    const request = post('/runs', C_WORKFLOW_BODY);
+  ])('refuses invalid workflow principal before joining the FIFO: %s', async (principal) => {
+    const fixture = workflowIngressFixture();
+    const hold = await holdWorkflowFifo(fixture);
+    const request = post('/runs', WORKFLOW_START_BODY);
     if (principal === null) request.headers.delete(EXECUTION_PRINCIPAL_HEADER);
     else request.headers.set(EXECUTION_PRINCIPAL_HEADER, principal);
     const body = vi.spyOn(request, 'json');
-    const observation = cObserveFifo();
+    const observation = observeWorkflowFifo();
     const pending = fixture.runner.fetch(request);
     try {
       expect(
@@ -1270,12 +1277,12 @@ describe('C workflow ingress capture', () => {
       400,
       'mutationEpoch must be a nonnegative safe integer or undefined',
     ],
-  ] as const)('C workflow ingress refuses combined invalid authority before route: %s', async (_label, secret, tag, status, error) => {
-    const fixture = cWorkflowFixture();
+  ] as const)('workflow ingress refuses combined invalid authority before route: %s', async (_label, secret, tag, status, error) => {
+    const fixture = workflowIngressFixture();
     fixture.env.DB = deploymentIdentityDatabase(tag);
     const request = deploymentIdentityRequest(
       'http://do/runs',
-      { method: 'POST', body: JSON.stringify(C_WORKFLOW_BODY) },
+      { method: 'POST', body: JSON.stringify(WORKFLOW_START_BODY) },
       secret,
     );
     request.headers.set(MUTATION_EPOCH_HEADER, '01');
@@ -1299,9 +1306,11 @@ describe('C workflow ingress capture', () => {
     expect(fixture.reserve).not.toHaveBeenCalled();
   });
 
-  it('C workflow status and liveness remain principal-free', async () => {
-    const fixture = cWorkflowFixture();
-    const started = await fixture.runner.fetch(post('/runs', C_WORKFLOW_BODY));
+  it('workflow status and liveness remain principal-free', async () => {
+    const fixture = workflowIngressFixture();
+    const started = await fixture.runner.fetch(
+      post('/runs', WORKFLOW_START_BODY),
+    );
     expect(started.status).toBe(200);
     const response = await fixture.runner.fetch(
       deploymentIdentityRequest('http://do/runs/gated/c-run'),
@@ -1311,15 +1320,15 @@ describe('C workflow ingress capture', () => {
       runId: 'c-run',
       status: 'suspended',
     });
-    await cWorkflowBarrier(fixture.runner);
+    await workflowIngressBarrier(fixture.runner);
   });
 
   it.each([
     'terminate',
     'deadline',
-  ] as const)('C workflow %s uses the pre-verifier principal string', async (action) => {
-    const fixture = cWorkflowFixture();
-    const hold = cHoldWorkflowVerification(fixture.env);
+  ] as const)('workflow %s uses the pre-verifier principal string', async (action) => {
+    const fixture = workflowIngressFixture();
+    const hold = holdWorkflowVerification(fixture.env);
     const cancel = vi
       .spyOn(fixture.runtime, 'cancelActiveExecution')
       .mockResolvedValue(false);
@@ -1350,9 +1359,9 @@ describe('DurableObjectRunner.fetch', () => {
     {},
     { 'app.attribution': { workspaceId: 'workspace-1', origin: 'api' } },
   ])('forwards ordinary start context to Runtime: %j', async (requestContext) => {
-    const fixture = cWorkflowFixture();
+    const fixture = workflowIngressFixture();
     const response = await fixture.runner.fetch(
-      post('/runs', { ...C_WORKFLOW_BODY, requestContext }),
+      post('/runs', { ...WORKFLOW_START_BODY, requestContext }),
     );
 
     expect(response.status).toBe(200);
@@ -6937,9 +6946,9 @@ describe('DurableObjectRunner — idempotent start plumbing', () => {
   });
 });
 
-describe('FS8 D3 host activation workflow recovery barriers', () => {
+describe('host activation workflow recovery barriers', () => {
   async function preparedFixture() {
-    const fixture = cWorkflowFixture(true);
+    const fixture = workflowIngressFixture(true);
     const writes: unknown[] = [];
     const put = fixture.journal.storage.put.bind(fixture.journal.storage);
     vi.spyOn(fixture.journal.storage, 'put').mockImplementation(
@@ -6949,7 +6958,9 @@ describe('FS8 D3 host activation workflow recovery barriers', () => {
         await put(key, value);
       },
     );
-    const response = await fixture.runner.fetch(post('/runs', C_WORKFLOW_BODY));
+    const response = await fixture.runner.fetch(
+      post('/runs', WORKFLOW_START_BODY),
+    );
     expect(response.status).toBe(200);
     const journal = writes.at(-1) as Record<string, unknown>;
     expect(journal).toMatchObject({
@@ -7140,7 +7151,7 @@ describe('FS8 D3 host activation workflow recovery barriers', () => {
   });
 
   it('converges a prepared journal put whose response was lost before admission', async () => {
-    const fixture = cWorkflowFixture(true);
+    const fixture = workflowIngressFixture(true);
     const put = fixture.journal.storage.put.bind(fixture.journal.storage);
     vi.spyOn(fixture.journal.storage, 'put').mockImplementation(
       async (key, value) => {
@@ -7152,7 +7163,9 @@ describe('FS8 D3 host activation workflow recovery barriers', () => {
           throw new Error('preparation receipt lost');
       },
     );
-    const response = await fixture.runner.fetch(post('/runs', C_WORKFLOW_BODY));
+    const response = await fixture.runner.fetch(
+      post('/runs', WORKFLOW_START_BODY),
+    );
     const state = await fixture.runtime.authoritativeStartState(
       'gated',
       'c-run',
@@ -7229,11 +7242,11 @@ describe('FS8 D3 host activation workflow recovery barriers', () => {
   });
 });
 
-describe('FS8 D3 protected replay selected workflow value', () => {
+describe('protected replay selected workflow value', () => {
   it('pairs the original selected generation with its value after durable replacement', async () => {
-    const fixture = cWorkflowFixture(true);
+    const fixture = workflowIngressFixture(true);
     expect(
-      (await fixture.runner.fetch(post('/runs', C_WORKFLOW_BODY))).status,
+      (await fixture.runner.fetch(post('/runs', WORKFLOW_START_BODY))).status,
     ).toBe(200);
     const workflows = await fixture.storage.getStore('workflows');
     const snapshot = await workflows?.loadWorkflowSnapshot({
@@ -7300,12 +7313,12 @@ describe('FS8 D3 protected replay selected workflow value', () => {
   });
 });
 
-describe('FS8 D3 host activation original claim preflight', () => {
+describe('host activation original claim preflight', () => {
   it.each([
     false,
     true,
   ])('releases only its exact captured claim on a local fence refusal (replacement=%s)', async (replacement) => {
-    const fixture = cWorkflowFixture(true);
+    const fixture = workflowIngressFixture(true);
     const store = fixture.runtime.startIdempotency;
     if (!store || !fixture.env.fence)
       throw new Error('missing test authority wiring');
@@ -7333,7 +7346,7 @@ describe('FS8 D3 host activation original claim preflight', () => {
     }
     const response = await fixture.runner.fetch(
       post('/runs', {
-        ...C_WORKFLOW_BODY,
+        ...WORKFLOW_START_BODY,
         idempotencyKey: 'host-key',
         startReservation: claim,
       }),
@@ -7351,9 +7364,9 @@ describe('FS8 D3 host activation original claim preflight', () => {
   });
 });
 
-describe('FS8 D3 host activation managed workflow expectation', () => {
-  it('rejects an agent role at the same physical workflow generation before B2 or cleanup', async () => {
-    const fixture = cWorkflowFixture(true);
+describe('host activation managed workflow expectation', () => {
+  it('rejects an agent role at the same physical workflow generation before terminalization', async () => {
+    const fixture = workflowIngressFixture(true);
     const put = fixture.journal.storage.put.bind(fixture.journal.storage);
     let journal: unknown;
     vi.spyOn(fixture.journal.storage, 'put').mockImplementation(
@@ -7367,7 +7380,7 @@ describe('FS8 D3 host activation managed workflow expectation', () => {
       },
     );
     expect(
-      (await fixture.runner.fetch(post('/runs', C_WORKFLOW_BODY))).status,
+      (await fixture.runner.fetch(post('/runs', WORKFLOW_START_BODY))).status,
     ).toBe(200);
     const domain = (await fixture.storage.getStore(
       'workflows',
@@ -7450,12 +7463,12 @@ describe('FS8 D3 host activation managed workflow expectation', () => {
   });
 });
 
-describe('FS8 D3 host activation prepared absence and local zero', () => {
+describe('host activation prepared absence and local zero', () => {
   it.each([
     true,
     false,
   ])('retains a cold prepared workflow journal across same-ID retries after absence (keyed=%s)', async (keyed) => {
-    const fixture = cWorkflowFixture(true);
+    const fixture = workflowIngressFixture(true);
     const reservations = fixture.runtime.startIdempotency;
     if (!reservations) throw new Error('missing reservations');
     let claim:
@@ -7488,7 +7501,7 @@ describe('FS8 D3 host activation prepared absence and local zero', () => {
       (
         await fixture.runner.fetch(
           post('/runs', {
-            ...C_WORKFLOW_BODY,
+            ...WORKFLOW_START_BODY,
             ...(claim
               ? { idempotencyKey: claim.key, startReservation: claim }
               : {}),
@@ -7525,7 +7538,7 @@ describe('FS8 D3 host activation prepared absence and local zero', () => {
     for (let retry = 0; retry < 2; retry++) {
       const response = await evicted.fetch(
         post('/runs', {
-          ...C_WORKFLOW_BODY,
+          ...WORKFLOW_START_BODY,
           ...(claim
             ? { idempotencyKey: claim.key, startReservation: claim }
             : {}),
@@ -7854,20 +7867,20 @@ describe('FS8 D3 host activation prepared absence and local zero', () => {
   });
 });
 
-describe('FS8 D3 host R1 ordinary legacy workflow lifecycle', () => {
+describe('host ordinary legacy workflow lifecycle', () => {
   it.each([
     ['v1', 'terminate'],
     ['absent', 'terminate'],
     ['v1', 'deadline'],
     ['absent', 'deadline'],
   ] as const)('converges actual Core cleanup and replay with retained key (%s %s)', async (version, operation) => {
-    const fixture = await hostR1WorkflowFixture('custom-null');
+    const fixture = await hostWorkflowLifecycleFixture('custom-null');
     const runId = 'legacy-run';
     const reserved = await fixture.reservations.reserve({
       key: 'retained-legacy-key',
       owner: { kind: 'human', id: OWNER_PRINCIPAL.id },
       targetKind: 'workflow',
-      targetId: 'host-r1',
+      targetId: 'host-lifecycle-workflow',
       mintRunId: () => runId,
     });
     const claim = await fixture.reservations.claimReservation(
@@ -7878,7 +7891,7 @@ describe('FS8 D3 host R1 ordinary legacy workflow lifecycle', () => {
       (
         await fixture.runner.fetch(
           post('/runs', {
-            workflowId: 'host-r1',
+            workflowId: 'host-lifecycle-workflow',
             runId,
             inputData: {},
             deadlineMs: 0,
@@ -7889,7 +7902,7 @@ describe('FS8 D3 host R1 ordinary legacy workflow lifecycle', () => {
       ).status,
     ).toBe(200);
     const snapshot = await fixture.workflows.loadWorkflowSnapshot({
-      workflowName: 'host-r1',
+      workflowName: 'host-lifecycle-workflow',
       runId,
     });
     if (!snapshot?.requestContext)
@@ -7897,14 +7910,14 @@ describe('FS8 D3 host R1 ordinary legacy workflow lifecycle', () => {
     if (version === 'v1')
       snapshot.requestContext['flowsafe.runProvenance'] = {
         version: 1,
-        attemptToken: 'host-r1-legacy-leg',
+        attemptToken: 'host-lifecycle-legacy-leg',
         requestedBy: OWNER_PRINCIPAL.id,
         requestedByKind: 'human',
         resumeCounts: [],
       };
     else delete snapshot.requestContext['flowsafe.runProvenance'];
     await fixture.workflows.persistWorkflowSnapshot({
-      workflowName: 'host-r1',
+      workflowName: 'host-lifecycle-workflow',
       runId,
       snapshot,
     });
@@ -7933,7 +7946,10 @@ describe('FS8 D3 host R1 ordinary legacy workflow lifecycle', () => {
       },
     );
     const settle = vi.spyOn(fixture.app.runtime, 'settleStartExecution');
-    const b2 = vi.spyOn(fixture.app.runtime, 'recoverStartAttempt');
+    const recoverStartAttemptSpy = vi.spyOn(
+      fixture.app.runtime,
+      'recoverStartAttempt',
+    );
     const body =
       operation === 'deadline'
         ? {
@@ -7950,7 +7966,11 @@ describe('FS8 D3 host R1 ordinary legacy workflow lifecycle', () => {
           }
         : OWNER_PRINCIPAL;
     const first = await fixture.runner.fetch(
-      post(`/runs/host-r1/${runId}/${operation}`, body, principal),
+      post(
+        `/runs/host-lifecycle-workflow/${runId}/${operation}`,
+        body,
+        principal,
+      ),
     );
     expect(await fixture.owners.owner('run', runId)).toBeUndefined();
     expect(await fixture.reservations.readForAdmission(claim.key)).toEqual(
@@ -7958,10 +7978,10 @@ describe('FS8 D3 host R1 ordinary legacy workflow lifecycle', () => {
     );
     expect(events).toEqual(['approvals', 'owner', 'completion']);
     expect(settle).not.toHaveBeenCalled();
-    expect(b2).not.toHaveBeenCalled();
+    expect(recoverStartAttemptSpy).not.toHaveBeenCalled();
     expect(first.status).toBe(200);
     const terminal = await fixture.workflows.loadWorkflowSnapshot({
-      workflowName: 'host-r1',
+      workflowName: 'host-lifecycle-workflow',
       runId,
     });
     expect(terminal).toMatchObject({
@@ -7975,7 +7995,7 @@ describe('FS8 D3 host R1 ordinary legacy workflow lifecycle', () => {
     const bytes = JSON.stringify(terminal);
     const replay = await fixture.runner.fetch(
       post(
-        `/runs/host-r1/${runId}/${operation === 'deadline' ? 'deadline' : 'terminate-replay'}`,
+        `/runs/host-lifecycle-workflow/${runId}/${operation === 'deadline' ? 'deadline' : 'terminate-replay'}`,
         body,
         principal,
       ),
@@ -7983,7 +8003,7 @@ describe('FS8 D3 host R1 ordinary legacy workflow lifecycle', () => {
     expect(
       JSON.stringify(
         await fixture.workflows.loadWorkflowSnapshot({
-          workflowName: 'host-r1',
+          workflowName: 'host-lifecycle-workflow',
           runId,
         }),
       ),
@@ -8000,12 +8020,12 @@ describe('FS8 D3 host R1 ordinary legacy workflow lifecycle', () => {
     'v1',
     'absent',
   ] as const)('retains actual legacy ownership after hook failure and completes one retry (%s)', async (version) => {
-    const fixture = await hostR1WorkflowFixture('custom-null');
+    const fixture = await hostWorkflowLifecycleFixture('custom-null');
     expect(
       (
         await fixture.runner.fetch(
           post('/runs', {
-            workflowId: 'host-r1',
+            workflowId: 'host-lifecycle-workflow',
             runId: 'legacy-retry',
             inputData: {},
           }),
@@ -8013,21 +8033,21 @@ describe('FS8 D3 host R1 ordinary legacy workflow lifecycle', () => {
       ).status,
     ).toBe(200);
     const snapshot = await fixture.workflows.loadWorkflowSnapshot({
-      workflowName: 'host-r1',
+      workflowName: 'host-lifecycle-workflow',
       runId: 'legacy-retry',
     });
     if (!snapshot?.requestContext) throw new Error('missing Core snapshot');
     if (version === 'v1')
       snapshot.requestContext['flowsafe.runProvenance'] = {
         version: 1,
-        attemptToken: 'host-r1-legacy-leg',
+        attemptToken: 'host-lifecycle-legacy-leg',
         requestedBy: OWNER_PRINCIPAL.id,
         requestedByKind: 'human',
         resumeCounts: [],
       };
     else delete snapshot.requestContext['flowsafe.runProvenance'];
     await fixture.workflows.persistWorkflowSnapshot({
-      workflowName: 'host-r1',
+      workflowName: 'host-lifecycle-workflow',
       runId: 'legacy-retry',
       snapshot,
     });
@@ -8037,7 +8057,7 @@ describe('FS8 D3 host R1 ordinary legacy workflow lifecycle', () => {
     fixture.env.lifecycle = { abandonApprovals: approvals };
     const complete = vi.spyOn(fixture.app.runtime, 'completeTerminalCleanup');
     const first = await fixture.runner.fetch(
-      post('/runs/host-r1/legacy-retry/terminate', {}),
+      post('/runs/host-lifecycle-workflow/legacy-retry/terminate', {}),
     );
     expect(await fixture.owners.owner('run', 'legacy-retry')).toEqual({
       kind: 'human',
@@ -8047,14 +8067,14 @@ describe('FS8 D3 host R1 ordinary legacy workflow lifecycle', () => {
     expect(
       (
         await fixture.workflows.loadWorkflowSnapshot({
-          workflowName: 'host-r1',
+          workflowName: 'host-lifecycle-workflow',
           runId: 'legacy-retry',
         })
       )?.status,
     ).toBe('cancelled');
     expect(first.status).toBe(500);
     const retry = await fixture.runner.fetch(
-      post('/runs/host-r1/legacy-retry/terminate-replay', {}),
+      post('/runs/host-lifecycle-workflow/legacy-retry/terminate-replay', {}),
     );
     expect(await fixture.owners.owner('run', 'legacy-retry')).toBeUndefined();
     expect(approvals).toHaveBeenCalledTimes(2);
@@ -8064,7 +8084,7 @@ describe('FS8 D3 host R1 ordinary legacy workflow lifecycle', () => {
   });
 });
 
-describe('FS8 D3 host R1 workflow unfenced recovery', () => {
+describe('host workflow unfenced recovery', () => {
   it.each([
     ['custom-null', 'missing'],
     ['custom-null', 'pending'],
@@ -8073,11 +8093,11 @@ describe('FS8 D3 host R1 workflow unfenced recovery', () => {
     ['actual-prefix', 'pending'],
     ['actual-prefix', 'suspended'],
   ] as const)('retains keyed journal and ownership before missing-store refusal (%s %s)', async (mode, status) => {
-    const fixture = await hostR1WorkflowFixture(mode, false);
+    const fixture = await hostWorkflowLifecycleFixture(mode, false);
     const runId = 'unfenced-run';
     const execution = {
-      tablePrefix: mode === 'custom-null' ? null : 'host_r1_',
-      workflowId: 'host-r1',
+      tablePrefix: mode === 'custom-null' ? null : 'host_lifecycle_',
+      workflowId: 'host-lifecycle-workflow',
       runId,
       startToken: 'unfenced-generation',
     };
@@ -8085,7 +8105,7 @@ describe('FS8 D3 host R1 workflow unfenced recovery', () => {
       key: 'unfenced-key',
       owner: { kind: 'human' as const, id: OWNER_PRINCIPAL.id },
       targetKind: 'workflow',
-      targetId: 'host-r1',
+      targetId: 'host-lifecycle-workflow',
       mintRunId: () => runId,
     });
     const claim = await fixture.reservations.claimReservation(
@@ -8095,12 +8115,12 @@ describe('FS8 D3 host R1 workflow unfenced recovery', () => {
     await fixture.reservations.bindPreparedStart(claim, {
       ...execution,
       owner: { kind: 'human' as const, id: OWNER_PRINCIPAL.id },
-      target: { kind: 'workflow', id: 'host-r1' },
+      target: { kind: 'workflow', id: 'host-lifecycle-workflow' },
     });
     const journal = {
       version: 2,
       phase: 'prepared-unfenced',
-      workflowId: 'host-r1',
+      workflowId: 'host-lifecycle-workflow',
       runId,
       token: 'unfenced-attempt',
       owner: { kind: 'human' as const, id: OWNER_PRINCIPAL.id },
@@ -8115,7 +8135,7 @@ describe('FS8 D3 host R1 workflow unfenced recovery', () => {
     );
     if (status !== 'missing')
       await fixture.workflows.persistWorkflowSnapshot({
-        workflowName: 'host-r1',
+        workflowName: 'host-lifecycle-workflow',
         runId,
         snapshot: {
           runId,
@@ -8137,19 +8157,22 @@ describe('FS8 D3 host R1 workflow unfenced recovery', () => {
               resumeCounts: [],
               startIdentity: {
                 owner: journal.owner,
-                target: { kind: 'workflow', id: 'host-r1' },
+                target: { kind: 'workflow', id: 'host-lifecycle-workflow' },
               },
             },
           },
         },
       });
     const before = await fixture.workflows.loadWorkflowSnapshot({
-      workflowName: 'host-r1',
+      workflowName: 'host-lifecycle-workflow',
       runId,
     });
     const bound = await fixture.reservations.readForAdmission('unfenced-key');
     const settle = vi.spyOn(fixture.owners, 'settleReservation');
-    const b2 = vi.spyOn(fixture.app.runtime, 'recoverStartAttempt');
+    const recoverStartAttemptSpy = vi.spyOn(
+      fixture.app.runtime,
+      'recoverStartAttempt',
+    );
     const outcome = await fixture.runner
       .alarm()
       .catch((error: unknown) => error);
@@ -8169,12 +8192,12 @@ describe('FS8 D3 host R1 workflow unfenced recovery', () => {
     );
     expect(
       await fixture.workflows.loadWorkflowSnapshot({
-        workflowName: 'host-r1',
+        workflowName: 'host-lifecycle-workflow',
         runId,
       }),
     ).toEqual(before);
     expect(fixture.journal.alarms.at(-1)).toBeGreaterThan(Date.now());
-    expect(b2).not.toHaveBeenCalled();
+    expect(recoverStartAttemptSpy).not.toHaveBeenCalled();
     expect(outcome).toMatchObject({ status: 503 });
   });
 
@@ -8183,19 +8206,19 @@ describe('FS8 D3 host R1 workflow unfenced recovery', () => {
     ['custom-null', 'pending'],
     ['actual-prefix', 'missing'],
     ['actual-prefix', 'pending'],
-  ] as const)('retains actual unkeyed unfenced absence or pending without B2 (%s %s)', async (mode, status) => {
-    const fixture = await hostR1WorkflowFixture(mode);
+  ] as const)('retains actual unkeyed unfenced absence or pending without invoking recovery (%s %s)', async (mode, status) => {
+    const fixture = await hostWorkflowLifecycleFixture(mode);
     const runId = 'unkeyed-unfenced';
     const execution = {
-      tablePrefix: mode === 'custom-null' ? null : 'host_r1_',
-      workflowId: 'host-r1',
+      tablePrefix: mode === 'custom-null' ? null : 'host_lifecycle_',
+      workflowId: 'host-lifecycle-workflow',
       runId,
       startToken: 'unkeyed-generation',
     };
     const journal = {
       version: 2,
       phase: 'prepared-unfenced',
-      workflowId: 'host-r1',
+      workflowId: 'host-lifecycle-workflow',
       runId,
       token: 'unkeyed-attempt',
       owner: { kind: 'human' as const, id: OWNER_PRINCIPAL.id },
@@ -8209,7 +8232,7 @@ describe('FS8 D3 host R1 workflow unfenced recovery', () => {
     );
     if (status === 'pending')
       await fixture.workflows.persistWorkflowSnapshot({
-        workflowName: 'host-r1',
+        workflowName: 'host-lifecycle-workflow',
         runId,
         snapshot: {
           runId,
@@ -8231,13 +8254,16 @@ describe('FS8 D3 host R1 workflow unfenced recovery', () => {
               resumeCounts: [],
               startIdentity: {
                 owner: journal.owner,
-                target: { kind: 'workflow', id: 'host-r1' },
+                target: { kind: 'workflow', id: 'host-lifecycle-workflow' },
               },
             },
           },
         },
       });
-    const b2 = vi.spyOn(fixture.app.runtime, 'recoverStartAttempt');
+    const recoverStartAttemptSpy = vi.spyOn(
+      fixture.app.runtime,
+      'recoverStartAttempt',
+    );
     const settle = vi.spyOn(fixture.owners, 'settleReservation');
     const outcome = await fixture.runner
       .alarm()
@@ -8247,13 +8273,13 @@ describe('FS8 D3 host R1 workflow unfenced recovery', () => {
       fixture.journal.values.get('flowsafe:run-owner-recovery:v1'),
     ).toEqual(journal);
     expect(fixture.journal.alarms.at(-1)).toBeGreaterThan(Date.now());
-    expect(b2).not.toHaveBeenCalled();
+    expect(recoverStartAttemptSpy).not.toHaveBeenCalled();
     if (status === 'pending') expect(outcome).toMatchObject({ status: 503 });
     else expect(outcome).toBeUndefined();
   });
 });
 
-describe('FS8 D3 host R1 workflow recovery object address', () => {
+describe('host workflow recovery object address', () => {
   it.each([
     ['preparing', 'workflow'],
     ['preparing', 'run'],
@@ -8262,7 +8288,7 @@ describe('FS8 D3 host R1 workflow recovery object address', () => {
     ['prepared-unfenced', 'workflow'],
     ['prepared-unfenced', 'run'],
   ] as const)('preserves valid foreign address before Runtime and ownership (%s %s)', async (phase, mismatch) => {
-    const fixture = cWorkflowFixture(true);
+    const fixture = workflowIngressFixture(true);
     const reservations = fixture.runtime.startIdempotency;
     if (!reservations) throw new Error('missing foreign reservation store');
     const reserved = await reservations.reserve({
@@ -8278,7 +8304,7 @@ describe('FS8 D3 host R1 workflow recovery object address', () => {
       (
         await fixture.runner.fetch(
           post('/runs', {
-            ...C_WORKFLOW_BODY,
+            ...WORKFLOW_START_BODY,
             idempotencyKey: claim.key,
             startReservation: claim,
           }),
@@ -8363,9 +8389,9 @@ describe('FS8 D3 host R1 workflow recovery object address', () => {
     'own',
     'undefined',
   ] as const)('keeps supported workflow object name recovery (%s)', async (name) => {
-    const fixture = cWorkflowFixture(true);
+    const fixture = workflowIngressFixture(true);
     expect(
-      (await fixture.runner.fetch(post('/runs', C_WORKFLOW_BODY))).status,
+      (await fixture.runner.fetch(post('/runs', WORKFLOW_START_BODY))).status,
     ).toBe(200);
     const selected = await fixture.runtime.authoritativeStartState(
       'gated',
@@ -8394,15 +8420,15 @@ describe('FS8 D3 host R1 workflow recovery object address', () => {
   });
 });
 
-describe('FS8 D3 host R1 workflow keyed finalization preflight', () => {
+describe('host workflow keyed finalization preflight', () => {
   it('retains the original journal claim during cold normal termination and replay without its store', async () => {
-    const fixture = await hostR1WorkflowFixture('custom-null');
+    const fixture = await hostWorkflowLifecycleFixture('custom-null');
     const runId = 'cold-terminate';
     const reserved = await fixture.reservations.reserve({
       key: 'cold-terminate-key',
       owner: { kind: 'human', id: OWNER_PRINCIPAL.id },
       targetKind: 'workflow',
-      targetId: 'host-r1',
+      targetId: 'host-lifecycle-workflow',
       mintRunId: () => runId,
     });
     const claim = await fixture.reservations.claimReservation(
@@ -8427,7 +8453,7 @@ describe('FS8 D3 host R1 workflow keyed finalization preflight', () => {
       (
         await fixture.runner.fetch(
           post('/runs', {
-            workflowId: 'host-r1',
+            workflowId: 'host-lifecycle-workflow',
             runId,
             inputData: {},
             idempotencyKey: claim.key,
@@ -8452,7 +8478,7 @@ describe('FS8 D3 host R1 workflow keyed finalization preflight', () => {
     const effects = vi.fn(async () => ({}));
     cold
       .createWorkflow({
-        id: 'host-r1',
+        id: 'host-lifecycle-workflow',
         inputSchema: z.object({}),
         outputSchema: z.object({}),
       })
@@ -8487,7 +8513,7 @@ describe('FS8 D3 host R1 workflow keyed finalization preflight', () => {
     const completion = vi.spyOn(cold.runtime, 'completeTerminalCleanup');
     for (const action of ['terminate', 'terminate-replay']) {
       const response = await runner.fetch(
-        post(`/runs/host-r1/${runId}/${action}`, {}),
+        post(`/runs/host-lifecycle-workflow/${runId}/${action}`, {}),
       );
       expect(await fixture.owners.owner('run', runId)).toEqual({
         kind: 'human',
@@ -8509,7 +8535,7 @@ describe('FS8 D3 host R1 workflow keyed finalization preflight', () => {
     expect(
       (
         await fixture.workflows.loadWorkflowSnapshot({
-          workflowName: 'host-r1',
+          workflowName: 'host-lifecycle-workflow',
           runId,
         })
       )?.status,
@@ -8518,12 +8544,12 @@ describe('FS8 D3 host R1 workflow keyed finalization preflight', () => {
   });
 
   it('retains prepared nonterminal ownership when the store disappears after native persistence', async () => {
-    const fixture = await hostR1WorkflowFixture('custom-null');
+    const fixture = await hostWorkflowLifecycleFixture('custom-null');
     const reserved = await fixture.reservations.reserve({
       key: 'workflow-finalizer-key',
       owner: { kind: 'human', id: OWNER_PRINCIPAL.id },
       targetKind: 'workflow',
-      targetId: 'host-r1',
+      targetId: 'host-lifecycle-workflow',
       mintRunId: () => 'finalizer-run',
     });
     const claim = await fixture.reservations.claimReservation(
@@ -8545,7 +8571,7 @@ describe('FS8 D3 host R1 workflow keyed finalization preflight', () => {
     const settle = vi.spyOn(fixture.owners, 'settleReservation');
     const response = await fixture.runner.fetch(
       post('/runs', {
-        workflowId: 'host-r1',
+        workflowId: 'host-lifecycle-workflow',
         runId: 'finalizer-run',
         inputData: {},
         idempotencyKey: claim.key,
@@ -8559,7 +8585,7 @@ describe('FS8 D3 host R1 workflow keyed finalization preflight', () => {
     expect(
       (
         await fixture.workflows.loadWorkflowSnapshot({
-          workflowName: 'host-r1',
+          workflowName: 'host-lifecycle-workflow',
           runId: 'finalizer-run',
         })
       )?.status,
@@ -8572,19 +8598,19 @@ describe('FS8 D3 host R1 workflow keyed finalization preflight', () => {
   });
 });
 
-describe('FS8 D3 host R1 workflow legacy cleanup wait guards', () => {
+describe('host workflow legacy cleanup wait guards', () => {
   it.each([
     'dispatch',
     'owner release',
     'completion',
   ] as const)('retains a journal appearing during the final legacy %s wait', async (boundary) => {
-    const fixture = await hostR1WorkflowFixture('custom-null');
+    const fixture = await hostWorkflowLifecycleFixture('custom-null');
     const runId = 'late-journal';
     expect(
       (
         await fixture.runner.fetch(
           post('/runs', {
-            workflowId: 'host-r1',
+            workflowId: 'host-lifecycle-workflow',
             runId,
             inputData: {},
           }),
@@ -8592,7 +8618,7 @@ describe('FS8 D3 host R1 workflow legacy cleanup wait guards', () => {
       ).status,
     ).toBe(200);
     const snapshot = await fixture.workflows.loadWorkflowSnapshot({
-      workflowName: 'host-r1',
+      workflowName: 'host-lifecycle-workflow',
       runId,
     });
     if (!snapshot?.requestContext) throw new Error('missing stored run');
@@ -8606,7 +8632,7 @@ describe('FS8 D3 host R1 workflow legacy cleanup wait guards', () => {
       },
     };
     await fixture.workflows.persistWorkflowSnapshot({
-      workflowName: 'host-r1',
+      workflowName: 'host-lifecycle-workflow',
       runId,
       snapshot,
     });
@@ -8639,7 +8665,7 @@ describe('FS8 D3 host R1 workflow legacy cleanup wait guards', () => {
         return result;
       });
     const response = await fixture.runner.fetch(
-      post(`/runs/host-r1/${runId}/terminate`, {}),
+      post(`/runs/host-lifecycle-workflow/${runId}/terminate`, {}),
     );
     expect(
       fixture.journal.values.get('flowsafe:run-owner-recovery:v1'),
@@ -8660,12 +8686,12 @@ describe('FS8 D3 host R1 workflow legacy cleanup wait guards', () => {
     'journal',
     'active execution',
   ] as const)('retains owner after approval wait changes legacy authority (%s)', async (change) => {
-    const fixture = await hostR1WorkflowFixture('custom-null');
+    const fixture = await hostWorkflowLifecycleFixture('custom-null');
     expect(
       (
         await fixture.runner.fetch(
           post('/runs', {
-            workflowId: 'host-r1',
+            workflowId: 'host-lifecycle-workflow',
             runId: 'legacy-wait',
             inputData: {},
           }),
@@ -8673,13 +8699,13 @@ describe('FS8 D3 host R1 workflow legacy cleanup wait guards', () => {
       ).status,
     ).toBe(200);
     const snapshot = await fixture.workflows.loadWorkflowSnapshot({
-      workflowName: 'host-r1',
+      workflowName: 'host-lifecycle-workflow',
       runId: 'legacy-wait',
     });
     if (!snapshot?.requestContext) throw new Error('missing Core row');
     delete snapshot.requestContext['flowsafe.runProvenance'];
     await fixture.workflows.persistWorkflowSnapshot({
-      workflowName: 'host-r1',
+      workflowName: 'host-lifecycle-workflow',
       runId: 'legacy-wait',
       snapshot,
     });
@@ -8695,7 +8721,7 @@ describe('FS8 D3 host R1 workflow legacy cleanup wait guards', () => {
     const release = vi.spyOn(fixture.owners, 'release');
     const complete = vi.spyOn(fixture.app.runtime, 'completeTerminalCleanup');
     const response = await fixture.runner.fetch(
-      post('/runs/host-r1/legacy-wait/terminate', {}),
+      post('/runs/host-lifecycle-workflow/legacy-wait/terminate', {}),
     );
     expect(await fixture.owners.owner('run', 'legacy-wait')).toEqual({
       kind: 'human',

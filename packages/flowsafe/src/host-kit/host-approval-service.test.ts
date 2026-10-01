@@ -307,7 +307,7 @@ describe('buildHostApprovalService allowSelfDecision passthrough', () => {
   });
 });
 
-describe('FS8 D3 proof activation host approval namespace', () => {
+describe('proof activation host approval namespace', () => {
   it('forwards the explicit namespace to the deciding service without inferring an omitted prefix', async () => {
     const execution = {
       tablePrefix: 'proof_',

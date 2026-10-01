@@ -3,7 +3,7 @@
 //
 // The wrapper's contract is that the durable-agentic-loop runs only through
 // RunnerRuntime, via the overridden executeWorkflow, entered only by a
-// caller-minted runId (INV-1). That contract is stated over the surface core's
+// caller-minted runId. That contract is stated over the surface core's
 // DurableAgent exposes — so it silently decays whenever a peer bump ADDS a
 // method. 1.53.0 is the live example: it added recover() / recoverActiveRuns()
 // / listActiveRuns() / deleteRunSnapshots(), which read persisted snapshot
