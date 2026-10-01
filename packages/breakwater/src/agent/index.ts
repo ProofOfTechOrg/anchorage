@@ -655,37 +655,54 @@ function hasHook(processor: Processor, hook: ProcessorHook): boolean {
   return typeof processor[hook] === 'function';
 }
 
-function validateInputProcessors(
+function validateApplicationProcessors(
+  side: 'input',
   processors: readonly GuardedInputProcessor[],
-): readonly GuardedInputProcessor[] {
-  if (!Array.isArray(processors)) {
-    throw new TypeError(
-      'createGuardedAgent: applicationInputProcessors must be an array',
-    );
-  }
-  for (const processor of processors) {
-    if (!processor || typeof processor !== 'object') {
+): readonly GuardedInputProcessor[];
+function validateApplicationProcessors(
+  side: 'output',
+  processors: readonly GuardedOutputProcessor[],
+): readonly GuardedOutputProcessor[];
+function validateApplicationProcessors(
+  side: 'input' | 'output',
+  processors: unknown,
+): readonly (GuardedInputProcessor | GuardedOutputProcessor)[] {
+  const { field, requiredHooks, forbiddenHooks } = {
+    input: {
+      field: 'applicationInputProcessors',
+      requiredHooks: INPUT_PROCESSOR_REQUIRED_HOOKS,
+      forbiddenHooks: INPUT_PROCESSOR_FORBIDDEN_HOOKS,
+    },
+    output: {
+      field: 'applicationOutputProcessors',
+      requiredHooks: OUTPUT_PROCESSOR_REQUIRED_HOOKS,
+      forbiddenHooks: OUTPUT_PROCESSOR_FORBIDDEN_HOOKS,
+    },
+  }[side];
+  return readFrozenList(`createGuardedAgent: ${field}`, processors, (entry) => {
+    if (!entry || typeof entry !== 'object') {
       throw new TypeError(
-        'createGuardedAgent: application input processors must be processor objects',
+        `createGuardedAgent: application ${side} processors must be processor objects`,
       );
     }
-    assertProcessorId(processor, 'application input');
-    for (const hook of INPUT_PROCESSOR_REQUIRED_HOOKS) {
+    const processor = entry as Processor;
+    assertProcessorId(processor, `application ${side}`);
+    for (const hook of requiredHooks) {
       if (!hasHook(processor, hook)) {
         throw new TypeError(
-          `createGuardedAgent: input processor '${processor.id}' must implement ${hook}`,
+          `createGuardedAgent: ${side} processor '${processor.id}' must implement ${hook}`,
         );
       }
     }
-    for (const hook of INPUT_PROCESSOR_FORBIDDEN_HOOKS) {
+    for (const hook of forbiddenHooks) {
       if (hasHook(processor, hook)) {
         throw new TypeError(
-          `createGuardedAgent: input processor '${processor.id}' must not implement ${hook}`,
+          `createGuardedAgent: ${side} processor '${processor.id}' must not implement ${hook}`,
         );
       }
     }
-  }
-  return Object.freeze([...processors]);
+    return processor as GuardedInputProcessor | GuardedOutputProcessor;
+  });
 }
 
 const INPUT_RESULT_NOT_APPLICABLE =
@@ -916,39 +933,6 @@ function guardInputProcessor(
   } as InputProcessor;
 }
 
-function validateOutputProcessors(
-  processors: readonly GuardedOutputProcessor[],
-): readonly GuardedOutputProcessor[] {
-  if (!Array.isArray(processors)) {
-    throw new TypeError(
-      'createGuardedAgent: applicationOutputProcessors must be an array',
-    );
-  }
-  for (const processor of processors) {
-    if (!processor || typeof processor !== 'object') {
-      throw new TypeError(
-        'createGuardedAgent: application output processors must be processor objects',
-      );
-    }
-    assertProcessorId(processor, 'application output');
-    for (const hook of OUTPUT_PROCESSOR_REQUIRED_HOOKS) {
-      if (!hasHook(processor, hook)) {
-        throw new TypeError(
-          `createGuardedAgent: output processor '${processor.id}' must implement ${hook}`,
-        );
-      }
-    }
-    for (const hook of OUTPUT_PROCESSOR_FORBIDDEN_HOOKS) {
-      if (hasHook(processor, hook)) {
-        throw new TypeError(
-          `createGuardedAgent: output processor '${processor.id}' must not implement ${hook}`,
-        );
-      }
-    }
-  }
-  return Object.freeze([...processors]);
-}
-
 function guardedCallOptions(options: unknown): GuardedAgentCallOptions {
   if (!options || typeof options !== 'object' || Array.isArray(options)) {
     throw new TypeError(
@@ -1165,9 +1149,11 @@ class GuardedAgent<
         'createGuardedAgent: maxSteps must be a positive safe integer',
       );
     }
-    if (!Array.isArray(options.policies)) {
-      throw new TypeError('createGuardedAgent: policies must be an array');
-    }
+    const policies = readFrozenList(
+      'createGuardedAgent: policies',
+      options.policies,
+      (entry) => entry as PolicyEvaluator,
+    );
     const configuredMemory = options.memory;
     if (
       configuredMemory !== undefined &&
@@ -1191,19 +1177,22 @@ class GuardedAgent<
     // Wrapped before any hand-off to Mastra: its standard loop runs the
     // per-call processors, not listInputProcessors.
     const applicationInputProcessors = Object.freeze(
-      validateInputProcessors(options.applicationInputProcessors ?? []).map(
-        (processor) =>
-          guardInputProcessor(processor, `agent:${options.id}`, options.audit),
+      validateApplicationProcessors(
+        'input',
+        options.applicationInputProcessors ?? [],
+      ).map((processor) =>
+        guardInputProcessor(processor, `agent:${options.id}`, options.audit),
       ),
     );
-    const applicationOutputProcessors = validateOutputProcessors(
+    const applicationOutputProcessors = validateApplicationProcessors(
+      'output',
       options.applicationOutputProcessors ?? [],
     );
     const {
       allowedRoles: _allowedRoles,
       allowedPrincipalKinds: _allowedPrincipalKinds,
       allowedInputAssetOrigins: _allowedInputAssetOrigins,
-      policies,
+      policies: _policies,
       audit,
       maxSteps: _maxSteps,
       toolChoice: _toolChoice,
@@ -1212,7 +1201,7 @@ class GuardedAgent<
       ...agentConfig
     } = options;
     const policy = new PolicyEngine({
-      policies: Object.freeze([...policies]),
+      policies,
       audit,
       holdBack: true,
       resource: `agent:${options.id}`,

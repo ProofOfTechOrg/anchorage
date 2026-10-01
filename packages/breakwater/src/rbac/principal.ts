@@ -9,7 +9,7 @@
 //
 // @internal
 
-import { describeEntry } from '../host-input.js';
+import { describeEntry, readFrozenList } from '../host-input.js';
 
 /**
  * What KIND of principal an actor is. Roles are a human vocabulary — a
@@ -69,20 +69,23 @@ export function assertPrincipalKinds(
   label: string,
 ): readonly PrincipalKind[] {
   if (kinds === undefined) return DEFAULT_ALLOWED_PRINCIPAL_KINDS;
-  if (!Array.isArray(kinds) || kinds.length === 0) {
-    throw new TypeError(
-      `${label}: allowedPrincipalKinds must be a non-empty array`,
-    );
-  }
+  const subject = `${label}: allowedPrincipalKinds`;
   const seen = new Set<PrincipalKind>();
-  for (const kind of kinds) {
-    if (!(PRINCIPAL_KINDS as readonly unknown[]).includes(kind)) {
-      throw new TypeError(`${label}: unknown principal kind '${String(kind)}'`);
+  const copy = readFrozenList(subject, kinds, (entry) => {
+    if (!(PRINCIPAL_KINDS as readonly unknown[]).includes(entry)) {
+      throw new TypeError(
+        `${label}: unknown principal kind '${String(entry)}'`,
+      );
     }
+    const kind = entry as PrincipalKind;
     if (seen.has(kind)) {
       throw new TypeError(`${label}: duplicate principal kind '${kind}'`);
     }
     seen.add(kind);
+    return kind;
+  });
+  if (copy.length === 0) {
+    throw new TypeError(`${subject} must be a non-empty array`);
   }
-  return Object.freeze([...kinds]);
+  return copy;
 }

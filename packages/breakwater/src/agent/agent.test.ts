@@ -10,6 +10,7 @@ import { MockMemory } from '@mastra/core/memory';
 import type {
   ProcessInputArgs,
   ProcessOutputResultArgs,
+  ProcessOutputStepArgs,
   ProcessOutputStreamArgs,
 } from '@mastra/core/processors';
 import { RequestContext } from '@mastra/core/request-context';
@@ -148,6 +149,18 @@ function guarded(
     maxSteps: 2,
     toolChoice: 'auto',
     ...overrides,
+  });
+}
+
+function listWithPerCallIterator<T>(
+  entries: readonly T[],
+  answer: (call: number) => readonly T[],
+): T[] {
+  let calls = 0;
+  return Object.assign([...entries], {
+    [Symbol.iterator]: function* () {
+      yield* answer(calls++);
+    },
   });
 }
 
@@ -1737,6 +1750,94 @@ describe('guarded call-option boundary', () => {
 });
 
 describe('guarded construction and processor validation', () => {
+  it('enforces indexed policies when their iterator yields no policies', async () => {
+    const modelCall = vi.fn();
+    const agent = guarded({
+      model: testModel('unreachable', modelCall),
+      policies: listWithPerCallIterator([denyPatterns(['blocked'])], () => []),
+    });
+
+    const result = await agent.generate('blocked', {
+      requestContext: actorContext(),
+    });
+
+    expect(result.tripwire).toMatchObject({
+      processorId: 'breakwater-policy-engine',
+    });
+    expect(modelCall).not.toHaveBeenCalled();
+  });
+
+  it('runs indexed input processors when their iterator changes members', async () => {
+    const calls: string[] = [];
+    const indexed: GuardedInputProcessor = {
+      id: 'indexed-input',
+      processInput: (args) => {
+        calls.push('index');
+        return args.messages;
+      },
+    };
+    const substitute: GuardedInputProcessor = {
+      id: 'substitute-input',
+      processInput: (args) => {
+        calls.push('substitute');
+        return args.messages;
+      },
+    };
+    const agent = guarded({
+      applicationInputProcessors: listWithPerCallIterator([indexed], () => [
+        substitute,
+      ]),
+    });
+
+    await agent.generate('hello', { requestContext: actorContext() });
+
+    expect(calls).toEqual(['index']);
+  });
+
+  it('runs indexed output hooks when their iterator supplies a forbidden step hook', async () => {
+    const calls: string[] = [];
+    const indexed: GuardedOutputProcessor = {
+      id: 'indexed-output',
+      processOutputStream: async (args) => {
+        if (args.part.type === 'text-delta') calls.push('index-stream');
+        return args.part;
+      },
+      processOutputResult: (args) => {
+        calls.push('index-result');
+        return args.messages;
+      },
+    };
+    const decoy: GuardedOutputProcessor = {
+      id: 'decoy-output',
+      processOutputStream: async (args) => args.part,
+      processOutputResult: (args) => args.messages,
+    };
+    const substitute = {
+      id: 'substitute-output',
+      processOutputStep: (args: ProcessOutputStepArgs) => {
+        calls.push('substitute-step');
+        return args.messages;
+      },
+      processOutputStream: async (args: ProcessOutputStreamArgs) => {
+        if (args.part.type === 'text-delta') calls.push('substitute-stream');
+        return args.part;
+      },
+      processOutputResult: (args: ProcessOutputResultArgs) => {
+        calls.push('substitute-result');
+        return args.messages;
+      },
+    };
+    const agent = guarded({
+      applicationOutputProcessors: listWithPerCallIterator([indexed], (call) =>
+        call === 0 ? [decoy] : [substitute as never],
+      ),
+    });
+
+    await agent.generate('hello', { requestContext: actorContext() });
+
+    expect(calls).toEqual(['index-stream', 'index-result']);
+  });
+
   it('resolves no core error processors in the guarded LLM-request lane', async () => {
     const agent = guarded() as unknown as Agent;
     const context = actorContext();
@@ -2503,6 +2604,30 @@ describe('createGuardedAgent principal kinds', () => {
     });
     return context;
   }
+
+  it('exposes and authorizes indexed principal kinds when their iterator names another kind', async () => {
+    const modelCall = vi.fn();
+    const agent = guarded({
+      model: testModel('generated', modelCall),
+      allowedPrincipalKinds: listWithPerCallIterator<PrincipalKind>(
+        ['human'],
+        () => ['system'],
+      ),
+    });
+
+    expect(agent.allowedPrincipalKinds).toEqual(['human']);
+    await expect(
+      agent.generate('hello', { requestContext: automatedContext('system') }),
+    ).rejects.toThrow(
+      /principal kind 'system' is not in allowed kinds \[human\]/,
+    );
+    expect(modelCall).not.toHaveBeenCalled();
+    const result = await agent.generate('hello', {
+      requestContext: actorContext(),
+    });
+    expect(result.text).toBe('generated');
+    expect(modelCall).toHaveBeenCalledTimes(1);
+  });
 
   it('defaults to humans only, so an agent that names no kinds denies automation', async () => {
     // #given — `guarded()` passes no `allowedPrincipalKinds`.
