@@ -70,6 +70,10 @@ const baseResolveInputProcessors = Reflect.get(
   Agent.prototype,
   'resolveInputProcessors',
 );
+const basePushMessageToSource = Reflect.get(
+  MessageList.prototype,
+  'pushMessageToSource',
+);
 
 const RESERVED_PROCESSOR_IDS = new Set([
   'breakwater-rbac',
@@ -260,10 +264,12 @@ const BOUND_PROCESSOR_MEMBERS: ReadonlySet<ProcessorMember> = new Set([
  * execution after the mandatory input gates have run.
  *
  * Its return value is applied to the call's message list as Mastra's durable
- * runner applies one, on every loop. A processor that throws other than
- * through its `abort` or a `TripWire`, or returns a value that cannot be
- * applied, stops the call with one `agent.input.processor` error event and
- * the reason `input processor failed`.
+ * runner applies one, on every loop, except that a returned message Mastra
+ * holds as both remembered and call input stays both, such as a remembered
+ * assistant message with the caller's client tool outcome. A processor that
+ * throws other than through its `abort` or a `TripWire`, or returns a value
+ * that cannot be applied, stops the call with one `agent.input.processor`
+ * error event and the reason `input processor failed`.
  *
  * The input policies read what the processor adds to the prompt, or changes
  * in it, outside the call's input, as they read the input: system messages
@@ -728,6 +734,7 @@ function applyInputMessages(
   if (omitted.length > 0) messageList.removeByIds(omitted);
   const systemEntries = messages.filter(({ role }) => role === 'system');
   const otherEntries = messages.filter(({ role }) => role !== 'system');
+  const sharedIds = new Set<string>();
   for (const entry of systemEntries) {
     messageList.addSystem(
       entry.content.content ??
@@ -742,14 +749,30 @@ function applyInputMessages(
     messageList.add(entry, check.getSource(entry) ?? 'input', {
       merge: false,
     });
+    if (check.memory.has(entry.id) && check.input.has(entry.id)) {
+      sharedIds.add(entry.id);
+    }
+  }
+  // getSource names memory first, so a message Mastra held as both remembered
+  // and call input, such as a caller's client tool outcome merged into a
+  // remembered message, would leave the input the policies read and Mastra
+  // saves. pushMessageToSource returns it without add's part stamping, which
+  // would change its fingerprint and record it as a processor change.
+  if (sharedIds.size > 0) {
+    for (const message of messageList.get.all.db()) {
+      if (sharedIds.has(message.id)) {
+        Reflect.apply(basePushMessageToSource, messageList, [message, 'input']);
+      }
+    }
   }
 }
 
-// Applies an input processor's return value to the call's message list with
-// the steps of Mastra's durable runner, which keeps a system entry's id in the
-// input. Mastra's standard loop removes that id, so a processor returning its
-// input as system entries would leave the input policies an empty input.
-// `before` holds the ids of the processor's `messages`, including thread history.
+// Applies an input processor's return value to the call's message list. A
+// returned system entry keeps its id in the input, as Mastra's durable
+// runner keeps it; Mastra's standard loop removes that id, so a processor
+// returning its input as system entries would leave the input policies an
+// empty input. `before` holds the ids of the processor's `messages`,
+// including thread history.
 function applyInputResult(
   messageList: MessageList,
   result: unknown,
@@ -1184,6 +1207,14 @@ class GuardedAgent<
         guardInputProcessor(processor, `agent:${options.id}`, options.audit),
       ),
     );
+    if (
+      applicationInputProcessors.length > 0 &&
+      typeof basePushMessageToSource !== 'function'
+    ) {
+      throw new TypeError(
+        'GuardedAgent: incompatible @mastra/core; MessageList.pushMessageToSource is unavailable',
+      );
+    }
     const applicationOutputProcessors = validateApplicationProcessors(
       'output',
       options.applicationOutputProcessors ?? [],

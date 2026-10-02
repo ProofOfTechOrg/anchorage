@@ -60,7 +60,10 @@ const concatenateOutput = (value: unknown) => ({
 const POLICY_FAILED = 'policy evaluation failed';
 const PROCESSOR_FAILED = 'input processor failed';
 
-function lookupTool(toModelOutput: (value: unknown) => unknown, id = 'lookup') {
+function lookupTool(
+  toModelOutput?: (value: unknown) => unknown,
+  id = 'lookup',
+) {
   return createTool({
     id,
     description: 'Look up status',
@@ -1587,9 +1590,19 @@ async function runSharedClientOutcome(
   loop: Loop,
   {
     storedMessageText,
-    clean,
+    lookupResult,
     callerResult,
-  }: { storedMessageText: string; clean: string; callerResult?: typeof raw },
+    processors,
+    lookup = (value: unknown) => ({ type: 'text', value: `mapped ${value}` }),
+    historicalResult = false,
+  }: {
+    storedMessageText: string;
+    lookupResult: string | typeof raw;
+    callerResult?: typeof raw;
+    processors?: readonly GuardedInputProcessor[];
+    lookup?: ((value: unknown) => unknown) | null;
+    historicalResult?: boolean;
+  },
 ) {
   const memory = await historyMemory();
   const pending = {
@@ -1627,7 +1640,27 @@ async function runSharedClientOutcome(
         createdAt: new Date(Date.now() - 100_000),
         content: {
           format: 2,
-          parts: [{ type: 'text', text: storedMessageText }, ...pendingCalls],
+          // The text and stored `call-0` parts have no `createdAt`, so a restore
+          // that stamps parts changes the message and turns the `without
+          // re-reading history` rows red.
+          parts: [
+            { type: 'text', text: storedMessageText },
+            ...(historicalResult
+              ? [
+                  {
+                    type: 'tool-invocation' as const,
+                    toolInvocation: {
+                      state: 'result' as const,
+                      toolCallId: 'call-0',
+                      toolName: 'historical_lookup',
+                      args: {},
+                      result: 'stored historical result',
+                    },
+                  },
+                ]
+              : []),
+            ...pendingCalls,
+          ],
         },
       },
     ],
@@ -1638,15 +1671,19 @@ async function runSharedClientOutcome(
     audit: new AuditLogger(),
     memory,
     tools: {
-      lookup: lookupTool((value: unknown) => ({
-        type: 'text',
-        value: `mapped ${value}`,
-      })),
+      lookup: lookupTool(lookup ?? undefined),
+      ...(historicalResult
+        ? {
+            historical_lookup: lookupTool(() => {
+              throw new Error('stored result mapper failed');
+            }, 'historical_lookup'),
+          }
+        : {}),
       ...(callerResult
         ? { details_lookup: lookupTool(concatenateOutput, 'details_lookup') }
         : {}),
     },
-    processors: [
+    processors: processors ?? [
       app(({ messageList }) => {
         const own = messageList.get.input.db().find(({ id }) => id === 'm2');
         const part = own?.content.parts.find(
@@ -1686,7 +1723,7 @@ async function runSharedClientOutcome(
                 state: 'result',
                 result:
                   call.toolInvocation.toolCallId === 'call-1'
-                    ? clean
+                    ? lookupResult
                     : { ...callerResult },
               },
             })),
@@ -1697,7 +1734,7 @@ async function runSharedClientOutcome(
       { requestContext: actorContext(), memory: THREAD },
     ),
   );
-  return { outcome, prompts };
+  return { outcome, prompts, memory };
 }
 
 it.each(
@@ -1706,7 +1743,7 @@ it.each(
   const clean = 'clean client result';
   const { outcome, prompts } = await runSharedClientOutcome(loop, {
     storedMessageText: MARK,
-    clean,
+    lookupResult: clean,
   });
   const received = {
     loop,
@@ -1728,7 +1765,7 @@ it.each(
 )('refuses a mapped caller outcome beside a client outcome shared with older history on %s', async (loop) => {
   const { outcome, prompts } = await runSharedClientOutcome(loop, {
     storedMessageText: 'pending client lookups',
-    clean: 'clean client result',
+    lookupResult: 'clean client result',
     callerResult: raw,
   });
   expect({
@@ -1743,6 +1780,97 @@ it.each(
     prompts: 0,
     sent: false,
   });
+});
+
+it.each([
+  {
+    shape: 'copies',
+    processor: app(({ messages }) =>
+      messages.map((message) => ({ ...message })),
+    ),
+    result: MARK,
+    lookup: null,
+  },
+  {
+    shape: 'an identity array after mapping',
+    processor: app(({ messages }) => messages),
+    result: { ...raw },
+    lookup: concatenateOutput,
+  },
+])('refuses a returned remembered client outcome as $shape', async (row) => {
+  const received = [];
+  for (const loop of LOOPS) {
+    const { outcome, prompts, memory } = await runSharedClientOutcome(loop, {
+      storedMessageText: 'pending client lookup',
+      lookupResult: row.result,
+      lookup: row.lookup,
+      processors: [row.processor],
+    });
+    received.push({
+      loop,
+      ...outcome,
+      prompts: prompts.length,
+      sent: JSON.stringify(prompts).includes(MARK),
+      saved: await savedMarker(memory, loop, [raw.first]),
+    });
+  }
+  expect(received).toEqual(
+    LOOPS.map((loop) => ({
+      loop,
+      tripwire: policyDenialReason('deny-patterns', 'input'),
+      failure: undefined,
+      prompts: 0,
+      sent: false,
+      saved: false,
+    })),
+  );
+});
+
+it.each([
+  { shape: 'an identity array', processor: app(({ messages }) => messages) },
+  {
+    shape: 'copies',
+    processor: app(({ messages }) =>
+      messages.map((message) => ({ ...message })),
+    ),
+  },
+])('maps a returned remembered client outcome as $shape without re-reading history and saves it on standard loops', async (row) => {
+  const clean = 'clean client result';
+  const received = [];
+  for (const loop of LOOPS) {
+    const { outcome, prompts, memory } = await runSharedClientOutcome(loop, {
+      storedMessageText: MARK,
+      lookupResult: clean,
+      historicalResult: true,
+      processors: [row.processor],
+    });
+    received.push({
+      loop,
+      ...outcome,
+      prompts: prompts.length,
+      mapped: JSON.stringify(prompts).includes(`mapped ${clean}`),
+      ...(loop === 'durable'
+        ? {}
+        : { saved: await savedMarker(memory, loop, [clean]) }),
+    });
+  }
+  expect(received).toEqual([
+    ...STANDARD.map((loop) => ({
+      loop,
+      tripwire: undefined,
+      failure: undefined,
+      prompts: 1,
+      mapped: true,
+      saved: true,
+    })),
+    {
+      loop: 'durable',
+      tripwire: undefined,
+      failure: undefined,
+      prompts: 1,
+      mapped: true,
+    },
+  ]);
 });
 
 describe('durable memory preparation', () => {
