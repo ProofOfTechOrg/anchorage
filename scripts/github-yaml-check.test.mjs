@@ -694,8 +694,8 @@ test('the canary summary distinguishes equality from forward-version coverage', 
   );
 
   const forward = runMastraVersionAssertion({
-    baselineCore: core,
-    baselineD1: d1,
+    baselineCore: '1.67.0',
+    baselineD1: '1.3.2',
     expectedCore: '1.68.0',
     expectedD1: '1.4.0',
     installedCore: '1.68.0',
