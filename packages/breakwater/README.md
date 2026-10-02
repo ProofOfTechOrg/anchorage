@@ -589,6 +589,9 @@ before enabling real execution.
 `authorization`, `cookie`, and `proxy-authorization` on a cross-origin
 redirect, rewrites methods according to fetch redirect rules, refuses to
 replay one-shot bodies across 307 or 308 redirects, and defaults to 20 hops.
+In `'error'` mode, a redirect response rejects with a `TypeError` (`fetch
+failed`) on every runtime, and the transport behind `runtime.fetch`
+(`policies.fetch` or the global `fetch`) always receives `redirect: 'manual'`.
 
 This enforcement cannot see:
 

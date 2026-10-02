@@ -378,6 +378,8 @@ Omit the policy when the deployment intentionally does not restrict declarations
 - refuses an `init.redirect` other than `'follow'`, `'manual'` or `'error'` before any request;
 - checks the initial request and every redirect hop;
 - follows redirects manually;
+- rejects a redirect response in `'error'` mode with a `TypeError` (`fetch failed`) on every runtime;
+- sends the base fetch `redirect: 'manual'` in every mode;
 - strips authorization, cookie, and proxy credential headers on a cross-origin redirect;
 - rewrites method/body according to redirect status semantics;
 - refuses a 307/308 that would require replaying a one-shot stream body;

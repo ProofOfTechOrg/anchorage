@@ -51,15 +51,20 @@ export interface EgressResponse {
  * enumerable members and the standard and Workers request-init members it
  * defines, whether own or inherited, reading each once per call. Class
  * instances, Object.create objects, and Requests passed as init retain their
- * method, headers, body, and signal. Redirect is replaced by the checked mode.
+ * method, headers, body, and signal. The base fetch always receives
+ * `redirect: 'manual'`; the guard applies the checked mode itself.
  */
 export interface EgressRequestInit {
   /** HTTP method. Defaults to the base fetch implementation's default. */
   method?: string;
   /**
    * 'follow' (default) follows redirects with a per-hop allowlist check.
-   * 'manual' and 'error' pass straight through to the base fetch — no hop
-   * happens here, so nothing escapes the initial check.
+   * 'manual' returns a 3xx to the caller; no hop happens here, so nothing
+   * escapes the initial check.
+   * 'error' rejects a 301, 302, 303, 307 or 308 response, or a browser's opaque
+   * redirect, with TypeError('fetch failed') whose cause is
+   * Error('unexpected redirect'), as Node's fetch does. It behaves the same on
+   * Workers, whose fetch refuses 'error'.
    * Any other value is refused with EGRESS_INPUT_INVALID before any request.
    */
   redirect?: 'follow' | 'error' | 'manual';
@@ -458,25 +463,23 @@ export function egressFetch(
     }
     let url = checkUrl(raw, 0);
     const requestInit = forwardedInit(init);
-    // The base fetch reads and converts `redirect` again, so the guard reads it
-    // once and sends the string it checked: a value that converts to 'follow',
-    // or a getter that answers differently, would otherwise make the base
-    // follow redirects without a hop check.
+    // Reading the mode once and always sending 'manual' prevents conversion or
+    // a changing getter from making the base follow a hop without a check.
     const mode: unknown = requestInit.redirect;
-    if (mode !== undefined && mode !== 'follow') {
-      if (mode !== 'manual' && mode !== 'error') {
-        throw denied({
-          code: 'EGRESS_INPUT_INVALID',
-          host: url.hostname,
-          reason: "init.redirect must be 'follow', 'manual' or 'error'",
-          hop: 0,
-        });
-      }
-      // 'manual' hands the 3xx back to the caller (any follow-up fetch goes
-      // through this guard again); 'error' fails on it at the base.
-      return base(url.href, { ...requestInit, redirect: mode });
+    if (
+      mode !== undefined &&
+      mode !== 'follow' &&
+      mode !== 'manual' &&
+      mode !== 'error'
+    ) {
+      throw denied({
+        code: 'EGRESS_INPUT_INVALID',
+        host: url.hostname,
+        reason: "init.redirect must be 'follow', 'manual' or 'error'",
+        hop: 0,
+      });
     }
-
+    // A malformed method can throw during normalization before a request is sent.
     let method = (requestInit.method ?? 'GET').toUpperCase();
     let body = requestInit.body ?? null;
     let headers: HeadersLike | undefined; // built on the first hop only
@@ -484,6 +487,18 @@ export function egressFetch(
       ...requestInit,
       redirect: 'manual',
     });
+    if (mode === 'manual') return response;
+    if (mode === 'error') {
+      // workerd refuses 'error'; fetch rejects redirect statuses even without
+      // Location, and browsers represent opaque redirects with status 0.
+      if (response.status === 0 || REDIRECT_STATUSES.has(response.status)) {
+        releaseResponse(response);
+        throw new TypeError('fetch failed', {
+          cause: new Error('unexpected redirect'),
+        });
+      }
+      return response;
+    }
 
     for (let hop = 1; ; hop++) {
       if (response.status === 0) {

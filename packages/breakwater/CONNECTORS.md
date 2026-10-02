@@ -543,10 +543,11 @@ the base response object unchanged, so runtime-specific response members remain
 available on the underlying value even though the portable TypeScript surface
 models only common response methods.
 
-If `redirect` is `manual`, the caller receives the 3xx and any follow-up fetch
-must go through the guard again. If it is `error`, the base fetch owns the
-redirect failure. A value other than `follow`, `manual` or `error` is refused
-with `EGRESS_INPUT_INVALID` before any request.
+If `redirect` is `manual`, the caller receives the 3xx and any follow-up
+fetch must go through the guard again. If it is `error`, a redirect response
+rejects with a `TypeError` (`fetch failed`) on every runtime. The base fetch
+always receives `redirect: 'manual'`. A value other than `follow`, `manual` or
+`error` is refused with `EGRESS_INPUT_INVALID` before any request.
 
 The guard cannot see global `fetch`, a vendor SDK with its own transport, a raw
 socket, or child-process traffic. Pass `runtime.fetch` into SDKs that support a

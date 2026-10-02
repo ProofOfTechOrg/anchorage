@@ -7393,6 +7393,42 @@ describe('connector decision taxonomy', () => {
 });
 
 describe('runtime fetch decision projection', () => {
+  it('audits an error-mode redirect as an execution failure', async () => {
+    const cancel = vi.fn();
+    const audit = new AuditLogger();
+    const fetch = vi.fn(async () => ({
+      status: 302,
+      headers: { get: () => 'https://other.example.com/x' },
+      body: { cancel },
+    }));
+    const tool = createConnector({
+      id: 'taxonomy.redirect-error',
+      description: 'Observe redirect execution failure',
+      permissions: { sideEffect: 'read', egress: ['api.example.com'] },
+      policies: { audit, fetch },
+      execute: async (_input, _context, runtime) =>
+        runtime.fetch('https://api.example.com/start', { redirect: 'error' }),
+    });
+
+    const error = await run(tool, {}).catch((failure: unknown) => failure);
+
+    expect(error).toBeInstanceOf(TypeError);
+    expect(error).not.toBeInstanceOf(ConnectorPolicyError);
+    expect(error).toMatchObject({ message: 'fetch failed' });
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(fetch).toHaveBeenCalledWith(
+      'https://api.example.com/start',
+      expect.objectContaining({ redirect: 'manual' }),
+    );
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(
+      audit.events().filter((event) => event.decision === 'denied'),
+    ).toEqual([]);
+    expect(
+      audit.events().filter((event) => event.decision === 'error'),
+    ).toMatchObject([{ decisionCode: 'CONNECTOR_EXECUTION_FAILED' }]);
+  });
+
   it.each([
     ['input', 'EGRESS_INPUT_INVALID', null, 0, 0],
     ['url', 'EGRESS_URL_INVALID', null, 0, 0],
