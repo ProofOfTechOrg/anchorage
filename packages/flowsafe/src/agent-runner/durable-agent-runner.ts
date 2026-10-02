@@ -64,6 +64,7 @@ import {
   type ToolsInput,
 } from '@mastra/core/agent';
 import {
+  AGENT_STREAM_TOPIC,
   DurableAgent,
   type DurableAgentConfig,
   type DurableAgenticWorkflowInput,
@@ -74,13 +75,14 @@ import {
 import type { MastraDBMessage } from '@mastra/core/agent/message-list';
 import type { Mastra } from '@mastra/core/mastra';
 import type { RequestContext } from '@mastra/core/request-context';
-import type { AnyWorkflow } from '@mastra/core/workflows';
+import type { AnyWorkflow, WorkflowRunStatus } from '@mastra/core/workflows';
 
 import {
   type ExecutionPrincipalKind,
   isExecutionPrincipalId,
   isExecutionPrincipalKind,
 } from '../approval-api/principal.js';
+import { DoStatusError } from '../do-runner/do-status-error.js';
 import {
   type D1RunExecutionIdentity,
   normalizeMutationEpoch,
@@ -95,6 +97,7 @@ import {
   RunStateUnreadableError,
 } from '../do-runner/index.js';
 import { resourceIdFromKey } from '../do-runner/memory-id.js';
+import { isTerminalRunStatus } from '../do-runner/run-terminal-state.js';
 import type {
   AuthoritativeStartState,
   LegacyRunState,
@@ -106,6 +109,15 @@ import {
   captureReservation,
   type StartReservationReading,
 } from '../do-runner/start-reservation-contract.js';
+
+class AgentAuthorizationDeniedError extends DoStatusError {
+  readonly status = 403;
+
+  constructor() {
+    super('agent authorization denied');
+    this.name = 'AgentAuthorizationDeniedError';
+  }
+}
 
 /** @internal One owned snapshot observation; pending never carries a summary. */
 export type AuthoritativeAgentStartState = AuthoritativeStartState & {
@@ -826,23 +838,35 @@ function unavailableRunEntry(method: string, why: string): Error {
   );
 }
 
-function bindThreadCompletion<T extends object>(
+type ThreadLegTerminalOutcome = 'success' | 'canceled' | 'failed';
+
+interface ResumedThreadLeg {
+  completion: Promise<void>;
+  complete: () => void;
+  outcome?: ThreadLegTerminalOutcome | 'suspended';
+}
+
+function bindResumedLegLifecycle<T extends { status: WorkflowRunStatus }>(
   output: T,
-  completion: Promise<void>,
+  leg: ResumedThreadLeg,
 ): T {
   return new Proxy(output, {
     get(target, property) {
+      if (property === '_waitUntilFinished') return () => leg.completion;
+      if (property === 'status') {
+        if (leg.outcome === 'suspended') return 'suspended';
+        const status = target.status;
+        if (leg.outcome === undefined) {
+          return status === 'running' || status === 'suspended'
+            ? status
+            : 'running';
+        }
+        return status !== 'running' && status !== 'suspended'
+          ? status
+          : leg.outcome;
+      }
       // Core's output getters read private fields, which a proxy receiver lacks.
       const value = Reflect.get(target, property, target);
-      if (property === '_waitUntilFinished') {
-        return () =>
-          typeof value === 'function'
-            ? Promise.race([
-                Promise.resolve(value.call(target) as unknown),
-                completion,
-              ])
-            : completion;
-      }
       return typeof value === 'function' ? value.bind(target) : value;
     },
   });
@@ -938,6 +962,7 @@ export class FlowsafeDurableAgent<
   readonly #rehydrationInputProcessorIds: ReadonlySet<string>;
   readonly #guardedCallOptionMapper?: DurableCallOptionMapper;
   readonly #threadRuntime?: Mastra['agentThreadStreamRuntime'];
+  readonly #resumedThreadLegs = new Map<string, Set<ResumedThreadLeg>>();
   readonly #persistenceWaiters = new Map<
     string,
     {
@@ -1876,6 +1901,10 @@ export class FlowsafeDurableAgent<
    * Rehydrate a suspended durable-agent run after isolate eviction, restore its
    * active thread registration, then resume through RunnerRuntime so approval
    * grant derivation and snapshot provenance remain authoritative.
+   * A resumed leg observes from the current run stream position. Its thread
+   * registration completes on the run's terminal outcome or a resume failure
+   * after rehydration, when the wrapper publishes a terminal error. Another
+   * suspension keeps blocking the thread until the next resume, as a first leg does.
    * Hosts expose this only from their trusted approval-decision topology.
    */
   async resumeViaRuntime(options: {
@@ -1893,7 +1922,7 @@ export class FlowsafeDurableAgent<
         ) as typeof options.memory)
       : options.memory;
     let rehydrated = false;
-    let finishThreadRegistration: (() => void) | undefined;
+    let leg: ResumedThreadLeg | undefined;
     try {
       const summary = await this.#runtime.resume(
         this.getWorkflow().id,
@@ -1906,29 +1935,32 @@ export class FlowsafeDurableAgent<
           requestedBy: options.requestedBy,
           requestedByKind: 'human',
           prepareExecution: async (requestContext) => {
+            const offset = (
+              await this.pubsub.getHistory(AGENT_STREAM_TOPIC(options.runId))
+            ).length;
             await this.#rehydrateRegistry({
               runId: options.runId,
               requestContext,
               ...(memory !== undefined ? { memory } : {}),
             });
             rehydrated = true;
-            const observed = await this.observe(options.runId);
-            const completion = new Promise<void>((resolve) => {
-              finishThreadRegistration = resolve;
-            });
-            await this.#threadRuntime?.registerRun(
-              this as unknown as Parameters<
-                Mastra['agentThreadStreamRuntime']['registerRun']
-              >[0],
-              bindThreadCompletion(observed.output, completion),
-              {
-                runId: options.runId,
-                ...(memory !== undefined ? { memory } : {}),
-              } as Parameters<
-                Mastra['agentThreadStreamRuntime']['registerRun']
-              >[2],
-              this.getPubSub(),
-            );
+            const observed = await this.observe(options.runId, { offset });
+            if (this.#threadRuntime) {
+              leg = this.#trackResumedLeg(options.runId);
+              await this.#threadRuntime.registerRun(
+                this as unknown as Parameters<
+                  Mastra['agentThreadStreamRuntime']['registerRun']
+                >[0],
+                bindResumedLegLifecycle(observed.output, leg),
+                {
+                  runId: options.runId,
+                  ...(memory !== undefined ? { memory } : {}),
+                } as Parameters<
+                  Mastra['agentThreadStreamRuntime']['registerRun']
+                >[2],
+                this.getPubSub(),
+              );
+            }
           },
         },
       );
@@ -1940,17 +1972,70 @@ export class FlowsafeDurableAgent<
         this.runRegistryInternal.cleanup(options.runId);
         globalRunRegistry.delete(options.runId);
       }
+      if (isTerminalRunStatus(summary.status)) {
+        this.#completeResumedThreadLegs(
+          options.runId,
+          summary.status === 'success'
+            ? 'success'
+            : summary.status === 'canceled' || summary.status === 'cancelled'
+              ? 'canceled'
+              : 'failed',
+        );
+      } else if (leg) {
+        leg.outcome = 'suspended';
+      }
       return summary;
     } catch (error) {
       if (rehydrated) {
         await this.#publishTerminalError(options.runId, error);
         this.runRegistryInternal.cleanup(options.runId);
         globalRunRegistry.delete(options.runId);
+        this.#completeResumedThreadLegs(options.runId, 'failed');
       }
       throw error;
-    } finally {
-      finishThreadRegistration?.();
     }
+  }
+
+  #trackResumedLeg(runId: string): ResumedThreadLeg {
+    let complete!: () => void;
+    const completion = new Promise<void>((resolve) => {
+      complete = resolve;
+    });
+    const leg = { completion, complete };
+    let legs = this.#resumedThreadLegs.get(runId);
+    if (!legs) {
+      legs = new Set();
+      this.#resumedThreadLegs.set(runId, legs);
+    }
+    legs.add(leg);
+    return leg;
+  }
+
+  #completeResumedThreadLegs(
+    runId: string,
+    outcome: ThreadLegTerminalOutcome,
+  ): void {
+    const legs = this.#resumedThreadLegs.get(runId);
+    if (!legs) return;
+    this.#resumedThreadLegs.delete(runId);
+    for (const leg of legs) {
+      leg.outcome = outcome;
+      leg.complete();
+    }
+  }
+
+  async #settleRefusedStart(runId: string, refusal: Error): Promise<void> {
+    let published = false;
+    try {
+      published =
+        (await this.#publishTerminalError(runId, refusal)) ||
+        (await this.#publishTerminalError(runId, refusal));
+    } finally {
+      this.#replayedSignals.delete(runId);
+      this.runRegistryInternal.cleanup(runId);
+      globalRunRegistry.delete(runId);
+    }
+    if (!published) throw refusal;
   }
 
   /**
@@ -2012,7 +2097,7 @@ export class FlowsafeDurableAgent<
           if (!threadId || state?.threadExists !== true) return;
           // Explicit read-only memory forbids preserving denied input.
           if (state.memoryConfig?.readOnly === true) return;
-          const registryEntry = globalRunRegistry.get(runId);
+          const registryEntry = this.runRegistryInternal.get(runId);
           const tripwire = registryEntry?.tripwire;
           const memory = await this.getMemory({
             requestContext: registryEntry?.requestContext,
@@ -2293,17 +2378,7 @@ export class FlowsafeDurableAgent<
         const refusal = new InvalidRunRequestError(
           `${UNREGISTERED_RUN_REFUSAL_PREFIX}run '${runId}' was not registered by the host start seam — the durable-agent runner never executes a run it does not own`,
         );
-        let published = false;
-        try {
-          published =
-            (await this.#publishTerminalError(runId, refusal)) ||
-            (await this.#publishTerminalError(runId, refusal));
-        } finally {
-          this.#replayedSignals.delete(runId);
-          this.runRegistryInternal.cleanup(runId);
-          globalRunRegistry.delete(runId);
-        }
-        if (!published) throw refusal;
+        await this.#settleRefusedStart(runId, refusal);
         return;
       }
       const {
@@ -2324,6 +2399,19 @@ export class FlowsafeDurableAgent<
         throw new InvalidRunRequestError(
           'Core input does not match agent start authority',
         );
+      }
+      // The agent registry retains the preparation refusal when the isolate-wide
+      // registry evicts its entry before the first step.
+      if (
+        this.runRegistryInternal.get(runId)?.tripwire?.processorId ===
+        BREAKWATER_RBAC_PROCESSOR_ID
+      ) {
+        const refusal = new AgentAuthorizationDeniedError();
+        // The waiter's first rejection wins; publishing ERROR first supplies a
+        // plain Error that doErrorResponse maps to 500.
+        waiter?.reject(refusal);
+        await this.#settleRefusedStart(runId, refusal);
+        return;
       }
       const workflow = this.getWorkflow();
       summary = await this.#runtime.start(workflow.id, {

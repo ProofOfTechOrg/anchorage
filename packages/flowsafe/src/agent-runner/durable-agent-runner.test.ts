@@ -9,6 +9,8 @@
 
 import { Agent, createSignal } from '@mastra/core/agent';
 import {
+  AGENT_STREAM_TOPIC,
+  AgentStreamEventTypes,
   DurableAgent,
   type DurableAgenticWorkflowInput,
   type ExtendedRunRegistry,
@@ -55,6 +57,7 @@ import { z } from 'zod';
 
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import { createD1Storage } from '../do-runner/d1-storage.js';
+import { DoStatusError } from '../do-runner/do-status-error.js';
 import {
   type ExecutionFenceDatabase,
   ExecutionFenceStore,
@@ -199,6 +202,41 @@ function registryFor(agent: FlowsafeDurableAgent): ExtendedRunRegistry {
       readonly runRegistryInternal: ExtendedRunRegistry;
     }
   ).runRegistryInternal;
+}
+
+function evictCoreRunEntry(fillers: string[]): void {
+  for (let index = 0; index < 1000; index++) {
+    const id = crypto.randomUUID();
+    fillers.push(id);
+    globalRunRegistry.set(id, { cleanup: () => undefined } as never);
+  }
+}
+
+function spyOnRefusedExecute(
+  agent: FlowsafeDurableAgent,
+  evicted: boolean,
+  fillers: string[],
+  onTripwire?: (tripwire: RunRegistryEntry['tripwire']) => void,
+) {
+  const executable = agent as unknown as {
+    executeWorkflow(
+      runId: string,
+      input: DurableAgenticWorkflowInput,
+    ): Promise<void>;
+  };
+  const original = executable.executeWorkflow.bind(agent);
+  return vi
+    .spyOn(executable, 'executeWorkflow')
+    .mockImplementation(async (runId, input) => {
+      const tripwire = registryFor(agent).get(runId)?.tripwire;
+      expect(tripwire?.processorId).toBe('breakwater-rbac');
+      onTripwire?.(tripwire);
+      if (evicted) {
+        evictCoreRunEntry(fillers);
+        expect(globalRunRegistry.has(runId)).toBe(false);
+      }
+      return original(runId, input);
+    });
 }
 
 async function guardedResumeFixture(
@@ -2656,9 +2694,144 @@ describe('createFlowsafeDurableAgent', () => {
 });
 
 describe('FlowsafeDurableAgent.executeWorkflow', () => {
+  async function guardedUnownedInputFixture() {
+    const { runtime, start } = fakeRuntime();
+    const memory = new MockMemory();
+    await memory.saveThread({
+      thread: {
+        id: 'thread-1',
+        resourceId: 'resource-1',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        metadata: {},
+      },
+    });
+    const audit = new AuditLogger();
+    const agent = createFlowsafeDurableAgent({
+      agent: createGuardedAgent({
+        id: 'writer',
+        name: 'Writer',
+        instructions: 'Answer the request.',
+        model: 'openai/gpt-4o-mini',
+        memory,
+        allowedRoles: ['operator'],
+        policies: [denyPatterns([UNOWNED_INPUT_MARK])],
+        audit,
+        maxSteps: 2,
+        toolChoice: 'auto',
+      }) as unknown as Agent,
+      runtime,
+      cache: false,
+    });
+    const emitError = vi.spyOn(
+      agent as unknown as {
+        emitError: (id: string, error: Error) => Promise<void>;
+      },
+      'emitError',
+    );
+    return { agent, memory, audit, start, emitError };
+  }
+
   afterEach(() => {
     vi.restoreAllMocks();
   });
+
+  it.each([
+    ['is retained on an unthreaded start', false, false],
+    ['is evicted on an unthreaded start', true, false],
+    ['is retained on a threaded start', false, true],
+    ['is evicted on a threaded start', true, true],
+  ] as const)(
+    'refuses a host start that RBAC refused at preparation with 403 before the runtime starts when its core run entry %s',
+    async (_label, evicted, threaded) => {
+      const memory = new MockMemory();
+      if (threaded) {
+        await memory.saveThread({
+          thread: {
+            id: 'thread-1',
+            resourceId: 'thread-1',
+            createdAt: new Date(),
+            updatedAt: new Date(),
+            metadata: {},
+          },
+        });
+      }
+      const f = await realAgentBridgeFixture(
+        () => ({ [ACTOR_CONTEXT_KEY]: { id: 'actor-1', role: 'viewer' } }),
+        undefined,
+        threaded,
+        { memory, prompts: [] },
+      );
+      const runId = crypto.randomUUID();
+      const fillers: string[] = [];
+      let refusalReason = '';
+      const execute = spyOnRefusedExecute(
+        f.agent,
+        evicted,
+        fillers,
+        (tripwire) => {
+          assert(tripwire);
+          refusalReason = tripwire.reason;
+        },
+      );
+      let result:
+        | Awaited<ReturnType<typeof f.agent.streamUntilPersisted>>
+        | undefined;
+      try {
+        const error = await f.agent
+          .streamUntilPersisted(
+            'hello',
+            {
+              runId,
+              requestContext: actorContext('viewer'),
+              disableBackgroundTasks: true,
+              ...(threaded
+                ? { memory: { thread: 'thread-1', resource: 'thread-1' } }
+                : {}),
+            },
+            'operator-1',
+            'human',
+            `${runId}-attempt`,
+            undefined,
+            undefined,
+            { ...startAuthority(), agentStart: { threaded } },
+          )
+          .then(
+            (value) => {
+              result = value;
+              return value;
+            },
+            (refusal: unknown) => refusal,
+          );
+        expect(execute).toHaveBeenCalledOnce();
+        expect(f.counts.model).toBe(0);
+        expect(error).toBeInstanceOf(DoStatusError);
+        expect(error).toMatchObject({ status: 403 });
+        expect((error as Error).message).not.toContain(refusalReason);
+        expect(doErrorResponse(error).status).toBe(403);
+        expect(f.start).not.toHaveBeenCalled();
+        if (threaded) {
+          await vi.waitFor(() =>
+            expect(
+              f.agent.getActiveThreadRunId({
+                threadId: 'thread-1',
+                resourceId: 'thread-1',
+              }),
+            ).toBeUndefined(),
+          );
+        }
+      } finally {
+        result?.cleanup();
+        registryFor(f.agent).clear();
+        globalRunRegistry.delete(runId);
+        for (const id of fillers) globalRunRegistry.delete(id);
+        execute.mockRestore();
+        f.start.mockRestore();
+        f.sql.close();
+      }
+    },
+    15_000,
+  );
 
   it('terminally fails and persists input when the host seam did not register the run', async () => {
     // #given a real prepared input whose thread already exists
@@ -2777,41 +2950,9 @@ describe('FlowsafeDurableAgent.executeWorkflow', () => {
   ] as const)('saves none of a direct unowned stream input when %s', async (_label, input, requestContext, refusingAction) => {
     // #given — a guarded agent whose input policy denies the marker, over a
     // thread that exists
-    const { runtime, start } = fakeRuntime();
-    const memory = new MockMemory();
-    await memory.saveThread({
-      thread: {
-        id: 'thread-1',
-        resourceId: 'resource-1',
-        createdAt: new Date(),
-        updatedAt: new Date(),
-        metadata: {},
-      },
-    });
-    const audit = new AuditLogger();
-    const agent = createFlowsafeDurableAgent({
-      agent: createGuardedAgent({
-        id: 'writer',
-        name: 'Writer',
-        instructions: 'Answer the request.',
-        model: 'openai/gpt-4o-mini',
-        memory,
-        allowedRoles: ['operator'],
-        policies: [denyPatterns([UNOWNED_INPUT_MARK])],
-        audit,
-        maxSteps: 2,
-        toolChoice: 'auto',
-      }) as unknown as Agent,
-      runtime,
-      cache: false,
-    });
+    const { agent, memory, audit, start, emitError } =
+      await guardedUnownedInputFixture();
     const saveMessages = vi.spyOn(memory, 'saveMessages');
-    const emitError = vi.spyOn(
-      agent as unknown as {
-        emitError: (id: string, error: Error) => Promise<void>;
-      },
-      'emitError',
-    );
 
     // #when — a caller streams its own input past the host start seam
     await agent.stream(input, {
@@ -2839,6 +2980,43 @@ describe('FlowsafeDurableAgent.executeWorkflow', () => {
     expect(saveMessages).not.toHaveBeenCalled();
     const { messages } = await memory.recall({ threadId: 'thread-1' });
     expect(JSON.stringify(messages)).not.toContain(UNOWNED_INPUT_MARK);
+  });
+
+  it.each([
+    ['is retained', false],
+    ['is evicted', true],
+  ] as const)('preserves a created signal refused for a missing actor when its core run entry %s', async (_label, evicted) => {
+    const { agent, memory, audit, start, emitError } =
+      await guardedUnownedInputFixture();
+    const fillers: string[] = [];
+    const execute = spyOnRefusedExecute(agent, evicted, fillers);
+    try {
+      await agent.stream(
+        createSignal({ type: 'user', contents: `${UNOWNED_INPUT_MARK} text` }),
+        {
+          runId: 'run-1',
+          memory: { thread: 'thread-1', resource: 'resource-1' },
+        },
+      );
+      await vi.waitFor(() =>
+        expect(emitError).toHaveBeenCalledWith(
+          'run-1',
+          expect.any(InvalidRunRequestError),
+        ),
+      );
+      expect(audit.events()).toContainEqual(
+        expect.objectContaining({
+          action: 'agent.input.authorize',
+          decision: 'denied',
+        }),
+      );
+      expect(start).not.toHaveBeenCalled();
+      const { messages } = await memory.recall({ threadId: 'thread-1' });
+      expect(JSON.stringify(messages)).toContain(`${UNOWNED_INPUT_MARK} text`);
+    } finally {
+      for (const id of fillers) globalRunRegistry.delete(id);
+      execute.mockRestore();
+    }
   });
 
   it('publishes the terminal error when unowned input persistence times out', async () => {
@@ -3558,23 +3736,70 @@ describe('FlowsafeDurableAgent thread runtime registration and rehydration', () 
     expect(agent.getPubSub()).toBe(pubsub);
   });
 
-  it('keeps private-field getters readable on a registered resumed output', async () => {
-    // Core's stream output keeps `status` in a private field, and the thread
-    // runtime reads it to decide whether the run blocks its thread.
+  it('resumes observation after retained earlier events on the observer bus', async () => {
+    const pubsub = new EventEmitterPubSub();
+    const { runtime, resume } = fakeRuntime({
+      pubsub,
+      resumeContext: actorContext(),
+    });
+    const agent = createFlowsafeDurableAgent({
+      agent: testAgent(),
+      runtime,
+    });
+    const runId = 'resume-observer-history';
+    const topic = AGENT_STREAM_TOPIC(runId);
+    await agent.pubsub.publish(topic, {
+      type: AgentStreamEventTypes.CHUNK,
+      runId,
+      data: {
+        type: 'tool-call-approval',
+        runId,
+        from: 'AGENT',
+        payload: {
+          toolCallId: 'earlier-approval',
+          toolName: 'approve-action',
+          args: {},
+        },
+      },
+    });
+    expect(agent.pubsub).not.toBe(agent.getPubSub());
+    const innerPubsub = agent.getPubSub();
+    assert(innerPubsub);
+    expect((await innerPubsub.getHistory(topic)).length).not.toBe(1);
+    const observe = agent.observe.bind(agent);
+    const observer = vi
+      .spyOn(agent, 'observe')
+      .mockImplementation((...args) => observe(...args));
+
+    await agent.resumeViaRuntime({ runId, requestedBy: 'reviewer-1' });
+
+    expect(resume).toHaveBeenCalledOnce();
+    expect(observer).toHaveBeenCalledWith(runId, { offset: 1 });
+  });
+
+  it('keeps private-field getters readable and reports the runtime outcome on a registered resumed output', async () => {
+    // Core's stream output keeps `status` and other state in private fields read through the registered output.
+    // The registered status follows the runtime's outcome once the resume returns.
     class PrivateStatusOutput {
       readonly #status = 'running';
+      readonly #runId = 'run-1';
       get status(): string {
         return this.#status;
       }
+      get runId(): string {
+        return this.#runId;
+      }
     }
     const { runtime } = fakeRuntime({ resumeContext: actorContext() });
-    let registeredOutput: { status: string } | undefined;
+    let registeredOutput: { status: string; runId: string } | undefined;
+    let statusDuringResume: string | undefined;
     const agent = createFlowsafeDurableAgent({
       agent: testAgent(),
       runtime,
       threadRuntime: {
         registerRun: vi.fn(async (_agent, output) => {
           registeredOutput = output as typeof registeredOutput;
+          statusDuringResume = (output as { status: string }).status;
         }),
       } as never,
     });
@@ -3584,7 +3809,9 @@ describe('FlowsafeDurableAgent thread runtime registration and rehydration', () 
 
     await agent.resumeViaRuntime({ runId: 'run-1', requestedBy: 'reviewer-1' });
 
-    expect(registeredOutput?.status).toBe('running');
+    expect(statusDuringResume).toBe('running');
+    expect(registeredOutput?.status).toBe('success');
+    expect(registeredOutput?.runId).toBe('run-1');
   });
 
   it('guarded durable call options refuse memory configuration before runtime resume', async () => {
