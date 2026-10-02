@@ -58,10 +58,12 @@ export interface PolicyContext {
    * the streamed output accumulated so far, or the final output result.
    * Inside a guarded agent the input text also holds the text of each system
    * message and each other message its application input processors add or
-   * change, once for each version a processor leaves it in and for the
-   * version the `breakwater-client-tool-output` step leaves after mapping
-   * that message's client tool results; a version still among `messages` is
-   * read there, not again.
+   * change, and a remembered message carrying the caller's client tool
+   * outcome that one of them keeps but moves out of the input, read whole
+   * with its stored history. Each recorded version contributes text, including
+   * the version the `breakwater-client-tool-output` step leaves after mapping
+   * results in a message of the call's input; a version still among `messages`
+   * is read there, not again.
    */
   text: string;
   /** Mastra request context associated with the agent call. */

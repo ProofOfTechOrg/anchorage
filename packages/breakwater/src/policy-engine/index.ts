@@ -659,9 +659,8 @@ function recordedSystemText(
   return joinedPromptText(values);
 }
 
-// The text of what application input processors added or changed outside the
-// call's input, read as the caller's messages are read, or undefined when any
-// of it is unclassified.
+// The text of the recorded prompt versions, read as the caller's messages are
+// read, or undefined when any of it is unclassified.
 function processorAdditionText(
   additions: readonly ProcessorAddition[],
 ): string | undefined {

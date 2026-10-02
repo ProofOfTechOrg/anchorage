@@ -1586,24 +1586,35 @@ async function historyMemory(
   return memory;
 }
 
-async function runSharedClientOutcome(
-  loop: Loop,
-  {
-    storedMessageText,
-    lookupResult,
-    callerResult,
-    processors,
-    lookup = (value: unknown) => ({ type: 'text', value: `mapped ${value}` }),
-    historicalResult = false,
-  }: {
-    storedMessageText: string;
-    lookupResult: string | typeof raw;
-    callerResult?: typeof raw;
-    processors?: readonly GuardedInputProcessor[];
-    lookup?: ((value: unknown) => unknown) | null;
-    historicalResult?: boolean;
-  },
+function moveCallerOutcome(
+  { messageList, abort }: Pick<ProcessInputArgs, 'messageList' | 'abort'>,
+  target: 'memory' | 'response',
 ) {
+  const m = messageList.get.input.db().find(({ id }) => id === 'm2');
+  if (!m) return abort('caller outcome missing');
+  messageList.removeByIds([m.id]);
+  messageList.add(m, target, { merge: false });
+  return m;
+}
+
+async function sharedClientOutcomeFixture({
+  storedMessageText,
+  lookupResult,
+  callerResult,
+  processors,
+  lookup = (value: unknown) => ({ type: 'text', value: `mapped ${value}` }),
+  historicalResult = false,
+  stampedHistory = false,
+}: {
+  storedMessageText: string;
+  lookupResult: string | typeof raw;
+  callerResult?: typeof raw;
+  processors?: readonly GuardedInputProcessor[];
+  lookup?: ((value: unknown) => unknown) | null;
+  historicalResult?: boolean;
+  stampedHistory?: boolean;
+}) {
+  const stamp = { createdAt: 1_700_000_000_000 };
   const memory = await historyMemory();
   const pending = {
     type: 'tool-invocation' as const,
@@ -1640,15 +1651,19 @@ async function runSharedClientOutcome(
         createdAt: new Date(Date.now() - 100_000),
         content: {
           format: 2,
-          // The text and stored `call-0` parts have no `createdAt`, so a restore
-          // that stamps parts changes the message and turns the `without
-          // re-reading history` rows red.
+          // By default the stored parts omit `createdAt`, so stamping a restore
+          // changes the message and turns the `without re-reading history` rows red.
           parts: [
-            { type: 'text', text: storedMessageText },
+            {
+              type: 'text',
+              text: storedMessageText,
+              ...(stampedHistory ? stamp : {}),
+            },
             ...(historicalResult
               ? [
                   {
                     type: 'tool-invocation' as const,
+                    ...(stampedHistory ? stamp : {}),
                     toolInvocation: {
                       state: 'result' as const,
                       toolCallId: 'call-0',
@@ -1706,34 +1721,38 @@ async function runSharedClientOutcome(
       }),
     ],
   });
-  const outcome = await outcomeOf(
-    drive(
-      agent,
-      loop,
-      [
-        {
-          id: 'm2',
-          role: 'assistant',
-          content: {
-            format: 2,
-            parts: pendingCalls.map((call) => ({
-              ...call,
-              toolInvocation: {
-                ...call.toolInvocation,
-                state: 'result',
-                result:
-                  call.toolInvocation.toolCallId === 'call-1'
-                    ? lookupResult
-                    : { ...callerResult },
-              },
-            })),
+  const messages = [
+    {
+      id: 'm2',
+      role: 'assistant',
+      content: {
+        format: 2,
+        parts: pendingCalls.map((call) => ({
+          ...call,
+          toolInvocation: {
+            ...call.toolInvocation,
+            state: 'result',
+            result:
+              call.toolInvocation.toolCallId === 'call-1'
+                ? lookupResult
+                : { ...callerResult },
           },
-        },
-        'and now?',
-      ],
-      { requestContext: actorContext(), memory: THREAD },
-    ),
-  );
+        })),
+      },
+    },
+    'and now?',
+  ];
+  const callOptions = { requestContext: actorContext(), memory: THREAD };
+  return { agent, messages, callOptions, prompts, memory };
+}
+
+async function runSharedClientOutcome(
+  loop: Loop,
+  options: Parameters<typeof sharedClientOutcomeFixture>[0],
+) {
+  const { agent, messages, callOptions, prompts, memory } =
+    await sharedClientOutcomeFixture(options);
+  const outcome = await outcomeOf(drive(agent, loop, messages, callOptions));
   return { outcome, prompts, memory };
 }
 
@@ -1871,6 +1890,86 @@ it.each([
       mapped: true,
     },
   ]);
+});
+
+it.each([
+  'memory',
+  'response',
+  'memory beside an input copy',
+] as const)('refuses a remembered caller outcome moved to %s', async (move) => {
+  const received = [];
+  for (const loop of LOOPS) {
+    const { outcome, prompts, memory } = await runSharedClientOutcome(loop, {
+      storedMessageText: 'pending client lookup',
+      lookupResult: MARK,
+      lookup: null,
+      // Stamping keeps response and input-copy adds from changing the fingerprint.
+      stampedHistory: true,
+      processors: [
+        app(({ messageList, abort }) => {
+          const m = moveCallerOutcome(
+            { messageList, abort },
+            move === 'response' ? 'response' : 'memory',
+          );
+          if (move === 'memory beside an input copy') {
+            messageList.add({ ...m }, 'input');
+          }
+          return messageList;
+        }),
+      ],
+    });
+    received.push({
+      loop,
+      ...outcome,
+      prompts: prompts.length,
+      sent: JSON.stringify(prompts).includes(MARK),
+      saved: await savedMarker(memory, loop),
+    });
+  }
+  expect(received).toEqual(
+    LOOPS.map((loop) => ({
+      loop,
+      tripwire: policyDenialReason('deny-patterns', 'input'),
+      failure: undefined,
+      prompts: 0,
+      sent: false,
+      saved: false,
+    })),
+  );
+});
+
+it('sends an allowed moved remembered caller outcome without new mapping', async () => {
+  const received = [];
+  for (const loop of LOOPS) {
+    const { outcome, prompts } = await runSharedClientOutcome(loop, {
+      storedMessageText: 'pending client lookup',
+      lookupResult: { ...raw },
+      lookup: concatenateOutput,
+      processors: [
+        app(({ messageList, abort }) => {
+          moveCallerOutcome({ messageList, abort }, 'memory');
+          return messageList;
+        }),
+      ],
+    });
+    received.push({
+      loop,
+      ...outcome,
+      prompts: prompts.length,
+      sent: JSON.stringify(prompts).includes(MARK),
+      rawSent: JSON.stringify(prompts).includes(raw.first),
+    });
+  }
+  expect(received).toEqual(
+    LOOPS.map((loop) => ({
+      loop,
+      tripwire: undefined,
+      failure: undefined,
+      prompts: 1,
+      sent: false,
+      rawSent: true,
+    })),
+  );
 });
 
 describe('durable memory preparation', () => {
@@ -2404,6 +2503,40 @@ describe('a refused standard-loop call', () => {
     finishReason: output.finishReason,
     messages: output.messages.map(({ id }) => id),
     remembered: output.rememberedMessages.map(({ id }) => id),
+  });
+
+  it.each([
+    { end: 'aborts', reason: 'application refused' },
+    { end: 'throws', reason: PROCESSOR_FAILED },
+  ])('removes a moved remembered caller outcome when its processor $end', async (row) => {
+    const received = [];
+    for (const loop of STANDARD) {
+      const { agent, messages, callOptions } = await sharedClientOutcomeFixture(
+        {
+          storedMessageText: 'pending client lookup',
+          lookupResult: MARK,
+          lookup: null,
+          processors: [
+            app(({ messageList, abort }) => {
+              moveCallerOutcome({ messageList, abort }, 'memory');
+              if (row.end === 'aborts') return abort('application refused');
+              throw new Error('application failed');
+            }),
+          ],
+        },
+      );
+      const output = await fullOutput(agent, loop, callOptions, messages);
+      const { reason, messages: remaining, remembered } = summary(output);
+      received.push({ loop, reason, messages: remaining, remembered });
+    }
+    expect(received).toEqual(
+      STANDARD.map((loop) => ({
+        loop,
+        reason: row.reason,
+        messages: ['mem-u', 'mem-a'],
+        remembered: ['mem-u', 'mem-a'],
+      })),
+    );
   });
 
   it('returns the tripwire, the remembered history and the audit it did before, without the refused input in messages, on generate and stream', async () => {

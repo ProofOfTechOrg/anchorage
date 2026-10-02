@@ -33,13 +33,14 @@ import type { FullOutput, MastraModelOutput } from '@mastra/core/stream';
 
 import { type AuditLogger, agentAuditDetail } from '../audit/index.js';
 import { assertKnownFields, readFrozenList } from '../host-input.js';
-import { stopWithoutCallMessages } from '../input-refusal.js';
+import { type Refusal, stopWithoutCallMessages } from '../input-refusal.js';
 import { PolicyEngine, type PolicyEvaluator } from '../policy-engine/index.js';
 import {
   inputAssetUrls,
   UNCLASSIFIED_INPUT_CONTENT,
 } from '../policy-engine/prompt-media.js';
 import {
+  callerOutcomeMessageIds,
   type PromptSnapshot,
   recordClientToolOutcomes,
   recordProcessorAdditions,
@@ -274,15 +275,21 @@ const BOUND_PROCESSOR_MEMBERS: ReadonlySet<ProcessorMember> = new Set([
  * The input policies read what the processor adds to the prompt, or changes
  * in it, outside the call's input, as they read the input: system messages
  * with their provider options, and messages of every other source, a history
- * message it rewrites through any source included. A system message it adds
- * or changes must hold text alone in data properties, and what it adds or
- * changes must be a value `structuredClone` can copy, or the call stops as
- * above.
+ * message it rewrites through any source included, and a remembered message
+ * carrying the caller's client tool outcome it keeps but moves out of the
+ * call's input, read whole, stored history included. Client tool result
+ * mapping applies to messages of the call's input; a moved message gets no
+ * new `toModelOutput` mapping, and cached output is read and sent. A system
+ * message it adds or changes must hold text alone in data properties, and
+ * what it adds or changes must be a value `structuredClone` can copy, or the
+ * call stops as above.
  *
  * A call that RBAC, an input policy or an application input processor
  * refuses has its input, its response messages, and every other non-system
  * message its application input processors added or changed, the refusing
- * processor's own included, removed from Mastra's message list before it
+ * processor's own included, and a remembered message carrying the caller's
+ * client tool outcome a processor keeps but moves out of the input, even
+ * before aborting or throwing, removed from Mastra's message list before it
  * stops. It saves none of them to memory, Mastra's durable loop generates no
  * thread title from them, and on `generate()` and `stream()` the result's
  * `messages` and `rememberedMessages` omit them, a history message such a
@@ -823,7 +830,7 @@ function failInputProcessor(
   resource: string,
   audit: AuditLogger,
   processorId: string,
-  snapshot?: PromptSnapshot,
+  refusal: Refusal = {},
 ): never {
   try {
     audit.record({
@@ -835,7 +842,7 @@ function failInputProcessor(
       detail: agentAuditDetail(args.requestContext, { processor: processorId }),
     });
   } finally {
-    stopWithoutCallMessages(args.messageList, { snapshot }, () =>
+    stopWithoutCallMessages(args.messageList, refusal, () =>
       args.abort(INPUT_PROCESSOR_FAILED),
     );
   }
@@ -916,9 +923,10 @@ function guardMemoryInputProcessor(
 // and returns the list, so Mastra applies nothing after it, and turns any
 // error other than the processor's own abort or tripwire into an audited
 // abort. Either way the refusal drops the call's messages, those the
-// processor added or changed before it failed included. What the processor
-// adds or changes outside the input is recorded for the policy engine. The
-// wrapper stays extensible: Mastra writes `processorIndex` onto it.
+// processor added or changed before it failed included, and remembered
+// caller outcomes it moved out of the input. Those moved messages and what
+// the processor adds or changes outside the input are recorded for the policy
+// engine. The wrapper stays extensible: Mastra writes `processorIndex` onto it.
 function guardInputProcessor(
   inner: GuardedInputProcessor,
   resource: string,
@@ -929,8 +937,10 @@ function guardInputProcessor(
     async processInput(args: ProcessInputArgs): Promise<ProcessInputResult> {
       const { abort, abortErrors } = forwardingProcessorAbort(args.abort);
       let snapshot: PromptSnapshot | undefined;
+      let outcomeIds: ReadonlySet<string> | undefined;
       try {
         const { messageList } = args;
+        outcomeIds = callerOutcomeMessageIds(messageList);
         // Durable preparation passes input-only args.messages; the list includes loaded history.
         const messages = messageList.get.all.db();
         const beforeIds = messages.map(({ id }) => id);
@@ -942,14 +952,20 @@ function guardInputProcessor(
           abort,
         });
         applyInputResult(messageList, result, beforeIds, check);
-        recordProcessorAdditions(messageList, snapshot);
+        recordProcessorAdditions(messageList, snapshot, {
+          callerOutcomeMessageIds: outcomeIds,
+        });
       } catch (error) {
+        const refusal: Refusal = {
+          snapshot,
+          callerOutcomeMessageIds: outcomeIds,
+        };
         if (isForwardedAbortOrTripWire(error, abortErrors)) {
-          return stopWithoutCallMessages(args.messageList, { snapshot }, () => {
+          return stopWithoutCallMessages(args.messageList, refusal, () => {
             throw error;
           });
         }
-        return failInputProcessor(args, resource, audit, inner.id, snapshot);
+        return failInputProcessor(args, resource, audit, inner.id, refusal);
       }
       return args.messageList;
     },

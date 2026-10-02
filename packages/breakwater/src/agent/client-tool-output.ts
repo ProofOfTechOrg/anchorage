@@ -193,11 +193,9 @@ export function clientToolOutputProcessor(
         if (changed.length > 0) {
           const snapshot = snapshotPromptMessages(args.messageList);
           for (const part of changed) await mapPart(part);
-          recordProcessorAdditions(
-            args.messageList,
-            snapshot,
-            changedMessageIds,
-          );
+          recordProcessorAdditions(args.messageList, snapshot, {
+            messageIds: changedMessageIds,
+          });
         }
         for (const part of caller) await mapPart(part);
       } catch {

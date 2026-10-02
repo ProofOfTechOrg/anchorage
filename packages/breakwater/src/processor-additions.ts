@@ -4,8 +4,9 @@
 // Mastra renders every system message and every message outside the call's
 // input into the prompt, and the input policies read the input. A processor
 // that moves the caller's text there would give it to the model unread, so
-// a snapshot comparison preserves prompt versions outside caller input,
-// keyed by the list, until the policy engine takes them.
+// a record keyed by the list preserves prompt versions outside caller input,
+// including remembered caller outcomes moved out of the input without a
+// content change, until the policy engine takes them.
 //
 // The per-list client tool outcome record preserves provenance before memory
 // merges outcome parts. The callerMessages reader selects caller messages
@@ -117,6 +118,18 @@ export function callerMessages(
     if (selected.length === 0) return [];
     return [{ ...message, content: { format: 2 as const, parts: selected } }];
   });
+}
+
+/** @internal The remembered input message ids with selected caller tool outcomes. */
+export function callerOutcomeMessageIds(
+  messageList: MessageList,
+): ReadonlySet<string> {
+  const { memory } = messageSources(messageList);
+  return new Set(
+    callerMessages(messageList, messageList.get.input.db())
+      .filter(({ id }) => memory.has(id))
+      .map(({ id }) => id),
+  );
 }
 
 const identities = new WeakMap<object, number>();
@@ -302,10 +315,13 @@ function readSystemMessage(entry: unknown): RecordedSystemMessage {
 }
 
 /**
- * @internal Record copies of prompt entries that do not match `before`.
+ * @internal Record copies of prompt entries that do not match `before`, and
+ * remembered caller outcomes moved out of the input even when they match.
  *
- * @param messageIds Message ids eligible for recording; system entries are
- * unaffected. When omitted, message ids are unrestricted.
+ * @param options `messageIds` restricts eligible message ids, with system
+ * entries unaffected. `callerOutcomeMessageIds` names remembered messages
+ * with caller tool outcomes before the processor; a message it keeps outside
+ * the input's object view is recorded even when its fingerprint matches.
  *
  * @throws TypeError when such a system message's content is not a string or
  * an array of text parts, or when one of its fields is an accessor. A copy
@@ -314,17 +330,26 @@ function readSystemMessage(entry: unknown): RecordedSystemMessage {
 export function recordProcessorAdditions(
   messageList: MessageList,
   before: PromptSnapshot,
-  messageIds?: ReadonlySet<string>,
+  {
+    messageIds,
+    callerOutcomeMessageIds: outcomeIds,
+  }: {
+    messageIds?: ReadonlySet<string>;
+    callerOutcomeMessageIds?: ReadonlySet<string>;
+  } = {},
 ): void {
   const unmatched = new Map(before);
   const { system, messages } = promptEntries(messageList);
+  const inputObjects = new Set(messageList.get.input.db());
   const additions: ProcessorAddition[] = [];
   for (const entry of system) {
     if (takeOne(unmatched, systemKey(entry))) continue;
     additions.push({ kind: 'system', message: readSystemMessage(entry) });
   }
   for (const message of messages) {
-    if (takeOne(unmatched, messageKey(message))) continue;
+    const matches = takeOne(unmatched, messageKey(message));
+    const moved = outcomeIds?.has(message.id) && !inputObjects.has(message);
+    if (matches && !moved) continue;
     if (messageIds !== undefined && !messageIds.has(message.id)) continue;
     additions.push({ kind: 'message', message: structuredClone(message) });
   }
