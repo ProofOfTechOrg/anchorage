@@ -893,6 +893,119 @@ describe('piiSecrets', () => {
   });
 
   describe('streaming (via a real PolicyEngine)', () => {
+    it('denies a spaced card that completes after the rescan window start', async () => {
+      // #given — the second delta's window starts at the card's first digit.
+      const policy = piiSecrets({ detectors: ['creditCard'] });
+      const maxEnabledSpan = (policy.holdBackChars ?? 0) + 1;
+      const engine = new PolicyEngine({ policies: [policy] });
+      const state: Record<string, unknown> = {};
+      const card = '4000000000000000006'.split('').join(' ');
+      const text = '9 '.repeat(19) + card;
+      const first = textDelta(
+        text.slice(0, text.length - card.length + maxEnabledSpan - 1),
+      );
+      const second = textDelta('6');
+
+      // #when
+      await expect(
+        engine.processOutputStream(makeStreamArgs([first], state)),
+      ).resolves.toStrictEqual(first);
+
+      // #then
+      await expect(
+        engine.processOutputStream(makeStreamArgs([first, second], state)),
+      ).rejects.toThrowError(policyDenialReason('pii-secrets', 'output'));
+    });
+
+    it('denies a high-entropy token that starts at the rescan window start', async () => {
+      // #given — the second delta's window starts at the digit after the A run.
+      const policy = piiSecrets({ detectors: ['highEntropy'] });
+      const maxEnabledSpan = (policy.holdBackChars ?? 0) + 1;
+      const engine = new PolicyEngine({ policies: [policy] });
+      const state: Record<string, unknown> = {};
+      const secret =
+        '0' +
+        'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.repeat(9) +
+        'ABCDEFGHIJKLMNOPQRST' +
+        'a';
+      const first = textDelta(
+        'A'.repeat(maxEnabledSpan) + secret.slice(0, maxEnabledSpan - 1),
+      );
+      const second = textDelta(secret.slice(maxEnabledSpan - 1));
+
+      // #when
+      await expect(
+        engine.processOutputStream(makeStreamArgs([first], state)),
+      ).resolves.toStrictEqual(first);
+
+      // #then
+      await expect(
+        engine.processOutputStream(makeStreamArgs([first, second], state)),
+      ).rejects.toThrowError(policyDenialReason('pii-secrets', 'output'));
+    });
+
+    it('does not deny an SSN the rescan window cuts from a longer word when ssn is the only detector', async () => {
+      // #given — the second delta's window starts right after the leading a.
+      const policy = piiSecrets({ detectors: ['ssn'] });
+      const maxEnabledSpan = (policy.holdBackChars ?? 0) + 1;
+      const engine = new PolicyEngine({ policies: [policy] });
+      const state: Record<string, unknown> = {};
+      const text = 'a123-45-6789 ok';
+      const first = textDelta(text.slice(0, maxEnabledSpan));
+      const second = textDelta(text.slice(maxEnabledSpan));
+
+      // #when
+      await expect(
+        engine.processOutputStream(makeStreamArgs([first], state)),
+      ).resolves.toStrictEqual(first);
+
+      // #then
+      await expect(
+        engine.processOutputStream(makeStreamArgs([first, second], state)),
+      ).resolves.toStrictEqual(second);
+    });
+
+    it('does not deny an AWS access key the rescan window cuts from a longer word when awsAccessKey is the only detector', async () => {
+      // #given — the second delta's window starts right after the leading x.
+      const policy = piiSecrets({ detectors: ['awsAccessKey'] });
+      const maxEnabledSpan = (policy.holdBackChars ?? 0) + 1;
+      const engine = new PolicyEngine({ policies: [policy] });
+      const state: Record<string, unknown> = {};
+      const text = `xAKIA${'A'.repeat(16)} ok`;
+      const first = textDelta(text.slice(0, maxEnabledSpan));
+      const second = textDelta(text.slice(maxEnabledSpan));
+
+      // #when
+      await expect(
+        engine.processOutputStream(makeStreamArgs([first], state)),
+      ).resolves.toStrictEqual(first);
+
+      // #then
+      await expect(
+        engine.processOutputStream(makeStreamArgs([first, second], state)),
+      ).resolves.toStrictEqual(second);
+    });
+
+    it('denies a cut SSN when another detector is enabled', async () => {
+      // #given — the second delta's window starts right after the V.
+      const policy = piiSecrets();
+      const maxEnabledSpan = (policy.holdBackChars ?? 0) + 1;
+      const engine = new PolicyEngine({ policies: [policy] });
+      const state: Record<string, unknown> = {};
+      const first = textDelta('INV123-45-6789'.padEnd(3 + maxEnabledSpan - 1));
+      const second = textDelta(' more');
+
+      // #when
+      await expect(
+        engine.processOutputStream(makeStreamArgs([first], state)),
+      ).resolves.toStrictEqual(first);
+
+      // #then
+      await expect(
+        engine.processOutputStream(makeStreamArgs([first, second], state)),
+      ).rejects.toThrowError(policyDenialReason('pii-secrets', 'output'));
+    });
+
     it('catches a secret split across 1-char stream chunks on the completing chunk', async () => {
       // #given — ssn only, so maxEnabledSpan=11 keeps the rescan window
       // narrow enough to meaningfully exercise the windowing arithmetic; the
