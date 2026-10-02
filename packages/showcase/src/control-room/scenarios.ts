@@ -179,7 +179,7 @@ export const SCENARIOS: readonly GuardrailScenario[] = [
         return {
           status: 'blocked',
           headline:
-            'Stream killed on the access key. The audit record names the detector, never the matched secret.',
+            'Stream killed on the access key. The blocked event and audit name the policy, never the matched secret.',
         };
       }
       return {

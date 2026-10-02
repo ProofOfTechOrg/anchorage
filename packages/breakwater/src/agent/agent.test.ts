@@ -20,9 +20,11 @@ import { z } from 'zod';
 
 import { AGENT_AUDIT_CONTEXT_KEY, AuditLogger } from '../audit/index.js';
 import {
+  classifierPolicy,
   denyPatterns,
   type PolicyEvaluator,
   piiSecrets,
+  policyDenialReason,
 } from '../policy-engine/index.js';
 import { ACTOR_CONTEXT_KEY, type PrincipalKind } from '../rbac/index.js';
 import {
@@ -318,8 +320,8 @@ describe('createGuardedAgent direct execution', () => {
     });
 
     expect(result.finishReason).toBe('other');
-    expect(result.tripwire?.reason).toMatch(
-      /private-field-policy: matched private field/,
+    expect(result.tripwire?.reason).toBe(
+      policyDenialReason('private-field-policy', 'output'),
     );
   });
 
@@ -371,7 +373,7 @@ describe('createGuardedAgent direct execution', () => {
       expect(output.text).toBe('clean prefix ');
       expect(output.tripwire).toMatchObject({
         processorId: 'breakwater-policy-engine',
-        reason: expect.stringMatching(/^deny-patterns:/),
+        reason: policyDenialReason('deny-patterns', 'output'),
       });
       expect(output.finishReason).toBe('other');
     } else {
@@ -384,10 +386,49 @@ describe('createGuardedAgent direct execution', () => {
       expect(result.text).toBe('clean p');
       expect(result.tripwire).toMatchObject({
         processorId: 'breakwater-policy-engine',
-        reason: expect.stringMatching(/^deny-patterns:/),
+        reason: policyDenialReason('deny-patterns', 'output'),
       });
       expect(result.finishReason).toBe('other');
     }
+  });
+
+  it.each([
+    'generate',
+    'stream',
+  ] as const)('%s policy tripwire discards classifier echoes of denied output', async (method) => {
+    const marker = 'withheld-classifier-marker';
+    const policyName = 'deny-echoed-output';
+    const agent = guarded({
+      model: testModel(['clean prefix ', marker, ' after denial']),
+      policies: [
+        classifierPolicy({
+          name: policyName,
+          phases: ['output'],
+          evaluateEveryChars: 1,
+          classify: (text) =>
+            text.includes(marker)
+              ? { allowed: false, reason: `unsafe: ${text}` }
+              : { allowed: true },
+        }),
+      ],
+    });
+    const output = await agent[method]('hello', {
+      requestContext: actorContext(),
+    });
+    const result =
+      method === 'generate'
+        ? output
+        : (
+            await collectStreamed(
+              output as Awaited<ReturnType<GuardedAgentHandle['stream']>>,
+            )
+          ).result;
+
+    expect(result.tripwire?.reason).not.toContain(marker);
+    expect(result.tripwire?.reason).toBe(
+      policyDenialReason(policyName, 'output'),
+    );
+    expect(result.tripwire?.processorId).toBe('breakwater-policy-engine');
   });
 
   it.each([
@@ -431,7 +472,7 @@ describe('createGuardedAgent direct execution', () => {
       expect(output.text).toBe('clean answer');
       expect(output.tripwire).toMatchObject({
         processorId: 'breakwater-policy-engine',
-        reason: 'deny-final-result: final result denied',
+        reason: policyDenialReason('deny-final-result', 'output'),
       });
       expect(output.finishReason).toBe('other');
     } else {
@@ -444,7 +485,7 @@ describe('createGuardedAgent direct execution', () => {
       expect(result.text).toBe('clean answer');
       expect(result.tripwire).toMatchObject({
         processorId: 'breakwater-policy-engine',
-        reason: 'deny-final-result: final result denied',
+        reason: policyDenialReason('deny-final-result', 'output'),
       });
       expect(result.finishReason).toBe('other');
     }

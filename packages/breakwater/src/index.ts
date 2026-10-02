@@ -193,6 +193,7 @@ export {
   PII_SECRETS_DETECTOR_IDS,
   PolicyEngine,
   piiSecrets,
+  policyDenialReason,
   tenantIsolation,
   WORKFLOW_SCOPE_CONTEXT_KEY,
 } from './policy-engine/index.js';

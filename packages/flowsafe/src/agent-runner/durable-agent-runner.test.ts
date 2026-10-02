@@ -39,6 +39,7 @@ import {
   classifierPolicy,
   createGuardedAgent,
   denyPatterns,
+  policyDenialReason,
   type Role,
 } from '@proofoftech/breakwater';
 import {
@@ -832,7 +833,7 @@ describe('durable client tool outcomes merged into memory', () => {
       role: row.role,
       mapped: row.mapped,
     });
-    expect(run.tripwire).toMatch(/^deny-patterns:/);
+    expect(run.tripwire).toBe(policyDenialReason('deny-patterns', 'input'));
     expect(run.prompts).toEqual([]);
     expect(run.saves).toBe(0);
     expect(await savedClientCall(memory)).toEqual(
@@ -907,6 +908,7 @@ describe('durable caller-visible text', () => {
       'clean prefix ',
     ],
   ] as const)('%s', async (_label, terminalDenied, expectedText) => {
+    const marker = 'terminal output denied';
     const run = await runGuarded({
       memory: new MockMemory(),
       messages: 'hello',
@@ -925,7 +927,7 @@ describe('durable caller-visible text', () => {
                 evaluateEveryChars: 1000,
                 classify: async (text) =>
                   text.endsWith('blocked')
-                    ? { allowed: false, reason: 'terminal output denied' }
+                    ? { allowed: false, reason: marker }
                     : { allowed: true },
               }),
               holdBackChars: 7,
@@ -937,11 +939,14 @@ describe('durable caller-visible text', () => {
     expect(run.subscriber.receivedText).toBe(expectedText);
     expect(run.subscriber.text).toBe(expectedText);
     expect(run.subscriber.result.text).toBe(expectedText);
+    if (terminalDenied) {
+      expect(run.subscriber.result.tripwire?.reason).not.toContain(marker);
+    }
     expect(run.subscriber.result.tripwire).toMatchObject({
       processorId: 'breakwater-policy-engine',
       reason: terminalDenied
-        ? 'deny-terminal-output: terminal output denied'
-        : expect.stringMatching(/^deny-patterns:/),
+        ? policyDenialReason('deny-terminal-output', 'output')
+        : policyDenialReason('deny-patterns', 'output'),
     });
     expect(run.subscriber.result.finishReason).toBe('other');
   });
@@ -3212,7 +3217,7 @@ describe('FlowsafeDurableAgent thread runtime registration and rehydration', () 
         globalEntry as RunRegistryEntry,
         'blocked-resume-output',
       ),
-    ).rejects.toThrow('matched blocked pattern blocked-resume-output');
+    ).rejects.toThrowError(policyDenialReason('deny-patterns', 'output'));
     expect(outputInvocation).toHaveBeenCalledTimes(1);
   });
 

@@ -1000,6 +1000,17 @@ function snapshotPolicies(
 }
 
 /**
+ * Returns the caller-visible reason for a policy denial. `PolicyEngine` aborts
+ * every policy denial with this reason, discarding the evaluator's own reason.
+ */
+export function policyDenialReason(
+  policyName: string,
+  phase: PolicyPhase,
+): string {
+  return `policy '${policyName}' denied the ${phase}`;
+}
+
+/**
  * The reason an evaluator failure surfaces. Static because exception text may
  * carry the inspected payload; shared so the audit record and the streaming
  * abort reason cannot drift apart.
@@ -1012,7 +1023,7 @@ const NON_STRING_OUTPUT_TEXT = 'output text is not a string';
 type OrderedPolicyEvaluation =
   | { outcome: 'allowed'; evaluated: string[] }
   | { outcome: 'denied'; reason: string }
-  | { outcome: 'error'; error: unknown };
+  | { outcome: 'error' };
 
 interface OrderedPolicyEvaluationOptions {
   policies: readonly PolicyEvaluator[];
@@ -1023,25 +1034,21 @@ interface OrderedPolicyEvaluationOptions {
   streamAccumulator?: Record<string, unknown>;
 }
 
-/** A policy decision, read once from what an evaluator returned. */
-type ReadPolicyDecision =
-  | { readonly allowed: true }
-  | { readonly allowed: false; readonly reason: string | undefined };
-
 // An evaluator that returns no decision has failed as surely as one that
 // throws, and allowing its call would fail open.
-function readPolicyDecision(decision: unknown): ReadPolicyDecision {
+function readPolicyDecision(decision: unknown): boolean {
   if (typeof decision === 'object' && decision !== null) {
     const { allowed, reason } = decision as {
       allowed?: unknown;
       reason?: unknown;
     };
-    if (allowed === true) return { allowed };
+    if (allowed === true) return true;
+    // Validate the discarded reason so malformed denials remain evaluator errors.
     if (
       allowed === false &&
       (reason === undefined || typeof reason === 'string')
     ) {
-      return { allowed, reason };
+      return false;
     }
   }
   throw new TypeError('policy evaluator returned no decision');
@@ -1083,17 +1090,17 @@ async function evaluatePoliciesInOrder(
     if (policy.phases && !policy.phases.includes(phase)) continue;
     if (!(policy.channels ?? DEFAULT_CHANNELS).includes(channel)) continue;
     evaluated.push(policy.name);
-    let decision: ReadPolicyDecision;
+    let allowed: boolean;
     try {
       const streamState = streamAccumulator
         ? policyStreamStateOf(streamAccumulator, index)
         : undefined;
-      decision = readPolicyDecision(
+      allowed = readPolicyDecision(
         await policy.evaluate(
           streamState ? { ...context, streamState } : context,
         ),
       );
-    } catch (error) {
+    } catch {
       // An evaluator crash is worse than a denial; it must not leave less
       // audit evidence than one. Opaque exception text may contain the
       // inspected payload, so the audit and every abort reason stay static,
@@ -1109,9 +1116,9 @@ async function evaluatePoliciesInOrder(
           channel,
         }),
       });
-      return { outcome: 'error', error };
+      return { outcome: 'error' };
     }
-    if (!decision.allowed) {
+    if (!allowed) {
       audit?.record({
         actor,
         action: `agent.${phase}.policy`,
@@ -1125,7 +1132,7 @@ async function evaluatePoliciesInOrder(
       });
       return {
         outcome: 'denied',
-        reason: `${policy.name}: ${decision.reason}`,
+        reason: policyDenialReason(policy.name, phase),
       };
     }
   }
@@ -1765,11 +1772,12 @@ export class PolicyEngine implements Processor<'breakwater-policy-engine'> {
   // closed), never returning past a violation. Returns the evaluated policy
   // names for the caller's terminal "allowed" record — which the streaming
   // path omits. abortOnError converts an evaluator failure into abort()
-  // instead of a rethrow. Input needs it because Mastra's durable preparation
+  // instead of a throw. Input needs it because Mastra's durable preparation
   // runs the model past an input processor's error that is not a tripwire,
   // and the stream because Mastra's stream driver emits the chunk on one (see
-  // processOutputStream). The final result rethrows, which stops Mastra's
-  // standard loop. During streaming, `streamAccumulator` (the processor's
+  // processOutputStream). The final result throws the fixed
+  // POLICY_EVALUATION_FAILED error, which stops Mastra's standard loop.
+  // During streaming, `streamAccumulator` (the processor's
   // per-request state) hands each policy a private namespace, exposed as
   // context.streamState for incremental scanning.
   async #evaluate(
@@ -1792,7 +1800,7 @@ export class PolicyEngine implements Processor<'breakwater-policy-engine'> {
     }
     if (result.outcome === 'error') {
       if (abortOnError) abort(POLICY_EVALUATION_FAILED);
-      throw result.error;
+      throw new Error(POLICY_EVALUATION_FAILED);
     }
     return result.evaluated;
   }

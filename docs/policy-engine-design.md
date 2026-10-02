@@ -24,7 +24,7 @@ interface PolicyEvaluator {
 }
 ```
 
-Each decision is either `{ allowed: true }` or `{ allowed: false, reason }`. An evaluator that throws, or returns anything else, has failed. The engine records an error event for the failure and stops the call: it aborts at input and in-stream, on both of Mastra's agent loops, and rethrows at the final result, which stops Mastra's standard loop.
+Each decision is either `{ allowed: true }` or `{ allowed: false, reason }`. `PolicyEngine` aborts every denial with `policy '<name>' denied the <phase>`, built by `policyDenialReason(policyName, phase)`, discarding the evaluator's reason. An evaluator that throws, or returns anything else, has failed. The engine records an error event and aborts with `policy evaluation failed` at input and in-stream on both Mastra agent loops. At the final result it throws an `Error` with that fixed message and no `cause`, which stops Mastra's standard loop.
 
 Policies run in array order. The engine snapshots the list and each evaluator's
 name, phase/channel selectors, hold-back hint, and evaluator reference at
@@ -98,7 +98,7 @@ Under the supported core version, the engine sees the `object` channel only for 
 
 `denyPatterns(patterns, options)` performs literal or regular-expression-style configured matching according to its exported options. Its streaming implementation scans only the new suffix plus the largest pattern overlap. The default channels cover answer, reasoning, and object so a forbidden string cannot move to another output surface.
 
-Denial reasons identify the configured pattern, not the matched input span. Do not configure a literal secret itself as a pattern if the reason will enter a lower-trust audit sink.
+The evaluator's denial reason identifies the configured pattern, not the matched input span. `PolicyEngine` and `createContentPolicyGate()` discard that reason; their audit events use the static `policy denied` reason and identify the policy in `detail.policy`.
 
 ### Maximum length
 
@@ -140,6 +140,8 @@ const moderation = classifierPolicy({
   timeoutMs: 2_000,
 });
 ```
+
+`PolicyEngine` discards `result.category`; a host that needs it records it inside its own `classify` function.
 
 Input and final-result phases always classify. During append-only streaming, the evaluator runs when accumulated text grows by the configured cadence, `evaluateEveryChars`, a positive safe integer; object snapshots classify individually. Under hold-back, a text or reasoning segment's end, or `finish` without an end chunk, also classifies text left below the cadence before releasing it.
 

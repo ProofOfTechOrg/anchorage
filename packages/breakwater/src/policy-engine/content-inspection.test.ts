@@ -20,6 +20,7 @@ import {
   type PolicyContext,
   PolicyEngine,
   piiSecrets,
+  policyDenialReason,
 } from './index.js';
 import type { PolicyDecision } from './tool-policy.js';
 
@@ -916,7 +917,7 @@ describe('piiSecrets', () => {
       parts.push(textDelta(fullText[fullText.length - 1] ?? ''));
       await expect(
         engine.processOutputStream(makeStreamArgs([...parts], state)),
-      ).rejects.toThrow(/ssn detected/);
+      ).rejects.toThrowError(policyDenialReason('pii-secrets', 'output'));
     });
 
     it('rescans the full object-channel snapshot on every call (never incremental)', async () => {
@@ -936,7 +937,7 @@ describe('piiSecrets', () => {
       // #then — the REPLACEMENT snapshot (not a delta) is fully rescanned
       await expect(
         engine.processOutputStream(makeStreamArgs([withEmail], state)),
-      ).rejects.toThrow(/email detected/);
+      ).rejects.toThrowError(policyDenialReason('pii-secrets', 'output'));
     });
 
     it('emits no char of a violating span when holdBack is on', async () => {
@@ -964,7 +965,7 @@ describe('piiSecrets', () => {
       // ...the second chunk completes the SSN and aborts
       await expect(
         engine.processOutputStream(makeStreamArgs(chunks, state)),
-      ).rejects.toThrow(/ssn detected/);
+      ).rejects.toThrowError(policyDenialReason('pii-secrets', 'output'));
 
       // #then — nothing emitted contains any char of the SSN span
       expect(emitted.join('')).toBe('..');
@@ -1164,12 +1165,13 @@ describe('classifierPolicy', () => {
   describe('deny aborts', () => {
     it('aborts the stream when classify denies', async () => {
       // #given
+      const marker = 'flagged as unsafe';
       const engine = new PolicyEngine({
         policies: [
           classifierPolicy({
             classify: async () => ({
               allowed: false,
-              reason: 'flagged as unsafe',
+              reason: marker,
             }),
             evaluateEveryChars: 1,
           }),
@@ -1177,47 +1179,59 @@ describe('classifierPolicy', () => {
       });
 
       // #when / #then
-      await expect(
-        engine.processOutputStream(makeStreamArgs([textDelta('x')])),
-      ).rejects.toThrow(/classifier: flagged as unsafe/);
+      const failure = await engine
+        .processOutputStream(makeStreamArgs([textDelta('x')]))
+        .catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(Error);
+      expect((failure as Error).message).toBe(
+        policyDenialReason('classifier', 'output'),
+      );
+      expect((failure as Error).message).not.toContain(marker);
     });
   });
 
   describe('fail-closed', () => {
-    it('fails closed when classify throws synchronously', async () => {
+    it.each([
+      [
+        'synchronous',
+        (message: string): PolicyDecision => {
+          throw new Error(message);
+        },
+      ],
+      [
+        'asynchronous',
+        async (message: string): Promise<PolicyDecision> => {
+          throw new Error(message);
+        },
+      ],
+    ] as const)('discards %s classifier exception details at the final result', async (_label, classify) => {
       // #given
+      const sentinel = 'sk_live_sentinel';
+      const message = 'classifier exploded';
       const engine = new PolicyEngine({
         policies: [
           classifierPolicy({
-            classify: () => {
-              throw new Error('classifier exploded');
-            },
+            classify: () => classify(`${message} on ${sentinel}`),
           }),
         ],
       });
 
       // #when / #then
-      await expect(
-        engine.processOutputResult(makeOutputArgs('anything')),
-      ).rejects.toThrow('classifier exploded');
-    });
-
-    it('fails closed when classify rejects', async () => {
-      // #given
-      const engine = new PolicyEngine({
-        policies: [
-          classifierPolicy({
-            classify: async () => {
-              throw new Error('async classifier failure');
-            },
-          }),
-        ],
-      });
-
-      // #when / #then
-      await expect(
-        engine.processOutputResult(makeOutputArgs('anything')),
-      ).rejects.toThrow('async classifier failure');
+      const thrown = await engine
+        .processOutputResult(makeOutputArgs('anything'))
+        .catch((error: unknown) => error);
+      expect(thrown).toBeInstanceOf(Error);
+      const failure = thrown as Error;
+      for (const text of [
+        failure.message,
+        String(failure),
+        String(failure.cause),
+      ]) {
+        expect(text).not.toContain(sentinel);
+        expect(text).not.toContain(message);
+      }
+      expect(failure.cause).toBeUndefined();
+      expect(failure.message).toBe('policy evaluation failed');
     });
 
     it('fails closed when classify exceeds timeoutMs', async () => {
@@ -1227,7 +1241,6 @@ describe('classifierPolicy', () => {
           classifierPolicy({
             classify: () => new Promise<PolicyDecision>(() => {}),
             timeoutMs: 20,
-            name: 'slow-classifier',
           }),
         ],
       });
@@ -1235,33 +1248,31 @@ describe('classifierPolicy', () => {
       // #when / #then
       await expect(
         engine.processOutputResult(makeOutputArgs('anything')),
-      ).rejects.toThrow(/slow-classifier timed out after 20ms/);
+      ).rejects.toThrow('policy evaluation failed');
     });
 
     it('does not crash when a slow classify eventually rejects after its own timeout already fired', async () => {
-      // #given — the timeout (5ms) wins the race; classify's own later
-      // rejection (15ms) must still be handled, never an unhandled rejection
+      // #given
+      let rejectClassify!: (reason: Error) => void;
       const engine = new PolicyEngine({
         policies: [
           classifierPolicy({
             classify: () =>
               new Promise<PolicyDecision>((_resolve, reject) => {
-                setTimeout(() => reject(new Error('late failure')), 15);
+                rejectClassify = reject;
               }),
             timeoutMs: 5,
-            name: 'late-classifier',
           }),
         ],
       });
 
-      // #when / #then — the timeout error wins, not the classifier's own reason
+      // #when / #then
       await expect(
         engine.processOutputResult(makeOutputArgs('anything')),
-      ).rejects.toThrow(/late-classifier timed out after 5ms/);
+      ).rejects.toThrow('policy evaluation failed');
 
-      // give the classifier's now-irrelevant rejection a chance to fire;
-      // an unhandled rejection here would surface as a process warning
-      await new Promise((resolve) => setTimeout(resolve, 30));
+      rejectClassify(new Error('late failure'));
+      await new Promise((resolve) => setTimeout(resolve, 0));
     });
   });
 });

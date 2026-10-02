@@ -205,14 +205,17 @@ the downstream model will see plus an optional trusted `RequestContext`. An
 input that is not an object with a string `text`, that carries another field,
 or whose `requestContext` is not a `RequestContext` returns the error state
 without reaching a policy. It
-returns only allowed, denied, or evaluator-error state; policy names, reasons,
-content, and thrown values remain confined to the configured audit sink. Every
+returns only allowed, denied, or evaluator-error state. On denial or evaluator
+error, the audit sink records the policy name with a static reason; evaluator reasons,
+inspected content, and thrown values reach neither the caller nor the audit sink. Every
 registered policy must be able to run on the input `answer` channel — one that
 could never be evaluated here is rejected at construction, not skipped. That
 includes `maxTextLength`, which defaults to the output phase: pass
 `maxTextLength(n, { phases: ['input'] })` to use it at this boundary. The gate
 needs at least one policy; an empty list is rejected, because a gate with no
 policy allows every input.
+
+`PolicyEngine` aborts every policy denial with `policy '<name>' denied the <phase>`, discarding the evaluator's reason. Use `policyDenialReason(policyName, phase)`, exported from `@proofoftech/breakwater` and `@proofoftech/breakwater/policy-engine`, to match `result.tripwire.reason` or a stream's `tripwire` chunk. Both Mastra agent loops use this reason in their tripwires, logs, and spans. Audit events use the static `policy denied` reason and identify the policy in `detail.policy`.
 
 The included policies are:
 
@@ -239,7 +242,8 @@ gate turn into their error path.
 `classifierPolicy()` fails closed when the classifier throws, returns no
 decision or exceeds its configured timeout: `PolicyEngine` records an error
 event and stops the call at input and in-stream on both of Mastra's agent
-loops, and rethrows at the final result, which stops Mastra's standard loop.
+loops, and throws an `Error` with the fixed `policy evaluation failed` message
+and no `cause` at the final result, which stops Mastra's standard loop.
 On Mastra's durable loop, output policies stop the stream a subscriber receives,
 including hold-back's terminal classification. Mastra logs a result-phase
 refusal; the saved thread message and returned result come from model output

@@ -683,9 +683,9 @@ export const terminalPassStreamStates = new WeakSet<object>();
  * A `classify` call that throws, resolves to no decision, or does not settle
  * within `timeoutMs` is an evaluator failure. `PolicyEngine` records an error
  * event for it and aborts at input and in-stream, on both of Mastra's agent
- * loops, and rethrows at the final result, which stops Mastra's standard
- * loop. Fail-open is deliberately not offered. Omit `timeoutMs` to let
- * `classify` run unbounded.
+ * loops, and throws the fixed `policy evaluation failed` error at the final
+ * result, which stops Mastra's standard loop. Fail-open is not offered.
+ * Omit `timeoutMs` to let `classify` run unbounded.
  *
  * The returned evaluator carries no `holdBackChars` hint (engine default:
  * 0) — an async classifier has no bounded straddle window to report, unlike

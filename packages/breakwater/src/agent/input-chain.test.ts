@@ -29,6 +29,7 @@ import {
   PolicyEngine,
   type PolicyEvaluator,
   piiSecrets,
+  policyDenialReason,
 } from '../policy-engine/index.js';
 import {
   ACTOR_CONTEXT_KEY,
@@ -387,7 +388,7 @@ describe('client-only tool output before guarded input policies', () => {
       concatenateOutput,
     );
     expect.soft(outcome).toEqual({
-      tripwire: expect.stringMatching(/^deny-patterns: /),
+      tripwire: policyDenialReason('deny-patterns', 'input'),
       failure: undefined,
     });
     expect.soft(prompts).toEqual([]);
@@ -457,7 +458,7 @@ describe('client-only tool output before guarded input policies', () => {
       'docs.lookup',
     );
     expect.soft(outcome).toEqual({
-      tripwire: expect.stringMatching(/^deny-patterns: /),
+      tripwire: policyDenialReason('deny-patterns', 'input'),
       failure: undefined,
     });
     expect.soft(prompts).toEqual([]);
@@ -488,7 +489,7 @@ describe('client-only tool output before guarded input policies', () => {
       }),
     );
     expect.soft(outcome).toEqual({
-      tripwire: expect.stringMatching(/^deny-patterns: /),
+      tripwire: policyDenialReason('deny-patterns', 'input'),
       failure: undefined,
     });
     expect.soft(prompts).toEqual([]);
@@ -906,7 +907,7 @@ describe('file and image prompt media policy text', () => {
       } else {
         expect({ loop, ...outcome, prompts }).toEqual({
           loop,
-          tripwire: row.reason ?? expect.stringMatching(/^deny-patterns: /),
+          tripwire: row.reason ?? policyDenialReason('deny-patterns', 'input'),
           failure: undefined,
           prompts: [],
         });
@@ -2126,7 +2127,7 @@ describe('a refused standard-loop call', () => {
       // #then
       expect({ loop, ...summary(output) }).toEqual({
         loop,
-        reason: expect.stringMatching(/^deny-patterns: /),
+        reason: policyDenialReason('deny-patterns', 'input'),
         processorId: 'breakwater-policy-engine',
         text: '',
         finishReason: 'other',
@@ -2580,7 +2581,7 @@ async function expectStoppedOnPolicy(row: Moved): Promise<void> {
   expect(outcomes).toEqual(
     LOOPS.map((loop) => ({
       loop,
-      tripwire: expect.stringMatching(/^deny-patterns: /),
+      tripwire: policyDenialReason('deny-patterns', 'input'),
       failure: undefined,
       prompts: 0,
       sent: false,

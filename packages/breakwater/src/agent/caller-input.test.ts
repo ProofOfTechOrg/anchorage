@@ -17,6 +17,7 @@ import {
   PolicyEngine,
   type PolicyEvaluator,
   piiSecrets,
+  policyDenialReason,
 } from '../policy-engine/index.js';
 import { ACTOR_CONTEXT_KEY } from '../rbac/index.js';
 import { createGuardedAgent, type GuardedAgentCallOptions } from './index.js';
@@ -574,7 +575,7 @@ describe('client tool outcomes merged into memory', () => {
         call: THREAD,
       },
     );
-    expect(run.tripwire).toMatch(/^deny-patterns:/);
+    expect(run.tripwire).toBe(policyDenialReason('deny-patterns', 'input'));
     expect(run.prompts).toEqual([]);
     expect(await savedClientCall(memory)).toEqual(
       pendingClientCall(row.approval).toolInvocation,
@@ -720,7 +721,7 @@ describe('stored model outputs a caller message carries', () => {
       { markers: [OUTCOME_MARKER], memory, call: THREAD },
     );
 
-    expect(tripwire).toMatch(/^deny-patterns:/);
+    expect(tripwire).toBe(policyDenialReason('deny-patterns', 'input'));
     expect(prompts).toEqual([]);
     expect(await savedClientCall(memory)).toEqual(
       pendingClientCall().toolInvocation,
