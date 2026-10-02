@@ -8,6 +8,7 @@ import { MessageList } from '@mastra/core/agent/message-list';
 import type { MastraModelConfig } from '@mastra/core/llm';
 import { MockMemory } from '@mastra/core/memory';
 import type {
+  InputProcessor,
   ProcessInputArgs,
   ProcessOutputResultArgs,
   ProcessOutputStepArgs,
@@ -164,6 +165,41 @@ function listWithPerCallIterator<T>(
       yield* answer(calls++);
     },
   });
+}
+
+async function signalAssetStep(
+  allowedInputAssetOrigins: readonly string[] = [],
+  url = 'https://unlisted.example/a.png',
+) {
+  const audit = new AuditLogger();
+  const raw = guarded({ audit, allowedInputAssetOrigins }) as unknown as Agent;
+  const requestContext = actorContext();
+  const step = (await raw.listInputProcessors(requestContext)).find(
+    (processor): processor is InputProcessor =>
+      processor.id === 'breakwater-input-assets',
+  );
+  if (!step) throw new Error('asset processor is missing');
+  const messageList = new MessageList();
+  messageList.addSignal(
+    createSignal({
+      type: 'user',
+      contents: [
+        {
+          type: 'file',
+          data: new URL(url),
+          mediaType: 'image/png',
+        },
+      ],
+    }),
+  );
+  const abort = vi.fn((reason: string) => {
+    throw new Error(reason);
+  });
+  return {
+    step,
+    audit,
+    args: { messageList, requestContext, abort, stepNumber: 1 },
+  };
 }
 
 describe('createGuardedAgent direct execution', () => {
@@ -2442,6 +2478,36 @@ describe('guarded durable interop and brand', () => {
     ).toMatchObject([
       { decision: 'error', detail: { processor: 'breakwater-memory' } },
     ]);
+  });
+
+  it('refuses an unlisted asset origin in a drained signal step', async () => {
+    const { step, audit, args } = await signalAssetStep();
+    const reason = 'input asset URL origin is not allowed';
+    // An absent hook lets the signal proceed; it must fail the refusal assertion.
+    expect(() => step.processInputStep?.(args as never)).toThrow(reason);
+    expect(args.abort).toHaveBeenCalledWith(reason);
+    const events = audit
+      .events()
+      .filter((event) => event.action === 'agent.input.asset');
+    expect(events).toEqual([
+      expect.objectContaining({ decision: 'denied', reason }),
+    ]);
+    expect(JSON.stringify(events)).not.toContain('unlisted.example');
+    expect(args.messageList.get.input.db()).toEqual([]);
+  });
+
+  it('allows a listed asset origin in a drained signal step without a result', async () => {
+    const { step, audit, args } = await signalAssetStep(
+      ['https://assets.example'],
+      'https://assets.example/a.png',
+    );
+    if (typeof step.processInputStep !== 'function') {
+      throw new Error('asset processor has no step hook');
+    }
+    // A returned list becomes step input in Mastra's processor runner.
+    expect(step.processInputStep(args as never)).toBeUndefined();
+    expect(audit.events()).toEqual([]);
+    expect(args.abort).not.toHaveBeenCalled();
   });
 
   it.each([

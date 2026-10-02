@@ -57,6 +57,7 @@ import { readAllowedRoles } from '../rbac/roles.js';
 import {
   CLIENT_TOOL_OUTPUT_PROCESSOR_ID,
   clientToolOutputProcessor,
+  type InputAssetCheck,
 } from './client-tool-output.js';
 
 export {
@@ -396,7 +397,9 @@ export type GuardedAgentConfig<
   /**
    * Origins user file and image parts may name as network URLs, regardless of
    * who fetches them. Absent or empty refuses all network URLs; data: URLs
-   * are inline data. URLs in mapped client tool results are not checked.
+   * are inline data. Network URLs in the client tool outputs the call supplies
+   * are checked too. The check runs again before each model step.
+   * On the durable loop, signals drained before the first model step are not checked.
    * This is independent of connector egress allowlists.
    */
   allowedInputAssetOrigins?: readonly string[];
@@ -571,53 +574,66 @@ function readAllowedInputAssetOrigins(value: unknown): readonly string[] {
   });
 }
 
-// MessageList.all.aiV5.llmPrompt downloads asset URLs after input processors,
-// including history on each call. prepareForDurableExecution logs and skips
-// non-tripwire input-processor errors, so refusals must use a tripwire.
-function inputAssetProcessor(
+function inputAssetCheck(
   origins: readonly string[],
   resource: string,
   audit: AuditLogger,
-): InputProcessor {
+): InputAssetCheck {
   const allowed = new Set(origins);
+  return (args, readUrls) => {
+    let reason: string | undefined;
+    let decision: 'denied' | 'error' = 'denied';
+    try {
+      for (const url of readUrls()) {
+        if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+          reason = INPUT_ASSET_SCHEME_DENIED;
+        } else if (url.username || url.password) {
+          reason = INPUT_ASSET_CREDENTIALS_DENIED;
+        } else if (!allowed.has(url.origin)) {
+          reason = INPUT_ASSET_ORIGIN_DENIED;
+        }
+        if (reason !== undefined) break;
+      }
+    } catch {
+      // An unreadable asset prompt has the same audit result as unreadable policy input.
+      reason = UNCLASSIFIED_INPUT_CONTENT;
+      decision = 'error';
+    }
+    const refusalReason = reason;
+    if (refusalReason === undefined) return args.messageList;
+    try {
+      audit.record({
+        actor: actorFromRequestContext(args.requestContext) ?? null,
+        action:
+          decision === 'error' ? 'agent.input.policy' : 'agent.input.asset',
+        resource,
+        decision,
+        reason: refusalReason,
+        detail: agentAuditDetail(args.requestContext),
+      });
+    } finally {
+      stopWithoutCallMessages(args.messageList, {}, () =>
+        args.abort(refusalReason),
+      );
+    }
+  };
+}
+
+// Mastra builds llmPrompt and downloads user asset URLs after input processors,
+// including history on every call, and drained signals join the list between
+// steps. Each step runs input processors' processInputStep before the prompt
+// build; this hook checks the list then. It returns nothing because core
+// assigns a returned list into the step input.
+// prepareForDurableExecution logs and skips non-tripwire input-processor errors,
+// so refusals use a tripwire.
+function inputAssetProcessor(check: InputAssetCheck): InputProcessor {
   return {
     id: 'breakwater-input-assets',
     processInput(args) {
-      let reason: string | undefined;
-      let decision: 'denied' | 'error' = 'denied';
-      try {
-        for (const url of inputAssetUrls(args.messageList.get.all.db())) {
-          if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-            reason = INPUT_ASSET_SCHEME_DENIED;
-          } else if (url.username || url.password) {
-            reason = INPUT_ASSET_CREDENTIALS_DENIED;
-          } else if (!allowed.has(url.origin)) {
-            reason = INPUT_ASSET_ORIGIN_DENIED;
-          }
-          if (reason !== undefined) break;
-        }
-      } catch {
-        // An unreadable asset prompt has the same audit result as unreadable policy input.
-        reason = UNCLASSIFIED_INPUT_CONTENT;
-        decision = 'error';
-      }
-      const refusalReason = reason;
-      if (refusalReason === undefined) return args.messageList;
-      try {
-        audit.record({
-          actor: actorFromRequestContext(args.requestContext) ?? null,
-          action:
-            decision === 'error' ? 'agent.input.policy' : 'agent.input.asset',
-          resource,
-          decision,
-          reason: refusalReason,
-          detail: agentAuditDetail(args.requestContext),
-        });
-      } finally {
-        stopWithoutCallMessages(args.messageList, {}, () =>
-          args.abort(refusalReason),
-        );
-      }
+      return check(args, () => inputAssetUrls(args.messageList.get.all.db()));
+    },
+    processInputStep(args) {
+      check(args, () => inputAssetUrls(args.messageList.get.all.db()));
     },
   };
 }
@@ -1264,11 +1280,12 @@ class GuardedAgent<
       audit,
       resource: `agent:${options.id}`,
     });
-    const inputAssets = inputAssetProcessor(
+    const assetCheck = inputAssetCheck(
       allowedInputAssetOrigins,
       `agent:${options.id}`,
       audit,
     );
+    const inputAssets = inputAssetProcessor(assetCheck);
     super({
       ...agentConfig,
       // Core's default error processors rewrite model requests and retry with
@@ -1322,6 +1339,7 @@ class GuardedAgent<
           audit,
           CLIENT_TOOL_OUTPUT_PROCESSOR_ID,
         ),
+      assetCheck,
     );
     this.#rbac = rbac;
     this.#toolChoice = toolChoice;

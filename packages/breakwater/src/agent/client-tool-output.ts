@@ -5,16 +5,34 @@ import type {
   MastraToolInvocationPart,
   MessageList,
 } from '@mastra/core/agent/message-list';
-import type { InputProcessor, ProcessInputArgs } from '@mastra/core/processors';
+import type {
+  InputProcessor,
+  ProcessInputArgs,
+  ProcessInputStepArgs,
+} from '@mastra/core/processors';
 import type { RequestContext } from '@mastra/core/request-context';
 import type { CoreTool } from '@mastra/core/tools';
 
+import {
+  toolInvocationParts,
+  toolOutputAssetUrls,
+} from '../policy-engine/prompt-media.js';
 import {
   callerMessages,
   recordedMessageIds,
   recordProcessorAdditions,
   snapshotPromptMessages,
+  unrememberedInputMessages,
 } from '../processor-additions.js';
+
+/** @internal */
+export type InputAssetCheck = (
+  args: Pick<
+    ProcessInputArgs | ProcessInputStepArgs,
+    'messageList' | 'abort' | 'requestContext'
+  >,
+  readUrls: () => readonly URL[],
+) => MessageList;
 
 export const CLIENT_TOOL_OUTPUT_PROCESSOR_ID = 'breakwater-client-tool-output';
 
@@ -134,7 +152,7 @@ function selectClientToolResults(messageList: MessageList): {
 
 /**
  * @internal Map client tool results before guarded input policies read caller
- * input and recorded prompt additions.
+ * input and recorded prompt additions, and origin-check outputs the call carries.
  */
 export function clientToolOutputProcessor(
   resolveTools: (options: {
@@ -143,65 +161,77 @@ export function clientToolOutputProcessor(
     resourceId?: string;
   }) => Promise<Record<string, CoreTool>>,
   fail: (args: ProcessInputArgs) => never,
+  check: InputAssetCheck,
 ): InputProcessor {
   return {
     id: CLIENT_TOOL_OUTPUT_PROCESSOR_ID,
     async processInput(args) {
+      let readUrls: () => readonly URL[];
       try {
         const { changed, caller, changedMessageIds } = selectClientToolResults(
           args.messageList,
         );
-        if (changed.length === 0 && caller.length === 0)
-          return args.messageList;
-        const memoryInfo = args.messageList.serialize().memoryInfo;
-        const tools = await resolveTools({
-          requestContext: args.requestContext,
-          threadId: memoryInfo?.threadId,
-          resourceId: memoryInfo?.resourceId,
-        });
-        const mapPart = async (part: MastraToolInvocationPart) => {
-          const tool = tools[part.toolInvocation.toolName];
-          if (
-            !tool ||
-            tool.execute ||
-            tool.type === 'provider-defined' ||
-            typeof tool.toModelOutput !== 'function'
-          )
-            return;
-          const unwrapped = unwrapToolOutput(part.toolInvocation.result);
-          if (unwrapped.skip) return;
-          const modelOutput = normalizeModelOutput(
-            await tool.toModelOutput(unwrapped.output),
-          );
-          const providerModelOutput = modelOutput as unknown as NonNullable<
-            MastraToolInvocationPart['providerMetadata']
-          >[string][string];
-          const mastra = part.providerMetadata?.mastra;
-          part.providerMetadata = {
-            ...part.providerMetadata,
-            mastra: {
-              ...(mastra && typeof mastra === 'object' ? mastra : {}),
-              modelOutputComputed: true,
-              ...(modelOutput != null
-                ? { modelOutput: providerModelOutput }
-                : {}),
-            },
-          };
-        };
-        // A shared result part also changes messages the processor leaves untouched;
-        // the id set prevents recording those whole messages. Caller parts are read live.
-        if (changed.length > 0) {
-          const snapshot = snapshotPromptMessages(args.messageList);
-          for (const part of changed) await mapPart(part);
-          recordProcessorAdditions(args.messageList, snapshot, {
-            messageIds: changedMessageIds,
+        const mapped = [...changed, ...caller];
+        if (mapped.length > 0) {
+          const memoryInfo = args.messageList.serialize().memoryInfo;
+          const tools = await resolveTools({
+            requestContext: args.requestContext,
+            threadId: memoryInfo?.threadId,
+            resourceId: memoryInfo?.resourceId,
           });
+          const mapPart = async (part: MastraToolInvocationPart) => {
+            const tool = tools[part.toolInvocation.toolName];
+            if (
+              !tool ||
+              tool.execute ||
+              tool.type === 'provider-defined' ||
+              typeof tool.toModelOutput !== 'function'
+            )
+              return;
+            const unwrapped = unwrapToolOutput(part.toolInvocation.result);
+            if (unwrapped.skip) return;
+            const modelOutput = normalizeModelOutput(
+              await tool.toModelOutput(unwrapped.output),
+            );
+            const providerModelOutput = modelOutput as unknown as NonNullable<
+              MastraToolInvocationPart['providerMetadata']
+            >[string][string];
+            const mastra = part.providerMetadata?.mastra;
+            part.providerMetadata = {
+              ...part.providerMetadata,
+              mastra: {
+                ...(mastra && typeof mastra === 'object' ? mastra : {}),
+                modelOutputComputed: true,
+                ...(modelOutput != null
+                  ? { modelOutput: providerModelOutput }
+                  : {}),
+              },
+            };
+          };
+          // A shared result part also changes messages the processor leaves untouched;
+          // the id set prevents recording those whole messages. Caller parts are read live.
+          if (changed.length > 0) {
+            const snapshot = snapshotPromptMessages(args.messageList);
+            for (const part of changed) await mapPart(part);
+            recordProcessorAdditions(args.messageList, snapshot, {
+              messageIds: changedMessageIds,
+            });
+          }
+          for (const part of caller) await mapPart(part);
         }
-        for (const part of caller) await mapPart(part);
+        const checked = [
+          ...new Set([
+            ...mapped,
+            ...toolInvocationParts(unrememberedInputMessages(args.messageList)),
+          ]),
+        ];
+        readUrls = () => toolOutputAssetUrls(checked);
       } catch {
         return fail(args);
       }
-      return args.messageList;
+      // The tripwire must escape the mapper's catch. Fresh mappings and whole
+      // caller messages are checked; remembered outputs remain stored history.
+      return check(args, readUrls);
     },
   };
 }

@@ -75,6 +75,8 @@ import type {
 import {
   classifyPromptMedia,
   convertedPrompt,
+  type StoredModelOutput,
+  storedModelOutputs,
   UNCLASSIFIED_INPUT_CONTENT,
 } from './prompt-media.js';
 import { isPlainRecord, providerOptionValues } from './provider-options.js';
@@ -507,36 +509,6 @@ function isClassifiedInputMessage(message: MastraDBMessage): boolean {
       ),
     )
   );
-}
-
-interface StoredModelOutput {
-  readonly toolCallId: string;
-  readonly state: MastraToolInvocation['state'];
-  readonly output: unknown;
-}
-
-// Every `mastra.modelOutput` a tool invocation in these messages stores,
-// whatever the message's role and the invocation's state, in message order.
-function storedModelOutputs(
-  messages: readonly MastraDBMessage[],
-): readonly StoredModelOutput[] {
-  const stored: StoredModelOutput[] = [];
-  for (const message of messages) {
-    for (const part of message.content.parts) {
-      if (part.type !== 'tool-invocation') continue;
-      const mastra: unknown = part.providerMetadata?.mastra;
-      if (typeof mastra !== 'object' || mastra === null) continue;
-      const output = (mastra as { modelOutput?: unknown }).modelOutput;
-      if (output !== undefined && output !== null) {
-        stored.push({
-          toolCallId: part.toolInvocation.toolCallId,
-          state: part.toolInvocation.state,
-          output,
-        });
-      }
-    }
-  }
-  return stored;
 }
 
 // Mastra builds the model prompt with MessageList's `get.all.aiV5.llmPrompt`,

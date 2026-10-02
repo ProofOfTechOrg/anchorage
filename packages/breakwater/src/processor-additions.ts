@@ -120,6 +120,17 @@ export function callerMessages(
   });
 }
 
+/**
+ * @internal A remembered id is not the call's input: Mastra keeps it in memory's
+ * source set when a processor replaces or merges the message with source `input`.
+ */
+export function unrememberedInputMessages(
+  messageList: MessageList,
+): MastraDBMessage[] {
+  const { memory } = messageSources(messageList);
+  return messageList.get.input.db().filter(({ id }) => !memory.has(id));
+}
+
 /** @internal The remembered input message ids with selected caller tool outcomes. */
 export function callerOutcomeMessageIds(
   messageList: MessageList,
@@ -204,14 +215,8 @@ function messageSources(messageList: MessageList) {
 // Mastra's rendering reads its fields, and every message that is not the
 // call's input.
 function promptEntries(messageList: MessageList): PromptEntries {
-  const { memory: remembered } = messageSources(messageList);
-  // A remembered id is not the call's input: Mastra keeps it in memory's
-  // source set when a processor replaces or merges the message with source
-  // `input`.
   const input = new Set(
-    messageList.get.input
-      .db()
-      .flatMap(({ id }) => (remembered.has(id) ? [] : [id])),
+    unrememberedInputMessages(messageList).map(({ id }) => id),
   );
   return {
     system: MessageList.prototype.getAllSystemMessages.call(messageList),

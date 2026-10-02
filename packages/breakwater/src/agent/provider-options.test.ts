@@ -342,6 +342,7 @@ async function runAdapter(
   method: (typeof LOOPS)[number],
   messages: unknown,
   policies: readonly PolicyEvaluator[],
+  allowedInputAssetOrigins?: readonly string[],
 ): Promise<Run> {
   const audit = new AuditLogger();
   const agent = createGuardedAgent({
@@ -351,6 +352,7 @@ async function runAdapter(
     model: await adapter.model(),
     allowedRoles: ['operator'],
     policies,
+    allowedInputAssetOrigins,
     audit,
     maxSteps: 1,
     toolChoice: 'auto',
@@ -1031,9 +1033,13 @@ describe('guarded tool-output content items at the JSON adapters', () => {
         const requests = recordRequests(chatCompletion);
 
         // #when
-        const run = await runAdapter(adapter, method, messages, [
-          denyPatterns([marker]),
-        ]);
+        const run = await runAdapter(
+          adapter,
+          method,
+          messages,
+          [denyPatterns([marker])],
+          ['https://example.invalid'],
+        );
 
         // #then
         expect({ name, method, tripwire: run.tripwire }).toEqual({
