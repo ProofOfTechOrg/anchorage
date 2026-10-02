@@ -328,7 +328,8 @@ export interface ThreadSignalRoutesOptions {
   canPersist?: (scope: ThreadScope) => boolean | Promise<boolean>;
   /**
    * Whether the registered schedule owner may persist to its fixed target.
-   * When set, its answer is used in place of `canPersist`'s answer for schedule fires.
+   * When set, schedule fires consult it instead of `canPersist`, which is not
+   * called for those fires.
    */
   canPersistSchedule?: (
     scope: ThreadScope,
@@ -380,6 +381,10 @@ export interface ThreadSignalRoutesOptions {
    */
   scheduleProviderOptionsPolicy?: ScheduleProviderOptionsPolicy;
 }
+
+type ScheduleFireInput = Parameters<
+  NonNullable<ThreadSignalRoutesOptions['canPersistSchedule']>
+>[1];
 
 /**
  * A thread-DO signal router: `(request, scope) => Response | null`. `null` means
@@ -800,7 +805,15 @@ export function createThreadSignalRoutes(
       const blockingRun = resolveBlockingRun
         ? () => resolveBlockingRun(scope)
         : undefined;
-      const persistenceAllowed = canPersist ? await canPersist(scope) : true;
+      const schedulePersistenceAllowed =
+        path === '/signal/schedule' && canPersistSchedule
+          ? (input: ScheduleFireInput) => canPersistSchedule(scope, input)
+          : undefined;
+      // Schedule-owner authorization makes the request-principal check unnecessary.
+      const persistenceAllowed =
+        canPersist && !schedulePersistenceAllowed
+          ? await canPersist(scope)
+          : true;
       const inspectContent: InspectSignalContent | undefined = contentPolicy
         ? (signal, runId) =>
             inspectSignalContent(
@@ -902,11 +915,9 @@ export function createThreadSignalRoutes(
           startIdleRun,
           serializeWake,
           blockingRun,
-          persistenceAllowed,
           memoryAvailable,
-          schedulePersistenceAllowed: canPersistSchedule
-            ? (input) => canPersistSchedule(scope, input)
-            : undefined,
+          schedulePersistenceAllowed:
+            schedulePersistenceAllowed ?? (() => persistenceAllowed),
           resolveRunStatus: resolveScheduleRunStatus
             ? (input) => resolveScheduleRunStatus(scope, input)
             : undefined,
@@ -1234,9 +1245,7 @@ async function handleNotificationDispatch(options: {
       serializeWake: options.serializeWake,
       executionFence: options.executionFence,
       proof: options.proof,
-      blockingRun: durableBlockingRun
-        ? () => durableBlockingRun
-        : options.blockingRun,
+      blockingRun: options.blockingRun,
       persistenceAllowed: options.persistenceAllowed,
       memoryAvailable: options.memoryAvailable,
       signal: deliverableSignal,
@@ -1862,16 +1871,10 @@ async function handleScheduleSignal(options: {
   startIdleRun: StartIdleRun | undefined;
   serializeWake<T>(operation: () => Promise<T>): Promise<T>;
   blockingRun?: BlockingRunResolver;
-  persistenceAllowed: boolean;
   memoryAvailable: MemoryAvailable;
-  schedulePersistenceAllowed?: (input: {
-    scheduleId: string;
-    dispatchId: string;
-    runId: string;
-    agentId: string;
-    threadId: string;
-    resourceId: string;
-  }) => boolean | Promise<boolean>;
+  schedulePersistenceAllowed: (
+    input: ScheduleFireInput,
+  ) => boolean | Promise<boolean>;
   resolveRunStatus?: (input: {
     agentId: string;
     resourceId: string;
@@ -2071,16 +2074,14 @@ async function handleScheduleSignal(options: {
     : (ifIdle.behavior ?? 'wake') === 'persist';
   // A wake or a delivery can still end in persistence, so the schedule's
   // authorization governs every fire.
-  const persistenceAllowed = options.schedulePersistenceAllowed
-    ? await options.schedulePersistenceAllowed({
-        scheduleId,
-        dispatchId,
-        runId,
-        agentId: target.agentId,
-        threadId: options.threadId,
-        resourceId,
-      })
-    : options.persistenceAllowed;
+  const persistenceAllowed = await options.schedulePersistenceAllowed({
+    scheduleId,
+    dispatchId,
+    runId,
+    agentId: target.agentId,
+    threadId: options.threadId,
+    resourceId,
+  });
   if (persistenceRequested && !persistenceAllowed) {
     return await settleDiscard();
   }
@@ -2188,9 +2189,7 @@ async function handleScheduleSignal(options: {
       serializeWake: options.serializeWake,
       executionFence: options.executionFence,
       proof: options.proof,
-      blockingRun: durableBlockingRun
-        ? () => durableBlockingRun
-        : options.blockingRun,
+      blockingRun: options.blockingRun,
       persistenceAllowed,
       memoryAvailable: options.memoryAvailable,
       signal: idleSignal,
@@ -2340,9 +2339,7 @@ async function handleMessage(
       serializeWake,
       executionFence: options.executionFence,
       proof: options.proof,
-      blockingRun: durableBlockingRun
-        ? () => durableBlockingRun
-        : options.blockingRun,
+      blockingRun: options.blockingRun,
       persistenceAllowed: options.persistenceAllowed,
       memoryAvailable: options.memoryAvailable,
       message,
@@ -2550,9 +2547,7 @@ async function handleSignal(
       serializeWake,
       executionFence: options.executionFence,
       proof: options.proof,
-      blockingRun: durableBlockingRun
-        ? () => durableBlockingRun
-        : options.blockingRun,
+      blockingRun: options.blockingRun,
       persistenceAllowed: options.persistenceAllowed,
       memoryAvailable: options.memoryAvailable,
       signal,

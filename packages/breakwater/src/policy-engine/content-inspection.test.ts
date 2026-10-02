@@ -8,7 +8,7 @@ import type {
 } from '@mastra/core/processors';
 import { RequestContext } from '@mastra/core/request-context';
 import { ChunkFrom, type ChunkType } from '@mastra/core/stream';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { AuditLogger } from '../audit/index.js';
 import { HIGH_ENTROPY_CANDIDATE_RE } from './content-inspection.js';
@@ -1348,44 +1348,61 @@ describe('classifierPolicy', () => {
     });
 
     it('fails closed when classify exceeds timeoutMs', async () => {
-      // #given — never settles on its own
-      const engine = new PolicyEngine({
-        policies: [
-          classifierPolicy({
-            classify: () => new Promise<PolicyDecision>(() => {}),
-            timeoutMs: 20,
-          }),
-        ],
-      });
+      vi.useFakeTimers();
+      try {
+        // #given — never settles on its own
+        const engine = new PolicyEngine({
+          policies: [
+            classifierPolicy({
+              classify: () => new Promise<PolicyDecision>(() => {}),
+              timeoutMs: 20,
+            }),
+          ],
+        });
 
-      // #when / #then
-      await expect(
-        engine.processOutputResult(makeOutputArgs('anything')),
-      ).rejects.toThrow('policy evaluation failed');
+        // #when
+        const failure = expect(
+          engine.processOutputResult(makeOutputArgs('anything')),
+        ).rejects.toThrow('policy evaluation failed');
+        await vi.advanceTimersByTimeAsync(20);
+
+        // #then
+        await failure;
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it('does not crash when a slow classify eventually rejects after its own timeout already fired', async () => {
-      // #given
-      let rejectClassify!: (reason: Error) => void;
-      const engine = new PolicyEngine({
-        policies: [
-          classifierPolicy({
-            classify: () =>
-              new Promise<PolicyDecision>((_resolve, reject) => {
-                rejectClassify = reject;
-              }),
-            timeoutMs: 5,
-          }),
-        ],
-      });
+      vi.useFakeTimers();
+      try {
+        // #given
+        let rejectClassify!: (reason: Error) => void;
+        const engine = new PolicyEngine({
+          policies: [
+            classifierPolicy({
+              classify: () =>
+                new Promise<PolicyDecision>((_resolve, reject) => {
+                  rejectClassify = reject;
+                }),
+              timeoutMs: 5,
+            }),
+          ],
+        });
 
-      // #when / #then
-      await expect(
-        engine.processOutputResult(makeOutputArgs('anything')),
-      ).rejects.toThrow('policy evaluation failed');
+        // #when
+        const failure = expect(
+          engine.processOutputResult(makeOutputArgs('anything')),
+        ).rejects.toThrow('policy evaluation failed');
+        await vi.advanceTimersByTimeAsync(5);
 
-      rejectClassify(new Error('late failure'));
-      await new Promise((resolve) => setTimeout(resolve, 0));
+        // #then
+        await failure;
+        rejectClassify(new Error('late failure'));
+        await vi.advanceTimersByTimeAsync(0);
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 });
