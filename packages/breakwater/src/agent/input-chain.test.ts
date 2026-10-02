@@ -2660,21 +2660,21 @@ describe('durable memory preparation', () => {
       memory: async () => memory,
     });
 
-    expect(
-      await drive(agent, 'durable', ['hello'], {
+    const outcome = await outcomeOf(
+      drive(agent, 'durable', ['hello'], {
         requestContext: actorContext(),
         memory: THREAD,
       }),
-    ).toBe(PROCESSOR_FAILED);
-    expect(prompts).toEqual([]);
-    expect(eventsOf(audit, 'agent.input.processor', 'error')).toMatchObject([
-      { detail: { processor: 'breakwater-memory' } },
-    ]);
+    );
+    expect.soft(outcome.tripwire).toBeUndefined();
+    expect.soft(outcome.failure).toMatch(/generateTitle/);
+    expect.soft(prompts).toEqual([]);
+    expect.soft(eventsOf(audit, 'agent.input.processor', 'error')).toEqual([]);
   });
 
   it.each(
     LOOPS,
-  )('does not generate a title when dynamic memory changes between resolutions on %s', async (loop) => {
+  )('refuses a title-enabled dynamic memory resolution before the model call on %s', async (loop) => {
     const disabled = await threadMemory({ title: false });
     const enabled = new MockMemory({
       storage: new InMemoryStore(),
@@ -2704,14 +2704,14 @@ describe('durable memory preparation', () => {
       },
     });
 
-    expect(
-      await drive(agent, loop, ['hello'], {
+    const outcome = await outcomeOf(
+      drive(agent, loop, ['hello'], {
         requestContext: actorContext(),
         memory: THREAD,
       }),
-    ).toBeUndefined();
-    expect(prompts).toHaveLength(1);
-    expect(await titleWithin(enabled)).toBe('');
+    );
+    expect.soft(outcome.failure).toMatch(/generateTitle/);
+    expect.soft(prompts).toEqual([]);
   });
 });
 

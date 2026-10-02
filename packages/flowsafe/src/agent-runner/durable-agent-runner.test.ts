@@ -165,7 +165,12 @@ function testAgent(id = 'writer', pubsub?: EventEmitterPubSub): Agent {
   });
 }
 
-function guardedTestAgent(): Agent {
+function guardedTestAgent(
+  options: {
+    memory?: MockMemory | (() => MockMemory);
+    audit?: AuditLogger;
+  } = {},
+): Agent {
   return createGuardedAgent({
     id: 'writer',
     name: 'Writer',
@@ -173,7 +178,8 @@ function guardedTestAgent(): Agent {
     model: 'openai/gpt-4o-mini',
     allowedRoles: ['operator'],
     policies: [],
-    audit: new AuditLogger(),
+    memory: options.memory,
+    audit: options.audit ?? new AuditLogger(),
     maxSteps: 2,
     toolChoice: 'auto',
   }) as unknown as Agent;
@@ -193,6 +199,32 @@ function registryFor(agent: FlowsafeDurableAgent): ExtendedRunRegistry {
       readonly runRegistryInternal: ExtendedRunRegistry;
     }
   ).runRegistryInternal;
+}
+
+async function guardedResumeFixture(
+  memory: MockMemory | (() => MockMemory),
+  role: Role = 'operator',
+) {
+  const audit = new AuditLogger();
+  const { runtime, resume, resumeExecution } = fakeRuntime({
+    resumeContext: actorContext(role),
+  });
+  const agent = createFlowsafeDurableAgent({
+    agent: guardedTestAgent({ memory, audit }),
+    runtime,
+    cache: false,
+  });
+  await agent.prepare('initial request', {
+    runId: 'run-1',
+    requestContext: actorContext(),
+    memory: { thread: 'thread-1', resource: 'resource-1' },
+  });
+  registryFor(agent).clear();
+  globalRunRegistry.clear();
+  const observe = vi.spyOn(agent, 'observe').mockResolvedValue({
+    output: { id: 'rehydrated' },
+  } as never);
+  return { agent, audit, resume, resumeExecution, observe };
 }
 
 function processorTestAgent(options: {
@@ -3680,102 +3712,146 @@ describe('FlowsafeDurableAgent thread runtime registration and rehydration', () 
   });
 
   it.each([
-    ['an allowed actor', 'operator' as const],
-    ['a disallowed actor', 'viewer' as const],
-  ])('keeps a resumed guarded leg closed on memory resolution failure for %s', async (_label, role) => {
-    const memory = new MockMemory();
-    const audit = new AuditLogger();
-    const { runtime, resume } = fakeRuntime();
-    const modelCall = vi.fn();
-    const agent = createFlowsafeDurableAgent({
-      agent: createGuardedAgent({
-        id: 'writer',
-        name: 'Writer',
-        instructions: 'Answer the request.',
-        model: localModelFixture(modelCall),
-        memory,
-        allowedRoles: ['operator'],
-        policies: [],
-        audit,
-        maxSteps: 2,
-        toolChoice: 'auto',
-      }) as unknown as Agent,
-      runtime,
-      cache: false,
-    });
-    await agent.prepare('initial request', {
+    {
+      failure: 'a memory processor lookup fails',
+      setupMemory: () => {
+        const memory = new MockMemory();
+        return {
+          memory,
+          enableResume: () => {
+            vi.spyOn(memory, 'getInputProcessors').mockRejectedValue(
+              new Error('private memory failure'),
+            );
+          },
+        };
+      },
+    },
+    {
+      failure:
+        'memory resolves with title generation enabled during processor resolution',
+      setupMemory: () => {
+        const disabled = new MockMemory();
+        const enabled = new MockMemory({ options: { generateTitle: true } });
+        let resumeLeg = false;
+        let resumeMemoryResolutions = 0;
+        return {
+          memory: () => {
+            if (!resumeLeg) return disabled;
+            resumeMemoryResolutions += 1;
+            return resumeMemoryResolutions === 1 ? disabled : enabled;
+          },
+          enableResume: () => {
+            resumeLeg = true;
+          },
+        };
+      },
+    },
+  ])('refuses guarded resume before installation or execution when $failure', async ({
+    setupMemory,
+  }) => {
+    const { memory, enableResume } = setupMemory();
+    const { agent, audit, resume, resumeExecution, observe } =
+      await guardedResumeFixture(memory);
+    enableResume();
+
+    const pending = agent.resumeViaRuntime({
       runId: 'run-1',
-      requestContext: actorContext(),
+      requestedBy: 'reviewer-1',
       memory: { thread: 'thread-1', resource: 'resource-1' },
     });
+    await expect
+      .soft(pending)
+      .rejects.toThrow(
+        /^Durable agent registry rehydration denied: input processor failed$/,
+      );
+
+    expect(resume).toHaveBeenCalledOnce();
+    expect(resumeExecution).not.toHaveBeenCalled();
+    expect(observe).not.toHaveBeenCalled();
+    expect(registryFor(agent).has('run-1')).toBe(false);
+    expect(globalRunRegistry.has('run-1')).toBe(false);
+    expect(
+      audit
+        .events()
+        .filter((event) => event.action === 'agent.input.processor'),
+    ).toMatchObject([
+      { decision: 'error', detail: { processor: 'breakwater-memory' } },
+    ]);
+  });
+
+  it('refuses title-enabled memory on the first guarded resume resolution before installation or execution', async () => {
+    const disabled = new MockMemory();
+    let resumeLeg = false;
+    let resumeMemoryResolutions = 0;
+    const { agent, audit, resume, resumeExecution, observe } =
+      await guardedResumeFixture(() => {
+        if (!resumeLeg) return disabled;
+        resumeMemoryResolutions += 1;
+        return resumeMemoryResolutions === 1
+          ? new MockMemory({ options: { generateTitle: true } })
+          : disabled;
+      });
+    resumeLeg = true;
+
+    const pending = agent.resumeViaRuntime({
+      runId: 'run-1',
+      requestedBy: 'reviewer-1',
+      memory: { thread: 'thread-1', resource: 'resource-1' },
+    });
+    await expect.soft(pending).rejects.toBeInstanceOf(TypeError);
+    await expect.soft(pending).rejects.toThrow(/generateTitle/);
+
+    expect.soft(resume).toHaveBeenCalledOnce();
+    expect.soft(resumeExecution).not.toHaveBeenCalled();
+    expect.soft(observe).not.toHaveBeenCalled();
+    expect.soft(registryFor(agent).has('run-1')).toBe(false);
+    expect.soft(globalRunRegistry.has('run-1')).toBe(false);
+    expect
+      .soft(
+        audit
+          .events()
+          .filter((event) => event.action === 'agent.input.processor'),
+      )
+      .toEqual([]);
+  });
+
+  it('refuses a disallowed actor before auditing a guarded resume memory failure', async () => {
+    const memory = new MockMemory();
+    const { agent, audit, resume, resumeExecution, observe } =
+      await guardedResumeFixture(memory, 'viewer');
     vi.spyOn(memory, 'getInputProcessors').mockRejectedValue(
       new Error('private memory failure'),
     );
-    registryFor(agent).clear();
-    globalRunRegistry.clear();
-    vi.spyOn(agent, 'observe').mockResolvedValue({
-      output: { id: 'rehydrated' },
-    } as never);
-    let restoredInputProcessors: string[] | undefined;
-    resume.mockImplementation(async (_workflowId, runId, options) => {
-      await options?.prepareExecution?.(actorContext(role));
-      const entry = globalRunRegistry.get(runId);
-      assert(entry);
-      restoredInputProcessors = entry.inputProcessors?.map(({ id }) => id);
-      const messageList = new MessageList();
-      messageList.add('follow-up', 'input');
-      const runner = new ProcessorRunner({
-        inputProcessors: entry.inputProcessors,
-        logger: {} as never,
-        agentName: 'Writer',
-        processorStates: entry.processorStates,
-      });
-      await runner.runProcessInputStep({
-        messageList,
-        stepNumber: 1,
-        steps: [],
-        model: entry.model as never,
-        requestContext: actorContext(role),
-      });
-      modelCall();
-      return { runId, status: 'success' as const };
+
+    const pending = agent.resumeViaRuntime({
+      runId: 'run-1',
+      requestedBy: 'reviewer-1',
+      memory: { thread: 'thread-1', resource: 'resource-1' },
     });
 
-    await expect(
-      agent.resumeViaRuntime({
-        runId: 'run-1',
-        requestedBy: 'reviewer-1',
-        memory: { thread: 'thread-1', resource: 'resource-1' },
-      }),
-    ).rejects.toThrow(
-      role === 'operator'
-        ? 'input processor failed'
-        : /^Durable agent registry rehydration denied: /,
-    );
-
-    expect(modelCall).not.toHaveBeenCalled();
+    await expect.soft(pending).rejects.toBeInstanceOf(Error);
+    await expect
+      .soft(pending)
+      .rejects.toHaveProperty(
+        'message',
+        expect.stringMatching(/^Durable agent registry rehydration denied: /),
+      );
+    await expect
+      .soft(pending)
+      .rejects.toHaveProperty(
+        'message',
+        expect.not.stringContaining('input processor failed'),
+      );
     expect(resume).toHaveBeenCalledOnce();
-    if (role === 'operator') {
-      expect(restoredInputProcessors).toEqual([
-        'breakwater-rbac',
-        'breakwater-memory',
-      ]);
-      expect(
-        audit
-          .events()
-          .filter((event) => event.action === 'agent.input.processor'),
-      ).toMatchObject([
-        { decision: 'error', detail: { processor: 'breakwater-memory' } },
-      ]);
-    } else {
-      expect(registryFor(agent).has('run-1')).toBe(false);
-      expect(globalRunRegistry.has('run-1')).toBe(false);
-      expect(
-        audit
-          .events()
-          .filter((event) => event.action === 'agent.input.processor'),
-      ).toEqual([]);
-    }
+    expect(resumeExecution).not.toHaveBeenCalled();
+    expect(observe).not.toHaveBeenCalled();
+    expect(registryFor(agent).has('run-1')).toBe(false);
+    expect(globalRunRegistry.has('run-1')).toBe(false);
+    expect(
+      audit
+        .events()
+        .filter((event) => event.action === 'agent.input.processor'),
+    ).toEqual([]);
   });
 
   it('preserves raw-agent step and LLM-request processors without replaying processInput', async () => {

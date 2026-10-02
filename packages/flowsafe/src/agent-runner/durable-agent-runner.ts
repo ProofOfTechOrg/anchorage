@@ -46,8 +46,9 @@
 // one isolate, so a resume decided before eviction finds it. A resume
 // AFTER eviction must first rehydrate that registry without replaying
 // application input processors. resumeViaRuntime() rebuilds the registry with
-// complete runtime processor lists after invoking only reserved RBAC during
-// empty-message preparation, then drives runtime.resume().
+// complete runtime processor lists after invoking only Breakwater's reserved
+// processInput steps during empty-message preparation, then drives
+// runtime.resume().
 
 import {
   type Agent,
@@ -164,6 +165,9 @@ const BREAKWATER_GUARDED_AGENT_HOST_PROTOCOL = Symbol.for(
   '@proofoftech/breakwater/guarded-agent-host/v1',
 );
 const BREAKWATER_RBAC_PROCESSOR_ID = 'breakwater-rbac';
+// Replaying the reserved failure step for unresolved memory processors refuses
+// rehydration before the resumed step.
+const BREAKWATER_MEMORY_PROCESSOR_ID = 'breakwater-memory';
 
 interface BreakwaterGuardedAgentHostProtocol {
   readonly version: 1;
@@ -931,6 +935,7 @@ export class FlowsafeDurableAgent<
   readonly [RUNTIME_DRIVEN_AGENT] = true;
   readonly #runtime: RunnerRuntime;
   readonly #wrappedAgent: Agent<TAgentId, TTools, TOutput>;
+  readonly #rehydrationInputProcessorIds: ReadonlySet<string>;
   readonly #guardedCallOptionMapper?: DurableCallOptionMapper;
   readonly #threadRuntime?: Mastra['agentThreadStreamRuntime'];
   readonly #persistenceWaiters = new Map<
@@ -1025,6 +1030,11 @@ export class FlowsafeDurableAgent<
     });
     this.#runtime = options.runtime;
     this.#wrappedAgent = options.agent;
+    this.#rehydrationInputProcessorIds = new Set(
+      guardedProtocol !== undefined
+        ? [BREAKWATER_RBAC_PROCESSOR_ID, BREAKWATER_MEMORY_PROCESSOR_ID]
+        : [BREAKWATER_RBAC_PROCESSOR_ID],
+    );
     this.#guardedCallOptionMapper = callOptionMapper;
     this.#threadRuntime = options.threadRuntime;
     // Core keys thread state and signal delivery on the agent-level pub/sub;
@@ -1784,12 +1794,12 @@ export class FlowsafeDurableAgent<
       ReturnType<Agent<TAgentId, TTools, TOutput>['__listLLMRequestProcessors']>
     > = [];
     const rehydrationAgent = new Proxy(wrappedAgent, {
-      get(target, property) {
+      get: (target, property) => {
         if (property === 'listInputProcessors') {
           return async (requestContext?: RequestContext) => {
             inputProcessors = await target.listInputProcessors(requestContext);
-            return inputProcessors.filter(
-              (processor) => processor.id === BREAKWATER_RBAC_PROCESSOR_ID,
+            return inputProcessors.filter((processor) =>
+              this.#rehydrationInputProcessorIds.has(processor.id),
             );
           };
         }

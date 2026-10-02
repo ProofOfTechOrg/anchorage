@@ -1363,7 +1363,7 @@ class GuardedAgent<
     this.#memoryError = {
       id: 'breakwater-memory',
       processInput: failMemory,
-      // A resumed leg skips processInput; each durable step runs processInputStep.
+      // A resume with a live run registry entry skips processInput; durable steps run processInputStep.
       processInputStep: failMemory,
     };
     this.disableBackgroundTasks();
@@ -1372,15 +1372,22 @@ class GuardedAgent<
   async #assertResolvedMemoryTitleDisabled(
     requestContext: RequestContext,
   ): Promise<void> {
-    const memory = await this.getMemory({ requestContext });
+    await this.getMemory({ requestContext });
+  }
+
+  // Mastra resolves memory through getMemory for saving, recall and processors, so each resolution needs the title check.
+  override async getMemory(options?: {
+    requestContext?: RequestContext;
+  }): Promise<MastraMemory | undefined> {
+    const memory = await super.getMemory(options);
     if (memory) assertGuardedMemoryTitleDisabled(memory);
+    return memory;
   }
 
   async #resolveMemoryProcessors(requestContext: RequestContext) {
     try {
       const memory = await this.getMemory({ requestContext });
       if (!memory) return { input: [], output: [] };
-      assertGuardedMemoryTitleDisabled(memory);
       const input = await memory.getInputProcessors(
         [...this.#guardedInput],
         requestContext,

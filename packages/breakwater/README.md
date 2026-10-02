@@ -120,9 +120,9 @@ The handle exposes only unstructured `generate()` and `stream()`. Each call requ
 
 `allowedRoles` is an exact allowlist with no role hierarchy.
 
-A guarded agent refuses any `Memory` a call resolves whose configuration enables thread title generation, including function-valued and inherited memory. It also checks a `Memory` instance at construction. The guarded agent never generates a thread title, including when a host starts the durable loop with call-level `memory.options.generateTitle`. Disable `generateTitle` on the guarded agent's `Memory`: Mastra's title model call bypasses the input and output policies.
+A guarded agent refuses title-enabled configuration whenever it resolves a `Memory`, including function-valued and inherited memory. It also checks a `Memory` instance at construction. The guarded agent never generates a thread title, including when a host starts the durable loop with call-level `memory.options.generateTitle`. Disable `generateTitle` on the guarded agent's `Memory`: Mastra's title model call bypasses the input and output policies.
 
-The guarded durable loop loads the agent's memory, including thread history, working memory, and semantic recall, as the standard loops do. A memory resolution failure or memory input processor error, such as a failed thread-history read, stops a durable call with `input processor failed` and one `agent.input.processor` error event naming the processor's id (`message-history` for history). On `generate()` and `stream()`, Mastra rejects a memory input processor error and Breakwater writes no audit event.
+The guarded durable loop loads the agent's memory, including thread history, working memory, and semantic recall, as the standard loops do. A memory input processor error, such as a failed thread-history read, or a failure to resolve the memory processors stops a durable call with `input processor failed` and one `agent.input.processor` error event. The event names the processor's id (`message-history` for history), or `breakwater-memory` when resolving the memory processors fails. A failed first memory lookup rejects the durable call with that error and writes no audit event. On `generate()` and `stream()`, Mastra rejects a memory input processor error and Breakwater writes no audit event.
 
 ### Input policies and memory
 
