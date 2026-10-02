@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-// The prompt messages a guarded agent's application input processors add or
-// change on a call's message list, recorded for the policy engine.
+// Prompt message versions recorded for a guarded agent's input policies.
 //
 // Mastra renders every system message and every message outside the call's
 // input into the prompt, and the input policies read the input. A processor
 // that moves the caller's text there would give it to the model unread, so
-// each processor's call is compared with the list as it stood before, and a
-// copy of each message it added or changed is kept, keyed by the list, until
-// the policy engine takes it.
+// a snapshot comparison preserves prompt versions outside caller input,
+// keyed by the list, until the policy engine takes them.
 //
 // The per-list client tool outcome record preserves provenance before memory
 // merges outcome parts. The callerMessages reader selects caller messages
@@ -37,7 +35,7 @@ export interface RecordedSystemMessage {
   readonly experimental_providerMetadata: unknown;
 }
 
-/** @internal A prompt message an application input processor added or changed. */
+/** @internal A prompt message version recorded for input policy evaluation. */
 export type ProcessorAddition =
   | { readonly kind: 'system'; readonly message: RecordedSystemMessage }
   | { readonly kind: 'message'; readonly message: MastraDBMessage };
@@ -222,10 +220,16 @@ export function addedMessageIds(
   );
 }
 
+/** @internal Return recorded message ids without taking their prompt versions. */
+export function recordedMessageIds(
+  messageList: MessageList,
+): ReadonlySet<string> {
+  return new Set(addedMessageIds(additionsByList.get(messageList) ?? []));
+}
+
 /**
  * @internal Count the system messages and the messages outside the call's
- * input on `messageList` by fingerprint, before an application input
- * processor runs.
+ * input on `messageList` by fingerprint, before a guarded input step runs.
  */
 export function snapshotPromptMessages(
   messageList: MessageList,
@@ -298,9 +302,10 @@ function readSystemMessage(entry: unknown): RecordedSystemMessage {
 }
 
 /**
- * @internal Record a copy of each system message and each message outside
- * the call's input that is not in `before`, which an application input
- * processor therefore added or changed.
+ * @internal Record copies of prompt entries that do not match `before`.
+ *
+ * @param messageIds Message ids eligible for recording; system entries are
+ * unaffected. When omitted, message ids are unrestricted.
  *
  * @throws TypeError when such a system message's content is not a string or
  * an array of text parts, or when one of its fields is an accessor. A copy
@@ -309,6 +314,7 @@ function readSystemMessage(entry: unknown): RecordedSystemMessage {
 export function recordProcessorAdditions(
   messageList: MessageList,
   before: PromptSnapshot,
+  messageIds?: ReadonlySet<string>,
 ): void {
   const unmatched = new Map(before);
   const { system, messages } = promptEntries(messageList);
@@ -319,6 +325,7 @@ export function recordProcessorAdditions(
   }
   for (const message of messages) {
     if (takeOne(unmatched, messageKey(message))) continue;
+    if (messageIds !== undefined && !messageIds.has(message.id)) continue;
     additions.push({ kind: 'message', message: structuredClone(message) });
   }
   if (additions.length === 0) return;
@@ -329,9 +336,8 @@ export function recordProcessorAdditions(
 }
 
 /**
- * @internal Remove and return what application input processors added or
- * changed on `messageList`, so a second evaluation of the list does not read
- * it again.
+ * @internal Remove and return recorded prompt versions on `messageList`, so
+ * a second evaluation of the list does not read them again.
  */
 export function takeProcessorAdditions(
   messageList: MessageList,

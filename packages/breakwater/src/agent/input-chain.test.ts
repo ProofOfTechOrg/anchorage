@@ -52,8 +52,22 @@ type Loop = (typeof LOOPS)[number];
 const STANDARD = ['generate', 'stream'] as const;
 
 const MARK = 'MKREFUSEDINPUT';
+const raw = { first: MARK.slice(0, 9), second: MARK.slice(9) };
+const concatenateOutput = (value: unknown) => ({
+  type: 'text',
+  value: (value as typeof raw).first + (value as typeof raw).second,
+});
 const POLICY_FAILED = 'policy evaluation failed';
 const PROCESSOR_FAILED = 'input processor failed';
+
+function lookupTool(toModelOutput: (value: unknown) => unknown, id = 'lookup') {
+  return createTool({
+    id,
+    description: 'Look up status',
+    inputSchema: z.object({}),
+    toModelOutput,
+  } as never);
+}
 
 const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
 
@@ -326,11 +340,6 @@ function promptLines(prompt: unknown): string[] {
 }
 
 describe('client-only tool output before guarded input policies', () => {
-  const raw = { first: MARK.slice(0, 9), second: MARK.slice(9) };
-  const concatenateOutput = (value: unknown) => ({
-    type: 'text',
-    value: (value as typeof raw).first + (value as typeof raw).second,
-  });
   const messages = (name: string, output: unknown) => [
     {
       id: 'u1',
@@ -362,12 +371,7 @@ describe('client-only tool output before guarded input policies', () => {
     const prompts: unknown[] = [];
     const audit = new AuditLogger();
     const toModelOutput = vi.fn(mapper);
-    const lookup = createTool({
-      id: toolName,
-      description: 'Look up status',
-      inputSchema: z.object({}),
-      toModelOutput,
-    } as never);
+    const lookup = lookupTool(toModelOutput, toolName);
     const agent = guardedAgent({
       prompts,
       audit,
@@ -470,12 +474,7 @@ describe('client-only tool output before guarded input policies', () => {
     const prompts: unknown[] = [];
     const audit = new AuditLogger();
     const toModelOutput = vi.fn(concatenateOutput);
-    const lookup = createTool({
-      id: 'lookup',
-      description: 'Look up status',
-      inputSchema: z.object({}),
-      toModelOutput,
-    } as never);
+    const lookup = lookupTool(toModelOutput);
     const memory = new (class extends MockMemory {
       override listTools() {
         return { lookup };
@@ -1520,14 +1519,17 @@ async function storedText(memory: MockMemory): Promise<string> {
 }
 
 // Mastra's durable finish saves the thread after its stream drains, so the
-// thread is read until `marker` appears or the wait ends.
+// thread is read until a requested marker appears or the wait ends.
 async function storedWithin(
   memory: MockMemory,
-  marker: string,
+  markers: readonly string[],
 ): Promise<string> {
   const deadline = Date.now() + WAIT_MS;
   let text = await storedText(memory);
-  while (!text.includes(marker) && Date.now() < deadline) {
+  while (
+    !markers.some((marker) => text.includes(marker)) &&
+    Date.now() < deadline
+  ) {
     await new Promise((resolve) => setTimeout(resolve, 25));
     text = await storedText(memory);
   }
@@ -1535,12 +1537,16 @@ async function storedWithin(
 }
 
 // Whether the thread holds the marker once the call has finished.
-async function savedMarker(memory: MockMemory, loop: Loop): Promise<boolean> {
+async function savedMarker(
+  memory: MockMemory,
+  loop: Loop,
+  markers: readonly string[] = [MARK],
+): Promise<boolean> {
   const text =
     loop === 'durable'
-      ? await storedWithin(memory, MARK)
+      ? await storedWithin(memory, markers)
       : await storedText(memory);
-  return text.includes(MARK);
+  return markers.some((marker) => text.includes(marker));
 }
 
 async function historyMemory(
@@ -1576,6 +1582,168 @@ async function historyMemory(
   });
   return memory;
 }
+
+async function runSharedClientOutcome(
+  loop: Loop,
+  {
+    storedMessageText,
+    clean,
+    callerResult,
+  }: { storedMessageText: string; clean: string; callerResult?: typeof raw },
+) {
+  const memory = await historyMemory();
+  const pending = {
+    type: 'tool-invocation' as const,
+    createdAt: Date.now() - 100_000,
+    toolInvocation: {
+      state: 'call' as const,
+      toolCallId: 'call-1',
+      toolName: 'lookup',
+      args: {},
+    },
+  };
+  const pendingCalls = [
+    pending,
+    ...(callerResult
+      ? [
+          {
+            ...pending,
+            toolInvocation: {
+              ...pending.toolInvocation,
+              toolCallId: 'call-2',
+              toolName: 'details_lookup',
+            },
+          },
+        ]
+      : []),
+  ];
+  await memory.saveMessages({
+    messages: [
+      {
+        id: 'm2',
+        role: 'assistant',
+        threadId: 't1',
+        resourceId: 'r1',
+        createdAt: new Date(Date.now() - 100_000),
+        content: {
+          format: 2,
+          parts: [{ type: 'text', text: storedMessageText }, ...pendingCalls],
+        },
+      },
+    ],
+  });
+  const prompts: unknown[] = [];
+  const agent = guardedAgent({
+    prompts,
+    audit: new AuditLogger(),
+    memory,
+    tools: {
+      lookup: lookupTool((value: unknown) => ({
+        type: 'text',
+        value: `mapped ${value}`,
+      })),
+      ...(callerResult
+        ? { details_lookup: lookupTool(concatenateOutput, 'details_lookup') }
+        : {}),
+    },
+    processors: [
+      app(({ messageList }) => {
+        const own = messageList.get.input.db().find(({ id }) => id === 'm2');
+        const part = own?.content.parts.find(
+          (candidate) =>
+            candidate.type === 'tool-invocation' &&
+            candidate.toolInvocation.toolCallId === 'call-1',
+        );
+        if (!part) throw new Error('caller outcome missing');
+        messageList.add(
+          {
+            id: 'mem-a',
+            role: 'assistant',
+            threadId: 't1',
+            createdAt: new Date(),
+            content: { format: 2, parts: [part] },
+          },
+          'input',
+        );
+        return messageList;
+      }),
+    ],
+  });
+  const outcome = await outcomeOf(
+    drive(
+      agent,
+      loop,
+      [
+        {
+          id: 'm2',
+          role: 'assistant',
+          content: {
+            format: 2,
+            parts: pendingCalls.map((call) => ({
+              ...call,
+              toolInvocation: {
+                ...call.toolInvocation,
+                state: 'result',
+                result:
+                  call.toolInvocation.toolCallId === 'call-1'
+                    ? clean
+                    : { ...callerResult },
+              },
+            })),
+          },
+        },
+        'and now?',
+      ],
+      { requestContext: actorContext(), memory: THREAD },
+    ),
+  );
+  return { outcome, prompts };
+}
+
+it.each(
+  LOOPS,
+)('allows a clean client outcome shared with older history on %s', async (loop) => {
+  const clean = 'clean client result';
+  const { outcome, prompts } = await runSharedClientOutcome(loop, {
+    storedMessageText: MARK,
+    clean,
+  });
+  const received = {
+    loop,
+    ...outcome,
+    prompts: prompts.length,
+    mapped: JSON.stringify(prompts).includes(`mapped ${clean}`),
+  };
+  expect(received).toEqual({
+    loop,
+    tripwire: undefined,
+    failure: undefined,
+    prompts: 1,
+    mapped: true,
+  });
+});
+
+it.each(
+  LOOPS,
+)('refuses a mapped caller outcome beside a client outcome shared with older history on %s', async (loop) => {
+  const { outcome, prompts } = await runSharedClientOutcome(loop, {
+    storedMessageText: 'pending client lookups',
+    clean: 'clean client result',
+    callerResult: raw,
+  });
+  expect({
+    loop,
+    ...outcome,
+    prompts: prompts.length,
+    sent: JSON.stringify(prompts).includes(MARK),
+  }).toEqual({
+    loop,
+    tripwire: policyDenialReason('deny-patterns', 'input'),
+    failure: undefined,
+    prompts: 0,
+    sent: false,
+  });
+});
 
 describe('durable memory preparation', () => {
   function semanticMemory() {
@@ -1999,7 +2167,7 @@ describe('a call refused on the input chain saves none of its input', () => {
 
     // #then
     expect(tripwire).toBeUndefined();
-    expect(await storedWithin(memory, MARK)).toContain(MARK);
+    expect(await storedWithin(memory, [MARK])).toContain(MARK);
   });
 
   it.each(
@@ -2027,7 +2195,7 @@ describe('a call refused on the input chain saves none of its input', () => {
     // #then
     expect(tripwire).toBeDefined();
     expect(refusedPrompts).toEqual([]);
-    expect(await storedWithin(memory, MARK)).not.toContain(MARK);
+    expect(await storedWithin(memory, [MARK])).not.toContain(MARK);
     for (const loop of STANDARD) {
       const prompts: unknown[] = [];
       const next = guardedAgent({
@@ -2533,9 +2701,11 @@ describe('the value an application input processor returns', () => {
 // input policies would not otherwise read it.
 interface Moved {
   readonly processors: () => readonly GuardedInputProcessor[];
+  readonly tools?: () => ToolsInput;
   readonly input?: readonly unknown[];
   readonly instructions?: string;
   readonly unsaved?: true;
+  readonly savedTexts?: readonly string[];
 }
 
 async function collectMovedOutcomes(row: Moved) {
@@ -2549,6 +2719,7 @@ async function collectMovedOutcomes(row: Moved) {
       audit: new AuditLogger(),
       processors: row.processors(),
       memory,
+      ...(row.tools ? { tools: row.tools() } : {}),
       ...(row.instructions !== undefined
         ? { instructions: row.instructions }
         : {}),
@@ -2567,7 +2738,9 @@ async function collectMovedOutcomes(row: Moved) {
       ...outcome,
       prompts: prompts.length,
       sent: JSON.stringify(prompts).includes(MARK),
-      ...(row.unsaved ? { saved: await savedMarker(memory, loop) } : {}),
+      ...(row.unsaved
+        ? { saved: await savedMarker(memory, loop, row.savedTexts) }
+        : {}),
     });
   }
 
@@ -2924,6 +3097,45 @@ describe('what application input processors add or change, read by the input pol
   // Mastra keeps a message's id in its memory set when a processor replaces
   // that message, or merges into it, with source `input`.
   const UNDER_MEMORY_IDS: ReadonlyArray<[string, Moved]> = [
+    [
+      'a client tool result a processor adds under a history id, whose mapped output carries the marker',
+      {
+        unsaved: true,
+        savedTexts: [raw.first, 'and now?'],
+        input: ['and now?'],
+        tools: () => ({
+          lookup: lookupTool(concatenateOutput),
+        }),
+        processors: () => [
+          app((args) => {
+            args.messageList.add(
+              {
+                id: 'mem-a',
+                role: 'assistant',
+                createdAt: new Date(),
+                content: {
+                  format: 2,
+                  parts: [
+                    {
+                      type: 'tool-invocation',
+                      toolInvocation: {
+                        state: 'result',
+                        toolCallId: 'call-1',
+                        toolName: 'lookup',
+                        args: {},
+                        result: { ...raw },
+                      },
+                    },
+                  ],
+                },
+              },
+              'input',
+            );
+            return args.messageList;
+          }),
+        ],
+      },
+    ],
     [
       'the input re-added under a history id by a processor that returns the list',
       {

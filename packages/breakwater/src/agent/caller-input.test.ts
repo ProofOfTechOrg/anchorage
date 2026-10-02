@@ -458,15 +458,19 @@ async function savedClientCall(memory: MockMemory) {
     : undefined;
 }
 
-function clientTools({ mapped = false }: { mapped?: boolean } = {}) {
+const deniedModelOutput = () => ({ type: 'text', value: OUTCOME_MARKER });
+
+function clientTools({
+  mapper,
+}: {
+  mapper?: (value: unknown) => unknown;
+} = {}) {
   return {
     crm_lookup: createTool({
       id: 'crm_lookup',
       description: 'Look up an account on the client',
       inputSchema: z.object({ account: z.string() }),
-      ...(mapped
-        ? { toModelOutput: () => ({ type: 'text', value: OUTCOME_MARKER }) }
-        : {}),
+      ...(mapper ? { toModelOutput: mapper } : {}),
     } as never),
   };
 }
@@ -571,7 +575,9 @@ describe('client tool outcomes merged into memory', () => {
       {
         policies: [denyPatterns([OUTCOME_MARKER])],
         memory,
-        tools: clientTools({ mapped: row.mapped }),
+        tools: clientTools({
+          mapper: row.mapped ? deniedModelOutput : undefined,
+        }),
         call: THREAD,
       },
     );
@@ -610,7 +616,7 @@ describe('client tool outcomes merged into memory', () => {
 
   it.each(
     METHODS,
-  )('allows a clean caller result beside an unsent stored denied result and saves the client tool outcome on %s', async (method) => {
+  )('allows a mapped clean caller result beside an unsent stored denied result and saves the client tool outcome on %s', async (method) => {
     const memory = await outcomeMemory({
       storedResult: clientToolOutcome('result', {
         toolCallId: 'call_0',
@@ -630,7 +636,12 @@ describe('client tool outcomes merged into memory', () => {
         policies: [denyPatterns([OUTCOME_MARKER])],
         memory,
         tools: {
-          ...clientTools(),
+          ...clientTools({
+            mapper: (value: unknown) => ({
+              type: 'text',
+              value: `mapped ${value}`,
+            }),
+          }),
           historical_lookup: createTool({
             id: 'historical_lookup',
             description: 'Look up historical data on the client',
@@ -648,7 +659,7 @@ describe('client tool outcomes merged into memory', () => {
       'unsent stored-result mapper throws if selected',
     ).toBeUndefined();
     expect(run.prompts).toHaveLength(1);
-    expect(JSON.stringify(run.prompts[0])).toContain(CLEAN_OUTCOME);
+    expect(JSON.stringify(run.prompts[0])).toContain(`mapped ${CLEAN_OUTCOME}`);
     expect(JSON.stringify(run.prompts[0])).toContain(OUTCOME_MARKER);
     expect(await savedClientCall(memory)).toMatchObject({
       state: 'result',
