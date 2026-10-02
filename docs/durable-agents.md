@@ -176,7 +176,7 @@ const durableAgent = createFlowsafeDurableAgent({
 
 The trusted host calls `streamUntilPersisted(messages, options, requestedBy, requestedByKind, attemptToken, scheduleDispatch, idempotencyKey, authority)`. The eighth argument is required; pass explicit `undefined` for unused positional options. Its `AgentStartAuthority` type is exported only from `agent-runner`. It carries the initiating owner, agent and thread identity, threaded mode, optional caller epoch, separate resource-owner guard and original successful start-reservation claim when keyed.
 
-A host that calls `streamUntilPersisted()` itself applies Breakwater's `assertNoGuardedSystemMessages()` to the messages and `assertAcceptedCallProviderOptions()` to the call-level provider options first, as the thread host does. This direct path bypasses the guarded handle's checks.
+A host that calls `streamUntilPersisted()` itself applies Breakwater's `assertNoGuardedSystemMessages()` to the messages and `assertAcceptedCallProviderOptions()` to the call-level provider options first, as the thread host does. This direct path bypasses the guarded handle's checks. The wrapper still applies the [durable call-option restrictions](#durable-call-options).
 
 The bridge captures that authority before streaming and keeps it out of Core input, stream options and public JSON. It preserves the original method caller's requester identity even when a schedule or thread has a different resource owner. Mutable caller objects cannot replace the captured values after an await.
 
@@ -194,10 +194,23 @@ The wrapper fixes its agent-level pub/sub at construction to `pubsub ?? runtime.
 
 ### Durable call options
 
-For a guarded agent, `stream()`, `streamUntilPersisted()`, `generate()`, and `prepare()` refuse these call-level options before Mastra runs:
+For a guarded agent, `stream()`, `streamUntilPersisted()`, `generate()`, and `prepare()` check every call-level option before Mastra runs, and `resumeViaRuntime()` checks its `memory` the same way. A refused option throws a `TypeError`, even when its value is `undefined`.
 
-- `structuredOutput`: parsed output bypasses the policy chain
-- `errorProcessors`: error handling can change model requests after the guarded input chain
+Mastra would apply these refused options outside what the guarded agent fixes at construction:
+
+- Options that put text before the model outside the input policies: `instructions`, `system`, `context`, `autoResumeSuspendedTools`, `onIterationComplete`, `isTaskComplete`
+- Options that add or replace tools, hooks, processors, or their settings: `clientTools`, `toolsets`, `hooks`, `delegation`, `versions`, `inputProcessors`, `outputProcessors`, `errorProcessors`, `prepareStep`, `scorers`, `transform`, `requireToolApproval`, `backgroundTaskPolicy`, `maxProcessorRetries`, `eagerToolExecution`
+- Options that release or save output outside the output policies: `structuredOutput`, `includeRawChunks`, `onChunk`, `experimentalTransform`, `savePerStep`
+
+An own `__proto__` property is refused too: Mastra's option merge would make its value the prototype of the options it resolves.
+
+`maxSteps`, `toolChoice`, and `disableBackgroundTasks` are accepted only with the guarded agent's own values (`disableBackgroundTasks: true`). An object-form `toolChoice` is compared by `type` and `toolName`. Mastra passes these values back when it drains a queued signal into the thread, which is why they are compared rather than refused. The wrapper checks the guarded agent's default options the same way when it is constructed, and they must carry `maxSteps`, `toolChoice`, and `disableBackgroundTasks`: Mastra merges them into every run it registers.
+
+`memory` carries only `thread`, as an id or an object holding only `id`, and `resource`; the wrapper forwards a frozen copy. Memory configuration, tools, instructions, processors, hooks, and scorers belong on the guarded agent.
+
+Other options pass to Mastra. `modelSettings` and `providerOptions` stay the host's responsibility: the thread host checks provider options with `assertAcceptedCallProviderOptions()`. Sub-agent version overrides a host puts in the request context still apply. `observe()` accepts `onChunk`, which receives chunks before the output processors run. Mastra's idle loop, which continues a run after background tasks finish, is not supported for a guarded agent: the agent dispatches no background tasks, and a continuation that is reached fails.
+
+The check reads the options' own properties as data, so host code in the options is outside it. Mastra calls an own `then` method while it resolves the options. Options copied from ones Mastra already resolved keep its resolved marker, so Mastra does not merge the guarded agent's defaults into them, and a compared option the copy leaves out stays unset.
 
 The guarded agent retains Breakwater's [input policy coverage](../packages/breakwater/README.md#input-policy-coverage), [input policies and memory](../packages/breakwater/README.md#input-policies-and-memory), [application processor rules](../packages/breakwater/README.md#application-processors), and [streaming rules](../packages/breakwater/README.md#understand-streaming-hold-back).
 

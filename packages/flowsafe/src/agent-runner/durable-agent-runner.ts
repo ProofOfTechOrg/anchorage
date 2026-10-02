@@ -272,13 +272,21 @@ function captureAgentStartAuthority(
   });
 }
 
-function snapshotDurableCallOptions<T extends object>(options: T): T;
-function snapshotDurableCallOptions(options: undefined): undefined;
+type DurableCallOptionMapper = (key: PropertyKey, value: unknown) => unknown;
+
+function ownDataDescriptor(target: object, key: PropertyKey, path: string) {
+  const descriptor = Object.getOwnPropertyDescriptor(target, key);
+  if (descriptor && !('value' in descriptor)) {
+    throw new TypeError(
+      `FlowsafeDurableAgent: call option '${path}' must be a data property`,
+    );
+  }
+  return descriptor;
+}
+
 function snapshotDurableCallOptions<T extends object>(
   options: T | undefined,
-): T | undefined;
-function snapshotDurableCallOptions<T extends object>(
-  options: T | undefined,
+  mapper?: DurableCallOptionMapper,
 ): T | undefined {
   if (options === undefined) return undefined;
   if (
@@ -290,17 +298,12 @@ function snapshotDurableCallOptions<T extends object>(
   }
   const snapshot: Record<PropertyKey, unknown> = {};
   for (const key of Reflect.ownKeys(options)) {
-    const descriptor = Object.getOwnPropertyDescriptor(options, key);
+    const descriptor = ownDataDescriptor(options, key, String(key));
     if (!descriptor) continue;
-    if (descriptor.get || descriptor.set) {
-      throw new TypeError(
-        `FlowsafeDurableAgent: call option '${String(key)}' must be a data property`,
-      );
-    }
     Object.defineProperty(snapshot, key, {
       configurable: false,
       enumerable: descriptor.enumerable,
-      value: descriptor.value,
+      value: mapper ? mapper(key, descriptor.value) : descriptor.value,
       writable: false,
     });
   }
@@ -406,10 +409,339 @@ const INSTALLED_SERVICE_REASON =
 const DIRECT_ABORT_REASON =
   "a direct abort bypasses the terminate route's ownership check and disputed-settlement refusal, stops running tools, and can reach another thread's run in the isolate through core's global run registry; cancel through the terminate route";
 
-const REFUSED_GUARDED_DURABLE_CALL_OPTIONS = [
-  'structuredOutput',
-  'errorProcessors',
-] as const;
+type GuardedDurableCallOptionRule =
+  | { readonly kind: 'refused'; readonly why: string }
+  | {
+      readonly kind: 'compared';
+      readonly comparison:
+        | 'guardedMaxSteps'
+        | 'guardedToolChoice'
+        | 'backgroundTasksDisabled';
+    }
+  | { readonly kind: 'memoryBinding' }
+  | { readonly kind: 'allowed'; readonly why: string };
+
+type GuardedDurableDefaults = Readonly<{
+  maxSteps: NonNullable<AgentExecutionOptions<unknown>['maxSteps']>;
+  toolChoice: NonNullable<AgentExecutionOptions<unknown>['toolChoice']>;
+}>;
+
+const GUARDED_CALLBACK_REASON =
+  "it receives what the call's stream delivers; on the durable loop the saved message and the returned result are not filtered by the output policies";
+const GUARDED_OBSERVABILITY_REASON = 'observability only';
+const GUARDED_REENTRY_REASON =
+  "Mastra's own re-entry options for its idle loop and background-task wait";
+
+// The single classification of a guarded agent's durable call options; the
+// host-facing list in docs/durable-agents.md#durable-call-options follows it.
+// Keys the table does not name, and symbol keys, pass unchanged: core re-enters
+// stream() with keys of its own. Absent compared keys pass because core merges
+// the guarded defaults into every run it registers.
+const GUARDED_DURABLE_CALL_OPTIONS = {
+  structuredOutput: {
+    kind: 'refused',
+    why: 'Mastra parses and releases the structured object outside the output policies',
+  },
+  errorProcessors: {
+    kind: 'refused',
+    why: 'error processors can change model requests after the guarded input chain',
+  },
+  clientTools: {
+    kind: 'refused',
+    why: "Mastra maps a per-call client tool's result after the guarded input policies have read it",
+  },
+  toolsets: {
+    kind: 'refused',
+    why: "Mastra adds the call's tools and maps a client tool's result after the guarded input policies have read it",
+  },
+  outputProcessors: {
+    kind: 'refused',
+    why: "Mastra replaces the guarded output processors, output policies included, with the call's list",
+  },
+  inputProcessors: {
+    kind: 'refused',
+    why: 'Breakwater fixes the guarded input processors at construction',
+  },
+  instructions: {
+    kind: 'refused',
+    why: "Mastra replaces the guarded agent's instructions with the call's",
+  },
+  system: {
+    kind: 'refused',
+    why: "Mastra adds the call's system messages, which the input policies do not read",
+  },
+  context: {
+    kind: 'refused',
+    why: "Mastra adds the call's context messages, which the input policies do not read",
+  },
+  prepareStep: {
+    kind: 'refused',
+    why: "Mastra runs the call's step preparation after the guarded input processors on every step",
+  },
+  hooks: {
+    kind: 'refused',
+    why: "Mastra runs the call's tool hooks over the guarded agent's own, and a hook can replace a tool call's result",
+  },
+  scorers: {
+    kind: 'refused',
+    why: "Mastra replaces the guarded agent's scorers with the call's",
+  },
+  savePerStep: {
+    kind: 'refused',
+    why: "Mastra saves each step before the output processors' result phase and before a later refusal",
+  },
+  versions: {
+    kind: 'refused',
+    why: "Mastra resolves the guarded agent's sub-agents to the call's versions",
+  },
+  autoResumeSuspendedTools: {
+    kind: 'refused',
+    why: 'Mastra adds a system instruction after the guarded input chain and lets model input resume suspended tools',
+  },
+  includeRawChunks: {
+    kind: 'refused',
+    why: "the provider's raw chunks reach the stream without passing the output policies",
+  },
+  onChunk: {
+    kind: 'refused',
+    why: 'Mastra calls it with each chunk before the output processors run',
+  },
+  delegation: {
+    kind: 'refused',
+    why: "Mastra runs the call's delegation hooks, which can change what sub-agents receive and return",
+  },
+  onIterationComplete: {
+    kind: 'refused',
+    why: 'its feedback reaches the model and the saved thread without passing the guarded policies',
+  },
+  isTaskComplete: {
+    kind: 'refused',
+    why: "Mastra runs the call's completion scorers, and their feedback reaches the model and the saved thread without passing the guarded policies",
+  },
+  transform: {
+    kind: 'refused',
+    why: "Mastra replaces the guarded agent's tool-payload transform with the call's",
+  },
+  experimentalTransform: {
+    kind: 'refused',
+    why: "it rewrites the thread's shared stream after the output processors",
+  },
+  requireToolApproval: {
+    kind: 'refused',
+    why: "Mastra runs a call-level approval function with the tool's arguments, and a tool's own approval rule replaces the call's setting",
+  },
+  backgroundTaskPolicy: {
+    kind: 'refused',
+    why: 'it changes the delegated tools Mastra assembles, and Breakwater disables background tasks at construction',
+  },
+  maxProcessorRetries: {
+    kind: 'refused',
+    why: 'Breakwater fixes processor retries at construction',
+  },
+  eagerToolExecution: {
+    kind: 'refused',
+    why: "the guarded agent runs no tool eagerly, and Mastra's durable execution does not support eager tool execution",
+  },
+  maxSteps: { kind: 'compared', comparison: 'guardedMaxSteps' },
+  toolChoice: { kind: 'compared', comparison: 'guardedToolChoice' },
+  disableBackgroundTasks: {
+    kind: 'compared',
+    comparison: 'backgroundTasksDisabled',
+  },
+  memory: { kind: 'memoryBinding' },
+  runId: {
+    kind: 'allowed',
+    why: 'the host mints the run id, and each entry requires a path-safe one',
+  },
+  requestContext: {
+    kind: 'allowed',
+    why: 'the host builds it, and Breakwater authorizes the call from it',
+  },
+  abortSignal: { kind: 'allowed', why: 'it can only stop the run' },
+  actor: {
+    kind: 'allowed',
+    why: "Mastra's authorization signal, which only the host sets; Breakwater authorizes from the request context",
+  },
+  mcp: {
+    kind: 'allowed',
+    why: 'an execution context for tools the agent already has; it adds none',
+  },
+  serverless: {
+    kind: 'allowed',
+    why: 'it keeps the platform alive for finish work and changes nothing the call does',
+  },
+  hideSignals: {
+    kind: 'allowed',
+    why: "it hides signals from the caller's stream only; model context and storage are unchanged",
+  },
+  closeOnSuspend: {
+    kind: 'allowed',
+    why: "it closes the caller's stream when the run suspends",
+  },
+  stopWhen: {
+    kind: 'allowed',
+    why: 'it can only stop the run earlier, within maxSteps',
+  },
+  activeTools: {
+    kind: 'allowed',
+    why: "it selects among the guarded agent's tools and adds none",
+  },
+  toolCallConcurrency: {
+    kind: 'allowed',
+    why: "it schedules the guarded agent's tool calls and adds none",
+  },
+  returnScorerData: {
+    kind: 'allowed',
+    why: "it returns the guarded agent's own scorers' data",
+  },
+  modelSettings: {
+    kind: 'allowed',
+    why: 'host-owned generation settings: headers, stop sequences and timeouts',
+  },
+  providerOptions: {
+    kind: 'allowed',
+    why: "the thread host checks it against Breakwater's accepted provider options, and a direct caller must",
+  },
+  onStepFinish: { kind: 'allowed', why: GUARDED_CALLBACK_REASON },
+  onFinish: { kind: 'allowed', why: GUARDED_CALLBACK_REASON },
+  onError: { kind: 'allowed', why: GUARDED_CALLBACK_REASON },
+  onSuspended: { kind: 'allowed', why: GUARDED_CALLBACK_REASON },
+  onAbort: { kind: 'allowed', why: GUARDED_CALLBACK_REASON },
+  tracingOptions: { kind: 'allowed', why: GUARDED_OBSERVABILITY_REASON },
+  tracing: { kind: 'allowed', why: GUARDED_OBSERVABILITY_REASON },
+  loggerVNext: { kind: 'allowed', why: GUARDED_OBSERVABILITY_REASON },
+  metrics: { kind: 'allowed', why: GUARDED_OBSERVABILITY_REASON },
+  tracingContext: { kind: 'allowed', why: GUARDED_OBSERVABILITY_REASON },
+  untilIdle: { kind: 'allowed', why: GUARDED_REENTRY_REASON },
+  _skipBgTaskWait: { kind: 'allowed', why: GUARDED_REENTRY_REASON },
+} as const satisfies Record<
+  | keyof DurableAgentStreamOptions<unknown>
+  | keyof AgentExecutionOptions<unknown>,
+  GuardedDurableCallOptionRule
+>;
+
+const GUARDED_MEMORY_REASON =
+  "Mastra applies call-level memory configuration and thread fields outside the input policies; configure them on the agent's Memory";
+
+function guardedMemoryBinding<M>(memory: M): M {
+  if (memory === undefined) return memory;
+  if (memory === null || typeof memory !== 'object' || Array.isArray(memory)) {
+    throw new TypeError(
+      'FlowsafeDurableAgent: memory must be an object for a Breakwater guarded agent',
+    );
+  }
+  const binding: Record<string, unknown> = {};
+  for (const key of Reflect.ownKeys(memory)) {
+    if (key !== 'thread' && key !== 'resource') {
+      throw new TypeError(
+        `FlowsafeDurableAgent: memory.${String(key)} is not supported for a Breakwater guarded agent because ${GUARDED_MEMORY_REASON}`,
+      );
+    }
+    const descriptor = ownDataDescriptor(memory, key, `memory.${key}`);
+    if (!descriptor) continue;
+    let value = descriptor.value;
+    if (
+      key === 'thread' &&
+      value !== null &&
+      (typeof value === 'object' || typeof value === 'function')
+    ) {
+      let idDescriptor: PropertyDescriptor | undefined;
+      for (const threadKey of Reflect.ownKeys(value)) {
+        if (threadKey !== 'id') {
+          throw new TypeError(
+            `FlowsafeDurableAgent: memory.thread.${String(threadKey)} is not supported for a Breakwater guarded agent because ${GUARDED_MEMORY_REASON}`,
+          );
+        }
+        idDescriptor = ownDataDescriptor(value, threadKey, 'memory.thread.id');
+      }
+      value = Object.freeze({ id: idDescriptor?.value });
+    }
+    binding[key] = value;
+  }
+  return Object.freeze(binding) as M;
+}
+
+function guardedToolChoiceMatches(
+  value: unknown,
+  guarded: GuardedDurableDefaults['toolChoice'],
+): boolean {
+  if (typeof guarded === 'string') return value === guarded;
+  if (!guarded || value === null || typeof value !== 'object') return false;
+  if (
+    Reflect.ownKeys(value).some((key) => key !== 'type' && key !== 'toolName')
+  ) {
+    return false;
+  }
+  const typeDescriptor = Object.getOwnPropertyDescriptor(value, 'type');
+  const toolNameDescriptor = Object.getOwnPropertyDescriptor(value, 'toolName');
+  return (
+    typeDescriptor !== undefined &&
+    'value' in typeDescriptor &&
+    typeDescriptor.value === guarded.type &&
+    toolNameDescriptor !== undefined &&
+    'value' in toolNameDescriptor &&
+    toolNameDescriptor.value === guarded.toolName
+  );
+}
+
+function guardedCallOptionMapper(
+  defaults: GuardedDurableDefaults,
+): DurableCallOptionMapper {
+  const { maxSteps, toolChoice } = defaults;
+  return (key, value) => {
+    if (key === '__proto__') {
+      const why =
+        "Mastra's option merge makes its value the prototype of the options it resolves";
+      throw new TypeError(
+        `FlowsafeDurableAgent: __proto__ is not supported for a Breakwater guarded agent because ${why}`,
+      );
+    }
+    if (
+      typeof key !== 'string' ||
+      !Object.hasOwn(GUARDED_DURABLE_CALL_OPTIONS, key)
+    ) {
+      return value;
+    }
+    const rule =
+      GUARDED_DURABLE_CALL_OPTIONS[
+        key as keyof typeof GUARDED_DURABLE_CALL_OPTIONS
+      ];
+    switch (rule.kind) {
+      case 'refused':
+        throw new TypeError(
+          `FlowsafeDurableAgent: ${key} is not supported for a Breakwater guarded agent because ${rule.why}`,
+        );
+      case 'memoryBinding':
+        return guardedMemoryBinding(value);
+      case 'allowed':
+        return value;
+      case 'compared': {
+        let expected: unknown;
+        let matches: boolean;
+        switch (rule.comparison) {
+          case 'guardedMaxSteps':
+            expected = maxSteps;
+            matches = value === expected;
+            break;
+          case 'guardedToolChoice':
+            expected = toolChoice;
+            matches = guardedToolChoiceMatches(value, toolChoice);
+            break;
+          case 'backgroundTasksDisabled':
+            expected = true;
+            matches = value === expected;
+            break;
+        }
+        if (!matches) {
+          throw new TypeError(
+            `FlowsafeDurableAgent: ${key} must equal the guarded agent's own value`,
+          );
+        }
+        return expected;
+      }
+    }
+  };
+}
 
 /**
  * Why each blocked entry point is refused, keyed by method name: the SINGLE
@@ -599,7 +931,7 @@ export class FlowsafeDurableAgent<
   readonly [RUNTIME_DRIVEN_AGENT] = true;
   readonly #runtime: RunnerRuntime;
   readonly #wrappedAgent: Agent<TAgentId, TTools, TOutput>;
-  readonly #isBreakwaterGuardedAgent: boolean;
+  readonly #guardedCallOptionMapper?: DurableCallOptionMapper;
   readonly #threadRuntime?: Mastra['agentThreadStreamRuntime'];
   readonly #persistenceWaiters = new Map<
     string,
@@ -644,6 +976,45 @@ export class FlowsafeDurableAgent<
       );
     }
     const guardedProtocol = breakwaterGuardedAgentHostProtocol(options.agent);
+    let callOptionMapper: DurableCallOptionMapper | undefined;
+    if (guardedProtocol !== undefined) {
+      const defaults = options.agent.getDefaultOptions();
+      if (
+        defaults === null ||
+        typeof defaults !== 'object' ||
+        typeof (defaults as { then?: unknown }).then === 'function'
+      ) {
+        throw new TypeError(
+          'FlowsafeDurableAgent: a Breakwater guarded agent must have static default options',
+        );
+      }
+      for (const [key, rule] of Object.entries(GUARDED_DURABLE_CALL_OPTIONS)) {
+        if (
+          rule.kind === 'compared' &&
+          (!Object.hasOwn(defaults, key) ||
+            ownDataDescriptor(defaults, key, key)?.value === undefined)
+        ) {
+          throw new TypeError(
+            `FlowsafeDurableAgent: a Breakwater guarded agent's default options must carry ${key}`,
+          );
+        }
+      }
+      const { maxSteps, toolChoice } = defaults as GuardedDurableDefaults;
+      callOptionMapper = guardedCallOptionMapper(
+        Object.freeze({
+          maxSteps,
+          toolChoice:
+            toolChoice !== null && typeof toolChoice === 'object'
+              ? Object.freeze({
+                  type: toolChoice.type,
+                  toolName: toolChoice.toolName,
+                })
+              : toolChoice,
+        }),
+      );
+      // Signal drains replay these defaults, so an unusable one fails before registering a run.
+      snapshotDurableCallOptions(defaults, callOptionMapper);
+    }
     super({
       agent: options.agent,
       id: options.id,
@@ -654,7 +1025,7 @@ export class FlowsafeDurableAgent<
     });
     this.#runtime = options.runtime;
     this.#wrappedAgent = options.agent;
-    this.#isBreakwaterGuardedAgent = guardedProtocol !== undefined;
+    this.#guardedCallOptionMapper = callOptionMapper;
     this.#threadRuntime = options.threadRuntime;
     // Core keys thread state and signal delivery on the agent-level pub/sub;
     // its stream pub/sub option leaves that identity unset for the run's drain.
@@ -703,20 +1074,10 @@ export class FlowsafeDurableAgent<
     );
   }
 
-  #refuseGuardedDurableCallOptions(options: unknown): void {
-    if (
-      this.#isBreakwaterGuardedAgent &&
-      options !== null &&
-      typeof options === 'object'
-    ) {
-      for (const key of REFUSED_GUARDED_DURABLE_CALL_OPTIONS) {
-        if (Object.hasOwn(options, key)) {
-          throw new TypeError(
-            `FlowsafeDurableAgent: ${key} is not supported for a Breakwater guarded agent because Mastra durable execution bypasses the narrow guarded handle`,
-          );
-        }
-      }
-    }
+  #snapshotCallOptions<T extends object>(
+    options: T | undefined,
+  ): T | undefined {
+    return snapshotDurableCallOptions(options, this.#guardedCallOptionMapper);
   }
 
   /**
@@ -736,10 +1097,9 @@ export class FlowsafeDurableAgent<
     const hostStreamTicket =
       options !== undefined && this.#hostStreamTickets.has(options);
     if (hostStreamTicket) this.#hostStreamTickets.delete(options);
-    const callOptions = snapshotDurableCallOptions(options);
+    const callOptions = this.#snapshotCallOptions(options);
     this.#assertCallerRunId(callOptions?.runId);
     if (!hostStreamTicket) this.#assertRunIdNotLive(callOptions.runId);
-    this.#refuseGuardedDurableCallOptions(callOptions);
     let capturedSignal = false;
     if (
       !hostStreamTicket &&
@@ -797,9 +1157,8 @@ export class FlowsafeDurableAgent<
   ): Promise<
     Awaited<ReturnType<DurableAgent<TAgentId, TTools, TOutput>['stream']>>
   > {
-    const callOptions = snapshotDurableCallOptions(options);
+    const callOptions = this.#snapshotCallOptions(options);
     this.#assertCallerRunId(callOptions?.runId);
-    this.#refuseGuardedDurableCallOptions(callOptions);
     if (callOptions.untilIdle) {
       throw new InvalidRunRequestError(
         'streamUntilPersisted does not support untilIdle',
@@ -895,10 +1254,9 @@ export class FlowsafeDurableAgent<
   ): Promise<
     Awaited<ReturnType<DurableAgent<TAgentId, TTools, TOutput>['generate']>>
   > {
-    const callOptions = snapshotDurableCallOptions(options);
+    const callOptions = this.#snapshotCallOptions(options);
     this.#assertCallerRunId(callOptions?.runId);
     this.#assertRunIdNotLive(callOptions.runId);
-    this.#refuseGuardedDurableCallOptions(callOptions);
     try {
       return await super.generate(messages, callOptions);
     } catch (error) {
@@ -929,10 +1287,9 @@ export class FlowsafeDurableAgent<
   ): Promise<
     Awaited<ReturnType<DurableAgent<TAgentId, TTools, TOutput>['prepare']>>
   > {
-    const callOptions = snapshotDurableCallOptions(options);
+    const callOptions = this.#snapshotCallOptions(options);
     this.#assertCallerRunId(callOptions?.runId);
     this.#assertRunIdNotLive(callOptions.runId);
-    this.#refuseGuardedDurableCallOptions(callOptions);
     return super.prepare(messages, callOptions);
   }
 
@@ -1519,6 +1876,12 @@ export class FlowsafeDurableAgent<
     memory?: DurableAgentStreamOptions<TOutput>['memory'];
   }): Promise<RunSummary> {
     this.#assertCallerRunId(options.runId);
+    const memory = this.#guardedCallOptionMapper
+      ? (this.#guardedCallOptionMapper(
+          'memory',
+          options.memory,
+        ) as typeof options.memory)
+      : options.memory;
     let rehydrated = false;
     let finishThreadRegistration: (() => void) | undefined;
     try {
@@ -1536,9 +1899,7 @@ export class FlowsafeDurableAgent<
             await this.#rehydrateRegistry({
               runId: options.runId,
               requestContext,
-              ...(options.memory !== undefined
-                ? { memory: options.memory }
-                : {}),
+              ...(memory !== undefined ? { memory } : {}),
             });
             rehydrated = true;
             const observed = await this.observe(options.runId);
@@ -1552,9 +1913,7 @@ export class FlowsafeDurableAgent<
               bindThreadCompletion(observed.output, completion),
               {
                 runId: options.runId,
-                ...(options.memory !== undefined
-                  ? { memory: options.memory }
-                  : {}),
+                ...(memory !== undefined ? { memory } : {}),
               } as Parameters<
                 Mastra['agentThreadStreamRuntime']['registerRun']
               >[2],

@@ -4,19 +4,25 @@ import {
   type Agent,
   type CreatedAgentSignal,
   signalToXmlMarkup,
+  type ToolsInput,
 } from '@mastra/core/agent';
-import { globalRunRegistry } from '@mastra/core/agent/durable';
+import {
+  type DurableAgentStreamOptions,
+  globalRunRegistry,
+} from '@mastra/core/agent/durable';
 import { isLeaseProvider } from '@mastra/core/events';
 import type { MastraModelConfig } from '@mastra/core/llm';
 import { Mastra } from '@mastra/core/mastra';
 import { MockMemory } from '@mastra/core/memory';
 import { RequestContext } from '@mastra/core/request-context';
 import { InMemoryStore, MastraCompositeStore } from '@mastra/core/storage';
+import { createTool } from '@mastra/core/tools';
 import {
   ACTOR_CONTEXT_KEY,
   AuditLogger,
   createGuardedAgent,
   denyPatterns,
+  type GuardedToolChoice,
   type PolicyEvaluator,
 } from '@proofoftech/breakwater';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -97,6 +103,8 @@ function unreachableModel(): MastraModelConfig {
 function guardedTestAgent(
   memory: MockMemory,
   policies: readonly PolicyEvaluator[] = [],
+  toolChoice: GuardedToolChoice = 'auto',
+  tools?: ToolsInput,
 ): Agent {
   return createGuardedAgent({
     id: 'writer',
@@ -108,7 +116,8 @@ function guardedTestAgent(
     policies,
     audit: new AuditLogger(),
     maxSteps: 2,
-    toolChoice: 'auto',
+    toolChoice,
+    ...(tools ? { tools } : {}),
   }) as unknown as Agent;
 }
 
@@ -150,6 +159,8 @@ async function createHarness(
     contentPolicy?: SignalContentPolicy;
     runCapOpen?: boolean;
     policies?: readonly PolicyEvaluator[];
+    toolChoice?: GuardedToolChoice;
+    tools?: ToolsInput;
     cache?: 'default' | false;
   } = {},
 ) {
@@ -167,7 +178,14 @@ async function createHarness(
   const mastra = new Mastra({
     storage,
     logger: false,
-    agents: { writer: guardedTestAgent(memory, options.policies) },
+    agents: {
+      writer: guardedTestAgent(
+        memory,
+        options.policies,
+        options.toolChoice,
+        options.tools,
+      ),
+    },
   });
   const agent = createFlowsafeDurableAgent({
     agent: mastra.getAgentById('writer'),
@@ -253,6 +271,7 @@ async function heldRun(
   fixture: Pick<Harness, 'agent' | 'memory' | 'start'>,
   threadId: string,
   runId = crypto.randomUUID(),
+  extraOptions: DurableAgentStreamOptions<undefined> = {},
 ) {
   await seedThread(fixture.memory, threadId);
   let finish!: () => void;
@@ -273,6 +292,7 @@ async function heldRun(
       runId,
       memory: { thread: threadId, resource: RESOURCE_ID },
       requestContext: actorContext(),
+      ...extraOptions,
     },
     'operator',
     'human',
@@ -425,14 +445,48 @@ describe('thread signal routes with a real durable agent', () => {
   }, 15_000);
 
   it.each([
-    'deliver',
-    'exhausted',
-    'capped',
-    'capped at the attempt bound',
-  ] as const)('dispatches a non-owner row through D1 notification storage with a real agent: %s', async (mode) => {
+    {
+      mode: 'deliver',
+      runCapOpen: true,
+      priorAttempts: undefined,
+      exhausted: false,
+      capped: false,
+      atBound: false,
+    },
+    {
+      mode: 'exhausted',
+      runCapOpen: true,
+      priorAttempts: DEFAULT_MAX_NOTIFICATION_DELIVERY_ATTEMPTS,
+      exhausted: true,
+      capped: false,
+      atBound: false,
+    },
+    {
+      mode: 'capped',
+      runCapOpen: false,
+      priorAttempts: undefined,
+      exhausted: false,
+      capped: true,
+      atBound: false,
+    },
+    {
+      mode: 'capped at the attempt bound',
+      runCapOpen: false,
+      priorAttempts: DEFAULT_MAX_NOTIFICATION_DELIVERY_ATTEMPTS - 1,
+      exhausted: false,
+      capped: false,
+      atBound: true,
+    },
+  ] as const)('dispatches a non-owner row through D1 notification storage with a real agent: $mode', async ({
+    runCapOpen,
+    priorAttempts,
+    exhausted,
+    capped,
+    atBound,
+  }) => {
     // #given — a due row the dispatch tick delivers as its own principal
     const harness = await createHarness({
-      runCapOpen: mode !== 'capped' && mode !== 'capped at the attempt bound',
+      runCapOpen,
     });
     const threadId = crypto.randomUUID();
     await seedThread(harness.memory, threadId);
@@ -446,14 +500,11 @@ describe('thread signal routes with a real durable agent', () => {
       summary: 'notification input',
       deliverAt: now,
     });
-    if (mode === 'exhausted' || mode === 'capped at the attempt bound') {
+    if (priorAttempts !== undefined) {
       await harness.notifications.updateNotification({
         threadId,
         id: record.id,
-        deliveryAttempts:
-          mode === 'exhausted'
-            ? DEFAULT_MAX_NOTIFICATION_DELIVERY_ATTEMPTS
-            : DEFAULT_MAX_NOTIFICATION_DELIVERY_ATTEMPTS - 1,
+        deliveryAttempts: priorAttempts,
         lastDeliveryError: 'target refused',
         lastDeliveryAttemptAt: now,
       });
@@ -478,7 +529,7 @@ describe('thread signal routes with a real durable agent', () => {
       id: record.id,
     });
     expect(send).not.toHaveBeenCalled();
-    if (mode === 'exhausted') {
+    if (exhausted) {
       expect(await response?.json()).toMatchObject({
         delivered: 0,
         failed: 0,
@@ -495,7 +546,7 @@ describe('thread signal routes with a real durable agent', () => {
       });
       expect(persisted?.deliverAt).toBeUndefined();
       expect(persisted?.summaryAt).toBeUndefined();
-    } else if (mode === 'capped') {
+    } else if (capped) {
       // A capped idle wake cannot fall back to a persist the dispatch
       // principal is not allowed, so the round fails and the row retries.
       expect(await response?.json()).toEqual({ delivered: 0, failed: 1 });
@@ -506,7 +557,7 @@ describe('thread signal routes with a real durable agent', () => {
         deliveryAttempts: 1,
         deliverAt: expect.any(Date),
       });
-    } else if (mode === 'capped at the attempt bound') {
+    } else if (atBound) {
       expect(await response?.json()).toMatchObject({
         delivered: 0,
         failed: 0,
@@ -1205,6 +1256,107 @@ describe('thread signal routes with a real durable agent', () => {
     ).toBeUndefined();
     expect(harness.startIdleRun).not.toHaveBeenCalled();
     expect(harness.start).not.toHaveBeenCalled();
+  });
+
+  it.each<{
+    shape: string;
+    toolChoice: GuardedToolChoice;
+    tools: ToolsInput;
+    startOptions: DurableAgentStreamOptions<undefined>;
+  }>([
+    {
+      shape: 'no compared option',
+      toolChoice: 'auto',
+      tools: {},
+      startOptions: {},
+    },
+    {
+      shape: "the thread host's start options",
+      toolChoice: 'auto',
+      tools: {},
+      startOptions: { maxSteps: 2, disableBackgroundTasks: true },
+    },
+    {
+      shape: 'an equal object-form toolChoice',
+      toolChoice: { type: 'tool', toolName: 't' },
+      tools: {
+        t: createTool({
+          id: 't',
+          description: 'Test tool',
+          execute: async () => 'ok',
+        }),
+      },
+      startOptions: { toolChoice: { type: 'tool', toolName: 't' } },
+    },
+  ])('drains a signal left pending behind a host-started guarded run with $shape', async ({
+    toolChoice,
+    tools,
+    startOptions,
+  }) => {
+    const harness = await createHarness({ toolChoice, tools });
+    const threadId = crypto.randomUUID();
+    const runId = crypto.randomUUID();
+    await seedThread(harness.memory, threadId);
+    const saveMessages = vi.spyOn(harness.memory, 'saveMessages');
+    const publish = vi.spyOn(harness.pubsub, 'publish');
+    const stream = vi.spyOn(harness.agent, 'stream');
+
+    const run = await heldRun(harness, threadId, runId, startOptions);
+    try {
+      const sent = harness.agent.sendSignal(
+        { type: 'reactive', contents: `${DRAIN_MARK} leftover` },
+        {
+          runId,
+          threadId,
+          resourceId: RESOURCE_ID,
+          ifActive: { behavior: 'deliver' },
+        },
+      );
+      await expect(sent.accepted).resolves.toMatchObject({ action: 'deliver' });
+    } finally {
+      await finishRun(run);
+    }
+    await waitForIdle(harness.agent, threadId);
+
+    expect(stream).toHaveBeenCalledTimes(2);
+    expect(stream).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        type: 'reactive',
+        contents: `${DRAIN_MARK} leftover`,
+      }),
+      expect.objectContaining({
+        runId: expect.any(String),
+        toolChoice,
+        maxSteps: 2,
+        disableBackgroundTasks: true,
+      }),
+    );
+    const drainRunId = stream.mock.calls[1]?.[1]?.runId;
+    expect(drainRunId).not.toBe(runId);
+    await expect(stream.mock.results[1]?.value).resolves.toBeDefined();
+    const savedMessages = saveMessages.mock.calls.flatMap(
+      ([input]) => input.messages,
+    );
+    expect(savedMessages).toEqual([
+      expect.objectContaining({
+        role: 'signal',
+        threadId,
+        resourceId: RESOURCE_ID,
+      }),
+    ]);
+    const { messages } = await harness.memory.recall({
+      threadId,
+      hideSignals: false,
+    });
+    expect(JSON.stringify(messages)).toContain(DRAIN_MARK);
+    expect(
+      publish.mock.calls.some(
+        ([, event]) =>
+          event.type === 'run-failed' && event.runId === drainRunId,
+      ),
+    ).toBe(false);
+    expect(unhandled).toEqual([]);
   });
 
   it.each([

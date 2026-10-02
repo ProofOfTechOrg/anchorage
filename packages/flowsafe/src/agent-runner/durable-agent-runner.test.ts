@@ -1099,48 +1099,54 @@ describe('agent bridge capture', () => {
   });
 
   it.each([
-    'identity-owner',
-    'identity-target',
-    'guard-owner',
-    'guard-id',
-    'guard-token',
-  ] as const)('bridge preserves nested first getter faults before map installation: %s', async (location) => {
+    {
+      location: 'identity-owner',
+      key: 'id',
+      target: (source, _guard) => source.startIdentity.owner,
+    },
+    {
+      location: 'identity-target',
+      key: 'threadId',
+      target: (source, _guard) => source.startIdentity.target,
+    },
+    {
+      location: 'guard-owner',
+      key: 'owner',
+      target: (_source, guard) => guard,
+    },
+    {
+      location: 'guard-id',
+      key: 'id',
+      target: (_source, guard) => guard.owner,
+    },
+    {
+      location: 'guard-token',
+      key: 'reservationToken',
+      target: (_source, guard) => guard,
+    },
+  ] satisfies Array<{
+    location: string;
+    key: string;
+    target: (
+      source: ReturnType<typeof startAuthority>,
+      guard: NonNullable<AgentStartAuthority['runOwnerGuard']>,
+    ) => object;
+  }>)('bridge preserves nested first getter faults before map installation: $location', async ({
+    location,
+    key,
+    target,
+  }) => {
     const fault = new Error(`first ${location} read`);
     const source = startAuthority();
-    if (location === 'identity-owner')
-      Object.defineProperty(source.startIdentity.owner, 'id', {
-        get() {
-          throw fault;
-        },
-      });
-    if (location === 'identity-target')
-      Object.defineProperty(source.startIdentity.target, 'threadId', {
-        get() {
-          throw fault;
-        },
-      });
     const guard = {
       owner: { kind: 'human' as const, id: 'resource-owner' },
       reservationToken: 'token',
     };
-    if (location === 'guard-owner')
-      Object.defineProperty(guard, 'owner', {
-        get() {
-          throw fault;
-        },
-      });
-    if (location === 'guard-id')
-      Object.defineProperty(guard.owner, 'id', {
-        get() {
-          throw fault;
-        },
-      });
-    if (location === 'guard-token')
-      Object.defineProperty(guard, 'reservationToken', {
-        get() {
-          throw fault;
-        },
-      });
+    Object.defineProperty(target(source, guard), key, {
+      get() {
+        throw fault;
+      },
+    });
     await expectAuthorityRefusedBeforeStream(
       { ...source, runOwnerGuard: guard },
       fault,
@@ -1286,18 +1292,38 @@ describe('agent bridge capture', () => {
   });
 
   it.each([
-    'provider-failure',
-    'model-failure',
-    'lost-receipt',
-  ] as const)('real agent failure and terminal recovery keep the verified v2 generation: %s', async (phase) => {
+    {
+      phase: 'provider-failure',
+      providerFails: true,
+      modelFails: false,
+      loseReceipt: false,
+    },
+    {
+      phase: 'model-failure',
+      providerFails: false,
+      modelFails: true,
+      loseReceipt: false,
+    },
+    {
+      phase: 'lost-receipt',
+      providerFails: false,
+      modelFails: false,
+      loseReceipt: true,
+    },
+  ] as const)('real agent failure and terminal recovery keep the verified v2 generation: $phase', async ({
+    phase,
+    providerFails,
+    modelFails,
+    loseReceipt,
+  }) => {
     const fault = new Error(`real ${phase}`);
     const f = await realAgentBridgeFixture(
-      phase === 'provider-failure'
+      providerFails
         ? () => {
             throw fault;
           }
         : undefined,
-      phase === 'model-failure' ? fault : undefined,
+      modelFails ? fault : undefined,
     );
     const runId = `real-${phase}`;
     const attemptToken = `attempt-${phase}`;
@@ -1309,7 +1335,7 @@ describe('agent bridge capture', () => {
       .mockImplementation(async (input) => {
         await persist(input);
         if (
-          phase === 'lost-receipt' &&
+          loseReceipt &&
           input.workflowName === workflow.id &&
           input.runId === runId &&
           input.snapshot.status === 'success' &&
@@ -1355,11 +1381,10 @@ describe('agent bridge capture', () => {
         undefined,
         authority,
       );
-      if (phase === 'lost-receipt') {
+      if (loseReceipt) {
         const result = await pending;
         expect(await result.output.text).toBe('done');
-      } else if (phase === 'provider-failure')
-        await expect(pending).rejects.toBe(fault);
+      } else if (providerFails) await expect(pending).rejects.toBe(fault);
       else await expect(pending).rejects.toThrow('real model-failure');
       const execution = globalRunRegistry.get(runId)?.workflowExecution;
       if (execution) await execution.catch(() => undefined);
@@ -1371,13 +1396,13 @@ describe('agent bridge capture', () => {
         workflowName: workflow.id,
         runId,
       });
-      if (phase === 'provider-failure') {
+      if (providerFails) {
         expect(snapshot).toBeNull();
         expect(f.counts.model).toBe(0);
         expect(persistence).not.toHaveBeenCalled();
       } else {
         expect(snapshot?.status).toBe('success');
-        if (phase === 'model-failure')
+        if (modelFails)
           expect(snapshot?.result).toMatchObject({
             stepResult: { reason: 'error' },
             output: { text: '', steps: [{ finishReason: 'error' }] },
@@ -1408,7 +1433,7 @@ describe('agent bridge capture', () => {
           expect(snapshot?.requestContext).not.toHaveProperty(key);
         expect(f.counts.model).toBe(1);
       }
-      expect(lostReceipts).toBe(phase === 'lost-receipt' ? 1 : 0);
+      expect(lostReceipts).toBe(loseReceipt ? 1 : 0);
     } finally {
       await globalRunRegistry
         .get(runId)
@@ -1419,8 +1444,8 @@ describe('agent bridge capture', () => {
       persistence.mockRestore();
       f.start.mockRestore();
       f.sql.close();
-      expect(f.counts.callback).toBe(phase === 'provider-failure' ? 0 : 1);
-      expect(f.counts.admission).toBe(phase === 'provider-failure' ? 0 : 1);
+      expect(f.counts.callback).toBe(providerFails ? 0 : 1);
+      expect(f.counts.admission).toBe(providerFails ? 0 : 1);
       expect(f.counts.terminalization).toBe(0);
     }
   });
@@ -1700,11 +1725,45 @@ describe('agent bridge capture', () => {
   });
 
   it.each([
-    'success',
-    'stream-throw',
-    'onError',
-    'runtime-refusal',
-  ] as const)('bridge removes authority on every exit and isolates same-run retries (%s)', async (exit) => {
+    {
+      exit: 'success',
+      streamThrows: false,
+      callsOnError: false,
+      runtimeRefuses: false,
+      drives: true,
+      succeeds: true,
+    },
+    {
+      exit: 'stream-throw',
+      streamThrows: true,
+      callsOnError: false,
+      runtimeRefuses: false,
+      drives: false,
+      succeeds: false,
+    },
+    {
+      exit: 'onError',
+      streamThrows: false,
+      callsOnError: true,
+      runtimeRefuses: false,
+      drives: false,
+      succeeds: false,
+    },
+    {
+      exit: 'runtime-refusal',
+      streamThrows: false,
+      callsOnError: false,
+      runtimeRefuses: true,
+      drives: true,
+      succeeds: false,
+    },
+  ] as const)('bridge removes authority on every exit and isolates same-run retries ($exit)', async ({
+    streamThrows,
+    callsOnError,
+    runtimeRefuses,
+    drives,
+    succeeds,
+  }) => {
     const f = bridgeFixture();
     const nativeSet = Map.prototype.set;
     const nativeDelete = Map.prototype.delete;
@@ -1732,22 +1791,18 @@ describe('agent bridge capture', () => {
       });
     const failure = new InvalidRunRequestError('test refusal');
     try {
-      if (exit === 'stream-throw') f.stream.mockRejectedValueOnce(failure);
-      if (exit === 'onError')
+      if (streamThrows) f.stream.mockRejectedValueOnce(failure);
+      if (callsOnError)
         f.stream.mockImplementationOnce(async (_messages, options) => {
           await options?.onError?.({ error: failure } as never);
           return f.streamResult as never;
         });
-      if (exit === 'runtime-refusal') f.start.mockRejectedValueOnce(failure);
+      if (runtimeRefuses) f.start.mockRejectedValueOnce(failure);
       const pending = f.startHost();
       const outcomes = await Promise.allSettled(
-        exit === 'success' || exit === 'runtime-refusal'
-          ? [pending, drive(f.agent, 'run-1', INPUT)]
-          : [pending],
+        drives ? [pending, drive(f.agent, 'run-1', INPUT)] : [pending],
       );
-      expect(outcomes[0]?.status).toBe(
-        exit === 'success' ? 'fulfilled' : 'rejected',
-      );
+      expect(outcomes[0]?.status).toBe(succeeds ? 'fulfilled' : 'rejected');
       expect(authorityMap).toBeDefined();
       expect(authorityMap?.size).toBe(0);
       expect(deletions).toBe(1);
@@ -1844,36 +1899,57 @@ describe('agent bridge capture', () => {
   });
 
   it.each([
-    'run',
-    'core-agent',
-    'wrapped-agent',
-    'first-read',
-  ] as const)('refuses mismatched Core correlation and preserves first faults (%s)', async (kind) => {
+    {
+      kind: 'run',
+      inputOverrides: { runId: 'other' },
+      wrappedAgent: false,
+      firstRead: false,
+    },
+    {
+      kind: 'core-agent',
+      inputOverrides: { agentId: 'other' },
+      wrappedAgent: false,
+      firstRead: false,
+    },
+    {
+      kind: 'wrapped-agent',
+      inputOverrides: { agentId: 'other' },
+      wrappedAgent: true,
+      firstRead: false,
+    },
+    {
+      kind: 'first-read',
+      inputOverrides: {},
+      wrappedAgent: false,
+      firstRead: true,
+    },
+  ] as const)('refuses mismatched Core correlation and preserves first faults ($kind)', async ({
+    inputOverrides,
+    wrappedAgent,
+    firstRead,
+  }) => {
     const f = bridgeFixture();
     const fault = new Error('first Core read');
     const input = {
       ...INPUT,
-      ...(kind === 'run' ? { runId: 'other' } : {}),
-      ...(kind === 'core-agent' ? { agentId: 'other' } : {}),
+      ...inputOverrides,
     };
-    if (kind === 'first-read')
+    if (firstRead)
       Object.defineProperty(input, 'agentId', {
         get() {
           throw fault;
         },
       });
     const authority = startAuthority();
-    const changed =
-      kind === 'wrapped-agent'
-        ? {
-            ...authority,
-            startIdentity: {
-              ...authority.startIdentity,
-              target: { ...authority.startIdentity.target, id: 'other' },
-            },
-          }
-        : authority;
-    if (kind === 'wrapped-agent') input.agentId = 'other';
+    const changed = wrappedAgent
+      ? {
+          ...authority,
+          startIdentity: {
+            ...authority.startIdentity,
+            target: { ...authority.startIdentity.target, id: 'other' },
+          },
+        }
+      : authority;
     const results = await Promise.allSettled([
       f.startHost(changed),
       drive(f.agent, 'run-1', input),
@@ -1882,7 +1958,7 @@ describe('agent bridge capture', () => {
     for (const result of results) {
       expect(result.status).toBe('rejected');
       if (result.status === 'rejected') {
-        if (kind === 'first-read') expect(result.reason).toBe(fault);
+        if (firstRead) expect(result.reason).toBe(fault);
         else expect(result.reason).toBeInstanceOf(InvalidRunRequestError);
       }
     }
@@ -2065,66 +2141,395 @@ describe('createFlowsafeDurableAgent', () => {
     ).rejects.toThrow(refusal);
   });
 
-  it('rejects structured durable methods for a guarded agent before core dispatch', async () => {
-    const { runtime } = fakeRuntime();
-    const durable = createFlowsafeDurableAgent({
-      agent: guardedTestAgent(),
-      runtime,
+  describe('guarded durable call options', () => {
+    function guardedCore(
+      method: 'stream' | 'generate' | 'prepare',
+      guarded = guardedTestAgent(),
+    ) {
+      const durable = createFlowsafeDurableAgent({
+        agent: guarded,
+        runtime: fakeRuntime().runtime,
+      });
+      const core = vi
+        .spyOn(DurableAgent.prototype, method)
+        .mockResolvedValue({} as never);
+      return { durable, core };
+    }
+
+    async function expectRefusedBeforeCore(
+      pending: Promise<unknown>,
+      core: ReturnType<typeof guardedCore>['core'],
+      message: string,
+    ) {
+      await expect(pending).rejects.toBeInstanceOf(TypeError);
+      await expect(pending).rejects.toThrow(message);
+      expect(core).not.toHaveBeenCalled();
+    }
+
+    const refusedOptions = [
+      ['structuredOutput', { schema: z.object({ answer: z.string() }) }],
+      ['errorProcessors', []],
+      ['clientTools', {}],
+      ['toolsets', {}],
+      ['outputProcessors', []],
+      ['inputProcessors', []],
+      ['instructions', 'override'],
+      ['system', 'override'],
+      ['context', []],
+      ['prepareStep', () => ({})],
+      ['hooks', {}],
+      ['scorers', {}],
+      ['savePerStep', true],
+      ['versions', {}],
+      ['autoResumeSuspendedTools', true],
+      ['includeRawChunks', true],
+      ['onChunk', () => undefined],
+      ['delegation', {}],
+      ['onIterationComplete', () => ({ continue: true })],
+      ['isTaskComplete', {}],
+      ['transform', {}],
+      ['experimentalTransform', {}],
+      ['requireToolApproval', true],
+      ['backgroundTaskPolicy', {}],
+      ['maxProcessorRetries', 3],
+      ['eagerToolExecution', true],
+    ] as const;
+
+    it.each([
+      { method: 'stream', coreMethod: 'stream' },
+      { method: 'streamUntilPersisted', coreMethod: 'stream' },
+      { method: 'generate', coreMethod: 'generate' },
+      { method: 'prepare', coreMethod: 'prepare' },
+    ] as const)('refuses an own __proto__ on $method before core dispatch', async ({
+      method,
+      coreMethod,
+    }) => {
+      const { durable, core } = guardedCore(coreMethod);
+      core.mockRejectedValue(new Error('core dispatch reached'));
+      const options = JSON.parse(
+        '{"runId":"run-1","__proto__":{"outputProcessors":[],"instructions":"override"}}',
+      );
+      options.requestContext = actorContext();
+      const pending =
+        method === 'streamUntilPersisted'
+          ? durable.streamUntilPersisted(
+              'hello',
+              options,
+              'operator-1',
+              'human',
+              undefined,
+              undefined,
+              undefined,
+              startAuthority(),
+            )
+          : durable[method]('hello', options);
+
+      await expectRefusedBeforeCore(
+        pending,
+        core,
+        '__proto__ is not supported',
+      );
     });
-    const schema = z.object({ answer: z.string() });
-    const superStream = vi.spyOn(DurableAgent.prototype, 'stream');
-    const superGenerate = vi.spyOn(DurableAgent.prototype, 'generate');
-    const superPrepare = vi.spyOn(DurableAgent.prototype, 'prepare');
 
-    await expect(
-      durable.stream('hello', {
-        runId: 'run-1',
-        structuredOutput: { schema },
-      } as never),
-    ).rejects.toThrow(/structuredOutput is not supported.*guarded agent/is);
-    await expect(
-      durable.generate('hello', {
-        runId: 'run-1',
-        structuredOutput: { schema },
-      } as never),
-    ).rejects.toThrow(/structuredOutput is not supported.*guarded agent/is);
-    await expect(
-      durable.prepare('hello', {
-        runId: 'run-1',
-        structuredOutput: { schema },
-      } as never),
-    ).rejects.toThrow(/structuredOutput is not supported.*guarded agent/is);
-    expect(superStream).not.toHaveBeenCalled();
-    expect(superGenerate).not.toHaveBeenCalled();
-    expect(superPrepare).not.toHaveBeenCalled();
+    it.each([
+      {
+        shape: 'a refused eagerToolExecution key',
+        override: { eagerToolExecution: false },
+        omitBackgroundTasks: false,
+      },
+      {
+        shape: 'background tasks enabled',
+        override: { disableBackgroundTasks: false },
+        omitBackgroundTasks: false,
+      },
+      {
+        shape: 'an absent disableBackgroundTasks key',
+        override: {},
+        omitBackgroundTasks: true,
+      },
+    ])('refuses unusable guarded defaults with $shape at construction', async ({
+      override,
+      omitBackgroundTasks,
+    }) => {
+      const guarded = guardedTestAgent();
+      const defaults: Awaited<ReturnType<Agent['getDefaultOptions']>> = {
+        ...(await guarded.getDefaultOptions()),
+        ...override,
+      };
+      if (omitBackgroundTasks) delete defaults.disableBackgroundTasks;
+      vi.spyOn(guarded, 'getDefaultOptions').mockReturnValue(defaults);
 
-    await expect(
-      durable.generate('hello', {
-        runId: 'run-1',
-        structuredOutput: undefined,
-      } as never),
-    ).rejects.toThrow(/structuredOutput is not supported.*guarded agent/is);
-    expect(superGenerate).not.toHaveBeenCalled();
-  });
-
-  it('refuses guarded durable errorProcessors before registering the run', async () => {
-    const durable = createFlowsafeDurableAgent({
-      agent: guardedTestAgent(),
-      runtime: fakeRuntime().runtime,
-      cache: false,
+      expect(() =>
+        createFlowsafeDurableAgent({
+          agent: guarded,
+          runtime: fakeRuntime().runtime,
+        }),
+      ).toThrow(TypeError);
     });
-    const probe = { id: 'call-error-probe', processAPIError: vi.fn() };
-    const runId = 'guarded-error-override';
 
-    await expect(
-      durable.prepare('hello', {
-        runId,
-        requestContext: actorContext(),
-        errorProcessors: [probe],
-      }),
-    ).rejects.toThrow(/errorProcessors is not supported.*guarded agent/is);
-    expect(registryFor(durable).has(runId)).toBe(false);
-    expect(globalRunRegistry.has(runId)).toBe(false);
+    it.each(
+      (['stream', 'generate', 'prepare'] as const).flatMap((method) =>
+        refusedOptions.map(([key, value]) => ({ method, key, value })),
+      ),
+    )('refuses $key on $method before core dispatch', async ({
+      method,
+      key,
+      value,
+    }) => {
+      const { durable, core } = guardedCore(method);
+      const pending = durable[method]('hello', {
+        runId: 'run-1',
+        [key]: value,
+      } as never);
+
+      await expectRefusedBeforeCore(pending, core, `${key} is not supported`);
+    });
+
+    it.each([
+      'stream',
+      'generate',
+      'prepare',
+    ] as const)('refuses an own undefined clientTools on %s', async (method) => {
+      const { durable, core } = guardedCore(method);
+      const pending = durable[method]('hello', {
+        runId: 'run-1',
+        clientTools: undefined,
+      } as never);
+
+      await expectRefusedBeforeCore(
+        pending,
+        core,
+        'clientTools is not supported',
+      );
+    });
+
+    it('refuses non-enumerable hooks before core dispatch', async () => {
+      const { durable, core } = guardedCore('stream');
+      const options = { runId: 'run-1' };
+      Object.defineProperty(options, 'hooks', { value: {}, enumerable: false });
+      const pending = durable.stream('hello', options);
+
+      await expectRefusedBeforeCore(pending, core, 'hooks is not supported');
+    });
+
+    it.each([
+      'stream',
+      'generate',
+      'prepare',
+    ] as const)('refuses memory configuration on %s', async (method) => {
+      const { durable, core } = guardedCore(method);
+      const pending = durable[method]('hello', {
+        runId: 'run-1',
+        memory: { thread: 't', resource: 'r', options: {} },
+      } as never);
+
+      await expectRefusedBeforeCore(pending, core, 'memory.options');
+    });
+
+    it.each([
+      {
+        memory: { thread: { id: 't', metadata: {} }, resource: 'r' },
+        refusal: 'memory.thread.metadata',
+      },
+      {
+        memory: { thread: { id: 't', title: 'x' }, resource: 'r' },
+        refusal: 'memory.thread.title',
+      },
+      {
+        memory: { thread: 't', resource: 'r', readOnly: true },
+        refusal: 'memory.readOnly',
+      },
+      {
+        memory: { thread: 't', resource: 'r', [Symbol('extra')]: true },
+        refusal: 'memory.Symbol(extra)',
+      },
+      {
+        memory: {
+          thread: Object.assign(() => undefined, {
+            id: 'thread-1',
+            metadata: { workingMemory: 'x' },
+          }),
+          resource: 'r',
+        },
+        refusal: 'memory.thread.length',
+      },
+      { memory: 'x', refusal: 'memory must be an object' },
+    ])('refuses $refusal before preparation', async ({ memory, refusal }) => {
+      const { durable, core } = guardedCore('prepare');
+      const pending = durable.prepare('hello', {
+        runId: 'run-1',
+        memory,
+      } as never);
+
+      await expectRefusedBeforeCore(pending, core, refusal);
+    });
+
+    it.each([
+      { key: 'thread', path: 'memory.thread', onThread: false },
+      { key: 'id', path: 'memory.thread.id', onThread: true },
+    ] as const)('refuses accessor-backed memory $key without invoking the getter', async ({
+      key,
+      path,
+      onThread,
+    }) => {
+      const { durable, core } = guardedCore('prepare');
+      const getter = vi.fn(() => 't');
+      const memory = { thread: { id: 't' }, resource: 'r' };
+      Object.defineProperty(onThread ? memory.thread : memory, key, {
+        get: getter,
+      });
+      const pending = durable.prepare('hello', { runId: 'run-1', memory });
+
+      await expectRefusedBeforeCore(
+        pending,
+        core,
+        `call option '${path}' must be a data property`,
+      );
+      expect(getter).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['maxSteps', 3],
+      ['toolChoice', 'none'],
+      ['disableBackgroundTasks', false],
+      ['maxSteps', undefined],
+      ['toolChoice', undefined],
+      ['disableBackgroundTasks', undefined],
+    ] as const)('refuses differing %s value %s before core dispatch', async (key, value) => {
+      const { durable, core } = guardedCore('stream');
+      const pending = durable.stream('hello', {
+        runId: 'run-1',
+        [key]: value,
+      } as never);
+
+      await expectRefusedBeforeCore(
+        pending,
+        core,
+        `${key} must equal the guarded agent's own value`,
+      );
+    });
+
+    it('forwards matching guarded defaults to core', async () => {
+      const { durable, core } = guardedCore('stream');
+      await durable.stream('hello', {
+        runId: 'run-1',
+        maxSteps: 2,
+        toolChoice: 'auto',
+        disableBackgroundTasks: true,
+      });
+
+      expect(core).toHaveBeenCalledWith('hello', {
+        runId: 'run-1',
+        maxSteps: 2,
+        toolChoice: 'auto',
+        disableBackgroundTasks: true,
+      });
+    });
+
+    it.each([
+      { type: 'tool', toolName: 'u' },
+      'auto',
+    ])('refuses a non-matching named-tool choice %s', async (choice) => {
+      const guarded = createGuardedAgent({
+        id: 'writer',
+        name: 'Writer',
+        instructions: 'Answer the request.',
+        model: 'openai/gpt-4o-mini',
+        allowedRoles: ['operator'],
+        policies: [],
+        audit: new AuditLogger(),
+        maxSteps: 2,
+        tools: {
+          t: createTool({
+            id: 't',
+            description: 'Test tool',
+            inputSchema: z.object({}),
+            execute: async () => 'ok',
+          }),
+        },
+        toolChoice: { type: 'tool', toolName: 't' },
+      }) as unknown as Agent;
+      const { durable, core } = guardedCore('stream', guarded);
+      const pending = durable.stream('hello', {
+        runId: 'run-1',
+        toolChoice: choice,
+      } as never);
+      await expectRefusedBeforeCore(
+        pending,
+        core,
+        "toolChoice must equal the guarded agent's own value",
+      );
+    });
+
+    it('forwards a matching named-tool choice as a frozen copy', async () => {
+      const guarded = createGuardedAgent({
+        id: 'writer',
+        name: 'Writer',
+        instructions: 'Answer the request.',
+        model: 'openai/gpt-4o-mini',
+        allowedRoles: ['operator'],
+        policies: [],
+        audit: new AuditLogger(),
+        maxSteps: 2,
+        tools: {
+          t: createTool({
+            id: 't',
+            description: 'Test tool',
+            inputSchema: z.object({}),
+            execute: async () => 'ok',
+          }),
+        },
+        toolChoice: { type: 'tool', toolName: 't' },
+      }) as unknown as Agent;
+      const { durable, core } = guardedCore('stream', guarded);
+      const choice = { type: 'tool' as const, toolName: 't' };
+      await durable.stream('hello', { runId: 'run-1', toolChoice: choice });
+      const forwarded = core.mock.calls[0]?.[1]?.toolChoice;
+      expect(forwarded).toEqual({ type: 'tool', toolName: 't' });
+      expect(forwarded).not.toBe(choice);
+      expect(Object.isFrozen(forwarded)).toBe(true);
+      choice.toolName = 'other';
+      expect(forwarded).toEqual({ type: 'tool', toolName: 't' });
+    });
+
+    it.each([
+      'stream',
+      'generate',
+      'prepare',
+    ] as const)('freezes the memory binding before delegating %s to core', async (method) => {
+      const { durable, core } = guardedCore(method);
+      const memory = { thread: { id: 't' }, resource: 'r' };
+      await durable[method]('hello', { runId: 'run-1', memory });
+      const forwarded = core.mock.calls[0]?.[1]?.memory;
+
+      expect(forwarded).toEqual({ thread: { id: 't' }, resource: 'r' });
+      expect(forwarded).not.toBe(memory);
+      expect(Object.isFrozen(forwarded)).toBe(true);
+      expect(Object.isFrozen(forwarded?.thread)).toBe(true);
+      memory.thread.id = 'other';
+      expect(forwarded?.thread).toEqual({ id: 't' });
+    });
+
+    it('forwards client tools and execution limits for a raw agent', async () => {
+      const durable = createFlowsafeDurableAgent({
+        agent: testAgent(),
+        runtime: fakeRuntime().runtime,
+      });
+      const core = vi
+        .spyOn(DurableAgent.prototype, 'stream')
+        .mockResolvedValue({} as never);
+      await durable.stream('hello', {
+        runId: 'run-1',
+        clientTools: {},
+        maxSteps: 7,
+      });
+
+      expect(core).toHaveBeenCalledWith('hello', {
+        runId: 'run-1',
+        clientTools: {},
+        maxSteps: 7,
+      });
+    });
   });
 
   it('snapshots durable call options before delegating to core', async () => {
@@ -2513,21 +2918,23 @@ describe('FlowsafeDurableAgent.isRunLive', () => {
   });
 
   it.each([
-    'global',
-    'internal',
-  ] as const)('shares the refusal predicate for an isolated %s registry entry', async (source) => {
+    { source: 'global', global: true },
+    { source: 'internal', global: false },
+  ] as const)('shares the refusal predicate for an isolated $source registry entry', async ({
+    source,
+    global,
+  }) => {
     const { runtime, start } = fakeRuntime();
     const agent = createFlowsafeDurableAgent({ agent: testAgent(), runtime });
     const seedRunId = `live-seed-${source}`;
     const runId = `live-${source}`;
     try {
       const prepared = await agent.prepare('hello', { runId: seedRunId });
-      if (source === 'global')
-        globalRunRegistry.set(runId, prepared.registryEntry);
+      if (global) globalRunRegistry.set(runId, prepared.registryEntry);
       else registryFor(agent).register(runId, prepared.registryEntry);
       const stream = vi.spyOn(DurableAgent.prototype, 'stream');
-      expect(globalRunRegistry.has(runId)).toBe(source === 'global');
-      expect(registryFor(agent).has(runId)).toBe(source === 'internal');
+      expect(globalRunRegistry.has(runId)).toBe(global);
+      expect(registryFor(agent).has(runId)).toBe(!global);
       expect(agent.isRunLive(runId)).toBe(true);
       expect(agent.isRunLive('live-absent')).toBe(false);
       await expect(agent.stream('duplicate', { runId })).rejects.toThrow(
@@ -2644,6 +3051,35 @@ describe('FlowsafeDurableAgent.streamUntilPersisted', () => {
     expect(stream).toHaveBeenCalledOnce();
     expect(stream.mock.calls[0]?.[1]).toMatchObject({ runId: 'run-1' });
     expect(stream.mock.calls[0]?.[1]).not.toHaveProperty('structuredOutput');
+  });
+
+  it.each([
+    { clientTools: {} },
+    { maxSteps: 3 },
+    { memory: { thread: 't', resource: 'r', options: {} } },
+  ])('guarded durable call options refuse %j before installing persistence state', async (options) => {
+    const agent = createFlowsafeDurableAgent({
+      agent: guardedTestAgent(),
+      runtime: fakeRuntime().runtime,
+    });
+    const stream = vi
+      .spyOn(agent, 'stream')
+      .mockRejectedValue(new Error('unexpected dispatch'));
+
+    await expect(
+      agent.streamUntilPersisted(
+        'hello',
+        { runId: 'run-1', ...options } as never,
+        'operator-1',
+        'human',
+        undefined,
+        undefined,
+        undefined,
+        startAuthority(),
+      ),
+    ).rejects.toBeInstanceOf(TypeError);
+    expect(agent.isRunLive('run-1')).toBe(false);
+    expect(stream).not.toHaveBeenCalled();
   });
 
   it('rejects accessor-backed call options before installing persistence state', async () => {
@@ -3117,6 +3553,28 @@ describe('FlowsafeDurableAgent thread runtime registration and rehydration', () 
     await agent.resumeViaRuntime({ runId: 'run-1', requestedBy: 'reviewer-1' });
 
     expect(registeredOutput?.status).toBe('running');
+  });
+
+  it('guarded durable call options refuse memory configuration before runtime resume', async () => {
+    const { runtime, resume } = fakeRuntime();
+    resume.mockResolvedValue({ runId: 'run-1', status: 'success' });
+    const agent = createFlowsafeDurableAgent({
+      agent: guardedTestAgent(),
+      runtime,
+    });
+    const pending = agent.resumeViaRuntime({
+      runId: 'run-1',
+      requestedBy: 'reviewer-1',
+      memory: {
+        thread: 't',
+        resource: 'r',
+        options: { workingMemory: { enabled: true } },
+      },
+    });
+
+    await expect(pending).rejects.toBeInstanceOf(TypeError);
+    await expect(pending).rejects.toThrow('memory.options');
+    expect(resume).not.toHaveBeenCalled();
   });
 
   it('rehydrates guarded registries without replaying application input processors', async () => {
@@ -3757,29 +4215,79 @@ describe('agent observation', () => {
   });
 
   it.each([
-    'runtime',
-    'thread',
-    'agent',
-    'input',
-    'memory',
-    'audit',
-  ] as const)('refuses present %s disagreements without engine work', async (corruption) => {
-    const f = await agentObservationFixture(true);
-    try {
-      if (corruption === 'agent')
-        f.snapshot.requestContext[
+    {
+      corruption: 'runtime',
+      wrongRuntime: true,
+      threadId: 'thread-1',
+      selectorMismatch: false,
+      mutate: (_snapshot) => {},
+    },
+    {
+      corruption: 'thread',
+      wrongRuntime: false,
+      threadId: 'wrong',
+      selectorMismatch: true,
+      mutate: (_snapshot) => {},
+    },
+    {
+      corruption: 'agent',
+      wrongRuntime: false,
+      threadId: 'thread-1',
+      selectorMismatch: true,
+      mutate: (snapshot) => {
+        snapshot.requestContext[
           'flowsafe.runProvenance'
         ].startIdentity.target.id = 'wrong';
-      if (corruption === 'input')
-        Object.assign(f.snapshot.context, { input: { agentId: 'wrong' } });
-      if (corruption === 'memory')
-        Object.assign(f.snapshot.context, {
+      },
+    },
+    {
+      corruption: 'input',
+      wrongRuntime: false,
+      threadId: 'thread-1',
+      selectorMismatch: false,
+      mutate: (snapshot) => {
+        Object.assign(snapshot.context, { input: { agentId: 'wrong' } });
+      },
+    },
+    {
+      corruption: 'memory',
+      wrongRuntime: false,
+      threadId: 'thread-1',
+      selectorMismatch: false,
+      mutate: (snapshot) => {
+        Object.assign(snapshot.context, {
           input: { agentId: 'writer', messageListState: { memoryInfo: null } },
         });
-      if (corruption === 'audit')
-        Object.assign(f.snapshot.requestContext, {
+      },
+    },
+    {
+      corruption: 'audit',
+      wrongRuntime: false,
+      threadId: 'thread-1',
+      selectorMismatch: false,
+      mutate: (snapshot) => {
+        Object.assign(snapshot.requestContext, {
           'breakwater.auditContext': { threadId: 'wrong' },
         });
+      },
+    },
+  ] satisfies Array<{
+    corruption: string;
+    wrongRuntime: boolean;
+    threadId: string;
+    selectorMismatch: boolean;
+    mutate: (
+      snapshot: Awaited<ReturnType<typeof agentObservationFixture>>['snapshot'],
+    ) => void;
+  }>)('refuses present $corruption disagreements without engine work', async ({
+    wrongRuntime,
+    threadId,
+    selectorMismatch,
+    mutate,
+  }) => {
+    const f = await agentObservationFixture(true);
+    try {
+      mutate(f.snapshot);
       await f.seed();
       const capability = f.workflows[FENCED_WORKFLOW_STORAGE];
       assert(capability);
@@ -3788,16 +4296,16 @@ describe('agent observation', () => {
         await import('../do-runner/runtime.js');
       const outcome = await f.agent
         .authoritativeAgentStartState(
-          corruption === 'runtime' ? ({} as RunnerRuntime) : f.runtime,
-          corruption === 'thread' ? 'wrong' : 'thread-1',
+          wrongRuntime ? ({} as RunnerRuntime) : f.runtime,
+          threadId,
           'observed-agent-run',
         )
         .catch((error) => error);
       expect(f.counts.model).toBe(0);
-      if (corruption === 'runtime') expect(read).not.toHaveBeenCalled();
+      if (wrongRuntime) expect(read).not.toHaveBeenCalled();
       else expect(read).toHaveBeenCalledOnce();
       expect(outcome).toBeInstanceOf(ReloadedRunStateUnreadableError);
-      if (corruption === 'thread' || corruption === 'agent')
+      if (selectorMismatch)
         expect(outcome).toBeInstanceOf(AgentRunSelectorMismatchError);
       else expect(outcome).not.toBeInstanceOf(AgentRunSelectorMismatchError);
     } finally {
@@ -3958,17 +4466,63 @@ async function legacyAgentFixture(version: 'v1' | 'absent', threaded: boolean) {
 
 describe('agent selector mismatch classification', () => {
   it.each([
-    ['pending', true, false, 'agent'],
-    ['success', false, false, 'thread'],
-    ['pending', false, true, 'both'],
-    ['success', true, true, 'agent'],
-    ['success', false, true, 'thread'],
-    ['pending', true, true, 'both'],
-  ] as const)('classifies a coherent foreign modern tuple from one row (%s threaded=%s metadata=%s %s)', async (status, threaded, metadata, foreign) => {
+    {
+      status: 'pending',
+      threaded: true,
+      metadata: false,
+      foreign: 'agent',
+      agentId: 'other-agent',
+      threadId: 'thread-1',
+    },
+    {
+      status: 'success',
+      threaded: false,
+      metadata: false,
+      foreign: 'thread',
+      agentId: 'writer',
+      threadId: 'other-thread',
+    },
+    {
+      status: 'pending',
+      threaded: false,
+      metadata: true,
+      foreign: 'both',
+      agentId: 'other-agent',
+      threadId: 'other-thread',
+    },
+    {
+      status: 'success',
+      threaded: true,
+      metadata: true,
+      foreign: 'agent',
+      agentId: 'other-agent',
+      threadId: 'thread-1',
+    },
+    {
+      status: 'success',
+      threaded: false,
+      metadata: true,
+      foreign: 'thread',
+      agentId: 'writer',
+      threadId: 'other-thread',
+    },
+    {
+      status: 'pending',
+      threaded: true,
+      metadata: true,
+      foreign: 'both',
+      agentId: 'other-agent',
+      threadId: 'other-thread',
+    },
+  ] as const)('classifies a coherent foreign modern tuple from one row ($status threaded=$threaded metadata=$metadata $foreign)', async ({
+    status,
+    threaded,
+    metadata,
+    agentId,
+    threadId,
+  }) => {
     const f = await agentObservationFixture(threaded);
     try {
-      const agentId = foreign === 'thread' ? 'writer' : 'other-agent';
-      const threadId = foreign === 'agent' ? 'thread-1' : 'other-thread';
       Object.assign(f.snapshot, { status, result: { selected: 'S1' } });
       Object.assign(
         f.snapshot.requestContext['flowsafe.runProvenance'].startIdentity
@@ -4026,15 +4580,42 @@ describe('agent selector mismatch classification', () => {
   });
 
   it.each([
-    ['v1', true, 'agent'],
-    ['v1', false, 'thread'],
-    ['absent', true, 'both'],
-    ['absent', false, 'agent'],
-  ] as const)('classifies a coherent foreign legacy tuple (%s threaded=%s %s)', async (version, threaded, foreign) => {
+    {
+      version: 'v1',
+      threaded: true,
+      foreign: 'agent',
+      agentId: 'other-agent',
+      threadId: 'thread-1',
+    },
+    {
+      version: 'v1',
+      threaded: false,
+      foreign: 'thread',
+      agentId: 'writer',
+      threadId: 'other-thread',
+    },
+    {
+      version: 'absent',
+      threaded: true,
+      foreign: 'both',
+      agentId: 'other-agent',
+      threadId: 'other-thread',
+    },
+    {
+      version: 'absent',
+      threaded: false,
+      foreign: 'agent',
+      agentId: 'other-agent',
+      threadId: 'thread-1',
+    },
+  ] as const)('classifies a coherent foreign legacy tuple ($version threaded=$threaded $foreign)', async ({
+    version,
+    threaded,
+    agentId,
+    threadId,
+  }) => {
     const f = await legacyAgentFixture(version, threaded);
     try {
-      const agentId = foreign === 'thread' ? 'writer' : 'other-agent';
-      const threadId = foreign === 'agent' ? 'thread-1' : 'other-thread';
       Object.assign(f.snapshot.requestContext ?? {}, {
         threadId,
         resourceId: threadId,
@@ -4072,14 +4653,16 @@ describe('agent selector mismatch classification', () => {
   });
 
   it.each([
-    'modern',
-    'v1',
-    'absent',
-  ] as const)('checks internal coherence before foreign lookup classification: %s', async (version) => {
-    const f =
-      version === 'modern'
-        ? await agentObservationFixture(true)
-        : await legacyAgentFixture(version, true);
+    { shape: 'modern', modern: true, version: 'v1' },
+    { shape: 'v1', modern: false, version: 'v1' },
+    { shape: 'absent', modern: false, version: 'absent' },
+  ] as const)('checks internal coherence before foreign lookup classification: $shape', async ({
+    modern,
+    version,
+  }) => {
+    const f = modern
+      ? await agentObservationFixture(true)
+      : await legacyAgentFixture(version, true);
     try {
       Object.assign(f.snapshot.requestContext ?? {}, {
         'breakwater.auditContext': { agentId: 'contradiction' },
@@ -4109,13 +4692,15 @@ describe('agent selector mismatch classification', () => {
   });
 
   it.each([
-    'modern',
-    'v1',
-  ] as const)('classifies the selected foreign row when replacement storage matches the selector: %s', async (version) => {
-    const f =
-      version === 'modern'
-        ? await agentObservationFixture(false)
-        : await legacyAgentFixture(version, false);
+    { shape: 'modern', modern: true, version: 'v1' },
+    { shape: 'v1', modern: false, version: 'v1' },
+  ] as const)('classifies the selected foreign row when replacement storage matches the selector: $shape', async ({
+    modern,
+    version,
+  }) => {
+    const f = modern
+      ? await agentObservationFixture(false)
+      : await legacyAgentFixture(version, false);
     try {
       const capability = f.workflows[FENCED_WORKFLOW_STORAGE];
       assert(capability);
@@ -4124,7 +4709,7 @@ describe('agent selector mismatch classification', () => {
         .spyOn(capability, 'readSnapshot')
         .mockImplementation(async (address) => {
           const row = await native(address);
-          if (version === 'modern') {
+          if (modern) {
             const provenance =
               f.snapshot.requestContext?.['flowsafe.runProvenance'];
             provenance.startIdentity.target.threadId = 'replacement-thread';
@@ -4160,19 +4745,22 @@ describe('agent selector mismatch classification', () => {
   });
 
   it.each([
-    'undefined',
-    'error',
-    'unknown run',
-  ] as const)('keeps failed selected sources unreadable rather than classifying a lookup miss: %s', async (failure) => {
+    { failure: 'undefined', resolves: true, unknownRun: false },
+    { failure: 'error', resolves: false, unknownRun: false },
+    { failure: 'unknown run', resolves: false, unknownRun: true },
+  ] as const)('keeps failed selected sources unreadable rather than classifying a lookup miss: $failure', async ({
+    resolves,
+    unknownRun,
+  }) => {
     const f = await agentObservationFixture(false);
     try {
       const source = vi.spyOn(f.runtime, 'authoritativeStartState');
-      if (failure === 'undefined') source.mockResolvedValue(undefined as never);
+      if (resolves) source.mockResolvedValue(undefined as never);
       else
         source.mockRejectedValue(
-          failure === 'error'
-            ? new Error('source failed')
-            : new UnknownRunError(f.workflow.id, 'observed-agent-run'),
+          unknownRun
+            ? new UnknownRunError(f.workflow.id, 'observed-agent-run')
+            : new Error('source failed'),
         );
       const outcome = await f.agent
         .authoritativeAgentStartState(
@@ -4254,17 +4842,20 @@ describe('legacy agent observations', () => {
   });
 
   it.each([
-    'input-agent',
-    'input-run',
-    'context-run',
-    'context-thread',
-    'context-resource',
-    'audit-agent',
-    'audit-thread',
-    'audit-resource',
-    'memory-thread',
-    'missing-input',
-  ] as const)('rejects legacy %s contradictions in its one selected snapshot', async (field) => {
+    { field: 'input-agent', target: 'input', key: 'agentId' },
+    { field: 'input-run', target: 'input', key: 'runId' },
+    { field: 'context-run', target: 'context', key: 'runId' },
+    { field: 'context-thread', target: 'context', key: 'threadId' },
+    { field: 'context-resource', target: 'context', key: 'resourceId' },
+    { field: 'audit-agent', target: 'audit', key: 'agentId' },
+    { field: 'audit-thread', target: 'audit', key: 'threadId' },
+    { field: 'audit-resource', target: 'audit', key: 'resourceId' },
+    { field: 'memory-thread', target: 'memory', key: 'threadId' },
+    { field: 'missing-input', target: 'missing', key: 'input' },
+  ] as const)('rejects legacy $field contradictions in its one selected snapshot', async ({
+    target,
+    key,
+  }) => {
     const f = await legacyAgentFixture('v1', true);
     try {
       const context = f.snapshot.requestContext;
@@ -4276,19 +4867,15 @@ describe('legacy agent observations', () => {
           memoryInfo: { threadId: string; resourceId: string };
         };
       };
-      if (field === 'input-agent') input.agentId = 'wrong';
-      else if (field === 'input-run') input.runId = 'wrong';
-      else if (field === 'context-run') context.runId = 'wrong';
-      else if (field === 'context-thread') context.threadId = 'wrong';
-      else if (field === 'context-resource') context.resourceId = 'wrong';
-      else if (field === 'audit-agent')
-        context['breakwater.auditContext'].agentId = 'wrong';
-      else if (field === 'audit-thread')
-        context['breakwater.auditContext'].threadId = 'wrong';
-      else if (field === 'audit-resource')
-        context['breakwater.auditContext'].resourceId = 'wrong';
-      else if (field === 'memory-thread')
-        input.messageListState.memoryInfo.threadId = 'wrong';
+      const targets = {
+        input,
+        context,
+        audit: context['breakwater.auditContext'],
+        memory: input.messageListState.memoryInfo,
+        missing: undefined,
+      };
+      const changed = targets[target];
+      if (changed) Object.assign(changed, { [key]: 'wrong' });
       else delete f.snapshot.context.input;
       await f.seed();
       const capability = f.workflows[FENCED_WORKFLOW_STORAGE];
