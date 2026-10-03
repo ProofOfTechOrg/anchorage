@@ -635,12 +635,29 @@ const SPIKE_ACTORS = new Map<string, ApprovalActor>([
 // workflow's first step writes a durable D1 row instead, so the spike can count
 // executions directly across a process death and across a concurrent burst.
 const COUNTED_WORKFLOW_ID = 'demo-idempotent';
+// IL1-IL3: a step that counts its execution and then waits ten minutes in memory,
+// the shape of a leg the platform ends mid-step.
+const INTERRUPT_WORKFLOW_ID = 'demo-interrupt';
 const APPLICATION_CONTEXT_KEY = 'spike.attribution';
 const EXECUTION_COUNT_TABLE = 'spike_execution_count';
 const EXECUTION_COUNT_DDL = `CREATE TABLE IF NOT EXISTS ${EXECUTION_COUNT_TABLE} (
     id TEXT PRIMARY KEY,
     executions INTEGER NOT NULL
   )`;
+
+async function countExecution(db: D1Database, counterId: string) {
+  // Lazy DDL rather than a provisioning step: this table belongs to the
+  // probe, not to the deployment, and creating it here keeps its one
+  // definition beside its one writer.
+  await db.prepare(EXECUTION_COUNT_DDL).run();
+  await db
+    .prepare(
+      `INSERT INTO ${EXECUTION_COUNT_TABLE} (id, executions) VALUES (?, 1)
+         ON CONFLICT(id) DO UPDATE SET executions = executions + 1`,
+    )
+    .bind(counterId)
+    .run();
+}
 
 const WORKFLOWS: ReadonlyArray<WorkflowMeta> = [
   {
@@ -670,6 +687,13 @@ const WORKFLOWS: ReadonlyArray<WorkflowMeta> = [
     description:
       'demo-approval with a counting first step, so an idempotent start can be proved by EXECUTIONS rather than by run ids',
     sampleInput: { topic: 'launch', counterId: 'probe' },
+  },
+  {
+    id: INTERRUPT_WORKFLOW_ID,
+    title: 'Demo interrupted leg',
+    description:
+      'one counted step that waits ten minutes in memory, so a killed process leaves its leg mid-step',
+    sampleInput: { counterId: 'probe' },
   },
   {
     id: 'sched-echo',
@@ -835,16 +859,7 @@ function defineWorkflows(env: Env): RunnerRuntime {
     inputSchema: z.object({ topic: z.string(), counterId: z.string() }),
     outputSchema: z.object({ topic: z.string(), notes: z.string() }),
     execute: async ({ inputData }) => {
-      // Lazy DDL rather than a provisioning step: this table belongs to the
-      // probe, not to the deployment, and creating it here keeps its one
-      // definition beside its one writer.
-      await env.DB.prepare(EXECUTION_COUNT_DDL).run();
-      await env.DB.prepare(
-        `INSERT INTO ${EXECUTION_COUNT_TABLE} (id, executions) VALUES (?, 1)
-           ON CONFLICT(id) DO UPDATE SET executions = executions + 1`,
-      )
-        .bind(inputData.counterId)
-        .run();
+      await countExecution(env.DB, inputData.counterId);
       return {
         topic: inputData.topic,
         notes: `research notes for ${inputData.topic}`,
@@ -1048,6 +1063,25 @@ function defineWorkflows(env: Env): RunnerRuntime {
     outputSchema: deadlineOutputSchema,
   })
     .then(deadlineWait)
+    .commit();
+
+  createWorkflow({
+    id: INTERRUPT_WORKFLOW_ID,
+    inputSchema: z.object({ counterId: z.string() }),
+    outputSchema: z.object({ counterId: z.string() }),
+  })
+    .then(
+      createStep({
+        id: 'wait-in-memory',
+        inputSchema: z.object({ counterId: z.string() }),
+        outputSchema: z.object({ counterId: z.string() }),
+        execute: async ({ inputData }) => {
+          await countExecution(env.DB, inputData.counterId);
+          await new Promise((resolve) => setTimeout(resolve, 600_000));
+          return inputData;
+        },
+      }),
+    )
     .commit();
 
   return runtime;
@@ -2829,6 +2863,50 @@ async function handleSuspensionDeadlineProbe(
   return json({ status: response.status, armed: await response.json() });
 }
 
+// --- Interrupted-leg probe (IL1-IL3) ---------------------------------------
+// LOCAL-ONLY, like every other spike probe. `GET /interrupt/rows` lists the
+// demo-interrupt rows, whose run ids the stalled start never returns to its
+// client. `POST /interrupt/silence?runId=` ages one row's `updatedAt` past the
+// silence the run object requires before it settles a leg (RUN_LEG_SILENT_MS),
+// standing in for minutes of wall clock after the process running the leg died.
+const INTERRUPT_SILENCE_MS = 7 * 60_000;
+
+async function handleInterruptProbe(
+  request: Request,
+  env: Env,
+): Promise<Response | null> {
+  const url = new URL(request.url);
+  if (request.method === 'GET' && url.pathname === '/interrupt/rows') {
+    const { results } = await env.DB.prepare(
+      `SELECT run_id, json_extract(snapshot, '$.status') AS status
+         FROM mastra_workflow_snapshot WHERE workflow_name = ?`,
+    )
+      .bind(INTERRUPT_WORKFLOW_ID)
+      .all<{ run_id: string; status: string }>();
+    return json({
+      rows: results.map((row) => ({ runId: row.run_id, status: row.status })),
+    });
+  }
+  if (request.method === 'POST' && url.pathname === '/interrupt/silence') {
+    const runId = url.searchParams.get('runId');
+    if (!isPathSafeId(runId)) {
+      return json({ error: 'a path-safe runId is required' }, 404);
+    }
+    const result = await env.DB.prepare(
+      `UPDATE mastra_workflow_snapshot SET updatedAt = ?
+         WHERE workflow_name = ? AND run_id = ?`,
+    )
+      .bind(
+        new Date(Date.now() - INTERRUPT_SILENCE_MS).toISOString(),
+        INTERRUPT_WORKFLOW_ID,
+        runId,
+      )
+      .run();
+    return json({ changes: result.meta.changes });
+  }
+  return null;
+}
+
 // --- Idempotent-start execution count probe (FI1/FI2) ----------------------
 // Reads the counter `counted-research` writes. LOCAL-ONLY and unauthenticated,
 // like every other spike probe: it exposes nothing a run's own status does not,
@@ -3032,6 +3110,11 @@ const handler: ExportedHandler<Env> = {
     // ahead of the routers.
     const executionCountProbe = await handleExecutionCountProbe(routed, env);
     if (executionCountProbe) return executionCountProbe;
+
+    // Interrupted-leg rows and silence (IL1-IL3) — local, unauthenticated,
+    // ahead of the routers.
+    const interruptProbe = await handleInterruptProbe(routed, env);
+    if (interruptProbe) return interruptProbe;
 
     // Track E webhook ingress: the github webhook route TERMINATES on the Worker,
     // signature-authed (not bearer), route-absent when its secret is unset.

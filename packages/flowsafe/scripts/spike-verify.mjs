@@ -82,6 +82,7 @@ const AGENT_RUN_BODY = {
 // (spike/worker.ts COUNTED_WORKFLOW_ID). MUST match the worker's id.
 const COUNTED_WORKFLOW_ID = 'demo-idempotent';
 const DEADLINE_WORKFLOW_ID = 'demo-deadline';
+const INTERRUPT_WORKFLOW_ID = 'demo-interrupt';
 const DEADLINE_STEP = 'wait-signal';
 // The reserved arming key, as it appears on the wire (do-runner exports it to
 // TypeScript authors as SUSPENSION_DEADLINE_PAYLOAD_KEY).
@@ -1045,6 +1046,54 @@ async function main() {
     },
   );
 
+  // --- Interrupted leg (IL1-IL3): a step the process dies under -------------
+  // A start parks its one step in a ten-minute in-memory wait, and the A2 kill
+  // ends that leg mid-step. The restarted run object must settle the run as
+  // failed INTERRUPTED from its own wake, without running the step again.
+  const interruptedRun = await step(
+    'IL1 interrupted leg: a start left executing mid-step reads running',
+    async () => {
+      const counterId = `interrupt-${crypto.randomUUID()}`;
+      const client = new AbortController();
+      // The start answers only when its leg ends, ten minutes out; the client
+      // gives up instead, as the consumer whose leg the platform ended did.
+      const start = fetch(`${BASE}/runs`, {
+        method: 'POST',
+        headers: { ...AUTH.operator, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          workflowId: INTERRUPT_WORKFLOW_ID,
+          inputData: { counterId },
+        }),
+        signal: client.signal,
+      }).catch(() => undefined);
+      try {
+        // The router answers 404 until the start's ownership settles, so the
+        // row is read through the probe.
+        const deadline = Date.now() + 15_000;
+        let rows;
+        while (Date.now() < deadline) {
+          rows = (await http('GET', '/interrupt/rows')).body.rows;
+          if (rows?.[0]?.status === 'running') break;
+          await sleep(250);
+        }
+        assert(
+          rows?.length === 1 && rows[0].status === 'running',
+          'the started run reads running while its step waits',
+          rows,
+        );
+        assert(
+          (await executionCount(counterId)) === 1,
+          'the step began once',
+          counterId,
+        );
+        return { runId: rows[0].runId, counterId };
+      } finally {
+        client.abort();
+        await start;
+      }
+    },
+  );
+
   await step('A2 kill: group-SIGKILL gen-1, prove port refused', async () => {
     await killServer(currentServer);
   });
@@ -1066,6 +1115,31 @@ async function main() {
       recovered,
     );
   });
+
+  await step(
+    'IL2 interrupted leg: the killed leg left its run running and silent',
+    async () => {
+      const { body } = await http('GET', '/interrupt/rows');
+      assert(
+        body.rows?.length === 1 &&
+          body.rows[0].runId === interruptedRun.runId &&
+          body.rows[0].status === 'running',
+        'the run the dead leg drove still reads running after the restart',
+        body,
+      );
+      // No live leg can touch the row any more; ageing it stands in for the
+      // minutes of silence the run object waits for before it settles.
+      const aged = await http(
+        'POST',
+        `/interrupt/silence?runId=${encodeURIComponent(interruptedRun.runId)}`,
+      );
+      assert(
+        aged.status === 200 && aged.body.changes === 1,
+        "the run row's last write was aged past the settlement silence",
+        aged,
+      );
+    },
+  );
 
   await step(
     'PA2 restart: replay cache is gone, authoritative status and principal survive',
@@ -2601,6 +2675,36 @@ async function main() {
     },
   );
 
+  // Placed before the fence scenarios, whose drain inventory must not find
+  // this run still executing.
+  await step(
+    'IL3 interrupted leg: the run object settles the run failed INTERRUPTED ' +
+      'and never runs the step again',
+    async () => {
+      const path = `/runs/${INTERRUPT_WORKFLOW_ID}/${encodeURIComponent(interruptedRun.runId)}`;
+      const deadline = Date.now() + 150_000;
+      let seen;
+      while (Date.now() < deadline) {
+        seen = await http('GET', path, { headers: AUTH.viewer });
+        if (seen.status === 200 && seen.body.status !== 'running') break;
+        await sleep(1_000);
+      }
+      assert(
+        seen?.status === 200 &&
+          seen.body.status === 'failed' &&
+          seen.body.errorEnvelope?.code === 'INTERRUPTED',
+        "the restarted object's own wake settled the stranded run as failed " +
+          'INTERRUPTED, readable through the run route',
+        seen,
+      );
+      assert(
+        (await executionCount(interruptedRun.counterId)) === 1,
+        'the interrupted step was not executed again',
+        interruptedRun.counterId,
+      );
+    },
+  );
+
   // --- Execution fence (F1): the migration control, on real workerd ---------
   // Unit tests can prove the store's compare-and-set. What they cannot prove is
   // that a fence written by one process still refuses work in the NEXT one, and
@@ -3293,7 +3397,11 @@ try {
       "reserved deadline key armed the run DO's own fenced wake, and after a " +
       'kill+restart that wake fired on the restarted object and resumed the run ' +
       "ITSELF with the timeout envelope under the run's requester — no client " +
-      'called resume. The deployment execution fence (F1): provisioning seeded ' +
+      'called resume. Interrupted legs (IL1-IL3): a start whose step was still ' +
+      'waiting when its process was killed read running after the restart, and ' +
+      "once its row had gone silent the run's own object settled it as failed " +
+      'INTERRUPTED without running the step again. ' +
+      'The deployment execution fence (F1): provisioning seeded ' +
       'an explicit open fence, draining refused new starts with 503 ' +
       'EXECUTION_FENCED while still resuming an outstanding approval to ' +
       'success, migration-locked refused starts, raw resumes AND approval ' +
