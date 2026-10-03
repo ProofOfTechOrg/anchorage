@@ -27,6 +27,12 @@ import type { RunSummary } from './runtime.js';
 /** Reserved key a step sets in its `suspend()` payload to arm a deadline. */
 export const SUSPENSION_DEADLINE_PAYLOAD_KEY = 'flowsafe.deadlineMs';
 
+/**
+ * Reserved key a step sets to `true` beside its deadline to wait without an
+ * approval: the run's own object resumes the step when the deadline expires.
+ */
+export const SUSPENSION_TIMER_PAYLOAD_KEY = 'flowsafe.timer';
+
 /** Reserved key wrapping the resume data an expired deadline resumes with. */
 export const SUSPENSION_TIMEOUT_RESUME_KEY = 'flowsafe.suspensionTimeout';
 
@@ -35,10 +41,10 @@ export const SUSPENSION_DEADLINE_STORAGE_KEY =
   'flowsafe:suspension-deadline:v1';
 
 /**
- * Requester recorded on a timeout resume. A self-initiated resume must be
- * distinguishable in run provenance from the human or automation that advanced
- * the run to the suspension, so it files under a reserved system id of its own
- * rather than borrowing the recorded requester's identity.
+ * Requester recorded on a timeout resume of a run with no recorded requester.
+ * A run that has one keeps it, so separation of duties applies to the gate
+ * after the timeout as it would without the timeout; the resume data envelope
+ * is what marks the resume as a timeout.
  */
 export const SUSPENSION_DEADLINE_PRINCIPAL_ID = 'flowsafe-suspension-deadline';
 
@@ -453,6 +459,19 @@ function abandoned(entry: SuspensionDeadlineEntry): boolean {
   return (entry.attempts ?? 0) >= MAX_SUSPENSION_DEADLINE_ATTEMPTS;
 }
 
+// An entry whose fence or deadline moved belongs to a different suspension.
+function sameSuspension(
+  left: SuspensionDeadlineEntry,
+  right: SuspensionDeadlineEntry,
+): boolean {
+  return (
+    left.step === right.step &&
+    left.suspendedAt === right.suspendedAt &&
+    left.resumeCount === right.resumeCount &&
+    left.deadlineAt === right.deadlineAt
+  );
+}
+
 /** When an entry needs its wake: the deadline, or the retry floor past it. */
 function dueAt(entry: SuspensionDeadlineEntry): number {
   return Math.max(entry.deadlineAt, entry.nextAttemptAt ?? 0);
@@ -495,6 +514,43 @@ export function dueSuspensionDeadline(
     if (!due || byDueThenStep(entry, due) < 0) due = entry;
   }
   return due;
+}
+
+/** `stored` when it is this run's record; another run's entries are not its own. */
+export function ownSuspensionDeadlines(
+  stored: SuspensionDeadlineRecord | undefined,
+  workflowId: string,
+  runId: string,
+): SuspensionDeadlineRecord | undefined {
+  return stored?.workflowId === workflowId && stored.runId === runId
+    ? stored
+    : undefined;
+}
+
+/**
+ * The suspended steps of `summary` that wait as timers: each derives an armable
+ * deadline from the current suspension, its payload sets
+ * SUSPENSION_TIMER_PAYLOAD_KEY to `true`, and the run's own record holds no
+ * abandoned entry for that suspension. Derivation rather than the stored record
+ * decides, so a read racing the record write still sees the timer, and a
+ * request the arming refuses is never listed. The caller vouches that a wake is
+ * scheduled.
+ */
+export function suspensionTimerSteps(
+  summary: RunSummary,
+  own: SuspensionDeadlineRecord | undefined,
+): string[] {
+  const payloads = record(summary.suspendPayload);
+  return suspensionDeadlinesOf(summary)
+    .entries.filter(
+      (entry) =>
+        record(payloads?.[entry.step])?.[SUSPENSION_TIMER_PAYLOAD_KEY] ===
+          true &&
+        !own?.entries.some(
+          (held) => abandoned(held) && sameSuspension(held, entry),
+        ),
+    )
+    .map((entry) => entry.step);
 }
 
 /** The resume data a timeout resume delivers to the expired step. */
@@ -551,12 +607,8 @@ export function mergeSuspensionDeadlines(
   derived: readonly SuspensionDeadlineEntry[],
 ): SuspensionDeadlineEntry[] {
   return derived.map((entry) => {
-    const carried = previous?.entries.find(
-      (stored) =>
-        stored.step === entry.step &&
-        stored.suspendedAt === entry.suspendedAt &&
-        stored.resumeCount === entry.resumeCount &&
-        stored.deadlineAt === entry.deadlineAt,
+    const carried = previous?.entries.find((stored) =>
+      sameSuspension(stored, entry),
     );
     return carried?.attempts === undefined
       ? entry

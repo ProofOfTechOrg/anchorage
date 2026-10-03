@@ -158,6 +158,7 @@ export function publicRunSummary(value: unknown, runId: string): RunSummary {
     'suspendedAt',
     'resumedAt',
     'resumeCount',
+    'suspensionTimers',
     'createdAt',
     'updatedAt',
   ]);
@@ -194,6 +195,12 @@ export function publicRunSummary(value: unknown, runId: string): RunSummary {
         (path) =>
           !Array.isArray(path) || path.some((part) => typeof part !== 'string'),
       ))
+  )
+    invalid();
+  if (
+    summary.suspensionTimers !== undefined &&
+    (!Array.isArray(summary.suspensionTimers) ||
+      summary.suspensionTimers.some((step) => typeof step !== 'string'))
   )
     invalid();
   for (const key of ['suspendedAt', 'resumedAt', 'resumeCount']) {

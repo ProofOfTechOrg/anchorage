@@ -51,11 +51,13 @@ Only terminal records are eligible for approval retention. An old open request i
 - `workflowId` and server-minted `runId`
 - the suspended `stepPath`
 - `suspendedAt` and the runtime-owned `resumeCount`
-- `requestedBy` and `requestedByKind` from the execution principal that advanced the run; a human approval resume is attributed to its decider
+- `requestedBy` and `requestedByKind` from the execution principal that advanced the run; a human approval resume is attributed to its decider, and a suspension-deadline resume keeps the run's recorded requester
 - `connectors` from the server-authored suspend payload
 - `grantScope` derived by the service
 - `toolCallId` from a durable-agent approval suspension
 - an optional server-authored durable-agent `resumeTarget`
+
+It files nothing for a step listed in `RunSummary.suspensionTimers`: the run's Durable Object resumes that step itself (see [timer suspensions](do-runner-design.md#timer-suspensions)).
 
 The HTTP create route is disabled by default. If a host enables it, the router requires write access to the named run and rejects every field that could select a capability, change attribution, or choose a resume target. An HTTP-created request can collect a human decision, but cannot mint a connector grant or resume execution.
 

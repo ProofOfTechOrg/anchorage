@@ -32,6 +32,7 @@ export function durableKeyValueStorageFixture(
 ): DurableKeyValueStorageFixture {
   const values = new Map<string, unknown>();
   const alarms: number[] = [];
+  let scheduled: number | null = null;
   const storage: DurableKeyValueStorage = {
     async get<T>(key: string): Promise<T | undefined> {
       events.push(`get:${key}`);
@@ -45,14 +46,19 @@ export function durableKeyValueStorageFixture(
       events.push(`delete:${key}`);
       return values.delete(key);
     },
+    async getAlarm(): Promise<number | null> {
+      events.push('getAlarm');
+      return scheduled;
+    },
     async setAlarm(scheduledTime: number | Date): Promise<void> {
       events.push('setAlarm');
-      alarms.push(
-        scheduledTime instanceof Date ? scheduledTime.getTime() : scheduledTime,
-      );
+      scheduled =
+        scheduledTime instanceof Date ? scheduledTime.getTime() : scheduledTime;
+      alarms.push(scheduled);
     },
     async deleteAlarm(): Promise<void> {
       events.push('deleteAlarm');
+      scheduled = null;
     },
   };
   return {

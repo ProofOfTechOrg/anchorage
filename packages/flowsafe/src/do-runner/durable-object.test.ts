@@ -71,8 +71,10 @@ import {
   SUSPENSION_DEADLINE_PRINCIPAL_ID,
   SUSPENSION_DEADLINE_STORAGE_KEY,
   SUSPENSION_TIMEOUT_RESUME_KEY,
+  SUSPENSION_TIMER_PAYLOAD_KEY,
   type SuspensionDeadlineEntry,
   type SuspensionDeadlineRecord,
+  tombstoned,
 } from './suspension-deadline.js';
 
 const testStorageDatabases = new WeakMap<
@@ -3184,6 +3186,19 @@ function timedRuntime(
           : firstDeadlineMs,
       });
   singleStepWorkflow('timed', timedStep('gate', settling));
+  // Waits as a timer, and waits again after any resume but its own timeout.
+  singleStepWorkflow(
+    'timed-timer',
+    timedStep('gate', async ({ inputData, resumeData, suspend }) => {
+      if (!isSuspensionTimeoutResumeData(resumeData)) {
+        return suspend({
+          [SUSPENSION_TIMER_PAYLOAD_KEY]: true,
+          [SUSPENSION_DEADLINE_PAYLOAD_KEY]: TIMED_DEADLINE_MS,
+        });
+      }
+      return { topic: inputData.topic, settledBy: 'timeout' };
+    }),
+  );
   singleStepWorkflow(
     'timed-escalating',
     timedStep('gate', async ({ inputData, resumeData, suspend }) => {
@@ -3642,7 +3657,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
     expect(alarms.at(-1)).toBe(dueAt);
   });
 
-  it('resumes the suspended step with the timeout envelope under a system principal', async () => {
+  it("resumes the suspended step with the timeout envelope under the run's requester", async () => {
     const sent: string[] = [];
     const { storage, values } = durableKeyValueStorageFixture();
     const state = {
@@ -3666,11 +3681,234 @@ describe('DurableObjectRunner suspension deadlines', () => {
       // The step branched on isSuspensionTimeoutResumeData, so the envelope
       // survived the resume path intact.
       result: { settledBy: 'timeout' },
-      requestedBy: SUSPENSION_DEADLINE_PRINCIPAL_ID,
-      requestedByKind: 'system',
+      // A timeout is no principal's action, so the next gate stays filed
+      // against the run's recorded requester.
+      requestedBy: OWNER_PRINCIPAL.id,
+      requestedByKind: 'human',
     });
     // #then — a terminal run has no suspension left to arm
     expect(storedDeadlines(values)).toBeUndefined();
+  });
+
+  it.each([
+    {
+      provenance: 'a requester without a kind',
+      recorded: { requestedBy: 'legacy-1' },
+      expected: { requestedBy: 'legacy-1', requestedByKind: 'human' },
+    },
+    {
+      provenance: 'no requester',
+      recorded: {},
+      expected: {
+        requestedBy: SUSPENSION_DEADLINE_PRINCIPAL_ID,
+        requestedByKind: 'system',
+      },
+    },
+  ])('resumes a run recording $provenance under $expected.requestedBy', async ({
+    recorded,
+    expected,
+  }) => {
+    // #given — a due entry for a run whose provenance predates requester kinds,
+    // or records no requester at all
+    const { state, values } = durableKeyValueStorageFixture();
+    const resume = vi.fn(async () => ({
+      runId: 'run-legacy',
+      status: 'success' as const,
+    }));
+    const runtime = {
+      ...statusStub(async () => ({
+        ...suspendedFence('run-legacy', 1),
+        ...recorded,
+      })),
+      resume,
+    } as unknown as RunnerRuntime;
+    seedDeadlines(values, 'run-legacy', [armedEntry('gate', 1)]);
+    const runner = new TestRunner(state, { ...timedEnv(), runtime });
+
+    // #when
+    await runner.alarm();
+
+    // #then
+    expect(resume).toHaveBeenCalledWith(
+      'timed',
+      'run-legacy',
+      expect.objectContaining(expected),
+    );
+  });
+
+  it('lists a timer step on the start, status, dispatch-status and replay responses', async () => {
+    // #given
+    const { state } = durableKeyValueStorageFixture();
+    const runner = new TestRunner(state, timedEnv());
+
+    // #when
+    const started = await startTimed(runner, 'run-timer', 'timed-timer');
+    const read = async (path: string) =>
+      (
+        await runner.fetch(deploymentIdentityRequest(`http://do${path}`))
+      ).json();
+    const status = (await read('/runs/timed-timer/run-timer')) as RunSummary;
+    const dispatched = (await read(
+      '/runs/timed-timer/run-timer/dispatch-status',
+    )) as RunSummary;
+    const replayed = (await read('/runs/timed-timer/run-timer?replay=1')) as {
+      value: RunSummary;
+    };
+
+    // #then
+    expect([
+      started.suspensionTimers,
+      status.suspensionTimers,
+      dispatched.suspensionTimers,
+      replayed.value.suspensionTimers,
+    ]).toEqual([['gate'], ['gate'], ['gate'], ['gate']]);
+  });
+
+  it('lists a timer step the resume route re-suspends', async () => {
+    // #given
+    const { state } = durableKeyValueStorageFixture();
+    const runner = new TestRunner(state, timedEnv());
+    await startTimed(runner, 'run-timer-resumed', 'timed-timer');
+
+    // #when
+    const response = await runner.fetch(
+      post('/runs/timed-timer/run-timer-resumed/resume', {
+        step: 'gate',
+        resumeData: { nudge: true },
+      }),
+    );
+
+    // #then
+    expect(await response.json()).toMatchObject({
+      status: 'suspended',
+      resumeCount: { gate: 1 },
+      suspensionTimers: ['gate'],
+    });
+  });
+
+  it('lists a timer step on a start the route recovered', async () => {
+    // #given — the start persisted its suspension, then lost its settlement
+    // receipt, so the route answers from start recovery
+    const { state } = durableKeyValueStorageFixture();
+    const env = timedEnv();
+    const settle = env.owners.settleReservation.bind(env.owners);
+    const lost = vi
+      .spyOn(env.owners, 'settleReservation')
+      .mockImplementationOnce(async (...args) => {
+        await settle(...args);
+        throw new Error('settlement receipt lost');
+      });
+    const runner = new TestRunner(state, env);
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    // #when
+    let started: RunSummary;
+    try {
+      started = await startTimed(runner, 'run-timer-recovered', 'timed-timer');
+    } finally {
+      log.mockRestore();
+    }
+
+    // #then
+    expect(lost).toHaveBeenCalled();
+    expect(started.suspensionTimers).toEqual(['gate']);
+  });
+
+  it('lists a timer step whose deadline record is not written yet', async () => {
+    // #given — a status read that lands between the leg persisting its
+    // suspension and the object writing the record, with the leg's wake armed
+    const { state, values } = durableKeyValueStorageFixture();
+    const runner = new TestRunner(state, timedEnv());
+    await startTimed(runner, 'run-timer-unwritten', 'timed-timer');
+    values.delete(SUSPENSION_DEADLINE_STORAGE_KEY);
+
+    // #when
+    const status = await runner.fetch(
+      deploymentIdentityRequest(
+        'http://do/runs/timed-timer/run-timer-unwritten',
+      ),
+    );
+
+    // #then
+    expect(((await status.json()) as RunSummary).suspensionTimers).toEqual([
+      'gate',
+    ]);
+  });
+
+  it('answers a status read without timer steps when the record read fails, and keeps the record', async () => {
+    // #given
+    const { storage, values } = durableKeyValueStorageFixture();
+    let failing = false;
+    const state = {
+      storage: {
+        ...storage,
+        get: async <T>(key: string): Promise<T | undefined> => {
+          if (failing && key === SUSPENSION_DEADLINE_STORAGE_KEY)
+            throw new Error('storage unavailable');
+          return storage.get<T>(key);
+        },
+      },
+    } as unknown as DurableObjectState;
+    const runner = new TestRunner(state, timedEnv());
+    await startTimed(runner, 'run-timer-unreadable', 'timed-timer');
+    failing = true;
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    // #when
+    let status: Response;
+    try {
+      status = await runner.fetch(
+        deploymentIdentityRequest(
+          'http://do/runs/timed-timer/run-timer-unreadable',
+        ),
+      );
+    } finally {
+      log.mockRestore();
+    }
+
+    // #then
+    expect(status.status).toBe(200);
+    const summary = (await status.json()) as RunSummary;
+    expect(summary.status).toBe('suspended');
+    expect(summary).not.toHaveProperty('suspensionTimers');
+    expect(values.has(SUSPENSION_DEADLINE_STORAGE_KEY)).toBe(true);
+  });
+
+  it.each([
+    {
+      without: 'a scheduled wake',
+      lose: async (storage: DurableKeyValueStorage) => {
+        await storage.deleteAlarm?.();
+      },
+    },
+    {
+      without: 'a live entry',
+      lose: async (storage: DurableKeyValueStorage) => {
+        const stored = (await storage.get(
+          SUSPENSION_DEADLINE_STORAGE_KEY,
+        )) as SuspensionDeadlineRecord;
+        await storage.put(SUSPENSION_DEADLINE_STORAGE_KEY, {
+          ...stored,
+          entries: stored.entries.map(tombstoned),
+        });
+      },
+    },
+  ])('lists no timer step $without', async ({ lose }) => {
+    // #given
+    const { state, storage } = durableKeyValueStorageFixture();
+    const runner = new TestRunner(state, timedEnv());
+    await startTimed(runner, 'run-timer-lost', 'timed-timer');
+    await lose(storage);
+
+    // #when
+    const status = await runner.fetch(
+      deploymentIdentityRequest('http://do/runs/timed-timer/run-timer-lost'),
+    );
+
+    // #then
+    const summary = (await status.json()) as RunSummary;
+    expect(summary.status).toBe('suspended');
+    expect(summary).not.toHaveProperty('suspensionTimers');
   });
 
   it('drops a stale entry without resuming when the suspension fence moved', async () => {
@@ -4115,7 +4353,6 @@ describe('DurableObjectRunner suspension deadlines', () => {
     expect(await settled.json()).toMatchObject({
       status: 'success',
       result: { settledBy: 'timeout' },
-      requestedBy: SUSPENSION_DEADLINE_PRINCIPAL_ID,
     });
     expect(storedDeadlines(values)).toBeUndefined();
   });
@@ -5304,7 +5541,6 @@ describe('DurableObjectRunner suspension deadlines', () => {
     expect(await status.json()).toMatchObject({
       status: 'success',
       result: { settledBy: 'timeout' },
-      requestedBy: SUSPENSION_DEADLINE_PRINCIPAL_ID,
     });
     expect(storedDeadlines(values)).toBeUndefined();
     // #then — the recovery duty still owns its own retry wake
@@ -5382,7 +5618,6 @@ describe('DurableObjectRunner suspension deadlines', () => {
     expect(await status.json()).toMatchObject({
       status: 'success',
       result: { settledBy: 'timeout' },
-      requestedBy: SUSPENSION_DEADLINE_PRINCIPAL_ID,
     });
     expect(logged).toEqual([]);
     expect(storedDeadlines(values)).toBeUndefined();

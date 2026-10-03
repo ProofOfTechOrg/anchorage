@@ -117,13 +117,15 @@ function bookkeepingPrincipal(
 }
 
 /**
- * A suspension IS an approval request: queue one record per suspended step
- * path (idempotently — the store's partial unique open-step index collapses
- * duplicates, so re-queuing an already-queued gate is a no-op). EVERY path
- * files: `.parallel()` branches can suspend together
- * (`summary.suspended = [['a'], ['b']]`), and a gate that never reaches the
- * queue can never be decided — its connector then denies on every resume
- * (fail closed) with nothing telling a reviewer why the run is stuck.
+ * A suspension is an approval request unless its step is in
+ * `summary.suspensionTimers`, which the run's Durable Object resumes itself.
+ * Queue one record per other suspended step path (idempotently — the store's
+ * partial unique open-step index collapses duplicates, so re-queuing an
+ * already-queued gate is a no-op). EVERY such path files: `.parallel()`
+ * branches can suspend together (`summary.suspended = [['a'], ['b']]`), and a
+ * gate that never reaches the queue can never be decided — its connector then
+ * denies on every resume (fail closed) with nothing telling a reviewer why the
+ * run is stuck.
  * Capturing each step's (suspendedAt, resumeCount) pair binds its approval to
  * THAT suspension exactly (clock-free grant minting), and each suspend
  * payload's `connectors` declares what a decision should mint.
@@ -149,7 +151,12 @@ export async function queueApprovalForSuspension(
     systemPrincipalId,
     RECONCILE_PURPOSE,
   );
-  const suspended = summary.suspended ?? [];
+  const timers = Array.isArray(summary.suspensionTimers)
+    ? summary.suspensionTimers
+    : [];
+  const suspended = (summary.suspended ?? []).filter(
+    (stepPath) => !timers.includes(stepPath.join('.')),
+  );
   const records: ApprovalRecord[] = [];
   const failures: Array<{ stepKey: string; message: string }> = [];
   for (const stepPath of suspended) {
@@ -403,7 +410,8 @@ export async function abandonApprovalsForRun(
  *
  * Delegates the actual filing to queueApprovalForSuspension against a copy of
  * `summary` narrowed to only the healed paths, so a step with a live or
- * in-flight record is never touched. Generic runner summaries carry durable
+ * in-flight record is never touched, and a timer step's stale records are
+ * superseded with nothing filed in their place. Generic runner summaries carry durable
  * execution provenance. A suspended summary without it cannot be filed: using
  * the system principal as a fallback would erase an unknown human initiator and
  * weaken separation of duties. Agent hosts may pass an explicit trusted value.

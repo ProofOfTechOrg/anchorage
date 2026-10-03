@@ -291,6 +291,8 @@ The trusted suspension bridge records:
 - requester attribution;
 - optional server-authored durable-agent resume target.
 
+It files no record for a step in `RunSummary.suspensionTimers`. Only the run's Durable Object fills that list, from its own wake state.
+
 `approvalGrantProvider()` reads only approved records. A durable-agent record produces `tool-call` scope and binds connector, workflow, run, step path, `suspendedAt`, `resumeCount`, and `toolCallId`. A workflow record produces `suspension` scope and binds every field except `toolCallId`, which Mastra cannot reproduce for an arbitrary workflow gate. The runtime-owned resume count distinguishes repeated same-step suspensions even when timestamps collide.
 
 An agent resume target contains the agent, thread, resource, and original authorized principal. A reviewer decision resumes execution as that principal after re-authorizing it against the current catalog. The host checks a human against the agent's roles and an automated principal against its `allowedAutomation` declaration. It then checks any `requiredPermissions` through the current server-owned resolver policy. The reviewer cannot replace the principal. Legacy agent approvals without this principal fail closed.
@@ -324,6 +326,8 @@ A host with only one human reviewer must consciously choose availability or sepa
 | Old approval reused at another gate | Exact step, `suspendedAt`, and `resumeCount` match | Trusted run-scoped grants intentionally span legs |
 | Reviewer races another reviewer | Store CAS and terminal-state immutability | Batch decisions are partial, not globally transactional |
 | Reviewer approves their own action | Requester and cross-gate history checks | Explicit exemptions weaken this control |
+| Requester decides the gate after a timeout | A suspension-deadline resume keeps the run's recorded requester, so separation of duties applies to the next gate as it would without the timeout | A run that records no requester, or whose recorded requester is the reserved deadline principal, resumes under that principal |
+| Gate waits without an approval | The run object lists a timer step only for an armable deadline it holds a wake for; the bridge files every unlisted step, and an unfiled gate mints no grant | Untrusted data spread into a suspend payload can delay a gate until its deadline |
 | Approval resume fails after commit | Decision stays durable; trusted redrive/registry rehydration invokes [only Breakwater's reserved `processInput` steps](durable-agents.md#host-a-guarded-agent-catalog), then restores complete processor lists for resumed loop hooks | Operator may need to redrive; no automatic rollback |
 | Approval id from another deployment read or changed | Physical deployment identity selects the approval store; every authenticated approval role may read its deployment queue, while review-role, separation-of-duties, and CAS checks guard mutations; exact workflow and run predicates bind grants | A mis-provisioned database is detected by the deployment sentinel before routes are served |
 | Foreign run or thread reached | Exported topology, opaque object names, path-safe id checks, and exact Durable Object identity checks | Infrastructure with access to another deployment's bindings can cross the physical boundary |

@@ -2376,7 +2376,7 @@ async function main() {
   // Mastra suspend payload, the run's OWN Durable Object persists a fenced
   // entry and arms its single alarm for it, the process DIES, and the restarted
   // object wakes itself and resumes the run with the reserved timeout envelope
-  // under the system principal — with no client ever calling resume.
+  // under the run's own requester — with no client ever calling resume.
   const signalRun = await step(
     'T1 signal fence: a real signal before the deadline resumes the run as its ' +
       'human requester and settles the armed entry',
@@ -2503,7 +2503,7 @@ async function main() {
 
   await step(
     'T3 deadline wake: the armed alarm survives a workerd kill+restart and the ' +
-      'run resumes ITSELF with the timeout envelope under the system principal',
+      "run resumes ITSELF with the timeout envelope under the run's requester",
     async () => {
       // Still suspended on THIS process, so the wake has not fired yet:
       // whatever resumes this run has to come from the restarted object.
@@ -2564,12 +2564,12 @@ async function main() {
           resumed.body.result?.expiredAt >= deadlineRun.deadlineAt &&
           resumed.body.result?.expiredAt >= killedAt &&
           deadlineRun.deadlineAt > killedAt &&
-          resumed.body.requestedBy === 'flowsafe-suspension-deadline' &&
-          resumed.body.requestedByKind === 'system',
+          resumed.body.requestedBy === 'opal' &&
+          resumed.body.requestedByKind === 'human',
         'the alarm armed before the kill fired on the RESTARTED process and ' +
           'resumed the run itself: the step saw the reserved timeout envelope ' +
           '(isSuspensionTimeoutResumeData) for its own step and deadline, under ' +
-          'the system principal, with no client calling resume, the deadline ' +
+          "the run's own requester, with no client calling resume, the deadline " +
           'was still in the future when the process died, and the wake acted ' +
           'after the kill rather than in the gap before it',
         { killedAt, body: resumed.body },
@@ -3292,7 +3292,7 @@ try {
       'human requester and settled the armed entry, a suspension carrying the ' +
       "reserved deadline key armed the run DO's own fenced wake, and after a " +
       'kill+restart that wake fired on the restarted object and resumed the run ' +
-      'ITSELF with the timeout envelope under the system principal — no client ' +
+      "ITSELF with the timeout envelope under the run's requester — no client " +
       'called resume. The deployment execution fence (F1): provisioning seeded ' +
       'an explicit open fence, draining refused new starts with 503 ' +
       'EXECUTION_FENCED while still resuming an outstanding approval to ' +

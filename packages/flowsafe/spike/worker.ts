@@ -995,7 +995,7 @@ function defineWorkflows(env: Env): RunnerRuntime {
   // suspend(); the run's OWN Durable Object derives a fenced entry from the
   // authoritative summary, persists it in DO storage, and arms its single alarm
   // for it. When the wake fires it resumes THIS step with the reserved timeout
-  // envelope under the system principal. The step therefore records WHICH kind
+  // envelope under the run's requester. The step therefore records WHICH kind
   // of resume reached it, through the exported guard rather than a string
   // literal, so spike-verify can assert the ENVELOPE arrived — not merely that
   // the run advanced.
@@ -1089,13 +1089,8 @@ export class DemoRunner extends DurableObjectRunner<Env> {
     try {
       await verifyDurableObjectDeploymentRequest(request, this.state, this.env);
       const storage = this.state?.storage;
-      // getAlarm is not part of the structural storage subset do-runner
-      // declares (it never reads the alarm back); workerd always provides it.
-      const alarms = storage as unknown as
-        | { getAlarm(): Promise<number | null> }
-        | undefined;
       return json({
-        alarmAt: (await alarms?.getAlarm()) ?? null,
+        alarmAt: (await storage?.getAlarm?.()) ?? null,
         record:
           (await storage?.get(SPIKE_SUSPENSION_DEADLINE_STORAGE_KEY)) ?? null,
       });

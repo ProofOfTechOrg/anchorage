@@ -169,7 +169,7 @@ A run whose execution leg stops mid-step, because the platform ended the Durable
 }
 ```
 
-A run with a recorded cancellation or timeout completes that transition instead. A deploy does not interrupt a leg: the outgoing instance keeps running it, and its touches keep the run from being settled. A Workers runtime update gives in-flight requests at most 30 seconds, so it interrupts a longer leg. Without a connected client, a Durable Object invocation lasts about 15 minutes, so each step must finish within one. Split long work into steps, and wait in a suspension with a deadline rather than in an in-memory polling loop. Settlement needs the `FencedWorkflowsStorageD1` workflow domain that `createD1Storage()` composes; terminate a stranded run on other storage. See [interrupted legs](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/do-runner-design.md#interrupted-legs).
+A run with a recorded cancellation or timeout completes that transition instead. A deploy does not interrupt a leg: the outgoing instance keeps running it, and its touches keep the run from being settled. A Workers runtime update gives in-flight requests at most 30 seconds, so it interrupts a longer leg. Without a connected client, a Durable Object invocation lasts about 15 minutes, so each step must finish within one. Split long work into steps, and [wait without an approval](#wait-without-an-approval) rather than in an in-memory polling loop. Settlement needs the `FencedWorkflowsStorageD1` workflow domain that `createD1Storage()` composes; terminate a stranded run on other storage. See [interrupted legs](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/do-runner-design.md#interrupted-legs).
 
 Economic settlement projections are trusted internal `StartRunOptions.economicOperations` and `ResumeRunOptions.economicOperations` inputs. The host fixes the projection at an execution-leg boundary before that leg becomes cancellable. Public start and resume bodies cannot set it, and Flowsafe does not expose a dynamic mid-leg update API.
 
@@ -221,15 +221,46 @@ const gate = createStep({
 });
 ```
 
-Use `isArmableSuspensionDeadlineMs(value)` to validate relative milliseconds against the runner's safe-integer and inclusive duration bounds. Import it, those duration bounds and the reserved payload keys from `@proofoftech/flowsafe/do-runner/constants` to avoid loading the runner graph; the per-run cap `MAX_SUSPENSION_DEADLINES_PER_RUN` comes from `@proofoftech/flowsafe/do-runner`. A step declaring a Zod `suspendSchema` must declare the reserved field or use a loose object, because Mastra replaces the suspend payload with parsed output. Its `resumeSchema` must accept the timeout envelope as well as the signal shape.
+Use `isArmableSuspensionDeadlineMs(value)` to validate relative milliseconds against the runner's safe-integer and inclusive duration bounds. Import it, those duration bounds and the reserved payload keys from `@proofoftech/flowsafe/do-runner/constants` to avoid loading the runner graph; the per-run cap `MAX_SUSPENSION_DEADLINES_PER_RUN` comes from `@proofoftech/flowsafe/do-runner`. A step declaring a Zod `suspendSchema` must declare the reserved fields it sets, the timer marker included, or use a loose object, because Mastra replaces the suspend payload with parsed output. Its `resumeSchema` must accept the timeout envelope as well as the signal shape.
 
-For workflow tests, import `suspensionTimeoutResumeData` from `@proofoftech/flowsafe/do-runner/testing` and call it with `{ step, deadlineAt }` and an expiry time. It returns the alarm's envelope shape; `isSuspensionTimeoutResumeData` checks that shape without authenticating its origin. Public resume requests containing the reserved key are rejected. Alarm resumes record system provenance and do not grant approval.
+For workflow tests, import `suspensionTimeoutResumeData` from `@proofoftech/flowsafe/do-runner/testing` and call it with `{ step, deadlineAt }` and an expiry time. It returns the alarm's envelope shape; `isSuspensionTimeoutResumeData` checks that shape without authenticating its origin. Public resume requests containing the reserved key are rejected. An alarm resume keeps the run's recorded requester, so separation of duties applies to the next gate as it would without the timeout, and it grants no approval.
 
 Import `suspensionDeadlinesOf` from `@proofoftech/flowsafe/do-runner` to inspect a `RunSummary`. It returns derived entries and rejected requests without scheduling a wake or mutating the summary. See the [acceptance rules](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/do-runner-design.md#inspect-and-test-suspension-deadlines).
 
 Only a top-level suspended step can arm a deadline. A step suspended inside a nested workflow is reported under the nested path while its suspension time is recorded against the enclosing step, so there is nothing to fence the resume against; the deadline is refused and logged instead of armed.
 
 Wake precision is the Durable Object alarm's, and there is no maintenance-sweep backstop for it, so treat a suspension deadline as best-effort near its due time. Run-level `deadlineMs` remains the swept mechanism. `MAX_SUSPENSION_DEADLINES_PER_RUN` caps how many deadlines one run arms; the stored record, its parser, and the wake arithmetic stay inside the run's Durable Object, because nothing outside it can act on that state safely. Suspension deadlines apply to `DurableObjectRunner`-hosted workflow runs; durable agents keep their own resume path.
+
+#### Wait without an approval
+
+A step that only waits, such as a poll between attempts, suspends as a timer: it sets `SUSPENSION_TIMER_PAYLOAD_KEY` to `true` beside its deadline. The run's Durable Object resumes the step when the deadline expires, lists the step in `RunSummary.suspensionTimers`, and the approval bridges file no approval for it. A run that must outlast one Durable Object invocation, about 15 minutes without a connected client, waits this way between steps.
+
+```ts
+import {
+  SUSPENSION_DEADLINE_PAYLOAD_KEY,
+  SUSPENSION_TIMER_PAYLOAD_KEY,
+} from '@proofoftech/flowsafe/do-runner/constants';
+
+const poll = createStep({
+  id: 'poll',
+  inputSchema: z.object({ jobId: z.string() }),
+  outputSchema: z.object({ jobId: z.string() }),
+  execute: async ({ inputData, suspend }) => {
+    // Checked on every resume, whatever resumed the step.
+    if (!(await jobFinished(inputData.jobId))) {
+      return suspend({
+        [SUSPENSION_TIMER_PAYLOAD_KEY]: true,
+        [SUSPENSION_DEADLINE_PAYLOAD_KEY]: 60_000,
+      });
+    }
+    return { jobId: inputData.jobId };
+  },
+});
+```
+
+A timer can still receive an approval: the run object lists a step only while it can vouch for the wake, and every other case files an ordinary approval (see [timer suspensions](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/do-runner-design.md#timer-suspensions)). So a timer step accepts an approval decision's `{ approved, comment?, decidedBy? }` as well as the timeout envelope, in its `resumeSchema` and its branch, and re-checks its wait condition on every resume rather than treating any resume as permission to proceed. Approvals after a timer, for an abandoned timer or the gate the run reaches next, are filed when a host reads the run's status with approval reconciliation, as `createFlowsafeWorker` does.
+
+The marker lives in the step's suspend payload, so a step that spreads untrusted data into that payload can make a gate wait without an approval for up to the deadline. A `foreach` with `concurrency` above 1 reports one payload for its suspended iterations, so one iteration's marker applies to the batch.
 
 Read the [Durable Object runner design](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/do-runner-design.md) for the suspension fence, the stored record, and the failure modes.
 

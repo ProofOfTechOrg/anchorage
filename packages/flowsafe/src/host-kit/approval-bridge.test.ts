@@ -13,6 +13,10 @@ import {
   InMemoryApprovalStore,
   trustAutomationPrincipal,
 } from '../approval-api/index.js';
+import {
+  SUSPENSION_DEADLINE_PAYLOAD_KEY,
+  SUSPENSION_TIMER_PAYLOAD_KEY,
+} from '../do-runner/constants.js';
 import type { RunSummary } from '../do-runner/index.js';
 // requestedConnectors is module-internal (not on the barrel): it is the
 // primitive beneath queueApprovalForSuspension, tested here directly.
@@ -633,6 +637,52 @@ describe('queueApprovalForSuspension', () => {
     const open = await store.list({ status: 'pending' });
     expect(open).toHaveLength(1);
     expect(open[0]?.stepPath).toEqual(['gateB']);
+  });
+
+  it.each([
+    {
+      listed: 'the run object lists the timer step',
+      suspensionTimers: ['wait'] as unknown,
+      filed: [['gate']],
+    },
+    {
+      listed: 'the payload marks a timer the run object does not list',
+      suspensionTimers: undefined,
+      filed: [['gate'], ['wait']],
+    },
+    {
+      listed: 'the list is not an array',
+      suspensionTimers: 'wait' as unknown,
+      filed: [['gate'], ['wait']],
+    },
+  ])('files only what no alarm resumes when $listed', async ({
+    suspensionTimers,
+    filed,
+  }) => {
+    // #given — a timer and an ordinary gate suspended together
+    const store = new InMemoryApprovalStore();
+    const service = new ApprovalService({ store, executionFence: 'none' });
+    const summary = {
+      runId: 'acme_run-timer',
+      status: 'suspended',
+      suspended: [['wait'], ['gate']],
+      suspendPayload: {
+        wait: {
+          [SUSPENSION_TIMER_PAYLOAD_KEY]: true,
+          [SUSPENSION_DEADLINE_PAYLOAD_KEY]: 900_000,
+        },
+        gate: { reason: 'approve' },
+      },
+      suspendedAt: { wait: 111, gate: 222 },
+      ...(suspensionTimers === undefined ? {} : { suspensionTimers }),
+    } as RunSummary;
+
+    // #when
+    await queueApprovalForSuspension(service, 'wf', summary, 'starter', SYSTEM);
+
+    // #then
+    const open = await store.list({ status: 'pending' });
+    expect(open.map(({ stepPath }) => stepPath).sort()).toEqual(filed);
   });
 });
 
@@ -1338,6 +1388,36 @@ describe('reconcileApprovalsForSummary', () => {
       decision: 'allowed',
       resource: `approval:${stale?.id}`,
     });
+  });
+
+  it("supersedes a timer step's stale OPEN record and files nothing in its place", async () => {
+    // #given — gate1 was an approval gate, and now waits as a timer
+    const store = new InMemoryApprovalStore();
+    const service = new ApprovalService({ store, executionFence: 'none' });
+    const [stale] = await queueApprovalForSuspension(
+      service,
+      'product-launch',
+      suspendedSummary('acme_run-timer', 'gate1', [], 8000),
+      'starter',
+      SYSTEM,
+    );
+    const timer: RunSummary = {
+      ...suspendedSummary('acme_run-timer', 'gate1', [], 9000, 1),
+      suspensionTimers: ['gate1'],
+    };
+
+    // #when
+    const filed = await reconcileApprovalsForSummary(
+      service,
+      'product-launch',
+      timer,
+      SYSTEM,
+    );
+
+    // #then
+    expect(filed).toEqual([]);
+    expect((await store.get(stale?.id ?? ''))?.status).toBe('rejected');
+    expect(await store.list({ status: 'pending' })).toEqual([]);
   });
 
   it('backs off when a concurrent decision wins the supersede CAS race (no clobber, no duplicate file)', async () => {

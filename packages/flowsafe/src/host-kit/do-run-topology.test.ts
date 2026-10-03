@@ -480,8 +480,36 @@ describe('protected replay workflow transport', () => {
     ).resolves.toEqual({ kind: 'result', execution, value: interrupted });
   });
 
+  it('replays the timer steps the run object listed', async () => {
+    // #given — a replay through the router reconciles approvals from this value
+    const timer = {
+      runId: 'run-1',
+      status: 'suspended',
+      suspended: [['wait']],
+      suspensionTimers: ['wait'],
+    };
+    const { topology } = topologyFor({
+      kind: 'result',
+      execution,
+      value: timer,
+    });
+
+    // #when / #then
+    await expect(
+      topology.persistedStart('workflow-1', 'run-1'),
+    ).resolves.toEqual({ kind: 'result', execution, value: timer });
+  });
+
   it.each([
     ['missing discriminator', { execution, value }],
+    [
+      'timer list that is not string steps',
+      {
+        kind: 'result',
+        execution,
+        value: { ...value, suspensionTimers: [['wait']] },
+      },
+    ],
     ['initial with value', { kind: 'initial', execution, value }],
     ['missing result value', { kind: 'result', execution }],
     [

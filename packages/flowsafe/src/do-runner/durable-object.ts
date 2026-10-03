@@ -91,6 +91,7 @@ import {
   MAX_SUSPENSION_DEADLINES_PER_RUN,
   mergeSuspensionDeadlines,
   nextSuspensionDeadlineAt,
+  ownSuspensionDeadlines,
   parseSuspensionDeadlineRecord,
   type RejectedSuspensionDeadline,
   SUSPENSION_DEADLINE_PRINCIPAL_ID,
@@ -100,6 +101,7 @@ import {
   type SuspensionDeadlineRecord,
   suspensionDeadlinesOf,
   suspensionTimeoutResumeData,
+  suspensionTimerSteps,
   tombstoned,
 } from './suspension-deadline.js';
 
@@ -1116,15 +1118,14 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
     // born abandoned. `previous` still reaches the write below, whose
     // write-or-skip decision is about the key that is stored, not about whose
     // run it names.
-    const inherited =
-      previous?.workflowId === workflowId && previous.runId === runId
-        ? previous
-        : undefined;
     await this.#writeSuspensionDeadlines(
       workflowId,
       runId,
       previous,
-      mergeSuspensionDeadlines(inherited, derived),
+      mergeSuspensionDeadlines(
+        ownSuspensionDeadlines(previous, workflowId, runId),
+        derived,
+      ),
     );
   }
 
@@ -1151,6 +1152,43 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
     console.error(
       `suspension deadline not armed for step '${rejection.step}' of run '${runId}': ${rejection.reason}`,
     );
+  }
+
+  /**
+   * The summary with its timer steps listed, so approval bridges file nothing
+   * for a step this object will resume itself. It never throws and never
+   * deletes: the lifecycle change behind the response has already persisted,
+   * and the status and replay routes run outside the operation lock. Without a
+   * scheduled wake nothing would resume a timer, so a step this read cannot
+   * vouch for is left out and gets an approval a person can resume.
+   */
+  async #withSuspensionTimers(
+    workflowId: string,
+    summary: RunSummary,
+  ): Promise<RunSummary> {
+    try {
+      // Most suspensions ask for no timer; they pay no storage read.
+      if (suspensionTimerSteps(summary, undefined).length === 0) return summary;
+      const storage = this.state?.storage;
+      if (!storage?.getAlarm || (await storage.getAlarm()) === null)
+        return summary;
+      const steps = suspensionTimerSteps(
+        summary,
+        ownSuspensionDeadlines(
+          parseSuspensionDeadlineRecord(
+            await storage.get<unknown>(SUSPENSION_DEADLINE_STORAGE_KEY),
+          ),
+          workflowId,
+          summary.runId,
+        ),
+      );
+      return steps.length === 0
+        ? summary
+        : { ...summary, suspensionTimers: steps };
+    } catch (error) {
+      console.error('suspension timer read failed', error);
+      return summary;
+    }
   }
 
   /**
@@ -1475,8 +1513,22 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
         runtime.resume(workflowId, runId, {
           step: [entry.step],
           resumeData: suspensionTimeoutResumeData(entry, now),
-          requestedBy: SUSPENSION_DEADLINE_PRINCIPAL_ID,
-          requestedByKind: 'system',
+          // A timeout is no principal's action, so the run keeps its recorded
+          // requester and the next gate is filed against them: the runtime
+          // inherits a complete pair. Legacy provenance without a kind takes
+          // the approval bridge's legacy default, which the runtime will not
+          // infer, and a run without a requester resumes under the reserved id.
+          ...(summary.requestedBy === undefined
+            ? {
+                requestedBy: SUSPENSION_DEADLINE_PRINCIPAL_ID,
+                requestedByKind: 'system' as const,
+              }
+            : summary.requestedByKind === undefined
+              ? {
+                  requestedBy: summary.requestedBy,
+                  requestedByKind: 'human' as const,
+                }
+              : {}),
         }),
       true,
     );
@@ -2378,7 +2430,9 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
           }
           summary = await this.#finishRunOwner(recovery, summary);
           this.#broadcastRunSummary(summary);
-          return json(summary);
+          return json(
+            await this.#withSuspensionTimers(startWorkflowId, summary),
+          );
         } catch (error) {
           frame.unwound = true;
           try {
@@ -2394,7 +2448,10 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
                 frame,
                 error,
               );
-              if (recovered) return json(recovered);
+              if (recovered)
+                return json(
+                  await this.#withSuspensionTimers(startWorkflowId, recovered),
+                );
             }
           } catch (recoveryError) {
             console.error('interrupted start recovery failed', recoveryError);
@@ -2445,12 +2502,19 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
         return json(
           state.kind === 'initial'
             ? { kind: 'initial', execution }
-            : { kind: 'result', execution, value: state.summary },
+            : {
+                kind: 'result',
+                execution,
+                value: await this.#withSuspensionTimers(
+                  workflowId,
+                  state.summary,
+                ),
+              },
         );
       }
       const summary = await runtime.status(workflowId, runId);
       if (!summary) return json({ error: 'run not found' }, 404);
-      return json(summary);
+      return json(await this.#withSuspensionTimers(workflowId, summary));
     }
     if (
       request.method === 'GET' &&
@@ -2465,7 +2529,7 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
         await this.#recoverPendingRunOwner();
         const summary = await runtime.status(workflowId, runId);
         if (!summary) return json({ error: 'run not found' }, 404);
-        return json(summary);
+        return json(await this.#withSuspensionTimers(workflowId, summary));
       });
     }
     if (
@@ -2562,7 +2626,7 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
         }
         // Broadcast the post-resume authoritative summary.
         this.#broadcastRunSummary(summary);
-        return json(summary);
+        return json(await this.#withSuspensionTimers(workflowId, summary));
       });
     }
     if (

@@ -263,6 +263,12 @@ export interface RunSummary {
    * CreateApprovalInput.resumeCount.
    */
   resumeCount?: Record<string, number>;
+  /**
+   * Dot-joined suspended step keys that wait as timers: the run's Durable
+   * Object resumes each one itself when its deadline expires, so approval
+   * bridges file no approval for it. Only `DurableObjectRunner` fills it.
+   */
+  suspensionTimers?: string[];
   /** ISO 8601. Present on status() projections (read from the stored snapshot). */
   createdAt?: string;
   /** ISO 8601. Present on status() projections (read from the stored snapshot). */

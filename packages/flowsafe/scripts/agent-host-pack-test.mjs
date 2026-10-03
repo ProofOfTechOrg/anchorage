@@ -160,12 +160,14 @@ assert.deepEqual(Object.keys(constants).sort(), [
   'isArmableSuspensionDeadlineMs', 'isSuspensionTimeoutResumeData',
   'MAX_SUSPENSION_DEADLINE_MS', 'MIN_SUSPENSION_DEADLINE_MS',
   'SUSPENSION_DEADLINE_PAYLOAD_KEY', 'SUSPENSION_TIMEOUT_RESUME_KEY',
+  'SUSPENSION_TIMER_PAYLOAD_KEY',
 ].sort());
 assert.deepEqual(Object.keys(testing), ['suspensionTimeoutResumeData']);
 assert.equal(constants.MIN_SUSPENSION_DEADLINE_MS, 1000);
 assert.equal(constants.MAX_SUSPENSION_DEADLINE_MS, 31536000000);
 assert.equal(constants.SUSPENSION_DEADLINE_PAYLOAD_KEY, 'flowsafe.deadlineMs');
 assert.equal(constants.SUSPENSION_TIMEOUT_RESUME_KEY, 'flowsafe.suspensionTimeout');
+assert.equal(constants.SUSPENSION_TIMER_PAYLOAD_KEY, 'flowsafe.timer');
 for (const value of [1000, 1001, 86400000, 31536000000]) {
   assert.equal(constants.isArmableSuspensionDeadlineMs(value), true, String(value));
 }
