@@ -10267,3 +10267,221 @@ describe('legacy Runtime observations', () => {
     }
   });
 });
+
+describe('RunnerRuntime.settleInterruptedRun', () => {
+  function holdingApp(
+    hold: Promise<void>,
+    entered: () => void,
+    storage: MastraCompositeStore = new InMemoryStore(),
+  ) {
+    const app = init(
+      { storage },
+      { executionFence: 'none', startIdempotency: 'none' },
+    );
+    const schema = z.object({});
+    const workflow = app
+      .createWorkflow({
+        id: 'interrupt-workflow',
+        inputSchema: schema,
+        outputSchema: schema,
+      })
+      .then(
+        app.createStep({
+          id: 'hold',
+          inputSchema: schema,
+          outputSchema: schema,
+          execute: async () => {
+            entered();
+            await hold;
+            throw Object.assign(new Error('step gave up'), {
+              name: 'RunInterruptedError',
+            });
+          },
+        }),
+      )
+      .commit();
+    return { app, workflow };
+  }
+
+  /**
+   * A run another runtime left mid-step, rewritten to `status`, and a fresh
+   * runtime over the same storage that drives nothing. `startedAt` is the
+   * clock reading before the row's last write.
+   */
+  async function strandedRun(
+    status: 'running' | 'waiting' | 'paused' = 'running',
+    storage: MastraCompositeStore = createD1Storage({
+      binding: sqliteUnitDatabase(openSqlite()) as D1DatabaseBinding,
+    }),
+  ) {
+    await storage.init();
+    const startedAt = Date.now();
+    const entered = deferredSignal();
+    const stranded = holdingApp(
+      new Promise<void>(() => undefined),
+      entered.resolve,
+      storage,
+    );
+    void stranded.app.runtime.start(stranded.workflow.id, {
+      runId: 'stranded-run',
+      inputData: {},
+    });
+    await entered.promise;
+    const workflows = await storage.getStore('workflows');
+    const snapshot = await workflows?.loadWorkflowSnapshot({
+      workflowName: stranded.workflow.id,
+      runId: 'stranded-run',
+    });
+    assert(workflows && snapshot);
+    await workflows.persistWorkflowSnapshot({
+      workflowName: stranded.workflow.id,
+      runId: 'stranded-run',
+      snapshot: { ...snapshot, status },
+    });
+    return {
+      startedAt,
+      ...holdingApp(Promise.resolve(), () => undefined, storage),
+    };
+  }
+
+  it.each([
+    'running',
+    'waiting',
+    'paused',
+  ] as const)('fails a %s row no leg has touched for six minutes as INTERRUPTED', async (stored) => {
+    // #given a row left mid-step (`waiting` is an in-memory `.sleep()`,
+    // `paused` a per-step pause), read from a runtime that drives nothing
+    const { app, workflow } = await strandedRun(stored);
+
+    // #when
+    const settled = await app.runtime.settleInterruptedRun(
+      workflow.id,
+      'stranded-run',
+      Date.now() + 360_001,
+    );
+
+    // #then
+    expect(settled).toMatchObject({
+      kind: 'interrupted',
+      summary: { status: 'failed', errorEnvelope: { code: 'INTERRUPTED' } },
+    });
+  });
+
+  it('reads a row a leg touched within six minutes as live, and settles it once that passes', async () => {
+    // #given a stranded row a leg on another instance touched five minutes on
+    const { app, workflow, startedAt } = await strandedRun();
+    const touchedAt = startedAt + 300_000;
+    await app.runtime.touchRun(workflow.id, 'stranded-run', touchedAt);
+
+    // #when
+    const early = await app.runtime.settleInterruptedRun(
+      workflow.id,
+      'stranded-run',
+      touchedAt + 359_000,
+    );
+    const late = await app.runtime.settleInterruptedRun(
+      workflow.id,
+      'stranded-run',
+      touchedAt + 360_000,
+    );
+
+    // #then
+    expect(early).toEqual({ kind: 'live' });
+    expect(late).toMatchObject({ kind: 'interrupted' });
+  });
+
+  it('never settles a run whose storage cannot mark legs live', async () => {
+    // #given a stranded row on storage without the D1 liveness touch
+    const { app, workflow } = await strandedRun('running', new InMemoryStore());
+
+    // #when
+    const settled = await app.runtime.settleInterruptedRun(
+      workflow.id,
+      'stranded-run',
+      Date.now() + 86_400_000,
+    );
+
+    // #then
+    expect(settled).toEqual({ kind: 'live' });
+  });
+
+  it('replays a terminal transition until its cleanup completes', async () => {
+    // #given a stranded run whose cancellation was persisted, cleanup not yet
+    const { app, workflow } = await strandedRun();
+    const cancelled = await app.runtime.terminate(workflow.id, 'stranded-run');
+    const later = Date.now() + 360_001;
+
+    // #when
+    const unfinished = await app.runtime.settleInterruptedRun(
+      workflow.id,
+      'stranded-run',
+      later,
+    );
+    await app.runtime.completeTerminalCleanup(
+      workflow.id,
+      'stranded-run',
+      cancelled.cleanup.revision,
+    );
+    const finished = await app.runtime.settleInterruptedRun(
+      workflow.id,
+      'stranded-run',
+      later,
+    );
+
+    // #then
+    expect(unfinished).toMatchObject({
+      kind: 'transition',
+      transition: { cleanup: { status: 'cancelled', cleanupCompleted: false } },
+    });
+    expect(finished).toEqual({ kind: 'durable' });
+  });
+
+  it('reads a run this runtime is still executing as live without waiting for its leg', async () => {
+    // #given an in-process leg holding the run lock inside its step
+    const entered = deferredSignal();
+    const { app, workflow } = holdingApp(
+      new Promise<void>(() => undefined),
+      entered.resolve,
+    );
+    void app.runtime.start(workflow.id, { runId: 'live-run', inputData: {} });
+    await entered.promise;
+
+    // #when / #then
+    await expect(
+      app.runtime.settleInterruptedRun(workflow.id, 'live-run'),
+    ).resolves.toEqual({ kind: 'live' });
+  });
+
+  it('refuses the pending initial row that start recovery owns, leaving it unchanged', async () => {
+    // #given an admitted initial row whose start never reached the engine
+    const f = await runtimeActivationFixture();
+    try {
+      await preparedPendingFixture(f);
+      const before = await f.row();
+
+      // #when / #then
+      await expect(
+        f.runtime.settleInterruptedRun(f.workflow.id, 'activation-run'),
+      ).rejects.toBeInstanceOf(RunStartPendingError);
+      expect(await f.row()).toStrictEqual(before);
+    } finally {
+      f.close();
+    }
+  });
+
+  it('gives a step failure that borrows the interruption error name no INTERRUPTED envelope', async () => {
+    // #given a step that throws an error named like the interruption
+    const { app, workflow } = holdingApp(Promise.resolve(), () => undefined);
+
+    // #when
+    await app.runtime.start(workflow.id, {
+      runId: 'borrowed-name',
+      inputData: {},
+    });
+
+    // #then
+    const summary = await app.runtime.status(workflow.id, 'borrowed-name');
+    expect(summary?.status).toBe('failed');
+    expect(summary?.errorEnvelope).toBeUndefined();
+  });
+});

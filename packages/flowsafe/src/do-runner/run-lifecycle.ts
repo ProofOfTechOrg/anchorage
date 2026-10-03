@@ -12,10 +12,31 @@ export const RUN_LIFECYCLE_CONTEXT_KEY = 'flowsafe.runLifecycle';
 
 export type RunTerminalStatus = 'cancelled' | 'timed_out';
 
+const RUN_TERMINAL_ERROR_CODES = [
+  'CANCELLED',
+  'TIMED_OUT',
+  'INTERRUPTED',
+] as const;
+
 export interface RunTerminalErrorEnvelope {
-  code: 'CANCELLED' | 'TIMED_OUT';
+  code: (typeof RUN_TERMINAL_ERROR_CODES)[number];
   message: string;
 }
+
+/** The envelope a stored terminal record carries; an interruption has none. */
+type RunTerminalRecordError = RunTerminalErrorEnvelope & {
+  code: 'CANCELLED' | 'TIMED_OUT';
+};
+
+export function isRunTerminalErrorCode(
+  value: unknown,
+): value is RunTerminalErrorEnvelope['code'] {
+  return (RUN_TERMINAL_ERROR_CODES as readonly unknown[]).includes(value);
+}
+
+/** The `INTERRUPTED` envelope message of a run whose execution leg ended mid-step. */
+export const RUN_INTERRUPTED_MESSAGE =
+  'Run execution stopped mid-step before a durable outcome was recorded; external effects may have occurred. This run will not be automatically re-executed.';
 
 export interface RunLifecycleBlockedReason {
   code: 'DISPUTED_SETTLEMENT';
@@ -64,6 +85,11 @@ export interface RunLifecycleState {
   revision: number;
   /** Epoch milliseconds. */
   deadlineAt?: number;
+  /**
+   * Epoch milliseconds at which the run object settled a run whose execution
+   * leg ended mid-step as `failed`. Only the run object writes it.
+   */
+  interruptedAt?: number;
   economicOperations?: RunEconomicOperation[];
   scheduleDispatch?: RunScheduleDispatch;
   transitionIntent?: {
@@ -75,7 +101,7 @@ export interface RunLifecycleState {
   };
   terminal?: {
     status: RunTerminalStatus;
-    error: RunTerminalErrorEnvelope;
+    error: RunTerminalRecordError;
     transitionedAt: number;
     /** Exact identities allowed to replay this terminal transition after ownership release. */
     replayPrincipals: RunLifecyclePrincipal[];
@@ -311,7 +337,8 @@ export function parseRunLifecycle(
     stored?.version !== 1 ||
     !Number.isSafeInteger(stored.revision) ||
     (stored.revision as number) < 1 ||
-    (stored.deadlineAt !== undefined && !validTime(stored.deadlineAt))
+    (stored.deadlineAt !== undefined && !validTime(stored.deadlineAt)) ||
+    (stored.interruptedAt !== undefined && !validTime(stored.interruptedAt))
   ) {
     throw new Error('stored run lifecycle is malformed');
   }
@@ -321,6 +348,9 @@ export function parseRunLifecycle(
     ...(stored.deadlineAt === undefined
       ? {}
       : { deadlineAt: stored.deadlineAt as number }),
+    ...(stored.interruptedAt === undefined
+      ? {}
+      : { interruptedAt: stored.interruptedAt as number }),
     ...(stored.economicOperations === undefined
       ? {}
       : { economicOperations: economicOperations(stored.economicOperations) }),

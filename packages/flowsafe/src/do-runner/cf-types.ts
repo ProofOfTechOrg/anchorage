@@ -105,6 +105,8 @@ export function safeSend(ws: WebSocketLike, frame: string): void {
  */
 export interface DurableObjectRunnerState {
   waitUntil?(promise: Promise<unknown>): void;
+  /** Reset the object (workerd-only); an interrupted alarm retries afterwards. */
+  abort?(reason?: string): void;
   readonly id: {
     readonly name?: string;
   };
@@ -161,4 +163,9 @@ type _DurableObjectStateHasHibernationApi = AssertTrue<
   }
     ? true
     : false
+>;
+// The same required-shape pin for the optional `abort`, which resets an
+// object whose leg outlived its invocation.
+type _DurableObjectStateHasAbort = AssertTrue<
+  DurableObjectState extends { abort(reason?: string): void } ? true : false
 >;

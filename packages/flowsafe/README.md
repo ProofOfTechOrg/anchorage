@@ -156,6 +156,21 @@ The composed host mounts `POST /runs/:workflowId/:runId/terminate`. It transitio
 
 Termination is idempotent. A retry by the same trusted principal returns the persisted terminal summary after ownership cleanup. An unrelated principal receives the same opaque `404` as any inaccessible run. A disputed economic settlement returns `409` with `reason.code` set to `DISPUTED_SETTLEMENT` before the runtime cancels active work.
 
+A run whose execution leg stops mid-step, because the platform ended the Durable Object invocation, does not stay `running`. A running leg marks its run row in D1 every 30 seconds. Once the row has gone six minutes without a write, the run's own object settles it on its next wake, and it never re-executes the interrupted step:
+
+```json
+{
+  "status": "failed",
+  "error": "Run execution stopped mid-step before a durable outcome was recorded; external effects may have occurred. This run will not be automatically re-executed.",
+  "errorEnvelope": {
+    "code": "INTERRUPTED",
+    "message": "Run execution stopped mid-step before a durable outcome was recorded; external effects may have occurred. This run will not be automatically re-executed."
+  }
+}
+```
+
+A run with a recorded cancellation or timeout completes that transition instead. A deploy does not interrupt a leg: the outgoing instance keeps running it, and its touches keep the run from being settled. A Workers runtime update gives in-flight requests at most 30 seconds, so it interrupts a longer leg. Without a connected client, a Durable Object invocation lasts about 15 minutes, so each step must finish within one. Split long work into steps, and wait in a suspension with a deadline rather than in an in-memory polling loop. Settlement needs the `FencedWorkflowsStorageD1` workflow domain that `createD1Storage()` composes; terminate a stranded run on other storage. See [interrupted legs](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/do-runner-design.md#interrupted-legs).
+
 Economic settlement projections are trusted internal `StartRunOptions.economicOperations` and `ResumeRunOptions.economicOperations` inputs. The host fixes the projection at an execution-leg boundary before that leg becomes cancellable. Public start and resume bodies cannot set it, and Flowsafe does not expose a dynamic mid-leg update API.
 
 The terminal snapshot commits before lifecycle cleanup. Cleanup abandons open approvals, discards an executing agent-schedule receipt, releases run ownership, and then records completion. A crash between those steps reuses the terminal snapshot as its retry anchor. Hosts that compose the run route must override `DurableObjectRunner.runLifecycle()`; use `createFlowsafeRunnerLifecycle()` so approval cleanup uses the same approval service and separation-of-duties configuration as the Worker.

@@ -42,6 +42,7 @@ import {
   type DurableObjectRunOwner,
   type DurableObjectRunOwnershipStore,
   nextDutyAlarmAt,
+  RUN_OWNER_RECOVERY_DELAY_MS,
 } from './durable-object.js';
 import { MUTATION_EPOCH_HEADER } from './execution-admission.js';
 import type { ExecutionFenceDatabase } from './execution-fence.js';
@@ -8733,5 +8734,573 @@ describe('host workflow legacy cleanup wait guards', () => {
         fixture.journal.values.get('flowsafe:run-owner-recovery:v1'),
       ).toEqual({ version: 1 });
     expect(response.status).toBe(503);
+  });
+});
+
+/**
+ * Workflows whose step reports entry and then waits on `hold`: the step a dead
+ * leg leaves behind. Mastra writes the `running` row before it calls the step,
+ * so once `entered` fires the stored run reads `running`. `holding` holds on
+ * its start leg, `holding-resume` on the leg that resumes its suspension, and
+ * `holding-deadline` on the leg its own suspension deadline resumes.
+ */
+function holdingRuntime(
+  storage: MastraCompositeStore,
+  hold: Promise<void> = new Promise<void>(() => undefined),
+  entered: () => void = () => undefined,
+): RunnerRuntime {
+  const { createWorkflow, createStep, runtime } = init(
+    { storage },
+    {
+      executionFence: newTestExecutionFence(storage),
+      startIdempotency: newTestStartIdempotency(storage),
+    },
+  );
+  const holding = (id: string, suspension?: Record<string, unknown>) =>
+    createWorkflow({
+      id,
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+    })
+      .then(
+        createStep({
+          id: 'hold',
+          inputSchema: z.object({}),
+          outputSchema: z.object({}),
+          execute: async ({ resumeData, suspend }) => {
+            if (suspension && !resumeData) return suspend(suspension);
+            entered();
+            await hold;
+            return {};
+          },
+        }),
+      )
+      .commit();
+  holding('holding');
+  holding('holding-resume', { reason: 'awaiting approval' });
+  holding('holding-deadline', {
+    reason: 'awaiting a signal',
+    [SUSPENSION_DEADLINE_PAYLOAD_KEY]: MIN_SUSPENSION_DEADLINE_MS,
+  });
+  return runtime;
+}
+
+/**
+ * Run a wake with the clock past the six minutes a run row must stay untouched
+ * before the run object settles a stopped leg's run.
+ */
+async function afterLegSilence<T>(wake: () => Promise<T>): Promise<T> {
+  const now = vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 360_001);
+  try {
+    return await wake();
+  } finally {
+    now.mockRestore();
+  }
+}
+
+describe('DurableObjectRunner interrupted legs', () => {
+  it('settles a start whose leg died mid-step as failed INTERRUPTED on the next wake', async () => {
+    // #given a start leg executing a step that never returns, and the object
+    // re-created over the same storage the way an eviction re-creates it
+    const storage = testStorage();
+    const journal = durableKeyValueStorageFixture();
+    const entered = deferredSignal();
+    const live = new TestRunner(journal.state, {
+      ...makeProductionEnv(storage),
+      runtime: holdingRuntime(storage, undefined, entered.resolve),
+    });
+    void live.fetch(
+      post('/runs', {
+        workflowId: 'holding',
+        runId: 'run-stranded',
+        inputData: {},
+      }),
+    );
+    await entered.promise;
+    const fresh = holdingRuntime(storage);
+    const evicted = new TestRunner(journal.state, {
+      ...makeProductionEnv(storage),
+      runtime: fresh,
+    });
+
+    // #when
+    await afterLegSilence(() => evicted.alarm());
+
+    // #then
+    const summary = await fresh.status('holding', 'run-stranded');
+    expect(summary).toMatchObject({
+      status: 'failed',
+      errorEnvelope: { code: 'INTERRUPTED' },
+    });
+  });
+
+  it('settles a resume whose leg died mid-step as failed INTERRUPTED on the next wake', async () => {
+    // #given a suspended run whose resume leg is executing a step that never
+    // returns, and the object re-created over the same storage
+    const storage = testStorage();
+    const journal = durableKeyValueStorageFixture();
+    const entered = deferredSignal();
+    const live = new TestRunner(journal.state, {
+      ...makeProductionEnv(storage),
+      runtime: holdingRuntime(storage, undefined, entered.resolve),
+    });
+    const started = await live.fetch(
+      post('/runs', {
+        workflowId: 'holding-resume',
+        runId: 'run-stranded-resume',
+        inputData: {},
+      }),
+    );
+    expect(((await started.json()) as RunSummary).status).toBe('suspended');
+    void live.fetch(
+      post('/runs/holding-resume/run-stranded-resume/resume', {
+        resumeData: { approved: true },
+      }),
+    );
+    await entered.promise;
+    const fresh = holdingRuntime(storage);
+    const evicted = new TestRunner(journal.state, {
+      ...makeProductionEnv(storage),
+      runtime: fresh,
+    });
+
+    // #when
+    await afterLegSilence(() => evicted.alarm());
+
+    // #then
+    const summary = await fresh.status('holding-resume', 'run-stranded-resume');
+    expect(summary).toMatchObject({
+      status: 'failed',
+      errorEnvelope: { code: 'INTERRUPTED' },
+    });
+  });
+
+  /**
+   * A `holding` start whose step has been entered, the runner driving it, and
+   * a factory for the object an eviction would create over the same storage.
+   */
+  async function enteredHoldingStart(
+    runId: string,
+    state: Partial<DurableObjectState> = {},
+  ) {
+    const storage = testStorage();
+    const journal = durableKeyValueStorageFixture();
+    const entered = deferredSignal();
+    const live = new TestRunner(
+      { ...journal.state, ...state } as DurableObjectState,
+      {
+        ...makeProductionEnv(storage),
+        runtime: holdingRuntime(storage, undefined, entered.resolve),
+      },
+    );
+    void live.fetch(
+      post('/runs', { workflowId: 'holding', runId, inputData: {} }),
+    );
+    await entered.promise;
+    const evict = () => {
+      const runtime = holdingRuntime(storage);
+      const env = { ...makeProductionEnv(storage), runtime };
+      return { runtime, env, runner: new TestRunner(journal.state, env) };
+    };
+    return { storage, journal, live, evict };
+  }
+
+  it('lets a wake pass a leg in this object younger than two hours instead of queueing behind it', async () => {
+    // #given a start leg still executing in this object, a second short of
+    // the age at which the object resets it
+    const abort = vi.fn();
+    const { journal, live, evict } = await enteredHoldingStart('run-live-leg', {
+      abort,
+    });
+    const before = Date.now();
+    const now = vi.spyOn(Date, 'now').mockReturnValue(before + 7_199_000);
+
+    // #when — a wake that queued behind the leg's lock would never resolve
+    try {
+      await live.alarm();
+    } finally {
+      now.mockRestore();
+    }
+
+    // #then the wake keeps the recovery cadence and leaves the leg alone
+    expect(abort).not.toHaveBeenCalled();
+    expect(journal.alarms.at(-1)).toBeGreaterThanOrEqual(
+      before + 7_199_000 + RUN_OWNER_RECOVERY_DELAY_MS,
+    );
+    expect(
+      (await evict().runtime.status('holding', 'run-live-leg'))?.status,
+    ).toBe('running');
+  });
+
+  it('resets the object when a leg in it reaches two hours, without writing the run', async () => {
+    // #given a leg two hours old: far past any invocation without a client,
+    // so its promise is one the platform may have stopped without settling
+    const abort = vi.fn();
+    const { live, evict } = await enteredHoldingStart('run-hung-leg', {
+      abort,
+    });
+    const now = vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 7_200_000);
+
+    // #when
+    try {
+      await live.alarm();
+    } finally {
+      now.mockRestore();
+    }
+
+    // #then
+    expect(abort).toHaveBeenCalledTimes(1);
+    expect(
+      (await evict().runtime.status('holding', 'run-hung-leg'))?.status,
+    ).toBe('running');
+  });
+
+  it('leaves a run alone while its row was touched within six minutes, as a leg on an outgoing instance keeps it', async () => {
+    // #given a leg still executing on another instance (an object replaced by
+    // a deploy keeps its in-flight leg running), seen from the new instance
+    const { journal, evict } = await enteredHoldingStart('run-outgoing-leg');
+    const { runtime, runner } = evict();
+
+    // #when the new instance wakes with the row freshly written
+    await runner.alarm();
+
+    // #then nothing settles the run, and the marker stays for a later wake
+    expect((await runtime.status('holding', 'run-outgoing-leg'))?.status).toBe(
+      'running',
+    );
+    expect(journal.values.has('flowsafe:run-leg:v1')).toBe(true);
+  });
+
+  it('marks its run row live on an interval while the leg runs', async () => {
+    // #given a leg whose step is in flight, with interval timers faked
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    try {
+      const storage = testStorage();
+      const entered = deferredSignal();
+      const runtime = holdingRuntime(storage, undefined, entered.resolve);
+      const touch = vi.spyOn(runtime, 'touchRun').mockResolvedValue();
+      const runner = new TestRunner(durableKeyValueStorageFixture().state, {
+        ...makeProductionEnv(storage),
+        runtime,
+      });
+      void runner.fetch(
+        post('/runs', {
+          workflowId: 'holding',
+          runId: 'run-touched-leg',
+          inputData: {},
+        }),
+      );
+      await entered.promise;
+
+      // #when
+      vi.advanceTimersByTime(60_000);
+
+      // #then
+      expect(touch.mock.calls).toEqual([
+        ['holding', 'run-touched-leg'],
+        ['holding', 'run-touched-leg'],
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('settles a suspension-deadline leg that died mid-step on a later wake', async () => {
+    // #given a run whose own deadline resumed it into a step that never
+    // returns, inside the alarm that drives the deadline
+    const storage = testStorage();
+    const journal = durableKeyValueStorageFixture();
+    const entered = deferredSignal();
+    const live = new TestRunner(journal.state, {
+      ...makeProductionEnv(storage),
+      runtime: holdingRuntime(storage, undefined, entered.resolve),
+    });
+    await live.fetch(
+      post('/runs', {
+        workflowId: 'holding-deadline',
+        runId: 'run-stranded-deadline',
+        inputData: {},
+      }),
+    );
+    const due = vi
+      .spyOn(Date, 'now')
+      .mockReturnValue(Date.now() + MIN_SUSPENSION_DEADLINE_MS + 1_000);
+    try {
+      void live.alarm();
+      await entered.promise;
+    } finally {
+      due.mockRestore();
+    }
+    const fresh = holdingRuntime(storage);
+    const evicted = new TestRunner(journal.state, {
+      ...makeProductionEnv(storage),
+      runtime: fresh,
+    });
+
+    // #when
+    await afterLegSilence(() => evicted.alarm());
+
+    // #then
+    expect(
+      await fresh.status('holding-deadline', 'run-stranded-deadline'),
+    ).toMatchObject({
+      status: 'failed',
+      errorEnvelope: { code: 'INTERRUPTED' },
+    });
+  });
+
+  it.each([
+    [
+      'rejects',
+      async (): Promise<RunSummary> => {
+        throw new Error('invocation cancelled');
+      },
+    ],
+    [
+      'answers with the stored running row',
+      async (): Promise<RunSummary> => ({
+        runId: 'run-rejected-leg',
+        status: 'running',
+      }),
+    ],
+  ])('settles a run whose resume leg %s after the step began, on the next wake', async (_ending, ending) => {
+    // #given a resume leg that ends while its step is still in flight, as when
+    // the platform cancels the invocation: the engine promise rejects, or the
+    // runtime recovers the persisted `running` row for it
+    const storage = testStorage();
+    const journal = durableKeyValueStorageFixture();
+    const entered = deferredSignal();
+    const real = holdingRuntime(storage, undefined, entered.resolve);
+    const cancelling = new Proxy(real, {
+      get: (target, property) => {
+        if (property === 'resume')
+          return (...args: Parameters<RunnerRuntime['resume']>) =>
+            Promise.race([
+              target.resume(...args),
+              entered.promise.then(ending),
+            ]);
+        const value: unknown = Reflect.get(target, property, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    const live = new TestRunner(journal.state, {
+      ...makeProductionEnv(storage),
+      runtime: cancelling,
+    });
+    await live.fetch(
+      post('/runs', {
+        workflowId: 'holding-resume',
+        runId: 'run-rejected-leg',
+        inputData: {},
+      }),
+    );
+    await live.fetch(
+      post('/runs/holding-resume/run-rejected-leg/resume', {
+        resumeData: { approved: true },
+      }),
+    );
+    const fresh = holdingRuntime(storage);
+    const evicted = new TestRunner(journal.state, {
+      ...makeProductionEnv(storage),
+      runtime: fresh,
+    });
+
+    // #when
+    await afterLegSilence(() => evicted.alarm());
+
+    // #then
+    expect(
+      await fresh.status('holding-resume', 'run-rejected-leg'),
+    ).toMatchObject({
+      status: 'failed',
+      errorEnvelope: { code: 'INTERRUPTED' },
+    });
+  });
+
+  it('drops a leg marker whose run is still suspended and leaves the run as it was', async () => {
+    // #given a suspended run and the marker of a resume leg that stopped
+    // before its first write
+    const storage = testStorage();
+    const journal = durableKeyValueStorageFixture();
+    const runtime = holdingRuntime(storage);
+    const runner = new TestRunner(journal.state, {
+      ...makeProductionEnv(storage),
+      runtime,
+    });
+    await runner.fetch(
+      post('/runs', {
+        workflowId: 'holding-resume',
+        runId: 'run-unstarted-resume',
+        inputData: {},
+      }),
+    );
+    journal.values.set('flowsafe:run-leg:v1', {
+      version: 1,
+      workflowId: 'holding-resume',
+      runId: 'run-unstarted-resume',
+      token: 'leg-before-first-write',
+      trigger: 'resume',
+      startedAt: Date.now(),
+    });
+    const settle = vi.spyOn(runtime, 'settleInterruptedRun');
+
+    // #when
+    await runner.alarm();
+
+    // #then
+    expect(settle).toHaveBeenCalledOnce();
+    expect(journal.values.has('flowsafe:run-leg:v1')).toBe(false);
+    expect(
+      (await runtime.status('holding-resume', 'run-unstarted-resume'))?.status,
+    ).toBe('suspended');
+  });
+
+  it.each([
+    'running',
+    'canceled',
+  ] as const)('completes a cancellation recorded before the leg stopped, from a %s row', async (stored) => {
+    // #given a stranded start whose cancellation intent was persisted; a
+    // cancel that already took effect leaves Mastra's `canceled` precursor
+    const { storage, evict } = await enteredHoldingStart('run-intent-leg');
+    const { runtime, env, runner } = evict();
+    await runtime.cancelActiveExecution(
+      'holding',
+      'run-intent-leg',
+      'cancelled',
+      [{ kind: 'human', id: OWNER_PRINCIPAL.id }],
+    );
+    if (stored === 'canceled') {
+      const workflows = await storage.getStore('workflows');
+      const snapshot = await workflows?.loadWorkflowSnapshot({
+        workflowName: 'holding',
+        runId: 'run-intent-leg',
+      });
+      if (!workflows || !snapshot) throw new Error('missing stranded row');
+      await workflows.persistWorkflowSnapshot({
+        workflowName: 'holding',
+        runId: 'run-intent-leg',
+        snapshot: { ...snapshot, status: 'canceled' },
+      });
+    }
+
+    // #when
+    await afterLegSilence(() => runner.alarm());
+
+    // #then the recorded request owns the outcome, with its cleanup
+    expect(await runtime.status('holding', 'run-intent-leg')).toMatchObject({
+      status: 'cancelled',
+      errorEnvelope: { code: 'CANCELLED' },
+    });
+    expect(await env.owners.owner('run', 'run-intent-leg')).toBeUndefined();
+  });
+
+  function seededLegMarker(workflowId: string, startedAt: number) {
+    return {
+      version: 1,
+      workflowId,
+      runId: 'run-unsettled',
+      token: 'unsettled-leg',
+      trigger: 'resume',
+      startedAt,
+    };
+  }
+
+  it('keeps the recovery cadence while a leg marker cannot settle yet', async () => {
+    // #given a marker whose run cannot be settled: its workflow is not
+    // registered on this runtime
+    const events: string[] = [];
+    const journal = durableKeyValueStorageFixture(events);
+    journal.values.set(
+      'flowsafe:run-leg:v1',
+      seededLegMarker('unregistered', Date.now()),
+    );
+    const runner = new TestRunner(journal.state, makeProductionEnv());
+
+    // #when
+    await runner.alarm();
+
+    // #then the wake re-arms instead of deleting the alarm
+    expect(journal.values.has('flowsafe:run-leg:v1')).toBe(true);
+    expect(events.at(-1)).toBe('setAlarm');
+  });
+
+  it('drops a leg marker that has not settled for a day', async () => {
+    // #given an unsettleable marker whose leg began more than a day ago
+    const journal = durableKeyValueStorageFixture();
+    journal.values.set(
+      'flowsafe:run-leg:v1',
+      seededLegMarker('unregistered', Date.now() - 86_400_001),
+    );
+    const runner = new TestRunner(journal.state, makeProductionEnv());
+
+    // #when
+    await runner.alarm();
+
+    // #then
+    expect(journal.values.has('flowsafe:run-leg:v1')).toBe(false);
+  });
+
+  it('arms a wake before a resume leg writes its marker', async () => {
+    // #given a suspended run on an object with no wake pending
+    const events: string[] = [];
+    const journal = durableKeyValueStorageFixture(events);
+    const storage = testStorage();
+    const entered = deferredSignal();
+    const runner = new TestRunner(journal.state, {
+      ...makeProductionEnv(storage),
+      runtime: holdingRuntime(storage, undefined, entered.resolve),
+    });
+    await runner.fetch(
+      post('/runs', {
+        workflowId: 'holding-resume',
+        runId: 'run-armed-resume',
+        inputData: {},
+      }),
+    );
+    const resumeEvents = events.length;
+
+    // #when
+    void runner.fetch(
+      post('/runs/holding-resume/run-armed-resume/resume', {
+        resumeData: { approved: true },
+      }),
+    );
+    await entered.promise;
+
+    // #then a leg that dies from here on still has a wake to settle it
+    const leg = events.slice(resumeEvents);
+    expect(leg.indexOf('setAlarm')).toBeGreaterThan(-1);
+    expect(leg.indexOf('setAlarm')).toBeLessThan(
+      leg.indexOf('put:flowsafe:run-leg:v1'),
+    );
+  });
+
+  it('drops the leg wake once a resume finishes the run', async () => {
+    // #given a suspended run
+    const events: string[] = [];
+    const { state } = durableKeyValueStorageFixture(events);
+    const storage = testStorage();
+    const runner = new TestRunner(state, {
+      ...makeProductionEnv(storage),
+      runtime: holdingRuntime(storage, Promise.resolve()),
+    });
+    await runner.fetch(
+      post('/runs', {
+        workflowId: 'holding-resume',
+        runId: 'run-resumed-to-end',
+        inputData: {},
+      }),
+    );
+
+    // #when
+    const resumed = await runner.fetch(
+      post('/runs/holding-resume/run-resumed-to-end/resume', {
+        resumeData: { approved: true },
+      }),
+    );
+
+    // #then no wake stays armed for a run with nothing pending
+    expect(((await resumed.json()) as RunSummary).status).toBe('success');
+    expect(events.at(-1)).toBe('deleteAlarm');
   });
 });

@@ -15,6 +15,7 @@ import {
   type StartExecutionIdentity,
 } from '../do-runner/execution-admission.js';
 import type { RunSummary } from '../do-runner/index.js';
+import { isRunTerminalErrorCode } from '../do-runner/run-lifecycle.js';
 import { isRunStatus } from '../do-runner/run-terminal-state.js';
 import type { PersistedStartResult } from '../do-runner/start-idempotency.js';
 import { RunRouteError } from './run-route-error.js';
@@ -212,7 +213,7 @@ export function publicRunSummary(value: unknown, runId: string): RunSummary {
   if (summary.errorEnvelope !== undefined) {
     const error = persistedStartRecord(summary.errorEnvelope);
     if (
-      (error.code !== 'CANCELLED' && error.code !== 'TIMED_OUT') ||
+      !isRunTerminalErrorCode(error.code) ||
       typeof error.message !== 'string'
     )
       invalid();

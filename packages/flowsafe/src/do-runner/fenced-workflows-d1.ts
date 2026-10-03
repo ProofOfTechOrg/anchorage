@@ -80,6 +80,7 @@ import {
   readRawWorkflowSnapshot,
   type SnapshotStatement,
   snapshotResultRows,
+  touchRawWorkflowSnapshot,
 } from './workflow-snapshot-row.js';
 
 const PROVENANCE = 'flowsafe.runProvenance';
@@ -626,6 +627,19 @@ export class FencedWorkflowsStorageD1 extends WorkflowsStorageD1 {
           ),
         terminalizeInitialAdmission: (request: InitialTerminalizationRequest) =>
           this.#terminalizeInitialAdmission(request),
+        touchRun: (
+          address: { workflowId: string; runId: string },
+          nowMs: number,
+        ) =>
+          touchRawWorkflowSnapshot(
+            database,
+            {
+              tablePrefix,
+              workflowId: address.workflowId,
+              runId: address.runId,
+            },
+            nowMs,
+          ),
       });
       this[FENCED_WORKFLOW_STORAGE] = this.#admission;
     }

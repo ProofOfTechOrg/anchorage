@@ -8,9 +8,10 @@
 // enforced by RunnerRuntime's per-run FIFO locks; routing one DO instance per run
 // (idFromName(`${workflowId}:${runId}`)) makes those locks authoritative,
 // since all traffic for a run lands on one instance. The object's alarm is
-// reserved for recovering run-owner claims that outlive an interrupted start
-// and for the per-suspension deadlines of this run (suspension-deadline.ts);
-// both duties share one wake, armed at the earliest of the two due times.
+// reserved for settling a run whose execution leg stopped mid-step, for
+// recovering run-owner claims that outlive an interrupted start, and for the
+// per-suspension deadlines of this run (suspension-deadline.ts); the duties
+// share one wake, armed at the earliest due time.
 
 import {
   decodeExecutionPrincipal,
@@ -54,11 +55,16 @@ import {
   lifecycleFromRequestContext,
   terminalCleanupFor,
 } from './run-lifecycle.js';
-import { isTerminalRunStatus } from './run-terminal-state.js';
+import {
+  isDurableRunStatus,
+  isTerminalRunStatus,
+} from './run-terminal-state.js';
 import {
   type AuthoritativeStartState,
+  type InterruptedRunSettlement,
   InvalidRunRequestError,
   type RecoveredStart,
+  RUN_LEG_TOUCH_MS,
   RunAlreadyExistsError,
   type RunLifecycleCas,
   type RunLifecycleTransitionResult,
@@ -169,6 +175,36 @@ const SUSPENSION_DEADLINE_UNREADABLE_LIMIT_MS = 86_400_000;
 // deferred to the watchdog — up to a minute late, and only while the fault
 // lasts.
 const SUSPENSION_DEADLINE_ARM_FLOOR_MS = 1_000;
+// The marker of the execution leg this object is driving. It outlives an
+// isolate that dies mid-step, which is how the next wake learns that a run
+// left `running` has nothing driving it.
+const RUN_LEG_KEY = 'flowsafe:run-leg:v1';
+// Far past the 15 minutes a pending operation keeps a Durable Object running
+// without a connected client. A leg frame this old belongs to an invocation
+// that ended without settling the leg's promise — which still holds this
+// object's locks — or to a leg whose client has stayed connected all along.
+// Resetting the object bounds the first and ends the second.
+const RUN_LEG_MAX_AGE_MS = 7_200_000;
+// The bound on a marker whose run cannot be settled, for instance because a
+// deploy unregistered its workflow: the bound the suspension-deadline duty
+// allows an unreadable run.
+const RUN_LEG_UNSETTLED_LIMIT_MS = SUSPENSION_DEADLINE_UNREADABLE_LIMIT_MS;
+
+type RunLegTrigger = 'start' | 'resume' | 'deadline';
+
+interface RunLegMarker {
+  version: 1;
+  workflowId: string;
+  runId: string;
+  token: string;
+  trigger: RunLegTrigger;
+  startedAt: number;
+}
+
+interface RunLegFrame {
+  token: string;
+  startedAt: number;
+}
 
 type RunOwnerRecovery = {
   version: 2;
@@ -200,6 +236,34 @@ function recoveryObject(value: unknown): Record<string, unknown> {
     copy[key] = descriptor.value;
   }
   return copy;
+}
+
+function runLegMarker(value: unknown): RunLegMarker {
+  let stored: Record<string, unknown>;
+  try {
+    stored = recoveryObject(value);
+  } catch {
+    throw new Error('stored run leg marker is malformed');
+  }
+  if (
+    stored.version !== 1 ||
+    !isPathSafeId(stored.workflowId) ||
+    !isPathSafeId(stored.runId) ||
+    !isPathSafeId(stored.token) ||
+    (stored.trigger !== 'start' &&
+      stored.trigger !== 'resume' &&
+      stored.trigger !== 'deadline') ||
+    !Number.isSafeInteger(stored.startedAt)
+  )
+    throw new Error('stored run leg marker is malformed');
+  return {
+    version: 1,
+    workflowId: stored.workflowId,
+    runId: stored.runId,
+    token: stored.token,
+    trigger: stored.trigger,
+    startedAt: stored.startedAt as number,
+  };
 }
 
 function sameRunRecovery(
@@ -328,6 +392,8 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
   #reportedSuspensionRejections = new Set<string>();
   /** Persisted claims outlive an isolate and cannot establish run liveness. */
   readonly #startsInFlight = new Map<string, RunStartFrame>();
+  /** Execution legs running in this isolate. */
+  readonly #legs = new Set<RunLegFrame>();
 
   constructor(state: DurableObjectRunnerState | undefined, env: TEnv) {
     this.state = state;
@@ -699,8 +765,9 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
   }
 
   /**
-   * The arming path for this object's one alarm, which two independent duties
-   * share: run-owner recovery and the run's suspension deadlines. Every arm
+   * The arming path for this object's one alarm, which independent duties
+   * share: run-owner recovery and leg settlement (one cadence, kept while
+   * either record exists) and the run's suspension deadlines. Every arm
    * that reflects CONVERGED state routes through here, or through the
    * #armAlarmFor it delegates to, because an alarm set for one duty from a
    * site that cannot see the other would silently drop the other's wake — a
@@ -739,9 +806,12 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
       );
     }
     const suspensionDueAt = nextSuspensionDeadlineAt(stored);
+    // A leg marker keeps the recovery cadence: it is the wake that finds a
+    // leg which stopped without reaching a durable state.
     const recoveryDue =
       recoveryDueAt ??
-      ((await storage.get<unknown>(RUN_OWNER_RECOVERY_KEY)) !== undefined
+      ((await storage.get<unknown>(RUN_OWNER_RECOVERY_KEY)) !== undefined ||
+      (await storage.get<unknown>(RUN_LEG_KEY)) !== undefined
         ? Date.now() + RUN_OWNER_RECOVERY_DELAY_MS
         : undefined);
     // `now` is sampled AFTER the awaited recovery-key read above. Hoisting it
@@ -1397,12 +1467,19 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
       );
       return;
     }
-    const next = await runtime.resume(workflowId, runId, {
-      step: [entry.step],
-      resumeData: suspensionTimeoutResumeData(entry, now),
-      requestedBy: SUSPENSION_DEADLINE_PRINCIPAL_ID,
-      requestedByKind: 'system',
-    });
+    const next = await this.#withLeg(
+      workflowId,
+      runId,
+      'deadline',
+      () =>
+        runtime.resume(workflowId, runId, {
+          step: [entry.step],
+          resumeData: suspensionTimeoutResumeData(entry, now),
+          requestedBy: SUSPENSION_DEADLINE_PRINCIPAL_ID,
+          requestedByKind: 'system',
+        }),
+      true,
+    );
     // EVERYTHING after this point is best effort, because the resume has
     // already run the step: charging a bookkeeping failure to the retry ledger
     // would record a failed resume that in fact succeeded, and could resume the
@@ -1424,9 +1501,8 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
    * directly from the one it read): re-derive this run's deadlines from
    * authoritative state. The set of wakes that land here with nothing due is
    * ordinary, not anomalous — the watchdog survivor whose duty already ran,
-   * H1's retry wake after a failed reconcile, a recovery-armed wake whose
-   * start body outlived the 60 s recovery delay (a healthy slow workflow), a
-   * workerd alarm redelivery or at-least-once retry after a rethrown recovery
+   * H1's retry wake after a failed reconcile, a recovery-armed wake that fell
+   * due after its start leg returned, a workerd alarm redelivery or at-least-once retry after a rethrown recovery
    * error (up to 6 retries), and an entry still inside the 1 s arm floor. The
    * `authoritativeStatus()` read lands off the lifecycle hot path on exactly
    * those wakes — and it is the authoritative read, not `status()`, because
@@ -1820,7 +1896,233 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
     }
   }
 
+  /**
+   * Drive one execution leg under a durable marker and an in-memory frame.
+   *
+   * The marker is written before the engine runs and removed once the leg is
+   * known to have left the run in a durable state (suspended or terminal). A
+   * leg that throws is not such evidence: when a platform limit cancels the
+   * invocation, the engine's promise rejects mid-step and this frame still
+   * unwinds, so a throw clears the marker only when an authoritative read then
+   * shows a durable run — the read a cancelled invocation cannot make. A kept
+   * marker is the next wake's to settle.
+   *
+   * While the leg runs it also marks its run row live in D1 every
+   * RUN_LEG_TOUCH_MS. The marker says a leg began; the touch says one is still
+   * running, from whichever instance runs it — during a deploy an outgoing
+   * instance keeps executing a leg that never touches this object's storage,
+   * while the next wake already runs on the new instance.
+   *
+   * `armed` is true where the caller already holds a wake within the recovery
+   * delay: the start journal's, or the watchdog an alarm body opens with.
+   * Clearing never arms: each caller's own boundary re-arms from what is left.
+   * Everything after `body` is best effort, because the leg has already run.
+   */
+  async #withLeg(
+    workflowId: string,
+    runId: string,
+    trigger: RunLegTrigger,
+    body: () => Promise<RunSummary>,
+    armed: boolean,
+  ): Promise<RunSummary> {
+    const runtime = this.#ensureRuntime();
+    const frame: RunLegFrame = {
+      token: crypto.randomUUID(),
+      startedAt: Date.now(),
+    };
+    this.#legs.add(frame);
+    const touch = setInterval(() => {
+      runtime
+        .touchRun(workflowId, runId)
+        .catch((error: unknown) =>
+          console.error('run leg liveness touch failed', error),
+        );
+    }, RUN_LEG_TOUCH_MS);
+    const clearIfDurable = async (summary: RunSummary | null) => {
+      try {
+        if (summary && isDurableRunStatus(summary.status))
+          await this.#clearLegMarker(frame.token);
+      } catch (error) {
+        console.error('run leg marker clear failed', error);
+      }
+    };
+    try {
+      const storage = this.state?.storage;
+      if (storage) {
+        if (!armed)
+          await this.#armNextAlarm(Date.now() + RUN_OWNER_RECOVERY_DELAY_MS);
+        await storage.put<RunLegMarker>(RUN_LEG_KEY, {
+          version: 1,
+          workflowId,
+          runId,
+          token: frame.token,
+          trigger,
+          startedAt: frame.startedAt,
+        });
+      }
+      let summary: RunSummary;
+      try {
+        summary = await body();
+      } catch (error) {
+        let current: RunSummary | null = null;
+        try {
+          current = await runtime.authoritativeStatus(workflowId, runId);
+        } catch {
+          // Unreadable: the marker stays for the next wake.
+        }
+        await clearIfDurable(current);
+        throw error;
+      }
+      await clearIfDurable(summary);
+      return summary;
+    } finally {
+      clearInterval(touch);
+      this.#legs.delete(frame);
+    }
+  }
+
+  /** Remove the leg marker unless a later leg has replaced it. */
+  async #clearLegMarker(token: string): Promise<void> {
+    const storage = this.state?.storage;
+    if (!storage) return;
+    const stored = await storage.get<unknown>(RUN_LEG_KEY);
+    if (stored === undefined) return;
+    let current: RunLegMarker | undefined;
+    try {
+      current = runLegMarker(stored);
+    } catch {
+      current = undefined;
+    }
+    if (current !== undefined && current.token !== token) return;
+    await storage.delete(RUN_LEG_KEY);
+  }
+
+  /**
+   * The alarm's check before it queues behind the operation lock, which a leg
+   * holds for its whole run. It reads only this isolate's frames, so the
+   * watchdog it may arm is still the wake's first storage operation.
+   *
+   * A leg in this isolate is executing as far as the isolate can tell: the
+   * wake has nothing to do while it runs (the run is not suspended, and its
+   * start journal cannot be recovered while it is live), so it keeps the
+   * recovery cadence instead of waiting out the leg — which can outlast the
+   * alarm's own wall-time limit.
+   *
+   * A frame older than RUN_LEG_MAX_AGE_MS is reset instead. Its promise still
+   * holds the operation and run locks, so nothing in this isolate can settle
+   * the run; the interrupted alarm retries on a fresh instance, which settles
+   * through #settleInterruptedLeg. Writing the snapshot from here would race a
+   * promise that could still write it. Returns whether this wake stops here.
+   */
+  async #deferToLiveLeg(): Promise<boolean> {
+    const frames = [...this.#legs];
+    if (frames.length === 0) return false;
+    const now = Date.now();
+    if (frames.some((frame) => now - frame.startedAt >= RUN_LEG_MAX_AGE_MS)) {
+      console.error(
+        JSON.stringify({ type: 'run-leg-reset', legs: frames.length }),
+      );
+      this.state?.abort?.('flowsafe: run leg outlived its invocation');
+    }
+    await this.#armAlarmWatchdog();
+    return true;
+  }
+
+  /**
+   * Settle the run a leg marker names once no leg of this object drives it.
+   *
+   * The first duty of every alarm body, ahead of start recovery: a stranded
+   * start settled here reaches the journal duty as a terminal run, whose
+   * terminal branch settles the start reservation and clears the journal.
+   *
+   * The marker is this object's own record, written only after its run's
+   * identity was asserted, so its ids are asserted against `id.name` like the
+   * start journal's. No leg of this object can be executing here: each one
+   * drops its frame before it releases the operation lock this duty runs
+   * under. A leg on an instance being replaced still touches the run row, and
+   * the runtime settles nothing while it does (`live`).
+   *
+   * A refused or `live` settlement keeps the marker, so the recovery cadence
+   * retries it, for at most RUN_LEG_UNSETTLED_LIMIT_MS after the leg began;
+   * past that the marker is dropped with a log line rather than waking the
+   * object forever.
+   */
+  async #settleInterruptedLeg(): Promise<void> {
+    const storage = this.state?.storage;
+    if (!storage) return;
+    const stored = await storage.get<unknown>(RUN_LEG_KEY);
+    if (stored === undefined) return;
+    let marker: RunLegMarker;
+    try {
+      marker = runLegMarker(stored);
+    } catch (error) {
+      console.error('stored run leg marker discarded', error);
+      await storage.delete(RUN_LEG_KEY);
+      return;
+    }
+    const { workflowId, runId } = marker;
+    const dropIfStale = async (cause?: unknown): Promise<boolean> => {
+      if (Date.now() - marker.startedAt < RUN_LEG_UNSETTLED_LIMIT_MS)
+        return false;
+      console.error(
+        `run leg marker for run '${runId}' of workflow '${workflowId}' dropped without settlement`,
+        cause,
+      );
+      await this.#clearLegMarker(marker.token);
+      return true;
+    };
+    let settled: InterruptedRunSettlement;
+    let runtime: RunnerRuntime;
+    try {
+      this.#assertRunIdentity(workflowId, runId);
+      runtime = this.#ensureRuntime();
+      settled = await runtime.settleInterruptedRun(workflowId, runId);
+    } catch (error) {
+      if (await dropIfStale(error)) return;
+      throw error;
+    }
+    if (settled.kind === 'live') {
+      await dropIfStale();
+      return;
+    }
+    let summary: RunSummary | undefined;
+    if (settled.kind === 'interrupted') {
+      summary = settled.summary;
+      console.error(
+        JSON.stringify({
+          type: 'run-leg-interrupted',
+          workflowId,
+          runId,
+          trigger: marker.trigger,
+        }),
+      );
+    } else if (settled.kind === 'transition') {
+      const owner = await this.runOwnership(this.env).owner('run', runId);
+      summary = await this.#finalizeTerminal(
+        runtime,
+        workflowId,
+        runId,
+        owner ?? settled.replayPrincipal,
+        settled.transition,
+      );
+    }
+    if (summary) {
+      try {
+        this.#broadcastRunSummary(summary);
+      } catch (error) {
+        console.error('interrupted run broadcast failed', error);
+      }
+      await this.#reconcileSuspensionDeadlinesBestEffort(
+        workflowId,
+        runId,
+        summary,
+      );
+    }
+    await this.#clearLegMarker(marker.token);
+  }
+
   async alarm(): Promise<void> {
+    if (await this.#deferToLiveLeg()) return;
     await this.#withOperationLock(async () => {
       await this.#armAlarmWatchdog();
       // The watchdog arm above is deliberately the ONLY arm on the path where
@@ -1831,9 +2133,16 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
       // long as the misbinding lasts. Failing with the watchdog in place keeps
       // the recovery cadence this object woke at before it served deadlines.
       await verifyDurableObjectDeploymentIdentity(this.state, this.env);
-      // The two duties are failure-isolated: a run-owner recovery that throws
-      // must not skip a due suspension deadline (and its re-arm), and neither
-      // must be able to leave the object with no wake at all.
+      // The duties are failure-isolated: none that throws may skip the
+      // others (or their re-arm), and none may leave the object with no wake.
+      // A leg settlement that fails keeps its marker, which the final arm
+      // reads back into the recovery cadence; it is never rethrown, because a
+      // retried alarm would repeat the other duties' work.
+      try {
+        await this.#settleInterruptedLeg();
+      } catch (error) {
+        console.error('interrupted run leg settlement failed', error);
+      }
       let recoveryError: unknown;
       try {
         await this.#recoverPendingRunOwner();
@@ -2035,28 +2344,35 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
           await this.#reserveRunOwner(startRunId, owner, recovery.token);
           let summary: RunSummary;
           try {
-            summary = await runtime.start(startWorkflowId, {
-              runId: startRunId,
-              inputData: resolvedInput,
-              initialState: resolvedState,
-              ...(storedRequestContext !== undefined
-                ? { storedRequestContext }
-                : {}),
-              requestedBy: principal.id,
-              requestedByKind: principal.kind,
-              attemptToken: recovery.token,
-              ...(mutationEpoch === undefined ? {} : { mutationEpoch }),
-              startIdentity,
-              startReservation,
-              runOwnerGuard: { owner, reservationToken: recovery.token },
-              onPreparedStartIdentity: async (execution) => {
-                recovery = await this.#prepareRunOwner(recovery, execution);
-              },
-              ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
-              ...(deadlineMs === undefined
-                ? {}
-                : { deadlineMs: deadlineMs as number }),
-            });
+            summary = await this.#withLeg(
+              startWorkflowId,
+              startRunId,
+              'start',
+              () =>
+                runtime.start(startWorkflowId, {
+                  runId: startRunId,
+                  inputData: resolvedInput,
+                  initialState: resolvedState,
+                  ...(storedRequestContext !== undefined
+                    ? { storedRequestContext }
+                    : {}),
+                  requestedBy: principal.id,
+                  requestedByKind: principal.kind,
+                  attemptToken: recovery.token,
+                  ...(mutationEpoch === undefined ? {} : { mutationEpoch }),
+                  startIdentity,
+                  startReservation,
+                  runOwnerGuard: { owner, reservationToken: recovery.token },
+                  onPreparedStartIdentity: async (execution) => {
+                    recovery = await this.#prepareRunOwner(recovery, execution);
+                  },
+                  ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
+                  ...(deadlineMs === undefined
+                    ? {}
+                    : { deadlineMs: deadlineMs as number }),
+                }),
+              true,
+            );
           } finally {
             frame.unwound = true;
           }
@@ -2212,20 +2528,38 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
         // resumes — the suspended runs it is draining are waiting for exactly
         // these — and proof-only admits its one nominated run.
         await runtime.assertExistingRunAllowed(workflowId, runId);
-        const summary = await runtime.resume(workflowId, runId, {
-          step: body.step,
-          resumeData,
-          requestedBy,
-          requestedByKind,
-          ...(body.deadlineMs === undefined
-            ? {}
-            : { deadlineMs: body.deadlineMs as number }),
-        });
-        await this.#reconcileSuspensionDeadlinesBestEffort(
+        const summary = await this.#withLeg(
           workflowId,
           runId,
-          summary,
+          'resume',
+          () =>
+            runtime.resume(workflowId, runId, {
+              step: body.step,
+              resumeData,
+              requestedBy,
+              requestedByKind,
+              ...(body.deadlineMs === undefined
+                ? {}
+                : { deadlineMs: body.deadlineMs as number }),
+            }),
+          false,
         );
+        // The leg armed a recovery-cadence wake for its marker. A boundary
+        // that converged re-arms from what is left, which drops that wake
+        // when nothing is pending; one that did not keeps its retry wake.
+        if (
+          await this.#reconcileSuspensionDeadlinesBestEffort(
+            workflowId,
+            runId,
+            summary,
+          )
+        ) {
+          try {
+            await this.#armNextAlarm();
+          } catch (error) {
+            console.error('resume boundary re-arm failed', error);
+          }
+        }
         // Broadcast the post-resume authoritative summary.
         this.#broadcastRunSummary(summary);
         return json(summary);

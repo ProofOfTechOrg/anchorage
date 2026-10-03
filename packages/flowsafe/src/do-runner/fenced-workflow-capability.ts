@@ -85,4 +85,12 @@ export interface FencedWorkflowAdmissionCapability {
   terminalizeInitialAdmission(
     request: InitialTerminalizationRequest,
   ): Promise<InitialTerminalizationResult>;
+  /**
+   * Mark an executing leg's run row live by its `updatedAt` alone. Without it
+   * a run whose leg stops is never settled automatically.
+   */
+  touchRun?(
+    address: { workflowId: string; runId: string },
+    nowMs: number,
+  ): Promise<void>;
 }

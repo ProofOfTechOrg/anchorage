@@ -479,6 +479,20 @@ describe('lifecycle metadata compatibility', () => {
     expect(parseRunLifecycle(lifecycle)).toStrictEqual(lifecycle);
   });
 
+  it('keeps a stored interruption time and refuses one that is not a time', () => {
+    const lifecycle: RunLifecycleState = {
+      version: 1,
+      revision: 2,
+      interruptedAt: 1_751_883_300_000,
+    };
+    expect(parseRunLifecycle(lifecycle)).toStrictEqual(lifecycle);
+    for (const interruptedAt of [-1, 1.5, '1751883300000', null]) {
+      expect(() => parseRunLifecycle({ ...lifecycle, interruptedAt })).toThrow(
+        'stored run lifecycle is malformed',
+      );
+    }
+  });
+
   it('preserves the moved blocked error name, message and reason object', () => {
     const reason: RunLifecycleBlockedReason = {
       code: 'DISPUTED_SETTLEMENT',

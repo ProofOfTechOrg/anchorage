@@ -460,6 +460,26 @@ describe('protected replay workflow transport', () => {
     ).resolves.toEqual({ kind: 'result', execution, value });
   });
 
+  it('replays an interrupted run with its envelope', async () => {
+    // #given the persisted result of a run whose leg stopped mid-step
+    const interrupted = {
+      runId: 'run-1',
+      status: 'failed',
+      error: 'leg stopped',
+      errorEnvelope: { code: 'INTERRUPTED', message: 'leg stopped' },
+    };
+    const { topology } = topologyFor({
+      kind: 'result',
+      execution,
+      value: interrupted,
+    });
+
+    // #when / #then
+    await expect(
+      topology.persistedStart('workflow-1', 'run-1'),
+    ).resolves.toEqual({ kind: 'result', execution, value: interrupted });
+  });
+
   it.each([
     ['missing discriminator', { execution, value }],
     ['initial with value', { kind: 'initial', execution, value }],

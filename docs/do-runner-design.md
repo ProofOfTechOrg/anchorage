@@ -109,6 +109,43 @@ Terminate:
 
 A repeated request reads the terminal snapshot and returns the same summary. After ownership release, the public router delegates replay authorization to the owner object. The object accepts only a principal recorded by the original transition.
 
+Terminate is also the operator primitive for a run that no leg drives: it transitions a `running` run, reading the run's snapshot as step 2 describes.
+
+### Interrupted legs
+
+An execution leg is one start, one resume, or one suspension-deadline resume. A leg runs inside a single Durable Object invocation, and the platform can end that invocation while a step is awaiting I/O: without a connected client, each pending operation keeps the object running for at most 15 minutes, and an alarm handler for at most 15 minutes. Mastra persists `running` when each step begins, so a leg that stops mid-step leaves a `running` row that nothing else will advance.
+
+The run object records each leg it drives:
+
+1. Before the engine runs, it arms a wake within the 60-second recovery cadence and writes a leg marker to its own storage.
+2. While the leg runs, an in-memory frame records that this isolate is executing it, and every 30 seconds the leg sets its run row's `updatedAt` in D1 without writing the snapshot.
+3. When the leg returns a suspended or terminal run, the marker is removed. A leg that throws removes it only when an authoritative read shows a suspended or terminal run, because a cancelled invocation rejects the engine's promise mid-step.
+
+The `updatedAt` touch is the evidence that a leg is still running. When a deploy or a partition replaces the object, the outgoing instance keeps executing an in-flight leg that does not touch the object's own storage, while new events, including the alarm, reach the new instance. The touch goes to D1 from whichever instance runs the leg. A Workers runtime update also replaces the object, but it gives in-flight requests at most 30 seconds, so it interrupts a leg that runs longer.
+
+Each wake first handles a marker:
+
+- A leg frame in this isolate means the leg is still executing as far as the isolate can tell. The wake re-arms the cadence and returns without waiting for the leg's lock.
+- A leg frame older than two hours is reset with `ctx.abort()`. Such a frame belongs to an invocation that ended without settling the leg's promise, which still holds the object's locks, or to a leg whose client stayed connected for two hours. The interrupted alarm retries on a fresh instance.
+- With no leg in this isolate, the wake reads authoritative state. An absent run, a suspended run, or a terminal run whose cleanup has completed clears the marker. Otherwise the run is settled only once its row has gone six minutes without a write. Six minutes exceeds the largest Workers CPU limit, the longest a busy step can delay a touch, so a live leg is settled only when its touches stop reaching D1.
+- A settled run with a recorded cancellation or timeout intent, or a terminal transition whose cleanup is unfinished, completes that transition and its cleanup. Any other non-pending run becomes `failed` with `errorEnvelope.code: 'INTERRUPTED'`, its start reservation is settled, and the summary is broadcast. The pending initial row stays with start recovery, which repairs it as an unknown outcome.
+- A marker that cannot be settled keeps the cadence for a day after its leg began, then is dropped with a log line.
+
+Settling runs in every execution-fence state, because it ends work rather than starting it. Settling runs before start recovery in the same wake, so a stranded start reaches the journal duty as a terminal run.
+
+Flowsafe never re-executes the interrupted step. The step may already have called external services, so re-running it could repeat those effects. An interruption is an ordinary failure: it releases no ownership and abandons no approval, and a disputed economic operation does not block it. Like any `failed` run, the record, including its economic projections, is purged after the retention horizon.
+
+A step must finish within one invocation. Split long work into steps, and wait in a suspension with a [deadline](#per-suspension-deadlines) rather than in an in-memory polling loop. A deploy does not end an in-flight leg: the outgoing instance keeps running it, and the run settles only if that leg then stops. A Workers runtime update ends a leg still running 30 seconds after the update begins, and that run settles as interrupted.
+
+Limits:
+
+- Settlement needs the touch, which the `FencedWorkflowsStorageD1` workflow domain of `createD1Storage()` provides. A run on other storage, including Mastra's own D1 workflow storage, is never settled automatically; terminate it.
+- A live leg whose touches fail to reach D1 for six minutes, for example during a D1 outage, is settled while it runs, and its next workflow write replaces the settlement.
+- A leg whose promise never settles while its isolate stays alive keeps touching its row, so it is not detected until its frame reaches two hours, and terminate waits on its lock until then or until the object is evicted.
+- A leg run by a flowsafe version without the marker cannot be told apart from a live one; terminate such a run.
+
+Legs that an in-process driver runs through a shared `RunnerRuntime`, and durable-agent legs, write no marker.
+
 ### Read stored run summaries
 
 Stored summaries use the selected workflow's direct step records, without recursively merging child workflow rows. A nested `a` workflow's `b` step therefore cannot overwrite the payload or suspension timestamp of a direct `a.b` step. The same root-local projection applies to status, authoritative status, recovered execution outcomes and lifecycle completion summaries.
@@ -294,7 +331,7 @@ The optional `flowsafe.runLifecycle` record stores deadlines, trusted economic-s
 
 Economic settlement projections enter through internal `StartRunOptions.economicOperations` or `ResumeRunOptions.economicOperations`. The host fixes them at the execution-leg boundary before the leg becomes cancellable. Public HTTP bodies cannot supply them. The runtime exposes no dynamic mid-leg mutation because an external snapshot update could race Mastra's own snapshot writes and lose a disputed marker.
 
-The run's Durable Object alarm serves two duties: reconciling an interrupted run-owner reservation, and the per-suspension deadlines described below. It is armed at the earlier of the two due times. Starts and approval resumes still arrive by request; the alarm drives execution only when a suspension deadline expires.
+The run's Durable Object alarm serves three duties: settling a run whose execution leg stopped (see [Interrupted legs](#interrupted-legs)), reconciling an interrupted run-owner reservation, and the per-suspension deadlines described below. It is armed at the earliest due time. Starts and approval resumes still arrive by request; the alarm drives execution only when a suspension deadline expires.
 
 ### Per-suspension deadlines
 
@@ -405,7 +442,7 @@ interface RunSummary {
   result?: unknown;
   error?: string;
   errorEnvelope?: {
-    code: 'CANCELLED' | 'TIMED_OUT';
+    code: 'CANCELLED' | 'TIMED_OUT' | 'INTERRUPTED';
     message: string;
   };
   deadlineAt?: number;
@@ -421,7 +458,7 @@ interface RunSummary {
 }
 ```
 
-The runtime maps serialized errors from existing failed runs to `error`. Flowsafe-owned `cancelled` and `timed_out` summaries use `errorEnvelope` without changing that failed-run shape. `resumedAt` is informational because Mastra does not stamp it for every resume shape. Grant binding uses `resumeCount`. `requestedByKind` is paired with `requestedBy`; it is absent only on legacy snapshots written before principal kinds were persisted.
+The runtime maps serialized errors from existing failed runs to `error`. Flowsafe-owned `cancelled` and `timed_out` summaries use `errorEnvelope` without changing that failed-run shape. A `failed` run that the run object settled after its leg stopped also carries `errorEnvelope` with code `INTERRUPTED`; a step error's name never produces it. `resumedAt` is informational because Mastra does not stamp it for every resume shape. Grant binding uses `resumeCount`. `requestedByKind` is paired with `requestedBy`; it is absent only on legacy snapshots written before principal kinds were persisted.
 
 Run WebSockets send the entire authoritative summary at start, resume, terminate, deadline expiry, and connection. Consumers can replace their cached summary rather than reconstructing state from deltas.
 
