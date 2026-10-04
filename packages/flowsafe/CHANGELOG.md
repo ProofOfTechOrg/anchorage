@@ -1,5 +1,112 @@
 # @proofoftech/flowsafe
 
+## 0.24.0
+
+### Minor Changes
+
+- b96f8dd: Breaking: Guarded durable calls refuse more call-level options. `stream()`, `streamUntilPersisted()`, `generate()`, and `prepare()` on a wrapped Breakwater guarded agent refuse, with a `TypeError`, the call-level options that would change what the guarded agent fixes at construction: tools, hooks, processors, scorers, instructions and system or context messages, step preparation, delegation and sub-agent versions, chunk callbacks and stream transforms, per-step saving, and an own `__proto__` property. See the [durable call-option restrictions](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/durable-agents.md#durable-call-options) for the list. `maxSteps`, `toolChoice`, and `disableBackgroundTasks` are accepted only with the guarded agent's own values. `memory` accepts only the thread and resource on these entries and on `resumeViaRuntime()`, and the wrapper forwards a frozen copy. The wrapper's constructor throws when the guarded agent's default options carry a refused option, lack `maxSteps`, `toolChoice`, or `disableBackgroundTasks`, or set `disableBackgroundTasks` to anything but `true`.
+
+  Security: Before this change, host code that passed such an option to a guarded durable call could bypass the guarded agent's input or output policies, tool set, or memory configuration: for example, a per-call client tool whose mapped result the input policies never read, a call-level output processor list that replaced the output policies, or a working-memory template added to the system prompt. The check closes these per-call routes; the documented limits of durable results for guarded agents are unchanged. The check reads option values as data; the restrictions page names what it leaves to host code.
+
+  Migration: Configure tools, instructions, memory, processors, hooks, and scorers on the guarded agent, not per call. Pass `maxSteps`, `toolChoice`, and `disableBackgroundTasks` only with the agent's own values, or omit them. Flowsafe's thread host, signal routes, and schedules pass none of the refused options.
+
+- 21df7fb: A `DurableObjectRunner` run whose execution leg stops mid-step no longer stays `running`. A start, resume or suspension-deadline leg can stop this way when the platform ends the Durable Object invocation, for example about 15 minutes after the client disconnected. While a leg runs, it sets its run row's `updatedAt` in D1 every 30 seconds without writing the snapshot. Once the row has gone six minutes without a write, the run's own object settles the run on its next wake, with a compare-and-set against the row it read silent. The run becomes `failed` with `errorEnvelope: { code: 'INTERRUPTED', message }`, and its idempotent-start reservation is settled. A retry of the same key returns that result instead of `503 persisted start is not readable`. Flowsafe never re-executes the interrupted step, because it may already have had external effects. A run with a recorded cancellation or timeout completes that transition, with its cleanup, instead.
+
+  A deploy does not interrupt a leg: the outgoing instance keeps running it, and its touches keep the run from being settled. A Workers runtime update gives in-flight requests at most 30 seconds, so it interrupts a longer leg. A wake no longer queues behind a leg that is still executing in the object. A leg frame older than two hours is reset with `ctx.abort()`, which releases the locks of a promise the platform stopped without settling. A leg that a client keeps connected for longer than two hours is reset the same way.
+
+  Settlement needs the `FencedWorkflowsStorageD1` workflow domain that `createD1Storage()` composes. A live leg whose touches fail to reach D1 for six minutes is settled while it runs, and its next workflow write is refused. A run on other storage, including Mastra's own D1 workflow storage, or one whose leg ran on a flowsafe version before this one, is not settled automatically; `POST /runs/:workflowId/:runId/terminate` ends it.
+
+  `RunTerminalErrorEnvelope.code` and `RunSummary.errorEnvelope.code` gain `'INTERRUPTED'`. Code that switches exhaustively on the code needs a branch for it. `FencedWorkflowAdmissionCapability` gains optional `touchRun` and `replaceSnapshot`; a custom capability without both never settles a run automatically.
+
+  Each step must finish within one invocation. Split long work into steps, and wait in a suspension with a deadline rather than in an in-memory polling loop.
+
+- 9feb010: Require `@mastra/core` `1.73.0` exactly and `@proofoftech/breakwater` `>=0.17.0 <1.0.0` when used. Pin the D1 storage dependency to `@mastra/cloudflare-d1` `1.4.0`.
+
+  Breaking: Guarded durable calls refuse call-level `errorProcessors`, accepted in 0.23, alongside the existing structured-output restriction. See the [durable call-option restrictions](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/durable-agents.md#durable-call-options).
+
+  Breaking: When a state read falls back to Mastra's in-memory run, `status()` and the run status, dispatch-status and stream routes report that run's lifecycle status, `suspended` with no suspended paths or `running`, instead of `pending`. The fallback state remains marked `isFromInMemory`; authoritative reads used by resume, deadline and terminate paths still refuse it.
+
+  Core 1.73.0's `@mastra/core/events` entry calls `crypto.randomUUID()` while it loads, which Cloudflare Workers refuse during startup. Flowsafe's do-runner supplies that value before the entry loads, so Workers that build their pub/sub from `createHostPubSub()` start. A Worker whose bundle evaluates `@mastra/core/events` before Flowsafe's do-runner fails at startup with `Disallowed operation called within global scope`, for example a Worker importing `CachingPubSub` or `withCaching` from that entry, since import sorters order `@mastra/*` before `@proofoftech/*`. On core 1.73.0, such a Worker should not import `@mastra/core/events` itself.
+
+  Storage initialization (`init()`) automatically adds `ownerId` and `leaseExpiresAt` to `mastra_background_tasks` with additive `ALTER TABLE … ADD COLUMN` statements. No manual migration is needed. Mastra's background-task manager claims and renews task leases, skips live leases during recovery, reclaims running tasks with expired or absent leases, and clears leases on suspension. Flowsafe continues applying the `resourceId` filter omitted by the D1 adapter's `listTasks`.
+
+  Guarded agents inherit Breakwater's [input policy coverage](https://github.com/ProofOfTechOrg/anchorage/blob/main/packages/breakwater/README.md#input-policy-coverage), [input policies and memory](https://github.com/ProofOfTechOrg/anchorage/blob/main/packages/breakwater/README.md#input-policies-and-memory), [application processor rules](https://github.com/ProofOfTechOrg/anchorage/blob/main/packages/breakwater/README.md#application-processors), and [streaming rules](https://github.com/ProofOfTechOrg/anchorage/blob/main/packages/breakwater/README.md#understand-streaming-hold-back).
+
+  Migration: Upgrade `@mastra/core` to `1.73.0`, `@mastra/cloudflare-d1` to `1.4.0`, and `@proofoftech/breakwater` to `>=0.17.0 <1.0.0` when used. Remove call-level `errorProcessors` from guarded durable calls. Build the bus with `createHostPubSub()` and do not import `@mastra/core/events` in Worker code on core 1.73.0.
+
+- 3d5bd5b: A threaded schedule fire that the thread refuses permanently is recorded as `failed` with the refusal's message, and the schedule keeps firing. The trigger and audit carry the reason `dispatch-refused`. This covers an invalid dispatch or host input, an agent that does not allow the scheduled automation, and no matching thread binding or claimed dispatch. A 403 from a host automation policy fails that fire, not the schedule. Conflicts, server errors and other failures keep being retried. Fires already waiting in `deferred` close the same way on their next retry.
+
+  A permission-requiring agent whose `resolvePrincipalPermissions` throws, rejects or returns malformed output refuses the entry with 503 `permission resolution unavailable` instead of 403 `forbidden`. Automated callers, including the schedule tick, retry it. Human callers of agent starts receive this status too. A missing resolver or unsatisfied permissions still answer 403.
+
+  A fire refused because its thread binding does not exist yet is lost and is visible in trigger history.
+
+  Signal routes answer a request the thread refuses as malformed, including host input refusals, with 400 `{ "error": "bad request" }` instead of 502 `{ "error": "internal error" }`. Public signal callers receive this response too.
+
+  In `D1SchedulesStorage`, permanently refused fires no longer hold schedule deletion open while they wait for retries. A custom store decides its own deletion handling.
+
+  Migration: The required `failDeferredTrigger` member on `ScheduleTickStore` is a breaking interface change. If you supply a custom store, implement this signature:
+
+  ```typescript
+  failDeferredTrigger(
+    id: string,
+    scheduleId: string,
+    error: string,
+    metadata: Record<string, unknown>,
+  ): Promise<boolean>;
+  ```
+
+  Merge `metadata` into the stored metadata, as `touchDeferredTrigger` does. Record the failure only while the trigger is still `deferred`, and resolve `true` when a row changes or `false` otherwise. Leave a trigger whose target already settled a receipt, or that another tick resolved, unchanged.
+
+  A custom `signalAgent` seam must throw an error with the thread route's status in a numeric `status` property, as `ScheduleTickSignalAgent` documents. An adapter that reaches the route through another hop must not report that hop's own status as a refusal. A seam that throws without a status keeps every refusal retrying.
+
+- 4d0fe16: `FencedWorkflowsStorageD1` refuses to overwrite a settled run row. A row is settled once its run lifecycle records a terminal transition (terminate or timeout), an interruption, or a start-recovery repair. A workflow snapshot write over such a row lands only when it advances the lifecycle revision and keeps those records; any other write throws the new `RunSettledConflictError`, which the run routes answer with 409. This fixes a defect in earlier releases. When a deploy left a run's leg executing on the outgoing Durable Object instance, a terminate or timeout on the new instance did not stop that leg: it went on running the run's remaining steps, with their external effects, and its writes replaced the terminal record. The cancelled or timed-out run could end `success`, `failed`, `running` or `suspended`, and a run left `suspended` could be resumed after its cancellation. Now the leg's next write is refused and the leg stops there.
+
+  The guard applies on a D1 binding with `batch()`, where unscoped persistence is now one conditional upsert that writes the same columns as `@mastra/cloudflare-d1`. Standalone client and REST configurations keep the adapter's write and have no guard. Code that rewrites a settled row through `persistWorkflowSnapshot` without advancing its lifecycle revision is refused. Legs running a flowsafe version without the guard still overwrite: during this upgrade, after a rollback, and in a mixed-version deploy. A refused leg stops at its next write; a workflow whose `shouldPersistSnapshot` skips `running` writes nothing between steps, so its steps run until that write. A durable agent persists nothing between tool calls by default, so a terminated agent's leg on an outgoing instance keeps calling tools until it suspends or finishes, and that write is refused. The agent thread host's start recovery does not stamp its repair, so a durable-agent leg that outlives it still overwrites it.
+
+  A `DurableObjectRunner` start whose leg stopped before its first write is now repaired as `StartOutcomeUnknown` only once its row has gone six minutes without a write, about six to seven minutes after it stopped instead of about one minute, unless the start route sees its own leg fail in the object. The repair stamps the run lifecycle so the guard refuses that leg's later writes; the run's summary is unchanged. `InitialTerminalizationRequest` gains an optional `markOutcomeUnknown`.
+
+- 65f7715: A `DurableObjectRunner` workflow step can wait without an approval. It suspends with `SUSPENSION_TIMER_PAYLOAD_KEY` (`'flowsafe.timer'`, exported from `@proofoftech/flowsafe/do-runner/constants` and `@proofoftech/flowsafe/do-runner`) set to `true` beside its `flowsafe.deadlineMs`, and the run's Durable Object resumes it with the timeout envelope when the deadline expires. A run that must outlast one Durable Object invocation waits this way between steps.
+
+  The run object lists such steps in the new `RunSummary.suspensionTimers` on its start, resume, status, dispatch-status and protected-replay responses. It lists a step only when the current suspension derives an armable deadline for it, the marker is exactly `true`, the entry has not been abandoned, and an alarm is scheduled. `queueApprovalForSuspension` files nothing for a listed step, and `reconcileApprovalsForSummary` supersedes its stale open records without filing a new one. Every other case files an ordinary approval, so a timer step accepts an approval decision's `{ approved, comment?, decidedBy? }` as well as the timeout envelope and re-checks its wait condition on every resume. During a rollout, a timer step gets an ordinary approval wherever a Worker or run object without this change handles the run. Reconciliation supersedes that record once the step has suspended again.
+
+  The run object files the approvals of a run it leaves suspended with no host request behind it, from its alarm: after a timeout resume (a timer that waits again, the gate after it, or a deadline gate that suspends again, whose expired approval is superseded and filed afresh, notifying reviewers), after it abandons a timer, after its alarm recovers a start, and after it finds a stopped leg's run suspended. `DurableObjectRunLifecycleHooks` gains an optional `reconcileApprovals(workflowId, summary)`, which `createFlowsafeRunnerLifecycle()` fills with `reconcileApprovalsForSummary`. It is best effort; a failure is logged as `reconcile-error`, and a host status read with approval reconciliation, as `createFlowsafeWorker` does, files what it missed. Hooks without the member, and a timer abandoned after 24 hours of unreadable run state, leave those approvals to that host read. An approval open for a suspension that a timeout resume ended stays open.
+
+  A suspension-deadline resume now keeps the run's recorded `requestedBy` and `requestedByKind` instead of recording `SUSPENSION_DEADLINE_PRINCIPAL_ID` with kind `system`, so separation of duties applies to the gate after a timeout as it would without the timeout. A legacy requester without a kind is kept with kind `human`. The reserved principal is recorded only for a run without a requester, and a run whose recorded requester is already the reserved principal keeps it. A step that recognized a timeout resume by that principal id should test its resume data with `isSuspensionTimeoutResumeData` instead; a `RunSummary` no longer shows that a timeout advanced the run.
+
+  A step declaring a Zod `suspendSchema` must declare `flowsafe.timer` as well as `flowsafe.deadlineMs`, or use a loose object; a schema that strips the marker files an approval on every wait.
+
+  `DurableKeyValueStorage` gains an optional `getAlarm`. A storage without it lists no timer steps, so their approvals are filed.
+
+### Patch Changes
+
+- 5b467f2: A registered agent start whose caller Breakwater's RBAC gate refuses during preparation is refused with status 403 before the runtime starts and creates no run. An automated fire the agent's RBAC gate refuses now records `failed` instead of a run that did nothing. A created signal the gate refuses for a missing actor is preserved even when Mastra's isolate-wide run registry evicts the start's entry.
+
+  Security: Before this change, if Mastra's isolate-wide run registry evicted the start's entry between preparation and the first step, the loop called the model for the refused caller on the thread's history and returned its output.
+
+  No migration is needed.
+
+- 3b5b0ad: A guarded `resumeViaRuntime()` whose memory does not resolve is refused before registry installation, observation, or the resumed step. The run stays suspended and can be redriven once memory resolves. A failure while Breakwater resolves the memory processors, including a memory processor lookup error or function-valued memory that resolves a title-enabled `Memory` there, stops the audited `breakwater-memory` step with `input processor failed` and one `agent.input.processor` error event; the resume rejects with `Durable agent registry rehydration denied: input processor failed`. If durable preparation's first memory lookup throws or resolves a title-enabled `Memory`, the resume rejects with that error, including the title `TypeError`, and writes no audit event.
+
+  Security: Before this change, such a resume ran the approved tool and failed only at the next model step. A leg with no further model step finished and saved through the memory.
+
+  No migration is needed.
+
+- 5b467f2: A run resumed through `resumeViaRuntime()` that suspends at another approval keeps blocking its thread until that approval is decided, even while an output processor has not processed or drops the approval. Under the default cache, the resumed observer starts from the current stream position without replaying earlier legs' events. Earlier resumed legs' thread registrations complete when the run ends or a resume fails after rehydration; the wrapper then publishes a terminal error.
+
+  Availability: Before this change, the thread was released while the run awaited approval. Signals to the thread were refused as blocked, or a host without a durable blocking check could start a second run.
+
+  No migration is needed.
+
+- aa48c2c: When you set `canPersistSchedule`, its answer governs persistence for every threaded schedule fire in place of `canPersist`'s answer. This includes a wake that falls back to persistence during a deployment drain, under a run cap, or without a start seam. Delivered signals whose schedule persistence is denied carry the persistence-forbidden marker, preventing the runner from persisting them after the run ends. For those fires, `canPersist` is not called, so a throwing `canPersist` no longer fails them and hosts see fewer `canPersist` calls.
+
+  An authorized schedule wake with memory available persists, instead of being discarded, when a drain keeps it from starting a run. A fire that `canPersistSchedule` refuses is never persisted through a wake fallback, even when `canPersist` allows the system principal.
+
+  A throwing `canPersistSchedule` fails every fire on which it is consulted, including wake and deliver targets, and the schedule tick retries the fire.
+
+- 049971f: Message, signal, notification-dispatch, and schedule routes now re-read the thread's blocking run when they wake. If that run ends while the route checks authorization or content, the idle thread wakes instead of answering `blocked`. A schedule fire no longer settles a permanent `blocked`/`skipped` receipt in that case.
+
+  This matters for hosts whose `resolveBlockingRun` answer can change while the route holds `serializeDispatch`, such as a host whose start returns while the run keeps executing. Hosts that execute a run's steps under the dispatch lock see no change. Each wake that found a blocking run makes one more `resolveBlockingRun` call, per send in a notification dispatch batch. No migration is required.
+
 ## 0.23.0
 
 ### Minor Changes
