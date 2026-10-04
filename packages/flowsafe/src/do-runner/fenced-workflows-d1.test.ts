@@ -3556,6 +3556,72 @@ describe('settled-row guard on unscoped persistence', () => {
         .all();
     expect(rows(guarded.sql)).toEqual(rows(plainSql));
   });
+
+  describe('liveness touch', () => {
+    const ADDRESS = { workflowId: 'workflow', runId: 'run' };
+    const TOUCHED_MS = Date.parse('2030-01-02T03:04:05.006Z');
+    const TOUCHED_AT = new Date(TOUCHED_MS).toISOString();
+
+    it('marks an unsettled row live and moves its updatedAt', async () => {
+      // #given an unsettled row
+      const h = await fixture();
+      await persist(h.domain, snapshot('running'));
+      const [before] = h.rows() as { snapshot: string; updatedAt: string }[];
+
+      // #when
+      const touched = await h.capability.touchRun?.(ADDRESS, TOUCHED_MS);
+
+      // #then the row is live, with a new updatedAt and the same snapshot
+      expect(touched).toBe('live');
+      expect(h.rows()).toEqual([{ ...before, updatedAt: TOUCHED_AT }]);
+    });
+
+    it.each(
+      RUN_SETTLING_MARKERS,
+    )('reports a row settled by %s and leaves it as it is', async (marker) => {
+      // #given a row settled by the marker
+      const h = await fixture();
+      await persist(h.domain, snapshot('failed', SETTLED[marker].lifecycle));
+      const settled = h.rows();
+
+      // #when
+      const touched = await h.capability.touchRun?.(ADDRESS, TOUCHED_MS);
+
+      // #then
+      expect(touched).toBe('settled');
+      expect(h.rows()).toEqual(settled);
+    });
+
+    it('reports an absent row and writes none', async () => {
+      // #given no run row
+      const h = await fixture();
+
+      // #when
+      const touched = await h.capability.touchRun?.(ADDRESS, TOUCHED_MS);
+
+      // #then
+      expect(touched).toBe('absent');
+      expect(h.rows()).toEqual([]);
+    });
+
+    it('marks a row whose stored JSON is unreadable live', async () => {
+      // #given a row whose stored bytes are not JSON
+      const h = await fixture();
+      await persist(h.domain, snapshot('running'));
+      h.sql
+        .prepare('UPDATE mastra_workflow_snapshot SET snapshot = ?')
+        .run('{not json');
+
+      // #when
+      const touched = await h.capability.touchRun?.(ADDRESS, TOUCHED_MS);
+
+      // #then
+      expect(touched).toBe('live');
+      expect(h.rows()).toMatchObject([
+        { snapshot: '{not json', updatedAt: TOUCHED_AT },
+      ]);
+    });
+  });
 });
 
 describe('snapshot replacement input', () => {

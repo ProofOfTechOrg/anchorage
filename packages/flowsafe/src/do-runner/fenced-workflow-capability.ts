@@ -92,13 +92,21 @@ export interface FencedWorkflowAdmissionCapability {
     request: InitialTerminalizationRequest,
   ): Promise<InitialTerminalizationResult>;
   /**
-   * Mark an executing leg's run row live by its `updatedAt` alone. Without it
-   * a run whose leg stops is never settled automatically.
+   * Mark an executing leg's run row live by its `updatedAt` alone, and report
+   * what the row holds: `live`, `settled` (another writer settled the run; the
+   * row is left as it is), or `absent`. The runtime aborts the leg on
+   * `settled`, so report it only when the same storage refuses that leg's later
+   * writes over the row, as the settled-row guard does; a capability without
+   * such a guard resolves nothing, which is no evidence and aborts nothing.
+   * Without `touchRun` a run whose leg stops is never settled automatically.
    */
   touchRun?(
     address: { workflowId: string; runId: string },
     nowMs: number,
-  ): Promise<void>;
+  ): Promise<
+    // biome-ignore lint/suspicious/noConfusingVoidType: an implementation resolving nothing stays assignable
+    'live' | 'settled' | 'absent' | void
+  >;
   /**
    * Replace the snapshot and `updatedAt` of the exact row `expected` names, or
    * report `false` when any of its columns changed since. It writes the bytes

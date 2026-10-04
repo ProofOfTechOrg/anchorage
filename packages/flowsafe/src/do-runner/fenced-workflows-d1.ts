@@ -85,7 +85,6 @@ import {
   readRawWorkflowSnapshot,
   type SnapshotStatement,
   snapshotResultRows,
-  touchRawWorkflowSnapshot,
 } from './workflow-snapshot-row.js';
 
 const PROVENANCE = 'flowsafe.runProvenance';
@@ -622,6 +621,47 @@ const SETTLED_ROW_GUARD_SQL = `CASE
         ).join(' AND ')})
     END`;
 
+/**
+ * A stored row's liveness for a leg's touch: unsettled is live, and so is
+ * JSON SQLite cannot read, which the guard also writes over.
+ */
+const STORED_LIVE_SQL = `CASE WHEN NOT json_valid(snapshot) THEN 1 ELSE (${STORED_UNSETTLED_SQL}) END`;
+
+/**
+ * SQLite counts a matched row as changed even when `updatedAt` is set to
+ * itself, so on a settled row `meta.changes` and the returned row still agree.
+ * `SET` reads the row before the update and `RETURNING` after it, and the
+ * predicate reads only `snapshot`, which the statement leaves alone.
+ */
+async function touchRunRow(
+  database: InitialAdmissionDatabase,
+  tablePrefix: string,
+  address: { workflowId: string; runId: string },
+  nowMs: number,
+): Promise<'live' | 'settled' | 'absent'> {
+  const { workflowId, runId } = address;
+  if (
+    !isPathSafeId(workflowId) ||
+    !isPathSafeId(runId) ||
+    !Number.isSafeInteger(nowMs) ||
+    nowMs < 0
+  )
+    throw new Error('workflow snapshot address is malformed');
+  const result = await database
+    .prepare(`UPDATE "${tablePrefix}mastra_workflow_snapshot"
+    SET updatedAt = CASE WHEN ${STORED_LIVE_SQL} THEN ?1 ELSE updatedAt END
+    WHERE workflow_name = ?2 AND run_id = ?3
+    RETURNING ${STORED_LIVE_SQL} AS live`)
+    .bind(new Date(nowMs).toISOString(), workflowId, runId)
+    .all();
+  const captured = captureStatementResult(result);
+  if (writtenRowCount(captured) === 0) return 'absent';
+  const live: unknown = captured.results[0]?.live;
+  if (live === 1) return 'live';
+  if (live === 0) return 'settled';
+  throw new Error('workflow snapshot touch result is malformed');
+}
+
 function terminalizationUnreadable(
   cause: unknown,
 ): ExecutionFenceUnreadableError {
@@ -858,16 +898,7 @@ export class FencedWorkflowsStorageD1 extends WorkflowsStorageD1 {
         touchRun: (
           address: { workflowId: string; runId: string },
           nowMs: number,
-        ) =>
-          touchRawWorkflowSnapshot(
-            database,
-            {
-              tablePrefix,
-              workflowId: address.workflowId,
-              runId: address.runId,
-            },
-            nowMs,
-          ),
+        ) => touchRunRow(database, tablePrefix, address, nowMs),
         replaceSnapshot: (
           expected: RawWorkflowSnapshot,
           replacement: { snapshot: string; updatedAt: string },

@@ -93,6 +93,7 @@ import {
   type RunLifecyclePrincipal,
   type RunLifecycleState,
   type RunScheduleDispatch,
+  RunSettledConflictError,
   type RunTerminalCleanup,
   type RunTerminalErrorEnvelope,
   type RunTerminalStatus,
@@ -855,8 +856,8 @@ export interface RunLifecycleTransitionResult {
   cleanup: RunTerminalCleanup;
 }
 
-/** @internal How often an executing leg marks its run row live. */
-export const RUN_LEG_TOUCH_MS = 30_000;
+/** How often an executing leg marks its run row live. */
+const RUN_LEG_TOUCH_MS = 30_000;
 // Longer than the largest Workers CPU limit (five minutes), which is the most
 // a busy step can delay a touch timer: a row untouched this long has no leg
 // left marking it, on this instance or one being replaced.
@@ -1165,7 +1166,7 @@ type CapturedWorkflowStorage = {
 );
 
 type ActiveRun = {
-  run?: { cancel(): Promise<void> };
+  run?: { cancel(): Promise<void>; readonly abortController: AbortController };
   lifecycle?: RunLifecycleState;
   requestContext?: RequestContext;
   source?: CapturedWorkflowStorage;
@@ -1557,7 +1558,12 @@ export class RunnerRuntime {
         const active: ActiveRun = {};
         if (this.#activeRuns.has(activeKey))
           throw new RunAlreadyExistsError(workflowId, runId, 'running');
-        this.#activeRuns.set(activeKey, active);
+        const leaveLeg = this.#registerLeg(
+          activeKey,
+          active,
+          workflowId,
+          runId,
+        );
         let execution: RunExecutionIdentity | undefined;
         let engineEntered = false;
         let outcomeReadStarted = false;
@@ -1740,8 +1746,7 @@ export class RunnerRuntime {
           }
           throw asClientError(error) ?? error;
         } finally {
-          if (this.#activeRuns.get(activeKey) === active)
-            this.#activeRuns.delete(activeKey);
+          await leaveLeg();
         }
       });
     } catch (error) {
@@ -1767,7 +1772,7 @@ export class RunnerRuntime {
       const active: ActiveRun = {};
       if (this.#activeRuns.has(activeKey))
         throw new RunTerminalConflictError(workflowId, runId, 'running');
-      this.#activeRuns.set(activeKey, active);
+      const leaveLeg = this.#registerLeg(activeKey, active, workflowId, runId);
       let provenance: RunProvenance | undefined;
       let engineEntered = false;
       let outcomeReadStarted = false;
@@ -1897,8 +1902,7 @@ export class RunnerRuntime {
         }
         throw asClientError(error) ?? error;
       } finally {
-        if (this.#activeRuns.get(activeKey) === active)
-          this.#activeRuns.delete(activeKey);
+        await leaveLeg();
       }
     });
   }
@@ -2857,8 +2861,11 @@ export class RunnerRuntime {
 
   /**
    * @internal Mark this run's row live for an executing leg, from whichever
-   * instance runs it; the evidence #silentRow reads. A storage source without
-   * the touch leaves nothing to read, so its runs are never settled here.
+   * instance runs it; the evidence #silentRow reads. When the row reads
+   * settled, the leg this runtime drives for the run is aborted: its engine
+   * starts no further step, and its step in flight sees its `abortSignal`
+   * aborted. A storage source without the touch leaves nothing to read, so its
+   * runs are never settled here.
    */
   async touchRun(
     workflowId: string,
@@ -2866,8 +2873,64 @@ export class RunnerRuntime {
     now = Date.now(),
   ): Promise<void> {
     const source = await this.#captureWorkflowStorage(workflowId);
-    if (source.storage === 'd1' && source.touch)
-      await source.touch.call(source.capability, { workflowId, runId }, now);
+    if (source.storage !== 'd1' || !source.touch) return;
+    const touched = await source.touch.call(
+      source.capability,
+      { workflowId, runId },
+      now,
+    );
+    if (touched === 'settled') this.#abortSettledLeg(workflowId, runId);
+  }
+
+  /**
+   * A leg's registration and its touch share one span, because recovery reads a
+   * row nobody touches as abandoned. The release waits for a touch in flight:
+   * its late write would make a following repair's exact-row compare-and-set
+   * miss.
+   */
+  #registerLeg(
+    activeKey: string,
+    active: ActiveRun,
+    workflowId: string,
+    runId: string,
+  ): () => Promise<void> {
+    this.#activeRuns.set(activeKey, active);
+    const touches = new Set<Promise<void>>();
+    const timer = setInterval(() => {
+      const touch: Promise<void> = this.touchRun(workflowId, runId)
+        .catch((error: unknown) =>
+          console.error('run leg liveness touch failed', error),
+        )
+        .finally(() => touches.delete(touch));
+      touches.add(touch);
+    }, RUN_LEG_TOUCH_MS);
+    return async () => {
+      clearInterval(timer);
+      await Promise.all(touches);
+      if (this.#activeRuns.get(activeKey) === active)
+        this.#activeRuns.delete(activeKey);
+    };
+  }
+
+  /**
+   * Abort the leg this runtime drives for a run another instance settled.
+   * Never `run.cancel()`: it reads the stored status first and returns without
+   * aborting on `failed`, which an interruption or a start repair writes. The
+   * reason is named `AbortError`, which Mastra and the AI SDK read as an abort,
+   * and carries the settlement as its cause.
+   */
+  #abortSettledLeg(workflowId: string, runId: string): void {
+    const active = this.#activeRuns.get(this.#runKey(workflowId, runId));
+    if (!active?.run || active.run.abortController.signal.aborted) return;
+    console.error(
+      JSON.stringify({ type: 'run-leg-settled-abort', workflowId, runId }),
+    );
+    const conflict = new RunSettledConflictError(workflowId, runId);
+    active.run.abortController.abort(
+      Object.assign(new Error(conflict.message, { cause: conflict }), {
+        name: 'AbortError',
+      }),
+    );
   }
 
   /**

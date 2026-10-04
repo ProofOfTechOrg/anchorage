@@ -8,7 +8,15 @@ import {
   createConnector,
   invokeConnector,
 } from '@proofoftech/breakwater/connector-sdk';
-import { assert, describe, expect, expectTypeOf, it, vi } from 'vitest';
+import {
+  assert,
+  describe,
+  expect,
+  expectTypeOf,
+  it,
+  onTestFinished,
+  vi,
+} from 'vitest';
 import { z } from 'zod';
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import {
@@ -11179,5 +11187,318 @@ describe('RunnerRuntime lifecycle transitions on D1 storage', () => {
       transitioned: true,
       summary: { status: 'cancelled' },
     });
+  });
+});
+
+describe('RunnerRuntime leg liveness touch', () => {
+  const WORKFLOW_ID = 'abortable-workflow';
+  const RUN_ID = 'touched-run';
+
+  async function d1Storage() {
+    const sql = openSqlite();
+    const storage = createD1Storage({
+      binding: sqliteUnitDatabase(sql) as D1DatabaseBinding,
+    });
+    await storage.init();
+    return { sql, storage };
+  }
+
+  /**
+   * Two steps: `hold` records the `abortSignal` it receives, signals `entered`
+   * and waits for `release`; `after` counts its executions. `quietAfterHold`
+   * drops the engine's `running` writes once `hold` has begun, so nothing but
+   * an abort stands between the steps; `suspends` makes `hold` suspend until it
+   * is resumed.
+   */
+  function abortableApp(
+    storage: MastraCompositeStore,
+    options: { quietAfterHold?: boolean; suspends?: boolean } = {},
+  ) {
+    const app = init(
+      { storage },
+      { executionFence: 'none', startIdempotency: 'none' },
+    );
+    const schema = z.object({});
+    const entered = deferredSignal();
+    const release = deferredSignal();
+    const observed: { signal?: AbortSignal; afterRuns: number } = {
+      afterRuns: 0,
+    };
+    const workflow = app
+      .createWorkflow({
+        id: WORKFLOW_ID,
+        inputSchema: schema,
+        outputSchema: schema,
+        ...(options.quietAfterHold
+          ? {
+              options: {
+                shouldPersistSnapshot: ({ workflowStatus }) =>
+                  workflowStatus !== 'running' || observed.signal === undefined,
+              },
+            }
+          : {}),
+      })
+      .then(
+        app.createStep({
+          id: 'hold',
+          inputSchema: schema,
+          outputSchema: schema,
+          suspendSchema: schema,
+          resumeSchema: schema,
+          execute: async ({ abortSignal, resumeData, suspend }) => {
+            if (options.suspends && !resumeData) return suspend({});
+            observed.signal = abortSignal;
+            entered.resolve();
+            await release.promise;
+            return {};
+          },
+        }),
+      )
+      .then(
+        app.createStep({
+          id: 'after',
+          inputSchema: schema,
+          outputSchema: schema,
+          execute: async () => {
+            observed.afterRuns += 1;
+            return {};
+          },
+        }),
+      )
+      .commit();
+    return { app, workflow, entered, release, observed };
+  }
+
+  /** Starts a leg that stays in `hold` until the test ends or releases it. */
+  function startHeldLeg(
+    storage: MastraCompositeStore,
+    options: Parameters<typeof abortableApp>[1] = {},
+  ) {
+    const leg = abortableApp(storage, options);
+    const started = leg.app.runtime.start(WORKFLOW_ID, {
+      runId: RUN_ID,
+      inputData: {},
+    });
+    onTestFinished(async () => {
+      leg.release.resolve();
+      await started.catch(() => undefined);
+    });
+    return { ...leg, started };
+  }
+
+  const SETTLEMENTS = [
+    { settled: 'terminated', summary: { status: 'cancelled' } },
+    {
+      settled: 'interrupted',
+      summary: { status: 'failed', errorEnvelope: { code: 'INTERRUPTED' } },
+    },
+  ] as const;
+
+  /** A held leg, and its run row after another instance settled the run. */
+  async function holdLegSettledElsewhere(
+    settled: (typeof SETTLEMENTS)[number]['settled'],
+    options: Parameters<typeof abortableApp>[1] = {},
+  ) {
+    const { sql, storage } = await d1Storage();
+    const leg = startHeldLeg(storage, options);
+    await leg.entered.promise;
+    const other = abortableApp(storage);
+    if (settled === 'terminated')
+      await other.app.runtime.terminate(WORKFLOW_ID, RUN_ID);
+    else
+      await other.app.runtime.settleInterruptedRun(
+        WORKFLOW_ID,
+        RUN_ID,
+        Date.now() + 360_001,
+      );
+    const rows = () =>
+      sql.prepare('SELECT * FROM mastra_workflow_snapshot').all();
+    return { leg, rows, settledRows: rows() };
+  }
+
+  it.each(
+    SETTLEMENTS,
+  )('aborts a leg whose run another instance $settled at its next touch', async ({
+    settled,
+    summary,
+  }) => {
+    // #given a leg held in its first step, on a run another instance settled
+    const { leg, rows, settledRows } = await holdLegSettledElsewhere(settled);
+
+    // #when the leg's touch runs
+    await leg.app.runtime.touchRun(WORKFLOW_ID, RUN_ID);
+
+    // #then the step in flight sees its signal aborted, with the settlement as
+    // the cause
+    expect(leg.observed.signal?.aborted).toBe(true);
+    expect(leg.observed.signal?.reason).toMatchObject({
+      name: 'AbortError',
+      cause: expect.any(RunSettledConflictError),
+    });
+
+    // #when the step returns
+    leg.release.resolve();
+    const ended = await leg.started;
+
+    // #then the start answers the settled summary and the settlement stands
+    expect(ended).toMatchObject(summary);
+    expect(rows()).toEqual(settledRows);
+  });
+
+  it.each(
+    SETTLEMENTS,
+  )('starts no further step on a leg whose run another instance $settled when the engine writes nothing between steps', async ({
+    settled,
+  }) => {
+    // #given a leg held in its first step, on a workflow whose engine writes
+    // nothing once that step has begun, and a run another instance settled
+    const { leg } = await holdLegSettledElsewhere(settled, {
+      quietAfterHold: true,
+    });
+
+    // #when the leg's touch runs and the step returns
+    await leg.app.runtime.touchRun(WORKFLOW_ID, RUN_ID);
+    leg.release.resolve();
+    await leg.started;
+
+    // #then the second step never ran
+    expect(leg.observed.afterRuns).toBe(0);
+  });
+
+  it('logs the abort of a settled leg once however many touches follow', async () => {
+    // #given a held leg whose run another instance terminated
+    const logged = vi
+      .spyOn(console, 'error')
+      .mockImplementation(() => undefined);
+    onTestFinished(() => {
+      logged.mockRestore();
+    });
+    const { leg } = await holdLegSettledElsewhere('terminated');
+
+    // #when two touches run
+    await leg.app.runtime.touchRun(WORKFLOW_ID, RUN_ID);
+    await leg.app.runtime.touchRun(WORKFLOW_ID, RUN_ID);
+
+    // #then one structured line says so
+    expect(logged).toHaveBeenCalledExactlyOnceWith(
+      JSON.stringify({
+        type: 'run-leg-settled-abort',
+        workflowId: WORKFLOW_ID,
+        runId: RUN_ID,
+      }),
+    );
+  });
+
+  it('leaves a leg whose row is live running', async () => {
+    // #given a leg held in its first step, on a row nobody settled
+    const { storage } = await d1Storage();
+    const leg = startHeldLeg(storage);
+    await leg.entered.promise;
+
+    // #when its touch runs
+    await leg.app.runtime.touchRun(WORKFLOW_ID, RUN_ID);
+
+    // #then the step's signal is not aborted
+    expect(leg.observed.signal?.aborted).toBe(false);
+
+    // #when the step returns
+    leg.release.resolve();
+    const ended = await leg.started;
+
+    // #then the run completes both steps
+    expect(ended.status).toBe('success');
+    expect(leg.observed.afterRuns).toBe(1);
+  });
+
+  it.each([
+    'start',
+    'resume',
+    'engine failure',
+  ] as const)('touches the row every interval while the leg runs and stops when it ends (%s)', async (kind) => {
+    // #given a leg held in a step, with interval timers faked
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    const { storage } = await d1Storage();
+    const leg = abortableApp(storage, { suspends: kind === 'resume' });
+    const touch = vi.spyOn(leg.app.runtime, 'touchRun').mockResolvedValue();
+    if (kind === 'engine failure') {
+      const create = leg.workflow.createRun.bind(leg.workflow);
+      vi.spyOn(leg.workflow, 'createRun').mockImplementation(
+        async (...args) => {
+          const run = await create(...args);
+          const engine = run.start.bind(run);
+          vi.spyOn(run, 'start').mockImplementation(async (...input) => {
+            await engine(...input);
+            throw new Error('engine lost its result');
+          });
+          return run;
+        },
+      );
+    }
+    let ended: Promise<unknown> = Promise.resolve();
+    try {
+      const first = leg.app.runtime.start(WORKFLOW_ID, {
+        runId: RUN_ID,
+        inputData: {},
+      });
+      if (kind === 'resume') {
+        await first;
+        touch.mockClear();
+        ended = leg.app.runtime.resume(WORKFLOW_ID, RUN_ID, { resumeData: {} });
+      } else ended = first;
+      await leg.entered.promise;
+
+      // #when the interval elapses twice while the leg runs
+      vi.advanceTimersByTime(60_000);
+
+      // #then it touched the row twice
+      expect(touch.mock.calls).toEqual([
+        [WORKFLOW_ID, RUN_ID],
+        [WORKFLOW_ID, RUN_ID],
+      ]);
+
+      // #when the leg ends and the interval elapses twice more
+      leg.release.resolve();
+      await Promise.allSettled([ended]);
+      vi.advanceTimersByTime(60_000);
+
+      // #then it touched no more
+      expect(touch).toHaveBeenCalledTimes(2);
+    } finally {
+      leg.release.resolve();
+      await Promise.allSettled([ended]);
+      vi.useRealTimers();
+    }
+  });
+
+  it('logs a touch that fails inside the interval and keeps the leg running', async () => {
+    // #given a leg held in a step whose touch rejects, with interval timers
+    // faked
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
+    const logged = vi
+      .spyOn(console, 'error')
+      .mockImplementation(() => undefined);
+    onTestFinished(() => {
+      logged.mockRestore();
+    });
+    const { storage } = await d1Storage();
+    const leg = startHeldLeg(storage);
+    const failure = new Error('D1 unavailable');
+    vi.spyOn(leg.app.runtime, 'touchRun').mockRejectedValue(failure);
+    await leg.entered.promise;
+
+    // #when the interval elapses once and the step returns
+    vi.advanceTimersByTime(30_000);
+    leg.release.resolve();
+    const ended = await leg.started;
+
+    // #then the failure is logged and the run completes
+    expect(logged).toHaveBeenCalledExactlyOnceWith(
+      'run leg liveness touch failed',
+      failure,
+    );
+    expect(ended.status).toBe('success');
   });
 });

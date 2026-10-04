@@ -65,7 +65,6 @@ import {
   type InterruptedRunSettlement,
   InvalidRunRequestError,
   type RecoveredStart,
-  RUN_LEG_TOUCH_MS,
   RunAlreadyExistsError,
   type RunLifecycleCas,
   type RunLifecycleTransitionResult,
@@ -2050,11 +2049,12 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
    * shows a durable run — the read a cancelled invocation cannot make. A kept
    * marker is the next wake's to settle.
    *
-   * While the leg runs it also marks its run row live in D1 every
-   * RUN_LEG_TOUCH_MS. The marker says a leg began; the touch says one is still
-   * running, from whichever instance runs it — during a deploy an outgoing
-   * instance keeps executing a leg that never touches this object's storage,
-   * while the next wake already runs on the new instance.
+   * While the leg runs, the runtime marks its run row live in D1 every
+   * RUN_LEG_TOUCH_MS (RunnerRuntime.start and resume). The marker says a leg
+   * began; the touch says one is still running, from whichever instance runs
+   * it — during a deploy an outgoing instance keeps executing a leg that never
+   * touches this object's storage, while the next wake already runs on the new
+   * instance.
    *
    * `armed` is true where the caller already holds a wake within the recovery
    * delay: the start journal's, or the watchdog an alarm body opens with.
@@ -2074,13 +2074,6 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
       startedAt: Date.now(),
     };
     this.#legs.add(frame);
-    const touch = setInterval(() => {
-      runtime
-        .touchRun(workflowId, runId)
-        .catch((error: unknown) =>
-          console.error('run leg liveness touch failed', error),
-        );
-    }, RUN_LEG_TOUCH_MS);
     const clearIfDurable = async (summary: RunSummary | null) => {
       try {
         if (summary && isDurableRunStatus(summary.status))
@@ -2119,7 +2112,6 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
       await clearIfDurable(summary);
       return summary;
     } finally {
-      clearInterval(touch);
       this.#legs.delete(frame);
     }
   }
