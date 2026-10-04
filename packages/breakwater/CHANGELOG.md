@@ -1,5 +1,80 @@
 # @proofoftech/breakwater
 
+## 0.17.0
+
+### Minor Changes
+
+- b79f67b: The guarded agent checks user file and image URLs in the call's input, memory-loaded history, and processor additions before each model step on the message list as it stands. This checks signals Mastra drains into a running loop before it downloads their assets. On the durable loop, signals drained before the first model step join the prompt after that step's check and bypass it. Each step converts the message list once more for the check.
+
+  The client tool output step checks network URLs with the input asset check's rules, reasons, and audit events. It checks outputs it maps through a client-only tool's `toModelOutput` in caller input or a message an application input processor changes, and every stored model output on a caller message whose id memory does not hold, including server-tool outputs in replayed transcripts. Stored outputs on remembered messages are not checked, including a completed call the caller re-sends. A tool-output refusal's tripwire carries `processorId: 'breakwater-client-tool-output'`; a mapper error still stops the call with `input processor failed` first.
+
+  A mid-run refusal removes the call's input, including drained signals and remembered messages carrying the caller's client tool outcome, and its response messages from Mastra's message list. Nothing more of the refused call is saved to thread memory, but input and earlier steps Mastra saved at a durable suspension for tool approval, or steps saved under `savePerStep`, stay saved. The call's input and response messages are removed regardless of what added them; other messages an application input processor added or changed outside those sources stay on the list but are not saved. On the durable loop, a signal drained after a step refusal continues the run with the refused call's input and responses removed, and the arriving signal is checked at its step. Resumed durable legs check before each step and refuse a thread whose history names an origin absent from the configured list.
+
+  A stored output an application input processor writes on a remembered message or outside the call's input, or a caller-supplied stored output it moves out of that input, is not origin-checked; input policies still read both. A model provider may fetch URLs in these unchecked outputs or remembered outputs. An unmarked stored client result in a message an application input processor changes is mapped and URL-checked. Inline `data:` URLs and base64 data remain inline data. See [Input asset origins](https://github.com/ProofOfTechOrg/anchorage/blob/main/packages/breakwater/README.md#input-asset-origins) for the tool-output content items the check reads.
+
+  Security: A signal's file URL or a URL in a mapped or caller-supplied tool output could name an origin absent from the configured list, such as a link-local cloud metadata address, which Mastra or a model provider then fetched.
+
+  Migration: List in `allowedInputAssetOrigins` the origins signals and client tool outputs may name, including origins in replayed transcripts' tool outputs, or keep history in memory instead of replaying it. Hosts reading the tripwire chunk's `processorId` see `breakwater-client-tool-output` for a tool-output refusal.
+
+- c3fdee4: Every `PolicyEngine` policy denial uses the tripwire reason `policy '<name>' denied the input|output`. This reason appears in `result.tripwire.reason`, the stream's `tripwire` chunk on both Mastra agent loops, and Mastra's logs and spans.
+
+  When a policy evaluator throws or returns no decision at the final result, `PolicyEngine` throws a plain `Error` with the fixed message `policy evaluation failed` and no `cause`. Mastra's standard loop surfaces it to the `generate()` caller; the durable loop's finish step runs output processors but only logs what they throw. A missing decision no longer surfaces as `TypeError('policy evaluator returned no decision')`, so hosts checking `instanceof TypeError` stop matching.
+
+  Use `policyDenialReason(policyName, phase)`, exported from both `@proofoftech/breakwater` and `@proofoftech/breakwater/policy-engine`, to construct the denial reason.
+
+  Security: For `PolicyEngine` and `createContentPolicyGate` denials, evaluator reasons, classifier echoes, configured patterns, length limits, and detector names reach neither the caller nor the policy audit record. Audit events identify the policy in `detail.policy` and use static denial or failure reasons.
+
+  Migration: Hosts that parse denial reasons match `policyDenialReason(...)`, read the audit event's `detail.policy`, or record the diagnostic information they need inside their own evaluator.
+
+- 9feb010: Require `@mastra/core` `1.73.0` exactly. The Node.js runtime floor remains `22.13.0`.
+
+  On a thread with stored memory, Mastra keeps input after the last assistant message, or that message's trailing client tool outcomes when the input ends with an assistant message. A caller message reusing a stored id takes the stored copy; only client tool outcomes that advance a stored pending call are merged, not replacement text. This happens before input policies, so dropped caller content reaches neither the model nor the saved thread and produces no tripwire or audit event. Send the new turn rather than re-sending history.
+
+  Security: Results, errors and denials a caller sends for a stored pending client tool call under the stored assistant message's id are evaluated as caller input after memory merges them. Breakwater records client tool outcomes before memory processing and evaluates their merged parts. Stored outcomes not re-sent are not re-evaluated; those re-sent in the same state are. Two client tool outcomes for one tool call in a caller message stop with `input processor failed`. A standalone policy engine on a plain Mastra agent with memory evaluates every client tool outcome of a merged message, including stored ones.
+
+  Guarded agents disable Mastra's default error processors, so provider-history rewriting, prefill retry and transient stream retry do not run. Construction refuses the error-processor options described in the [application processor rules](https://github.com/ProofOfTechOrg/anchorage/blob/main/packages/breakwater/README.md#application-processors). Transient stream failures and prefill rejections receive no automatic retry from those processors.
+
+  Guarded `stream()` disables eager tool execution: server tools wait until the step's stream-phase policies judge it. The durable loop runs tools after the model step regardless.
+
+  Breaking: Application input and output processors implementing `processToolResult` are refused at construction because Mastra runs that hook after Breakwater's policies on both standard and durable loops.
+
+  Migration: Move `processToolResult` logic from application input and application output processors into a tool's own result handling or an allowed processor hook. Upgrade `@mastra/core` to `1.73.0`.
+
+### Patch Changes
+
+- 549ab96: `redirect: 'error'` on the guarded fetch now works on Cloudflare Workers. The base fetch receives `redirect: 'manual'` in every mode. In `'error'` mode, a redirect response rejects with `TypeError('fetch failed')` whose cause is `Error('unexpected redirect')`, as on Node. Any other status, including 304, passes through unchanged. No migration is needed.
+- 8a8ef3a: `createGuardedAgent` reads `policies`, `applicationInputProcessors`, `applicationOutputProcessors`, and `allowedPrincipalKinds` once, by index. `RBACMiddleware` also reads `allowedPrincipalKinds` once, by index. A list whose iterator differs from its elements cannot change what is enforced after validation.
+
+  A non-array `allowedPrincipalKinds` is refused with "must be an array". No migration is needed.
+
+- 3b5b0ad: A guarded agent checks every memory resolution for thread title generation, so a title-enabled function-valued or inherited `Memory` is refused wherever Mastra resolves it. At the `generate()`/`stream()` entry check, the standard loops' execution lookup, and the durable loop's first lookup, the call rejects with the `generateTitle` `TypeError` before the model runs and writes no audit event. A title-enabled `Memory` resolved for the memory processors still stops the call with `input processor failed` and an audited `breakwater-memory` error. A lookup at Mastra's finish runs after the model. Before this change, a durable call whose first lookup alone resolved a title-enabled `Memory` answered.
+
+  Security: Before this change, the durable loop's first memory resolution was not checked, even though that `Memory` backs message saving. Thread title generation itself stayed disabled.
+
+  Migration: Disable `generateTitle` on every `Memory` a guarded agent can resolve.
+
+- 92be9d1: The input policies read a remembered message carrying the caller's client tool outcome that an application input processor keeps but moves out of the call's input through `MessageList` methods while returning the list or nothing. A refused call removes that message, also when the processor aborts or throws after moving it.
+
+  This closes a security gap where the client tool result reached the model without input policy evaluation, and a move to `response` could also save it to memory.
+
+  The moved message is read whole, stored history included, so a policy hit there refuses the call, as for a history message a processor rewrites. Its results get no new `toModelOutput` mapping. No migration is needed.
+
+- 8a3c108: On streamed answer and reasoning text, a `piiSecrets` policy whose only detectors are `ssn` and/or `awsAccessKey` no longer denies an SSN- or AWS-access-key-shaped run that the incremental scan cut from a longer word, such as `INV123-45-6789`. With any other detector enabled, such a run still denies.
+
+  This change adds no new denials. No migration is needed.
+
+- f8d0851: A guarded agent maps, through `toModelOutput` and before the input policies, a client-only tool result in a message an application input processor changes. For example, a processor can merge the result into a remembered assistant message. The policies read the mapped output the model receives.
+
+  This closes a security gap where mapped output reaches the model without input policy evaluation.
+
+  A mapper error on any result in such a message, stored results included, stops the call with `input processor failed` and an `agent.input.processor` error event naming `breakwater-client-tool-output`. The policies read such a message once more in its mapped version, which `maxTextLength` counts. No migration is needed.
+
+- 9d13a9c: A returned message Mastra holds as both remembered and call input stays both when an application input processor returns an array or a `{ messages, systemMessages }` pair.
+
+  This closes a security gap where the client tool result a caller sends for a remembered assistant message reaches the model without input policy evaluation, and could leave the stored tool call pending, when an application input processor returns its messages, as Mastra's `UnicodeNormalizer` does.
+
+  Such a processor's change to that message is now saved, as when it returns the message list. A mapper error on a stored result in a message it changes stops the call with `input processor failed`. No migration is needed.
+
 ## 0.16.0
 
 ### Minor Changes
