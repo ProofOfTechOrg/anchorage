@@ -29,6 +29,7 @@ import {
   PolicyEngine,
   type PolicyEvaluator,
   piiSecrets,
+  policyDenialReason,
 } from '../policy-engine/index.js';
 import {
   ACTOR_CONTEXT_KEY,
@@ -51,8 +52,42 @@ type Loop = (typeof LOOPS)[number];
 const STANDARD = ['generate', 'stream'] as const;
 
 const MARK = 'MKREFUSEDINPUT';
+const raw = { first: MARK.slice(0, 9), second: MARK.slice(9) };
+const concatenateOutput = (value: unknown) => ({
+  type: 'text',
+  value: (value as typeof raw).first + (value as typeof raw).second,
+});
 const POLICY_FAILED = 'policy evaluation failed';
 const PROCESSOR_FAILED = 'input processor failed';
+const ASSET_ORIGIN_DENIED = 'input asset URL origin is not allowed';
+const ASSET_SCHEME_DENIED = 'input asset URL scheme is not allowed';
+const ASSET_CREDENTIALS_DENIED = 'input asset URL credentials are not allowed';
+
+const stubFetch = () =>
+  vi.spyOn(globalThis, 'fetch').mockImplementation(
+    async () =>
+      new Response(new Uint8Array([137, 80, 78, 71]), {
+        headers: { 'content-type': 'image/png' },
+      }),
+  );
+const networkCalls = (fetch: ReturnType<typeof stubFetch>) =>
+  fetch.mock.calls
+    .map(([input]) => String(input))
+    .filter((url) => !url.toLowerCase().startsWith('data:'));
+
+afterEach(() => vi.restoreAllMocks());
+
+function lookupTool(
+  toModelOutput?: (value: unknown) => unknown,
+  id = 'lookup',
+) {
+  return createTool({
+    id,
+    description: 'Look up status',
+    inputSchema: z.object({}),
+    toModelOutput,
+  } as never);
+}
 
 const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
 
@@ -110,6 +145,7 @@ async function drive(
   loop: Loop,
   messages: unknown,
   options: Record<string, unknown>,
+  chunks?: unknown[],
 ): Promise<string | undefined> {
   if (loop === 'generate') {
     const result = (await agent.generate(
@@ -126,8 +162,8 @@ async function drive(
       fullStream: AsyncIterable<unknown>;
       tripwire: Promise<{ reason?: string } | undefined>;
     };
-    for await (const _chunk of output.fullStream) {
-      // drain
+    for await (const chunk of output.fullStream) {
+      chunks?.push(chunk);
     }
     return (await output.tripwire)?.reason;
   }
@@ -141,6 +177,7 @@ async function drive(
     type: string;
     payload?: { reason?: string };
   }>) {
+    chunks?.push(chunk);
     if (chunk.type === 'tripwire') tripwire = chunk.payload?.reason;
   }
   return tripwire;
@@ -184,6 +221,7 @@ function guardedAgent(settings: {
   instructions?: string;
   model?: MastraModelConfig;
   tools?: ToolsInput;
+  maxSteps?: number;
   allowedInputAssetOrigins?: readonly string[];
 }): GuardedAgentHandle {
   return createGuardedAgent({
@@ -201,7 +239,7 @@ function guardedAgent(settings: {
       : {}),
     policies: settings.policies ?? [denyPatterns([MARK])],
     audit: settings.audit,
-    maxSteps: 1,
+    maxSteps: settings.maxSteps ?? 1,
     toolChoice: 'auto',
     ...(settings.tools ? { tools: settings.tools } : {}),
     ...(settings.processors
@@ -325,11 +363,6 @@ function promptLines(prompt: unknown): string[] {
 }
 
 describe('client-only tool output before guarded input policies', () => {
-  const raw = { first: MARK.slice(0, 9), second: MARK.slice(9) };
-  const concatenateOutput = (value: unknown) => ({
-    type: 'text',
-    value: (value as typeof raw).first + (value as typeof raw).second,
-  });
   const messages = (name: string, output: unknown) => [
     {
       id: 'u1',
@@ -355,30 +388,283 @@ describe('client-only tool output before guarded input policies', () => {
     loop: Loop,
     output: unknown,
     mapper: (value: unknown) => unknown,
-    toolName = 'lookup',
-    configuredKey = toolName,
+    {
+      toolName = 'lookup',
+      configuredKey = toolName,
+      allowedInputAssetOrigins,
+    }: {
+      toolName?: string;
+      configuredKey?: string;
+      allowedInputAssetOrigins?: readonly string[];
+    } = {},
   ) => {
     const prompts: unknown[] = [];
     const audit = new AuditLogger();
     const toModelOutput = vi.fn(mapper);
-    const lookup = createTool({
-      id: toolName,
-      description: 'Look up status',
-      inputSchema: z.object({}),
-      toModelOutput,
-    } as never);
+    const lookup = lookupTool(toModelOutput, toolName);
     const agent = guardedAgent({
       prompts,
       audit,
       tools: { [configuredKey]: lookup },
+      allowedInputAssetOrigins,
+    });
+    const chunks: unknown[] = [];
+    const outcome = await outcomeOf(
+      drive(
+        agent,
+        loop,
+        messages(toolName, output),
+        {
+          requestContext: actorContext(),
+        },
+        chunks,
+      ),
+    );
+    return { outcome, prompts, audit, toModelOutput, chunks };
+  };
+
+  // User-asset rows miss URLs created by the client mapper after the asset step.
+  it.each(
+    [
+      {
+        kind: 'image-url',
+        item: {
+          type: 'image-url',
+          url: 'http://169.254.169.254/latest/meta-data/',
+        },
+        url: 'http://169.254.169.254/latest/meta-data/',
+        reason: ASSET_ORIGIN_DENIED,
+      },
+      {
+        kind: 'file-url',
+        item: { type: 'file-url', url: 'https://unlisted.example/a.pdf' },
+        url: 'https://unlisted.example/a.pdf',
+        reason: ASSET_ORIGIN_DENIED,
+      },
+      {
+        kind: 'media',
+        item: {
+          type: 'media',
+          data: 'gs://bucket/a.png',
+          mediaType: 'image/png',
+        },
+        url: 'gs://bucket/a.png',
+        reason: ASSET_SCHEME_DENIED,
+      },
+    ].flatMap((row) => LOOPS.map((loop) => ({ ...row, loop }))),
+  )('refuses a mapped $kind asset URL on $loop', async ({
+    item,
+    url,
+    reason,
+    kind,
+    loop,
+  }) => {
+    const { outcome, prompts, audit, toModelOutput, chunks } = await run(
+      loop,
+      'clean result',
+      () => ({ type: 'content', value: [item] }),
+    );
+    expect
+      .soft({
+        ...outcome,
+        prompts: prompts.length,
+        sent: JSON.stringify(prompts).includes(url),
+      })
+      .toEqual({
+        tripwire: reason,
+        failure: undefined,
+        prompts: 0,
+        sent: false,
+      });
+    const events = eventsOf(audit, 'agent.input.asset');
+    expect.soft(events).toMatchObject([{ decision: 'denied', reason }]);
+    expect.soft(events).toHaveLength(1);
+    expect(JSON.stringify(events)).not.toContain(new URL(url).host);
+    expect(eventsOf(audit, 'agent.input.processor')).toEqual([]);
+    expect(toModelOutput).toHaveBeenCalledTimes(1);
+    if (kind === 'image-url' && loop !== 'generate') {
+      expect
+        .soft(
+          (chunks as { type: string; payload?: unknown }[]).find(
+            ({ type }) => type === 'tripwire',
+          )?.payload,
+        )
+        .toMatchObject({ processorId: 'breakwater-client-tool-output' });
+    }
+  });
+
+  // The shared allowlist must also reach the mapper's check; user assets use another processor.
+  it.each(
+    LOOPS,
+  )('allows a mapped asset URL at a listed origin on %s', async (loop) => {
+    const url = 'https://assets.example/a.png';
+    const { outcome, prompts } = await run(
+      loop,
+      'clean result',
+      () => ({ type: 'content', value: [{ type: 'image-url', url }] }),
+      { allowedInputAssetOrigins: ['https://assets.example'] },
+    );
+    expect(outcome).toEqual({ tripwire: undefined, failure: undefined });
+    expect(prompts).toHaveLength(1);
+    expect(JSON.stringify(prompts)).toContain(url);
+  });
+
+  // Tool media keeps base64 inline; parsing data directly as a URL refuses this valid output.
+  it('keeps mapped base64 media inline on generate', async () => {
+    const fetch = stubFetch();
+    const { outcome, prompts } = await run('generate', 'clean result', () => ({
+      type: 'content',
+      value: [{ type: 'media', data: 'iVBORw0KGgo=', mediaType: 'image/png' }],
+    }));
+    expect(outcome).toEqual({ tripwire: undefined, failure: undefined });
+    expect(prompts).toHaveLength(1);
+    expect(networkCalls(fetch)).toEqual([]);
+  });
+
+  // Transcript replay can supply a server tool's cached output without invoking the client mapper.
+  it.each(
+    LOOPS,
+  )('refuses a caller UI stored server-tool asset URL on %s', async (loop) => {
+    const url = 'https://unlisted.example/a.png';
+    const prompts: unknown[] = [];
+    const audit = new AuditLogger();
+    const toModelOutput = vi.fn(() => ({
+      type: 'text',
+      value: 'clean output',
+    }));
+    const server = createTool({
+      id: 'server',
+      description: 'Server lookup',
+      inputSchema: z.object({}),
+      execute: async () => 'clean result',
+      toModelOutput,
+    } as never);
+    const agent = guardedAgent({ prompts, audit, tools: { server } });
+    const input = messages('server', 'clean result');
+    const part = input[1]?.parts[0];
+    if (!part) throw new Error('server tool result part is missing');
+    Object.assign(part, {
+      callProviderMetadata: {
+        mastra: {
+          modelOutput: { type: 'content', value: [{ type: 'image-url', url }] },
+        },
+      },
     });
     const outcome = await outcomeOf(
-      drive(agent, loop, messages(toolName, output), {
+      drive(agent, loop, input, { requestContext: actorContext() }),
+    );
+    expect
+      .soft({
+        ...outcome,
+        prompts: prompts.length,
+        sent: JSON.stringify(prompts).includes(url),
+      })
+      .toEqual({
+        tripwire: ASSET_ORIGIN_DENIED,
+        failure: undefined,
+        prompts: 0,
+        sent: false,
+      });
+    expect
+      .soft(eventsOf(audit, 'agent.input.asset'))
+      .toMatchObject([{ decision: 'denied', reason: ASSET_ORIGIN_DENIED }]);
+    expect(eventsOf(audit, 'agent.input.asset')).toHaveLength(1);
+    expect(toModelOutput).not.toHaveBeenCalled();
+  });
+
+  // The merge keeps completed history metadata even when useChat re-sends that part as caller input.
+  it.each(
+    LOOPS,
+  )('allows re-sent completed server-tool history beside a fresh client outcome on %s', async (loop) => {
+    const url = 'https://cdn.unlisted.example/a.png';
+    const memory = await historyMemory();
+    const completed = {
+      type: 'tool-invocation' as const,
+      toolInvocation: {
+        state: 'result' as const,
+        toolCallId: 'call-0',
+        toolName: 'server',
+        args: {},
+        result: 'old server result',
+      },
+      providerMetadata: {
+        mastra: {
+          modelOutput: { type: 'content', value: [{ type: 'image-url', url }] },
+        },
+      },
+    };
+    const pending = {
+      type: 'tool-invocation' as const,
+      toolInvocation: {
+        state: 'call' as const,
+        toolCallId: 'call-1',
+        toolName: 'lookup',
+        args: {},
+      },
+    };
+    await memory.saveMessages({
+      messages: [
+        {
+          id: 'm2',
+          role: 'assistant',
+          threadId: 't1',
+          resourceId: 'r1',
+          createdAt: new Date(Date.now() - 100_000),
+          content: { format: 2, parts: [completed, pending] },
+        } as never,
+      ],
+    });
+    const prompts: unknown[] = [];
+    const audit = new AuditLogger();
+    const agent = guardedAgent({
+      prompts,
+      audit,
+      memory,
+      tools: {
+        lookup: lookupTool(() => ({
+          type: 'text',
+          value: 'clean mapped result',
+        })),
+        server: createTool({
+          id: 'server',
+          description: 'Server lookup',
+          inputSchema: z.object({}),
+          execute: async () => 'unused',
+        }),
+      },
+    });
+    const input = [
+      {
+        id: 'm2',
+        role: 'assistant',
+        content: {
+          format: 2,
+          parts: [
+            structuredClone(completed),
+            {
+              ...pending,
+              toolInvocation: {
+                ...pending.toolInvocation,
+                state: 'result',
+                result: 'clean client result',
+              },
+            },
+          ],
+        },
+      },
+      'and now?',
+    ];
+    const outcome = await outcomeOf(
+      drive(agent, loop, input, {
         requestContext: actorContext(),
+        memory: THREAD,
       }),
     );
-    return { outcome, prompts, audit, toModelOutput };
-  };
+    expect(outcome).toEqual({ tripwire: undefined, failure: undefined });
+    expect(prompts).toHaveLength(1);
+    expect(JSON.stringify(prompts)).toContain(url);
+    expect(eventsOf(audit, 'agent.input.asset')).toEqual([]);
+  });
 
   it.each(LOOPS)('refuses mapped denied text on %s', async (loop) => {
     const { outcome, prompts, audit, toModelOutput } = await run(
@@ -387,7 +673,7 @@ describe('client-only tool output before guarded input policies', () => {
       concatenateOutput,
     );
     expect.soft(outcome).toEqual({
-      tripwire: expect.stringMatching(/^deny-patterns: /),
+      tripwire: policyDenialReason('deny-patterns', 'input'),
       failure: undefined,
     });
     expect.soft(prompts).toEqual([]);
@@ -453,11 +739,10 @@ describe('client-only tool output before guarded input policies', () => {
       loop,
       raw,
       concatenateOutput,
-      'docs_lookup',
-      'docs.lookup',
+      { toolName: 'docs_lookup', configuredKey: 'docs.lookup' },
     );
     expect.soft(outcome).toEqual({
-      tripwire: expect.stringMatching(/^deny-patterns: /),
+      tripwire: policyDenialReason('deny-patterns', 'input'),
       failure: undefined,
     });
     expect.soft(prompts).toEqual([]);
@@ -469,12 +754,7 @@ describe('client-only tool output before guarded input policies', () => {
     const prompts: unknown[] = [];
     const audit = new AuditLogger();
     const toModelOutput = vi.fn(concatenateOutput);
-    const lookup = createTool({
-      id: 'lookup',
-      description: 'Look up status',
-      inputSchema: z.object({}),
-      toModelOutput,
-    } as never);
+    const lookup = lookupTool(toModelOutput);
     const memory = new (class extends MockMemory {
       override listTools() {
         return { lookup };
@@ -488,7 +768,7 @@ describe('client-only tool output before guarded input policies', () => {
       }),
     );
     expect.soft(outcome).toEqual({
-      tripwire: expect.stringMatching(/^deny-patterns: /),
+      tripwire: policyDenialReason('deny-patterns', 'input'),
       failure: undefined,
     });
     expect.soft(prompts).toEqual([]);
@@ -529,20 +809,6 @@ describe('client-only tool output before guarded input policies', () => {
 });
 
 describe('guarded input asset URL origins', () => {
-  const originReason = 'input asset URL origin is not allowed';
-  const schemeReason = 'input asset URL scheme is not allowed';
-  const credentialsReason = 'input asset URL credentials are not allowed';
-  const stubFetch = () =>
-    vi.spyOn(globalThis, 'fetch').mockImplementation(
-      async () =>
-        new Response(new Uint8Array([137, 80, 78, 71]), {
-          headers: { 'content-type': 'image/png' },
-        }),
-    );
-  const networkCalls = (fetch: ReturnType<typeof stubFetch>) =>
-    fetch.mock.calls
-      .map(([input]) => String(input))
-      .filter((url) => !url.toLowerCase().startsWith('data:'));
   const modelImage = (image: string | URL) => [
     { role: 'user', content: [{ type: 'image', image }] },
   ];
@@ -554,7 +820,188 @@ describe('guarded input asset URL origins', () => {
     },
   ];
 
-  afterEach(() => vi.restoreAllMocks());
+  async function runDrainedAsset(
+    loop: 'stream' | 'durable',
+    allowedInputAssetOrigins: readonly string[] = [],
+    url = 'https://unlisted.example/a.png',
+  ) {
+    const fetch = stubFetch();
+    const memory = await threadMemory();
+    await memory.saveMessages({
+      messages: [
+        {
+          id: 'signal-seed',
+          role: 'user',
+          content: {
+            format: 2,
+            parts: [{ type: 'text', text: 'seeded history' }],
+          },
+          createdAt: new Date(Date.now() - 300_000),
+          threadId: THREAD.thread,
+          resourceId: THREAD.resource,
+        },
+      ] as never,
+    });
+    const before = (
+      await memory.recall({
+        threadId: THREAD.thread,
+        resourceId: THREAD.resource,
+      })
+    ).messages;
+    const prompts: unknown[] = [];
+    const audit = new AuditLogger();
+    const runId = `drained-asset-${loop}`;
+    const model: MastraModelConfig = {
+      specificationVersion: 'v2',
+      provider: 'breakwater-test',
+      modelId: 'signal-asset',
+      supportedUrls: {},
+      doGenerate: async () => {
+        throw new Error('stream model only');
+      },
+      doStream: async (options) => {
+        prompts.push(options.prompt);
+        const first = prompts.length === 1;
+        const parts = first
+          ? [
+              {
+                type: 'tool-call',
+                toolCallId: 'send-1',
+                toolName: 'send',
+                input: '{}',
+              },
+            ]
+          : [
+              { type: 'text-start', id: 'answer' },
+              { type: 'text-delta', id: 'answer', delta: 'answered' },
+              { type: 'text-end', id: 'answer' },
+            ];
+        return {
+          stream: new ReadableStream({
+            start(controller) {
+              controller.enqueue({ type: 'stream-start', warnings: [] });
+              for (const part of parts) controller.enqueue(part as never);
+              controller.enqueue({
+                type: 'finish',
+                finishReason: first ? 'tool-calls' : 'stop',
+                usage,
+              });
+              controller.close();
+            },
+          }),
+        };
+      },
+    };
+    const agent = guardedAgent({
+      prompts,
+      audit,
+      memory,
+      model,
+      maxSteps: 2,
+      allowedInputAssetOrigins,
+      tools: {
+        send: createTool({
+          id: 'send',
+          description: 'Send an asset signal',
+          inputSchema: z.object({}),
+          execute: async () => {
+            const sent = (agent as unknown as Agent).sendSignal(
+              {
+                type: 'user',
+                contents: [
+                  { type: 'file', data: new URL(url), mediaType: 'image/png' },
+                ],
+              },
+              {
+                runId,
+                threadId: THREAD.thread,
+                resourceId: THREAD.resource,
+                ifActive: { behavior: 'deliver' },
+                ifIdle: { behavior: 'discard' },
+              },
+            );
+            expect(await sent.accepted).toMatchObject({
+              action: 'deliver',
+              runId,
+            });
+            return { sent: true };
+          },
+        }),
+      },
+    });
+    // The durable wrapper registers itself and its wrapped agent on this pub/sub.
+    const writer =
+      loop === 'durable'
+        ? createDurableAgent({ agent: agent as unknown as Agent, cache: false })
+        : (agent as unknown as Agent);
+    new Mastra({ logger: false, agents: { writer } });
+    const chunks: Array<{
+      type: string;
+      payload?: { reason?: string; processorId?: string };
+    }> = [];
+    const streamed = await writer.stream(['signal call input'], {
+      requestContext: actorContext(),
+      memory: THREAD,
+      runId,
+    });
+    const output = 'output' in streamed ? streamed.output : streamed;
+    for await (const chunk of output.fullStream)
+      chunks.push(chunk as (typeof chunks)[number]);
+    const result = await output.getFullOutput();
+    if ('cleanup' in streamed) streamed.cleanup();
+    const after = (
+      await memory.recall({
+        threadId: THREAD.thread,
+        resourceId: THREAD.resource,
+      })
+    ).messages;
+    return { url, fetch, prompts, audit, chunks, result, before, after };
+  }
+
+  it.each([
+    'stream',
+    'durable',
+  ] as const)('refuses an unlisted asset origin drained between steps on %s', async (loop) => {
+    const { url, fetch, prompts, audit, chunks, before, after } =
+      await runDrainedAsset(loop);
+    expect
+      .soft(chunks.find((chunk) => chunk.type === 'tripwire')?.payload)
+      .toMatchObject({
+        reason: ASSET_ORIGIN_DENIED,
+        processorId: 'breakwater-input-assets',
+      });
+    expect.soft(prompts).toHaveLength(1);
+    expect.soft(networkCalls(fetch)).not.toContain(url);
+    const events = eventsOf(audit, 'agent.input.asset');
+    expect.soft(events).toEqual([
+      expect.objectContaining({
+        decision: 'denied',
+        reason: ASSET_ORIGIN_DENIED,
+      }),
+    ]);
+    expect(JSON.stringify(events)).not.toContain('unlisted.example');
+    expect.soft(after).toEqual(before);
+  });
+
+  it.each([
+    'stream',
+    'durable',
+  ] as const)('allows a listed asset origin drained between steps on %s', async (loop) => {
+    const { prompts, audit, chunks, result } = await runDrainedAsset(
+      loop,
+      ['https://assets.example'],
+      'https://assets.example/a.png',
+    );
+    expect(
+      chunks.filter(
+        (chunk) => chunk.type === 'tripwire' || chunk.type === 'error',
+      ),
+    ).toEqual([]);
+    expect(result.text).toBe('answered');
+    expect(prompts).toHaveLength(2);
+    expect(eventsOf(audit, 'agent.input.asset')).toEqual([]);
+    expect(eventsOf(audit, 'agent.input.policy', 'error')).toEqual([]);
+  });
 
   const refused: ReadonlyArray<{
     name: string;
@@ -566,75 +1013,87 @@ describe('guarded input asset URL origins', () => {
     {
       name: 'metadata IP',
       url: 'http://169.254.169.254/latest/meta-data/',
-      reason: originReason,
+      reason: ASSET_ORIGIN_DENIED,
     },
     {
       name: 'Docker loopback',
       url: 'http://127.0.0.1:2375/containers/json',
-      reason: originReason,
+      reason: ASSET_ORIGIN_DENIED,
     },
     {
       name: 'unlisted HTTPS',
       url: 'https://unlisted.example/a.png',
-      reason: originReason,
+      reason: ASSET_ORIGIN_DENIED,
     },
     {
       name: 'different scheme',
       url: 'http://assets.example/a.png',
       origins: ['https://assets.example'],
-      reason: originReason,
+      reason: ASSET_ORIGIN_DENIED,
     },
     {
       name: 'subdomain',
       url: 'https://cdn.assets.example/a.png',
       origins: ['https://assets.example'],
-      reason: originReason,
+      reason: ASSET_ORIGIN_DENIED,
     },
     {
       name: 'nondefault port',
       url: 'https://assets.example:8443/a.png',
       origins: ['https://assets.example'],
-      reason: originReason,
+      reason: ASSET_ORIGIN_DENIED,
     },
     {
       name: 'credentials',
       url: 'https://user:pw@assets.example/a.png',
       origins: ['https://assets.example'],
-      reason: credentialsReason,
+      reason: ASSET_CREDENTIALS_DENIED,
     },
-    { name: 'gs scheme', url: 'gs://bucket/a.png', reason: schemeReason },
-    { name: 's3 scheme', url: 's3://bucket/a.png', reason: schemeReason },
-    { name: 'file scheme', url: 'file:///etc/passwd', reason: schemeReason },
+    {
+      name: 'gs scheme',
+      url: 'gs://bucket/a.png',
+      reason: ASSET_SCHEME_DENIED,
+    },
+    {
+      name: 's3 scheme',
+      url: 's3://bucket/a.png',
+      reason: ASSET_SCHEME_DENIED,
+    },
+    {
+      name: 'file scheme',
+      url: 'file:///etc/passwd',
+      reason: ASSET_SCHEME_DENIED,
+    },
     {
       name: 'ftp scheme',
       url: 'ftp://assets.example/a.png',
-      reason: schemeReason,
+      reason: ASSET_SCHEME_DENIED,
     },
     {
       name: 'URL object',
       url: 'http://169.254.169.254/latest/meta-data/',
       messages: () =>
         modelImage(new URL('http://169.254.169.254/latest/meta-data/')),
-      reason: originReason,
+      reason: ASSET_ORIGIN_DENIED,
     },
     {
       name: 'file part',
       url: 'http://169.254.169.254/latest/meta-data/',
       messages: () =>
         modelFile('http://169.254.169.254/latest/meta-data/', 'image/png'),
-      reason: originReason,
+      reason: ASSET_ORIGIN_DENIED,
     },
     {
       name: 'upper-case DB URL',
       url: 'HTTP://169.254.169.254/x',
       messages: () => dbFile('HTTP://169.254.169.254/x', 'image/png'),
-      reason: originReason,
+      reason: ASSET_ORIGIN_DENIED,
     },
     {
       name: 'upper-case UI URL',
       url: 'HTTP://169.254.169.254/x',
       messages: () => uiFile('HTTP://169.254.169.254/x'),
-      reason: originReason,
+      reason: ASSET_ORIGIN_DENIED,
     },
     {
       name: 'UI attachment',
@@ -648,7 +1107,7 @@ describe('guarded input asset URL origins', () => {
           ],
         },
       ],
-      reason: originReason,
+      reason: ASSET_ORIGIN_DENIED,
     },
   ];
 
@@ -769,12 +1228,15 @@ describe('guarded input asset URL origins', () => {
       await outcomeOf(
         drive(agent, loop, ['hello'], { requestContext: actorContext() }),
       ),
-    ).toEqual({ tripwire: originReason, failure: undefined });
+    ).toEqual({ tripwire: ASSET_ORIGIN_DENIED, failure: undefined });
     expect(networkCalls(fetch)).not.toContain(url);
     expect(prompts).toEqual([]);
     const events = eventsOf(audit, 'agent.input.asset');
     expect(events).toEqual([
-      expect.objectContaining({ decision: 'denied', reason: originReason }),
+      expect.objectContaining({
+        decision: 'denied',
+        reason: ASSET_ORIGIN_DENIED,
+      }),
     ]);
     expect(JSON.stringify(events)).not.toContain(url);
     expect(JSON.stringify(events)).not.toContain(new URL(url).hostname);
@@ -804,12 +1266,15 @@ describe('guarded input asset URL origins', () => {
           memory: THREAD,
         }),
       ),
-    ).toEqual({ tripwire: originReason, failure: undefined });
+    ).toEqual({ tripwire: ASSET_ORIGIN_DENIED, failure: undefined });
     expect(networkCalls(fetch)).not.toContain(url);
     expect(prompts).toEqual([]);
     const events = eventsOf(audit, 'agent.input.asset');
     expect(events).toEqual([
-      expect.objectContaining({ decision: 'denied', reason: originReason }),
+      expect.objectContaining({
+        decision: 'denied',
+        reason: ASSET_ORIGIN_DENIED,
+      }),
     ]);
     expect(JSON.stringify(events)).not.toContain(url);
     expect(JSON.stringify(events)).not.toContain(new URL(url).hostname);
@@ -906,7 +1371,7 @@ describe('file and image prompt media policy text', () => {
       } else {
         expect({ loop, ...outcome, prompts }).toEqual({
           loop,
-          tripwire: row.reason ?? expect.stringMatching(/^deny-patterns: /),
+          tripwire: row.reason ?? policyDenialReason('deny-patterns', 'input'),
           failure: undefined,
           prompts: [],
         });
@@ -1519,14 +1984,17 @@ async function storedText(memory: MockMemory): Promise<string> {
 }
 
 // Mastra's durable finish saves the thread after its stream drains, so the
-// thread is read until `marker` appears or the wait ends.
+// thread is read until a requested marker appears or the wait ends.
 async function storedWithin(
   memory: MockMemory,
-  marker: string,
+  markers: readonly string[],
 ): Promise<string> {
   const deadline = Date.now() + WAIT_MS;
   let text = await storedText(memory);
-  while (!text.includes(marker) && Date.now() < deadline) {
+  while (
+    !markers.some((marker) => text.includes(marker)) &&
+    Date.now() < deadline
+  ) {
     await new Promise((resolve) => setTimeout(resolve, 25));
     text = await storedText(memory);
   }
@@ -1534,12 +2002,16 @@ async function storedWithin(
 }
 
 // Whether the thread holds the marker once the call has finished.
-async function savedMarker(memory: MockMemory, loop: Loop): Promise<boolean> {
+async function savedMarker(
+  memory: MockMemory,
+  loop: Loop,
+  markers: readonly string[] = [MARK],
+): Promise<boolean> {
   const text =
     loop === 'durable'
-      ? await storedWithin(memory, MARK)
+      ? await storedWithin(memory, markers)
       : await storedText(memory);
-  return text.includes(MARK);
+  return markers.some((marker) => text.includes(marker));
 }
 
 async function historyMemory(
@@ -1575,6 +2047,419 @@ async function historyMemory(
   });
   return memory;
 }
+
+function moveCallerOutcome(
+  { messageList, abort }: Pick<ProcessInputArgs, 'messageList' | 'abort'>,
+  target: 'memory' | 'response',
+) {
+  const m = messageList.get.input.db().find(({ id }) => id === 'm2');
+  if (!m) return abort('caller outcome missing');
+  messageList.removeByIds([m.id]);
+  messageList.add(m, target, { merge: false });
+  return m;
+}
+
+async function sharedClientOutcomeFixture({
+  storedMessageText,
+  lookupResult,
+  callerResult,
+  processors,
+  lookup = (value: unknown) => ({ type: 'text', value: `mapped ${value}` }),
+  historicalResult = false,
+  stampedHistory = false,
+}: {
+  storedMessageText: string;
+  lookupResult: string | typeof raw;
+  callerResult?: typeof raw;
+  processors?: readonly GuardedInputProcessor[];
+  lookup?: ((value: unknown) => unknown) | null;
+  historicalResult?: boolean;
+  stampedHistory?: boolean;
+}) {
+  const stamp = { createdAt: 1_700_000_000_000 };
+  const memory = await historyMemory();
+  const pending = {
+    type: 'tool-invocation' as const,
+    createdAt: Date.now() - 100_000,
+    toolInvocation: {
+      state: 'call' as const,
+      toolCallId: 'call-1',
+      toolName: 'lookup',
+      args: {},
+    },
+  };
+  const pendingCalls = [
+    pending,
+    ...(callerResult
+      ? [
+          {
+            ...pending,
+            toolInvocation: {
+              ...pending.toolInvocation,
+              toolCallId: 'call-2',
+              toolName: 'details_lookup',
+            },
+          },
+        ]
+      : []),
+  ];
+  await memory.saveMessages({
+    messages: [
+      {
+        id: 'm2',
+        role: 'assistant',
+        threadId: 't1',
+        resourceId: 'r1',
+        createdAt: new Date(Date.now() - 100_000),
+        content: {
+          format: 2,
+          // By default the stored parts omit `createdAt`, so stamping a restore
+          // changes the message and turns the `without re-reading history` rows red.
+          parts: [
+            {
+              type: 'text',
+              text: storedMessageText,
+              ...(stampedHistory ? stamp : {}),
+            },
+            ...(historicalResult
+              ? [
+                  {
+                    type: 'tool-invocation' as const,
+                    ...(stampedHistory ? stamp : {}),
+                    toolInvocation: {
+                      state: 'result' as const,
+                      toolCallId: 'call-0',
+                      toolName: 'historical_lookup',
+                      args: {},
+                      result: 'stored historical result',
+                    },
+                  },
+                ]
+              : []),
+            ...pendingCalls,
+          ],
+        },
+      },
+    ],
+  });
+  const prompts: unknown[] = [];
+  const agent = guardedAgent({
+    prompts,
+    audit: new AuditLogger(),
+    memory,
+    tools: {
+      lookup: lookupTool(lookup ?? undefined),
+      ...(historicalResult
+        ? {
+            historical_lookup: lookupTool(() => {
+              throw new Error('stored result mapper failed');
+            }, 'historical_lookup'),
+          }
+        : {}),
+      ...(callerResult
+        ? { details_lookup: lookupTool(concatenateOutput, 'details_lookup') }
+        : {}),
+    },
+    processors: processors ?? [
+      app(({ messageList }) => {
+        const own = messageList.get.input.db().find(({ id }) => id === 'm2');
+        const part = own?.content.parts.find(
+          (candidate) =>
+            candidate.type === 'tool-invocation' &&
+            candidate.toolInvocation.toolCallId === 'call-1',
+        );
+        if (!part) throw new Error('caller outcome missing');
+        messageList.add(
+          {
+            id: 'mem-a',
+            role: 'assistant',
+            threadId: 't1',
+            createdAt: new Date(),
+            content: { format: 2, parts: [part] },
+          },
+          'input',
+        );
+        return messageList;
+      }),
+    ],
+  });
+  const messages = [
+    {
+      id: 'm2',
+      role: 'assistant',
+      content: {
+        format: 2,
+        parts: pendingCalls.map((call) => ({
+          ...call,
+          toolInvocation: {
+            ...call.toolInvocation,
+            state: 'result',
+            result:
+              call.toolInvocation.toolCallId === 'call-1'
+                ? lookupResult
+                : { ...callerResult },
+          },
+        })),
+      },
+    },
+    'and now?',
+  ];
+  const callOptions = { requestContext: actorContext(), memory: THREAD };
+  return { agent, messages, callOptions, prompts, memory };
+}
+
+async function runSharedClientOutcome(
+  loop: Loop,
+  options: Parameters<typeof sharedClientOutcomeFixture>[0],
+) {
+  const { agent, messages, callOptions, prompts, memory } =
+    await sharedClientOutcomeFixture(options);
+  const outcome = await outcomeOf(drive(agent, loop, messages, callOptions));
+  return { outcome, prompts, memory };
+}
+
+// No application processor records this remembered message: the caller candidate itself must be checked after mapping.
+it.each(
+  LOOPS,
+)('refuses an asset URL mapped from a caller outcome merged into memory on %s', async (loop) => {
+  const url = 'https://unlisted.example/a.png';
+  const { outcome, prompts, memory } = await runSharedClientOutcome(loop, {
+    storedMessageText: 'pending client lookup',
+    lookupResult: 'clean client result',
+    processors: [],
+    lookup: () => ({ type: 'content', value: [{ type: 'image-url', url }] }),
+  });
+  expect
+    .soft({
+      ...outcome,
+      prompts: prompts.length,
+      sent: JSON.stringify(prompts).includes(url),
+      saved: await savedMarker(memory, loop, [url]),
+    })
+    .toEqual({
+      tripwire: ASSET_ORIGIN_DENIED,
+      failure: undefined,
+      prompts: 0,
+      sent: false,
+      saved: false,
+    });
+});
+
+it.each(
+  LOOPS,
+)('allows a clean client outcome shared with older history on %s', async (loop) => {
+  const clean = 'clean client result';
+  const { outcome, prompts } = await runSharedClientOutcome(loop, {
+    storedMessageText: MARK,
+    lookupResult: clean,
+  });
+  const received = {
+    loop,
+    ...outcome,
+    prompts: prompts.length,
+    mapped: JSON.stringify(prompts).includes(`mapped ${clean}`),
+  };
+  expect(received).toEqual({
+    loop,
+    tripwire: undefined,
+    failure: undefined,
+    prompts: 1,
+    mapped: true,
+  });
+});
+
+it.each(
+  LOOPS,
+)('refuses a mapped caller outcome beside a client outcome shared with older history on %s', async (loop) => {
+  const { outcome, prompts } = await runSharedClientOutcome(loop, {
+    storedMessageText: 'pending client lookups',
+    lookupResult: 'clean client result',
+    callerResult: raw,
+  });
+  expect({
+    loop,
+    ...outcome,
+    prompts: prompts.length,
+    sent: JSON.stringify(prompts).includes(MARK),
+  }).toEqual({
+    loop,
+    tripwire: policyDenialReason('deny-patterns', 'input'),
+    failure: undefined,
+    prompts: 0,
+    sent: false,
+  });
+});
+
+it.each([
+  {
+    shape: 'copies',
+    processor: app(({ messages }) =>
+      messages.map((message) => ({ ...message })),
+    ),
+    result: MARK,
+    lookup: null,
+  },
+  {
+    shape: 'an identity array after mapping',
+    processor: app(({ messages }) => messages),
+    result: { ...raw },
+    lookup: concatenateOutput,
+  },
+])('refuses a returned remembered client outcome as $shape', async (row) => {
+  const received = [];
+  for (const loop of LOOPS) {
+    const { outcome, prompts, memory } = await runSharedClientOutcome(loop, {
+      storedMessageText: 'pending client lookup',
+      lookupResult: row.result,
+      lookup: row.lookup,
+      processors: [row.processor],
+    });
+    received.push({
+      loop,
+      ...outcome,
+      prompts: prompts.length,
+      sent: JSON.stringify(prompts).includes(MARK),
+      saved: await savedMarker(memory, loop, [raw.first]),
+    });
+  }
+  expect(received).toEqual(
+    LOOPS.map((loop) => ({
+      loop,
+      tripwire: policyDenialReason('deny-patterns', 'input'),
+      failure: undefined,
+      prompts: 0,
+      sent: false,
+      saved: false,
+    })),
+  );
+});
+
+it.each([
+  { shape: 'an identity array', processor: app(({ messages }) => messages) },
+  {
+    shape: 'copies',
+    processor: app(({ messages }) =>
+      messages.map((message) => ({ ...message })),
+    ),
+  },
+])('maps a returned remembered client outcome as $shape without re-reading history and saves it on standard loops', async (row) => {
+  const clean = 'clean client result';
+  const received = [];
+  for (const loop of LOOPS) {
+    const { outcome, prompts, memory } = await runSharedClientOutcome(loop, {
+      storedMessageText: MARK,
+      lookupResult: clean,
+      historicalResult: true,
+      processors: [row.processor],
+    });
+    received.push({
+      loop,
+      ...outcome,
+      prompts: prompts.length,
+      mapped: JSON.stringify(prompts).includes(`mapped ${clean}`),
+      ...(loop === 'durable'
+        ? {}
+        : { saved: await savedMarker(memory, loop, [clean]) }),
+    });
+  }
+  expect(received).toEqual([
+    ...STANDARD.map((loop) => ({
+      loop,
+      tripwire: undefined,
+      failure: undefined,
+      prompts: 1,
+      mapped: true,
+      saved: true,
+    })),
+    {
+      loop: 'durable',
+      tripwire: undefined,
+      failure: undefined,
+      prompts: 1,
+      mapped: true,
+    },
+  ]);
+});
+
+it.each([
+  'memory',
+  'response',
+  'memory beside an input copy',
+] as const)('refuses a remembered caller outcome moved to %s', async (move) => {
+  const received = [];
+  for (const loop of LOOPS) {
+    const { outcome, prompts, memory } = await runSharedClientOutcome(loop, {
+      storedMessageText: 'pending client lookup',
+      lookupResult: MARK,
+      lookup: null,
+      // Stamping keeps response and input-copy adds from changing the fingerprint.
+      stampedHistory: true,
+      processors: [
+        app(({ messageList, abort }) => {
+          const m = moveCallerOutcome(
+            { messageList, abort },
+            move === 'response' ? 'response' : 'memory',
+          );
+          if (move === 'memory beside an input copy') {
+            messageList.add({ ...m }, 'input');
+          }
+          return messageList;
+        }),
+      ],
+    });
+    received.push({
+      loop,
+      ...outcome,
+      prompts: prompts.length,
+      sent: JSON.stringify(prompts).includes(MARK),
+      saved: await savedMarker(memory, loop),
+    });
+  }
+  expect(received).toEqual(
+    LOOPS.map((loop) => ({
+      loop,
+      tripwire: policyDenialReason('deny-patterns', 'input'),
+      failure: undefined,
+      prompts: 0,
+      sent: false,
+      saved: false,
+    })),
+  );
+});
+
+it('sends an allowed moved remembered caller outcome without new mapping', async () => {
+  const received = [];
+  for (const loop of LOOPS) {
+    const { outcome, prompts } = await runSharedClientOutcome(loop, {
+      storedMessageText: 'pending client lookup',
+      lookupResult: { ...raw },
+      lookup: concatenateOutput,
+      processors: [
+        app(({ messageList, abort }) => {
+          moveCallerOutcome({ messageList, abort }, 'memory');
+          return messageList;
+        }),
+      ],
+    });
+    received.push({
+      loop,
+      ...outcome,
+      prompts: prompts.length,
+      sent: JSON.stringify(prompts).includes(MARK),
+      rawSent: JSON.stringify(prompts).includes(raw.first),
+    });
+  }
+  expect(received).toEqual(
+    LOOPS.map((loop) => ({
+      loop,
+      tripwire: undefined,
+      failure: undefined,
+      prompts: 1,
+      sent: false,
+      rawSent: true,
+    })),
+  );
+});
 
 describe('durable memory preparation', () => {
   function semanticMemory() {
@@ -1775,21 +2660,21 @@ describe('durable memory preparation', () => {
       memory: async () => memory,
     });
 
-    expect(
-      await drive(agent, 'durable', ['hello'], {
+    const outcome = await outcomeOf(
+      drive(agent, 'durable', ['hello'], {
         requestContext: actorContext(),
         memory: THREAD,
       }),
-    ).toBe(PROCESSOR_FAILED);
-    expect(prompts).toEqual([]);
-    expect(eventsOf(audit, 'agent.input.processor', 'error')).toMatchObject([
-      { detail: { processor: 'breakwater-memory' } },
-    ]);
+    );
+    expect.soft(outcome.tripwire).toBeUndefined();
+    expect.soft(outcome.failure).toMatch(/generateTitle/);
+    expect.soft(prompts).toEqual([]);
+    expect.soft(eventsOf(audit, 'agent.input.processor', 'error')).toEqual([]);
   });
 
   it.each(
     LOOPS,
-  )('does not generate a title when dynamic memory changes between resolutions on %s', async (loop) => {
+  )('refuses a title-enabled dynamic memory resolution before the model call on %s', async (loop) => {
     const disabled = await threadMemory({ title: false });
     const enabled = new MockMemory({
       storage: new InMemoryStore(),
@@ -1819,14 +2704,14 @@ describe('durable memory preparation', () => {
       },
     });
 
-    expect(
-      await drive(agent, loop, ['hello'], {
+    const outcome = await outcomeOf(
+      drive(agent, loop, ['hello'], {
         requestContext: actorContext(),
         memory: THREAD,
       }),
-    ).toBeUndefined();
-    expect(prompts).toHaveLength(1);
-    expect(await titleWithin(enabled)).toBe('');
+    );
+    expect.soft(outcome.failure).toMatch(/generateTitle/);
+    expect.soft(prompts).toEqual([]);
   });
 });
 
@@ -1998,7 +2883,7 @@ describe('a call refused on the input chain saves none of its input', () => {
 
     // #then
     expect(tripwire).toBeUndefined();
-    expect(await storedWithin(memory, MARK)).toContain(MARK);
+    expect(await storedWithin(memory, [MARK])).toContain(MARK);
   });
 
   it.each(
@@ -2026,7 +2911,7 @@ describe('a call refused on the input chain saves none of its input', () => {
     // #then
     expect(tripwire).toBeDefined();
     expect(refusedPrompts).toEqual([]);
-    expect(await storedWithin(memory, MARK)).not.toContain(MARK);
+    expect(await storedWithin(memory, [MARK])).not.toContain(MARK);
     for (const loop of STANDARD) {
       const prompts: unknown[] = [];
       const next = guardedAgent({
@@ -2109,6 +2994,40 @@ describe('a refused standard-loop call', () => {
     remembered: output.rememberedMessages.map(({ id }) => id),
   });
 
+  it.each([
+    { end: 'aborts', reason: 'application refused' },
+    { end: 'throws', reason: PROCESSOR_FAILED },
+  ])('removes a moved remembered caller outcome when its processor $end', async (row) => {
+    const received = [];
+    for (const loop of STANDARD) {
+      const { agent, messages, callOptions } = await sharedClientOutcomeFixture(
+        {
+          storedMessageText: 'pending client lookup',
+          lookupResult: MARK,
+          lookup: null,
+          processors: [
+            app(({ messageList, abort }) => {
+              moveCallerOutcome({ messageList, abort }, 'memory');
+              if (row.end === 'aborts') return abort('application refused');
+              throw new Error('application failed');
+            }),
+          ],
+        },
+      );
+      const output = await fullOutput(agent, loop, callOptions, messages);
+      const { reason, messages: remaining, remembered } = summary(output);
+      received.push({ loop, reason, messages: remaining, remembered });
+    }
+    expect(received).toEqual(
+      STANDARD.map((loop) => ({
+        loop,
+        reason: row.reason,
+        messages: ['mem-u', 'mem-a'],
+        remembered: ['mem-u', 'mem-a'],
+      })),
+    );
+  });
+
   it('returns the tripwire, the remembered history and the audit it did before, without the refused input in messages, on generate and stream', async () => {
     for (const loop of STANDARD) {
       // #given
@@ -2126,7 +3045,7 @@ describe('a refused standard-loop call', () => {
       // #then
       expect({ loop, ...summary(output) }).toEqual({
         loop,
-        reason: expect.stringMatching(/^deny-patterns: /),
+        reason: policyDenialReason('deny-patterns', 'input'),
         processorId: 'breakwater-policy-engine',
         text: '',
         finishReason: 'other',
@@ -2532,22 +3451,33 @@ describe('the value an application input processor returns', () => {
 // input policies would not otherwise read it.
 interface Moved {
   readonly processors: () => readonly GuardedInputProcessor[];
+  readonly tools?: () => ToolsInput;
   readonly input?: readonly unknown[];
   readonly instructions?: string;
   readonly unsaved?: true;
+  readonly savedTexts?: readonly string[];
 }
 
-async function expectStoppedOnPolicy(row: Moved): Promise<void> {
-  const outcomes: unknown[] = [];
+async function collectMovedOutcomes(
+  row: Moved,
+  {
+    sentNeedle = MARK,
+  }: {
+    sentNeedle?: string;
+  } = {},
+) {
+  const outcomes = [];
   for (const loop of LOOPS) {
     // #given
     const memory = await historyMemory();
     const prompts: unknown[] = [];
+    const audit = new AuditLogger();
     const agent = guardedAgent({
       prompts,
-      audit: new AuditLogger(),
+      audit,
       processors: row.processors(),
       memory,
+      ...(row.tools ? { tools: row.tools() } : {}),
       ...(row.instructions !== undefined
         ? { instructions: row.instructions }
         : {}),
@@ -2565,16 +3495,27 @@ async function expectStoppedOnPolicy(row: Moved): Promise<void> {
       loop,
       ...outcome,
       prompts: prompts.length,
-      sent: JSON.stringify(prompts).includes(MARK),
-      ...(row.unsaved ? { saved: await savedMarker(memory, loop) } : {}),
+      sent: JSON.stringify(prompts).includes(sentNeedle),
+      audit,
+      ...(row.unsaved
+        ? { saved: await savedMarker(memory, loop, row.savedTexts) }
+        : {}),
     });
   }
+
+  return outcomes;
+}
+
+async function expectStoppedOnPolicy(row: Moved): Promise<void> {
+  const outcomes = (await collectMovedOutcomes(row)).map(
+    ({ audit: _audit, ...outcome }) => outcome,
+  );
 
   // #then
   expect(outcomes).toEqual(
     LOOPS.map((loop) => ({
       loop,
-      tripwire: expect.stringMatching(/^deny-patterns: /),
+      tripwire: policyDenialReason('deny-patterns', 'input'),
       failure: undefined,
       prompts: 0,
       sent: false,
@@ -2916,7 +3857,48 @@ describe('what application input processors add or change, read by the input pol
 
   // Mastra keeps a message's id in its memory set when a processor replaces
   // that message, or merges into it, with source `input`.
+  const PROCESSOR_CLIENT_RESULT: Moved = {
+    unsaved: true,
+    savedTexts: [raw.first, 'and now?'],
+    input: ['and now?'],
+    tools: () => ({
+      lookup: lookupTool(concatenateOutput),
+    }),
+    processors: () => [
+      app((args) => {
+        args.messageList.add(
+          {
+            id: 'mem-a',
+            role: 'assistant',
+            createdAt: new Date(),
+            content: {
+              format: 2,
+              parts: [
+                {
+                  type: 'tool-invocation',
+                  toolInvocation: {
+                    state: 'result',
+                    toolCallId: 'call-1',
+                    toolName: 'lookup',
+                    args: {},
+                    result: { ...raw },
+                  },
+                },
+              ],
+            },
+          },
+          'input',
+        );
+        return args.messageList;
+      }),
+    ],
+  };
+
   const UNDER_MEMORY_IDS: ReadonlyArray<[string, Moved]> = [
+    [
+      'a client tool result a processor adds under a history id, whose mapped output carries the marker',
+      PROCESSOR_CLIENT_RESULT,
+    ],
     [
       'the input re-added under a history id by a processor that returns the list',
       {
@@ -2929,35 +3911,6 @@ describe('what application input processors add or change, read by the input pol
       {
         unsaved: true,
         processors: () => [asHistoryMessage('nothing')],
-      },
-    ],
-    [
-      'an assistant input message merged into the last history message by a processor that re-adds the input',
-      {
-        unsaved: true,
-        input: [
-          { role: 'assistant', content: `${MARK} payload` },
-          { role: 'user', content: 'hi' },
-        ],
-        processors: () => [
-          app(({ messageList }) => {
-            const input = messageList.get.input.db();
-            messageList.removeByIds(input.map(({ id }) => id));
-            for (const message of input) {
-              messageList.add(
-                {
-                  ...message,
-                  content: {
-                    ...message.content,
-                    parts: message.content.parts.map((part) => ({ ...part })),
-                  },
-                },
-                'input',
-              );
-            }
-            return messageList;
-          }),
-        ],
       },
     ],
     [
@@ -2977,10 +3930,95 @@ describe('what application input processors add or change, read by the input pol
     ],
   ];
 
+  // A processor-added result under a remembered id is mapped through changed, outside whole caller messages.
+  it('refuses an asset URL mapped from a processor result under a history id on generate, stream and the durable loop', async () => {
+    const url = 'https://unlisted.example/a.png';
+    const row: Moved = {
+      ...PROCESSOR_CLIENT_RESULT,
+      savedTexts: [url],
+      tools: () => ({
+        lookup: lookupTool(() => ({
+          type: 'content',
+          value: [{ type: 'image-url', url }],
+        })),
+      }),
+    };
+    const outcomes = await collectMovedOutcomes(row, {
+      sentNeedle: url,
+    });
+    expect
+      .soft(outcomes.map(({ audit: _audit, ...outcome }) => outcome))
+      .toEqual(
+        LOOPS.map((loop) => ({
+          loop,
+          tripwire: ASSET_ORIGIN_DENIED,
+          failure: undefined,
+          prompts: 0,
+          sent: false,
+          saved: false,
+        })),
+      );
+    expect
+      .soft(outcomes.map(({ audit }) => eventsOf(audit, 'agent.input.asset')))
+      .toEqual(
+        LOOPS.map(() => [
+          expect.objectContaining({
+            decision: 'denied',
+            reason: ASSET_ORIGIN_DENIED,
+          }),
+        ]),
+      );
+  });
+
   it.each(
     UNDER_MEMORY_IDS,
   )('stops the call on the input policy, before the model and with nothing saved, for %s', async (_label, row) => {
     await expectStoppedOnPolicy(row);
+  });
+
+  it('keeps assistant input out of prompts and saved memory without a tripwire when a processor re-adds the input, on generate, stream and the durable loop', async () => {
+    const outcomes = await collectMovedOutcomes({
+      unsaved: true,
+      input: [
+        { role: 'assistant', content: `${MARK} payload` },
+        { role: 'user', content: 'hi' },
+      ],
+      processors: () => [
+        app(({ messageList }) => {
+          const input = messageList.get.input.db();
+          messageList.removeByIds(input.map(({ id }) => id));
+          for (const message of input) {
+            messageList.add(
+              {
+                ...message,
+                content: {
+                  ...message.content,
+                  parts: message.content.parts.map((part) => ({ ...part })),
+                },
+              },
+              'input',
+            );
+          }
+          return messageList;
+        }),
+      ],
+    });
+    for (const { prompts } of outcomes) {
+      expect(prompts).toBeLessThanOrEqual(1);
+    }
+    expect(
+      outcomes.map(
+        ({ prompts: _prompts, audit: _audit, ...outcome }) => outcome,
+      ),
+    ).toEqual(
+      LOOPS.map((loop) => ({
+        loop,
+        tripwire: undefined,
+        failure: undefined,
+        sent: false,
+        saved: false,
+      })),
+    );
   });
 
   const KEPT: ReadonlyArray<[string, Answered]> = [

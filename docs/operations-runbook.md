@@ -256,6 +256,8 @@ Audit records are security evidence. Queue depth and SIEM ingestion status must 
 | A foreign resource returns 403 instead of 404 | Route ownership ordering | Treat as an information-oracle regression and fix the shared boundary |
 | Start returns duplicate-run conflict | Client retried after a response loss | Query the server-minted run id; do not mint a replacement blindly |
 | Run stays `suspended` after approval | Decision result and resume outcome | Read stored decision, status, and audit; redrive through trusted resume |
+| Run reads `failed` with `errorEnvelope.code: 'INTERRUPTED'` | `run-leg-interrupted` log line (workflow, run, leg trigger) and the step that was in flight | Its leg stopped mid-step and nothing re-ran it. Check the step's external effects before starting a new run; split a step that runs past one invocation |
+| Run stays `running` with no progress | Run row `updatedAt`, `run-leg-reset` log lines, and the workflow storage | The run object settles it about six minutes after its last write. On workflow storage other than `FencedWorkflowsStorageD1`, or for a leg run by an older flowsafe version, terminate the run |
 | Durable agent resume fails after eviction | Prepare/observe registration and memory binding | Use `resumeViaRuntime()` through the thread topology; never raw inherited resume |
 | Agent stream returns 409 | In-memory replay cache was evicted or the isolate restarted | Read the authoritative status route; reconnect only for events still present in the configured cache |
 | Connector says approval missing after an approved record | Fingerprint, connector id, workflow, run, and deployment store | Confirm the record matches current step, `suspendedAt`, `resumeCount`, and exact connector id |

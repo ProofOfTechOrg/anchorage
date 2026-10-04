@@ -274,7 +274,7 @@ function req(path: string, options: ReqOptions = {}): Request {
   });
 }
 
-function cDeferred() {
+function deferredSignal() {
   let resolve = () => {};
   const promise = new Promise<void>((done) => {
     resolve = done;
@@ -282,15 +282,15 @@ function cDeferred() {
   return { promise, resolve };
 }
 
-function cStartStore() {
+function startIdempotencyStoreFixture() {
   return new StartIdempotencyStore(
     sqliteUnitDatabase(openSqlite()) as StartIdempotencyDatabase,
   );
 }
 
-function cHeldBody(body: unknown) {
-  const entered = cDeferred();
-  const release = cDeferred();
+function heldRequestBody(body: unknown) {
+  const entered = deferredSignal();
+  const release = deferredSignal();
   const bytes = new TextEncoder().encode(JSON.stringify(body));
   const stream = new ReadableStream<Uint8Array>(
     {
@@ -316,9 +316,9 @@ function cHeldBody(body: unknown) {
   return { request, entered, release };
 }
 
-describe('C workflow router capture', () => {
-  it('C keyed replay keeps the captured policy view through persisted lookup and reconciliation', async () => {
-    const store = cStartStore();
+describe('workflow router capture', () => {
+  it('keyed replay keeps the captured policy view through persisted lookup and reconciliation', async () => {
+    const store = startIdempotencyStoreFixture();
     await store.reserve({
       key: 'original-key',
       owner: { kind: 'human', id: OPERATOR.id },
@@ -328,8 +328,8 @@ describe('C workflow router capture', () => {
     });
     const actor: ApprovalActor = { id: OPERATOR.id, role: 'operator' };
     let source: ActorContext | undefined;
-    const entered = cDeferred();
-    const release = cDeferred();
+    const entered = deferredSignal();
+    const release = deferredSignal();
     const policy = vi.fn<NonNullable<RunRouterOptions['beforeStart']>>(
       async () => {},
     );
@@ -408,7 +408,7 @@ describe('C workflow router capture', () => {
     'attemptToken',
     'runOwnerGuard',
     'onPreparedStartIdentity',
-  ])('C workflow route refuses public authority field %s', async (field) => {
+  ])('workflow route refuses public authority field %s', async (field) => {
     const start = vi.fn<RunRouterOptions['start']>(async (input) => ({
       runId: input.runId,
       status: 'success',
@@ -424,7 +424,7 @@ describe('C workflow router capture', () => {
     expect(start).not.toHaveBeenCalled();
   });
 
-  it('C workflow route retains direct invalid-epoch error data', async () => {
+  it('workflow route retains direct invalid-epoch error data', async () => {
     const start = vi.fn<RunRouterOptions['start']>(async (input) => ({
       runId: input.runId,
       status: 'success',
@@ -449,7 +449,7 @@ describe('C workflow router capture', () => {
     'stale',
     'future',
     'invalid',
-  ] as const)('C workflow route retains complete encoded epoch refusals: %s', async (classification) => {
+  ] as const)('workflow route retains complete encoded epoch refusals: %s', async (classification) => {
     const error =
       classification === 'invalid'
         ? new InvalidMutationEpochError()
@@ -488,7 +488,7 @@ describe('C workflow router capture', () => {
     [true, 'operator', 'admin', 403],
     [false, 'admin', 'operator', 200],
     [true, 'admin', 'operator', 200],
-  ] as const)('C workflow start keeps the original actor role across body reads: keyed=%s %s to %s', async (keyed, initialRole, laterRole, status) => {
+  ] as const)('workflow start keeps the original actor role across body reads: keyed=%s %s to %s', async (keyed, initialRole, laterRole, status) => {
     const values = {
       id: 'original-actor',
       role: initialRole as ApprovalActor['role'],
@@ -504,7 +504,7 @@ describe('C workflow router capture', () => {
       },
     };
     let source: ActorContext | undefined;
-    const store = cStartStore();
+    const store = startIdempotencyStoreFixture();
     const reserve = vi.spyOn(store, 'reserve');
     const policy = vi.fn<NonNullable<RunRouterOptions['beforeStart']>>(
       async () => {},
@@ -525,7 +525,7 @@ describe('C workflow router capture', () => {
         ? { store, live: async () => false, executionFence: 'none' }
         : 'none',
     });
-    const body = cHeldBody({
+    const body = heldRequestBody({
       workflowId: RESTRICTED_FLOW.id,
       requestContext: { 'app.attribution': 'original' },
       ...(keyed ? { idempotencyKey: 'original-key' } : {}),
@@ -585,32 +585,32 @@ describe('C workflow router capture', () => {
     'unkeyed',
     'reserve',
     'claim',
-  ] as const)('C suspended start keeps original approval requester and workflow: %s', async (boundary) => {
+  ] as const)('suspended start keeps original approval requester and workflow: %s', async (boundary) => {
     const keyed = boundary !== 'unkeyed';
     const actor: ApprovalActor = { id: OPERATOR.id, role: 'operator' };
     let source: ActorContext | undefined;
-    const policyEntered = cDeferred();
-    const policyRelease = cDeferred();
-    const f3Entered = cDeferred();
-    const f3Release = cDeferred();
-    const startEntered = cDeferred();
-    const startRelease = cDeferred();
-    const store = cStartStore();
+    const policyEntered = deferredSignal();
+    const policyRelease = deferredSignal();
+    const reservationEntered = deferredSignal();
+    const reservationRelease = deferredSignal();
+    const startEntered = deferredSignal();
+    const startRelease = deferredSignal();
+    const store = startIdempotencyStoreFixture();
     const reserve = store.reserve.bind(store);
     const claim = store.claimReservation.bind(store);
     const reserveSpy = vi
       .spyOn(store, 'reserve')
       .mockImplementation(async (...args) => {
         if (boundary === 'reserve') {
-          f3Entered.resolve();
-          await f3Release.promise;
+          reservationEntered.resolve();
+          await reservationRelease.promise;
         }
         return reserve(...args);
       });
     vi.spyOn(store, 'claimReservation').mockImplementation(async (...args) => {
       if (boundary === 'claim') {
-        f3Entered.resolve();
-        await f3Release.promise;
+        reservationEntered.resolve();
+        await reservationRelease.promise;
       }
       return claim(...args);
     });
@@ -690,14 +690,14 @@ describe('C workflow router capture', () => {
       if (keyed) {
         expect(
           await Promise.race([
-            f3Entered.promise.then(() => true),
+            reservationEntered.promise.then(() => true),
             startEntered.promise.then(() => false),
             outcome,
           ]),
         ).toBe(true);
-        Object.assign(actor, { id: 'after-f3', role: 'viewer' });
+        Object.assign(actor, { id: 'after-reservation', role: 'viewer' });
         Object.assign(source ?? {}, { mutationEpoch: 4 });
-        f3Release.resolve();
+        reservationRelease.resolve();
       }
       expect(
         await Promise.race([startEntered.promise.then(() => true), outcome]),
@@ -706,7 +706,7 @@ describe('C workflow router capture', () => {
       body.workflowId = 'after-execution';
     } finally {
       policyRelease.resolve();
-      f3Release.resolve();
+      reservationRelease.resolve();
       startRelease.resolve();
       await outcome;
       parser.mockRestore();

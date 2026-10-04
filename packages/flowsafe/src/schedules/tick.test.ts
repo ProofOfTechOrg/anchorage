@@ -148,6 +148,30 @@ class FakeStore implements ScheduleTickStore {
     };
   }
 
+  async failDeferredTrigger(
+    id: string,
+    scheduleId: string,
+    error: string,
+    metadata: Record<string, unknown>,
+  ): Promise<boolean> {
+    const index = this.triggers.findIndex(
+      (candidateTrigger) =>
+        candidateTrigger.id === id &&
+        candidateTrigger.scheduleId === scheduleId &&
+        candidateTrigger.outcome === 'deferred' &&
+        candidateTrigger.metadata?.dispatchState !== 'settled',
+    );
+    const trigger = this.triggers[index];
+    if (!trigger) return false;
+    this.triggers[index] = {
+      ...trigger,
+      outcome: 'failed',
+      error,
+      metadata: { ...trigger.metadata, ...metadata },
+    };
+    return true;
+  }
+
   async listDeferredTriggers(limit?: number): Promise<ScheduleTrigger[]> {
     const deferred = this.triggers.filter(
       (trigger) => trigger.outcome === 'deferred',
@@ -165,6 +189,22 @@ class FakeStore implements ScheduleTickStore {
   }
 }
 
+function forwardingStore(
+  store: FakeStore,
+  overrides: Partial<ScheduleTickStore>,
+): ScheduleTickStore {
+  return {
+    listDueSchedules: (now, limit) => store.listDueSchedules(now, limit),
+    getSchedule: (id) => store.getSchedule(id),
+    claimScheduleFire: (claim) => store.claimScheduleFire(claim),
+    recordTrigger: (trigger) => store.recordTrigger(trigger),
+    touchDeferredTrigger: (...args) => store.touchDeferredTrigger(...args),
+    failDeferredTrigger: (...args) => store.failDeferredTrigger(...args),
+    listDeferredTriggers: (limit) => store.listDeferredTriggers(limit),
+    ...overrides,
+  };
+}
+
 function workflowSchedule(overrides: Partial<Schedule> = {}): Schedule {
   return {
     id: 'schedule_a',
@@ -178,6 +218,23 @@ function workflowSchedule(overrides: Partial<Schedule> = {}): Schedule {
     ...overrides,
   };
 }
+
+function threadedSchedule(overrides: Partial<Schedule> = {}): Schedule {
+  return workflowSchedule({
+    target: {
+      type: 'agent',
+      agentId: 'a1',
+      prompt: 'go',
+      threadId: 'acme_thread',
+      resourceId: 'acme_resource',
+    },
+    ...overrides,
+  });
+}
+
+const pendingTargetReceipt = async (): Promise<never> => {
+  throw new Error('target receipt pending');
+};
 
 describe('canPersistScheduledAgentSignal', () => {
   it('requires the registered schedule, thread, and resource to share one owner', async () => {
@@ -652,6 +709,85 @@ describe('createScheduleTick', () => {
     );
   });
 
+  it.each([
+    400, 403, 404,
+  ])('settles a threaded signal refusal with status %s as failed and advances the schedule', async (statusCode) => {
+    const store = new FakeStore();
+    store.seed(threadedSchedule());
+    const signalAgent = vi.fn(async () => {
+      throw Object.assign(new Error('refused'), { status: statusCode });
+    });
+    const status = vi.fn(pendingTargetReceipt);
+    const events: ScheduleTickAuditEvent[] = [];
+    const result = await createScheduleTick({
+      store,
+      start: vi.fn(),
+      signalAgent,
+      status,
+      now: () => NOW,
+      audit: (event) => {
+        events.push(event);
+      },
+    })();
+
+    expect(result).toMatchObject({ fired: 0, failed: 1, deferred: 0 });
+    expect(store.triggers[0]).toMatchObject({
+      outcome: 'failed',
+      error: 'refused',
+      metadata: { reason: 'dispatch-refused' },
+    });
+    expect(store.schedules.get('schedule_a')?.nextFireAt).toBeGreaterThan(NOW);
+    expect(signalAgent).toHaveBeenCalledOnce();
+    expect(status).toHaveBeenCalledOnce();
+    expect(events).toEqual([
+      expect.objectContaining({
+        outcome: 'failed',
+        reason: 'dispatch-refused',
+      }),
+    ]);
+  });
+
+  it.each([
+    409, 502, 503,
+  ])('keeps a threaded signal refusal with status %s deferred', async (statusCode) => {
+    const store = new FakeStore();
+    store.seed(threadedSchedule());
+    const result = await createScheduleTick({
+      store,
+      start: vi.fn(),
+      now: () => NOW,
+      signalAgent: async () => {
+        throw Object.assign(new Error('retryable refusal'), {
+          status: statusCode,
+        });
+      },
+      status: pendingTargetReceipt,
+    })();
+
+    expect(result).toMatchObject({ deferred: 1, failed: 0 });
+    expect(store.triggers[0]).toMatchObject({ outcome: 'deferred' });
+  });
+
+  it('keeps a workflow start refusal with status 404 deferred when status is unavailable', async () => {
+    const store = new FakeStore();
+    store.seed(workflowSchedule());
+    const result = await createScheduleTick({
+      store,
+      now: () => NOW,
+      start: async () => {
+        throw Object.assign(new Error('refused'), { status: 404 });
+      },
+      status: pendingTargetReceipt,
+    })();
+
+    expect(result).toMatchObject({ fired: 0, failed: 0, deferred: 1 });
+    expect(store.triggers[0]).toMatchObject({
+      outcome: 'deferred',
+      error: 'refused',
+      metadata: { reason: 'dispatch-indeterminate' },
+    });
+  });
+
   it('dispatches arbitrary path-safe stored memory ids within the deployment', async () => {
     const store = new FakeStore();
     store.seed(
@@ -985,6 +1121,151 @@ describe('createScheduleTick', () => {
     });
   });
 
+  it('settles a deferred threaded signal retry refusal with its own error message', async () => {
+    const store = new FakeStore();
+    store.seed(threadedSchedule());
+    const signalAgent = vi
+      .fn(async () => {
+        throw Object.assign(new Error('gone'), { status: 404 });
+      })
+      .mockRejectedValueOnce(new Error('first'));
+    const tick = createScheduleTick({
+      store,
+      start: vi.fn(),
+      signalAgent,
+      now: () => NOW,
+      status: pendingTargetReceipt,
+    });
+    expect(await tick()).toMatchObject({ deferred: 1 });
+    expect(store.triggers[0]).toMatchObject({ error: 'first' });
+
+    const result = await tick();
+
+    expect(result).toMatchObject({ failed: 1, reconciled: 1, deferred: 0 });
+    expect(store.triggers[0]).toMatchObject({
+      outcome: 'failed',
+      error: 'gone',
+      metadata: { reason: 'dispatch-refused' },
+    });
+  });
+
+  it('preserves a delivered threaded fire when a stale reconcile receives a refusal', async () => {
+    const store = new FakeStore();
+    store.seed(threadedSchedule());
+    const signalAgent = vi
+      .fn(async (_input: ScheduleTickSignalAgentInput) => ({
+        action: 'deliver' as const,
+        outcome: 'delivered' as const,
+        runId: 'active_run',
+        signalId: 'signal_1',
+      }))
+      .mockRejectedValueOnce(new Error('first'));
+    const status = vi.fn(pendingTargetReceipt);
+    const tick = createScheduleTick({
+      store,
+      start: vi.fn(),
+      signalAgent,
+      status,
+      now: () => NOW,
+    });
+    expect(await tick()).toMatchObject({ deferred: 1 });
+    const stale = structuredClone(store.triggers[0]);
+    if (!stale) throw new Error('expected a prepared trigger');
+    expect(await tick()).toMatchObject({ fired: 1, reconciled: 1 });
+    expect(store.triggers[0]).toMatchObject({ outcome: 'delivered' });
+    const staleStore = forwardingStore(store, {
+      listDeferredTriggers: async () => [stale],
+    });
+    const events: ScheduleTickAuditEvent[] = [];
+
+    const result = await createScheduleTick({
+      store: staleStore,
+      start: vi.fn(),
+      status,
+      now: () => NOW,
+      signalAgent: async () => {
+        throw Object.assign(new Error('gone'), { status: 404 });
+      },
+      audit: (event) => {
+        events.push(event);
+      },
+    })();
+
+    expect(store.triggers[0]).toMatchObject({ outcome: 'delivered' });
+    expect(result).toMatchObject({
+      failed: 0,
+      reconciled: 0,
+      deferred: 0,
+      fired: 0,
+    });
+    expect(events.filter((event) => event.outcome === 'failed')).toEqual([]);
+  });
+
+  it('keeps a refused threaded fire deferred when failure bookkeeping rejects', async () => {
+    const store = new FakeStore();
+    store.seed(threadedSchedule());
+    const throwingStore = forwardingStore(store, {
+      failDeferredTrigger: async () => {
+        throw new Error('D1 failure write unavailable');
+      },
+    });
+    const events: ScheduleTickAuditEvent[] = [];
+    const log = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      const result = await createScheduleTick({
+        store: throwingStore,
+        start: vi.fn(),
+        now: () => NOW,
+        signalAgent: async () => {
+          throw Object.assign(new Error('refused'), { status: 404 });
+        },
+        status: pendingTargetReceipt,
+        audit: (event) => {
+          events.push(event);
+        },
+      })();
+
+      expect(result).toMatchObject({ deferred: 1, failed: 0 });
+      expect(store.triggers[0]).toMatchObject({ outcome: 'deferred' });
+      expect(log).toHaveBeenCalledOnce();
+      expect(JSON.parse(log.mock.calls[0]?.[0] as string)).toMatchObject({
+        type: 'schedule-tick-bookkeeping-error',
+      });
+      expect(events.filter((event) => event.outcome === 'failed')).toEqual([]);
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it('settles a refused threaded fire when its failure audit throws', async () => {
+    const store = new FakeStore();
+    store.seed(threadedSchedule());
+    const log = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      const result = await createScheduleTick({
+        store,
+        start: vi.fn(),
+        now: () => NOW,
+        signalAgent: async () => {
+          throw Object.assign(new Error('refused'), { status: 404 });
+        },
+        status: pendingTargetReceipt,
+        audit: () => {
+          throw new Error('audit sink unavailable');
+        },
+      })();
+
+      expect(result).toMatchObject({ failed: 1 });
+      expect(store.triggers[0]).toMatchObject({ outcome: 'failed' });
+      expect(log).toHaveBeenCalledOnce();
+      expect(JSON.parse(log.mock.calls[0]?.[0] as string)).toMatchObject({
+        type: 'schedule-tick-bookkeeping-error',
+      });
+    } finally {
+      log.mockRestore();
+    }
+  });
+
   it('rotates permanently unavailable deferred rows so newer dispatches reconcile', async () => {
     const store = new FakeStore();
     for (const [index, runId] of [
@@ -1061,9 +1342,7 @@ describe('createScheduleTick', () => {
     const store = new FakeStore();
     store.seed(workflowSchedule());
     const events: ScheduleTickAuditEvent[] = [];
-    const losingStore: ScheduleTickStore = {
-      listDueSchedules: (now, limit) => store.listDueSchedules(now, limit),
-      getSchedule: (id) => store.getSchedule(id),
+    const losingStore = forwardingStore(store, {
       claimScheduleFire: async ({ scheduleId: id }) => {
         const current = store.schedules.get(id);
         if (reason === 'disappeared') store.schedules.delete(id);
@@ -1077,11 +1356,7 @@ describe('createScheduleTick', () => {
         }
         return false;
       },
-      recordTrigger: (trigger) => store.recordTrigger(trigger),
-      touchDeferredTrigger: (id, scheduleId, error, metadata) =>
-        store.touchDeferredTrigger(id, scheduleId, error, metadata),
-      listDeferredTriggers: (limit) => store.listDeferredTriggers(limit),
-    };
+    });
 
     const result = await createScheduleTick({
       store: losingStore,
@@ -1107,20 +1382,14 @@ describe('createScheduleTick', () => {
     store.seed(workflowSchedule());
     const start = vi.fn(async ({ runId }) => ({ runId }));
     const events: ScheduleTickAuditEvent[] = [];
-    const throwingStore: ScheduleTickStore = {
-      listDueSchedules: (n, l) => store.listDueSchedules(n, l),
-      getSchedule: (id) => store.getSchedule(id),
-      claimScheduleFire: (claim) => store.claimScheduleFire(claim),
+    const throwingStore = forwardingStore(store, {
       recordTrigger: async (trigger) => {
         if (trigger.outcome === 'published') {
           throw new Error('D1 write failed post-dispatch');
         }
         await store.recordTrigger(trigger);
       },
-      touchDeferredTrigger: (id, scheduleId, error, metadata) =>
-        store.touchDeferredTrigger(id, scheduleId, error, metadata),
-      listDeferredTriggers: (limit) => store.listDeferredTriggers(limit),
-    };
+    });
 
     // #when
     const result = await createScheduleTick({
@@ -1149,19 +1418,13 @@ describe('createScheduleTick', () => {
     store.seed(workflowSchedule({ id: 'schedule_1', nextFireAt: NOW - 2000 }));
     store.seed(workflowSchedule({ id: 'schedule_2', nextFireAt: NOW - 1000 }));
     let claims = 0;
-    const throwingStore: ScheduleTickStore = {
-      listDueSchedules: (n, l) => store.listDueSchedules(n, l),
-      getSchedule: (id) => store.getSchedule(id),
+    const throwingStore = forwardingStore(store, {
       claimScheduleFire: (claim) => {
         claims += 1;
         if (claims === 1) throw new Error('transient store failure');
         return store.claimScheduleFire(claim);
       },
-      recordTrigger: (t) => store.recordTrigger(t),
-      touchDeferredTrigger: (id, scheduleId, error, metadata) =>
-        store.touchDeferredTrigger(id, scheduleId, error, metadata),
-      listDeferredTriggers: (limit) => store.listDeferredTriggers(limit),
-    };
+    });
     const start = vi.fn(async ({ runId }) => ({ runId }));
 
     // #when
@@ -1355,7 +1618,7 @@ describe('createScheduleTick and the deployment execution fence', () => {
   });
 });
 
-describe('FS8 D3 host activation pending schedule status', () => {
+describe('host activation pending schedule status', () => {
   it('retains a deferred signal without resending or publishing finality while initial admission is pending', async () => {
     const store = new FakeStore();
     store.seed(

@@ -11,7 +11,7 @@ import {
   MastraCompositeStore,
   type MastraStorageDomains,
 } from '@mastra/core/storage';
-import { missingTableReadsEmpty } from './cause-chain.js';
+import { errorMessageOf, missingTableReadsEmpty } from './cause-chain.js';
 import type { D1DatabaseBinding } from './cf-types.js';
 import {
   normalizeD1RunExecutionIdentity,
@@ -2164,14 +2164,6 @@ export function d1Changes(result: unknown): number {
   const changes = (result as { meta?: { changes?: number } } | undefined)?.meta
     ?.changes;
   return typeof changes === 'number' ? changes : 0;
-}
-
-function errorMessageOf(error: unknown): string {
-  try {
-    return String(error instanceof Error ? error.message : error);
-  } catch {
-    return 'unreadable error';
-  }
 }
 
 /**

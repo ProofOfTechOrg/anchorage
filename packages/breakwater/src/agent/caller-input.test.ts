@@ -2,6 +2,7 @@
 
 import { Agent } from '@mastra/core/agent';
 import { createDurableAgent } from '@mastra/core/agent/durable';
+import type { MastraToolInvocation } from '@mastra/core/agent/message-list';
 import type { MastraModelConfig } from '@mastra/core/llm';
 import { MockMemory } from '@mastra/core/memory';
 import { RequestContext } from '@mastra/core/request-context';
@@ -16,6 +17,7 @@ import {
   PolicyEngine,
   type PolicyEvaluator,
   piiSecrets,
+  policyDenialReason,
 } from '../policy-engine/index.js';
 import { ACTOR_CONTEXT_KEY } from '../rbac/index.js';
 import { createGuardedAgent, type GuardedAgentCallOptions } from './index.js';
@@ -183,6 +185,35 @@ async function runGuarded(
   return { prompts, tripwire, policyErrors: policyErrorsOf(audit) };
 }
 
+async function runRaw(
+  method: Method,
+  messages: unknown,
+  settings: {
+    markers: readonly string[];
+    memory?: MockMemory;
+    call?: Record<string, unknown>;
+  },
+): Promise<Pick<Run, 'prompts' | 'tripwire'>> {
+  const prompts: unknown[] = [];
+  const agent = new Agent({
+    id: 'raw',
+    name: 'Raw',
+    instructions: 'Answer the request.',
+    model: scriptedModel(prompts),
+    ...(settings.memory ? { memory: settings.memory } : {}),
+    inputProcessors: [
+      new PolicyEngine({ policies: [denyPatterns(settings.markers)] }),
+    ],
+  });
+  const tripwire = await drive(
+    agent as unknown as Target,
+    method,
+    messages,
+    settings.call ?? {},
+  );
+  return { prompts, tripwire };
+}
+
 const isoAt = (second: number) =>
   `2026-01-01T00:00:${String(second).padStart(2, '0')}.000Z`;
 
@@ -207,6 +238,33 @@ function invocation(
     },
     ...extra,
   };
+}
+
+function clientToolOutcome(
+  state: MastraToolInvocation['state'],
+  fields: Record<string, unknown> = {},
+) {
+  return {
+    type: 'tool-invocation',
+    toolInvocation: {
+      toolCallId: 'call_1',
+      toolName: 'crm_lookup',
+      args: { account: 'acme' },
+      state,
+      ...fields,
+    },
+  };
+}
+
+function pendingClientCall(approval = false) {
+  return clientToolOutcome(
+    approval ? 'approval-requested' : 'call',
+    approval ? { approval: APPROVAL } : {},
+  );
+}
+
+function assistantMessage(parts: unknown[], role = 'assistant') {
+  return stored('m2', 2, role, parts);
 }
 
 function stored(id: string, second: number, role: string, parts: unknown[]) {
@@ -269,8 +327,11 @@ const CARRIERS: ReadonlyArray<[string, (toolCallId: string) => unknown]> = [
 const pendingCall = (toolCallId: string) =>
   stored('a0', 2, 'assistant', [invocation(toolCallId, 'call')]);
 
-async function threadMemory(): Promise<MockMemory> {
-  const memory = new MockMemory({ storage: new InMemoryStore() });
+async function threadMemory(retainFullInput = false): Promise<MockMemory> {
+  const memory = new MockMemory({
+    storage: new InMemoryStore(),
+    options: { retainFullInput },
+  });
   await memory.saveThread({
     thread: {
       id: 't1',
@@ -324,31 +385,302 @@ async function threadMemory(): Promise<MockMemory> {
   return memory;
 }
 
+async function collectMemoryOutcomes(
+  marker: string,
+  run: (
+    method: Method,
+    memory: MockMemory,
+  ) => Promise<Pick<Run, 'prompts' | 'tripwire'>>,
+) {
+  const outcomes = [];
+  for (const method of METHODS) {
+    const memory = await threadMemory();
+    const { prompts, tripwire } = await run(method, memory);
+    const recalled = await memory.recall({ threadId: 't1', resourceId: 'r1' });
+    expect(prompts.length).toBeLessThanOrEqual(1);
+    outcomes.push({
+      method,
+      tripwire,
+      sent: JSON.stringify(prompts).includes(marker),
+      saved: JSON.stringify(recalled.messages).includes(marker),
+    });
+  }
+  return outcomes;
+}
+
 const THREAD = { memory: { thread: 't1', resource: 'r1' } } as const;
+
+const OUTCOME_MARKER = 'MKCLIENTOUTCOME';
+const CLEAN_OUTCOME = 'clean client result';
+const APPROVAL = { id: 'approval_1' };
+
+async function outcomeMemory({
+  approval = false,
+  storedResult,
+  retainFullInput = false,
+}: {
+  approval?: boolean;
+  storedResult?: ReturnType<typeof clientToolOutcome>;
+  retainFullInput?: boolean;
+} = {}) {
+  const memory = await threadMemory(retainFullInput);
+  await memory.saveMessages({
+    messages: [
+      {
+        ...assistantMessage([
+          ...(storedResult ? [storedResult] : []),
+          pendingClientCall(approval),
+        ]),
+        createdAt: new Date(isoAt(2)),
+        threadId: 't1',
+        resourceId: 'r1',
+        type: 'tool-call',
+      } as never,
+    ],
+  });
+  return memory;
+}
+
+async function savedClientCall(memory: MockMemory) {
+  const { messages } = await memory.recall({
+    threadId: 't1',
+    resourceId: 'r1',
+  });
+  const savedPart = messages
+    .find(({ id }) => id === 'm2')
+    ?.content.parts.find(
+      (part) =>
+        part.type === 'tool-invocation' &&
+        part.toolInvocation.toolCallId === 'call_1',
+    );
+  return savedPart?.type === 'tool-invocation'
+    ? savedPart.toolInvocation
+    : undefined;
+}
+
+const deniedModelOutput = () => ({ type: 'text', value: OUTCOME_MARKER });
+
+function clientTools({
+  mapper,
+}: {
+  mapper?: (value: unknown) => unknown;
+} = {}) {
+  return {
+    crm_lookup: createTool({
+      id: 'crm_lookup',
+      description: 'Look up an account on the client',
+      inputSchema: z.object({ account: z.string() }),
+      ...(mapper ? { toModelOutput: mapper } : {}),
+    } as never),
+  };
+}
+
+describe('client tool outcomes merged into memory', () => {
+  type OutcomeCase = {
+    carries: string;
+    parts?: unknown[];
+    approval?: boolean;
+    ui?: boolean;
+    role?: string;
+    tail?: boolean;
+    fullHistory?: boolean;
+    mapped?: boolean;
+  };
+  const DENIED: OutcomeCase[] = [
+    {
+      carries: 'a DB result',
+      parts: [clientToolOutcome('result', { result: OUTCOME_MARKER })],
+    },
+    {
+      carries: 'an output-error errorText',
+      parts: [clientToolOutcome('output-error', { errorText: OUTCOME_MARKER })],
+    },
+    {
+      carries: 'an output-denied approval reason',
+      approval: true,
+      parts: [
+        clientToolOutcome('output-denied', {
+          approval: { ...APPROVAL, approved: false, reason: OUTCOME_MARKER },
+        }),
+      ],
+    },
+    {
+      carries: 'a result beside unrelated errorText and approval',
+      parts: [
+        clientToolOutcome('result', {
+          result: OUTCOME_MARKER,
+          errorText: 'unrelated',
+          approval: { id: 'unrelated', approved: true },
+        }),
+      ],
+    },
+    {
+      carries: 'a UI output-available with approval',
+      approval: true,
+      ui: true,
+    },
+    {
+      carries: 'a user-role client result',
+      role: 'user',
+      parts: [clientToolOutcome('result', { result: OUTCOME_MARKER })],
+    },
+    {
+      carries: 'a client result before a user tail',
+      tail: true,
+      parts: [clientToolOutcome('result', { result: OUTCOME_MARKER })],
+    },
+    {
+      carries: 'a client result in retained full history',
+      fullHistory: true,
+      parts: [clientToolOutcome('result', { result: OUTCOME_MARKER })],
+    },
+    {
+      carries: 'a clean result mapped to denied text',
+      mapped: true,
+      parts: [clientToolOutcome('result', { result: CLEAN_OUTCOME })],
+    },
+  ];
+
+  it.each(
+    DENIED.flatMap((row) => METHODS.map((method) => ({ ...row, method }))),
+  )('denies $carries before the model and leaves the stored call pending on $method', async (row) => {
+    const memory = await outcomeMemory({
+      approval: row.approval,
+      retainFullInput: row.fullHistory,
+    });
+    const message = row.ui
+      ? {
+          id: 'm2',
+          role: 'assistant',
+          parts: [
+            {
+              type: 'tool-crm_lookup',
+              toolCallId: 'call_1',
+              state: 'output-available',
+              input: { account: 'acme' },
+              output: OUTCOME_MARKER,
+              approval: { ...APPROVAL, approved: true },
+            },
+          ],
+        }
+      : assistantMessage(row.parts ?? [], row.role);
+    const history = row.fullHistory
+      ? (
+          await memory.recall({ threadId: 't1', resourceId: 'r1' })
+        ).messages.filter(({ id }) => id !== 'm2')
+      : [];
+    const run = await runGuarded(
+      row.method,
+      [...history, message, ...(row.tail ? ['next'] : [])],
+      {
+        policies: [denyPatterns([OUTCOME_MARKER])],
+        memory,
+        tools: clientTools({
+          mapper: row.mapped ? deniedModelOutput : undefined,
+        }),
+        call: THREAD,
+      },
+    );
+    expect(run.tripwire).toBe(policyDenialReason('deny-patterns', 'input'));
+    expect(run.prompts).toEqual([]);
+    expect(await savedClientCall(memory)).toEqual(
+      pendingClientCall(row.approval).toolInvocation,
+    );
+  });
+
+  it.each(
+    METHODS,
+  )('refuses duplicate client tool outcomes before the model and leaves the stored call pending on %s', async (method) => {
+    const memory = await outcomeMemory();
+    const run = await runGuarded(
+      method,
+      [
+        assistantMessage([
+          clientToolOutcome('result', { result: CLEAN_OUTCOME }),
+          clientToolOutcome('output-error', { errorText: 'failed' }),
+        ]),
+      ],
+      {
+        policies: [denyPatterns([OUTCOME_MARKER])],
+        memory,
+        tools: clientTools(),
+        call: THREAD,
+      },
+    );
+    expect(run.tripwire).toBe('input processor failed');
+    expect(run.prompts).toEqual([]);
+    expect(await savedClientCall(memory)).toEqual(
+      pendingClientCall().toolInvocation,
+    );
+  });
+
+  it.each(
+    METHODS,
+  )('allows a mapped clean caller result beside an unsent stored denied result and saves the client tool outcome on %s', async (method) => {
+    const memory = await outcomeMemory({
+      storedResult: clientToolOutcome('result', {
+        toolCallId: 'call_0',
+        toolName: 'historical_lookup',
+        args: {},
+        result: OUTCOME_MARKER,
+      }),
+    });
+    const run = await runGuarded(
+      method,
+      [
+        assistantMessage([
+          clientToolOutcome('result', { result: CLEAN_OUTCOME }),
+        ]),
+      ],
+      {
+        policies: [denyPatterns([OUTCOME_MARKER])],
+        memory,
+        tools: {
+          ...clientTools({
+            mapper: (value: unknown) => ({
+              type: 'text',
+              value: `mapped ${value}`,
+            }),
+          }),
+          historical_lookup: createTool({
+            id: 'historical_lookup',
+            description: 'Look up historical data on the client',
+            inputSchema: z.object({}),
+            toModelOutput: () => {
+              throw new Error('unsent stored-result mapper called');
+            },
+          } as never),
+        },
+        call: THREAD,
+      },
+    );
+    expect(
+      run.tripwire,
+      'unsent stored-result mapper throws if selected',
+    ).toBeUndefined();
+    expect(run.prompts).toHaveLength(1);
+    expect(JSON.stringify(run.prompts[0])).toContain(`mapped ${CLEAN_OUTCOME}`);
+    expect(JSON.stringify(run.prompts[0])).toContain(OUTCOME_MARKER);
+    expect(await savedClientCall(memory)).toMatchObject({
+      state: 'result',
+      result: CLEAN_OUTCOME,
+    });
+  });
+});
 
 describe('stored model outputs a caller message carries', () => {
   it.each(
     CARRIERS,
   )('denies an output stored in %s for a pending call, which Mastra gives the placeholder result, on a raw agent', async (_label, carrier) => {
     for (const method of METHODS) {
-      // #given
-      const prompts: unknown[] = [];
-      const agent = new Agent({
-        id: 'raw',
-        name: 'Raw',
-        instructions: 'Answer the request.',
-        model: scriptedModel(prompts),
-        inputProcessors: [
-          new PolicyEngine({ policies: [denyPatterns(['MKSTOREDOUTPUT'])] }),
-        ],
-      });
-
       // #when
-      const tripwire = await drive(
-        agent as unknown as Target,
+      const { prompts, tripwire } = await runRaw(
         method,
         [carrier('c9'), pendingCall('c9'), 'go'],
-        { memory: { options: { filterIncompleteToolCalls: false } } },
+        {
+          markers: ['MKSTOREDOUTPUT'],
+          call: { memory: { options: { filterIncompleteToolCalls: false } } },
+        },
       );
 
       // #then
@@ -357,39 +689,54 @@ describe('stored model outputs a caller message carries', () => {
     }
   });
 
-  it('denies a stored output for a pending call on a raw agent with thread memory', async () => {
-    for (const method of METHODS) {
-      // #given
-      const prompts: unknown[] = [];
-      const agent = new Agent({
-        id: 'raw',
-        name: 'Raw',
-        instructions: 'Answer the request.',
-        model: scriptedModel(prompts),
-        memory: await threadMemory(),
-        inputProcessors: [
-          new PolicyEngine({ policies: [denyPatterns(['MKSTOREDOUTPUT'])] }),
-        ],
-      });
-
-      // #when
-      const tripwire = await drive(
-        agent as unknown as Target,
-        method,
-        [userCarrier('c9'), pendingCall('c9'), 'go'],
-        {
-          memory: {
-            thread: 't1',
-            resource: 'r1',
-            options: { filterIncompleteToolCalls: false },
+  it('keeps a caller stored output out of prompts and saved memory without a tripwire on a raw agent with thread memory', async () => {
+    const outcomes = await collectMemoryOutcomes(
+      'MKSTOREDOUTPUT',
+      (method, memory) =>
+        runRaw(method, [userCarrier('c9'), pendingCall('c9'), 'go'], {
+          markers: ['MKSTOREDOUTPUT'],
+          memory,
+          call: {
+            memory: {
+              thread: 't1',
+              resource: 'r1',
+              options: { filterIncompleteToolCalls: false },
+            },
           },
-        },
-      );
+        }),
+    );
+    expect(outcomes).toEqual(
+      METHODS.map((method) => ({
+        method,
+        tripwire: undefined,
+        sent: false,
+        saved: false,
+      })),
+    );
+  });
 
-      // #then
-      expect(prompts).toEqual([]);
-      expect(tripwire).toMatch(/deny-patterns/);
-    }
+  it.each(
+    METHODS,
+  )('denies a client tool outcome merged into remembered input before the model on a raw agent with thread memory on %s', async (method) => {
+    const memory = await outcomeMemory();
+    const { prompts, tripwire } = await runRaw(
+      method,
+      [
+        {
+          id: 'm2',
+          role: 'assistant',
+          parts: [clientToolOutcome('result', { result: OUTCOME_MARKER })],
+        },
+        { role: 'user', content: 'go' },
+      ],
+      { markers: [OUTCOME_MARKER], memory, call: THREAD },
+    );
+
+    expect(tripwire).toBe(policyDenialReason('deny-patterns', 'input'));
+    expect(prompts).toEqual([]);
+    expect(await savedClientCall(memory)).toEqual(
+      pendingClientCall().toolInvocation,
+    );
   });
 
   it.each<[string, (toolCallId: string) => unknown]>([
@@ -665,6 +1012,26 @@ describe('caller messages beside memory-loaded history', () => {
       ],
       'MKCALLERUSEROUT',
     ],
+  ];
+
+  it.each(
+    MEETS_MEMORY,
+  )('denies %s before the model, on generate and stream', async (_label, messages, marker) => {
+    for (const method of METHODS) {
+      // #when
+      const run = await runGuarded(method, messages, {
+        policies: [denyPatterns([marker])],
+        memory: await threadMemory(),
+        call: THREAD,
+      });
+
+      // #then
+      expect(run.prompts).toEqual([]);
+      expect(run.tripwire).toMatch(/deny-patterns/);
+    }
+  });
+
+  const DROPPED_MEMORY: ReadonlyArray<[string, unknown[], string]> = [
     [
       'an AI SDK v5 tool result for the remembered tool call',
       [
@@ -706,20 +1073,28 @@ describe('caller messages beside memory-loaded history', () => {
   ];
 
   it.each(
-    MEETS_MEMORY,
-  )('denies %s before the model, on generate and stream', async (_label, messages, marker) => {
-    for (const method of METHODS) {
-      // #when
-      const run = await runGuarded(method, messages, {
-        policies: [denyPatterns([marker])],
-        memory: await threadMemory(),
-        call: THREAD,
-      });
-
-      // #then
-      expect(run.prompts).toEqual([]);
-      expect(run.tripwire).toMatch(/deny-patterns/);
-    }
+    DROPPED_MEMORY,
+  )('keeps %s out of prompts and saved memory without a tripwire, on generate and stream', async (_label, messages, marker) => {
+    const outcomes = await collectMemoryOutcomes(
+      marker,
+      async (method, memory) => {
+        const run = await runGuarded(method, messages, {
+          policies: [denyPatterns([marker])],
+          memory,
+          call: THREAD,
+        });
+        expect(run.policyErrors).toBe(0);
+        return run;
+      },
+    );
+    expect(outcomes).toEqual(
+      METHODS.map((method) => ({
+        method,
+        tripwire: undefined,
+        sent: false,
+        saved: false,
+      })),
+    );
   });
 });
 

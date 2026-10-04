@@ -15,8 +15,10 @@ import type {
 import type { MastraMemory } from '@mastra/core/memory';
 import type {
   ComputeStateSignalArgs,
+  ErrorProcessorOrWorkflow,
   InputProcessor,
   InputProcessorOrWorkflow,
+  LLMRequestProcessorOrWorkflow,
   OutputProcessorOrWorkflow,
   ProcessInputArgs,
   ProcessInputResult,
@@ -31,14 +33,16 @@ import type { FullOutput, MastraModelOutput } from '@mastra/core/stream';
 
 import { type AuditLogger, agentAuditDetail } from '../audit/index.js';
 import { assertKnownFields, readFrozenList } from '../host-input.js';
-import { stopWithoutCallMessages } from '../input-refusal.js';
+import { type Refusal, stopWithoutCallMessages } from '../input-refusal.js';
 import { PolicyEngine, type PolicyEvaluator } from '../policy-engine/index.js';
 import {
   inputAssetUrls,
   UNCLASSIFIED_INPUT_CONTENT,
 } from '../policy-engine/prompt-media.js';
 import {
+  callerOutcomeMessageIds,
   type PromptSnapshot,
+  recordClientToolOutcomes,
   recordProcessorAdditions,
   snapshotPromptMessages,
 } from '../processor-additions.js';
@@ -53,6 +57,7 @@ import { readAllowedRoles } from '../rbac/roles.js';
 import {
   CLIENT_TOOL_OUTPUT_PROCESSOR_ID,
   clientToolOutputProcessor,
+  type InputAssetCheck,
 } from './client-tool-output.js';
 
 export {
@@ -60,11 +65,24 @@ export {
   providerOptionsCarryContent,
 } from '../policy-engine/provider-options.js';
 
+const CLIENT_TOOL_OUTCOME_RECORDER_PROCESSOR_ID =
+  'breakwater-client-tool-outcome-recorder';
+
+const baseResolveInputProcessors = Reflect.get(
+  Agent.prototype,
+  'resolveInputProcessors',
+);
+const basePushMessageToSource = Reflect.get(
+  MessageList.prototype,
+  'pushMessageToSource',
+);
+
 const RESERVED_PROCESSOR_IDS = new Set([
   'breakwater-rbac',
   'breakwater-memory',
   'breakwater-input-assets',
   CLIENT_TOOL_OUTPUT_PROCESSOR_ID,
+  CLIENT_TOOL_OUTCOME_RECORDER_PROCESSOR_ID,
   'breakwater-policy-engine',
 ]);
 
@@ -105,6 +123,7 @@ const UNSAFE_CONSTRUCTION_KEYS = new Set([
   'inputProcessors',
   'outputProcessors',
   'errorProcessors',
+  'errorProcessorDefaults',
   'maxProcessorRetries',
   'defaultGenerateOptionsLegacy',
   'defaultStreamOptionsLegacy',
@@ -133,6 +152,7 @@ type ProcessorHook = Extract<
   | 'processOutputResult'
   | 'processOutputStep'
   | 'processAPIError'
+  | 'processToolResult'
 >;
 
 // The hooks an application input processor must implement.
@@ -175,6 +195,7 @@ const INPUT_PROCESSOR_FORBIDDEN_HOOK_SET: Record<
   processOutputResult: true,
   processOutputStep: true,
   processAPIError: true,
+  processToolResult: true,
 };
 
 const INPUT_PROCESSOR_FORBIDDEN_HOOKS = Object.keys(
@@ -193,6 +214,7 @@ const OUTPUT_PROCESSOR_FORBIDDEN_HOOK_SET: Record<
   processLLMResponse: true,
   processOutputStep: true,
   processAPIError: true,
+  processToolResult: true,
 };
 
 const OUTPUT_PROCESSOR_FORBIDDEN_HOOKS = Object.keys(
@@ -216,8 +238,6 @@ const PROCESSOR_MEMBER_FORWARDING = {
   spanAttributes: 'forward',
   onViolation: 'forward',
   __registerMastra: 'forward',
-  // An output-phase hook, which Mastra never runs on an input processor.
-  processToolResult: 'omit',
   // Read for output streams only.
   processDataParts: 'omit',
   // Read with computeStateSignal only, which validation refuses.
@@ -242,27 +262,35 @@ const BOUND_PROCESSOR_MEMBERS: ReadonlySet<ProcessorMember> = new Set([
  * Application input processor accepted by {@link createGuardedAgent}.
  *
  * It can transform or reject the initial input only. Per-step, provider,
- * output, and error hooks are unavailable because they can mutate execution
- * after the mandatory input gates have run.
+ * output, tool-result, and error hooks are unavailable because they can mutate
+ * execution after the mandatory input gates have run.
  *
  * Its return value is applied to the call's message list as Mastra's durable
- * runner applies one, on every loop. A processor that throws other than
- * through its `abort` or a `TripWire`, or returns a value that cannot be
- * applied, stops the call with one `agent.input.processor` error event and
- * the reason `input processor failed`.
+ * runner applies one, on every loop, except that a returned message Mastra
+ * holds as both remembered and call input stays both, such as a remembered
+ * assistant message with the caller's client tool outcome. A processor that
+ * throws other than through its `abort` or a `TripWire`, or returns a value
+ * that cannot be applied, stops the call with one `agent.input.processor`
+ * error event and the reason `input processor failed`.
  *
  * The input policies read what the processor adds to the prompt, or changes
  * in it, outside the call's input, as they read the input: system messages
  * with their provider options, and messages of every other source, a history
- * message it rewrites through any source included. A system message it adds
- * or changes must hold text alone in data properties, and what it adds or
- * changes must be a value `structuredClone` can copy, or the call stops as
- * above.
+ * message it rewrites through any source included, and a remembered message
+ * carrying the caller's client tool outcome it keeps but moves out of the
+ * call's input, read whole, stored history included. Client tool result
+ * mapping applies to messages of the call's input; a moved message gets no
+ * new `toModelOutput` mapping, and cached output is read and sent. A system
+ * message it adds or changes must hold text alone in data properties, and
+ * what it adds or changes must be a value `structuredClone` can copy, or the
+ * call stops as above.
  *
  * A call that RBAC, an input policy or an application input processor
  * refuses has its input, its response messages, and every other non-system
  * message its application input processors added or changed, the refusing
- * processor's own included, removed from Mastra's message list before it
+ * processor's own included, and a remembered message carrying the caller's
+ * client tool outcome a processor keeps but moves out of the input, even
+ * before aborting or throwing, removed from Mastra's message list before it
  * stops. It saves none of them to memory, Mastra's durable loop generates no
  * thread title from them, and on `generate()` and `stream()` the result's
  * `messages` and `rememberedMessages` omit them, a history message such a
@@ -289,6 +317,7 @@ export interface GuardedInputProcessor {
   processOutputResult?: never;
   processOutputStep?: never;
   processAPIError?: never;
+  processToolResult?: never;
 }
 
 /**
@@ -312,7 +341,16 @@ export interface GuardedOutputProcessor {
   processOutputResult: NonNullable<Processor['processOutputResult']>;
   processOutputStep?: never;
   processAPIError?: never;
+  processToolResult?: never;
 }
+
+type AssertNever<T extends never> = T;
+type _GuardedInputProcessorDeclaresForbiddenHooks = AssertNever<
+  Exclude<InputProcessorForbiddenHook, keyof GuardedInputProcessor>
+>;
+type _GuardedOutputProcessorDeclaresForbiddenHooks = AssertNever<
+  Exclude<OutputProcessorForbiddenHook, keyof GuardedOutputProcessor>
+>;
 
 /** Fixed tool-selection behavior for every guarded execution. */
 export type GuardedToolChoice = NonNullable<
@@ -334,6 +372,7 @@ export type GuardedAgentConfig<
   | 'inputProcessors'
   | 'outputProcessors'
   | 'errorProcessors'
+  | 'errorProcessorDefaults'
   | 'maxProcessorRetries'
   | 'defaultGenerateOptionsLegacy'
   | 'defaultStreamOptionsLegacy'
@@ -358,7 +397,9 @@ export type GuardedAgentConfig<
   /**
    * Origins user file and image parts may name as network URLs, regardless of
    * who fetches them. Absent or empty refuses all network URLs; data: URLs
-   * are inline data. URLs in mapped client tool results are not checked.
+   * are inline data. Network URLs in the client tool outputs the call supplies
+   * are checked too. The check runs again before each model step.
+   * On the durable loop, signals drained before the first model step are not checked.
    * This is independent of connector egress allowlists.
    */
   allowedInputAssetOrigins?: readonly string[];
@@ -533,53 +574,66 @@ function readAllowedInputAssetOrigins(value: unknown): readonly string[] {
   });
 }
 
-// Mastra downloads user asset URLs after input processors, including history
-// on every call (message-list-DCUwKHqe.js:11191-11226). Its durable runner
-// skips a non-tripwire processor error (create-durable-agent-DFHwqN2K.js:1336-1342).
-function inputAssetProcessor(
+function inputAssetCheck(
   origins: readonly string[],
   resource: string,
   audit: AuditLogger,
-): InputProcessor {
+): InputAssetCheck {
   const allowed = new Set(origins);
+  return (args, readUrls) => {
+    let reason: string | undefined;
+    let decision: 'denied' | 'error' = 'denied';
+    try {
+      for (const url of readUrls()) {
+        if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+          reason = INPUT_ASSET_SCHEME_DENIED;
+        } else if (url.username || url.password) {
+          reason = INPUT_ASSET_CREDENTIALS_DENIED;
+        } else if (!allowed.has(url.origin)) {
+          reason = INPUT_ASSET_ORIGIN_DENIED;
+        }
+        if (reason !== undefined) break;
+      }
+    } catch {
+      // An unreadable asset prompt has the same audit result as unreadable policy input.
+      reason = UNCLASSIFIED_INPUT_CONTENT;
+      decision = 'error';
+    }
+    const refusalReason = reason;
+    if (refusalReason === undefined) return args.messageList;
+    try {
+      audit.record({
+        actor: actorFromRequestContext(args.requestContext) ?? null,
+        action:
+          decision === 'error' ? 'agent.input.policy' : 'agent.input.asset',
+        resource,
+        decision,
+        reason: refusalReason,
+        detail: agentAuditDetail(args.requestContext),
+      });
+    } finally {
+      stopWithoutCallMessages(args.messageList, {}, () =>
+        args.abort(refusalReason),
+      );
+    }
+  };
+}
+
+// Mastra builds llmPrompt and downloads user asset URLs after input processors,
+// including history on every call, and drained signals join the list between
+// steps. Each step runs input processors' processInputStep before the prompt
+// build; this hook checks the list then. It returns nothing because core
+// assigns a returned list into the step input.
+// prepareForDurableExecution logs and skips non-tripwire input-processor errors,
+// so refusals use a tripwire.
+function inputAssetProcessor(check: InputAssetCheck): InputProcessor {
   return {
     id: 'breakwater-input-assets',
     processInput(args) {
-      let reason: string | undefined;
-      let decision: 'denied' | 'error' = 'denied';
-      try {
-        for (const url of inputAssetUrls(args.messageList.get.all.db())) {
-          if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-            reason = INPUT_ASSET_SCHEME_DENIED;
-          } else if (url.username || url.password) {
-            reason = INPUT_ASSET_CREDENTIALS_DENIED;
-          } else if (!allowed.has(url.origin)) {
-            reason = INPUT_ASSET_ORIGIN_DENIED;
-          }
-          if (reason !== undefined) break;
-        }
-      } catch {
-        // An unreadable asset prompt has the same audit result as unreadable policy input.
-        reason = UNCLASSIFIED_INPUT_CONTENT;
-        decision = 'error';
-      }
-      const refusalReason = reason;
-      if (refusalReason === undefined) return args.messageList;
-      try {
-        audit.record({
-          actor: actorFromRequestContext(args.requestContext) ?? null,
-          action:
-            decision === 'error' ? 'agent.input.policy' : 'agent.input.asset',
-          resource,
-          decision,
-          reason: refusalReason,
-          detail: agentAuditDetail(args.requestContext),
-        });
-      } finally {
-        stopWithoutCallMessages(args.messageList, {}, () =>
-          args.abort(refusalReason),
-        );
-      }
+      return check(args, () => inputAssetUrls(args.messageList.get.all.db()));
+    },
+    processInputStep(args) {
+      check(args, () => inputAssetUrls(args.messageList.get.all.db()));
     },
   };
 }
@@ -630,37 +684,54 @@ function hasHook(processor: Processor, hook: ProcessorHook): boolean {
   return typeof processor[hook] === 'function';
 }
 
-function validateInputProcessors(
+function validateApplicationProcessors(
+  side: 'input',
   processors: readonly GuardedInputProcessor[],
-): readonly GuardedInputProcessor[] {
-  if (!Array.isArray(processors)) {
-    throw new TypeError(
-      'createGuardedAgent: applicationInputProcessors must be an array',
-    );
-  }
-  for (const processor of processors) {
-    if (!processor || typeof processor !== 'object') {
+): readonly GuardedInputProcessor[];
+function validateApplicationProcessors(
+  side: 'output',
+  processors: readonly GuardedOutputProcessor[],
+): readonly GuardedOutputProcessor[];
+function validateApplicationProcessors(
+  side: 'input' | 'output',
+  processors: unknown,
+): readonly (GuardedInputProcessor | GuardedOutputProcessor)[] {
+  const { field, requiredHooks, forbiddenHooks } = {
+    input: {
+      field: 'applicationInputProcessors',
+      requiredHooks: INPUT_PROCESSOR_REQUIRED_HOOKS,
+      forbiddenHooks: INPUT_PROCESSOR_FORBIDDEN_HOOKS,
+    },
+    output: {
+      field: 'applicationOutputProcessors',
+      requiredHooks: OUTPUT_PROCESSOR_REQUIRED_HOOKS,
+      forbiddenHooks: OUTPUT_PROCESSOR_FORBIDDEN_HOOKS,
+    },
+  }[side];
+  return readFrozenList(`createGuardedAgent: ${field}`, processors, (entry) => {
+    if (!entry || typeof entry !== 'object') {
       throw new TypeError(
-        'createGuardedAgent: application input processors must be processor objects',
+        `createGuardedAgent: application ${side} processors must be processor objects`,
       );
     }
-    assertProcessorId(processor, 'application input');
-    for (const hook of INPUT_PROCESSOR_REQUIRED_HOOKS) {
+    const processor = entry as Processor;
+    assertProcessorId(processor, `application ${side}`);
+    for (const hook of requiredHooks) {
       if (!hasHook(processor, hook)) {
         throw new TypeError(
-          `createGuardedAgent: input processor '${processor.id}' must implement ${hook}`,
+          `createGuardedAgent: ${side} processor '${processor.id}' must implement ${hook}`,
         );
       }
     }
-    for (const hook of INPUT_PROCESSOR_FORBIDDEN_HOOKS) {
+    for (const hook of forbiddenHooks) {
       if (hasHook(processor, hook)) {
         throw new TypeError(
-          `createGuardedAgent: input processor '${processor.id}' must not implement ${hook}`,
+          `createGuardedAgent: ${side} processor '${processor.id}' must not implement ${hook}`,
         );
       }
     }
-  }
-  return Object.freeze([...processors]);
+    return processor as GuardedInputProcessor | GuardedOutputProcessor;
+  });
 }
 
 const INPUT_RESULT_NOT_APPLICABLE =
@@ -686,6 +757,7 @@ function applyInputMessages(
   if (omitted.length > 0) messageList.removeByIds(omitted);
   const systemEntries = messages.filter(({ role }) => role === 'system');
   const otherEntries = messages.filter(({ role }) => role !== 'system');
+  const sharedIds = new Set<string>();
   for (const entry of systemEntries) {
     messageList.addSystem(
       entry.content.content ??
@@ -700,14 +772,30 @@ function applyInputMessages(
     messageList.add(entry, check.getSource(entry) ?? 'input', {
       merge: false,
     });
+    if (check.memory.has(entry.id) && check.input.has(entry.id)) {
+      sharedIds.add(entry.id);
+    }
+  }
+  // getSource names memory first, so a message Mastra held as both remembered
+  // and call input, such as a caller's client tool outcome merged into a
+  // remembered message, would leave the input the policies read and Mastra
+  // saves. pushMessageToSource returns it without add's part stamping, which
+  // would change its fingerprint and record it as a processor change.
+  if (sharedIds.size > 0) {
+    for (const message of messageList.get.all.db()) {
+      if (sharedIds.has(message.id)) {
+        Reflect.apply(basePushMessageToSource, messageList, [message, 'input']);
+      }
+    }
   }
 }
 
-// Applies an input processor's return value to the call's message list with
-// the steps of Mastra's durable runner, which keeps a system entry's id in the
-// input. Mastra's standard loop removes that id, so a processor returning its
-// input as system entries would leave the input policies an empty input.
-// `before` holds the ids of the processor's `messages`, including thread history.
+// Applies an input processor's return value to the call's message list. A
+// returned system entry keeps its id in the input, as Mastra's durable
+// runner keeps it; Mastra's standard loop removes that id, so a processor
+// returning its input as system entries would leave the input policies an
+// empty input. `before` holds the ids of the processor's `messages`,
+// including thread history.
 function applyInputResult(
   messageList: MessageList,
   result: unknown,
@@ -758,7 +846,7 @@ function failInputProcessor(
   resource: string,
   audit: AuditLogger,
   processorId: string,
-  snapshot?: PromptSnapshot,
+  refusal: Refusal = {},
 ): never {
   try {
     audit.record({
@@ -770,7 +858,7 @@ function failInputProcessor(
       detail: agentAuditDetail(args.requestContext, { processor: processorId }),
     });
   } finally {
-    stopWithoutCallMessages(args.messageList, { snapshot }, () =>
+    stopWithoutCallMessages(args.messageList, refusal, () =>
       args.abort(INPUT_PROCESSOR_FAILED),
     );
   }
@@ -851,9 +939,10 @@ function guardMemoryInputProcessor(
 // and returns the list, so Mastra applies nothing after it, and turns any
 // error other than the processor's own abort or tripwire into an audited
 // abort. Either way the refusal drops the call's messages, those the
-// processor added or changed before it failed included. What the processor
-// adds or changes outside the input is recorded for the policy engine. The
-// wrapper stays extensible: Mastra writes `processorIndex` onto it.
+// processor added or changed before it failed included, and remembered
+// caller outcomes it moved out of the input. Those moved messages and what
+// the processor adds or changes outside the input are recorded for the policy
+// engine. The wrapper stays extensible: Mastra writes `processorIndex` onto it.
 function guardInputProcessor(
   inner: GuardedInputProcessor,
   resource: string,
@@ -864,8 +953,10 @@ function guardInputProcessor(
     async processInput(args: ProcessInputArgs): Promise<ProcessInputResult> {
       const { abort, abortErrors } = forwardingProcessorAbort(args.abort);
       let snapshot: PromptSnapshot | undefined;
+      let outcomeIds: ReadonlySet<string> | undefined;
       try {
         const { messageList } = args;
+        outcomeIds = callerOutcomeMessageIds(messageList);
         // Durable preparation passes input-only args.messages; the list includes loaded history.
         const messages = messageList.get.all.db();
         const beforeIds = messages.map(({ id }) => id);
@@ -877,51 +968,24 @@ function guardInputProcessor(
           abort,
         });
         applyInputResult(messageList, result, beforeIds, check);
-        recordProcessorAdditions(messageList, snapshot);
+        recordProcessorAdditions(messageList, snapshot, {
+          callerOutcomeMessageIds: outcomeIds,
+        });
       } catch (error) {
+        const refusal: Refusal = {
+          snapshot,
+          callerOutcomeMessageIds: outcomeIds,
+        };
         if (isForwardedAbortOrTripWire(error, abortErrors)) {
-          return stopWithoutCallMessages(args.messageList, { snapshot }, () => {
+          return stopWithoutCallMessages(args.messageList, refusal, () => {
             throw error;
           });
         }
-        return failInputProcessor(args, resource, audit, inner.id, snapshot);
+        return failInputProcessor(args, resource, audit, inner.id, refusal);
       }
       return args.messageList;
     },
   } as InputProcessor;
-}
-
-function validateOutputProcessors(
-  processors: readonly GuardedOutputProcessor[],
-): readonly GuardedOutputProcessor[] {
-  if (!Array.isArray(processors)) {
-    throw new TypeError(
-      'createGuardedAgent: applicationOutputProcessors must be an array',
-    );
-  }
-  for (const processor of processors) {
-    if (!processor || typeof processor !== 'object') {
-      throw new TypeError(
-        'createGuardedAgent: application output processors must be processor objects',
-      );
-    }
-    assertProcessorId(processor, 'application output');
-    for (const hook of OUTPUT_PROCESSOR_REQUIRED_HOOKS) {
-      if (!hasHook(processor, hook)) {
-        throw new TypeError(
-          `createGuardedAgent: output processor '${processor.id}' must implement ${hook}`,
-        );
-      }
-    }
-    for (const hook of OUTPUT_PROCESSOR_FORBIDDEN_HOOKS) {
-      if (hasHook(processor, hook)) {
-        throw new TypeError(
-          `createGuardedAgent: output processor '${processor.id}' must not implement ${hook}`,
-        );
-      }
-    }
-  }
-  return Object.freeze([...processors]);
 }
 
 function guardedCallOptions(options: unknown): GuardedAgentCallOptions {
@@ -1091,6 +1155,7 @@ class GuardedAgent<
   readonly #rbac: RBACMiddleware;
   readonly #toolChoice: GuardedToolChoice;
   readonly #memoryError: InputProcessor;
+  readonly #clientToolOutcomeRecorder: InputProcessor;
   readonly #memoryResolutions = new WeakMap<
     RequestContext,
     Promise<
@@ -1099,7 +1164,32 @@ class GuardedAgent<
     >
   >();
 
+  static {
+    // Core's TS-private resolveInputProcessors rules out a method override.
+    Object.defineProperty(GuardedAgent.prototype, 'resolveInputProcessors', {
+      async value(
+        this: GuardedAgent<string, ToolsInput, unknown>,
+        ...args: unknown[]
+      ): Promise<InputProcessorOrWorkflow[]> {
+        const recorder = this.#clientToolOutcomeRecorder;
+        const processors = (await Reflect.apply(
+          baseResolveInputProcessors,
+          this,
+          args,
+        )) as InputProcessorOrWorkflow[];
+        // Memory merges client tool outcomes into stored parts without
+        // preserving their provenance.
+        return [recorder, ...processors];
+      },
+    });
+  }
+
   constructor(options: GuardedAgentConfig<TAgentId, TTools, TRequestContext>) {
+    if (typeof baseResolveInputProcessors !== 'function') {
+      throw new TypeError(
+        'GuardedAgent: incompatible @mastra/core; Agent.resolveInputProcessors is unavailable',
+      );
+    }
     assertConstructionOptions(options);
     assertKnownFields(
       'createGuardedAgent: config',
@@ -1114,9 +1204,11 @@ class GuardedAgent<
         'createGuardedAgent: maxSteps must be a positive safe integer',
       );
     }
-    if (!Array.isArray(options.policies)) {
-      throw new TypeError('createGuardedAgent: policies must be an array');
-    }
+    const policies = readFrozenList(
+      'createGuardedAgent: policies',
+      options.policies,
+      (entry) => entry as PolicyEvaluator,
+    );
     const configuredMemory = options.memory;
     if (
       configuredMemory !== undefined &&
@@ -1140,19 +1232,30 @@ class GuardedAgent<
     // Wrapped before any hand-off to Mastra: its standard loop runs the
     // per-call processors, not listInputProcessors.
     const applicationInputProcessors = Object.freeze(
-      validateInputProcessors(options.applicationInputProcessors ?? []).map(
-        (processor) =>
-          guardInputProcessor(processor, `agent:${options.id}`, options.audit),
+      validateApplicationProcessors(
+        'input',
+        options.applicationInputProcessors ?? [],
+      ).map((processor) =>
+        guardInputProcessor(processor, `agent:${options.id}`, options.audit),
       ),
     );
-    const applicationOutputProcessors = validateOutputProcessors(
+    if (
+      applicationInputProcessors.length > 0 &&
+      typeof basePushMessageToSource !== 'function'
+    ) {
+      throw new TypeError(
+        'GuardedAgent: incompatible @mastra/core; MessageList.pushMessageToSource is unavailable',
+      );
+    }
+    const applicationOutputProcessors = validateApplicationProcessors(
+      'output',
       options.applicationOutputProcessors ?? [],
     );
     const {
       allowedRoles: _allowedRoles,
       allowedPrincipalKinds: _allowedPrincipalKinds,
       allowedInputAssetOrigins: _allowedInputAssetOrigins,
-      policies,
+      policies: _policies,
       audit,
       maxSteps: _maxSteps,
       toolChoice: _toolChoice,
@@ -1161,7 +1264,7 @@ class GuardedAgent<
       ...agentConfig
     } = options;
     const policy = new PolicyEngine({
-      policies: Object.freeze([...policies]),
+      policies,
       audit,
       holdBack: true,
       resource: `agent:${options.id}`,
@@ -1177,13 +1280,18 @@ class GuardedAgent<
       audit,
       resource: `agent:${options.id}`,
     });
-    const inputAssets = inputAssetProcessor(
+    const assetCheck = inputAssetCheck(
       allowedInputAssetOrigins,
       `agent:${options.id}`,
       audit,
     );
+    const inputAssets = inputAssetProcessor(assetCheck);
     super({
       ...agentConfig,
+      // Core's default error processors rewrite model requests and retry with
+      // a fixed continuation signal after Breakwater's input chain, which the
+      // guarded agent keeps closed.
+      errorProcessorDefaults: false,
       inputProcessors: [
         ...applicationInputProcessors,
       ] as InputProcessorOrWorkflow[],
@@ -1204,6 +1312,22 @@ class GuardedAgent<
       supportsDurableStructuredOutput: false,
     });
     this.#audit = audit;
+    this.#clientToolOutcomeRecorder = {
+      id: CLIENT_TOOL_OUTCOME_RECORDER_PROCESSOR_ID,
+      processInput: (args) => {
+        try {
+          recordClientToolOutcomes(args.messageList);
+          return args.messageList;
+        } catch {
+          return failInputProcessor(
+            args,
+            `agent:${options.id}`,
+            audit,
+            CLIENT_TOOL_OUTCOME_RECORDER_PROCESSOR_ID,
+          );
+        }
+      },
+    };
     // Core's execution assembly applies renamed keys and converted tool types
     // that its own client-output mapper reads.
     const clientToolOutput = clientToolOutputProcessor(
@@ -1215,6 +1339,7 @@ class GuardedAgent<
           audit,
           CLIENT_TOOL_OUTPUT_PROCESSOR_ID,
         ),
+      assetCheck,
     );
     this.#rbac = rbac;
     this.#toolChoice = toolChoice;
@@ -1238,7 +1363,7 @@ class GuardedAgent<
     this.#memoryError = {
       id: 'breakwater-memory',
       processInput: failMemory,
-      // A resumed leg skips processInput; each durable step runs processInputStep.
+      // A resume with a live run registry entry skips processInput; durable steps run processInputStep.
       processInputStep: failMemory,
     };
     this.disableBackgroundTasks();
@@ -1247,15 +1372,22 @@ class GuardedAgent<
   async #assertResolvedMemoryTitleDisabled(
     requestContext: RequestContext,
   ): Promise<void> {
-    const memory = await this.getMemory({ requestContext });
+    await this.getMemory({ requestContext });
+  }
+
+  // Mastra resolves memory through getMemory for saving, recall and processors, so each resolution needs the title check.
+  override async getMemory(options?: {
+    requestContext?: RequestContext;
+  }): Promise<MastraMemory | undefined> {
+    const memory = await super.getMemory(options);
     if (memory) assertGuardedMemoryTitleDisabled(memory);
+    return memory;
   }
 
   async #resolveMemoryProcessors(requestContext: RequestContext) {
     try {
       const memory = await this.getMemory({ requestContext });
       if (!memory) return { input: [], output: [] };
-      assertGuardedMemoryTitleDisabled(memory);
       const input = await memory.getInputProcessors(
         [...this.#guardedInput],
         requestContext,
@@ -1321,6 +1453,7 @@ class GuardedAgent<
     if (!result) return [this.#rbac, this.#memoryError];
     return [
       this.#rbac,
+      this.#clientToolOutcomeRecorder,
       ...result.input.map((processor) =>
         guardMemoryInputProcessor(processor, `agent:${this.id}`, this.#audit),
       ),
@@ -1346,9 +1479,15 @@ class GuardedAgent<
     return { shouldGenerate: false };
   }
 
+  /**
+   * Error processor overrides add processors after Breakwater's input chain to
+   * the LLM-request lane, which the guarded agent keeps closed. Guarded agents
+   * refuse call-level errorProcessors, so no guarded call supplies an override.
+   */
   override async __listLLMRequestProcessors(
     requestContext?: RequestContext,
-  ): Promise<InputProcessorOrWorkflow[]> {
+    _errorProcessorOverrides?: ErrorProcessorOrWorkflow[],
+  ): Promise<LLMRequestProcessorOrWorkflow[]> {
     try {
       return await super.__listLLMRequestProcessors(requestContext);
     } catch {
@@ -1384,6 +1523,9 @@ class GuardedAgent<
       maxSteps: this.maxSteps,
       toolChoice: this.#toolChoice,
       disableBackgroundTasks: true,
+      // A step's server tools start after its stream policies judge the later
+      // chunks in that step.
+      eagerToolExecution: false,
       inputProcessors: [...this.#guardedInput],
       outputProcessors: [...this.#guardedOutput],
     };

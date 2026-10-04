@@ -54,9 +54,9 @@ import {
 import { stopWithoutCallMessages } from '../input-refusal.js';
 import {
   additionsToRead,
+  callerMessages,
   type ProcessorAddition,
   type RecordedSystemMessage,
-  rememberedIds,
   takeProcessorAdditions,
 } from '../processor-additions.js';
 import { type Actor, actorFromRequestContext } from '../rbac/index.js';
@@ -75,6 +75,8 @@ import type {
 import {
   classifyPromptMedia,
   convertedPrompt,
+  type StoredModelOutput,
+  storedModelOutputs,
   UNCLASSIFIED_INPUT_CONTENT,
 } from './prompt-media.js';
 import { isPlainRecord, providerOptionValues } from './provider-options.js';
@@ -509,36 +511,6 @@ function isClassifiedInputMessage(message: MastraDBMessage): boolean {
   );
 }
 
-interface StoredModelOutput {
-  readonly toolCallId: string;
-  readonly state: MastraToolInvocation['state'];
-  readonly output: unknown;
-}
-
-// Every `mastra.modelOutput` a tool invocation in these messages stores,
-// whatever the message's role and the invocation's state, in message order.
-function storedModelOutputs(
-  messages: readonly MastraDBMessage[],
-): readonly StoredModelOutput[] {
-  const stored: StoredModelOutput[] = [];
-  for (const message of messages) {
-    for (const part of message.content.parts) {
-      if (part.type !== 'tool-invocation') continue;
-      const mastra: unknown = part.providerMetadata?.mastra;
-      if (typeof mastra !== 'object' || mastra === null) continue;
-      const output = (mastra as { modelOutput?: unknown }).modelOutput;
-      if (output !== undefined && output !== null) {
-        stored.push({
-          toolCallId: part.toolInvocation.toolCallId,
-          state: part.toolInvocation.state,
-          output,
-        });
-      }
-    }
-  }
-  return stored;
-}
-
 // Mastra builds the model prompt with MessageList's `get.all.aiV5.llmPrompt`,
 // which runs the conversion `convertMessages` exposes and then gives a tool
 // result the last stored output that a `result`-state invocation holds for its
@@ -659,9 +631,8 @@ function recordedSystemText(
   return joinedPromptText(values);
 }
 
-// The text of what application input processors added or changed outside the
-// call's input, read as the caller's messages are read, or undefined when any
-// of it is unclassified.
+// The text of the recorded prompt versions, read as the caller's messages are
+// read, or undefined when any of it is unclassified.
 function processorAdditionText(
   additions: readonly ProcessorAddition[],
 ): string | undefined {
@@ -682,22 +653,17 @@ interface CallerInput {
   readonly text: string;
 }
 
-// The input policies evaluate the call's own messages. Memory adds a thread's
-// stored history to the same message list, which records each message's
-// source; that history came from earlier calls and is not re-evaluated.
-// Without a message list, as in a direct `processInput` call, every message
-// is the caller's. What a guarded agent's application input processors added
-// or changed outside the input is evaluated with it.
+// Input policies read caller messages and client tool outcomes merged into
+// remembered messages, together with application processor additions.
+// Without a message list, every message is the caller's.
 function callerInput(
   args: ProcessInputArgs,
   additions: readonly ProcessorAddition[],
 ): CallerInput | undefined {
-  const remembered =
-    args.messageList == null ? undefined : rememberedIds(args.messageList);
   const messages =
-    remembered === undefined || remembered.size === 0
+    args.messageList == null
       ? args.messages
-      : args.messages.filter((message) => !remembered.has(message.id));
+      : callerMessages(args.messageList, args.messages);
   const text = inputPromptText(messages);
   const added = processorAdditionText(additionsToRead(additions, messages));
   if (text === undefined || added === undefined) return undefined;
@@ -1005,6 +971,17 @@ function snapshotPolicies(
 }
 
 /**
+ * Returns the caller-visible reason for a policy denial. `PolicyEngine` aborts
+ * every policy denial with this reason, discarding the evaluator's own reason.
+ */
+export function policyDenialReason(
+  policyName: string,
+  phase: PolicyPhase,
+): string {
+  return `policy '${policyName}' denied the ${phase}`;
+}
+
+/**
  * The reason an evaluator failure surfaces. Static because exception text may
  * carry the inspected payload; shared so the audit record and the streaming
  * abort reason cannot drift apart.
@@ -1017,7 +994,7 @@ const NON_STRING_OUTPUT_TEXT = 'output text is not a string';
 type OrderedPolicyEvaluation =
   | { outcome: 'allowed'; evaluated: string[] }
   | { outcome: 'denied'; reason: string }
-  | { outcome: 'error'; error: unknown };
+  | { outcome: 'error' };
 
 interface OrderedPolicyEvaluationOptions {
   policies: readonly PolicyEvaluator[];
@@ -1028,25 +1005,21 @@ interface OrderedPolicyEvaluationOptions {
   streamAccumulator?: Record<string, unknown>;
 }
 
-/** A policy decision, read once from what an evaluator returned. */
-type ReadPolicyDecision =
-  | { readonly allowed: true }
-  | { readonly allowed: false; readonly reason: string | undefined };
-
 // An evaluator that returns no decision has failed as surely as one that
 // throws, and allowing its call would fail open.
-function readPolicyDecision(decision: unknown): ReadPolicyDecision {
+function readPolicyDecision(decision: unknown): boolean {
   if (typeof decision === 'object' && decision !== null) {
     const { allowed, reason } = decision as {
       allowed?: unknown;
       reason?: unknown;
     };
-    if (allowed === true) return { allowed };
+    if (allowed === true) return true;
+    // Validate the discarded reason so malformed denials remain evaluator errors.
     if (
       allowed === false &&
       (reason === undefined || typeof reason === 'string')
     ) {
-      return { allowed, reason };
+      return false;
     }
   }
   throw new TypeError('policy evaluator returned no decision');
@@ -1088,17 +1061,17 @@ async function evaluatePoliciesInOrder(
     if (policy.phases && !policy.phases.includes(phase)) continue;
     if (!(policy.channels ?? DEFAULT_CHANNELS).includes(channel)) continue;
     evaluated.push(policy.name);
-    let decision: ReadPolicyDecision;
+    let allowed: boolean;
     try {
       const streamState = streamAccumulator
         ? policyStreamStateOf(streamAccumulator, index)
         : undefined;
-      decision = readPolicyDecision(
+      allowed = readPolicyDecision(
         await policy.evaluate(
           streamState ? { ...context, streamState } : context,
         ),
       );
-    } catch (error) {
+    } catch {
       // An evaluator crash is worse than a denial; it must not leave less
       // audit evidence than one. Opaque exception text may contain the
       // inspected payload, so the audit and every abort reason stay static,
@@ -1114,9 +1087,9 @@ async function evaluatePoliciesInOrder(
           channel,
         }),
       });
-      return { outcome: 'error', error };
+      return { outcome: 'error' };
     }
-    if (!decision.allowed) {
+    if (!allowed) {
       audit?.record({
         actor,
         action: `agent.${phase}.policy`,
@@ -1130,7 +1103,7 @@ async function evaluatePoliciesInOrder(
       });
       return {
         outcome: 'denied',
-        reason: `${policy.name}: ${decision.reason}`,
+        reason: policyDenialReason(policy.name, phase),
       };
     }
   }
@@ -1770,11 +1743,12 @@ export class PolicyEngine implements Processor<'breakwater-policy-engine'> {
   // closed), never returning past a violation. Returns the evaluated policy
   // names for the caller's terminal "allowed" record — which the streaming
   // path omits. abortOnError converts an evaluator failure into abort()
-  // instead of a rethrow. Input needs it because Mastra's durable preparation
+  // instead of a throw. Input needs it because Mastra's durable preparation
   // runs the model past an input processor's error that is not a tripwire,
   // and the stream because Mastra's stream driver emits the chunk on one (see
-  // processOutputStream). The final result rethrows, which stops Mastra's
-  // standard loop. During streaming, `streamAccumulator` (the processor's
+  // processOutputStream). The final result throws the fixed
+  // POLICY_EVALUATION_FAILED error, which stops Mastra's standard loop.
+  // During streaming, `streamAccumulator` (the processor's
   // per-request state) hands each policy a private namespace, exposed as
   // context.streamState for incremental scanning.
   async #evaluate(
@@ -1797,7 +1771,7 @@ export class PolicyEngine implements Processor<'breakwater-policy-engine'> {
     }
     if (result.outcome === 'error') {
       if (abortOnError) abort(POLICY_EVALUATION_FAILED);
-      throw result.error;
+      throw new Error(POLICY_EVALUATION_FAILED);
     }
     return result.evaluated;
   }

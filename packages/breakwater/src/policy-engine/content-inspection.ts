@@ -176,6 +176,11 @@ export const PII_SECRETS_DETECTOR_IDS = [
 /** Identifier accepted by {@link PiiSecretsOptions.detectors}. */
 export type PiiSecretsDetectorId = (typeof PII_SECRETS_DETECTOR_IDS)[number];
 
+const CUT_WORD_DETECTORS: ReadonlySet<PiiSecretsDetectorId> = new Set([
+  'ssn',
+  'awsAccessKey',
+]);
+
 const DEFAULT_ENTROPY_THRESHOLD = 4.5;
 const LEAK_PREVENTION_CHANNELS: readonly OutputChannel[] = [
   'answer',
@@ -386,18 +391,27 @@ function isAllowlisted(
   return false;
 }
 
-// Denies on the first non-allowlisted match found, scanning detectors in
-// their configured order. The reason names the detector id and the match's
-// ordinal position within that detector's own results — never the matched
-// text (see piiSecrets' doc).
+// Denies on the first non-allowlisted match found, scanning detectors in their
+// configured order; with `skipCutWordMatchesAtStart`, a `CUT_WORD_DETECTORS`
+// match at window index 0 is passed over. The reason names the detector id and
+// the match's ordinal position within that detector's own results — never the
+// matched text (see piiSecrets' doc).
 function scanForDenial(
   window: string,
   detectors: readonly Detector[],
   allowlist: readonly CompiledAllowlistEntry[],
+  skipCutWordMatchesAtStart = false,
 ): PolicyDecision | undefined {
   for (const detector of detectors) {
     const matches = detector.scan(window);
     for (const [index, match] of matches.entries()) {
+      if (
+        skipCutWordMatchesAtStart &&
+        match.index === 0 &&
+        CUT_WORD_DETECTORS.has(detector.id)
+      ) {
+        continue;
+      }
       if (isAllowlisted(match.text, allowlist)) continue;
       return {
         allowed: false,
@@ -468,11 +482,12 @@ const PII_SECRETS_OPTION_KEYS = {
  * proof of secrecy — natural text can score high and a deliberately-shaped
  * secret can score low. Do not rely on it alone against adversarial input.
  *
- * Streaming windows are re-sliced from partway through the accumulated text
- * on every call; a slice that starts mid-token can introduce a `\b` word
- * boundary the full text does not have at that position. Accepted,
- * consistent with denyPatterns' own windowing — a spurious boundary can only
- * ever produce an extra scan, never hide a real match, so it fails closed.
+ * Streaming windows are re-sliced from partway through the accumulated text.
+ * When every enabled detector is `ssn` or `awsAccessKey`, a match of theirs
+ * cut from a longer word at a window start is not reported; with any other
+ * detector enabled, it still denies. Other cut tokens can still deny, and
+ * where a window starts changes which overlapping candidates a scan reads, so
+ * a streaming scan can miss a match a full-text scan finds.
  */
 export function piiSecrets(options: PiiSecretsOptions = {}): PolicyEvaluator {
   assertKnownFields('piiSecrets: options', options, PII_SECRETS_OPTION_KEYS);
@@ -518,6 +533,16 @@ export function piiSecrets(options: PiiSecretsOptions = {}): PolicyEvaluator {
     (max, detector) => Math.max(max, detector.maxSpan),
     0,
   );
+  // These detectors' patterns begin with a word boundary that a window starting
+  // inside a word fakes. For them alone, the window scan finds every full-text
+  // match in the call that completes it: a match is at most one span long, and
+  // no candidate of either has an internal boundary where another could start,
+  // so the skipped match was never a real one. With another detector enabled,
+  // that detector's window scan can miss a match the full-text scan finds, and
+  // the skipped match's denial would have stopped it.
+  const canSkipCutWordMatches = detectors.every(({ id }) =>
+    CUT_WORD_DETECTORS.has(id),
+  );
   const configuredAllowlist = options.allowlist;
   const allowlist = compileAllowlist(
     configuredAllowlist === undefined ? [] : configuredAllowlist,
@@ -539,10 +564,14 @@ export function piiSecrets(options: PiiSecretsOptions = {}): PolicyEvaluator {
         const cursor = streamState[cursorKey];
         const scannedUpTo = typeof cursor === 'number' ? cursor : 0;
         if (text.length <= scannedUpTo) return { allowed: true };
-        const window = text.slice(
-          Math.max(0, scannedUpTo - (maxEnabledSpan - 1)),
+        const from = Math.max(0, scannedUpTo - (maxEnabledSpan - 1));
+        const window = text.slice(from);
+        const denial = scanForDenial(
+          window,
+          detectors,
+          allowlist,
+          canSkipCutWordMatches && from > 0 && /\w/.test(text[from - 1] ?? ''),
         );
-        const denial = scanForDenial(window, detectors, allowlist);
         if (denial) return denial;
         streamState[cursorKey] = text.length;
         return { allowed: true };
@@ -683,9 +712,9 @@ export const terminalPassStreamStates = new WeakSet<object>();
  * A `classify` call that throws, resolves to no decision, or does not settle
  * within `timeoutMs` is an evaluator failure. `PolicyEngine` records an error
  * event for it and aborts at input and in-stream, on both of Mastra's agent
- * loops, and rethrows at the final result, which stops Mastra's standard
- * loop. Fail-open is deliberately not offered. Omit `timeoutMs` to let
- * `classify` run unbounded.
+ * loops, and throws the fixed `policy evaluation failed` error at the final
+ * result, which stops Mastra's standard loop. Fail-open is not offered.
+ * Omit `timeoutMs` to let `classify` run unbounded.
  *
  * The returned evaluator carries no `holdBackChars` hint (engine default:
  * 0) — an async classifier has no bounded straddle window to report, unlike

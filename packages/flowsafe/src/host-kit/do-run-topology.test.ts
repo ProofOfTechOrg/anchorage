@@ -53,12 +53,12 @@ function harness() {
   };
 }
 
-describe('C workflow epoch transport', () => {
+describe('workflow epoch transport', () => {
   it.each([
     undefined,
     0,
     Number.MAX_SAFE_INTEGER,
-  ])('C workflow wire carries only canonical epoch headers (%s)', async (mutationEpoch) => {
+  ])('workflow wire carries only canonical epoch headers (%s)', async (mutationEpoch) => {
     const { topology, requests } = harness();
     await topology.start({
       workflowId: 'workflow-1',
@@ -99,7 +99,7 @@ describe('C workflow epoch transport', () => {
     NaN,
     Infinity,
     Number.MAX_SAFE_INTEGER + 1,
-  ])('C invalid workflow epoch refuses before namespace lookup (%s)', async (mutationEpoch) => {
+  ])('invalid workflow epoch refuses before namespace lookup (%s)', async (mutationEpoch) => {
     const { topology, namespace, requests } = harness();
     const get = vi.spyOn(namespace, 'get');
     await expect(
@@ -120,7 +120,7 @@ describe('C workflow epoch transport', () => {
     'missing',
     'stale',
     'future',
-  ] as const)('C workflow transport preserves complete downstream epoch refusal (%s)', async (classification) => {
+  ] as const)('workflow transport preserves complete downstream epoch refusal (%s)', async (classification) => {
     const error = new MutationEpochMismatchError(classification, 2);
     const topology = createDoRunTopology(
       {
@@ -248,7 +248,7 @@ describe('createDoRunTopology', () => {
   });
 });
 
-describe('FS8 D3 workflow reclaim liveness transport', () => {
+describe('workflow reclaim liveness transport', () => {
   async function retry(
     liveness: () => Promise<Response>,
     state: 'reserved' | 'started' = 'reserved',
@@ -412,7 +412,7 @@ describe('FS8 D3 workflow reclaim liveness transport', () => {
   });
 });
 
-describe('FS8 D3 protected replay workflow transport', () => {
+describe('protected replay workflow transport', () => {
   const execution = {
     tablePrefix: 'selected_',
     workflowId: 'workflow-1',
@@ -460,8 +460,56 @@ describe('FS8 D3 protected replay workflow transport', () => {
     ).resolves.toEqual({ kind: 'result', execution, value });
   });
 
+  it('replays an interrupted run with its envelope', async () => {
+    // #given the persisted result of a run whose leg stopped mid-step
+    const interrupted = {
+      runId: 'run-1',
+      status: 'failed',
+      error: 'leg stopped',
+      errorEnvelope: { code: 'INTERRUPTED', message: 'leg stopped' },
+    };
+    const { topology } = topologyFor({
+      kind: 'result',
+      execution,
+      value: interrupted,
+    });
+
+    // #when / #then
+    await expect(
+      topology.persistedStart('workflow-1', 'run-1'),
+    ).resolves.toEqual({ kind: 'result', execution, value: interrupted });
+  });
+
+  it('replays the timer steps the run object listed', async () => {
+    // #given — a replay through the router reconciles approvals from this value
+    const timer = {
+      runId: 'run-1',
+      status: 'suspended',
+      suspended: [['wait']],
+      suspensionTimers: ['wait'],
+    };
+    const { topology } = topologyFor({
+      kind: 'result',
+      execution,
+      value: timer,
+    });
+
+    // #when / #then
+    await expect(
+      topology.persistedStart('workflow-1', 'run-1'),
+    ).resolves.toEqual({ kind: 'result', execution, value: timer });
+  });
+
   it.each([
     ['missing discriminator', { execution, value }],
+    [
+      'timer list that is not string steps',
+      {
+        kind: 'result',
+        execution,
+        value: { ...value, suspensionTimers: [['wait']] },
+      },
+    ],
     ['initial with value', { kind: 'initial', execution, value }],
     ['missing result value', { kind: 'result', execution }],
     [

@@ -36,7 +36,7 @@ function socketSpy(attachment?: unknown, throwOnSend = false): SocketSpy {
 }
 
 // The base is abstract (extend, do not instantiate); a bare subclass is the
-// per-host binding target (ShowcaseHub / FlowsafeHub / DemoHub, M-008/M-009).
+// per-host binding target (ShowcaseHub / FlowsafeHub / DemoHub).
 class TestHub extends HubDurableObject {}
 
 function hubWith(name: string | undefined, sockets: SocketSpy[]): TestHub {
@@ -110,7 +110,7 @@ describe('HubDurableObject.fetch', () => {
     }
   });
 
-  it('keeps fanning out when one socket throws on send (per-socket isolation, F2)', async () => {
+  it('keeps fanning out when one socket throws on send (per-socket isolation)', async () => {
     // #given — a CLOSING socket (throws on send) ahead of a healthy one, both
     // on the deployment hub. Without per-socket isolation the throw aborts the loop
     // and the healthy subscriber never receives the frame.
@@ -130,7 +130,7 @@ describe('HubDurableObject.fetch', () => {
     expect(frame.type).toBe('queue');
   });
 
-  it('re-broadcasts presence past a throwing socket (per-socket isolation, F2)', () => {
+  it('re-broadcasts presence past a throwing socket (per-socket isolation)', () => {
     // #given — a departing socket, a throwing (CLOSING) subscriber, and a
     // healthy one. The roster must still reach the healthy subscriber.
     const leaving = socketSpy({ actorId: 'carol', role: 'reviewer' });
@@ -196,8 +196,8 @@ describe('HubDurableObject.fetch', () => {
   });
 
   it('returns a 426 non-WS fallback on /subscribe without the hibernation API', async () => {
-    // #given — a node hub (no acceptWebSocket). Subscribing is workerd-only and
-    // proven by the spike (M-009); off workerd it must degrade, never 500.
+    // #given — a node hub without workerd's hibernation API. Subscribing
+    // returns 426 instead of treating the missing API as a server failure.
     const hub = hubWith(HUB_INSTANCE_NAME, []);
 
     // #when — a websocket upgrade attempt

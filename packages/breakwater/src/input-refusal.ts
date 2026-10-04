@@ -30,6 +30,12 @@ export interface Refusal {
   readonly additions?: readonly ProcessorAddition[];
   /** The refusing processor's snapshot of the list, taken before it ran. */
   readonly snapshot?: PromptSnapshot | undefined;
+  /**
+   * Remembered messages that carried the caller's client tool outcome when
+   * the refusing processor started, removed whether or not they are still
+   * the call's input.
+   */
+  readonly callerOutcomeMessageIds?: ReadonlySet<string> | undefined;
 }
 
 // Runs each step and then `stop`, even when a step throws. `stop`'s throw
@@ -51,10 +57,11 @@ function runThenStop(
 /**
  * @internal Remove from `messageList` the call's input, its response
  * messages, each message the application input processors' record names, and,
- * with a snapshot, each message the snapshot does not match; then stop the
- * call with `stop`. Without a list nothing is removed. Each removal runs even
- * when an earlier one throws, and `stop` runs last; its throw replaces a
- * removal's.
+ * with a snapshot, each message the snapshot does not match, plus the
+ * remembered caller outcome messages the refusal names even when they left
+ * the input; then stop the call with `stop`. Without a list nothing is
+ * removed. Each removal runs even when an earlier one throws, and `stop` runs
+ * last; its throw replaces a removal's.
  */
 export function stopWithoutCallMessages(
   messageList: MessageList | null | undefined,
@@ -62,7 +69,7 @@ export function stopWithoutCallMessages(
   stop: () => never,
 ): never {
   if (messageList == null) return stop();
-  const { snapshot } = refusal;
+  const { snapshot, callerOutcomeMessageIds } = refusal;
   return runThenStop(
     [
       () => messageList.clear.input.db(),
@@ -81,6 +88,9 @@ export function stopWithoutCallMessages(
                 unmatchedMessageIds(messageList, snapshot),
               ),
           ]),
+      ...(callerOutcomeMessageIds === undefined
+        ? []
+        : [() => messageList.removeByIds([...callerOutcomeMessageIds])]),
     ],
     stop,
   );

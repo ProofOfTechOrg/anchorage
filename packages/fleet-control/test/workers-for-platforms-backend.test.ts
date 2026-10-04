@@ -3743,7 +3743,7 @@ describe('WorkersForPlatformsBackend', () => {
     expect(client.database).toMatchObject({ name: deployment.databaseName });
   });
 
-  it('seeds optional FS8 metadata through string-bound provider SQL', async () => {
+  it('seeds optional execution-fence metadata through string-bound provider SQL', async () => {
     const client = new FakeApi();
     const subject = new WorkersForPlatformsBackend({
       namespacedState: NAMESPACED_STATE,

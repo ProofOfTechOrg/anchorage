@@ -230,7 +230,6 @@ function reserveAgent(accepted?: Promise<unknown>) {
   const agent = {
     id: 'reserve',
     [RUNTIME_DRIVEN_AGENT]: true,
-    __setPubSub: () => {},
     getMemory: () => ({ saveMessages: vi.fn() }),
     sendSignal,
     sendMessage: (_message: unknown, target: { ifIdle?: unknown }) => {

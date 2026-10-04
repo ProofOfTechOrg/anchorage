@@ -85,6 +85,16 @@ import {
   reportNotificationDeliveryError,
 } from './notification-dispatch.js';
 
+// The schedule tick settles a threaded fire as failed when this route answers
+// one of the permanent statuses `ScheduleTickSignalAgent` documents, so a
+// transient condition must not answer with one of them.
+const SIGNAL_ROUTE_REFUSAL_MESSAGES: Partial<Record<number, string>> = {
+  400: 'bad request',
+  403: 'forbidden',
+  404: 'not found',
+  409: 'conflict',
+};
+
 /**
  * The idle-thread delivery behavior a send may ask for. `wake` starts a run
  * after consulting the run cap; `persist` writes the signal to the durable
@@ -241,6 +251,9 @@ export interface ThreadSignalRoutesOptions {
    * otherwise the route returns `persistence-forbidden` or
    * `memory-unavailable`, and never escapes onto core's default execution
    * engine. Trusted notification dispatch supplies the persisted agent id.
+   * When the thread's init() has a pub/sub, a runtime-driven agent must return
+   * that same instance from getPubSub() or the routes answer 503. The routes
+   * install the thread's pub/sub on a non-runtime-driven agent.
    */
   resolveAgent: (
     scope: ThreadScope,
@@ -313,7 +326,11 @@ export interface ThreadSignalRoutesOptions {
    * notification follows Mastra's delivery policy.
    */
   canPersist?: (scope: ThreadScope) => boolean | Promise<boolean>;
-  /** Whether the registered schedule owner may persist to its fixed target. */
+  /**
+   * Whether the registered schedule owner may persist to its fixed target.
+   * When set, schedule fires consult it instead of `canPersist`, which is not
+   * called for those fires.
+   */
   canPersistSchedule?: (
     scope: ThreadScope,
     input: {
@@ -364,6 +381,10 @@ export interface ThreadSignalRoutesOptions {
    */
   scheduleProviderOptionsPolicy?: ScheduleProviderOptionsPolicy;
 }
+
+type ScheduleFireInput = Parameters<
+  NonNullable<ThreadSignalRoutesOptions['canPersistSchedule']>
+>[1];
 
 /**
  * A thread-DO signal router: `(request, scope) => Response | null`. `null` means
@@ -784,7 +805,15 @@ export function createThreadSignalRoutes(
       const blockingRun = resolveBlockingRun
         ? () => resolveBlockingRun(scope)
         : undefined;
-      const persistenceAllowed = canPersist ? await canPersist(scope) : true;
+      const schedulePersistenceAllowed =
+        path === '/signal/schedule' && canPersistSchedule
+          ? (input: ScheduleFireInput) => canPersistSchedule(scope, input)
+          : undefined;
+      // Schedule-owner authorization makes the request-principal check unnecessary.
+      const persistenceAllowed =
+        canPersist && !schedulePersistenceAllowed
+          ? await canPersist(scope)
+          : true;
       const inspectContent: InspectSignalContent | undefined = contentPolicy
         ? (signal, runId) =>
             inspectSignalContent(
@@ -886,11 +915,9 @@ export function createThreadSignalRoutes(
           startIdleRun,
           serializeWake,
           blockingRun,
-          persistenceAllowed,
           memoryAvailable,
-          schedulePersistenceAllowed: canPersistSchedule
-            ? (input) => canPersistSchedule(scope, input)
-            : undefined,
+          schedulePersistenceAllowed:
+            schedulePersistenceAllowed ?? (() => persistenceAllowed),
           resolveRunStatus: resolveScheduleRunStatus
             ? (input) => resolveScheduleRunStatus(scope, input)
             : undefined,
@@ -983,17 +1010,11 @@ export function createThreadSignalRoutes(
           error.status,
         );
       }
-      if (
-        error instanceof DoStatusError &&
-        (error.status === 403 || error.status === 404 || error.status === 409)
-      ) {
-        const message =
-          error.status === 403
-            ? 'forbidden'
-            : error.status === 404
-              ? 'not found'
-              : 'conflict';
-        return json({ error: message }, error.status);
+      if (error instanceof DoStatusError) {
+        const message = SIGNAL_ROUTE_REFUSAL_MESSAGES[error.status];
+        if (message !== undefined) {
+          return json({ error: message }, error.status);
+        }
       }
       // A send that cannot be routed at all (e.g. an idle wake whose stream setup
       // throws — no model) rejects `accepted`; surface it as a 502 rather than a
@@ -1224,9 +1245,7 @@ async function handleNotificationDispatch(options: {
       serializeWake: options.serializeWake,
       executionFence: options.executionFence,
       proof: options.proof,
-      blockingRun: durableBlockingRun
-        ? () => durableBlockingRun
-        : options.blockingRun,
+      blockingRun: options.blockingRun,
       persistenceAllowed: options.persistenceAllowed,
       memoryAvailable: options.memoryAvailable,
       signal: deliverableSignal,
@@ -1852,16 +1871,10 @@ async function handleScheduleSignal(options: {
   startIdleRun: StartIdleRun | undefined;
   serializeWake<T>(operation: () => Promise<T>): Promise<T>;
   blockingRun?: BlockingRunResolver;
-  persistenceAllowed: boolean;
   memoryAvailable: MemoryAvailable;
-  schedulePersistenceAllowed?: (input: {
-    scheduleId: string;
-    dispatchId: string;
-    runId: string;
-    agentId: string;
-    threadId: string;
-    resourceId: string;
-  }) => boolean | Promise<boolean>;
+  schedulePersistenceAllowed: (
+    input: ScheduleFireInput,
+  ) => boolean | Promise<boolean>;
   resolveRunStatus?: (input: {
     agentId: string;
     resourceId: string;
@@ -2059,20 +2072,16 @@ async function handleScheduleSignal(options: {
   const persistenceRequested = localActiveRunId
     ? effectiveIfActive.behavior === 'persist'
     : (ifIdle.behavior ?? 'wake') === 'persist';
-  // Occupancy can change before the send, so either branch may persist.
-  const persistenceAllowed =
-    (effectiveIfActive.behavior === 'persist' ||
-      (ifIdle.behavior ?? 'wake') === 'persist') &&
-    options.schedulePersistenceAllowed
-      ? await options.schedulePersistenceAllowed({
-          scheduleId,
-          dispatchId,
-          runId,
-          agentId: target.agentId,
-          threadId: options.threadId,
-          resourceId,
-        })
-      : options.persistenceAllowed;
+  // A wake or a delivery can still end in persistence, so the schedule's
+  // authorization governs every fire.
+  const persistenceAllowed = await options.schedulePersistenceAllowed({
+    scheduleId,
+    dispatchId,
+    runId,
+    agentId: target.agentId,
+    threadId: options.threadId,
+    resourceId,
+  });
   if (persistenceRequested && !persistenceAllowed) {
     return await settleDiscard();
   }
@@ -2180,9 +2189,7 @@ async function handleScheduleSignal(options: {
       serializeWake: options.serializeWake,
       executionFence: options.executionFence,
       proof: options.proof,
-      blockingRun: durableBlockingRun
-        ? () => durableBlockingRun
-        : options.blockingRun,
+      blockingRun: options.blockingRun,
       persistenceAllowed,
       memoryAvailable: options.memoryAvailable,
       signal: idleSignal,
@@ -2332,9 +2339,7 @@ async function handleMessage(
       serializeWake,
       executionFence: options.executionFence,
       proof: options.proof,
-      blockingRun: durableBlockingRun
-        ? () => durableBlockingRun
-        : options.blockingRun,
+      blockingRun: options.blockingRun,
       persistenceAllowed: options.persistenceAllowed,
       memoryAvailable: options.memoryAvailable,
       message,
@@ -2542,9 +2547,7 @@ async function handleSignal(
       serializeWake,
       executionFence: options.executionFence,
       proof: options.proof,
-      blockingRun: durableBlockingRun
-        ? () => durableBlockingRun
-        : options.blockingRun,
+      blockingRun: options.blockingRun,
       persistenceAllowed: options.persistenceAllowed,
       memoryAvailable: options.memoryAvailable,
       signal,
@@ -2951,12 +2954,10 @@ async function handleNotification(
       delivery: { action: 'deferred', reason: 'dispatcher' },
     });
   }
-  // An unbranded agent's owner notification uses core's delivery policy, whose
-  // summary wake override can start a run below this boundary, outside
-  // RunnerRuntime, the host entry gate and the run cap (@mastra/core 1.67.0,
-  // agent-Dk0N0Nlg.js:38431, :38447). The inbox row is the durable artifact, so
-  // that path has no memory gate: without agent memory, a model-visible
-  // persist is best-effort and the row stays pending.
+  // Agent.sendNotificationSignal can wake a notification summary through the
+  // thread runtime outside RunnerRuntime, the host entry gate and the run cap.
+  // The inbox row is durable without agent memory; model-visible persistence
+  // is best-effort and the row stays pending when memory is unavailable.
   const notificationsStore = await agent
     .getMastraInstance?.()
     ?.getStorage()

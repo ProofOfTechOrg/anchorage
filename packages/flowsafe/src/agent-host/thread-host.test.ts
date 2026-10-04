@@ -764,7 +764,7 @@ function seedRecoveryState(
   }
 }
 
-function cDeferred() {
+function deferredSignal() {
   let resolve = () => {};
   const promise = new Promise<void>((done) => {
     resolve = done;
@@ -772,7 +772,7 @@ function cDeferred() {
   return { promise, resolve };
 }
 
-const C_START_INPUT: ThreadAgentStartInput = {
+const THREAD_START_INPUT: ThreadAgentStartInput = {
   agentId: 'writer',
   threadId: 'acme_thread',
   resourceId: RESOURCE_ID,
@@ -784,8 +784,8 @@ const C_START_INPUT: ThreadAgentStartInput = {
 describe('agent-host request bodies awaiting dispatch', () => {
   it('returns a non-host request without waiting for dispatch or reading its body', async () => {
     const fixture = harness();
-    const entered = cDeferred();
-    const release = cDeferred();
+    const entered = deferredSignal();
+    const release = deferredSignal();
     const holder = fixture.host.serializeDispatch(async () => {
       entered.resolve();
       await release.promise;
@@ -815,8 +815,8 @@ describe('agent-host request bodies awaiting dispatch', () => {
     'resume',
   ] as const)('rejects invalid %s JSON while dispatch is held', async (action) => {
     const fixture = harness();
-    const entered = cDeferred();
-    const release = cDeferred();
+    const entered = deferredSignal();
+    const release = deferredSignal();
     const holder = fixture.host.serializeDispatch(async () => {
       entered.resolve();
       await release.promise;
@@ -854,8 +854,8 @@ describe('agent-host request bodies awaiting dispatch', () => {
   ] as const)('processes a queued %s after its sender disconnects', async (action) => {
     const fixture = harness();
     if (action === 'resume') seedSuspendedApprovalRun(fixture);
-    const entered = cDeferred();
-    const release = cDeferred();
+    const entered = deferredSignal();
+    const release = deferredSignal();
     const holder = fixture.host.serializeDispatch(async () => {
       entered.resolve();
       await release.promise;
@@ -864,7 +864,7 @@ describe('agent-host request bodies awaiting dispatch', () => {
     let controller!: ReadableStreamDefaultController<Uint8Array>;
     const payload =
       action === 'start'
-        ? C_START_INPUT
+        ? THREAD_START_INPUT
         : {
             agentId: 'writer',
             threadId: 'acme_thread',
@@ -910,7 +910,7 @@ describe('agent-host request bodies awaiting dispatch', () => {
   });
 });
 
-function cObserved<T extends object>(
+function observedProperties<T extends object>(
   values: T,
   mode: 'alternate' | 'second-throw' = 'second-throw',
 ) {
@@ -935,7 +935,7 @@ function cObserved<T extends object>(
   return { source, counts, values };
 }
 
-describe('C direct thread host capture', () => {
+describe('direct thread host capture', () => {
   it.each(
     [
       'mutationEpoch',
@@ -948,7 +948,7 @@ describe('C direct thread host capture', () => {
       'runOwnerGuard',
       'onPreparedStartIdentity',
     ].flatMap((field) => [null, 2].map((value) => ({ field, value }))),
-  )('C thread host refuses internal JSON authority before effects ($field, $value)', async ({
+  )('thread host refuses internal JSON authority before effects ($field, $value)', async ({
     field,
     value,
   }) => {
@@ -959,7 +959,7 @@ describe('C direct thread host capture', () => {
         new Request('https://thread/_flowsafe/agent-host/start', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ ...C_START_INPUT, [field]: value }),
+          body: JSON.stringify({ ...THREAD_START_INPUT, [field]: value }),
         }),
         fixture.scope,
       )
@@ -980,7 +980,7 @@ describe('C direct thread host capture', () => {
         await fixture.host.route(
           new Request('https://thread/_flowsafe/agent-host/start', {
             method: 'POST',
-            body: JSON.stringify(C_START_INPUT),
+            body: JSON.stringify(THREAD_START_INPUT),
           }),
           fixture.scope,
         )
@@ -993,7 +993,7 @@ describe('C direct thread host capture', () => {
     'normal',
     'failure',
     'recovery',
-  ] as const)('FS8 D3 host activation agent preparation and ownership: %s', async (phase) => {
+  ] as const)('host activation agent preparation and ownership: %s', async (phase) => {
     const core = await vi.importActual<typeof import('@mastra/core/mastra')>(
       '@mastra/core/mastra',
     );
@@ -1031,7 +1031,7 @@ describe('C direct thread host capture', () => {
       mutationEpoch: 2,
       requireMutationEpoch: true,
     });
-    const failure = new Error('C thread provider failed');
+    const failure = new Error('thread provider failed');
     const app = init(
       { storage },
       {
@@ -1110,7 +1110,7 @@ describe('C direct thread host capture', () => {
         'settleReservation',
       ).mockImplementationOnce(async (...args) => {
         await settle(...args);
-        throw new Error('C lost thread settlement receipt');
+        throw new Error('thread settlement receipt lost');
       });
     mocked.stream.mockImplementation(
       async (
@@ -1155,7 +1155,7 @@ describe('C direct thread host capture', () => {
     );
     try {
       const pending = fixture.host.start(fixture.scope, {
-        ...C_START_INPUT,
+        ...THREAD_START_INPUT,
         threaded: false,
       });
       if (phase === 'failure') await expect(pending).rejects.toBe(failure);
@@ -1244,9 +1244,9 @@ describe('C direct thread host capture', () => {
     ['system', false, 'source'],
     ['service', true, 'authorize'],
     ['system', true, 'authorize'],
-  ] as const)('C direct host keeps scope selectors and separate owners: %s threaded=%s at %s', async (kind, threaded, boundary) => {
-    const entered = cDeferred();
-    const release = cDeferred();
+  ] as const)('direct host keeps scope selectors and separate owners: %s threaded=%s at %s', async (kind, threaded, boundary) => {
+    const entered = deferredSignal();
+    const release = deferredSignal();
     const principal: ExecutionPrincipal =
       kind === 'human'
         ? { kind, id: 'operator-1', role: 'operator' }
@@ -1300,8 +1300,8 @@ describe('C direct thread host capture', () => {
         return nativeOwner(resourceKind, id);
       },
     );
-    const ownerCopied = cDeferred();
-    const ownerRelease = cDeferred();
+    const ownerCopied = deferredSignal();
+    const ownerRelease = deferredSignal();
     const nativeGet = fixture.stateStorage.get.bind(fixture.stateStorage);
     vi.spyOn(fixture.stateStorage, 'get').mockImplementation(
       async <T>(key: string) => {
@@ -1315,7 +1315,7 @@ describe('C direct thread host capture', () => {
     const scope = { ...fixture.scope, mutationEpoch: 2, deploymentTag: 'acme' };
     const originalInit = scope.init;
     const input: ThreadAgentStartInput = {
-      ...C_START_INPUT,
+      ...THREAD_START_INPUT,
       entryPath,
       threaded,
       idempotencyKey: 'original-key',
@@ -1469,15 +1469,15 @@ describe('C direct thread host capture', () => {
   it.each([
     'alternate',
     'second-throw',
-  ] as const)('C direct host captures every declared scope and input getter once: %s', async (mode) => {
+  ] as const)('direct host captures every declared scope and input getter once: %s', async (mode) => {
     const fixture = harness();
-    const scope = cObserved(
+    const scope = observedProperties(
       { ...fixture.scope, mutationEpoch: 2, deploymentTag: 'acme' },
       mode,
     );
-    const input = cObserved<ThreadAgentStartInput>(
+    const input = observedProperties<ThreadAgentStartInput>(
       {
-        ...C_START_INPUT,
+        ...THREAD_START_INPUT,
         messages: undefined,
         threaded: false,
         scheduleId: undefined,
@@ -1522,10 +1522,10 @@ describe('C direct thread host capture', () => {
     'safeContext',
     'providerOptions',
     'idempotencyKey',
-  ])('C direct host preserves first capture fault without effects: %s', async (key) => {
+  ])('direct host preserves first capture fault without effects: %s', async (key) => {
     const fixture = harness();
     const scope = { ...fixture.scope, mutationEpoch: 2, deploymentTag: 'acme' };
-    const input = { ...C_START_INPUT };
+    const input = { ...THREAD_START_INPUT };
     const fault = new Error(`first fault ${key}`);
     Object.defineProperty(
       [
@@ -1911,7 +1911,7 @@ describe('createThreadAgentHost', () => {
 
     await expect(
       fixture.host.start(fixture.scope, {
-        ...C_START_INPUT,
+        ...THREAD_START_INPUT,
         prompt: undefined,
         messages: messages as unknown as ThreadAgentStartInput['messages'],
       }),
@@ -1946,7 +1946,7 @@ describe('createThreadAgentHost', () => {
 
     await expect(
       fixture.host.start(fixture.scope, {
-        ...C_START_INPUT,
+        ...THREAD_START_INPUT,
         entryPath: 'schedule.fire',
         threaded: false,
         scheduleId: SCHEDULE_ID,
@@ -1966,7 +1966,7 @@ describe('createThreadAgentHost', () => {
 
     await expect(
       fixture.host.start(fixture.scope, {
-        ...C_START_INPUT,
+        ...THREAD_START_INPUT,
         prompt: undefined,
         messages: [
           { role: 'user', content: 'x', callback: () => {} },
@@ -1992,7 +1992,7 @@ describe('createThreadAgentHost', () => {
 
     await expect(
       fixture.host.start(fixture.scope, {
-        ...C_START_INPUT,
+        ...THREAD_START_INPUT,
         prompt: undefined,
         messages: signal,
       }),
@@ -2007,7 +2007,7 @@ describe('createThreadAgentHost', () => {
 
     await expect(
       fixture.host.start(fixture.scope, {
-        ...C_START_INPUT,
+        ...THREAD_START_INPUT,
         prompt: undefined,
         messages: ['context', signal],
       }),
@@ -4200,8 +4200,8 @@ describe('createThreadAgentHost permission authorization', () => {
     });
 
     await expect(host.start(scope, startInput)).rejects.toMatchObject({
-      status: 403,
-      message: 'forbidden',
+      status: 503,
+      message: 'permission resolution unavailable',
     });
 
     expect(mocked.stream).not.toHaveBeenCalled();
@@ -4727,7 +4727,7 @@ describe('createThreadAgentHost saved owner journal presence', () => {
     );
     const operation =
       entry === 'start'
-        ? fixture.host.start(fixture.scope, C_START_INPUT)
+        ? fixture.host.start(fixture.scope, THREAD_START_INPUT)
         : entry === 'schedule status'
           ? fixture.host.scheduleDispatchStatus(fixture.scope, {
               agentId: 'writer',
@@ -4751,14 +4751,14 @@ describe('createThreadAgentHost saved owner journal presence', () => {
   it('starts when the owner journal is absent', async () => {
     const fixture = harness();
     await expect(
-      fixture.host.start(fixture.scope, C_START_INPUT),
+      fixture.host.start(fixture.scope, THREAD_START_INPUT),
     ).resolves.toMatchObject({ summary: { status: 'success' } });
     expect(mocked.stream).toHaveBeenCalledOnce();
     expect(fixture.state.has(TEST_OWNER_RECOVERY_KEY)).toBe(false);
   });
 });
 
-describe('FS8 D3 host shares cold wrapper initialization', () => {
+describe('host shares cold wrapper initialization', () => {
   async function coldInitializationFixture() {
     const core = await vi.importActual<typeof import('@mastra/core/mastra')>(
       '@mastra/core/mastra',
@@ -4812,7 +4812,7 @@ describe('FS8 D3 host shares cold wrapper initialization', () => {
       storage,
       resourceAccess: resources,
     });
-    const catalogGate = cDeferred();
+    const catalogGate = deferredSignal();
     const buildModules = vi.fn(async () => {
       await catalogGate.promise;
       return [
@@ -5044,7 +5044,7 @@ describe('FS8 D3 host shares cold wrapper initialization', () => {
     const writes = vi.spyOn(fixture.stateStorage, 'put');
     const replay = fixture.replay();
     const started = fixture.host.start(fixture.scope, {
-      ...C_START_INPUT,
+      ...THREAD_START_INPUT,
       idempotencyKey: request.key,
       startReservation: first.reservation,
     });
@@ -5139,7 +5139,7 @@ describe('FS8 D3 host shares cold wrapper initialization', () => {
     expect(released?.updatedAt).toBeLessThan(retry.reservation.updatedAt);
     await expect(
       retryHost.start(retryScope, {
-        ...C_START_INPUT,
+        ...THREAD_START_INPUT,
         idempotencyKey: request.key,
         startReservation: retry.reservation,
       }),
@@ -5211,7 +5211,7 @@ describe('FS8 D3 host shares cold wrapper initialization', () => {
   });
 });
 
-describe('FS8 D3 host activation cold agent recovery', () => {
+describe('host activation cold agent recovery', () => {
   async function coldFixture(
     threaded: boolean,
     mode: 'fenced' | 'unfenced',
@@ -5411,7 +5411,10 @@ describe('FS8 D3 host activation cold agent recovery', () => {
   ])('initializes a fresh actual wrapper for progressed unfenced recovery (threaded=%s)', async (threaded) => {
     const fixture = await coldFixture(threaded, 'unfenced');
     expect(fixture.app.runtime.workflowIds()).toEqual([]);
-    const b2 = vi.spyOn(fixture.app.runtime, 'recoverStartAttempt');
+    const recoverStartAttemptSpy = vi.spyOn(
+      fixture.app.runtime,
+      'recoverStartAttempt',
+    );
     await expect(
       fixture.host.recoverOwnership(fixture.scope),
     ).resolves.toBeUndefined();
@@ -5420,7 +5423,7 @@ describe('FS8 D3 host activation cold agent recovery', () => {
     expect(await fixture.resources.owner('run', 'acme_run')).toEqual(
       HUMAN_OWNER,
     );
-    expect(b2).not.toHaveBeenCalled();
+    expect(recoverStartAttemptSpy).not.toHaveBeenCalled();
     expect(mocked.stream).not.toHaveBeenCalled();
   });
 
@@ -5509,7 +5512,7 @@ describe('FS8 D3 host activation cold agent recovery', () => {
     'mode',
     'workflow role',
     'missing identity',
-  ] as const)('retains same-S foreign managed metadata before B2 from one selected row: %s', async (field) => {
+  ] as const)('retains same-S foreign managed metadata before terminalization from one selected row: %s', async (field) => {
     const fixture = await coldFixture(true, 'fenced', 'pending');
     const snapshot = await fixture.workflows.loadWorkflowSnapshot({
       workflowName: fixture.execution.workflowId,
@@ -5607,7 +5610,7 @@ describe('FS8 D3 host activation cold agent recovery', () => {
     for (let retry = 0; retry < 2; retry++) {
       const outcome = await fixture.host
         .start(fixture.scope, {
-          ...C_START_INPUT,
+          ...THREAD_START_INPUT,
           threaded,
           ...(fixture.claim
             ? {
@@ -5660,7 +5663,7 @@ describe('FS8 D3 host activation cold agent recovery', () => {
   });
 });
 
-describe('FS8 D3 host activation exact agent journals', () => {
+describe('host activation exact agent journals', () => {
   it.each([
     [
       'phase',
@@ -5759,7 +5762,7 @@ describe('FS8 D3 host activation exact agent journals', () => {
   it.each([
     null,
     'actual_',
-  ] as const)('never invokes B2 or absence rollback for missing prepared-unfenced state (prefix=%s)', async (tablePrefix) => {
+  ] as const)('never invokes recoverStartAttempt or absence rollback for missing prepared-unfenced state (prefix=%s)', async (tablePrefix) => {
     const fixture = harness();
     fixture.setSummary(null, true);
     const recovery = ownerRecovery('acme_run', {
@@ -5772,14 +5775,17 @@ describe('FS8 D3 host activation exact agent journals', () => {
       },
     });
     seedRecoveryState(fixture.state, 'acme_run', recovery);
-    const b2 = vi.spyOn(fixture.scope.init.runtime, 'recoverStartAttempt');
+    const recoverStartAttemptSpy = vi.spyOn(
+      fixture.scope.init.runtime,
+      'recoverStartAttempt',
+    );
     const outcome = await fixture.host
       .recoverOwnership(fixture.scope)
       .catch((error: unknown) => error);
     expect(fixture.state.get(TEST_OWNER_RECOVERY_KEY)).toEqual(recovery);
     expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(true);
     expect(fixture.alarmAt()).toBeDefined();
-    expect(b2).not.toHaveBeenCalled();
+    expect(recoverStartAttemptSpy).not.toHaveBeenCalled();
     expect(outcome).toBeInstanceOf(Error);
   });
 
@@ -5795,7 +5801,7 @@ describe('FS8 D3 host activation exact agent journals', () => {
       runtime: { settleStartExecution: settle },
     });
     const outcome = await fixture.host
-      .start(fixture.scope, { ...C_START_INPUT, threaded })
+      .start(fixture.scope, { ...THREAD_START_INPUT, threaded })
       .catch((error: unknown) => error);
     expect(fixture.state.get(TEST_OWNER_RECOVERY_KEY)).toMatchObject({
       phase: 'prepared-unfenced',
@@ -5820,7 +5826,7 @@ describe('FS8 D3 host activation exact agent journals', () => {
     const fixture = harness();
     fixture.setSummary({ runId: 'acme_run', status: 'pending' }, false);
     const outcome = await fixture.host
-      .start(fixture.scope, { ...C_START_INPUT, threaded })
+      .start(fixture.scope, { ...THREAD_START_INPUT, threaded })
       .catch((error: unknown) => error);
     expect(fixture.state.get(TEST_OWNER_RECOVERY_KEY)).toMatchObject({
       phase: 'prepared-unfenced',
@@ -5842,17 +5848,17 @@ describe('FS8 D3 host activation exact agent journals', () => {
   });
 });
 
-describe('FS8 D3 host activation owning quiescence', () => {
+describe('host activation owning quiescence', () => {
   it('refuses recovery while the exact start frame is still awaiting the engine', async () => {
     const fixture = harness();
-    const entered = cDeferred(),
-      release = cDeferred();
+    const entered = deferredSignal(),
+      release = deferredSignal();
     mocked.stream.mockImplementation(async () => {
       entered.resolve();
       await release.promise;
       return {};
     });
-    const start = fixture.host.start(fixture.scope, C_START_INPUT);
+    const start = fixture.host.start(fixture.scope, THREAD_START_INPUT);
     const outcome = start.catch((error: unknown) => error);
     await entered.promise;
     const journal = structuredClone(fixture.state.get(TEST_OWNER_RECOVERY_KEY));
@@ -5887,7 +5893,7 @@ describe('FS8 D3 host activation owning quiescence', () => {
       HUMAN_OWNER,
       previous.token as string,
     );
-    const start = fixture.host.start(fixture.scope, C_START_INPUT);
+    const start = fixture.host.start(fixture.scope, THREAD_START_INPUT);
     await expect(start).resolves.toMatchObject({ runId: 'acme_run' });
     const result = await start;
     expect(fixture.state.has(TEST_OWNER_RECOVERY_KEY)).toBe(false);
@@ -5903,7 +5909,7 @@ describe('FS8 D3 host activation owning quiescence', () => {
   });
 });
 
-describe('FS8 D3 host activation captured original claim', () => {
+describe('host activation captured original claim', () => {
   it('forwards the captured successful claim through the eighth argument after an authorization wait', async () => {
     const { StartIdempotencyStore } = await import(
       '../do-runner/start-idempotency.js'
@@ -5928,8 +5934,8 @@ describe('FS8 D3 host activation captured original claim', () => {
       owner: { ...claim.owner },
       binding: { ...claim.binding },
     };
-    const entered = cDeferred(),
-      release = cDeferred();
+    const entered = deferredSignal(),
+      release = deferredSignal();
     const fixture = harness(['writer'], {
       runtime: { startIdempotency: store },
       resolvePrincipalPermissions: async () => {
@@ -5939,7 +5945,7 @@ describe('FS8 D3 host activation captured original claim', () => {
       },
     });
     const pending = fixture.host.start(fixture.scope, {
-      ...C_START_INPUT,
+      ...THREAD_START_INPUT,
       idempotencyKey: claim.key,
       startReservation: mutable,
     });
@@ -5960,11 +5966,11 @@ describe('FS8 D3 host activation captured original claim', () => {
   });
 });
 
-describe('FS8 D3 host activation custom storage cold recovery', () => {
+describe('host activation custom storage cold recovery', () => {
   it.each([
     true,
     false,
-  ])('recovers a real custom-null result without B2 after lazy factory initialization (threaded=%s)', async (threaded) => {
+  ])('recovers a real custom-null result without recoverStartAttempt after lazy factory initialization (threaded=%s)', async (threaded) => {
     const core = await vi.importActual<typeof import('@mastra/core/mastra')>(
       '@mastra/core/mastra',
     );
@@ -6049,7 +6055,7 @@ describe('FS8 D3 host activation custom storage cold recovery', () => {
         },
       },
     });
-    const b2 = vi.spyOn(app.runtime, 'recoverStartAttempt');
+    const recoverStartAttemptSpy = vi.spyOn(app.runtime, 'recoverStartAttempt');
     expect(app.runtime.workflowIds()).toEqual([]);
     await expect(
       fixture.host.recoverOwnership(fixture.scope),
@@ -6059,12 +6065,12 @@ describe('FS8 D3 host activation custom storage cold recovery', () => {
     expect(await fixture.resources.owner('run', 'acme_run')).toEqual(
       HUMAN_OWNER,
     );
-    expect(b2).not.toHaveBeenCalled();
+    expect(recoverStartAttemptSpy).not.toHaveBeenCalled();
     expect(mocked.stream).not.toHaveBeenCalled();
   });
 });
 
-describe('FS8 D3 host activation native agent zero admission', () => {
+describe('host activation native agent zero admission', () => {
   async function nativeZeroFixture() {
     const core = await vi.importActual<typeof import('@mastra/core/mastra')>(
       '@mastra/core/mastra',
@@ -6204,8 +6210,8 @@ describe('FS8 D3 host activation native agent zero admission', () => {
   it('preserves H rows when non-owning recovery races a held native zero frame', async () => {
     const fixture = await nativeZeroFixture();
     const nativeStart = fixture.app.runtime.start.bind(fixture.app.runtime);
-    const entered = cDeferred();
-    const release = cDeferred();
+    const entered = deferredSignal();
+    const release = deferredSignal();
     vi.spyOn(fixture.app.runtime, 'start').mockImplementationOnce(
       async (...args) => {
         try {
@@ -6219,7 +6225,7 @@ describe('FS8 D3 host activation native agent zero admission', () => {
     );
     const starting = fixture.fixture.host.start(
       fixture.fixture.scope,
-      C_START_INPUT,
+      THREAD_START_INPUT,
     );
     const settled = starting.catch((error: unknown) => error);
     await entered.promise;
@@ -6322,7 +6328,7 @@ describe('FS8 D3 host activation native agent zero admission', () => {
     const claim = await fixture.claim();
     const first = await fixture.fixture.host
       .start(fixture.fixture.scope, {
-        ...C_START_INPUT,
+        ...THREAD_START_INPUT,
         idempotencyKey: claim.key,
         startReservation: claim,
       })
@@ -6397,7 +6403,7 @@ describe('FS8 D3 host activation native agent zero admission', () => {
     await fixture.fence.transition({ expected: 'draining', next: 'open' });
     const retry = await fixture.fixture.host
       .start(fixture.fixture.scope, {
-        ...C_START_INPUT,
+        ...THREAD_START_INPUT,
         idempotencyKey: claim.key,
         startReservation: claim,
       })
@@ -6422,7 +6428,7 @@ describe('FS8 D3 host activation native agent zero admission', () => {
     const firstClaim = await claim();
     const outcome = await fixture.host
       .start(fixture.scope, {
-        ...C_START_INPUT,
+        ...THREAD_START_INPUT,
         threaded,
         idempotencyKey: firstClaim.key,
         startReservation: firstClaim,
@@ -6446,7 +6452,7 @@ describe('FS8 D3 host activation native agent zero admission', () => {
     const nextClaim = await claim();
     await expect(
       fixture.host.start(fixture.scope, {
-        ...C_START_INPUT,
+        ...THREAD_START_INPUT,
         threaded,
         idempotencyKey: nextClaim.key,
         startReservation: nextClaim,
@@ -6461,7 +6467,7 @@ describe('FS8 D3 host activation native agent zero admission', () => {
   });
 });
 
-describe('FS8 D3 host activation explicit legacy observation', () => {
+describe('host activation explicit legacy observation', () => {
   it.each([
     null,
     3,
@@ -6499,7 +6505,7 @@ describe('FS8 D3 host activation explicit legacy observation', () => {
   });
 });
 
-async function hostR1AgentFixture(
+async function hostAgentLifecycleFixture(
   input: {
     mode?: 'custom-null' | 'actual-prefix' | 'fenced';
     provenance?: 'v1' | 'absent' | 'modern';
@@ -6544,7 +6550,7 @@ async function hostR1AgentFixture(
   const storage =
     mode === 'custom-null'
       ? new InMemoryStore()
-      : createD1Storage({ binding, tablePrefix: 'host_r1_' });
+      : createD1Storage({ binding, tablePrefix: 'host_lifecycle_' });
   await storage.init();
   const { StartIdempotencyStore } = await import(
     '../do-runner/start-idempotency.js'
@@ -6578,17 +6584,17 @@ async function hostR1AgentFixture(
     discardScheduleDispatch: dispatch,
   });
   const execution = {
-    tablePrefix: mode === 'custom-null' ? null : 'host_r1_',
+    tablePrefix: mode === 'custom-null' ? null : 'host_lifecycle_',
     workflowId: 'durable-agentic-loop',
     runId: 'acme_run',
-    startToken: 'host-r1-generation',
+    startToken: 'host-lifecycle-generation',
   };
   let claim:
     | import('../do-runner/start-reservation-contract.js').StartReservationReading
     | undefined;
   if (input.keyed) {
     const reserved = await reservations.reserve({
-      key: 'host-r1-key',
+      key: 'host-lifecycle-key',
       owner: HUMAN_OWNER,
       targetKind: 'agent',
       targetId: 'writer',
@@ -6605,7 +6611,7 @@ async function hostR1AgentFixture(
   }
   const recovery = ownerRecovery('acme_run', {
     phase: mode === 'fenced' ? 'prepared' : 'prepared-unfenced',
-    token: 'host-r1-attempt',
+    token: 'host-lifecycle-attempt',
     execution,
     threaded,
     ...(claim ? { startReservation: claim } : {}),
@@ -6666,7 +6672,7 @@ async function hostR1AgentFixture(
               version === 'v1'
                 ? {
                     version: 1,
-                    attemptToken: 'host-r1-legacy-leg',
+                    attemptToken: 'host-lifecycle-legacy-leg',
                     requestedBy: 'operator-1',
                     requestedByKind: 'human',
                     resumeCounts: [],
@@ -6748,7 +6754,7 @@ async function hostR1AgentFixture(
   };
 }
 
-function hostR1AgentRequest(suffix = '', query = '') {
+function hostAgentLifecycleRequest(suffix = '', query = '') {
   return new Request(
     `https://thread/_flowsafe/agent-host/runs/writer/acme_run${suffix}?resourceId=${RESOURCE_ID}${query}`,
     suffix ? { method: 'POST' } : undefined,
@@ -6767,7 +6773,7 @@ describe('agent host selector lookup isolation', () => {
     ['absent', false, 'stream'],
     ['absent', true, 'terminate'],
   ] as const)('maps a coherent foreign snapshot to public 404 without effects (%s threaded=%s %s)', async (provenance, threaded, route) => {
-    const f = await hostR1AgentFixture({
+    const f = await hostAgentLifecycleFixture({
       provenance,
       threaded,
       keyed: true,
@@ -6794,7 +6800,7 @@ describe('agent host selector lookup isolation', () => {
     const observe = vi.spyOn(FlowsafeDurableAgent.prototype, 'observe');
     const owners = f.owners();
     const state = structuredClone(f.state);
-    const claim = await f.reservations.readForAdmission('host-r1-key');
+    const claim = await f.reservations.readForAdmission('host-lifecycle-key');
     const suffix = route === 'status' ? '' : `/${route}`;
     const request = new Request(
       `https://thread/_flowsafe/agent-host/runs/writer/acme_run${suffix}?resourceId=${RESOURCE_ID}`,
@@ -6819,7 +6825,9 @@ describe('agent host selector lookup isolation', () => {
     expect(f.dispatch).not.toHaveBeenCalled();
     expect(f.owners()).toEqual(owners);
     expect(f.state).toEqual(state);
-    expect(await f.reservations.readForAdmission('host-r1-key')).toEqual(claim);
+    expect(await f.reservations.readForAdmission('host-lifecycle-key')).toEqual(
+      claim,
+    );
   });
 
   it.each([
@@ -6827,7 +6835,7 @@ describe('agent host selector lookup isolation', () => {
     'v1',
     'absent',
   ] as const)('keeps a corrupt foreign public lookup unreadable: %s', async (provenance) => {
-    const f = await hostR1AgentFixture({
+    const f = await hostAgentLifecycleFixture({
       provenance,
       snapshotTarget: { agentId: 'other-agent', threadId: 'other-thread' },
     });
@@ -6842,7 +6850,7 @@ describe('agent host selector lookup isolation', () => {
     const selected = vi.spyOn(f.app.runtime, 'authoritativeStartState');
     const before = structuredClone(f.state);
     const outcome = await f.host
-      .route(hostR1AgentRequest(), f.scope)
+      .route(hostAgentLifecycleRequest(), f.scope)
       .catch((error) => error);
     expect(outcome).toBeInstanceOf(RunStateUnreadableError);
     expect(outcome).not.toBeInstanceOf(AgentRunSelectorMismatchError);
@@ -6854,7 +6862,7 @@ describe('agent host selector lookup isolation', () => {
   });
 
   it('checks ordinary termination again inside its dispatch lock after storage changes', async () => {
-    const f = await hostR1AgentFixture({ provenance: 'modern' });
+    const f = await hostAgentLifecycleFixture({ provenance: 'modern' });
     onTestFinished(() => {
       vi.restoreAllMocks();
       f.sql.close();
@@ -6888,7 +6896,7 @@ describe('agent host selector lookup isolation', () => {
     const terminate = vi.spyOn(f.app.runtime, 'terminateAsPrincipal');
     const before = structuredClone(f.state);
     const outcome = await f.host
-      .route(hostR1AgentRequest('/terminate'), f.scope)
+      .route(hostAgentLifecycleRequest('/terminate'), f.scope)
       .catch((error) => error);
     expect(outcome).toMatchObject({ status: 404 });
     expect(selected).toHaveBeenCalledTimes(2);
@@ -6904,7 +6912,7 @@ describe('agent host selector lookup isolation', () => {
     'stream',
     'terminate',
   ] as const)('does not reread a selected absent row for public %s', async (route) => {
-    const f = await hostR1AgentFixture({ provenance: 'modern' });
+    const f = await hostAgentLifecycleFixture({ provenance: 'modern' });
     onTestFinished(() => {
       vi.restoreAllMocks();
       f.sql.close();
@@ -6934,7 +6942,7 @@ describe('agent host selector lookup isolation', () => {
     'blocking',
     'proof',
   ] as const)('keeps a coherent foreign row present on the strict %s path', async (route) => {
-    const f = await hostR1AgentFixture({
+    const f = await hostAgentLifecycleFixture({
       provenance: 'modern',
       keyed: true,
       snapshotTarget: { agentId: 'writer', threadId: 'other-thread' },
@@ -6945,7 +6953,7 @@ describe('agent host selector lookup isolation', () => {
     });
     const state = structuredClone(f.state);
     const owners = f.owners();
-    const claim = await f.reservations.readForAdmission('host-r1-key');
+    const claim = await f.reservations.readForAdmission('host-lifecycle-key');
     const terminate = vi.spyOn(f.app.runtime, 'terminateAsPrincipal');
     const resume = vi.spyOn(FlowsafeDurableAgent.prototype, 'resumeViaRuntime');
     const selected = vi.spyOn(f.app.runtime, 'authoritativeStartState');
@@ -6986,7 +6994,7 @@ describe('agent host selector lookup isolation', () => {
           f.scope,
         );
       return f.host.route(
-        hostR1AgentRequest(
+        hostAgentLifecycleRequest(
           route === 'terminate replay' ? '/terminate' : '',
           route === 'dispatch' ? '&dispatch=1' : '&dispatch=1&replay=1',
         ),
@@ -7001,7 +7009,9 @@ describe('agent host selector lookup isolation', () => {
     expect(resume).not.toHaveBeenCalled();
     expect(f.state).toEqual(state);
     expect(f.owners()).toEqual(owners);
-    expect(await f.reservations.readForAdmission('host-r1-key')).toEqual(claim);
+    expect(await f.reservations.readForAdmission('host-lifecycle-key')).toEqual(
+      claim,
+    );
     expect(f.approvals.list).not.toHaveBeenCalled();
     expect(f.dispatch).not.toHaveBeenCalled();
   });
@@ -7010,7 +7020,7 @@ describe('agent host selector lookup isolation', () => {
     'prepared',
     'prepared-unfenced',
   ] as const)('retains a %s keyed journal and rearms recovery for a coherent foreign row', async (phase) => {
-    const f = await hostR1AgentFixture({
+    const f = await hostAgentLifecycleFixture({
       mode: phase === 'prepared' ? 'fenced' : 'actual-prefix',
       provenance: 'modern',
       journal: true,
@@ -7024,7 +7034,7 @@ describe('agent host selector lookup isolation', () => {
     const state = structuredClone(f.state);
     const owners = f.owners();
     const row = await f.read();
-    const claim = await f.reservations.readForAdmission('host-r1-key');
+    const claim = await f.reservations.readForAdmission('host-lifecycle-key');
     const settle = vi.spyOn(f.resources, 'settleReservation');
     const settleStart = vi.spyOn(f.app.runtime, 'settleStartExecution');
     const recover = vi.spyOn(f.app.runtime, 'recoverStartAttempt');
@@ -7037,7 +7047,9 @@ describe('agent host selector lookup isolation', () => {
     expect(f.state).toEqual(state);
     expect(f.owners()).toEqual(owners);
     expect(await f.read()).toEqual(row);
-    expect(await f.reservations.readForAdmission('host-r1-key')).toEqual(claim);
+    expect(await f.reservations.readForAdmission('host-lifecycle-key')).toEqual(
+      claim,
+    );
     expect(f.alarmAt()).toBeDefined();
     expect(settle).not.toHaveBeenCalled();
     expect(settleStart).not.toHaveBeenCalled();
@@ -7047,7 +7059,7 @@ describe('agent host selector lookup isolation', () => {
   });
 
   it('preserves a reserved start when actual host replay observes another thread', async () => {
-    const f = await hostR1AgentFixture({
+    const f = await hostAgentLifecycleFixture({
       provenance: 'modern',
       keyed: true,
       snapshotTarget: { agentId: 'writer', threadId: 'other-thread' },
@@ -7088,13 +7100,13 @@ describe('agent host selector lookup isolation', () => {
       'test-deployment-identity-secret-0001',
       { startIdempotency: f.reservations, executionFence: 'none' },
     );
-    const before = await f.reservations.readForAdmission('host-r1-key');
+    const before = await f.reservations.readForAdmission('host-lifecycle-key');
     const outcome = await topology
       .start(context, {
         agentId: 'writer',
         prompt: 'retry',
         entryPath: 'http.start',
-        idempotencyKey: 'host-r1-key',
+        idempotencyKey: 'host-lifecycle-key',
       })
       .catch((error) => error);
     expect(outcome).toMatchObject({
@@ -7104,7 +7116,7 @@ describe('agent host selector lookup isolation', () => {
     });
     expect(hits).toHaveLength(1);
     expect(hits[0]).toContain('dispatch=1&replay=1');
-    expect(await f.reservations.readForAdmission('host-r1-key')).toEqual(
+    expect(await f.reservations.readForAdmission('host-lifecycle-key')).toEqual(
       before,
     );
     expect(mocked.stream).not.toHaveBeenCalled();
@@ -7112,7 +7124,7 @@ describe('agent host selector lookup isolation', () => {
   });
 });
 
-describe('FS8 D3 host R1 agent legacy status guards', () => {
+describe('host agent legacy status guards', () => {
   it.each([
     ['missing binding', true, 404],
     ['wrong binding', true, 404],
@@ -7120,7 +7132,7 @@ describe('FS8 D3 host R1 agent legacy status guards', () => {
     ['wrong record agent', true, 404],
     ['missing principal', true, 409],
   ] as const)('refuses before approval effects (%s)', async (guard, threaded, status) => {
-    const fixture = await hostR1AgentFixture({ threaded });
+    const fixture = await hostAgentLifecycleFixture({ threaded });
     if (guard === 'missing binding') fixture.state.delete(THREAD_BINDING_KEY);
     if (guard === 'wrong binding' || guard === 'unthreaded binding')
       fixture.state.set(THREAD_BINDING_KEY, {
@@ -7137,7 +7149,7 @@ describe('FS8 D3 host R1 agent legacy status guards', () => {
       fixture.state.delete(TEST_RUN_RECORD_KEY);
     const before = structuredClone(fixture.state);
     const outcome = await fixture.host
-      .route(hostR1AgentRequest(), fixture.scope)
+      .route(hostAgentLifecycleRequest(), fixture.scope)
       .catch((error: unknown) => error);
     expect(fixture.approvals.list).not.toHaveBeenCalled();
     expect(fixture.approvals.createAsPrincipal).not.toHaveBeenCalled();
@@ -7149,7 +7161,7 @@ describe('FS8 D3 host R1 agent legacy status guards', () => {
     'v1',
     'absent',
   ] as const)('retains raw pending with terminal projection (%s)', async (provenance) => {
-    const fixture = await hostR1AgentFixture({
+    const fixture = await hostAgentLifecycleFixture({
       provenance,
       status: 'pending',
       lifecycle: true,
@@ -7169,7 +7181,7 @@ describe('FS8 D3 host R1 agent legacy status guards', () => {
     'malformed provenance',
     'source error',
   ] as const)('never falls back after actual selected read failure (%s)', async (failure) => {
-    const fixture = await hostR1AgentFixture();
+    const fixture = await hostAgentLifecycleFixture();
     if (failure === 'malformed provenance') {
       fixture.snapshot.requestContext = {
         ...fixture.snapshot.requestContext,
@@ -7193,7 +7205,7 @@ describe('FS8 D3 host R1 agent legacy status guards', () => {
     const nominal = vi.spyOn(fixture.workflows, 'loadWorkflowSnapshot');
     const before = structuredClone(fixture.state);
     const outcome = await fixture.host
-      .route(hostR1AgentRequest(), fixture.scope)
+      .route(hostAgentLifecycleRequest(), fixture.scope)
       .catch((error: unknown) => error);
     expect(fixture.state).toEqual(before);
     expect(fixture.approvals.list).not.toHaveBeenCalled();
@@ -7203,7 +7215,7 @@ describe('FS8 D3 host R1 agent legacy status guards', () => {
   });
 });
 
-describe('FS8 D3 host R1 agent recovery barriers', () => {
+describe('host agent recovery barriers', () => {
   it.each([
     ['custom-null', 'missing'],
     ['custom-null', 'pending'],
@@ -7212,7 +7224,7 @@ describe('FS8 D3 host R1 agent recovery barriers', () => {
     ['actual-prefix', 'pending'],
     ['actual-prefix', 'suspended'],
   ] as const)('retains keyed nonterminal authority before missing-store refusal (%s %s)', async (mode, status) => {
-    const fixture = await hostR1AgentFixture({
+    const fixture = await hostAgentLifecycleFixture({
       mode,
       status: status === 'missing' ? 'pending' : status,
       provenance: 'modern',
@@ -7226,9 +7238,13 @@ describe('FS8 D3 host R1 agent recovery barriers', () => {
         runId: 'acme_run',
       });
     const before = fixture.owners();
-    const bound = await fixture.reservations.readForAdmission('host-r1-key');
+    const bound =
+      await fixture.reservations.readForAdmission('host-lifecycle-key');
     const row = await fixture.read();
-    const b2 = vi.spyOn(fixture.app.runtime, 'recoverStartAttempt');
+    const recoverStartAttemptSpy = vi.spyOn(
+      fixture.app.runtime,
+      'recoverStartAttempt',
+    );
     const settle = vi.spyOn(fixture.resources, 'settleReservation');
     const outcome = await fixture.host
       .recoverOwnership(fixture.scope)
@@ -7240,12 +7256,12 @@ describe('FS8 D3 host R1 agent recovery barriers', () => {
     );
     expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(true);
     expect(fixture.state.has(THREAD_BINDING_KEY)).toBe(true);
-    expect(await fixture.reservations.readForAdmission('host-r1-key')).toEqual(
-      bound,
-    );
+    expect(
+      await fixture.reservations.readForAdmission('host-lifecycle-key'),
+    ).toEqual(bound);
     expect(await fixture.read()).toEqual(row);
     expect(fixture.alarmAt()).toBeDefined();
-    expect(b2).not.toHaveBeenCalled();
+    expect(recoverStartAttemptSpy).not.toHaveBeenCalled();
     expect(outcome).toMatchObject({ status: 503 });
   });
 
@@ -7255,7 +7271,7 @@ describe('FS8 D3 host R1 agent recovery barriers', () => {
     ['actual-prefix', true],
     ['actual-prefix', false],
   ] as const)('finishes wired or unkeyed suspended recovery (%s keyed=%s)', async (mode, keyed) => {
-    const fixture = await hostR1AgentFixture({
+    const fixture = await hostAgentLifecycleFixture({
       mode,
       provenance: 'modern',
       keyed,
@@ -7263,7 +7279,7 @@ describe('FS8 D3 host R1 agent recovery barriers', () => {
       status: 'suspended',
     });
     const before = keyed
-      ? await fixture.reservations.readForAdmission('host-r1-key')
+      ? await fixture.reservations.readForAdmission('host-lifecycle-key')
       : undefined;
     await fixture.host.recoverOwnership(fixture.scope);
     expect(fixture.state.has(TEST_OWNER_RECOVERY_KEY)).toBe(false);
@@ -7273,7 +7289,7 @@ describe('FS8 D3 host R1 agent recovery barriers', () => {
     );
     expect(
       keyed
-        ? await fixture.reservations.readForAdmission('host-r1-key')
+        ? await fixture.reservations.readForAdmission('host-lifecycle-key')
         : undefined,
     ).toEqual(before);
     expect(mocked.stream).not.toHaveBeenCalled();
@@ -7283,7 +7299,7 @@ describe('FS8 D3 host R1 agent recovery barriers', () => {
     'generation',
     'phase',
   ] as const)('preserves all H ownership when the journal changes inside actual absence read (%s)', async (change) => {
-    const fixture = await hostR1AgentFixture({
+    const fixture = await hostAgentLifecycleFixture({
       mode: 'fenced',
       provenance: 'modern',
       journal: true,
@@ -7338,7 +7354,7 @@ describe('FS8 D3 host R1 agent recovery barriers', () => {
     ['completion', 'failure'],
     ['completion', 'response loss'],
   ] as const)('retains journal through ordered lifecycle retry (%s %s)', async (boundary, failureMode) => {
-    const fixture = await hostR1AgentFixture({
+    const fixture = await hostAgentLifecycleFixture({
       mode: 'fenced',
       provenance: 'modern',
       status: 'cancelled',
@@ -7365,7 +7381,7 @@ describe('FS8 D3 host R1 agent recovery barriers', () => {
       return result;
     };
     let approval: ApprovalRecord = {
-      id: 'host-r1-approval',
+      id: 'host-lifecycle-approval',
       workflowId: fixture.execution.workflowId,
       runId: 'acme_run',
       title: 'Held approval',
@@ -7458,7 +7474,7 @@ describe('FS8 D3 host R1 agent recovery barriers', () => {
   });
 });
 
-describe('FS8 D3 host R1 atomic agent admission', () => {
+describe('host atomic agent admission', () => {
   it('admits one different run ID on a prebound thread with committed same-owner claims', async () => {
     const fixture = harness();
     fixture.state.set(THREAD_BINDING_KEY, {
@@ -7469,14 +7485,14 @@ describe('FS8 D3 host R1 atomic agent admission', () => {
     await fixture.resources.claim('thread', 'acme_thread', HUMAN_OWNER);
     await fixture.resources.claim('resource', RESOURCE_ID, HUMAN_OWNER);
     fixture.setSummary({ runId: 'acme_run', status: 'suspended' }, false);
-    const release = cDeferred();
+    const release = deferredSignal();
     mocked.stream.mockImplementation(async () => {
       await release.promise;
       return {};
     });
-    const first = fixture.host.start(fixture.scope, C_START_INPUT);
+    const first = fixture.host.start(fixture.scope, THREAD_START_INPUT);
     const second = fixture.host.start(fixture.scope, {
-      ...C_START_INPUT,
+      ...THREAD_START_INPUT,
       runId: 'other-run',
     });
     const settled = Promise.allSettled([first, second]);
@@ -7502,43 +7518,50 @@ describe('FS8 D3 host R1 atomic agent admission', () => {
   });
 });
 
-describe('FS8 D3 host R1 ordinary legacy agent lifecycle', () => {
+describe('host ordinary legacy agent lifecycle', () => {
   it.each([
     ['v1', true],
     ['v1', false],
     ['absent', true],
     ['absent', false],
   ] as const)('terminates and replays the actual selected legacy row without settling retained key (%s threaded=%s)', async (provenance, threaded) => {
-    const fixture = await hostR1AgentFixture({
+    const fixture = await hostAgentLifecycleFixture({
       provenance,
       threaded,
       keyed: true,
     });
-    const bound = await fixture.reservations.readForAdmission('host-r1-key');
+    const bound =
+      await fixture.reservations.readForAdmission('host-lifecycle-key');
     const settle = vi.spyOn(fixture.app.runtime, 'settleStartExecution');
-    const b2 = vi.spyOn(fixture.app.runtime, 'recoverStartAttempt');
+    const recoverStartAttemptSpy = vi.spyOn(
+      fixture.app.runtime,
+      'recoverStartAttempt',
+    );
     const complete = vi.spyOn(fixture.app.runtime, 'completeTerminalCleanup');
     const terminate = vi.spyOn(fixture.app.runtime, 'terminateAsPrincipal');
     const response = await fixture.host
-      .route(hostR1AgentRequest('/terminate'), fixture.scope)
+      .route(hostAgentLifecycleRequest('/terminate'), fixture.scope)
       .catch((error: unknown) => error);
     expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(false);
     expect(await fixture.resources.owner('run', 'acme_run')).toBeUndefined();
-    expect(await fixture.reservations.readForAdmission('host-r1-key')).toEqual(
-      bound,
-    );
+    expect(
+      await fixture.reservations.readForAdmission('host-lifecycle-key'),
+    ).toEqual(bound);
     expect(settle).not.toHaveBeenCalled();
-    expect(b2).not.toHaveBeenCalled();
+    expect(recoverStartAttemptSpy).not.toHaveBeenCalled();
     expect(complete).toHaveBeenCalledOnce();
     expect(response).toMatchObject({ status: 200 });
     const bytes = JSON.stringify(await fixture.read());
     const replay = await fixture.host
-      .route(hostR1AgentRequest('/terminate', '&replay=1'), fixture.scope)
+      .route(
+        hostAgentLifecycleRequest('/terminate', '&replay=1'),
+        fixture.scope,
+      )
       .catch((error: unknown) => error);
     expect(JSON.stringify(await fixture.read())).toBe(bytes);
-    expect(await fixture.reservations.readForAdmission('host-r1-key')).toEqual(
-      bound,
-    );
+    expect(
+      await fixture.reservations.readForAdmission('host-lifecycle-key'),
+    ).toEqual(bound);
     expect(complete).toHaveBeenCalledOnce();
     expect(terminate).toHaveBeenCalledTimes(2);
     expect(replay).toMatchObject({ status: 200 });
@@ -7551,7 +7574,7 @@ describe('FS8 D3 host R1 ordinary legacy agent lifecycle', () => {
     ['absent', true],
     ['absent', false],
   ] as const)('retires terminal resume using canonical principal and actual owner despite changed requester (%s threaded=%s)', async (provenance, threaded) => {
-    const fixture = await hostR1AgentFixture({ provenance, threaded });
+    const fixture = await hostAgentLifecycleFixture({ provenance, threaded });
     const { FlowsafeDurableAgent: ReloadedDurableAgent } = await import(
       '../agent-runner/durable-agent-runner.js'
     );
@@ -7565,7 +7588,7 @@ describe('FS8 D3 host R1 ordinary legacy agent lifecycle', () => {
             ...fixture.snapshot.requestContext,
             'flowsafe.runProvenance': {
               version: 1,
-              attemptToken: 'host-r1-legacy-leg',
+              attemptToken: 'host-lifecycle-legacy-leg',
               requestedBy: 'reviewer-2',
               requestedByKind: 'human',
               resumeCounts: [],
@@ -7629,13 +7652,14 @@ describe('FS8 D3 host R1 ordinary legacy agent lifecycle', () => {
     ['v1', 'protected dispatch', 'success'],
     ['absent', 'protected dispatch', 'success'],
   ] as const)('selects cold actual legacy state (%s %s %s)', async (provenance, path, status) => {
-    const fixture = await hostR1AgentFixture({
+    const fixture = await hostAgentLifecycleFixture({
       provenance,
       status,
       keyed: true,
     });
     const bytes = JSON.stringify(await fixture.read());
-    const bound = await fixture.reservations.readForAdmission('host-r1-key');
+    const bound =
+      await fixture.reservations.readForAdmission('host-lifecycle-key');
     expect(fixture.app.runtime.workflowIds()).toEqual([]);
     const operation = (async () => {
       if (path === 'blocker') return fixture.host.blockingRun(fixture.scope);
@@ -7646,7 +7670,7 @@ describe('FS8 D3 host R1 ordinary legacy agent lifecycle', () => {
           runId: 'acme_run',
         });
       return fixture.host.route(
-        hostR1AgentRequest(
+        hostAgentLifecycleRequest(
           '',
           path === 'protected dispatch' ? '&dispatch=1' : '',
         ),
@@ -7656,9 +7680,9 @@ describe('FS8 D3 host R1 ordinary legacy agent lifecycle', () => {
     const outcome = await operation.catch((error: unknown) => error);
     expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(status === 'suspended');
     expect(JSON.stringify(await fixture.read())).toBe(bytes);
-    expect(await fixture.reservations.readForAdmission('host-r1-key')).toEqual(
-      bound,
-    );
+    expect(
+      await fixture.reservations.readForAdmission('host-lifecycle-key'),
+    ).toEqual(bound);
     expect(fixture.app.runtime.workflowIds()).toContain('durable-agentic-loop');
     expect(mocked.stream).not.toHaveBeenCalled();
     if (path === 'blocker')
@@ -7676,12 +7700,12 @@ describe('FS8 D3 host R1 ordinary legacy agent lifecycle', () => {
     'v1',
     'absent',
   ] as const)('retries legacy hook failure without repeated engine execution (%s)', async (provenance) => {
-    const fixture = await hostR1AgentFixture({ provenance });
+    const fixture = await hostAgentLifecycleFixture({ provenance });
     const failure = new Error('approval observation failed');
     fixture.approvals.list.mockRejectedValueOnce(failure);
     const complete = vi.spyOn(fixture.app.runtime, 'completeTerminalCleanup');
     const result = await fixture.host
-      .route(hostR1AgentRequest('/terminate'), fixture.scope)
+      .route(hostAgentLifecycleRequest('/terminate'), fixture.scope)
       .catch((error: unknown) => error);
     expect(await fixture.resources.owner('run', 'acme_run')).toEqual(
       HUMAN_OWNER,
@@ -7690,7 +7714,7 @@ describe('FS8 D3 host R1 ordinary legacy agent lifecycle', () => {
     expect(complete).not.toHaveBeenCalled();
     expect(result).toBe(failure);
     const retry = await fixture.host.route(
-      hostR1AgentRequest('/terminate', '&replay=1'),
+      hostAgentLifecycleRequest('/terminate', '&replay=1'),
       fixture.scope,
     );
     expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(false);
@@ -7706,7 +7730,7 @@ describe('FS8 D3 host R1 ordinary legacy agent lifecycle', () => {
     'malformed journal',
     'active execution',
   ] as const)('retains legacy terminal bookkeeping without cleanup authority (%s)', async (condition) => {
-    const fixture = await hostR1AgentFixture({
+    const fixture = await hostAgentLifecycleFixture({
       provenance: 'absent',
       status: 'cancelled',
       lifecycle: true,
@@ -7736,7 +7760,7 @@ describe('FS8 D3 host R1 ordinary legacy agent lifecycle', () => {
     'binding',
     'journal',
   ] as const)('preserves replacement after legacy cleanup observation waits (%s)', async (replacement) => {
-    const fixture = await hostR1AgentFixture({
+    const fixture = await hostAgentLifecycleFixture({
       status: 'cancelled',
       lifecycle: true,
     });
@@ -7800,9 +7824,9 @@ describe('FS8 D3 host R1 ordinary legacy agent lifecycle', () => {
   });
 });
 
-describe('FS8 D3 host R1 reserved lifecycle owner', () => {
+describe('host reserved lifecycle owner', () => {
   it('preserves the replacement journal before lifecycle effects after H settlement', async () => {
-    const fixture = await hostR1AgentFixture({
+    const fixture = await hostAgentLifecycleFixture({
       mode: 'fenced',
       provenance: 'modern',
       status: 'cancelled',
@@ -7840,7 +7864,7 @@ describe('FS8 D3 host R1 reserved lifecycle owner', () => {
     true,
     false,
   ])('retires the H-reserved run owner before journal lifecycle completion (threaded=%s)', async (threaded) => {
-    const fixture = await hostR1AgentFixture({
+    const fixture = await hostAgentLifecycleFixture({
       mode: 'fenced',
       threaded,
       provenance: 'modern',
@@ -7868,7 +7892,7 @@ describe('FS8 D3 host R1 reserved lifecycle owner', () => {
   });
 });
 
-describe('FS8 D3 host R1 keyed finalization preflight', () => {
+describe('host keyed finalization preflight', () => {
   it.each([
     true,
     false,
@@ -7913,7 +7937,7 @@ describe('FS8 D3 host R1 keyed finalization preflight', () => {
     const settle = vi.spyOn(fixture.resources, 'settleReservation');
     const outcome = await fixture.host
       .start(fixture.scope, {
-        ...C_START_INPUT,
+        ...THREAD_START_INPUT,
         threaded,
         idempotencyKey: claim.key,
         startReservation: claim,
@@ -7931,9 +7955,9 @@ describe('FS8 D3 host R1 keyed finalization preflight', () => {
   });
 });
 
-describe('FS8 D3 host R1 legacy requester and source owner', () => {
+describe('host legacy requester and source owner', () => {
   it('releases the actual owner while retiring the captured canonical record after a v1 requester change', async () => {
-    const fixture = await hostR1AgentFixture({ provenance: 'v1' });
+    const fixture = await hostAgentLifecycleFixture({ provenance: 'v1' });
     fixture.snapshot.requestContext = {
       ...fixture.snapshot.requestContext,
       'flowsafe.runProvenance': {
@@ -7950,7 +7974,7 @@ describe('FS8 D3 host R1 legacy requester and source owner', () => {
     await fixture.resources.claim('run', 'acme_run', owner);
     const release = vi.spyOn(fixture.resources, 'release');
     const response = await fixture.host.route(
-      hostR1AgentRequest('/terminate'),
+      hostAgentLifecycleRequest('/terminate'),
       { ...fixture.scope, principal: { ...owner, role: 'operator' } },
     );
     expect(await fixture.resources.owner('run', 'acme_run')).toBeUndefined();
@@ -7960,13 +7984,13 @@ describe('FS8 D3 host R1 legacy requester and source owner', () => {
   });
 });
 
-describe('FS8 D3 host R1 legacy cleanup wait guards', () => {
+describe('host legacy cleanup wait guards', () => {
   it.each([
     'dispatch',
     'owner release',
     'completion',
   ] as const)('retains the canonical record when a journal appears during legacy %s', async (boundary) => {
-    const fixture = await hostR1AgentFixture({
+    const fixture = await hostAgentLifecycleFixture({
       provenance: 'absent',
       status: 'cancelled',
       lifecycle: true,
@@ -7996,7 +8020,7 @@ describe('FS8 D3 host R1 legacy cleanup wait guards', () => {
         return result;
       });
     const outcome = await fixture.host
-      .route(hostR1AgentRequest('/terminate'), fixture.scope)
+      .route(hostAgentLifecycleRequest('/terminate'), fixture.scope)
       .catch((error: unknown) => error);
     expect(fixture.state.get(TEST_RUN_RECORD_KEY)).toEqual(record);
     expect(fixture.state.get(TEST_OWNER_RECOVERY_KEY)).toEqual(journal);
@@ -8016,7 +8040,7 @@ describe('FS8 D3 host R1 legacy cleanup wait guards', () => {
     'binding',
     'active execution',
   ] as const)('preserves ownership after approval wait changes cleanup authority (%s)', async (change) => {
-    const fixture = await hostR1AgentFixture({ provenance: 'absent' });
+    const fixture = await hostAgentLifecycleFixture({ provenance: 'absent' });
     let replacement: unknown;
     fixture.approvals.list.mockImplementationOnce(async () => {
       if (change === 'journal') {
@@ -8045,7 +8069,7 @@ describe('FS8 D3 host R1 legacy cleanup wait guards', () => {
     const release = vi.spyOn(fixture.resources, 'release');
     const complete = vi.spyOn(fixture.app.runtime, 'completeTerminalCleanup');
     const outcome = await fixture.host
-      .route(hostR1AgentRequest('/terminate'), fixture.scope)
+      .route(hostAgentLifecycleRequest('/terminate'), fixture.scope)
       .catch((error: unknown) => error);
     expect(await fixture.resources.owner('run', 'acme_run')).toEqual(
       HUMAN_OWNER,

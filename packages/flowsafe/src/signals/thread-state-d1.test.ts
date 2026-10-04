@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // D1ThreadStateStorage get/set/delete round-trip — the state-signal lanes and the
-// goal record (Track F) both ride this (threadId, type) key.
+// goal record both ride this (threadId, type) key.
 
 import { describe, expect, it } from 'vitest';
 

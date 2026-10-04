@@ -4,7 +4,7 @@
 // renderer (see components.test.ts's "hooks need a renderer, the merge does
 // not"; README.md: "No jsdom render tests"). fetchDashboardSnapshot is
 // exported from use-approval-dashboard.ts precisely so this filter-forwarding
-// behavior — the D3 fix — is testable in plain node.
+// behavior is testable in plain node.
 
 import { describe, expect, it } from 'vitest';
 import type { ApprovalStreamEvent } from '../approval-api/contract.js';
@@ -513,7 +513,7 @@ describe('subscribeApprovalStream', () => {
     expect(closes()).toBe(1);
   });
 
-  it('pings after open and forces a reconnect when no pong arrives (F1 half-open liveness)', async () => {
+  it('detects half-open liveness and reconnects when no pong arrives', async () => {
     // #given — a socket that opens but then goes silently half-open (never fires
     // onClose): without a heartbeat the run poll would stay paused on stale state.
     const { transport, opens, sent } = makeFakeTransport();
@@ -549,7 +549,7 @@ describe('subscribeApprovalStream', () => {
     connection.close();
   });
 
-  it('an inbound frame clears the pong deadline so a live socket is not force-closed (F1)', async () => {
+  it('an inbound frame clears the pong deadline so a live socket is not force-closed', async () => {
     // #given
     const { transport, opens, sent } = makeFakeTransport();
     const { scheduler, runNext } = makeFakeScheduler();
@@ -576,7 +576,7 @@ describe('subscribeApprovalStream', () => {
     connection.close();
   });
 
-  it('stops retrying when the ticket route returns a permanent 4xx (F4 poll-only)', async () => {
+  it('stops retrying on a permanent 4xx ticket response in poll-only mode', async () => {
     // #given — a host with no STREAM_TICKET_SECRET: the ticket route 404s. Retrying
     // cannot succeed, so the subscription must give up (not hammer 404s forever).
     const { transport, opens } = makeFakeTransport();

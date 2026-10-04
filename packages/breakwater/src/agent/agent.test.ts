@@ -8,18 +8,24 @@ import { MessageList } from '@mastra/core/agent/message-list';
 import type { MastraModelConfig } from '@mastra/core/llm';
 import { MockMemory } from '@mastra/core/memory';
 import type {
+  InputProcessor,
   ProcessInputArgs,
   ProcessOutputResultArgs,
+  ProcessOutputStepArgs,
   ProcessOutputStreamArgs,
 } from '@mastra/core/processors';
 import { RequestContext } from '@mastra/core/request-context';
+import { createTool } from '@mastra/core/tools';
 import { describe, expect, it, vi } from 'vitest';
+import { z } from 'zod';
 
 import { AGENT_AUDIT_CONTEXT_KEY, AuditLogger } from '../audit/index.js';
 import {
+  classifierPolicy,
   denyPatterns,
   type PolicyEvaluator,
   piiSecrets,
+  policyDenialReason,
 } from '../policy-engine/index.js';
 import { ACTOR_CONTEXT_KEY, type PrincipalKind } from '../rbac/index.js';
 import {
@@ -59,9 +65,10 @@ class PrivateFieldPolicy implements PolicyEvaluator {
 }
 
 function testModel(
-  text = 'model answer',
+  text: string | readonly string[] = 'model answer',
   onCall: (prompt: unknown) => void = () => {},
 ): MastraModelConfig {
+  const parts = typeof text === 'string' ? [text] : text;
   return {
     specificationVersion: 'v2',
     provider: 'breakwater-test',
@@ -70,7 +77,10 @@ function testModel(
     doGenerate: async (options) => {
       onCall(options.prompt);
       return {
-        content: [{ type: 'text', text }],
+        content: parts.map((part) => ({
+          type: 'text' as const,
+          text: part,
+        })),
         finishReason: 'stop',
         usage,
         warnings: [],
@@ -83,11 +93,9 @@ function testModel(
           start(controller) {
             controller.enqueue({ type: 'stream-start', warnings: [] });
             controller.enqueue({ type: 'text-start', id: 'answer' });
-            controller.enqueue({
-              type: 'text-delta',
-              id: 'answer',
-              delta: text,
-            });
+            for (const delta of parts) {
+              controller.enqueue({ type: 'text-delta', id: 'answer', delta });
+            }
             controller.enqueue({ type: 'text-end', id: 'answer' });
             controller.enqueue({
               type: 'finish',
@@ -100,6 +108,18 @@ function testModel(
       };
     },
   };
+}
+
+async function collectStreamed(
+  output: Awaited<ReturnType<GuardedAgentHandle['stream']>>,
+  source: 'fullStream' | 'textStream' = 'fullStream',
+) {
+  const chunks: string[] = [];
+  for await (const chunk of output[source]) {
+    if (typeof chunk === 'string') chunks.push(chunk);
+    else if (chunk.type === 'text-delta') chunks.push(chunk.payload.text);
+  }
+  return { text: chunks.join(''), result: await output.getFullOutput() };
 }
 
 function actorContext(
@@ -133,6 +153,53 @@ function guarded(
     toolChoice: 'auto',
     ...overrides,
   });
+}
+
+function listWithPerCallIterator<T>(
+  entries: readonly T[],
+  answer: (call: number) => readonly T[],
+): T[] {
+  let calls = 0;
+  return Object.assign([...entries], {
+    [Symbol.iterator]: function* () {
+      yield* answer(calls++);
+    },
+  });
+}
+
+async function signalAssetStep(
+  allowedInputAssetOrigins: readonly string[] = [],
+  url = 'https://unlisted.example/a.png',
+) {
+  const audit = new AuditLogger();
+  const raw = guarded({ audit, allowedInputAssetOrigins }) as unknown as Agent;
+  const requestContext = actorContext();
+  const step = (await raw.listInputProcessors(requestContext)).find(
+    (processor): processor is InputProcessor =>
+      processor.id === 'breakwater-input-assets',
+  );
+  if (!step) throw new Error('asset processor is missing');
+  const messageList = new MessageList();
+  messageList.addSignal(
+    createSignal({
+      type: 'user',
+      contents: [
+        {
+          type: 'file',
+          data: new URL(url),
+          mediaType: 'image/png',
+        },
+      ],
+    }),
+  );
+  const abort = vi.fn((reason: string) => {
+    throw new Error(reason);
+  });
+  return {
+    step,
+    audit,
+    args: { messageList, requestContext, abort, stepNumber: 1 },
+  };
 }
 
 describe('createGuardedAgent direct execution', () => {
@@ -289,8 +356,8 @@ describe('createGuardedAgent direct execution', () => {
     });
 
     expect(result.finishReason).toBe('other');
-    expect(result.tripwire?.reason).toMatch(
-      /private-field-policy: matched private field/,
+    expect(result.tripwire?.reason).toBe(
+      policyDenialReason('private-field-policy', 'output'),
     );
   });
 
@@ -324,6 +391,220 @@ describe('createGuardedAgent direct execution', () => {
     await expect(output.finishReason).resolves.toBe('other');
     expect(visibleText.join('')).not.toContain('blocked');
     void caught;
+  });
+
+  it.each([
+    'generate',
+    'stream',
+  ] as const)('%s caller-visible text excludes stream-denied output and following text', async (method) => {
+    const agent = guarded({
+      model: testModel(['clean prefix ', 'blocked', ' after denial']),
+      policies: [denyPatterns(['blocked'], { phases: ['output'] })],
+    });
+    const output = await agent[method]('hello', {
+      requestContext: actorContext(),
+    });
+    if (method === 'generate') {
+      // Each generated text part ends its stream segment, so the clean tail passes before denial.
+      expect(output.text).toBe('clean prefix ');
+      expect(output.tripwire).toMatchObject({
+        processorId: 'breakwater-policy-engine',
+        reason: policyDenialReason('deny-patterns', 'output'),
+      });
+      expect(output.finishReason).toBe('other');
+    } else {
+      const streamed = output as Awaited<
+        ReturnType<GuardedAgentHandle['stream']>
+      >;
+      const { text, result } = await collectStreamed(streamed);
+      expect(text).toBe('clean p');
+      await expect(streamed.text).resolves.toBe('clean p');
+      expect(result.text).toBe('clean p');
+      expect(result.tripwire).toMatchObject({
+        processorId: 'breakwater-policy-engine',
+        reason: policyDenialReason('deny-patterns', 'output'),
+      });
+      expect(result.finishReason).toBe('other');
+    }
+  });
+
+  it.each([
+    'generate',
+    'stream',
+  ] as const)('%s policy tripwire discards classifier echoes of denied output', async (method) => {
+    const marker = 'withheld-classifier-marker';
+    const policyName = 'deny-echoed-output';
+    const agent = guarded({
+      model: testModel(['clean prefix ', marker, ' after denial']),
+      policies: [
+        classifierPolicy({
+          name: policyName,
+          phases: ['output'],
+          evaluateEveryChars: 1,
+          classify: (text) =>
+            text.includes(marker)
+              ? { allowed: false, reason: `unsafe: ${text}` }
+              : { allowed: true },
+        }),
+      ],
+    });
+    const output = await agent[method]('hello', {
+      requestContext: actorContext(),
+    });
+    const result =
+      method === 'generate'
+        ? output
+        : (
+            await collectStreamed(
+              output as Awaited<ReturnType<GuardedAgentHandle['stream']>>,
+            )
+          ).result;
+
+    expect(result.tripwire?.reason).not.toContain(marker);
+    expect(result.tripwire?.reason).toBe(
+      policyDenialReason(policyName, 'output'),
+    );
+    expect(result.tripwire?.processorId).toBe('breakwater-policy-engine');
+  });
+
+  it.each([
+    'generate',
+    'stream',
+  ] as const)('%s caller-visible text on result denial equals released text without result-processor additions', async (method) => {
+    const agent = guarded({
+      model: testModel(['clean ', 'answer']),
+      policies: [
+        {
+          name: 'deny-final-result',
+          phases: ['output'],
+          evaluate: ({ streamState }) =>
+            streamState
+              ? { allowed: true }
+              : { allowed: false, reason: 'final result denied' },
+        },
+      ],
+      applicationOutputProcessors: [
+        {
+          id: 'append-result-text',
+          processOutputStream: async (args) => args.part,
+          processOutputResult: (args) =>
+            args.messages.map((message) => ({
+              ...message,
+              content: {
+                ...message.content,
+                parts: [
+                  ...message.content.parts,
+                  { type: 'text' as const, text: ' after-stream result text' },
+                ],
+              },
+            })),
+        },
+      ],
+    });
+    const output = await agent[method]('hello', {
+      requestContext: actorContext(),
+    });
+    if (method === 'generate') {
+      expect(output.text).toBe('clean answer');
+      expect(output.tripwire).toMatchObject({
+        processorId: 'breakwater-policy-engine',
+        reason: policyDenialReason('deny-final-result', 'output'),
+      });
+      expect(output.finishReason).toBe('other');
+    } else {
+      const streamed = output as Awaited<
+        ReturnType<GuardedAgentHandle['stream']>
+      >;
+      const { text, result } = await collectStreamed(streamed, 'textStream');
+      expect(text).toBe('clean answer');
+      await expect(streamed.text).resolves.toBe('clean answer');
+      expect(result.text).toBe('clean answer');
+      expect(result.tripwire).toMatchObject({
+        processorId: 'breakwater-policy-engine',
+        reason: policyDenialReason('deny-final-result', 'output'),
+      });
+      expect(result.finishReason).toBe('other');
+    }
+  });
+
+  it('runs no server tool when later text in the same stream step is denied', async () => {
+    vi.useFakeTimers();
+    try {
+      const execute = vi.fn(async () => ({ value: 'tool output' }));
+      let resolveModelStarted!: () => void;
+      const modelStarted = new Promise<void>((resolve) => {
+        resolveModelStarted = resolve;
+      });
+      const model: MastraModelConfig = {
+        specificationVersion: 'v2',
+        provider: 'breakwater-test',
+        modelId: 'guarded-tool-stream',
+        supportedUrls: {},
+        doGenerate: async () => {
+          throw new Error('stream model only');
+        },
+        doStream: async () => ({
+          stream: new ReadableStream({
+            start(controller) {
+              controller.enqueue({ type: 'stream-start', warnings: [] });
+              controller.enqueue({
+                type: 'tool-call',
+                toolCallId: 'lookup-1',
+                toolName: 'lookup',
+                input: '{}',
+              });
+              setTimeout(() => {
+                controller.enqueue({ type: 'text-start', id: 'answer' });
+                controller.enqueue({
+                  type: 'text-delta',
+                  id: 'answer',
+                  delta: 'blocked output',
+                });
+                controller.enqueue({ type: 'text-end', id: 'answer' });
+                controller.enqueue({
+                  type: 'finish',
+                  finishReason: 'tool-calls',
+                  usage,
+                });
+                controller.close();
+              }, 1);
+              resolveModelStarted();
+            },
+          }),
+        }),
+      };
+      const agent = guarded({
+        model,
+        tools: {
+          lookup: createTool({
+            id: 'lookup',
+            description: 'Look up a value.',
+            inputSchema: z.object({}),
+            execute,
+          }),
+        },
+        policies: [denyPatterns(['blocked'], { phases: ['output'] })],
+      });
+
+      const output = await agent.stream('hello', {
+        requestContext: actorContext(),
+      });
+      const drained = (async () => {
+        for await (const _chunk of output.fullStream) {
+          // Drain the step so its stream policies finish.
+        }
+      })();
+      await modelStarted;
+      await vi.advanceTimersByTimeAsync(1);
+      await drained;
+
+      expect(output.tripwire).toMatchObject({
+        reason: expect.stringMatching(/deny-patterns/),
+      });
+      expect(execute).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -694,9 +975,8 @@ describe('guarded caller messages', () => {
       ...extra,
     });
 
-    // Each form puts a marker in each string field it allows. The third
-    // column is the markers Mastra 1.67.0 renders into the prompt; the rest
-    // it drops before the model.
+    // MessageList prompt conversion drops some marked string fields before
+    // the model; the expected markers distinguish those from rendered fields.
     const FORMS: Array<[string, () => unknown, readonly string[]]> = [
       [
         'AI SDK v5 model messages',
@@ -1547,6 +1827,112 @@ describe('guarded call-option boundary', () => {
 });
 
 describe('guarded construction and processor validation', () => {
+  it('enforces indexed policies when their iterator yields no policies', async () => {
+    const modelCall = vi.fn();
+    const agent = guarded({
+      model: testModel('unreachable', modelCall),
+      policies: listWithPerCallIterator([denyPatterns(['blocked'])], () => []),
+    });
+
+    const result = await agent.generate('blocked', {
+      requestContext: actorContext(),
+    });
+
+    expect(result.tripwire).toMatchObject({
+      processorId: 'breakwater-policy-engine',
+    });
+    expect(modelCall).not.toHaveBeenCalled();
+  });
+
+  it('runs indexed input processors when their iterator changes members', async () => {
+    const calls: string[] = [];
+    const indexed: GuardedInputProcessor = {
+      id: 'indexed-input',
+      processInput: (args) => {
+        calls.push('index');
+        return args.messages;
+      },
+    };
+    const substitute: GuardedInputProcessor = {
+      id: 'substitute-input',
+      processInput: (args) => {
+        calls.push('substitute');
+        return args.messages;
+      },
+    };
+    const agent = guarded({
+      applicationInputProcessors: listWithPerCallIterator([indexed], () => [
+        substitute,
+      ]),
+    });
+
+    await agent.generate('hello', { requestContext: actorContext() });
+
+    expect(calls).toEqual(['index']);
+  });
+
+  it('runs indexed output hooks when their iterator supplies a forbidden step hook', async () => {
+    const calls: string[] = [];
+    const indexed: GuardedOutputProcessor = {
+      id: 'indexed-output',
+      processOutputStream: async (args) => {
+        if (args.part.type === 'text-delta') calls.push('index-stream');
+        return args.part;
+      },
+      processOutputResult: (args) => {
+        calls.push('index-result');
+        return args.messages;
+      },
+    };
+    const decoy: GuardedOutputProcessor = {
+      id: 'decoy-output',
+      processOutputStream: async (args) => args.part,
+      processOutputResult: (args) => args.messages,
+    };
+    const substitute = {
+      id: 'substitute-output',
+      processOutputStep: (args: ProcessOutputStepArgs) => {
+        calls.push('substitute-step');
+        return args.messages;
+      },
+      processOutputStream: async (args: ProcessOutputStreamArgs) => {
+        if (args.part.type === 'text-delta') calls.push('substitute-stream');
+        return args.part;
+      },
+      processOutputResult: (args: ProcessOutputResultArgs) => {
+        calls.push('substitute-result');
+        return args.messages;
+      },
+    };
+    const agent = guarded({
+      applicationOutputProcessors: listWithPerCallIterator([indexed], (call) =>
+        call === 0 ? [decoy] : [substitute as never],
+      ),
+    });
+
+    await agent.generate('hello', { requestContext: actorContext() });
+
+    expect(calls).toEqual(['index-stream', 'index-result']);
+  });
+
+  it('resolves no core error processors in the guarded LLM-request lane', async () => {
+    const agent = guarded() as unknown as Agent;
+    const context = actorContext();
+
+    expect(
+      (await agent.__resolveRunErrorProcessors(context)).errorProcessors,
+    ).toEqual([]);
+    expect(
+      (await agent.__listLLMRequestProcessors(context)).map(({ id }) => id),
+    ).not.toEqual(
+      expect.arrayContaining([
+        expect.stringMatching(
+          /^(provider-history-compat|prefill-error-handler|stream-error-retry-processor)$/,
+        ),
+      ]),
+    );
+  });
+
   it.each([
     ['non-array', 'https://a.example'],
     ['number entry', [42]],
@@ -1591,6 +1977,7 @@ describe('guarded construction and processor validation', () => {
     'outputProcessors',
     'errorProcessors',
     'maxProcessorRetries',
+    'errorProcessorDefaults',
     'defaultOptions',
     'defaultGenerateOptionsLegacy',
     'defaultStreamOptionsLegacy',
@@ -1691,6 +2078,7 @@ describe('guarded construction and processor validation', () => {
     'processOutputResult',
     'processOutputStep',
     'processAPIError',
+    'processToolResult',
   ])('rejects input processor hook %s', (hook) => {
     const processor = {
       id: `input-${hook}`,
@@ -1737,6 +2125,7 @@ describe('guarded construction and processor validation', () => {
     'processLLMResponse',
     'processOutputStep',
     'processAPIError',
+    'processToolResult',
   ])('rejects output processor hook %s', (hook) => {
     const processor = {
       id: `output-${hook}`,
@@ -1756,6 +2145,7 @@ describe('guarded construction and processor validation', () => {
     'breakwater-rbac',
     'breakwater-input-assets',
     'breakwater-client-tool-output',
+    'breakwater-client-tool-outcome-recorder',
     'breakwater-memory',
     'breakwater-policy-engine',
   ])("rejects reserved application processor id '%s'", (id) => {
@@ -1893,6 +2283,7 @@ describe('guarded durable interop and brand', () => {
       undefined,
       [
         'breakwater-rbac',
+        'breakwater-client-tool-outcome-recorder',
         'application-input',
         'breakwater-input-assets',
         'breakwater-client-tool-output',
@@ -1923,6 +2314,7 @@ describe('guarded durable interop and brand', () => {
       },
       [
         'breakwater-rbac',
+        'breakwater-client-tool-outcome-recorder',
         'memory-input',
         'application-input',
         'breakwater-input-assets',
@@ -1985,6 +2377,7 @@ describe('guarded durable interop and brand', () => {
       (await raw.listInputProcessors(context)).map((processor) => processor.id),
     ).toEqual([
       'breakwater-rbac',
+      'breakwater-client-tool-outcome-recorder',
       'memory-input',
       'breakwater-input-assets',
       'breakwater-client-tool-output',
@@ -2018,6 +2411,7 @@ describe('guarded durable interop and brand', () => {
       (await raw.listInputProcessors(context)).map((processor) => processor.id),
     ).toEqual([
       'breakwater-rbac',
+      'breakwater-client-tool-outcome-recorder',
       'breakwater-input-assets',
       'breakwater-client-tool-output',
       'breakwater-policy-engine',
@@ -2034,6 +2428,20 @@ describe('guarded durable interop and brand', () => {
     await expect(
       raw.__listLLMRequestProcessors(actorContext()),
     ).resolves.toEqual([]);
+  });
+
+  it('excludes caller-supplied error processors from the guarded LLM-request lane', async () => {
+    const probe = {
+      id: 'caller-error-processor',
+      processAPIError: () => undefined,
+    };
+    const raw = guarded() as unknown as Agent;
+
+    const processors = await raw.__listLLMRequestProcessors(actorContext(), [
+      probe,
+    ]);
+
+    expect(processors).not.toContain(probe);
   });
 
   it('audits and aborts a resumed memory error step', async () => {
@@ -2070,6 +2478,36 @@ describe('guarded durable interop and brand', () => {
     ).toMatchObject([
       { decision: 'error', detail: { processor: 'breakwater-memory' } },
     ]);
+  });
+
+  it('refuses an unlisted asset origin in a drained signal step', async () => {
+    const { step, audit, args } = await signalAssetStep();
+    const reason = 'input asset URL origin is not allowed';
+    // An absent hook lets the signal proceed; it must fail the refusal assertion.
+    expect(() => step.processInputStep?.(args as never)).toThrow(reason);
+    expect(args.abort).toHaveBeenCalledWith(reason);
+    const events = audit
+      .events()
+      .filter((event) => event.action === 'agent.input.asset');
+    expect(events).toEqual([
+      expect.objectContaining({ decision: 'denied', reason }),
+    ]);
+    expect(JSON.stringify(events)).not.toContain('unlisted.example');
+    expect(args.messageList.get.input.db()).toEqual([]);
+  });
+
+  it('allows a listed asset origin in a drained signal step without a result', async () => {
+    const { step, audit, args } = await signalAssetStep(
+      ['https://assets.example'],
+      'https://assets.example/a.png',
+    );
+    if (typeof step.processInputStep !== 'function') {
+      throw new Error('asset processor has no step hook');
+    }
+    // A returned list becomes step input in Mastra's processor runner.
+    expect(step.processInputStep(args as never)).toBeUndefined();
+    expect(audit.events()).toEqual([]);
+    expect(args.abort).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -2274,6 +2712,30 @@ describe('createGuardedAgent principal kinds', () => {
     return context;
   }
 
+  it('exposes and authorizes indexed principal kinds when their iterator names another kind', async () => {
+    const modelCall = vi.fn();
+    const agent = guarded({
+      model: testModel('generated', modelCall),
+      allowedPrincipalKinds: listWithPerCallIterator<PrincipalKind>(
+        ['human'],
+        () => ['system'],
+      ),
+    });
+
+    expect(agent.allowedPrincipalKinds).toEqual(['human']);
+    await expect(
+      agent.generate('hello', { requestContext: automatedContext('system') }),
+    ).rejects.toThrow(
+      /principal kind 'system' is not in allowed kinds \[human\]/,
+    );
+    expect(modelCall).not.toHaveBeenCalled();
+    const result = await agent.generate('hello', {
+      requestContext: actorContext(),
+    });
+    expect(result.text).toBe('generated');
+    expect(modelCall).toHaveBeenCalledTimes(1);
+  });
+
   it('defaults to humans only, so an agent that names no kinds denies automation', async () => {
     // #given — `guarded()` passes no `allowedPrincipalKinds`.
     const modelCall = vi.fn();
@@ -2428,14 +2890,25 @@ describe('Mastra Agent execution-entry inventory', () => {
       '__getEditorConfig',
       '__getGoalConfig',
       '__getLogger',
+      '__getMaxProcessorRetries',
+      '__getMaxRetriesConfigured',
+      // Resolves and prepares models, including dynamic model functions, as
+      // getModel does; starts no run.
+      '__getModelAndModelList',
       '__getOverridableFields',
       '__getStaticAgents',
       '__hasSubAgentsConfigured',
+      '__isStoredVersionApplied',
+      // Lists input and resolved error processors for the LLM-request lane;
+      // starts no run.
       '__listLLMRequestProcessors',
       '__markStoredVersionApplied',
       '__registerMastra',
       '__registerPrimitives',
       '__resetToOriginalModel',
+      // May call the configured errorProcessors function and instantiate
+      // defaults; returns processors without running them.
+      '__resolveRunErrorProcessors',
       // Writes declarative schedule metadata; it starts no scheduled run.
       '__setDeclaredSchedules',
       '__setMemory',
@@ -2444,6 +2917,7 @@ describe('Mastra Agent execution-entry inventory', () => {
       '__setThreadRuntimeAgent',
       '__setTools',
       '__setWorkspace',
+      '__supportsThreadSignalCancellation',
       '__updateInstructions',
       '__updateModel',
       'assertSupportsPreparedModels',
@@ -2472,6 +2946,9 @@ describe('Mastra Agent execution-entry inventory', () => {
       'getActiveThreadRunId',
       'getBackgroundTasksConfig',
       'getChannels',
+      // May call the configured errorProcessors function; returns configured
+      // ids without defaults or execution.
+      'getConfiguredErrorProcessorIds',
       'getConfiguredProcessorIds',
       'getConfiguredProcessorWorkflows',
       'getConfiguredToolHooks',
@@ -2544,6 +3021,9 @@ describe('Mastra Agent execution-entry inventory', () => {
       'resolveFallbackDynamic',
       'resolveInputProcessors',
       'resolveModelConfig',
+      // Resolves a selected model, including dynamic model functions, as
+      // getModel does; starts no run.
+      'resolveModelFromSelection',
       'resolveModelSelection',
       // May call the policy decider, but cannot send a signal or start execution.
       'resolveNotificationDeliveryDecision',
@@ -2559,6 +3039,9 @@ describe('Mastra Agent execution-entry inventory', () => {
       'stripParentToolParts',
       // Registers a queued-message-count listener; it drives nothing.
       'subscribeThreadEvents',
+      // Subscribes without starting a run; withInitialHistory reads the
+      // caller-named thread's stored messages through memory, as
+      // getMemory/getMemoryMessages permit.
       'subscribeToThread',
       'updateModelInModelList',
       'updateObjectiveOptions',
@@ -2575,10 +3058,7 @@ describe('Mastra Agent execution-entry inventory', () => {
     // there. A name belongs here only while the two cores disagree
     // about it: it goes once the pin catches up, and a name on NEITHER version
     // is dead and belongs in no list at all.
-    const forwardClassified: readonly string[] = [
-      '__getLogger',
-      'updateThreadPeerAdvertisement',
-    ];
+    const forwardClassified: readonly string[] = [];
     const classified = [
       ...wrapped,
       ...intentionallyUnavailable,

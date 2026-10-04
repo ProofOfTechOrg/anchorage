@@ -9,6 +9,7 @@ import {
   networkEgress,
   PolicyEngine,
   piiSecrets,
+  policyDenialReason,
   tenantIsolation,
 } from '@proofoftech/breakwater/policy-engine';
 import {
@@ -112,8 +113,8 @@ describe('streamGuarded', () => {
 
     // #then — blocked, and the emitted prefix contains no span character
     expect(outcome).toMatchObject({ blocked: true });
-    expect((outcome as { reason: string }).reason).toMatch(
-      /creditCard detected/,
+    expect((outcome as { reason: string }).reason).toBe(
+      policyDenialReason('pii-secrets', 'output'),
     );
     expect(h.emitted()).not.toContain('4111');
     expect(h.emitted()).not.toContain('refund');

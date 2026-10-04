@@ -2189,7 +2189,7 @@ describe('execution-entry matrix', () => {
     'do-runner/thread-do.ts',
     'agent-host/thread-host.ts',
     'agent-runner/durable-agent-runner.ts',
-  ])('D3 execution entry has no weak reservation or proof calls: %s', (file) => {
+  ])('execution entry has no weak reservation or proof calls: %s', (file) => {
     const source = sourceFileSystem().readFileSync(
       `${sourceRoot()}/${file}`,
       'utf8',

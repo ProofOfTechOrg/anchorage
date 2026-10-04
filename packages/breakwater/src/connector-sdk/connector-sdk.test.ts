@@ -3942,7 +3942,7 @@ describe('atomic idempotency (reserve path)', () => {
     expect(store.put).toHaveBeenCalledTimes(1);
     expect(store.get).not.toHaveBeenCalled();
     expect(execute).toHaveBeenCalledTimes(1);
-    // the lease minted by reserve() is exactly the token handed to put() (D2)
+    // the lease minted by reserve() is exactly the token handed to put()
     const reservation = store.reserve.mock.results[0]?.value as
       | IdempotencyReservation
       | undefined;
@@ -4490,7 +4490,7 @@ describe('atomic idempotency (reserve path)', () => {
   });
 
   it('audits a dedicated event when the reservation came from a stale-pending takeover', async () => {
-    // #given — a store reporting a takeover (audit D2)
+    // #given — a store reporting a takeover
     const audit = new AuditLogger();
     const store: AtomicIdempotencyStore = {
       get: () => undefined,
@@ -4520,7 +4520,7 @@ describe('atomic idempotency (reserve path)', () => {
   });
 
   // A store whose reserve() outcome is settled manually by the test — models
-  // an async store (D1) where the claimed row is visible to other callers
+  // an async store where the claimed row is visible to other callers
   // before the claimer's own promise resumes.
   function deferredReserveStore() {
     let settleReserve!: {
@@ -5214,7 +5214,7 @@ describe('InMemoryIdempotencyStore', () => {
     });
   });
 
-  it('binds release/put to the reservation token — a stale token cannot delete or finalize a live reservation (audit D2)', () => {
+  it('binds release/put to the reservation token — a stale token cannot delete or finalize a live reservation', () => {
     // #given — a live reservation holding its lease token
     const store = new InMemoryIdempotencyStore();
     const reservation = store.reserve('k1');
@@ -6017,7 +6017,7 @@ describe('createConnector egress-fetch runtime', () => {
   });
 });
 
-describe('_background model-override defense (DL-005)', () => {
+describe('_background model-override defense', () => {
   // These connectors declare NO stripping inputSchema, so a `_background` arg
   // reaches gatedExecute.
   function bgWriteConnector(audit?: AuditLogger) {
@@ -7393,6 +7393,42 @@ describe('connector decision taxonomy', () => {
 });
 
 describe('runtime fetch decision projection', () => {
+  it('audits an error-mode redirect as an execution failure', async () => {
+    const cancel = vi.fn();
+    const audit = new AuditLogger();
+    const fetch = vi.fn(async () => ({
+      status: 302,
+      headers: { get: () => 'https://other.example.com/x' },
+      body: { cancel },
+    }));
+    const tool = createConnector({
+      id: 'taxonomy.redirect-error',
+      description: 'Observe redirect execution failure',
+      permissions: { sideEffect: 'read', egress: ['api.example.com'] },
+      policies: { audit, fetch },
+      execute: async (_input, _context, runtime) =>
+        runtime.fetch('https://api.example.com/start', { redirect: 'error' }),
+    });
+
+    const error = await run(tool, {}).catch((failure: unknown) => failure);
+
+    expect(error).toBeInstanceOf(TypeError);
+    expect(error).not.toBeInstanceOf(ConnectorPolicyError);
+    expect(error).toMatchObject({ message: 'fetch failed' });
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(fetch).toHaveBeenCalledWith(
+      'https://api.example.com/start',
+      expect.objectContaining({ redirect: 'manual' }),
+    );
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(
+      audit.events().filter((event) => event.decision === 'denied'),
+    ).toEqual([]);
+    expect(
+      audit.events().filter((event) => event.decision === 'error'),
+    ).toMatchObject([{ decisionCode: 'CONNECTOR_EXECUTION_FAILED' }]);
+  });
+
   it.each([
     ['input', 'EGRESS_INPUT_INVALID', null, 0, 0],
     ['url', 'EGRESS_URL_INVALID', null, 0, 0],

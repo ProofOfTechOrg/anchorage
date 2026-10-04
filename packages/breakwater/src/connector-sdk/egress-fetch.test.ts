@@ -660,10 +660,7 @@ describe('egressFetch redirect following', () => {
     expect(calls).toHaveLength(3);
   });
 
-  it.each([
-    'manual',
-    'error',
-  ] as const)('passes redirect: "%s" through and returns the 3xx to the caller', async (redirect) => {
+  it('returns the 3xx to the caller in manual mode', async () => {
     // #given
     const { fn, calls } = baseFetch(
       stubResponse(302, { location: 'https://exfil.example.org/x' }),
@@ -672,12 +669,69 @@ describe('egressFetch redirect following', () => {
     // #when
     const response = await guarded('https://api.example.com/start', {
       method: 'POST',
-      redirect,
+      redirect: 'manual',
     });
     // #then — no hop happens, so the disallowed Location never gets fetched
     expect(response.status).toBe(302);
     expect(calls).toHaveLength(1);
-    expect(calls[0]?.init).toMatchObject({ method: 'POST', redirect });
+    expect(calls[0]?.init).toMatchObject({
+      method: 'POST',
+      redirect: 'manual',
+    });
+  });
+
+  it.each([
+    {
+      name: '302 with an absolute Location',
+      status: 302,
+      location: 'https://exfil.example.org/x',
+    },
+    { name: '307 with a relative Location', status: 307, location: '/retry' },
+    { name: '302 without Location', status: 302 },
+    { name: 'an opaque redirect (status 0)', status: 0 },
+  ])('rejects $name in error mode', async ({ status, location }) => {
+    const cancel = vi.fn(() => Promise.resolve());
+    const { fn, calls } = baseFetch(
+      stubResponse(status, location === undefined ? {} : { location }, {
+        cancel,
+      }),
+    );
+    const guarded = egressFetch(['api.example.com'], { fetch: fn });
+
+    const error = await guarded('https://api.example.com/start', {
+      method: 'POST',
+      redirect: 'error',
+    }).catch((failure: unknown) => failure);
+
+    expect(error).toBeInstanceOf(TypeError);
+    expect(error).not.toBeInstanceOf(EgressGuardError);
+    expect(error).toMatchObject({
+      message: 'fetch failed',
+      cause: new Error('unexpected redirect'),
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.init).toMatchObject({
+      method: 'POST',
+      redirect: 'manual',
+    });
+    expect(cancel).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    200, 304, 404,
+  ])('returns status %s unchanged in error mode', async (status) => {
+    const cancel = vi.fn(() => Promise.resolve());
+    const response = stubResponse(status, {}, { cancel });
+    const { fn, calls } = baseFetch(response);
+    const guarded = egressFetch(['api.example.com'], { fetch: fn });
+
+    await expect(
+      guarded('https://api.example.com/start', { redirect: 'error' }),
+    ).resolves.toBe(response);
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.init).toMatchObject({ redirect: 'manual' });
+    expect(cancel).not.toHaveBeenCalled();
   });
 
   function inheritedInit(redirect?: 'manual' | 'error') {
@@ -716,7 +770,7 @@ describe('egressFetch redirect following', () => {
       body: '{"a":1}',
       cache: 'no-store',
       credentials: 'include',
-      redirect,
+      redirect: 'manual',
     });
     expect(calls[0]?.init?.headers).toBe(headers);
     expect(calls[0]?.init?.signal).toBe(signal);
@@ -801,6 +855,22 @@ describe('egressFetch redirect following', () => {
       reason: "init.redirect must be 'follow', 'manual' or 'error'",
       details: { host: 'api.example.com', hop: 0 },
     });
+    expect(calls).toHaveLength(0);
+  });
+
+  it.each([
+    undefined,
+    'follow',
+  ] as const)('refuses a non-string method before any request in %s mode', async (redirect) => {
+    const { fn, calls } = baseFetch(stubResponse(200));
+    const guarded = egressFetch(['api.example.com'], { fetch: fn });
+
+    await expect(
+      guarded('https://api.example.com/x', {
+        method: 123 as unknown as string,
+        ...(redirect === undefined ? {} : { redirect }),
+      }),
+    ).rejects.toBeInstanceOf(TypeError);
     expect(calls).toHaveLength(0);
   });
 

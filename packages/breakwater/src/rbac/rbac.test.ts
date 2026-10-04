@@ -52,6 +52,14 @@ function makeInputArgs(
 
 const OPERATOR: Actor = { id: 'user-1', role: 'operator' };
 
+function answeringList<T>(entries: readonly T[], answer: readonly T[]): T[] {
+  return Object.assign([...entries], {
+    [Symbol.iterator]: function* () {
+      yield* answer;
+    },
+  });
+}
+
 describe('RBACMiddleware', () => {
   it('passes messages through for an allowed role and records an allowed audit event', () => {
     // #given
@@ -357,6 +365,30 @@ describe('RBACMiddleware principal kinds', () => {
     role: 'operator',
     kind: 'system',
   };
+
+  it('authorizes indexed principal kinds when their iterator names another kind', () => {
+    const audit = new AuditLogger();
+    const rbac = new RBACMiddleware({
+      allowedRoles: ['operator'],
+      allowedPrincipalKinds: answeringList<PrincipalKind>(
+        ['human'],
+        ['system'],
+      ),
+      audit,
+    });
+
+    expect(() =>
+      rbac.processInput(makeInputArgs({ contextValue: SCHEDULER })),
+    ).toThrow(
+      new Tripwire("principal kind 'system' is not in allowed kinds [human]"),
+    );
+    const humanArgs = makeInputArgs({ contextValue: OPERATOR });
+    expect(rbac.processInput(humanArgs)).toBe(humanArgs.messages);
+    expect(audit.events()).toMatchObject([
+      { decision: 'denied' },
+      { decision: 'allowed' },
+    ]);
+  });
 
   it('denies an automated principal when the caller never opted in', () => {
     // #given — a configuration that names roles only.

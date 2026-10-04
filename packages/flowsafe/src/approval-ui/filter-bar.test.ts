@@ -28,7 +28,7 @@ describe('buildTriageFilter', () => {
       NOW_MS,
     );
 
-    // #then — D3 page bound + reviewer ranking carry over; no time bound
+    // #then — page bound + reviewer ranking carry over; no time bound
     expect(filter).toEqual({
       status: [...OPEN_STATUSES],
       limit: 100,

@@ -119,7 +119,7 @@ describe('provider merge semantics', () => {
     expect(typeof merged.Select).toBe('function');
   });
 
-  it('falls back to default Toast/PresenceIndicator when an adapter omits the M-007 slots (additive contract)', () => {
+  it('falls back to default Toast/PresenceIndicator when an adapter omits the toast and presence slots (additive contract)', () => {
     // #given — an adapter written before the live-streaming slots existed
     const preStreamAdapter: Partial<ApprovalUIComponents> = {
       Text: htmlComponents.Text,

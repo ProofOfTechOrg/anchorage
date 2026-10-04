@@ -4,6 +4,8 @@ import {
   type AIV5Type,
   convertMessages,
   type MastraDBMessage,
+  type MastraToolInvocation,
+  type MastraToolInvocationPart,
 } from '@mastra/core/agent/message-list';
 
 /** @internal */
@@ -79,6 +81,20 @@ export function classifyPromptMedia(
   return undefined;
 }
 
+function pushNetworkUrl(urls: URL[], data: unknown): void {
+  const media = classifyPromptMedia(data);
+  if (media?.kind === 'network-url') {
+    urls.push(media.url);
+  } else if (media?.kind === 'inline-base64' && media.payload.includes('://')) {
+    // Mastra can wrap a non-HTTP URL in a data URI without encoding it.
+    try {
+      urls.push(new URL(media.payload));
+    } catch {
+      // A non-URL payload remains inline data.
+    }
+  }
+}
+
 /** @internal */
 export function inputAssetUrls(messages: readonly MastraDBMessage[]): URL[] {
   const converted = convertedPrompt(messages);
@@ -87,20 +103,74 @@ export function inputAssetUrls(messages: readonly MastraDBMessage[]): URL[] {
     if (message.role !== 'user' || !Array.isArray(message.content)) continue;
     for (const part of message.content) {
       if (part.type !== 'file' && part.type !== 'image') continue;
-      const data = part.type === 'file' ? part.data : part.image;
-      const media = classifyPromptMedia(data);
-      if (media?.kind === 'network-url') {
-        urls.push(media.url);
+      pushNetworkUrl(urls, part.type === 'file' ? part.data : part.image);
+    }
+  }
+  return urls;
+}
+
+/** @internal */
+export interface StoredModelOutput {
+  readonly toolCallId: string;
+  readonly state: MastraToolInvocation['state'];
+  readonly output: unknown;
+}
+
+function storedPartModelOutputs(
+  parts: readonly MastraToolInvocationPart[],
+): readonly StoredModelOutput[] {
+  const stored: StoredModelOutput[] = [];
+  for (const part of parts) {
+    const mastra: unknown = part.providerMetadata?.mastra;
+    if (typeof mastra !== 'object' || mastra === null) continue;
+    const output = (mastra as { modelOutput?: unknown }).modelOutput;
+    if (output !== undefined && output !== null) {
+      stored.push({
+        toolCallId: part.toolInvocation.toolCallId,
+        state: part.toolInvocation.state,
+        output,
+      });
+    }
+  }
+  return stored;
+}
+
+/** @internal */
+export function toolInvocationParts(
+  messages: readonly MastraDBMessage[],
+): MastraToolInvocationPart[] {
+  return messages.flatMap((message) =>
+    message.content.parts.filter((part) => part.type === 'tool-invocation'),
+  );
+}
+
+/** @internal */
+export function storedModelOutputs(
+  messages: readonly MastraDBMessage[],
+): readonly StoredModelOutput[] {
+  return storedPartModelOutputs(toolInvocationParts(messages));
+}
+
+/** @internal */
+export function toolOutputAssetUrls(
+  parts: readonly MastraToolInvocationPart[],
+): URL[] {
+  const urls: URL[] = [];
+  for (const { output } of storedPartModelOutputs(parts)) {
+    if (typeof output !== 'object' || output === null) continue;
+    const { type, value } = output as { type?: unknown; value?: unknown };
+    if (type !== 'content' || !Array.isArray(value)) continue;
+    for (const item of value as unknown[]) {
+      if (typeof item !== 'object' || item === null) continue;
+      const fields = item as { type?: unknown; url?: unknown; data?: unknown };
+      if (fields.type === 'image-url' || fields.type === 'file-url') {
+        pushNetworkUrl(urls, fields.url);
       } else if (
-        media?.kind === 'inline-base64' &&
-        media.payload.includes('://')
+        fields.type === 'media' ||
+        fields.type === 'image-data' ||
+        fields.type === 'file-data'
       ) {
-        // Mastra can wrap a non-HTTP URL in a data URI without encoding it.
-        try {
-          urls.push(new URL(media.payload));
-        } catch {
-          // A non-URL payload remains inline data.
-        }
+        pushNetworkUrl(urls, fields.data);
       }
     }
   }

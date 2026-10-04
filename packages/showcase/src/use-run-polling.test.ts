@@ -1,4 +1,4 @@
-// Node-testable coverage of the DL-021 poll/stream reconciliation, pulled out
+// Node-testable coverage of the poll/stream reconciliation, pulled out
 // of useRunPolling's effect as pure functions (pollableRuns, mergeRunResults,
 // allRunsSettled) precisely so the merge/done logic can be pinned without
 // mounting the hook or driving its self-scheduling setTimeout chain — the

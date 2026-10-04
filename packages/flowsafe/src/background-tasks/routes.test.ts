@@ -125,7 +125,7 @@ describe('createBackgroundTaskRoutes', () => {
       expect(res?.status).toBe(200);
     });
 
-    it('drops a row a regressed core filter leaks that is not the requested scope (per-row parity with the stream guard, DL-014)', async () => {
+    it('drops a row a regressed core filter leaks that is not the requested scope (per-row parity with the stream guard)', async () => {
       // #given — a manager whose listTasks IGNORES the filter (a future core
       // filter regression) and returns a mismatched row alongside the requested one
       const leaky = {
@@ -224,7 +224,7 @@ describe('createBackgroundTaskRoutes', () => {
       expect(stream).not.toHaveBeenCalled();
     });
 
-    it('the transform DROPS a chunk whose runId is not the requested scope (belt over core, DL-014)', async () => {
+    it('the transform DROPS a chunk whose runId is not the requested scope (belt over core)', async () => {
       // #given — a manager stream emitting an in-scope chunk and a mismatched one
       const manager = {
         stream: () =>

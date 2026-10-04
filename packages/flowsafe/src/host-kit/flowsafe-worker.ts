@@ -69,7 +69,11 @@ import {
 } from '../do-runner/index.js';
 import { validateTablePrefix } from '../do-runner/table-prefix.js';
 import { readBoundedBody } from '../http-body.js';
-import { abandonApprovalsForRun, type ResumeRunFn } from './approval-bridge.js';
+import {
+  abandonApprovalsForRun,
+  type ResumeRunFn,
+  reconcileApprovalsForSummary,
+} from './approval-bridge.js';
 import { bearerActorAuthenticator } from './bearer-auth.js';
 import {
   createDoRunTopology,
@@ -522,7 +526,8 @@ function buildConfiguredApprovalService<Env extends FlowsafeWorkerEnv>(
 }
 
 /**
- * Builds the Runner DO's terminal-cleanup hooks from the same approval-service
+ * Builds the Runner DO's lifecycle hooks (terminal cleanup, and the approvals
+ * the object files from its alarm) from the same approval-service
  * configuration as createFlowsafeWorker. Hosts supply only the optional DO
  * keepalive and their receipt-protocol-specific dispatch settler.
  */
@@ -569,6 +574,13 @@ export function createFlowsafeRunnerLifecycle<Env extends FlowsafeWorkerEnv>(
         workflowId,
         runId,
         status,
+        config.systemPrincipalId,
+      ).then(() => undefined),
+    reconcileApprovals: (workflowId, summary) =>
+      reconcileApprovalsForSummary(
+        service,
+        workflowId,
+        summary,
         config.systemPrincipalId,
       ).then(() => undefined),
     ...(options.discardScheduleDispatch

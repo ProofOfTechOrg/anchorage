@@ -172,12 +172,12 @@ function deferredContext() {
   return { promise, release };
 }
 
-describe('C context capture', () => {
+describe('context capture', () => {
   it.each([
     undefined,
     0,
     Number.MAX_SAFE_INTEGER,
-  ])('C constructors capture one epoch observation (%s)', async (epoch) => {
+  ])('constructors capture one epoch observation (%s)', async (epoch) => {
     const storeFactory = new InMemoryApprovalStoreFactory();
     const buildService = vi.fn(
       () =>
@@ -231,7 +231,7 @@ describe('C context capture', () => {
     Number.NaN,
     Infinity,
     Number.MAX_SAFE_INTEGER + 1,
-  ])('C malformed constructor epoch refuses before effects (%s)', (epoch) => {
+  ])('malformed constructor epoch refuses before effects (%s)', (epoch) => {
     const storeFactory = new InMemoryApprovalStoreFactory();
     const resources = vi.spyOn(storeFactory, 'resources');
     const store = vi.spyOn(storeFactory, 'store');
@@ -272,7 +272,7 @@ describe('C context capture', () => {
     [undefined, 0, Number.MAX_SAFE_INTEGER].flatMap((epoch) =>
       (['alternate', 'second-throw'] as const).map((mode) => ({ epoch, mode })),
     ),
-  )('C direct principal context captures its epoch exactly once ($epoch, $mode)', ({
+  )('direct principal context captures its epoch exactly once ($epoch, $mode)', ({
     epoch,
     mode,
   }) => {
@@ -312,7 +312,7 @@ describe('C context capture', () => {
     expect(read).toHaveBeenCalledTimes(1);
   });
 
-  it('C direct principal context preserves a first epoch getter fault without effects', () => {
+  it('direct principal context preserves a first epoch getter fault without effects', () => {
     const factory = new InMemoryApprovalStoreFactory();
     const resources = vi.spyOn(factory, 'resources');
     const store = vi.spyOn(factory, 'store');
@@ -337,7 +337,7 @@ describe('C context capture', () => {
     expect(buildService).not.toHaveBeenCalled();
   });
 
-  it('C resolver keeps its construction epoch through authentication', async () => {
+  it('resolver keeps its construction epoch through authentication', async () => {
     const hold = deferredContext();
     const entered = deferredContext();
     const options = {
@@ -366,7 +366,7 @@ describe('C context capture', () => {
   it.each([
     '2',
     'forged',
-  ])('C rejects the protected epoch header before authentication (%s)', async (value) => {
+  ])('rejects the protected epoch header before authentication (%s)', async (value) => {
     const authenticate = vi.fn(() => ({ id: 'a', role: 'admin' as const }));
     const resolve = createActorResolver({
       authenticate,
@@ -392,7 +392,7 @@ describe('C context capture', () => {
     'prototype',
     'non-enumerable',
     'own-enumerable',
-  ] as const)('C captures all declared ActorContext methods without enumeration (%s)', async (shape) => {
+  ] as const)('captures all declared ActorContext methods without enumeration (%s)', async (shape) => {
     const source = new ReceiverContext();
     const reads = new Map<string, number>();
     if (shape !== 'prototype') {
@@ -429,7 +429,7 @@ describe('C context capture', () => {
   it.each([
     'prototype',
     'own-enumerable',
-  ] as const)('C preserves the original receiver of captured ActorContext methods (%s)', async (shape) => {
+  ] as const)('preserves the original receiver of captured ActorContext methods (%s)', async (shape) => {
     const source = new ReceiverContext();
     if (shape === 'own-enumerable') {
       for (const method of contextMethods)
@@ -447,7 +447,7 @@ describe('C context capture', () => {
     expect(Object.isFrozen(source.resourceOwner)).toBe(false);
   });
 
-  it('C never refreshes captured context methods after owner lookup', async () => {
+  it('never refreshes captured context methods after owner lookup', async () => {
     const source = new ReceiverContext();
     const hold = deferredContext();
     const entered = deferredContext();
@@ -504,7 +504,7 @@ describe('C context capture', () => {
     }
   });
 
-  it('C preserves the original actor without imposing principal equality', () => {
+  it('preserves the original actor without imposing principal equality', () => {
     const source = new ReceiverContext();
     const id = vi.fn(() => 'custom-actor');
     const role = vi.fn(() => 'builder');
@@ -529,7 +529,7 @@ describe('C context capture', () => {
     'actor',
     { id: '', role: 'admin' },
     { id: 'secret', role: 'root' },
-  ])('C refuses malformed first actor data with the fixed error (%s)', (actor) => {
+  ])('refuses malformed first actor data with the fixed error (%s)', (actor) => {
     const source = new ReceiverContext();
     Object.defineProperty(source, 'actor', { value: actor });
     const principal = vi.fn();
@@ -541,7 +541,7 @@ describe('C context capture', () => {
     expect(source.calls).toEqual([]);
   });
 
-  it('C preserves first getter faults and principal own-data rules', () => {
+  it('preserves first getter faults and principal own-data rules', () => {
     const sentinel = new Error('first fault');
     const source = new ReceiverContext();
     Object.defineProperty(source.actor, 'id', {

@@ -64,6 +64,11 @@ export function isTerminalRunStatus(value: unknown): boolean {
   );
 }
 
+/** A run that needs no leg to reach its next state: suspended or terminal. */
+export function isDurableRunStatus(value: unknown): boolean {
+  return value === 'suspended' || isTerminalRunStatus(value);
+}
+
 const NONTERMINAL_RUN_STATUSES = new Set<WorkflowRunStatus>([
   'running',
   'suspended',

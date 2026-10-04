@@ -21,7 +21,7 @@
 //   - maintenance duties escalate an SLA-overdue approval and purge only
 //     stale TERMINAL snapshots; a broken approval store must not stop the
 //     retention purge (the two surfaces are isolated)
-//   - D4 wedge recovery: a status() poll re-files an approval a suspended
+//   - wedge recovery: a status() poll re-files an approval a suspended
 //     run lost, and deciding the re-filed record resumes the run to
 //     completion
 //
@@ -532,7 +532,7 @@ describe('deploy worker fetch(): deployment boundary', () => {
   });
 });
 
-describe('deploy worker fetch(): D4 wedge recovery (status() self-heals)', () => {
+describe('deploy worker fetch(): wedge recovery (status() self-heals)', () => {
   it('re-files a lost approval on the next status() poll, and deciding the re-filed record resumes the run to completion', async () => {
     // #given — a normal suspension with its approval auto-queued...
     const { env, sqlite } = makeEnv();
@@ -1137,7 +1137,7 @@ describe('deploy worker alarm-owned maintenance duties', () => {
   });
 });
 
-describe('createFlowsafeWorker artifact-paired retention purge (F4)', () => {
+describe('createFlowsafeWorker artifact-paired retention purge', () => {
   // The deploy template wires no R2, so it sets no artifactStore factory. This
   // drives createFlowsafeWorker directly with one, proving each maintenance
   // invocation resolves its own binding and deletes artifacts BEFORE the row.

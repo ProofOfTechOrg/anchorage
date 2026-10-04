@@ -30,6 +30,7 @@ import {
   type PolicyEvaluator,
   type PolicyPhase,
   piiSecrets,
+  policyDenialReason,
 } from './index.js';
 
 class Tripwire extends Error {}
@@ -212,7 +213,7 @@ describe('PolicyEngine', () => {
     // #when / #then
     await expect(
       engine.processInput(makeInputArgs('please DROP TABLE users')),
-    ).rejects.toThrowError(/deny-patterns: matched blocked pattern/);
+    ).rejects.toThrowError(policyDenialReason('deny-patterns', 'input'));
     expect(audit.events()[0]).toMatchObject({
       decision: 'denied',
       reason: 'policy denied',
@@ -220,7 +221,7 @@ describe('PolicyEngine', () => {
     });
   });
 
-  it('never copies evaluator reasons or blocked patterns into audit events', async () => {
+  it('excludes evaluator reasons and blocked patterns from abort reasons and audit events', async () => {
     const sentinel = 'sk_live_audit-must-not-contain-this';
     const evaluatorAudit = new AuditLogger();
     const evaluator = new PolicyEngine({
@@ -241,11 +242,21 @@ describe('PolicyEngine', () => {
       audit: patternAudit,
     });
 
-    await expect(
-      evaluator.processInput(makeInputArgs(sentinel)),
-    ).rejects.toThrow(sentinel);
-    await expect(pattern.processInput(makeInputArgs(sentinel))).rejects.toThrow(
-      sentinel,
+    const evaluatorError = await evaluator
+      .processInput(makeInputArgs(sentinel))
+      .catch((error: unknown) => error);
+    expect(evaluatorError).toBeInstanceOf(Error);
+    expect((evaluatorError as Error).message).not.toContain(sentinel);
+    expect((evaluatorError as Error).message).toBe(
+      policyDenialReason('opaque-denial', 'input'),
+    );
+    const patternError = await pattern
+      .processInput(makeInputArgs(sentinel))
+      .catch((error: unknown) => error);
+    expect(patternError).toBeInstanceOf(Error);
+    expect((patternError as Error).message).not.toContain(sentinel);
+    expect((patternError as Error).message).toBe(
+      policyDenialReason('deny-patterns', 'input'),
     );
 
     expect(evaluatorAudit.events()[0]?.reason).toBe('policy denied');
@@ -279,7 +290,7 @@ describe('PolicyEngine', () => {
     );
     await expect(
       engine.processOutputResult(makeOutputArgs('a'.repeat(100))),
-    ).rejects.toThrowError(/max-text-length: text length 100 exceeds limit 5/);
+    ).rejects.toThrowError(policyDenialReason('max-text-length', 'output'));
   });
 
   it('gates output on result.text, not on prior conversation messages', async () => {
@@ -317,7 +328,7 @@ describe('PolicyEngine', () => {
 
     // #when / #then
     await expect(engine.processInput(makeInputArgs('x'))).rejects.toThrowError(
-      /async-deny: nope/,
+      policyDenialReason('async-deny', 'input'),
     );
   });
 
@@ -434,7 +445,7 @@ describe('PolicyEngine', () => {
     ]);
   });
 
-  it('rethrows a static TypeError at the final result for a policy that returns no decision', async () => {
+  it('throws a fixed error at the final result for a policy that returns no decision', async () => {
     // #given
     const engine = new PolicyEngine({
       policies: [
@@ -449,7 +460,7 @@ describe('PolicyEngine', () => {
     // #when / #then
     await expect(
       engine.processOutputResult(makeOutputArgs('answer')),
-    ).rejects.toEqual(new TypeError('policy evaluator returned no decision'));
+    ).rejects.toEqual(new Error('policy evaluation failed'));
   });
 
   it('removes the call input from the message list before an input abort', async () => {
@@ -858,7 +869,7 @@ describe('content evaluator text', () => {
 
     // #when / #then
     await expect(engine.processOutputResult(args)).rejects.toThrow(
-      new TypeError('maxTextLength: text must be a string (got object)'),
+      new Error('policy evaluation failed'),
     );
     expect(audit.events()[0]).toMatchObject({
       decision: 'error',
@@ -1150,7 +1161,7 @@ describe('PolicyEngine constructor validation (K2)', () => {
 
     await expect(
       engine.processOutputResult(makeOutputArgs('blocked')),
-    ).rejects.toThrowError(/deny-patterns: matched blocked pattern/);
+    ).rejects.toThrowError(policyDenialReason('deny-patterns', 'output'));
   });
 
   it('snapshots hold-back hints before caller mutation', async () => {
@@ -1170,7 +1181,9 @@ describe('PolicyEngine constructor validation (K2)', () => {
 
     await expect(
       engine.processOutputResult(makeOutputArgs('blocked')),
-    ).rejects.toThrowError(/private-field-policy: matched private field/);
+    ).rejects.toThrowError(
+      policyDenialReason('private-field-policy', 'output'),
+    );
   });
 });
 
@@ -1503,7 +1516,7 @@ describe('policy engine values', () => {
     // #when / #then
     await expect(
       engine.processInput(makeInputArgs('x'.repeat(50))),
-    ).rejects.toThrowError(/max-text-length: text length 50 exceeds limit 10/);
+    ).rejects.toThrowError(policyDenialReason('max-text-length', 'input'));
   });
 
   it('refuses a misspelled maxTextLength option, which would narrow the phases it gates', () => {
@@ -1778,7 +1791,7 @@ describe('PolicyEngine.processOutputStream', () => {
     // ...the chunk that completes "secret" aborts before it reaches the client
     await expect(
       engine.processOutputStream(makeStreamArgs([first, second], state)),
-    ).rejects.toThrowError(/deny-patterns: matched blocked pattern/);
+    ).rejects.toThrowError(policyDenialReason('deny-patterns', 'output'));
   });
 
   it('enforces maxTextLength on cumulative output, not per chunk', async () => {
@@ -1798,7 +1811,7 @@ describe('PolicyEngine.processOutputStream', () => {
     ).resolves.toBe(parts[1]);
     await expect(
       engine.processOutputStream(makeStreamArgs(parts, state)),
-    ).rejects.toThrowError(/max-text-length: text length 6 exceeds limit 5/);
+    ).rejects.toThrowError(policyDenialReason('max-text-length', 'output'));
   });
 
   it('catches a RegExp pattern split across chunks via the full-scan fallback', async () => {
@@ -1817,7 +1830,7 @@ describe('PolicyEngine.processOutputStream', () => {
     ).resolves.toBe(first);
     await expect(
       engine.processOutputStream(makeStreamArgs([first, second], state)),
-    ).rejects.toThrowError(/deny-patterns: matched blocked pattern/);
+    ).rejects.toThrowError(policyDenialReason('deny-patterns', 'output'));
   });
 
   it('passes non-text chunks through without evaluating policies', async () => {
@@ -1947,7 +1960,7 @@ describe('PolicyEngine.processOutputStream', () => {
 
     // #then — this chunk's own text is still gated
     await expect(engine.processOutputStream(args)).rejects.toThrowError(
-      /deny-patterns: matched blocked pattern/,
+      policyDenialReason('deny-patterns', 'output'),
     );
   });
 
@@ -2023,7 +2036,7 @@ describe('PolicyEngine output channels — streaming', () => {
     ).resolves.toBe(first);
     await expect(
       engine.processOutputStream(makeStreamArgs([first, second], state)),
-    ).rejects.toThrowError(/deny-patterns: matched blocked pattern/);
+    ).rejects.toThrowError(policyDenialReason('deny-patterns', 'output'));
     // ...and the denial names the channel it fired on
     expect(audit.events()[0]).toMatchObject({
       decision: 'denied',
@@ -2056,7 +2069,7 @@ describe('PolicyEngine output channels — streaming', () => {
     // #when / #then
     await expect(
       engine.processOutputStream(makeStreamArgs([part])),
-    ).rejects.toThrowError(/deny-patterns: matched blocked pattern/);
+    ).rejects.toThrowError(policyDenialReason('deny-patterns', 'output'));
   });
 
   it('forwards the same canonical object snapshot that policy inspected', async () => {
@@ -2147,7 +2160,7 @@ describe('PolicyEngine output channels — streaming', () => {
       engine.processOutputStream(
         makeStreamArgs([reasoningDelta('r'.repeat(11))]),
       ),
-    ).rejects.toThrowError(/max-text-length: text length 11 exceeds limit 10/);
+    ).rejects.toThrowError(policyDenialReason('max-text-length', 'output'));
   });
 });
 
@@ -2166,7 +2179,7 @@ describe('PolicyEngine output channels — result phase', () => {
 
     // #when / #then
     await expect(engine.processOutputResult(args)).rejects.toThrowError(
-      /deny-patterns: matched blocked pattern/,
+      policyDenialReason('deny-patterns', 'output'),
     );
   });
 
@@ -2573,7 +2586,7 @@ describe('PolicyEngine hold-back buffering', () => {
     // ...the third completes the pattern and aborts
     await expect(
       engine.processOutputStream(makeStreamArgs(chunks, state)),
-    ).rejects.toThrowError(/deny-patterns: matched blocked pattern/);
+    ).rejects.toThrowError(policyDenialReason('deny-patterns', 'output'));
 
     // #then — the zero-leak win: nothing emitted contains ANY char of the
     // match ("secret" starts at index 4; only "the" ever left the engine)

@@ -273,7 +273,7 @@ describe('errorText', () => {
   });
 });
 
-describe('FS8 D3 Runtime activation', () => {
+describe('Runtime activation', () => {
   it('shares the eight terminal statuses while retaining extended waiting states', async () => {
     const { isTerminalRunStatus } = await import('./run-terminal-state.js');
     for (const status of [

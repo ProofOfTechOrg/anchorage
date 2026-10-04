@@ -100,7 +100,7 @@ describe('starter maintenance tick and the deployment execution fence', () => {
   });
 });
 
-describe('FS8 D3 proof activation in the starter', () => {
+describe('proof activation in the starter', () => {
   it.each([
     '',
     'other_',

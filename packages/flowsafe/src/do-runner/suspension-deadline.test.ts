@@ -14,13 +14,16 @@ import {
   MIN_SUSPENSION_DEADLINE_MS,
   mergeSuspensionDeadlines,
   nextSuspensionDeadlineAt,
+  ownSuspensionDeadlines,
   parseSuspensionDeadlineRecord,
   SUSPENSION_DEADLINE_PAYLOAD_KEY,
   SUSPENSION_TIMEOUT_RESUME_KEY,
+  SUSPENSION_TIMER_PAYLOAD_KEY,
   type SuspensionDeadlineEntry,
   type SuspensionDeadlineRecord,
   suspensionDeadlinesOf,
   suspensionTimeoutResumeData,
+  suspensionTimerSteps,
   tombstoned,
 } from './suspension-deadline.js';
 
@@ -957,11 +960,10 @@ describe('isReadableRunSummary', () => {
     expect(isReadableRunSummary({ runId: 'run-1', status: 'running' })).toBe(
       true,
     );
-    // Including the shape this predicate cannot catch: Mastra's in-memory
-    // fallback reports the Run object's own status, and that is 'pending' for
-    // a run which has never been resumed — the dominant degraded read. Only
-    // the isFromInMemory marker inside RunnerRuntime.authoritativeStatus tells
-    // it from a run that genuinely has not started executing yet.
+    // A never-started Run's in-memory fallback reports pending; other retained
+    // Runs report their lifecycle status. authoritativeStatus rejects the
+    // isFromInMemory marker even when this self-consistency check accepts the
+    // projection.
     expect(isReadableRunSummary({ runId: 'run-1', status: 'pending' })).toBe(
       true,
     );
@@ -1159,5 +1161,86 @@ describe('mergeSuspensionDeadlines', () => {
     expect(nextSuspensionDeadlineAt(storedRecord(merged))).toBe(
       merged[1]?.deadlineAt,
     );
+  });
+});
+
+describe('suspensionTimerSteps', () => {
+  const timerPayload = {
+    [SUSPENSION_TIMER_PAYLOAD_KEY]: true,
+    [SUSPENSION_DEADLINE_PAYLOAD_KEY]: 900_000,
+  };
+  const timerEntry: SuspensionDeadlineEntry = {
+    step: 'wait',
+    deadlineAt: SUSPENDED_AT + 900_000,
+    suspendedAt: SUSPENDED_AT,
+    resumeCount: 0,
+  };
+  const waiting = (payload: unknown = timerPayload): RunSummary =>
+    suspendedSummary({
+      wait: { payload, suspendedAt: SUSPENDED_AT },
+      gate: { payload: { reason: 'approve' }, suspendedAt: SUSPENDED_AT },
+    });
+
+  it('lists a timer step and leaves an ordinary gate beside it unlisted', () => {
+    expect(suspensionTimerSteps(waiting(), undefined)).toEqual(['wait']);
+  });
+
+  it.each([
+    [
+      'a deadline without the marker',
+      { [SUSPENSION_DEADLINE_PAYLOAD_KEY]: 900_000 },
+    ],
+    ['the marker without a deadline', { [SUSPENSION_TIMER_PAYLOAD_KEY]: true }],
+    [
+      'a marker that is not true',
+      { ...timerPayload, [SUSPENSION_TIMER_PAYLOAD_KEY]: 'true' },
+    ],
+    [
+      'a deadline the arming refuses',
+      {
+        ...timerPayload,
+        [SUSPENSION_DEADLINE_PAYLOAD_KEY]: MIN_SUSPENSION_DEADLINE_MS - 1,
+      },
+    ],
+  ])('lists nothing for %s', (_label, payload) => {
+    expect(suspensionTimerSteps(waiting(payload), undefined)).toEqual([]);
+  });
+
+  it('leaves out a timer whose entry was abandoned for this suspension', () => {
+    expect(
+      suspensionTimerSteps(waiting(), storedRecord([tombstoned(timerEntry)])),
+    ).toEqual([]);
+  });
+
+  it.each([
+    [
+      'a retrying entry',
+      storedRecord([
+        { ...timerEntry, attempts: 2, nextAttemptAt: SUSPENDED_AT + 960_000 },
+      ]),
+    ],
+    [
+      'a tombstone for an earlier suspension',
+      storedRecord([
+        tombstoned({ ...timerEntry, suspendedAt: SUSPENDED_AT - 1 }),
+      ]),
+    ],
+  ])('keeps listing a timer beside %s', (_label, stored) => {
+    expect(suspensionTimerSteps(waiting(), stored)).toEqual(['wait']);
+  });
+});
+
+describe('ownSuspensionDeadlines', () => {
+  const stored = storedRecord([]);
+
+  it('keeps the record of this run', () => {
+    expect(ownSuspensionDeadlines(stored, 'gated', 'run-1')).toBe(stored);
+  });
+
+  it.each([
+    ['another workflow', 'other', 'run-1'],
+    ['another run', 'gated', 'run-2'],
+  ])('drops a record of %s', (_label, workflowId, runId) => {
+    expect(ownSuspensionDeadlines(stored, workflowId, runId)).toBeUndefined();
   });
 });

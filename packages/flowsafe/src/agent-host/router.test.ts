@@ -118,7 +118,7 @@ async function payload(response: Response): Promise<Record<string, unknown>> {
   return (await response.json()) as Record<string, unknown>;
 }
 
-class CReceiverContext implements ActorContext {
+class ReceiverContextFixture implements ActorContext {
   #base = context();
   actor = this.#base.actor;
   principal = this.#base.principal;
@@ -153,7 +153,7 @@ class CReceiverContext implements ActorContext {
   }
 }
 
-function cAgentTopology(response?: Response) {
+function agentTopologyFixture(response?: Response) {
   const hits: Array<{ threadId: string; init: ThreadRequestInit | undefined }> =
     [];
   const namespace: ThreadNamespaceLike<string> = {
@@ -175,13 +175,13 @@ function cAgentTopology(response?: Response) {
   };
 }
 
-describe('C public agent transport', () => {
+describe('public agent transport', () => {
   it.each([
     'class',
     'non-enumerable',
     'own',
-  ] as const)('C agent router retains original authority and method receivers through the real topology: %s', async (layout) => {
-    const source = new CReceiverContext();
+  ] as const)('agent router retains original authority and method receivers through the real topology: %s', async (layout) => {
+    const source = new ReceiverContextFixture();
     const methods = [
       'service',
       'newRunId',
@@ -212,7 +212,7 @@ describe('C public agent transport', () => {
       }
     }
     const originalPrincipal = source.principal;
-    const fixture = cAgentTopology();
+    const fixture = agentTopologyFixture();
     const start = vi.spyOn(fixture.host, 'start');
     const router = createAgentRouter({
       agents,
@@ -304,7 +304,7 @@ describe('C public agent transport', () => {
     'runOwnerGuard',
     'onPreparedStartIdentity',
     'startReservation',
-  ])('C agent route refuses public authority field %s', async (field) => {
+  ])('agent route refuses public authority field %s', async (field) => {
     const host = topology();
     const router = createAgentRouter({
       agents,
@@ -324,7 +324,7 @@ describe('C public agent transport', () => {
     expect(host.start).not.toHaveBeenCalled();
   });
 
-  it('FS8 D3 protected replay rejects a complete public start reservation', async () => {
+  it('protected replay rejects a complete public start reservation', async () => {
     const host = topology();
     const router = createAgentRouter({
       agents,
@@ -358,7 +358,7 @@ describe('C public agent transport', () => {
     expect(host.start).not.toHaveBeenCalled();
   });
 
-  it('C agent route retains direct invalid-epoch error data', async () => {
+  it('agent route retains direct invalid-epoch error data', async () => {
     const host = topology();
     const source = { ...context(), mutationEpoch: -1 };
     const router = createAgentRouter({
@@ -385,12 +385,12 @@ describe('C public agent transport', () => {
     'stale',
     'future',
     'invalid',
-  ] as const)('C agent route retains complete encoded epoch refusals: %s', async (classification) => {
+  ] as const)('agent route retains complete encoded epoch refusals: %s', async (classification) => {
     const error =
       classification === 'invalid'
         ? new InvalidMutationEpochError()
         : new MutationEpochMismatchError(classification, 2);
-    const fixture = cAgentTopology(doErrorResponse(error));
+    const fixture = agentTopologyFixture(doErrorResponse(error));
     const router = createAgentRouter({
       agents,
       resolve: async () => context(),

@@ -74,7 +74,7 @@ function d1Like(db: SqliteDatabase): ApprovalDatabase {
   return { prepare: (sql: string) => statement(sql, []) };
 }
 
-// --- D1 create-race harness (F3) -------------------------------------------
+// --- D1 create-race harness -----------------------------------------------
 
 // Fires at the instant the store-under-test executes a #openFor SELECT or an
 // INSERT run(), letting a test interleave a concurrent decide-close (or
@@ -483,7 +483,7 @@ function describeStoreContract(
       );
     });
 
-    it('throws on a garbage time bound with ZERO matching records too (F6: eager validation)', async () => {
+    it('eagerly validates a garbage time bound with zero matching records', async () => {
       // #given — an EMPTY bound store: no record reaches matchesFilter, so a
       // per-record parse never runs; a lazy in-memory list() would return []
       // where D1's appendListFilters throws unconditionally (types.ts: both
@@ -499,7 +499,7 @@ function describeStoreContract(
       );
     });
 
-    it('a fresh factory store throws on a garbage time bound with ZERO records too (F6)', async () => {
+    it('a fresh factory store throws on a garbage time bound with ZERO records too', async () => {
       // #given — an EMPTY backend. It must reject a garbage bound identically
       // to a populated store rather than skipping validation with no rows.
       const backend = makeBackend();
@@ -688,7 +688,7 @@ function describeStoreContract(
       expect(await store.get(record.id)).toMatchObject({ runId: 'safe-run' });
     });
 
-    // ---- pagination (D3: limit + cursor) -----------------------------------
+    // ---- pagination: limit + cursor ---------------------------------------
 
     it('paginates with limit and a cursor, reconstructing the unpaged list with no gaps or dupes', async () => {
       // #given — 5 records in one deployment
@@ -746,7 +746,7 @@ function describeStoreContract(
       ).rejects.toThrow();
     });
 
-    it('bounds a bare deployment list() while explicit cursor paging stays complete (D3)', async () => {
+    it('bounds a bare deployment list() while explicit cursor paging stays complete', async () => {
       // #given — one deployment holding more than the cap in a single queue
       const backend = makeBackend();
       const store = backend.store();
@@ -906,7 +906,7 @@ function describeStoreContract(
       expect(listed.map((r) => r.id)).toEqual([low.id, rogue.id]);
     });
 
-    // ---- metrics() (D3: SQL aggregate on D1, JS reduction in-memory) ------
+    // ---- metrics(): SQL aggregate on D1, JS reduction in-memory -----------
 
     it('metrics() matches the reference JS computation — mixed statuses, undecided, and a missing-decidedAt edge case', async () => {
       // #given — breached open, fresh open, ever-escalated open, two clean
@@ -1140,7 +1140,7 @@ describe('D1ApprovalStore persisted resume-target validation', () => {
   });
 });
 
-describe('D1ApprovalStore.create — concurrent decide-close race (F3)', () => {
+describe('D1ApprovalStore.create — concurrent decide-close race', () => {
   // The idempotent-create contract ("Decided requests never block a new one")
   // must survive a decide() closing the conflicting open row between the failed
   // INSERT and the #openFor SELECT. D1-only (the synchronous in-memory store

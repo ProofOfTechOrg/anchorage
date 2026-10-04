@@ -19,6 +19,7 @@ import {
   denyPatterns,
   type PolicyEvaluator,
   piiSecrets,
+  policyDenialReason,
 } from '../policy-engine/index.js';
 import { ACTOR_CONTEXT_KEY } from '../rbac/index.js';
 import {
@@ -341,6 +342,7 @@ async function runAdapter(
   method: (typeof LOOPS)[number],
   messages: unknown,
   policies: readonly PolicyEvaluator[],
+  allowedInputAssetOrigins?: readonly string[],
 ): Promise<Run> {
   const audit = new AuditLogger();
   const agent = createGuardedAgent({
@@ -350,6 +352,7 @@ async function runAdapter(
     model: await adapter.model(),
     allowedRoles: ['operator'],
     policies,
+    allowedInputAssetOrigins,
     audit,
     maxSteps: 1,
     toolChoice: 'auto',
@@ -1030,9 +1033,13 @@ describe('guarded tool-output content items at the JSON adapters', () => {
         const requests = recordRequests(chatCompletion);
 
         // #when
-        const run = await runAdapter(adapter, method, messages, [
-          denyPatterns([marker]),
-        ]);
+        const run = await runAdapter(
+          adapter,
+          method,
+          messages,
+          [denyPatterns([marker])],
+          ['https://example.invalid'],
+        );
 
         // #then
         expect({ name, method, tripwire: run.tripwire }).toEqual({
@@ -1839,7 +1846,7 @@ describe('guarded provider-executed tool results', () => {
       // #then
       expect({ method, tripwire: run.tripwire }).toEqual({
         method,
-        tripwire: expect.stringMatching(/^deny-patterns: /),
+        tripwire: policyDenialReason('deny-patterns', 'input'),
       });
       expect(requests).toEqual([]);
     }
@@ -1938,7 +1945,7 @@ describe('guarded provider-executed tool results', () => {
     expect(outcomes).toEqual(
       LOOPS.map((loop) => ({
         loop,
-        tripwire: expect.stringMatching(/^deny-patterns: /),
+        tripwire: policyDenialReason('deny-patterns', 'input'),
         requests: 0,
         sent: false,
       })),

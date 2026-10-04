@@ -12,10 +12,31 @@ export const RUN_LIFECYCLE_CONTEXT_KEY = 'flowsafe.runLifecycle';
 
 export type RunTerminalStatus = 'cancelled' | 'timed_out';
 
+const RUN_TERMINAL_ERROR_CODES = [
+  'CANCELLED',
+  'TIMED_OUT',
+  'INTERRUPTED',
+] as const;
+
 export interface RunTerminalErrorEnvelope {
-  code: 'CANCELLED' | 'TIMED_OUT';
+  code: (typeof RUN_TERMINAL_ERROR_CODES)[number];
   message: string;
 }
+
+/** The envelope a stored terminal record carries; an interruption has none. */
+type RunTerminalRecordError = RunTerminalErrorEnvelope & {
+  code: 'CANCELLED' | 'TIMED_OUT';
+};
+
+export function isRunTerminalErrorCode(
+  value: unknown,
+): value is RunTerminalErrorEnvelope['code'] {
+  return (RUN_TERMINAL_ERROR_CODES as readonly unknown[]).includes(value);
+}
+
+/** The `INTERRUPTED` envelope message of a run whose execution leg ended mid-step. */
+export const RUN_INTERRUPTED_MESSAGE =
+  'Run execution stopped mid-step before a durable outcome was recorded; external effects may have occurred. This run will not be automatically re-executed.';
 
 export interface RunLifecycleBlockedReason {
   code: 'DISPUTED_SETTLEMENT';
@@ -29,6 +50,20 @@ export class RunLifecycleBlockedError extends Error {
     super(reason.message);
     this.name = 'RunLifecycleBlockedError';
     this.reason = reason;
+  }
+}
+
+/**
+ * A snapshot write over a settled run row that does not advance the row's
+ * lifecycle: the settlement stands, and the writer (typically an execution leg
+ * still running on another instance) is refused.
+ */
+export class RunSettledConflictError extends Error {
+  constructor(workflowId: string, runId: string) {
+    super(
+      `run '${runId}' of workflow '${workflowId}' is already settled; the write does not advance its lifecycle`,
+    );
+    this.name = 'RunSettledConflictError';
   }
 }
 
@@ -64,6 +99,19 @@ export interface RunLifecycleState {
   revision: number;
   /** Epoch milliseconds. */
   deadlineAt?: number;
+  /**
+   * Epoch milliseconds at which the run object settled a run whose execution
+   * leg ended mid-step as `failed`. Only the run object writes it. A settling
+   * marker: see RUN_SETTLING_MARKERS.
+   */
+  interruptedAt?: number;
+  /**
+   * Epoch milliseconds at which start recovery ended a run whose start leg
+   * stopped as `StartOutcomeUnknown`. A settling marker only
+   * (RUN_SETTLING_MARKERS), so the guard refuses that leg's later writes; it
+   * is not part of the run's summary.
+   */
+  startOutcomeUnknownAt?: number;
   economicOperations?: RunEconomicOperation[];
   scheduleDispatch?: RunScheduleDispatch;
   transitionIntent?: {
@@ -75,7 +123,7 @@ export interface RunLifecycleState {
   };
   terminal?: {
     status: RunTerminalStatus;
-    error: RunTerminalErrorEnvelope;
+    error: RunTerminalRecordError;
     transitionedAt: number;
     /** Exact identities allowed to replay this terminal transition after ownership release. */
     replayPrincipals: RunLifecyclePrincipal[];
@@ -83,6 +131,29 @@ export interface RunLifecycleState {
     cleanupCompletedAt?: number;
   };
 }
+
+/**
+ * Lifecycle fields whose presence settles a run row. A write over a settled
+ * row is admitted only when it advances the revision and carries
+ * RUN_SETTLED_IDENTITY_PATHS unchanged; `FencedWorkflowsStorageD1` renders its
+ * settled-row guard from both lists.
+ */
+export const RUN_SETTLING_MARKERS = [
+  'terminal',
+  'interruptedAt',
+  'startOutcomeUnknownAt',
+] as const satisfies readonly (keyof RunLifecycleState)[];
+
+type RunSettledIdentityPath =
+  | Exclude<(typeof RUN_SETTLING_MARKERS)[number], 'terminal'>
+  | `terminal.${keyof NonNullable<RunLifecycleState['terminal']>}`;
+
+export const RUN_SETTLED_IDENTITY_PATHS = [
+  'interruptedAt',
+  'startOutcomeUnknownAt',
+  'terminal.status',
+  'terminal.transitionedAt',
+] as const satisfies readonly RunSettledIdentityPath[];
 
 export function nextLifecycleRevision(current: number): number {
   if (
@@ -92,6 +163,19 @@ export function nextLifecycleRevision(current: number): number {
   )
     throw new Error('run lifecycle revision cannot advance');
   return current + 1;
+}
+
+/** The next revision of a lifecycle, or of a new one, with `patch` applied. */
+export function advanceLifecycle(
+  lifecycle: RunLifecycleState | undefined,
+  patch: Omit<Partial<RunLifecycleState>, 'version' | 'revision'>,
+): RunLifecycleState {
+  return {
+    ...lifecycle,
+    ...patch,
+    version: 1,
+    revision: nextLifecycleRevision(lifecycle?.revision ?? 0),
+  };
 }
 
 export function terminalCleanupFor(
@@ -311,7 +395,10 @@ export function parseRunLifecycle(
     stored?.version !== 1 ||
     !Number.isSafeInteger(stored.revision) ||
     (stored.revision as number) < 1 ||
-    (stored.deadlineAt !== undefined && !validTime(stored.deadlineAt))
+    (stored.deadlineAt !== undefined && !validTime(stored.deadlineAt)) ||
+    (stored.interruptedAt !== undefined && !validTime(stored.interruptedAt)) ||
+    (stored.startOutcomeUnknownAt !== undefined &&
+      !validTime(stored.startOutcomeUnknownAt))
   ) {
     throw new Error('stored run lifecycle is malformed');
   }
@@ -321,6 +408,12 @@ export function parseRunLifecycle(
     ...(stored.deadlineAt === undefined
       ? {}
       : { deadlineAt: stored.deadlineAt as number }),
+    ...(stored.interruptedAt === undefined
+      ? {}
+      : { interruptedAt: stored.interruptedAt as number }),
+    ...(stored.startOutcomeUnknownAt === undefined
+      ? {}
+      : { startOutcomeUnknownAt: stored.startOutcomeUnknownAt as number }),
     ...(stored.economicOperations === undefined
       ? {}
       : { economicOperations: economicOperations(stored.economicOperations) }),

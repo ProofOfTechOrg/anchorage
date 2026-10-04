@@ -127,7 +127,7 @@ function request(
   );
 }
 
-function cDeferred() {
+function deferredSignal() {
   let resolve = () => {};
   const promise = new Promise<void>((done) => {
     resolve = done;
@@ -135,13 +135,13 @@ function cDeferred() {
   return { promise, resolve };
 }
 
-describe('FS8 D3 host activation', () => {
+describe('host activation', () => {
   it.each([
     'replacement',
     undefined,
   ])('passes the verified alarm tag after the environment changes to %s', async (replacement) => {
-    const entered = cDeferred();
-    const release = cDeferred();
+    const entered = deferredSignal();
+    const release = deferredSignal();
     const identity = deploymentIdentityDatabase();
     const setAlarm = vi.fn(async () => {});
     const env = {
@@ -197,9 +197,9 @@ describe('ThreadDurableObject identity boundary', () => {
     0,
     2,
     Number.MAX_SAFE_INTEGER,
-  ])('C captures thread headers before deployment verification: %s', async (epoch) => {
-    const entered = cDeferred();
-    const release = cDeferred();
+  ])('captures thread headers before deployment verification: %s', async (epoch) => {
+    const entered = deferredSignal();
+    const release = deferredSignal();
     const identity = deploymentIdentityDatabase();
     const thread = new TestThread(
       {
@@ -316,7 +316,7 @@ describe('ThreadDurableObject identity boundary', () => {
       400,
       'mutationEpoch must be a nonnegative safe integer or undefined',
     ],
-  ] as const)('C thread ingress preserves combined-invalid precedence: %s', async (_label, name, principal, storedTag, secret, status, message) => {
+  ] as const)('thread ingress preserves combined-invalid precedence: %s', async (_label, name, principal, storedTag, secret, status, message) => {
     const events: string[] = [];
     const thread = threadWith(name, { storedTag, events });
     const input = request(principal === true, secret);

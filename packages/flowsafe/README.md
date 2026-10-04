@@ -9,7 +9,7 @@ Flowsafe runs Mastra workflows and agents through Cloudflare Durable Objects, st
 ## Install
 
 ```bash
-npm install @mastra/core@1.67.0 @proofoftech/flowsafe
+npm install @mastra/core@1.73.0 @proofoftech/flowsafe
 ```
 
 Install `@proofoftech/breakwater` when resumed steps call approval-protected connectors:
@@ -18,6 +18,8 @@ Install `@proofoftech/breakwater` when resumed steps call approval-protected con
 npm install @proofoftech/breakwater
 ```
 
+Guarded durable calls follow the [durable call-option restrictions](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/durable-agents.md#durable-call-options).
+
 Install React and React DOM only when you import `@proofoftech/flowsafe/approval-ui`.
 
 Compatibility:
@@ -25,9 +27,9 @@ Compatibility:
 - Node.js 22.13.0 or later (engine range `>=22.13.0`)
 - ESM only
 - TypeScript `moduleResolution: "NodeNext"`, `"Node16"`, or `"Bundler"`
-- `@mastra/core` `1.67.0`
+- `@mastra/core` `1.73.0`
 - `react` and `react-dom` `>=18 <20` (React 18 or 19) for the optional approval UI
-- `@proofoftech/breakwater` `>=0.16.0 <1.0.0` when used
+- `@proofoftech/breakwater` `>=0.17.0 <1.0.0` when used
 - host-provided Wrangler `>=4.118 <5` for the optional `flowsafe-provision` CLI
 
 ## Choose an export
@@ -103,7 +105,9 @@ export class AppRunner extends DurableObjectRunner<Env> {
 }
 ```
 
-`init()` creates D1-backed Mastra storage from the conventional `DB` binding unless you inject storage. Workflow definitions use the same `createWorkflow()` and `createStep()` shape as Mastra. Flowsafe pins `@mastra/cloudflare-d1` 1.3.2 because the shipped D1 storage is written against that release's domain surface: it subclasses the adapter's background-tasks domain to apply the `TaskFilter.resourceId` predicate the adapter accepts but omits from its SQL builder, and hand-writes the schedules, notifications, and thread-state domains the adapter does not ship at all. `D1StorageOptions.domains` accepts host-supplied `workflowDefinitions` and `knowledge` domains, which have no D1-backed defaults. The pin also holds the adapter on its `@cloudflare/workers-types` v4 peer, which is the major Flowsafe still builds against.
+`init()` creates D1-backed Mastra storage from the conventional `DB` binding unless you inject storage. Workflow definitions use the same `createWorkflow()` and `createStep()` shape as Mastra. Flowsafe pins `@mastra/cloudflare-d1` `1.4.0` because the shipped D1 storage is written against that release's domain surface: it subclasses the adapter's background-tasks domain to apply the `TaskFilter.resourceId` predicate the adapter accepts but omits from its SQL builder, and hand-writes the schedules, notifications, and thread-state domains the adapter does not ship at all. `D1StorageOptions.domains` accepts host-supplied `workflowDefinitions` and `knowledge` domains, which have no D1-backed defaults. The pin also holds the adapter on its `@cloudflare/workers-types` v4 peer, which is the major Flowsafe still builds against.
+
+Storage initialization (`init()`) adds `ownerId` and `leaseExpiresAt` to `mastra_background_tasks` with additive `ALTER TABLE … ADD COLUMN` statements. No manual migration is needed. Mastra's background-task manager claims tasks with a lease, renews it while running, skips live leases during recovery, and clears the lease on suspension. Recovery reclaims running tasks with expired or absent leases. Flowsafe continues applying the `resourceId` filter that the D1 adapter's `listTasks` omits.
 
 If the deployment uses a table prefix, pass one shared constant to storage and host maintenance:
 
@@ -152,9 +156,24 @@ The composed host mounts `POST /runs/:workflowId/:runId/terminate`. It transitio
 
 Termination is idempotent. A retry by the same trusted principal returns the persisted terminal summary after ownership cleanup. An unrelated principal receives the same opaque `404` as any inaccessible run. A disputed economic settlement returns `409` with `reason.code` set to `DISPUTED_SETTLEMENT` before the runtime cancels active work.
 
+A run whose execution leg stops mid-step, because the platform ended the Durable Object invocation, does not stay `running`. A running leg marks its run row in D1 every 30 seconds. Once the row has gone six minutes without a write, the run's own object settles it on its next wake, and it never re-executes the interrupted step:
+
+```json
+{
+  "status": "failed",
+  "error": "Run execution stopped mid-step before a durable outcome was recorded; external effects may have occurred. This run will not be automatically re-executed.",
+  "errorEnvelope": {
+    "code": "INTERRUPTED",
+    "message": "Run execution stopped mid-step before a durable outcome was recorded; external effects may have occurred. This run will not be automatically re-executed."
+  }
+}
+```
+
+A run with a recorded cancellation or timeout completes that transition instead. A deploy does not interrupt a leg: the outgoing instance keeps running it, and its touches keep the run from being settled. A Workers runtime update gives in-flight requests at most 30 seconds, so it interrupts a longer leg. Without a connected client, a Durable Object invocation lasts about 15 minutes, so each step must finish within one. Split long work into steps, and [wait without an approval](#wait-without-an-approval) rather than in an in-memory polling loop. Settlement needs the `FencedWorkflowsStorageD1` workflow domain that `createD1Storage()` composes; terminate a stranded run on other storage. See [interrupted legs](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/do-runner-design.md#interrupted-legs).
+
 Economic settlement projections are trusted internal `StartRunOptions.economicOperations` and `ResumeRunOptions.economicOperations` inputs. The host fixes the projection at an execution-leg boundary before that leg becomes cancellable. Public start and resume bodies cannot set it, and Flowsafe does not expose a dynamic mid-leg update API.
 
-The terminal snapshot commits before lifecycle cleanup. Cleanup abandons open approvals, discards an executing agent-schedule receipt, releases run ownership, and then records completion. A crash between those steps reuses the terminal snapshot as its retry anchor. Hosts that compose the run route must override `DurableObjectRunner.runLifecycle()`; use `createFlowsafeRunnerLifecycle()` so approval cleanup uses the same approval service and separation-of-duties configuration as the Worker.
+The terminal snapshot commits before lifecycle cleanup. Cleanup abandons open approvals, discards an executing agent-schedule receipt, releases run ownership, and then records completion. A crash between those steps reuses the terminal snapshot as its retry anchor. Hosts that compose the run route must override `DurableObjectRunner.runLifecycle()`; use `createFlowsafeRunnerLifecycle()` so approval cleanup, and the approvals the run object files from its alarm, use the same approval service and separation-of-duties configuration as the Worker.
 
 `POST /runs` and the resume body accept an optional nonnegative `deadlineMs`. Resume replaces the prior deadline relative to the accepted resume leg. `RunSummary.deadlineAt` exposes the persisted epoch-millisecond deadline. The independent deadline maintenance duty sends a compare-and-swap request to the owner Durable Object and transitions each expired run once:
 
@@ -202,15 +221,46 @@ const gate = createStep({
 });
 ```
 
-Use `isArmableSuspensionDeadlineMs(value)` to validate relative milliseconds against the runner's safe-integer and inclusive duration bounds. Import it, those duration bounds and the reserved payload keys from `@proofoftech/flowsafe/do-runner/constants` to avoid loading the runner graph; the per-run cap `MAX_SUSPENSION_DEADLINES_PER_RUN` comes from `@proofoftech/flowsafe/do-runner`. A step declaring a Zod `suspendSchema` must declare the reserved field or use a loose object, because Mastra replaces the suspend payload with parsed output. Its `resumeSchema` must accept the timeout envelope as well as the signal shape.
+Use `isArmableSuspensionDeadlineMs(value)` to validate relative milliseconds against the runner's safe-integer and inclusive duration bounds. Import it, those duration bounds and the reserved payload keys from `@proofoftech/flowsafe/do-runner/constants` to avoid loading the runner graph; the per-run cap `MAX_SUSPENSION_DEADLINES_PER_RUN` comes from `@proofoftech/flowsafe/do-runner`. A step declaring a Zod `suspendSchema` must declare the reserved fields it sets, the timer marker included, or use a loose object, because Mastra replaces the suspend payload with parsed output. Its `resumeSchema` must accept the timeout envelope as well as the signal shape.
 
-For workflow tests, import `suspensionTimeoutResumeData` from `@proofoftech/flowsafe/do-runner/testing` and call it with `{ step, deadlineAt }` and an expiry time. It returns the alarm's envelope shape; `isSuspensionTimeoutResumeData` checks that shape without authenticating its origin. Public resume requests containing the reserved key are rejected. Alarm resumes record system provenance and do not grant approval.
+For workflow tests, import `suspensionTimeoutResumeData` from `@proofoftech/flowsafe/do-runner/testing` and call it with `{ step, deadlineAt }` and an expiry time. It returns the alarm's envelope shape; `isSuspensionTimeoutResumeData` checks that shape without authenticating its origin. Public resume requests containing the reserved key are rejected. An alarm resume keeps the run's recorded requester, so separation of duties applies to the next gate as it would without the timeout, and it grants no approval.
 
 Import `suspensionDeadlinesOf` from `@proofoftech/flowsafe/do-runner` to inspect a `RunSummary`. It returns derived entries and rejected requests without scheduling a wake or mutating the summary. See the [acceptance rules](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/do-runner-design.md#inspect-and-test-suspension-deadlines).
 
 Only a top-level suspended step can arm a deadline. A step suspended inside a nested workflow is reported under the nested path while its suspension time is recorded against the enclosing step, so there is nothing to fence the resume against; the deadline is refused and logged instead of armed.
 
 Wake precision is the Durable Object alarm's, and there is no maintenance-sweep backstop for it, so treat a suspension deadline as best-effort near its due time. Run-level `deadlineMs` remains the swept mechanism. `MAX_SUSPENSION_DEADLINES_PER_RUN` caps how many deadlines one run arms; the stored record, its parser, and the wake arithmetic stay inside the run's Durable Object, because nothing outside it can act on that state safely. Suspension deadlines apply to `DurableObjectRunner`-hosted workflow runs; durable agents keep their own resume path.
+
+#### Wait without an approval
+
+A step that only waits, such as a poll between attempts, suspends as a timer: it sets `SUSPENSION_TIMER_PAYLOAD_KEY` to `true` beside its deadline. The run's Durable Object resumes the step when the deadline expires, lists the step in `RunSummary.suspensionTimers`, and the approval bridges file no approval for it. A run that must outlast one Durable Object invocation, about 15 minutes without a connected client, waits this way between steps.
+
+```ts
+import {
+  SUSPENSION_DEADLINE_PAYLOAD_KEY,
+  SUSPENSION_TIMER_PAYLOAD_KEY,
+} from '@proofoftech/flowsafe/do-runner/constants';
+
+const poll = createStep({
+  id: 'poll',
+  inputSchema: z.object({ jobId: z.string() }),
+  outputSchema: z.object({ jobId: z.string() }),
+  execute: async ({ inputData, suspend }) => {
+    // Checked on every resume, whatever resumed the step.
+    if (!(await jobFinished(inputData.jobId))) {
+      return suspend({
+        [SUSPENSION_TIMER_PAYLOAD_KEY]: true,
+        [SUSPENSION_DEADLINE_PAYLOAD_KEY]: 60_000,
+      });
+    }
+    return { jobId: inputData.jobId };
+  },
+});
+```
+
+A timer can still receive an approval: the run object lists a step only while it can vouch for the wake, and every other case files an ordinary approval (see [timer suspensions](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/do-runner-design.md#timer-suspensions)). So a timer step accepts an approval decision's `{ approved, comment?, decidedBy? }` as well as the timeout envelope, in its `resumeSchema` and its branch, and re-checks its wait condition on every resume rather than treating any resume as permission to proceed. The run object files the approvals a timer leaves to a person through the `reconcileApprovals` hook that `createFlowsafeRunnerLifecycle()` fills; see [approvals the run object files](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/do-runner-design.md#approvals-the-run-object-files) for when it files and what it leaves to a host status read.
+
+The marker lives in the step's suspend payload, so a step that spreads untrusted data into that payload can make a gate wait without an approval for up to the deadline. A `foreach` with `concurrency` above 1 reports one payload for its suspended iterations, so one iteration's marker applies to the batch.
 
 Read the [Durable Object runner design](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/do-runner-design.md) for the suspension fence, the stored record, and the failure modes.
 

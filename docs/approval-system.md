@@ -51,11 +51,13 @@ Only terminal records are eligible for approval retention. An old open request i
 - `workflowId` and server-minted `runId`
 - the suspended `stepPath`
 - `suspendedAt` and the runtime-owned `resumeCount`
-- `requestedBy` and `requestedByKind` from the execution principal that advanced the run; a human approval resume is attributed to its decider
+- `requestedBy` and `requestedByKind` from the execution principal that advanced the run; a human approval resume is attributed to its decider, and a suspension-deadline resume keeps the run's recorded requester
 - `connectors` from the server-authored suspend payload
 - `grantScope` derived by the service
 - `toolCallId` from a durable-agent approval suspension
 - an optional server-authored durable-agent `resumeTarget`
+
+It files nothing for a step listed in `RunSummary.suspensionTimers`: the run's Durable Object resumes that step itself (see [timer suspensions](do-runner-design.md#timer-suspensions)).
 
 The HTTP create route is disabled by default. If a host enables it, the router requires write access to the named run and rejects every field that could select a capability, change attribution, or choose a resume target. An HTTP-created request can collect a human decision, but cannot mint a connector grant or resume execution.
 
@@ -173,7 +175,7 @@ Recovery rules:
 1. Read the stored record and authoritative run status.
 2. Do not create another approval for the same suspension.
 3. For a workflow, invoke the trusted resume bridge again.
-4. For a durable agent, validate the persisted memory binding and redrive the trusted approval-resume bridge. It derives fresh trusted context and invokes only RBAC's `processInput` hook during rehydration. It then restores both Mastra registries with the complete runtime processor lists, observes and registers the stream, and resumes through `RunnerRuntime`.
+4. For a durable agent, validate the persisted memory binding and redrive the trusted approval-resume bridge. It derives fresh trusted context and invokes [only Breakwater's reserved `processInput` steps](durable-agents.md#host-a-guarded-agent-catalog) during rehydration. It then restores both Mastra registries with the complete runtime processor lists, observes and registers the stream, and resumes through `RunnerRuntime`.
 5. Let `approvalGrantProvider()` derive the same approved capability from D1.
 6. If the run immediately suspends at another gate, queue a new approval for the new fingerprint.
 

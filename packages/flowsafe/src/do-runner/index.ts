@@ -252,6 +252,7 @@ export {
   RunLifecycleBlockedError,
   RunNotSuspendedError,
   RunnerRuntime,
+  RunSettledConflictError,
   RunStateUnreadableError,
   RunTerminalConflictError,
   UnknownRunError,
@@ -338,6 +339,7 @@ export {
   SUSPENSION_DEADLINE_PAYLOAD_KEY,
   SUSPENSION_DEADLINE_PRINCIPAL_ID,
   SUSPENSION_TIMEOUT_RESUME_KEY,
+  SUSPENSION_TIMER_PAYLOAD_KEY,
   suspensionDeadlinesOf,
 } from './suspension-deadline.js';
 export type { ThreadScope } from './thread-do.js';

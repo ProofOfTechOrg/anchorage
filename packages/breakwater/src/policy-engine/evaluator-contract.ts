@@ -41,13 +41,13 @@ export interface PolicyContext {
   channel: OutputChannel;
   /**
    * The gated messages. In the input phase, the messages `text` is read from:
-   * the message list's non-system messages whose id memory does not hold. On
-   * Mastra's durable loop these are the list's input messages; on
+   * the message list's non-system caller messages. On
+   * Mastra's durable loop these come from the list's input messages; on
    * `generate()` and `stream()` they also include the context and response
-   * messages a guarded agent's application input processors added. History
-   * memory loads, a message such a processor added with source `memory`, and
-   * any message whose id memory holds, a history message a processor rewrote
-   * included, are never among them. Empty during streaming output —
+   * messages a guarded agent's application input processors add. For a
+   * guarded agent, a message in both memory and input is represented by a
+   * copy restricted to the client tool outcomes the caller sends. History
+   * outside the call's input is excluded. Empty during streaming output —
    * processOutputStream exposes no discrete messages — and empty at a
    * standalone `createContentPolicyGate` boundary, which has only the
    * rendered text.
@@ -57,9 +57,13 @@ export interface PolicyContext {
    * Concatenated text of the gated content: input messages, one channel of
    * the streamed output accumulated so far, or the final output result.
    * Inside a guarded agent the input text also holds the text of each system
-   * message and each other message its application input processors added or
-   * changed, once for each version a processor left it in; a version still
-   * among `messages` is read there, not again.
+   * message and each other message its application input processors add or
+   * change, and a remembered message carrying the caller's client tool
+   * outcome that one of them keeps but moves out of the input, read whole
+   * with its stored history. Each recorded version contributes text, including
+   * the version the `breakwater-client-tool-output` step leaves after mapping
+   * results in a message of the call's input; a version still among `messages`
+   * is read there, not again.
    */
   text: string;
   /** Mastra request context associated with the agent call. */

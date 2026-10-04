@@ -8,7 +8,7 @@ import type {
 } from '@mastra/core/processors';
 import { RequestContext } from '@mastra/core/request-context';
 import { ChunkFrom, type ChunkType } from '@mastra/core/stream';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { AuditLogger } from '../audit/index.js';
 import { HIGH_ENTROPY_CANDIDATE_RE } from './content-inspection.js';
@@ -20,6 +20,7 @@ import {
   type PolicyContext,
   PolicyEngine,
   piiSecrets,
+  policyDenialReason,
 } from './index.js';
 import type { PolicyDecision } from './tool-policy.js';
 
@@ -892,6 +893,119 @@ describe('piiSecrets', () => {
   });
 
   describe('streaming (via a real PolicyEngine)', () => {
+    it('denies a spaced card that completes after the rescan window start', async () => {
+      // #given — the second delta's window starts at the card's first digit.
+      const policy = piiSecrets({ detectors: ['creditCard'] });
+      const maxEnabledSpan = (policy.holdBackChars ?? 0) + 1;
+      const engine = new PolicyEngine({ policies: [policy] });
+      const state: Record<string, unknown> = {};
+      const card = '4000000000000000006'.split('').join(' ');
+      const text = '9 '.repeat(19) + card;
+      const first = textDelta(
+        text.slice(0, text.length - card.length + maxEnabledSpan - 1),
+      );
+      const second = textDelta('6');
+
+      // #when
+      await expect(
+        engine.processOutputStream(makeStreamArgs([first], state)),
+      ).resolves.toStrictEqual(first);
+
+      // #then
+      await expect(
+        engine.processOutputStream(makeStreamArgs([first, second], state)),
+      ).rejects.toThrowError(policyDenialReason('pii-secrets', 'output'));
+    });
+
+    it('denies a high-entropy token that starts at the rescan window start', async () => {
+      // #given — the second delta's window starts at the digit after the A run.
+      const policy = piiSecrets({ detectors: ['highEntropy'] });
+      const maxEnabledSpan = (policy.holdBackChars ?? 0) + 1;
+      const engine = new PolicyEngine({ policies: [policy] });
+      const state: Record<string, unknown> = {};
+      const secret =
+        '0' +
+        'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.repeat(9) +
+        'ABCDEFGHIJKLMNOPQRST' +
+        'a';
+      const first = textDelta(
+        'A'.repeat(maxEnabledSpan) + secret.slice(0, maxEnabledSpan - 1),
+      );
+      const second = textDelta(secret.slice(maxEnabledSpan - 1));
+
+      // #when
+      await expect(
+        engine.processOutputStream(makeStreamArgs([first], state)),
+      ).resolves.toStrictEqual(first);
+
+      // #then
+      await expect(
+        engine.processOutputStream(makeStreamArgs([first, second], state)),
+      ).rejects.toThrowError(policyDenialReason('pii-secrets', 'output'));
+    });
+
+    it('does not deny an SSN the rescan window cuts from a longer word when ssn is the only detector', async () => {
+      // #given — the second delta's window starts right after the leading a.
+      const policy = piiSecrets({ detectors: ['ssn'] });
+      const maxEnabledSpan = (policy.holdBackChars ?? 0) + 1;
+      const engine = new PolicyEngine({ policies: [policy] });
+      const state: Record<string, unknown> = {};
+      const text = 'a123-45-6789 ok';
+      const first = textDelta(text.slice(0, maxEnabledSpan));
+      const second = textDelta(text.slice(maxEnabledSpan));
+
+      // #when
+      await expect(
+        engine.processOutputStream(makeStreamArgs([first], state)),
+      ).resolves.toStrictEqual(first);
+
+      // #then
+      await expect(
+        engine.processOutputStream(makeStreamArgs([first, second], state)),
+      ).resolves.toStrictEqual(second);
+    });
+
+    it('does not deny an AWS access key the rescan window cuts from a longer word when awsAccessKey is the only detector', async () => {
+      // #given — the second delta's window starts right after the leading x.
+      const policy = piiSecrets({ detectors: ['awsAccessKey'] });
+      const maxEnabledSpan = (policy.holdBackChars ?? 0) + 1;
+      const engine = new PolicyEngine({ policies: [policy] });
+      const state: Record<string, unknown> = {};
+      const text = `xAKIA${'A'.repeat(16)} ok`;
+      const first = textDelta(text.slice(0, maxEnabledSpan));
+      const second = textDelta(text.slice(maxEnabledSpan));
+
+      // #when
+      await expect(
+        engine.processOutputStream(makeStreamArgs([first], state)),
+      ).resolves.toStrictEqual(first);
+
+      // #then
+      await expect(
+        engine.processOutputStream(makeStreamArgs([first, second], state)),
+      ).resolves.toStrictEqual(second);
+    });
+
+    it('denies a cut SSN when another detector is enabled', async () => {
+      // #given — the second delta's window starts right after the V.
+      const policy = piiSecrets();
+      const maxEnabledSpan = (policy.holdBackChars ?? 0) + 1;
+      const engine = new PolicyEngine({ policies: [policy] });
+      const state: Record<string, unknown> = {};
+      const first = textDelta('INV123-45-6789'.padEnd(3 + maxEnabledSpan - 1));
+      const second = textDelta(' more');
+
+      // #when
+      await expect(
+        engine.processOutputStream(makeStreamArgs([first], state)),
+      ).resolves.toStrictEqual(first);
+
+      // #then
+      await expect(
+        engine.processOutputStream(makeStreamArgs([first, second], state)),
+      ).rejects.toThrowError(policyDenialReason('pii-secrets', 'output'));
+    });
+
     it('catches a secret split across 1-char stream chunks on the completing chunk', async () => {
       // #given — ssn only, so maxEnabledSpan=11 keeps the rescan window
       // narrow enough to meaningfully exercise the windowing arithmetic; the
@@ -916,7 +1030,7 @@ describe('piiSecrets', () => {
       parts.push(textDelta(fullText[fullText.length - 1] ?? ''));
       await expect(
         engine.processOutputStream(makeStreamArgs([...parts], state)),
-      ).rejects.toThrow(/ssn detected/);
+      ).rejects.toThrowError(policyDenialReason('pii-secrets', 'output'));
     });
 
     it('rescans the full object-channel snapshot on every call (never incremental)', async () => {
@@ -936,7 +1050,7 @@ describe('piiSecrets', () => {
       // #then — the REPLACEMENT snapshot (not a delta) is fully rescanned
       await expect(
         engine.processOutputStream(makeStreamArgs([withEmail], state)),
-      ).rejects.toThrow(/email detected/);
+      ).rejects.toThrowError(policyDenialReason('pii-secrets', 'output'));
     });
 
     it('emits no char of a violating span when holdBack is on', async () => {
@@ -964,7 +1078,7 @@ describe('piiSecrets', () => {
       // ...the second chunk completes the SSN and aborts
       await expect(
         engine.processOutputStream(makeStreamArgs(chunks, state)),
-      ).rejects.toThrow(/ssn detected/);
+      ).rejects.toThrowError(policyDenialReason('pii-secrets', 'output'));
 
       // #then — nothing emitted contains any char of the SSN span
       expect(emitted.join('')).toBe('..');
@@ -1164,12 +1278,13 @@ describe('classifierPolicy', () => {
   describe('deny aborts', () => {
     it('aborts the stream when classify denies', async () => {
       // #given
+      const marker = 'flagged as unsafe';
       const engine = new PolicyEngine({
         policies: [
           classifierPolicy({
             classify: async () => ({
               allowed: false,
-              reason: 'flagged as unsafe',
+              reason: marker,
             }),
             evaluateEveryChars: 1,
           }),
@@ -1177,91 +1292,117 @@ describe('classifierPolicy', () => {
       });
 
       // #when / #then
-      await expect(
-        engine.processOutputStream(makeStreamArgs([textDelta('x')])),
-      ).rejects.toThrow(/classifier: flagged as unsafe/);
+      const failure = await engine
+        .processOutputStream(makeStreamArgs([textDelta('x')]))
+        .catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(Error);
+      expect((failure as Error).message).toBe(
+        policyDenialReason('classifier', 'output'),
+      );
+      expect((failure as Error).message).not.toContain(marker);
     });
   });
 
   describe('fail-closed', () => {
-    it('fails closed when classify throws synchronously', async () => {
+    it.each([
+      [
+        'synchronous',
+        (message: string): PolicyDecision => {
+          throw new Error(message);
+        },
+      ],
+      [
+        'asynchronous',
+        async (message: string): Promise<PolicyDecision> => {
+          throw new Error(message);
+        },
+      ],
+    ] as const)('discards %s classifier exception details at the final result', async (_label, classify) => {
       // #given
+      const sentinel = 'sk_live_sentinel';
+      const message = 'classifier exploded';
       const engine = new PolicyEngine({
         policies: [
           classifierPolicy({
-            classify: () => {
-              throw new Error('classifier exploded');
-            },
+            classify: () => classify(`${message} on ${sentinel}`),
           }),
         ],
       });
 
       // #when / #then
-      await expect(
-        engine.processOutputResult(makeOutputArgs('anything')),
-      ).rejects.toThrow('classifier exploded');
-    });
-
-    it('fails closed when classify rejects', async () => {
-      // #given
-      const engine = new PolicyEngine({
-        policies: [
-          classifierPolicy({
-            classify: async () => {
-              throw new Error('async classifier failure');
-            },
-          }),
-        ],
-      });
-
-      // #when / #then
-      await expect(
-        engine.processOutputResult(makeOutputArgs('anything')),
-      ).rejects.toThrow('async classifier failure');
+      const thrown = await engine
+        .processOutputResult(makeOutputArgs('anything'))
+        .catch((error: unknown) => error);
+      expect(thrown).toBeInstanceOf(Error);
+      const failure = thrown as Error;
+      for (const text of [
+        failure.message,
+        String(failure),
+        String(failure.cause),
+      ]) {
+        expect(text).not.toContain(sentinel);
+        expect(text).not.toContain(message);
+      }
+      expect(failure.cause).toBeUndefined();
+      expect(failure.message).toBe('policy evaluation failed');
     });
 
     it('fails closed when classify exceeds timeoutMs', async () => {
-      // #given — never settles on its own
-      const engine = new PolicyEngine({
-        policies: [
-          classifierPolicy({
-            classify: () => new Promise<PolicyDecision>(() => {}),
-            timeoutMs: 20,
-            name: 'slow-classifier',
-          }),
-        ],
-      });
+      vi.useFakeTimers();
+      try {
+        // #given — never settles on its own
+        const engine = new PolicyEngine({
+          policies: [
+            classifierPolicy({
+              classify: () => new Promise<PolicyDecision>(() => {}),
+              timeoutMs: 20,
+            }),
+          ],
+        });
 
-      // #when / #then
-      await expect(
-        engine.processOutputResult(makeOutputArgs('anything')),
-      ).rejects.toThrow(/slow-classifier timed out after 20ms/);
+        // #when
+        const failure = expect(
+          engine.processOutputResult(makeOutputArgs('anything')),
+        ).rejects.toThrow('policy evaluation failed');
+        await vi.advanceTimersByTimeAsync(20);
+
+        // #then
+        await failure;
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it('does not crash when a slow classify eventually rejects after its own timeout already fired', async () => {
-      // #given — the timeout (5ms) wins the race; classify's own later
-      // rejection (15ms) must still be handled, never an unhandled rejection
-      const engine = new PolicyEngine({
-        policies: [
-          classifierPolicy({
-            classify: () =>
-              new Promise<PolicyDecision>((_resolve, reject) => {
-                setTimeout(() => reject(new Error('late failure')), 15);
-              }),
-            timeoutMs: 5,
-            name: 'late-classifier',
-          }),
-        ],
-      });
+      vi.useFakeTimers();
+      try {
+        // #given
+        let rejectClassify!: (reason: Error) => void;
+        const engine = new PolicyEngine({
+          policies: [
+            classifierPolicy({
+              classify: () =>
+                new Promise<PolicyDecision>((_resolve, reject) => {
+                  rejectClassify = reject;
+                }),
+              timeoutMs: 5,
+            }),
+          ],
+        });
 
-      // #when / #then — the timeout error wins, not the classifier's own reason
-      await expect(
-        engine.processOutputResult(makeOutputArgs('anything')),
-      ).rejects.toThrow(/late-classifier timed out after 5ms/);
+        // #when
+        const failure = expect(
+          engine.processOutputResult(makeOutputArgs('anything')),
+        ).rejects.toThrow('policy evaluation failed');
+        await vi.advanceTimersByTimeAsync(5);
 
-      // give the classifier's now-irrelevant rejection a chance to fire;
-      // an unhandled rejection here would surface as a process warning
-      await new Promise((resolve) => setTimeout(resolve, 30));
+        // #then
+        await failure;
+        rejectClassify(new Error('late failure'));
+        await vi.advanceTimersByTimeAsync(0);
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 });

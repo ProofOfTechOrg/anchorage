@@ -18,7 +18,7 @@ import {
   terminalCleanupFor,
 } from './run-lifecycle.js';
 
-describe('C dense economic-operation format', () => {
+describe('dense economic-operation format', () => {
   const entries = [
     { id: 'first', settlementState: 'settled' },
     { id: 'second', settlementState: 'held' },
@@ -30,7 +30,7 @@ describe('C dense economic-operation format', () => {
     'interior',
     'trailing',
     'all-hole',
-  ] as const)('C rejects sparse economic operations in the shared lifecycle parser: %s', (shape) => {
+  ] as const)('rejects sparse economic operations in the shared lifecycle parser: %s', (shape) => {
     const operations = shape === 'all-hole' ? new Array(3) : [...entries];
     if (shape !== 'all-hole')
       delete operations[{ leading: 0, interior: 1, trailing: 2 }[shape]];
@@ -59,7 +59,7 @@ describe('C dense economic-operation format', () => {
     'dense',
     'inherited',
     'empty',
-  ] as const)('C keeps dense and inherited economic data readable: %s', (shape) => {
+  ] as const)('keeps dense and inherited economic data readable: %s', (shape) => {
     const operations = shape === 'empty' ? [] : [...entries];
     if (shape === 'inherited') {
       const prototype = Object.create(Array.prototype);
@@ -79,7 +79,7 @@ describe('C dense economic-operation format', () => {
     expect(Object.isFrozen(operations)).toBe(false);
   });
 
-  it('C shared economic parsing ignores caller methods and reads primitives once', () => {
+  it('shared economic parsing ignores caller methods and reads primitives once', () => {
     const id = vi
       .fn()
       .mockReturnValueOnce('first')
@@ -126,7 +126,7 @@ describe('C dense economic-operation format', () => {
     NaN,
     Infinity,
     Number.MAX_SAFE_INTEGER,
-  ])('C shared economic parsing refuses malformed array length: %s', (length) => {
+  ])('shared economic parsing refuses malformed array length: %s', (length) => {
     const operations = new Proxy([...entries], {
       get(target, key, receiver) {
         return key === 'length' ? length : Reflect.get(target, key, receiver);
@@ -143,7 +143,7 @@ describe('C dense economic-operation format', () => {
     expect(error).toEqual(new Error('stored run lifecycle is malformed'));
   });
 
-  it('C shared economic parsing preserves first getter faults and avoids array species', () => {
+  it('shared economic parsing preserves first getter faults and avoids array species', () => {
     const fault = new Error('first economic id read');
     const operations = [
       {
@@ -477,6 +477,20 @@ describe('lifecycle metadata compatibility', () => {
       }),
     ).toBe(false);
     expect(parseRunLifecycle(lifecycle)).toStrictEqual(lifecycle);
+  });
+
+  it('keeps a stored interruption time and refuses one that is not a time', () => {
+    const lifecycle: RunLifecycleState = {
+      version: 1,
+      revision: 2,
+      interruptedAt: 1_751_883_300_000,
+    };
+    expect(parseRunLifecycle(lifecycle)).toStrictEqual(lifecycle);
+    for (const interruptedAt of [-1, 1.5, '1751883300000', null]) {
+      expect(() => parseRunLifecycle({ ...lifecycle, interruptedAt })).toThrow(
+        'stored run lifecycle is malformed',
+      );
+    }
   });
 
   it('preserves the moved blocked error name, message and reason object', () => {

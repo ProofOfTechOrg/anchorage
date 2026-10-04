@@ -4,7 +4,7 @@
 // resource business key so a client can never smuggle an id that collides with
 // (or probes for) another user's memory keys.
 //
-// Chokepoint rule (INV-2 style): hosts NEVER accept a client-supplied
+// Chokepoint rule: hosts NEVER accept a client-supplied
 // threadId/resourceId — mint the thread server-side and validate the resource
 // key from trusted host data. ActorContext.newThreadId() and
 // ActorContext.resourceIdFromKey() wrap these constructors. Message ids need no

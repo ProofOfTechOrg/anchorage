@@ -1,18 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
-// The prompt messages a guarded agent's application input processors add or
-// change on a call's message list, recorded for the policy engine.
+// Prompt message versions recorded for a guarded agent's input policies.
 //
 // Mastra renders every system message and every message outside the call's
 // input into the prompt, and the input policies read the input. A processor
 // that moves the caller's text there would give it to the model unread, so
-// each processor's call is compared with the list as it stood before, and a
-// copy of each message it added or changed is kept, keyed by the list, until
-// the policy engine takes it.
+// a record keyed by the list preserves prompt versions outside caller input,
+// including remembered caller outcomes moved out of the input without a
+// content change, until the policy engine takes them.
+//
+// The per-list client tool outcome record preserves provenance before memory
+// merges outcome parts. The callerMessages reader selects caller messages
+// and recorded client tool outcomes.
 //
 // @internal
 
 import {
   type MastraDBMessage,
+  type MastraToolInvocation,
   MessageList,
 } from '@mastra/core/agent/message-list';
 
@@ -32,7 +36,7 @@ export interface RecordedSystemMessage {
   readonly experimental_providerMetadata: unknown;
 }
 
-/** @internal A prompt message an application input processor added or changed. */
+/** @internal A prompt message version recorded for input policy evaluation. */
 export type ProcessorAddition =
   | { readonly kind: 'system'; readonly message: RecordedSystemMessage }
   | { readonly kind: 'message'; readonly message: MastraDBMessage };
@@ -41,6 +45,103 @@ export type ProcessorAddition =
 export type PromptSnapshot = ReadonlyMap<string, number>;
 
 const additionsByList = new WeakMap<MessageList, ProcessorAddition[]>();
+
+const CLIENT_OUTCOME_STATES = {
+  'partial-call': false,
+  call: false,
+  'approval-requested': false,
+  'approval-responded': true,
+  result: true,
+  'output-error': true,
+  'output-denied': true,
+} satisfies Record<MastraToolInvocation['state'], boolean>;
+
+const clientOutcomesByList = new WeakMap<
+  MessageList,
+  ReadonlyMap<string, ReadonlyMap<string, MastraToolInvocation['state']>>
+>();
+
+/**
+ * @internal Record client tool outcome states before memory merges their parts.
+ */
+export function recordClientToolOutcomes(messageList: MessageList): void {
+  if (clientOutcomesByList.has(messageList)) return;
+  const outcomes = new Map<
+    string,
+    Map<string, MastraToolInvocation['state']>
+  >();
+  for (const message of messageList.get.input.db()) {
+    const calls =
+      outcomes.get(message.id) ??
+      new Map<string, MastraToolInvocation['state']>();
+    for (const part of message.content.parts) {
+      if (part.type !== 'tool-invocation') continue;
+      const { toolCallId, state } = part.toolInvocation;
+      if (!CLIENT_OUTCOME_STATES[state]) continue;
+      if (calls.has(toolCallId)) {
+        throw new TypeError('duplicate client tool outcome');
+      }
+      calls.set(toolCallId, state);
+    }
+    outcomes.set(message.id, calls);
+  }
+  clientOutcomesByList.set(messageList, outcomes);
+}
+
+/**
+ * @internal Return caller messages and remembered parts matching recorded
+ * client tool outcome ids and states. Values are not compared because core
+ * merges different fields per state. Without a record, every client tool
+ * outcome part of a remembered input message counts as caller input.
+ *
+ * Expects input-source messages: a message in neither source set is returned
+ * whole as caller input. Restricted copies share part objects with the list,
+ * which the client-tool-output mapper relies on when it writes
+ * part.providerMetadata.
+ */
+export function callerMessages(
+  messageList: MessageList,
+  messages: readonly MastraDBMessage[],
+): MastraDBMessage[] {
+  const { memory, input } = messageSources(messageList);
+  const outcomes = clientOutcomesByList.get(messageList);
+  return messages.flatMap((message) => {
+    if (!memory.has(message.id)) return [message];
+    if (!input.has(message.id)) return [];
+    const selected = message.content.parts.filter((part) => {
+      if (part.type !== 'tool-invocation') return false;
+      const { toolCallId, state } = part.toolInvocation;
+      return outcomes === undefined
+        ? CLIENT_OUTCOME_STATES[state]
+        : outcomes.get(message.id)?.get(toolCallId) === state;
+    });
+    if (selected.length === 0) return [];
+    return [{ ...message, content: { format: 2 as const, parts: selected } }];
+  });
+}
+
+/**
+ * @internal A remembered id is not the call's input: Mastra keeps it in memory's
+ * source set when a processor replaces or merges the message with source `input`.
+ */
+export function unrememberedInputMessages(
+  messageList: MessageList,
+): MastraDBMessage[] {
+  const { memory } = messageSources(messageList);
+  return messageList.get.input.db().filter(({ id }) => !memory.has(id));
+}
+
+/** @internal The remembered input message ids with selected caller tool outcomes. */
+export function callerOutcomeMessageIds(
+  messageList: MessageList,
+): ReadonlySet<string> {
+  const { memory } = messageSources(messageList);
+  return new Set(
+    callerMessages(messageList, messageList.get.input.db())
+      .filter(({ id }) => memory.has(id))
+      .map(({ id }) => id),
+  );
+}
 
 const identities = new WeakMap<object, number>();
 let lastIdentity = 0;
@@ -102,28 +203,20 @@ interface PromptEntries {
   readonly messages: readonly MastraDBMessage[];
 }
 
-/**
- * @internal The ids of the messages memory holds on `messageList`. A message
- * whose id is among them is not the call's input, even while the list holds
- * it as input: Mastra keeps the id when a processor replaces a remembered
- * message, or merges into one, with source `input`. Read through the
- * prototype, so an instance override cannot make this record and the policy
- * engine disagree on what the input is.
- */
-export function rememberedIds(messageList: MessageList): ReadonlySet<string> {
-  return MessageList.prototype.makeMessageSourceChecker.call(messageList)
-    .memory;
+// Read through the prototype so an instance override cannot make the
+// processor-addition record and caller input disagree on message sources.
+function messageSources(messageList: MessageList) {
+  const { memory, input } =
+    MessageList.prototype.makeMessageSourceChecker.call(messageList);
+  return { memory, input };
 }
 
 // Every system message, untagged and tagged, read through the prototype as
 // Mastra's rendering reads its fields, and every message that is not the
 // call's input.
 function promptEntries(messageList: MessageList): PromptEntries {
-  const remembered = rememberedIds(messageList);
   const input = new Set(
-    messageList.get.input
-      .db()
-      .flatMap(({ id }) => (remembered.has(id) ? [] : [id])),
+    unrememberedInputMessages(messageList).map(({ id }) => id),
   );
   return {
     system: MessageList.prototype.getAllSystemMessages.call(messageList),
@@ -145,10 +238,16 @@ export function addedMessageIds(
   );
 }
 
+/** @internal Return recorded message ids without taking their prompt versions. */
+export function recordedMessageIds(
+  messageList: MessageList,
+): ReadonlySet<string> {
+  return new Set(addedMessageIds(additionsByList.get(messageList) ?? []));
+}
+
 /**
  * @internal Count the system messages and the messages outside the call's
- * input on `messageList` by fingerprint, before an application input
- * processor runs.
+ * input on `messageList` by fingerprint, before a guarded input step runs.
  */
 export function snapshotPromptMessages(
   messageList: MessageList,
@@ -221,9 +320,13 @@ function readSystemMessage(entry: unknown): RecordedSystemMessage {
 }
 
 /**
- * @internal Record a copy of each system message and each message outside
- * the call's input that is not in `before`, which an application input
- * processor therefore added or changed.
+ * @internal Record copies of prompt entries that do not match `before`, and
+ * remembered caller outcomes moved out of the input even when they match.
+ *
+ * @param options `messageIds` restricts eligible message ids, with system
+ * entries unaffected. `callerOutcomeMessageIds` names remembered messages
+ * with caller tool outcomes before the processor; a message it keeps outside
+ * the input's object view is recorded even when its fingerprint matches.
  *
  * @throws TypeError when such a system message's content is not a string or
  * an array of text parts, or when one of its fields is an accessor. A copy
@@ -232,16 +335,27 @@ function readSystemMessage(entry: unknown): RecordedSystemMessage {
 export function recordProcessorAdditions(
   messageList: MessageList,
   before: PromptSnapshot,
+  {
+    messageIds,
+    callerOutcomeMessageIds: outcomeIds,
+  }: {
+    messageIds?: ReadonlySet<string>;
+    callerOutcomeMessageIds?: ReadonlySet<string>;
+  } = {},
 ): void {
   const unmatched = new Map(before);
   const { system, messages } = promptEntries(messageList);
+  const inputObjects = new Set(messageList.get.input.db());
   const additions: ProcessorAddition[] = [];
   for (const entry of system) {
     if (takeOne(unmatched, systemKey(entry))) continue;
     additions.push({ kind: 'system', message: readSystemMessage(entry) });
   }
   for (const message of messages) {
-    if (takeOne(unmatched, messageKey(message))) continue;
+    const matches = takeOne(unmatched, messageKey(message));
+    const moved = outcomeIds?.has(message.id) && !inputObjects.has(message);
+    if (matches && !moved) continue;
+    if (messageIds !== undefined && !messageIds.has(message.id)) continue;
     additions.push({ kind: 'message', message: structuredClone(message) });
   }
   if (additions.length === 0) return;
@@ -252,9 +366,8 @@ export function recordProcessorAdditions(
 }
 
 /**
- * @internal Remove and return what application input processors added or
- * changed on `messageList`, so a second evaluation of the list does not read
- * it again.
+ * @internal Remove and return recorded prompt versions on `messageList`, so
+ * a second evaluation of the list does not read them again.
  */
 export function takeProcessorAdditions(
   messageList: MessageList,

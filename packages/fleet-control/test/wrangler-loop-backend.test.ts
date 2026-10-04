@@ -1847,7 +1847,7 @@ export default {
     expect(runner.calls.map(operation)).toContain('versions upload');
   });
 
-  it('seeds optional FS8 metadata through string-bound provider SQL', async () => {
+  it('seeds optional execution-fence metadata through string-bound provider SQL', async () => {
     const d1 = new D1State();
     let fenceBindings: readonly unknown[] | undefined;
     const runner = new FakeRunner();

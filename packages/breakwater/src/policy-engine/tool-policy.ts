@@ -27,7 +27,11 @@ export type PolicyDecision =
   | ({
       /** Deny the operation. */
       allowed: false;
-      /** Human-readable denial reason suitable for audit records. */
+      /**
+       * The connector seam exposes this reason in `ConnectorPolicyError` and its
+       * audit record; keep inspected input out of it.
+       * `PolicyEngine` and `createContentPolicyGate` discard it.
+       */
       reason: string;
     } & (ConnectorDenialMetadata | { code?: undefined; details?: undefined }));
 

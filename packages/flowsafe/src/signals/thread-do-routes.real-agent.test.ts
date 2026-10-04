@@ -1,28 +1,46 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import {
-  type Agent,
+  Agent,
   type CreatedAgentSignal,
   signalToXmlMarkup,
+  type ToolsInput,
 } from '@mastra/core/agent';
-import { globalRunRegistry } from '@mastra/core/agent/durable';
-import { isLeaseProvider } from '@mastra/core/events';
+import {
+  type DurableAgentStreamOptions,
+  globalRunRegistry,
+} from '@mastra/core/agent/durable';
+import { InMemoryServerCache } from '@mastra/core/cache';
+import { CachingPubSub, isLeaseProvider } from '@mastra/core/events';
 import type { MastraModelConfig } from '@mastra/core/llm';
 import { Mastra } from '@mastra/core/mastra';
 import { MockMemory } from '@mastra/core/memory';
+import type { Processor } from '@mastra/core/processors';
 import { RequestContext } from '@mastra/core/request-context';
 import { InMemoryStore, MastraCompositeStore } from '@mastra/core/storage';
+import { createTool } from '@mastra/core/tools';
 import {
   ACTOR_CONTEXT_KEY,
   AuditLogger,
   createGuardedAgent,
   denyPatterns,
+  type GuardedToolChoice,
   type PolicyEvaluator,
 } from '@proofoftech/breakwater';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  afterEach,
+  assert,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from 'vitest';
+import { z } from 'zod';
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import {
   BLOCKED_RUN_ENTRIES,
+  DURABLE_AGENTIC_LOOP_WORKFLOW_ID,
   FLOWSAFE_PERSISTENCE_FORBIDDEN,
 } from '../agent-runner/durable-agent-runner.js';
 import {
@@ -97,6 +115,8 @@ function unreachableModel(): MastraModelConfig {
 function guardedTestAgent(
   memory: MockMemory,
   policies: readonly PolicyEvaluator[] = [],
+  toolChoice: GuardedToolChoice = 'auto',
+  tools?: ToolsInput,
 ): Agent {
   return createGuardedAgent({
     id: 'writer',
@@ -108,7 +128,8 @@ function guardedTestAgent(
     policies,
     audit: new AuditLogger(),
     maxSteps: 2,
-    toolChoice: 'auto',
+    toolChoice,
+    ...(tools ? { tools } : {}),
   }) as unknown as Agent;
 }
 
@@ -150,6 +171,8 @@ async function createHarness(
     contentPolicy?: SignalContentPolicy;
     runCapOpen?: boolean;
     policies?: readonly PolicyEvaluator[];
+    toolChoice?: GuardedToolChoice;
+    tools?: ToolsInput;
     cache?: 'default' | false;
   } = {},
 ) {
@@ -167,7 +190,14 @@ async function createHarness(
   const mastra = new Mastra({
     storage,
     logger: false,
-    agents: { writer: guardedTestAgent(memory, options.policies) },
+    agents: {
+      writer: guardedTestAgent(
+        memory,
+        options.policies,
+        options.toolChoice,
+        options.tools,
+      ),
+    },
   });
   const agent = createFlowsafeDurableAgent({
     agent: mastra.getAgentById('writer'),
@@ -253,6 +283,7 @@ async function heldRun(
   fixture: Pick<Harness, 'agent' | 'memory' | 'start'>,
   threadId: string,
   runId = crypto.randomUUID(),
+  extraOptions: DurableAgentStreamOptions<undefined> = {},
 ) {
   await seedThread(fixture.memory, threadId);
   let finish!: () => void;
@@ -273,6 +304,7 @@ async function heldRun(
       runId,
       memory: { thread: threadId, resource: RESOURCE_ID },
       requestContext: actorContext(),
+      ...extraOptions,
     },
     'operator',
     'human',
@@ -425,14 +457,48 @@ describe('thread signal routes with a real durable agent', () => {
   }, 15_000);
 
   it.each([
-    'deliver',
-    'exhausted',
-    'capped',
-    'capped at the attempt bound',
-  ] as const)('dispatches a non-owner row through D1 notification storage with a real agent: %s', async (mode) => {
+    {
+      mode: 'deliver',
+      runCapOpen: true,
+      priorAttempts: undefined,
+      exhausted: false,
+      capped: false,
+      atBound: false,
+    },
+    {
+      mode: 'exhausted',
+      runCapOpen: true,
+      priorAttempts: DEFAULT_MAX_NOTIFICATION_DELIVERY_ATTEMPTS,
+      exhausted: true,
+      capped: false,
+      atBound: false,
+    },
+    {
+      mode: 'capped',
+      runCapOpen: false,
+      priorAttempts: undefined,
+      exhausted: false,
+      capped: true,
+      atBound: false,
+    },
+    {
+      mode: 'capped at the attempt bound',
+      runCapOpen: false,
+      priorAttempts: DEFAULT_MAX_NOTIFICATION_DELIVERY_ATTEMPTS - 1,
+      exhausted: false,
+      capped: false,
+      atBound: true,
+    },
+  ] as const)('dispatches a non-owner row through D1 notification storage with a real agent: $mode', async ({
+    runCapOpen,
+    priorAttempts,
+    exhausted,
+    capped,
+    atBound,
+  }) => {
     // #given — a due row the dispatch tick delivers as its own principal
     const harness = await createHarness({
-      runCapOpen: mode !== 'capped' && mode !== 'capped at the attempt bound',
+      runCapOpen,
     });
     const threadId = crypto.randomUUID();
     await seedThread(harness.memory, threadId);
@@ -446,14 +512,11 @@ describe('thread signal routes with a real durable agent', () => {
       summary: 'notification input',
       deliverAt: now,
     });
-    if (mode === 'exhausted' || mode === 'capped at the attempt bound') {
+    if (priorAttempts !== undefined) {
       await harness.notifications.updateNotification({
         threadId,
         id: record.id,
-        deliveryAttempts:
-          mode === 'exhausted'
-            ? DEFAULT_MAX_NOTIFICATION_DELIVERY_ATTEMPTS
-            : DEFAULT_MAX_NOTIFICATION_DELIVERY_ATTEMPTS - 1,
+        deliveryAttempts: priorAttempts,
         lastDeliveryError: 'target refused',
         lastDeliveryAttemptAt: now,
       });
@@ -478,7 +541,7 @@ describe('thread signal routes with a real durable agent', () => {
       id: record.id,
     });
     expect(send).not.toHaveBeenCalled();
-    if (mode === 'exhausted') {
+    if (exhausted) {
       expect(await response?.json()).toMatchObject({
         delivered: 0,
         failed: 0,
@@ -495,7 +558,7 @@ describe('thread signal routes with a real durable agent', () => {
       });
       expect(persisted?.deliverAt).toBeUndefined();
       expect(persisted?.summaryAt).toBeUndefined();
-    } else if (mode === 'capped') {
+    } else if (capped) {
       // A capped idle wake cannot fall back to a persist the dispatch
       // principal is not allowed, so the round fails and the row retries.
       expect(await response?.json()).toEqual({ delivered: 0, failed: 1 });
@@ -506,7 +569,7 @@ describe('thread signal routes with a real durable agent', () => {
         deliveryAttempts: 1,
         deliverAt: expect.any(Date),
       });
-    } else if (mode === 'capped at the attempt bound') {
+    } else if (atBound) {
       expect(await response?.json()).toMatchObject({
         delivered: 0,
         failed: 0,
@@ -1207,6 +1270,107 @@ describe('thread signal routes with a real durable agent', () => {
     expect(harness.start).not.toHaveBeenCalled();
   });
 
+  it.each<{
+    shape: string;
+    toolChoice: GuardedToolChoice;
+    tools: ToolsInput;
+    startOptions: DurableAgentStreamOptions<undefined>;
+  }>([
+    {
+      shape: 'no compared option',
+      toolChoice: 'auto',
+      tools: {},
+      startOptions: {},
+    },
+    {
+      shape: "the thread host's start options",
+      toolChoice: 'auto',
+      tools: {},
+      startOptions: { maxSteps: 2, disableBackgroundTasks: true },
+    },
+    {
+      shape: 'an equal object-form toolChoice',
+      toolChoice: { type: 'tool', toolName: 't' },
+      tools: {
+        t: createTool({
+          id: 't',
+          description: 'Test tool',
+          execute: async () => 'ok',
+        }),
+      },
+      startOptions: { toolChoice: { type: 'tool', toolName: 't' } },
+    },
+  ])('drains a signal left pending behind a host-started guarded run with $shape', async ({
+    toolChoice,
+    tools,
+    startOptions,
+  }) => {
+    const harness = await createHarness({ toolChoice, tools });
+    const threadId = crypto.randomUUID();
+    const runId = crypto.randomUUID();
+    await seedThread(harness.memory, threadId);
+    const saveMessages = vi.spyOn(harness.memory, 'saveMessages');
+    const publish = vi.spyOn(harness.pubsub, 'publish');
+    const stream = vi.spyOn(harness.agent, 'stream');
+
+    const run = await heldRun(harness, threadId, runId, startOptions);
+    try {
+      const sent = harness.agent.sendSignal(
+        { type: 'reactive', contents: `${DRAIN_MARK} leftover` },
+        {
+          runId,
+          threadId,
+          resourceId: RESOURCE_ID,
+          ifActive: { behavior: 'deliver' },
+        },
+      );
+      await expect(sent.accepted).resolves.toMatchObject({ action: 'deliver' });
+    } finally {
+      await finishRun(run);
+    }
+    await waitForIdle(harness.agent, threadId);
+
+    expect(stream).toHaveBeenCalledTimes(2);
+    expect(stream).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        type: 'reactive',
+        contents: `${DRAIN_MARK} leftover`,
+      }),
+      expect.objectContaining({
+        runId: expect.any(String),
+        toolChoice,
+        maxSteps: 2,
+        disableBackgroundTasks: true,
+      }),
+    );
+    const drainRunId = stream.mock.calls[1]?.[1]?.runId;
+    expect(drainRunId).not.toBe(runId);
+    await expect(stream.mock.results[1]?.value).resolves.toBeDefined();
+    const savedMessages = saveMessages.mock.calls.flatMap(
+      ([input]) => input.messages,
+    );
+    expect(savedMessages).toEqual([
+      expect.objectContaining({
+        role: 'signal',
+        threadId,
+        resourceId: RESOURCE_ID,
+      }),
+    ]);
+    const { messages } = await harness.memory.recall({
+      threadId,
+      hideSignals: false,
+    });
+    expect(JSON.stringify(messages)).toContain(DRAIN_MARK);
+    expect(
+      publish.mock.calls.some(
+        ([, event]) =>
+          event.type === 'run-failed' && event.runId === drainRunId,
+      ),
+    ).toBe(false);
+    expect(unhandled).toEqual([]);
+  });
+
   it.each([
     ['owner leftover', {}, 1],
     [
@@ -1752,7 +1916,12 @@ describe('thread signal routes with a real durable agent', () => {
     expect(unhandled).toEqual([]);
   }, 15_000);
 
-  it('rejects re-entry after the host waiter settles while the run registry stays live', async () => {
+  it.each([
+    { name: 'while the run registry stays live', evicted: false },
+    { name: 'when its core run entry is evicted', evicted: true },
+  ])('rejects re-entry after the host waiter settles $name', async ({
+    evicted,
+  }) => {
     const harness = await createHarness();
     harness.start.mockImplementationOnce(
       async () =>
@@ -1785,18 +1954,254 @@ describe('thread signal routes with a real durable agent', () => {
     );
     const liveEntry = globalRunRegistry.get(hostId);
     expect(liveEntry).toBeDefined();
+    const fillers: string[] = [];
+    try {
+      if (evicted) {
+        for (let index = 0; index < 1000; index++) {
+          const id = crypto.randomUUID();
+          fillers.push(id);
+          globalRunRegistry.set(id, { cleanup: () => undefined } as never);
+        }
+        expect(globalRunRegistry.has(hostId)).toBe(false);
+        expect(harness.agent.isRunLive(hostId)).toBe(true);
+      }
 
-    await expect(
-      harness.agent.stream('collision', {
-        runId: hostId,
-        requestContext: actorContext(),
-      }),
-    ).rejects.toBeInstanceOf(InvalidRunRequestError);
-    expect(globalRunRegistry.get(hostId)).toBe(liveEntry);
-    await expect(
+      await expect(
+        harness.agent.stream('collision', {
+          runId: hostId,
+          requestContext: actorContext(),
+        }),
+      ).rejects.toBeInstanceOf(InvalidRunRequestError);
+      expect(globalRunRegistry.get(hostId)).toBe(
+        evicted ? undefined : liveEntry,
+      );
+      await expect(
+        harness.agent.streamUntilPersisted(
+          'second host start',
+          { runId: hostId, requestContext: actorContext() },
+          'operator',
+          'human',
+          undefined,
+          undefined,
+          undefined,
+          {
+            startIdentity: {
+              owner: { kind: 'human', id: 'operator' },
+              target: { kind: 'agent', id: 'writer', threadId: hostId },
+            },
+            agentStart: { threaded: false },
+            onPreparedStartIdentity: undefined,
+          },
+        ),
+      ).rejects.toBeInstanceOf(InvalidRunRequestError);
+      expect(globalRunRegistry.get(hostId)).toBe(
+        evicted ? undefined : liveEntry,
+      );
+      await expect(
+        harness.agent.prepare('collision', {
+          runId: hostId,
+          requestContext: actorContext(),
+        }),
+      ).rejects.toBeInstanceOf(InvalidRunRequestError);
+      expect(globalRunRegistry.get(hostId)).toBe(
+        evicted ? undefined : liveEntry,
+      );
+      await expect(
+        harness.agent.generate('collision', {
+          runId: hostId,
+          requestContext: actorContext(),
+        }),
+      ).rejects.toBeInstanceOf(InvalidRunRequestError);
+      expect(globalRunRegistry.get(hostId)).toBe(
+        evicted ? undefined : liveEntry,
+      );
+    } finally {
+      try {
+        await (
+          harness.agent as unknown as {
+            emitError(runId: string, error: Error): Promise<void>;
+          }
+        ).emitError(hostId, new Error('test cleanup'));
+        await within(first.output.consumeStream(), 'suspended stream cleanup');
+      } finally {
+        for (const id of fillers) globalRunRegistry.delete(id);
+      }
+    }
+  }, 15_000);
+});
+
+describe('resumed approval that suspends again', () => {
+  function runCompleted(
+    calls: ReadonlyArray<
+      readonly [unknown, { runId?: string; type: string }, ...unknown[]]
+    >,
+    runId: string,
+  ): boolean {
+    return calls.some(
+      ([, event]) => event.runId === runId && event.type === 'run-completed',
+    );
+  }
+
+  function createApprovalHarness(
+    options: {
+      cache?: 'default';
+      secondApproval?: 'hold' | 'drop' | 'replace' | 'abort';
+      finishThirdCall?: boolean;
+    } = {},
+  ) {
+    const transport = createHostPubSub();
+    const pubsub =
+      options.cache === 'default'
+        ? new CachingPubSub(transport, new InMemoryServerCache())
+        : transport;
+    const storage = new InMemoryStore();
+    const { runtime } = init(
+      { storage },
+      { pubsub, executionFence: 'none', startIdempotency: 'none' },
+    );
+    const memory = new MockMemory();
+    let modelCalls = 0;
+    let markReached!: () => void;
+    let release!: () => void;
+    const reached = new Promise<void>((resolve) => {
+      markReached = resolve;
+    });
+    const released = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const secondApprovalObserver = {
+      id: 'second-approval-observer',
+      processOutputStream: async ({ part, abort, state }) => {
+        // The first stream remains subscribed; its approvals must stay intact.
+        if (
+          part.type === 'tool-call-approval' &&
+          part.payload.toolCallId === 'call-1'
+        )
+          state.sawFirstApproval = true;
+        if (
+          options.secondApproval &&
+          !state.sawFirstApproval &&
+          part.type === 'tool-call-approval' &&
+          part.payload.toolCallId === 'call-2'
+        ) {
+          markReached();
+          if (options.secondApproval === 'drop') return null;
+          if (options.secondApproval === 'replace') {
+            return {
+              type: 'error',
+              runId: part.runId,
+              from: part.from,
+              payload: { error: new Error('observer refused approval') },
+            };
+          }
+          if (options.secondApproval === 'abort')
+            abort('observer refused approval');
+          await released;
+        }
+        return part;
+      },
+    } satisfies Processor;
+    const model: MastraModelConfig = {
+      specificationVersion: 'v2',
+      provider: 'flowsafe-test',
+      modelId: 'repeated-approval',
+      supportedUrls: {},
+      doGenerate: async () => {
+        throw new Error('approval tests use streaming');
+      },
+      doStream: async () => {
+        modelCalls += 1;
+        const toolCallId = `call-${modelCalls}`;
+        return {
+          stream: new ReadableStream({
+            start(controller) {
+              controller.enqueue({ type: 'stream-start', warnings: [] });
+              if (options.finishThirdCall && modelCalls === 3) {
+                controller.enqueue({ type: 'text-start', id: 'answer' });
+                controller.enqueue({
+                  type: 'text-delta',
+                  id: 'answer',
+                  delta: 'done',
+                });
+                controller.enqueue({ type: 'text-end', id: 'answer' });
+              } else
+                controller.enqueue({
+                  type: 'tool-call',
+                  toolCallId,
+                  toolName: 'approve-action',
+                  input: '{}',
+                });
+              controller.enqueue({
+                type: 'finish',
+                finishReason:
+                  options.finishThirdCall && modelCalls === 3
+                    ? 'stop'
+                    : 'tool-calls',
+                usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+              });
+              controller.close();
+            },
+          }),
+        };
+      },
+    };
+    const rawAgent = new Agent({
+      id: 'writer',
+      name: 'Writer',
+      instructions: 'Request approval before each action.',
+      model,
+      memory,
+      tools: {
+        'approve-action': createTool({
+          id: 'approve-action',
+          description: 'Perform an approved action',
+          inputSchema: z.object({}),
+          requireApproval: true,
+          execute: async () => 'approved',
+        }),
+      },
+      outputProcessors: [secondApprovalObserver],
+    });
+    const mastra = new Mastra({
+      storage,
+      logger: false,
+      agents: { writer: rawAgent },
+    });
+    const agent = createFlowsafeDurableAgent({
+      agent: rawAgent,
+      runtime,
+      pubsub,
+      ...(options.cache === 'default' ? {} : { cache: false }),
+      maxSteps: 3,
+      threadRuntime: mastra.agentThreadStreamRuntime,
+    });
+    return {
+      agent,
+      memory,
+      pubsub,
+      runtime,
+      reached,
+      release,
+      threadRuntime: mastra.agentThreadStreamRuntime,
+      modelCalls: () => modelCalls,
+    };
+  }
+
+  async function startApproval(
+    harness: ReturnType<typeof createApprovalHarness>,
+    threadId: string,
+    runId: string,
+  ) {
+    await seedThread(harness.memory, threadId);
+    return within(
       harness.agent.streamUntilPersisted(
-        'second host start',
-        { runId: hostId, requestContext: actorContext() },
+        'request approval twice',
+        {
+          runId,
+          memory: { thread: threadId, resource: RESOURCE_ID },
+          requestContext: actorContext(),
+          disableBackgroundTasks: true,
+        },
         'operator',
         'human',
         undefined,
@@ -1805,39 +2210,219 @@ describe('thread signal routes with a real durable agent', () => {
         {
           startIdentity: {
             owner: { kind: 'human', id: 'operator' },
-            target: { kind: 'agent', id: 'writer', threadId: hostId },
+            target: { kind: 'agent', id: 'writer', threadId },
           },
-          agentStart: { threaded: false },
+          agentStart: { threaded: true },
           onPreparedStartIdentity: undefined,
         },
       ),
-    ).rejects.toBeInstanceOf(InvalidRunRequestError);
-    expect(globalRunRegistry.get(hostId)).toBe(liveEntry);
-    await expect(
-      harness.agent.prepare('collision', {
-        runId: hostId,
-        requestContext: actorContext(),
-      }),
-    ).rejects.toBeInstanceOf(InvalidRunRequestError);
-    expect(globalRunRegistry.get(hostId)).toBe(liveEntry);
-    await expect(
-      harness.agent.generate('collision', {
-        runId: hostId,
-        requestContext: actorContext(),
-      }),
-    ).rejects.toBeInstanceOf(InvalidRunRequestError);
-    expect(globalRunRegistry.get(hostId)).toBe(liveEntry);
+      'first approval persistence',
+    );
+  }
 
-    await (
-      harness.agent as unknown as {
-        emitError(runId: string, error: Error): Promise<void>;
-      }
-    ).emitError(hostId, new Error('test cleanup'));
-    await within(first.output.consumeStream(), 'suspended stream cleanup');
+  async function resumeApproval(
+    harness: ReturnType<typeof createApprovalHarness>,
+    threadId: string,
+    runId: string,
+  ) {
+    const snapshot = await harness.runtime.status(
+      DURABLE_AGENTIC_LOOP_WORKFLOW_ID,
+      runId,
+    );
+    expect(snapshot?.status).toBe('suspended');
+    expect(snapshot?.suspended?.[0]).toBeDefined();
+    return harness.agent.resumeViaRuntime({
+      runId,
+      requestedBy: 'operator',
+      step: snapshot?.suspended?.[0],
+      resumeData: { approved: true },
+      memory: { thread: threadId, resource: RESOURCE_ID },
+    });
+  }
+
+  async function cleanupApproval(
+    harness: ReturnType<typeof createApprovalHarness>,
+    runId: string,
+    first:
+      | Awaited<ReturnType<typeof harness.agent.streamUntilPersisted>>
+      | undefined,
+  ) {
+    harness.release();
+    try {
+      await (
+        harness.agent as unknown as {
+          emitError(runId: string, error: Error): Promise<void>;
+        }
+      ).emitError(runId, new Error('test cleanup'));
+      if (first)
+        await within(first.output.consumeStream(), 'approval stream cleanup');
+    } finally {
+      (
+        harness.agent as unknown as {
+          runRegistryInternal: { cleanup(runId: string): void };
+        }
+      ).runRegistryInternal.cleanup(runId);
+      globalRunRegistry.delete(runId);
+      expect(unhandled).toEqual([]);
+    }
+  }
+
+  it('keeps the thread blocked while the observer holds the second approval and after release', async () => {
+    const harness = createApprovalHarness({ secondApproval: 'hold' });
+    const threadId = crypto.randomUUID();
+    const runId = crypto.randomUUID();
+    const identity = { threadId, resourceId: RESOURCE_ID };
+    const publish = vi.spyOn(harness.pubsub, 'publish');
+    let first:
+      | Awaited<ReturnType<typeof harness.agent.streamUntilPersisted>>
+      | undefined;
+    try {
+      first = await startApproval(harness, threadId, runId);
+      const resumed = await resumeApproval(harness, threadId, runId);
+      expect(resumed.status).toBe('suspended');
+      expect(harness.modelCalls()).toBe(2);
+      await within(harness.reached, 'observed second approval hold');
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(harness.agent.getActiveThreadRunId(identity)).toBe(runId);
+      expect(runCompleted(publish.mock.calls, runId)).toBe(false);
+      harness.release();
+      await vi.waitFor(() =>
+        expect(
+          harness.threadRuntime.getResumableThreadRun(
+            { ...identity, runId, toolCallId: 'call-2' },
+            harness.agent.getPubSub(),
+          ),
+        ).toEqual({ runId, toolCallId: 'call-2' }),
+      );
+      expect(harness.agent.getActiveThreadRunId(identity)).toBe(runId);
+      expect(runCompleted(publish.mock.calls, runId)).toBe(false);
+    } finally {
+      await cleanupApproval(harness, runId, first);
+      publish.mockRestore();
+    }
+  }, 15_000);
+
+  it.each([
+    'drop',
+    'replace',
+    'abort',
+  ] as const)('keeps the thread blocked when the observer uses %s processing for the second approval', async (secondApproval) => {
+    const harness = createApprovalHarness({ secondApproval });
+    const threadId = crypto.randomUUID();
+    const runId = crypto.randomUUID();
+    const publish = vi.spyOn(harness.pubsub, 'publish');
+    let first:
+      | Awaited<ReturnType<typeof harness.agent.streamUntilPersisted>>
+      | undefined;
+    try {
+      first = await startApproval(harness, threadId, runId);
+      const resumed = await resumeApproval(harness, threadId, runId);
+      expect(resumed.status).toBe('suspended');
+      expect(harness.modelCalls()).toBe(2);
+      await within(harness.reached, 'observed second approval processing');
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(
+        harness.agent.getActiveThreadRunId({
+          threadId,
+          resourceId: RESOURCE_ID,
+        }),
+      ).toBe(runId);
+      expect(runCompleted(publish.mock.calls, runId)).toBe(false);
+    } finally {
+      await cleanupApproval(harness, runId, first);
+      publish.mockRestore();
+    }
+  }, 15_000);
+
+  it('observes the second approval from the current stream position with the default cache', async () => {
+    const harness = createApprovalHarness({ cache: 'default' });
+    const threadId = crypto.randomUUID();
+    const runId = crypto.randomUUID();
+    const observe = harness.agent.observe.bind(harness.agent);
+    let suspendPayload:
+      | Awaited<ReturnType<typeof observe>>['output']['suspendPayload']
+      | undefined;
+    const observer = vi
+      .spyOn(harness.agent, 'observe')
+      .mockImplementation(async (...args) => {
+        const observed = await observe(...args);
+        suspendPayload = observed.output.suspendPayload;
+        return observed;
+      });
+    let first:
+      | Awaited<ReturnType<typeof harness.agent.streamUntilPersisted>>
+      | undefined;
+    try {
+      first = await startApproval(harness, threadId, runId);
+      const resumed = await resumeApproval(harness, threadId, runId);
+      expect(resumed.status).toBe('suspended');
+      assert(suspendPayload);
+      expect(
+        await within(suspendPayload, 'resumed approval payload'),
+      ).toMatchObject({ toolCallId: 'call-2' });
+      expect(
+        harness.agent.getActiveThreadRunId({
+          threadId,
+          resourceId: RESOURCE_ID,
+        }),
+      ).toBe(runId);
+    } finally {
+      await cleanupApproval(harness, runId, first);
+      observer.mockRestore();
+    }
+  }, 15_000);
+
+  it('completes earlier resumed thread registrations when the run ends', async () => {
+    const harness = createApprovalHarness({ finishThirdCall: true });
+    const threadId = crypto.randomUUID();
+    const runId = crypto.randomUUID();
+    const publish = vi.spyOn(harness.pubsub, 'publish');
+    let first:
+      | Awaited<ReturnType<typeof harness.agent.streamUntilPersisted>>
+      | undefined;
+    try {
+      first = await startApproval(harness, threadId, runId);
+      const suspended = await resumeApproval(harness, threadId, runId);
+      expect(suspended.status).toBe('suspended');
+      const completed = await resumeApproval(harness, threadId, runId);
+      expect(completed.status).toBe('success');
+      const streamIds = new Set(
+        publish.mock.calls.flatMap(([topic, event]) => {
+          const data = event.data as { streamId?: string } | undefined;
+          return topic.startsWith('agent.thread-stream.') &&
+            event.runId === runId &&
+            data?.streamId
+            ? [data.streamId]
+            : [];
+        }),
+      );
+      expect(streamIds.size).toBeGreaterThan(1);
+      await vi.waitFor(() => {
+        for (const streamId of streamIds) {
+          expect(
+            publish.mock.calls.some(
+              ([, event]) =>
+                event.runId === runId &&
+                event.type === 'run-completed' &&
+                (event.data as { streamId?: string }).streamId === streamId,
+            ),
+          ).toBe(true);
+        }
+      });
+      expect(
+        harness.agent.getActiveThreadRunId({
+          threadId,
+          resourceId: RESOURCE_ID,
+        }),
+      ).toBeUndefined();
+    } finally {
+      await cleanupApproval(harness, runId, first);
+      publish.mockRestore();
+    }
   }, 15_000);
 });
 
-describe('FS8 D3 proof activation actual agent authority', () => {
+describe('proof activation actual agent authority', () => {
   it('uses the actual wrapper workflow and refuses a replaced generation after content inspection', async () => {
     const sqlite = openSqlite();
     const db = sqliteUnitDatabase(sqlite) as ExecutionFenceDatabase;

@@ -79,13 +79,14 @@ import { mastraRegistryEntries } from './mastra-registry.js';
 import { isPathSafeId } from './path-safe-id.js';
 import type { HostPubSub } from './pubsub.js';
 import {
+  advanceLifecycle,
   canonicalEconomicOperations,
   canonicalReplayPrincipals,
   canonicalScheduleDispatch,
   hasDisputedSettlement,
   lifecycleFromRequestContext,
-  nextLifecycleRevision,
   projectTerminalLifecycle,
+  RUN_INTERRUPTED_MESSAGE,
   RUN_LIFECYCLE_CONTEXT_KEY,
   type RunEconomicOperation,
   RunLifecycleBlockedError,
@@ -107,6 +108,7 @@ import {
 import {
   type CoreRunResult,
   errorText,
+  isDurableRunStatus,
   isRunStatus,
   isTerminalRunStatus,
   type RunStatus,
@@ -123,6 +125,7 @@ import type { RawWorkflowSnapshot } from './workflow-snapshot-row.js';
 export {
   RunLifecycleBlockedError,
   type RunLifecycleBlockedReason,
+  RunSettledConflictError,
 } from './run-lifecycle.js';
 export type { RunStatus } from './run-terminal-state.js';
 
@@ -261,6 +264,12 @@ export interface RunSummary {
    * CreateApprovalInput.resumeCount.
    */
   resumeCount?: Record<string, number>;
+  /**
+   * Dot-joined suspended step keys that wait as timers: the run's Durable
+   * Object resumes each one itself when its deadline expires, so approval
+   * bridges file no approval for it. Only `DurableObjectRunner` fills it.
+   */
+  suspensionTimers?: string[];
   /** ISO 8601. Present on status() projections (read from the stored snapshot). */
   createdAt?: string;
   /** ISO 8601. Present on status() projections (read from the stored snapshot). */
@@ -546,8 +555,13 @@ function summarizeState(
   summaryWithRequester(summary, requestedBy, requestedByKind);
   if (state.status === 'success') {
     summary.result = state.result;
-  } else if (state.status === 'failed' && state.error) {
-    summary.error = errorText(state.error);
+  } else if (state.status === 'failed') {
+    if (state.error) summary.error = errorText(state.error);
+    if (lifecycle?.interruptedAt !== undefined)
+      summary.errorEnvelope = {
+        code: 'INTERRUPTED',
+        message: RUN_INTERRUPTED_MESSAGE,
+      };
   } else if (state.status === 'suspended') {
     const suspendedKeys = Object.keys(state.suspendedPaths ?? {});
     summary.suspended = suspendedKeys.map((key) => key.split('.'));
@@ -714,10 +728,10 @@ export interface RunnerRuntimeOptions {
    * here by init() alongside storage so a host that configures it
    * reaches the runtime with no host change.
    *
-   * PASSED TO CORE at `workflow.createRun({ runId, pubsub })` — the only place
-   * core accepts one; the `pubsub` getter still exposes the held identity so an
-   * agent runner sharing this isolate takes THIS instance rather than building
-   * a second feed. Absent ⇒ undefined ⇒ core defaults a fresh emitter per run.
+   * Passed to core at `workflow.createRun({ runId, pubsub })` and to Mastra
+   * at construction. The `pubsub` getter exposes the held identity so an
+   * agent runner sharing this isolate uses the same feed. When absent, core
+   * defaults a fresh emitter per run.
    */
   pubsub?: HostPubSub;
   /**
@@ -837,6 +851,24 @@ export interface RunLifecycleTransitionResult {
   casMatched: boolean;
   cleanup: RunTerminalCleanup;
 }
+
+/** @internal How often an executing leg marks its run row live. */
+export const RUN_LEG_TOUCH_MS = 30_000;
+// Longer than the largest Workers CPU limit (five minutes), which is the most
+// a busy step can delay a touch timer: a row untouched this long has no leg
+// left marking it, on this instance or one being replaced.
+const RUN_LEG_SILENT_MS = 360_000;
+
+/** Has no leg marked this row live within RUN_LEG_SILENT_MS? */
+function rowSilent(raw: RawWorkflowSnapshot, now: number): boolean {
+  const touchedAt = Date.parse(raw.updatedAt);
+  if (!Number.isFinite(touchedAt))
+    throw new RunStateUnreadableError(raw.workflowId, raw.runId);
+  return now - touchedAt >= RUN_LEG_SILENT_MS;
+}
+
+/** A settlement compare-and-set found its row changed since the silence read. */
+class SettlementMissError extends Error {}
 
 const TERMINABLE_RUN_STATUSES = new Set<RunStatus>([
   'running',
@@ -1101,6 +1133,8 @@ type CapturedWorkflowStorage = {
       readonly readSnapshot: FencedWorkflowAdmissionCapability['readSnapshot'];
       readonly admit: FencedWorkflowAdmissionCapability['withInitialAdmission'];
       readonly terminalize: FencedWorkflowAdmissionCapability['terminalizeInitialAdmission'];
+      readonly touch?: FencedWorkflowAdmissionCapability['touchRun'];
+      readonly replace?: FencedWorkflowAdmissionCapability['replaceSnapshot'];
     }
 );
 
@@ -1115,6 +1149,21 @@ type ActiveRun = {
 export type RecoveredStart =
   | { kind: 'ordinary'; summary: RunSummary }
   | { kind: 'lifecycle'; transition: RunLifecycleTransitionResult };
+
+/** @internal What settling a run with no live execution leg found or wrote. */
+export type InterruptedRunSettlement =
+  | { kind: 'absent' }
+  | { kind: 'durable' }
+  /** A leg may still drive the run here or on an instance being replaced. */
+  | { kind: 'live' }
+  | {
+      kind: 'transition';
+      /** The recorded cancellation or timeout, completed; cleanup is the host's. */
+      transition: RunLifecycleTransitionResult;
+      /** Its first replay principal, for an owner already released. */
+      replayPrincipal: RunLifecyclePrincipal;
+    }
+  | { kind: 'interrupted'; summary: RunSummary };
 
 type RecoveryTargetExpectation =
   | { readonly kind: 'workflow' }
@@ -1171,8 +1220,8 @@ export class RunnerRuntime {
   readonly #activeRuns = new Map<string, ActiveRun>();
   readonly #terminalAbortIntents = new Map<string, RunTerminalStatus>();
   readonly #lifecycleLocks = new Map<string, Promise<unknown>>();
-  // The host DO's pubsub identity (RunnerRuntimeOptions.pubsub), threaded into
-  // createRun so a configured host publishes and replays on ONE shared feed.
+  // The host DO's pubsub identity (RunnerRuntimeOptions.pubsub) is passed to
+  // Mastra and each createRun so a configured host shares one feed.
   // Undefined ⇒ core defaults a fresh emitter per run.
   readonly #pubsub?: HostPubSub;
   readonly #executionFence?: ExecutionFenceStore;
@@ -1904,9 +1953,7 @@ export class RunnerRuntime {
           return undefined;
         }
         const principals = canonicalReplayPrincipals(replayPrincipals);
-        const intent: RunLifecycleState = {
-          ...(lifecycle ?? { version: 1 as const, revision: 0 }),
-          revision: nextLifecycleRevision(lifecycle?.revision ?? 0),
+        const intent = advanceLifecycle(lifecycle, {
           transitionIntent: {
             status: intendedStatus,
             requestedAt: now,
@@ -1918,7 +1965,7 @@ export class RunnerRuntime {
                 }
               : {}),
           },
-        };
+        });
         await this.#persistLifecycle(
           workflowId,
           runId,
@@ -2016,125 +2063,57 @@ export class RunnerRuntime {
     replayingPrincipal?: RunLifecyclePrincipal,
   ): Promise<RunLifecycleTransitionResult> {
     this.#getWorkflow(workflowId);
-    return this.#withRunLock(workflowId, runId, async () => {
-      const source = await this.#captureWorkflowStorage(workflowId);
-      const state = await source.load.call(source.workflows, {
-        workflowName: workflowId,
-        runId,
-      });
-      if (!state) throw new UnknownRunError(workflowId, runId);
-      if (state.runId !== runId)
-        throw new RunStateUnreadableError(workflowId, runId);
-      const lifecycle = lifecycleFromRequestContext(state.requestContext);
-      if (lifecycle?.terminal) {
-        if (
-          replayingPrincipal &&
-          !lifecycle.terminal.replayPrincipals.some(
-            (principal) =>
-              principal.kind === replayingPrincipal.kind &&
-              principal.id === replayingPrincipal.id,
-          )
-        ) {
-          throw new UnknownRunError(workflowId, runId);
-        }
-        return {
-          summary: await this.#summaryAfterPersist(
-            workflowId,
-            runId,
-            source,
-            runProvenance(state),
-          ),
-          transitioned: false,
-          casMatched:
-            cas === undefined ||
-            (lifecycle.terminal.status === 'timed_out' &&
-              lifecycle.deadlineAt === cas.expectedDeadlineAt),
-          cleanup: terminalCleanupFor(lifecycle) as RunTerminalCleanup,
-        };
-      }
-      const transitionIntent = lifecycle?.transitionIntent;
-      const intentMatchesTransition =
-        transitionIntent?.status === status &&
-        (cas === undefined ||
-          (transitionIntent.expectedRevision === cas.expectedRevision &&
-            transitionIntent.expectedDeadlineAt === cas.expectedDeadlineAt));
-      const intentMatchesCas = cas !== undefined && intentMatchesTransition;
+    return this.#withRunLock(workflowId, runId, () =>
+      this.#transitionTerminalLocked(workflowId, runId, status, now, {
+        cas,
+        replayPrincipals,
+        replayingPrincipal,
+      }),
+    );
+  }
+
+  /**
+   * #transitionTerminal's body, for a caller already holding the run lock.
+   * With `expected`, the write is a compare-and-set against that exact row and
+   * a miss throws SettlementMissError.
+   */
+  async #transitionTerminalLocked(
+    workflowId: string,
+    runId: string,
+    status: RunTerminalStatus,
+    now: number,
+    {
+      cas,
+      replayPrincipals,
+      replayingPrincipal,
+      expected,
+    }: {
+      cas?: RunLifecycleCas;
+      replayPrincipals?: readonly RunLifecyclePrincipal[];
+      replayingPrincipal?: RunLifecyclePrincipal;
+      expected?: RawWorkflowSnapshot;
+    } = {},
+  ): Promise<RunLifecycleTransitionResult> {
+    const source = await this.#captureWorkflowStorage(workflowId);
+    const state = await source.load.call(source.workflows, {
+      workflowName: workflowId,
+      runId,
+    });
+    if (!state) throw new UnknownRunError(workflowId, runId);
+    if (state.runId !== runId)
+      throw new RunStateUnreadableError(workflowId, runId);
+    const lifecycle = lifecycleFromRequestContext(state.requestContext);
+    if (lifecycle?.terminal) {
       if (
-        cas !== undefined &&
-        !intentMatchesCas &&
-        (lifecycle?.revision !== cas.expectedRevision ||
-          lifecycle.deadlineAt !== cas.expectedDeadlineAt ||
-          lifecycle.deadlineAt === undefined ||
-          lifecycle.deadlineAt > now)
+        replayingPrincipal &&
+        !lifecycle.terminal.replayPrincipals.some(
+          (principal) =>
+            principal.kind === replayingPrincipal.kind &&
+            principal.id === replayingPrincipal.id,
+        )
       ) {
-        return {
-          summary: await this.#summaryAfterPersist(
-            workflowId,
-            runId,
-            source,
-            runProvenance(state),
-          ),
-          transitioned: false,
-          casMatched: false,
-          cleanup: {
-            revision: lifecycle?.revision ?? 0,
-            status,
-            cleanupCompleted: false,
-            ...(lifecycle?.scheduleDispatch
-              ? { scheduleDispatch: lifecycle.scheduleDispatch }
-              : {}),
-          },
-        };
+        throw new UnknownRunError(workflowId, runId);
       }
-      if (hasDisputedSettlement(lifecycle)) {
-        throw new RunLifecycleBlockedError({
-          code: 'DISPUTED_SETTLEMENT',
-          message:
-            'run termination is blocked while an economic operation is disputed',
-        });
-      }
-      const currentStatus = state.status as RunStatus;
-      const abortIntent = this.#terminalAbortIntents.get(
-        this.#runKey(workflowId, runId),
-      );
-      if (
-        !TERMINABLE_RUN_STATUSES.has(currentStatus) &&
-        !intentMatchesTransition &&
-        !(currentStatus === 'canceled' && abortIntent === status)
-      ) {
-        throw new RunTerminalConflictError(workflowId, runId, currentStatus);
-      }
-      const provenance = runProvenance(state);
-      const fallbackPrincipal: RunLifecyclePrincipal =
-        provenance?.requestedBy && provenance.requestedByKind
-          ? {
-              kind: provenance.requestedByKind,
-              id: provenance.requestedBy,
-            }
-          : { kind: 'system', id: 'flowsafe-system' };
-      const principals = canonicalReplayPrincipals(
-        replayPrincipals ??
-          transitionIntent?.replayPrincipals ?? [fallbackPrincipal],
-      );
-      const next = projectTerminalLifecycle(lifecycle, status, now, principals);
-      await this.#persistLifecycle(
-        workflowId,
-        runId,
-        {
-          ...state,
-          ...terminalStateFields(status),
-          error: {
-            name:
-              status === 'cancelled' ? 'RunCancelledError' : 'RunTimedOutError',
-            message: next.terminal.error.message,
-          },
-          timestamp: now,
-        },
-        next,
-        now,
-        source,
-      );
-      this.#terminalAbortIntents.delete(this.#runKey(workflowId, runId));
       return {
         summary: await this.#summaryAfterPersist(
           workflowId,
@@ -2142,11 +2121,109 @@ export class RunnerRuntime {
           source,
           runProvenance(state),
         ),
-        transitioned: true,
-        casMatched: true,
-        cleanup: terminalCleanupFor(next) as RunTerminalCleanup,
+        transitioned: false,
+        casMatched:
+          cas === undefined ||
+          (lifecycle.terminal.status === 'timed_out' &&
+            lifecycle.deadlineAt === cas.expectedDeadlineAt),
+        cleanup: terminalCleanupFor(lifecycle) as RunTerminalCleanup,
       };
-    });
+    }
+    const transitionIntent = lifecycle?.transitionIntent;
+    const intentMatchesTransition =
+      transitionIntent?.status === status &&
+      (cas === undefined ||
+        (transitionIntent.expectedRevision === cas.expectedRevision &&
+          transitionIntent.expectedDeadlineAt === cas.expectedDeadlineAt));
+    const intentMatchesCas = cas !== undefined && intentMatchesTransition;
+    if (
+      cas !== undefined &&
+      !intentMatchesCas &&
+      (lifecycle?.revision !== cas.expectedRevision ||
+        lifecycle.deadlineAt !== cas.expectedDeadlineAt ||
+        lifecycle.deadlineAt === undefined ||
+        lifecycle.deadlineAt > now)
+    ) {
+      return {
+        summary: await this.#summaryAfterPersist(
+          workflowId,
+          runId,
+          source,
+          runProvenance(state),
+        ),
+        transitioned: false,
+        casMatched: false,
+        cleanup: {
+          revision: lifecycle?.revision ?? 0,
+          status,
+          cleanupCompleted: false,
+          ...(lifecycle?.scheduleDispatch
+            ? { scheduleDispatch: lifecycle.scheduleDispatch }
+            : {}),
+        },
+      };
+    }
+    if (hasDisputedSettlement(lifecycle)) {
+      throw new RunLifecycleBlockedError({
+        code: 'DISPUTED_SETTLEMENT',
+        message:
+          'run termination is blocked while an economic operation is disputed',
+      });
+    }
+    const currentStatus = state.status as RunStatus;
+    const abortIntent = this.#terminalAbortIntents.get(
+      this.#runKey(workflowId, runId),
+    );
+    if (
+      !TERMINABLE_RUN_STATUSES.has(currentStatus) &&
+      !intentMatchesTransition &&
+      !(currentStatus === 'canceled' && abortIntent === status)
+    ) {
+      throw new RunTerminalConflictError(workflowId, runId, currentStatus);
+    }
+    const provenance = runProvenance(state);
+    const fallbackPrincipal: RunLifecyclePrincipal =
+      provenance?.requestedBy && provenance.requestedByKind
+        ? {
+            kind: provenance.requestedByKind,
+            id: provenance.requestedBy,
+          }
+        : { kind: 'system', id: 'flowsafe-system' };
+    const principals = canonicalReplayPrincipals(
+      replayPrincipals ??
+        transitionIntent?.replayPrincipals ?? [fallbackPrincipal],
+    );
+    const next = projectTerminalLifecycle(lifecycle, status, now, principals);
+    await this.#persistLifecycle(
+      workflowId,
+      runId,
+      {
+        ...state,
+        ...terminalStateFields(status),
+        error: {
+          name:
+            status === 'cancelled' ? 'RunCancelledError' : 'RunTimedOutError',
+          message: next.terminal.error.message,
+        },
+        timestamp: now,
+      },
+      next,
+      now,
+      source,
+      expected,
+    );
+    this.#terminalAbortIntents.delete(this.#runKey(workflowId, runId));
+    return {
+      summary: await this.#summaryAfterPersist(
+        workflowId,
+        runId,
+        source,
+        runProvenance(state),
+      ),
+      transitioned: true,
+      casMatched: true,
+      cleanup: terminalCleanupFor(next) as RunTerminalCleanup,
+    };
   }
 
   /** Marks idempotent terminal side-effect cleanup after every hook succeeds. */
@@ -2185,14 +2262,9 @@ export class RunnerRuntime {
       if (lifecycle.revision !== expectedRevision) {
         throw new Error('run terminal cleanup CAS no longer matches');
       }
-      const next: RunLifecycleState = {
-        ...lifecycle,
-        revision: nextLifecycleRevision(lifecycle.revision),
-        terminal: {
-          ...lifecycle.terminal,
-          cleanupCompletedAt: now,
-        },
-      };
+      const next = advanceLifecycle(lifecycle, {
+        terminal: { ...lifecycle.terminal, cleanupCompletedAt: now },
+      });
       await this.#persistLifecycle(workflowId, runId, state, next, now, source);
       return this.#summaryAfterPersist(
         workflowId,
@@ -2223,16 +2295,11 @@ export class RunnerRuntime {
    * status() for a caller about to CONCLUDE something irreversible from what it
    * reads — delete a wake record, spend an abandonment budget, resume a run.
    *
-   * Mastra answers a state read from an in-memory Run whenever storage is
-   * unavailable or the row lookup comes back empty while this isolate still
-   * holds the run, and that fallback reports the Run object's own status
-   * ('pending' until something updates it) with no suspended paths and no
-   * requestContext at all. Projecting it is indistinguishable from evidence
-   * about the run. Mastra stamps `isFromInMemory` on it at its single
-   * construction site and the persisted branch builds its result field by
-   * field without ever copying the marker, so this throws on exactly the reads
-   * that did not reach storage. `null` still means the read SUCCEEDED and
-   * found nothing.
+   * Workflow.getInMemoryRunAsWorkflowState reports the retained Run's lifecycle
+   * status with isFromInMemory: true, without suspended paths or requestContext.
+   * Refusing that marker prevents an approximation from authorizing an
+   * irreversible action; after non-suspended completion the Run leaves the
+   * in-memory map, so the fallback is null.
    *
    * A valid v2 pending row is refused before lifecycle projection; it has no
    * durable execution outcome yet.
@@ -2302,12 +2369,16 @@ export class RunnerRuntime {
       readSnapshot,
       withInitialAdmission: admit,
       terminalizeInitialAdmission: terminalize,
+      touchRun: touch,
+      replaceSnapshot: replace,
     } = capability;
     if (
       typeof prefix !== 'string' ||
       typeof readSnapshot !== 'function' ||
       typeof admit !== 'function' ||
       typeof terminalize !== 'function' ||
+      (touch !== undefined && typeof touch !== 'function') ||
+      (replace !== undefined && typeof replace !== 'function') ||
       !database ||
       typeof database.prepare !== 'function' ||
       typeof database.batch !== 'function'
@@ -2328,6 +2399,8 @@ export class RunnerRuntime {
       readSnapshot,
       admit,
       terminalize,
+      ...(touch === undefined ? {} : { touch }),
+      ...(replace === undefined ? {} : { replace }),
     };
   }
 
@@ -2559,6 +2632,15 @@ export class RunnerRuntime {
       isOwnerQuiescent: () => boolean | Promise<boolean>;
       startReservation?: StartReservationReading;
       expectedTarget?: RecoveryTargetExpectation;
+      /**
+       * What the caller knows of the start leg. `unwound`: it ended in this
+       * isolate. `touched`: it marks the row live while it runs (RUN_LEG_TOUCH_MS),
+       * so an initial row is repaired only once silent for RUN_LEG_SILENT_MS.
+       * Both stamp the repaired row so the leg's later writes are refused,
+       * except `touched` on storage without the touch, which has no silence to
+       * wait for. Omitted, the row is repaired at once and unstamped.
+       */
+      startLeg?: 'unwound' | 'touched';
     },
   ): Promise<RecoveredStart | null> {
     const execution = normalizeD1RunExecutionIdentity(value);
@@ -2567,6 +2649,7 @@ export class RunnerRuntime {
       isOwnerQuiescent,
       startReservation: suppliedClaim,
       expectedTarget: suppliedTarget,
+      startLeg,
     } = recovery;
     let expectedTarget: RecoveryTargetExpectation | undefined;
     if (suppliedTarget !== undefined) {
@@ -2622,7 +2705,13 @@ export class RunnerRuntime {
       suppliedClaim === undefined
         ? undefined
         : captureReservation(suppliedClaim, 'started');
-    if (!isPathSafeId(attemptToken) || typeof isOwnerQuiescent !== 'function')
+    if (
+      !isPathSafeId(attemptToken) ||
+      typeof isOwnerQuiescent !== 'function' ||
+      (startLeg !== undefined &&
+        startLeg !== 'unwound' &&
+        startLeg !== 'touched')
+    )
       throw new InvalidRunRequestError('start recovery authority is malformed');
     if (claim && !this.#startIdempotency)
       throw new ExecutionFenceUnreadableError(
@@ -2676,11 +2765,20 @@ export class RunnerRuntime {
               state.provenance.resumeCounts.length !== 0
             )
               throw new RunStartPendingError();
+            const nowMs = Date.now();
+            // A source without the touch keeps no silence evidence: its start
+            // leg may still run, so it is repaired at once and unstamped.
+            const waitsForSilence =
+              startLeg === 'touched' && source.touch !== undefined;
+            if (waitsForSilence && !rowSilent(state.raw, nowMs))
+              throw new RunStartPendingError();
+            const legStopped = startLeg === 'unwound' || waitsForSilence;
             const result = await source.terminalize.call(source.capability, {
               expected: state.raw,
               execution,
               attemptToken,
-              nowMs: Date.now(),
+              nowMs,
+              ...(legStopped ? { markOutcomeUnknown: true as const } : {}),
             });
             if (result.kind === 'conflict')
               throw new Error('initial terminalization conflicts');
@@ -2727,6 +2825,158 @@ export class RunnerRuntime {
         }
       }),
     );
+  }
+
+  /**
+   * @internal Mark this run's row live for an executing leg, from whichever
+   * instance runs it; the evidence #silentRow reads. A storage source without
+   * the touch leaves nothing to read, so its runs are never settled here.
+   */
+  async touchRun(
+    workflowId: string,
+    runId: string,
+    now = Date.now(),
+  ): Promise<void> {
+    const source = await this.#captureWorkflowStorage(workflowId);
+    if (source.storage === 'd1' && source.touch)
+      await source.touch.call(source.capability, { workflowId, runId }, now);
+  }
+
+  /**
+   * @internal Settle a run whose execution leg ended without a durable outcome.
+   *
+   * The caller is the run's own Durable Object after it has established that no
+   * leg of its own drives the run; this runtime's `#activeRuns` covers the
+   * in-process drivers. An object can be replaced while its leg keeps running
+   * on the outgoing instance, so a run is written only after its row has gone
+   * untouched for RUN_LEG_SILENT_MS (`live` otherwise).
+   *
+   * `durable` (suspended, or terminal with its cleanup done) and `absent` leave
+   * the snapshot untouched. A recorded cancellation or timeout owns the
+   * outcome: `transition` completes it, or replays a terminal one whose cleanup
+   * is unfinished, and leaves the cleanup to the caller as the terminate and
+   * deadline routes do. The pending initial row stays with start recovery,
+   * which repairs it as an unknown outcome.
+   *
+   * Any other run becomes `failed` (`interrupted`), never re-executed: the step
+   * that was in flight may already have had effects.
+   */
+  async settleInterruptedRun(
+    workflowId: string,
+    runId: string,
+    now = Date.now(),
+  ): Promise<InterruptedRunSettlement> {
+    this.#getWorkflow(workflowId);
+    // Checked before queueing: a live leg holds the run lock for its whole
+    // length, and a caller waiting behind it would learn nothing.
+    if (this.isRunActive(workflowId, runId)) return { kind: 'live' };
+    return this.#withRunLock(workflowId, runId, () =>
+      this.#withLifecycleLock(workflowId, runId, async () => {
+        const source = await this.#captureWorkflowStorage(workflowId);
+        const state = await source.load.call(source.workflows, {
+          workflowName: workflowId,
+          runId,
+        });
+        if (!state) return { kind: 'absent' };
+        if (state.runId !== runId)
+          throw new RunStateUnreadableError(workflowId, runId);
+        const lifecycle = lifecycleFromRequestContext(state.requestContext);
+        // Ahead of the status checks: a cancel that took effect leaves Mastra's
+        // terminal `canceled` precursor, which only the recorded transition
+        // turns into `cancelled` with its cleanup.
+        const recorded = lifecycle?.terminal ?? lifecycle?.transitionIntent;
+        if (lifecycle?.terminal?.cleanupCompletedAt !== undefined)
+          return { kind: 'durable' };
+        if (!recorded) {
+          if (isDurableRunStatus(state.status)) return { kind: 'durable' };
+          if (state.status === 'pending') throw new RunStartPendingError();
+          if (!TERMINABLE_RUN_STATUSES.has(state.status as RunStatus))
+            throw new RunStateUnreadableError(workflowId, runId);
+        }
+        // Every settlement write below is a compare-and-set against this
+        // silent row: a write that lands after the read makes it miss (`live`).
+        const silent = await this.#silentRow(source, workflowId, runId, now);
+        if (!silent) return { kind: 'live' };
+        try {
+          if (recorded)
+            return {
+              kind: 'transition',
+              replayPrincipal: recorded
+                .replayPrincipals[0] as RunLifecyclePrincipal,
+              transition: await this.#transitionTerminalLocked(
+                workflowId,
+                runId,
+                recorded.status,
+                now,
+                { expected: silent },
+              ),
+            };
+          // The write replaces the silent row, so it is built from that row;
+          // one that moved since the decision above waits for the next wake.
+          const current = JSON.parse(silent.snapshot) as WorkflowRunState;
+          if (current.runId !== runId)
+            throw new RunStateUnreadableError(workflowId, runId);
+          const currentLifecycle = lifecycleFromRequestContext(
+            current.requestContext,
+          );
+          if (
+            current.status !== state.status ||
+            currentLifecycle?.revision !== lifecycle?.revision ||
+            currentLifecycle?.terminal ||
+            currentLifecycle?.transitionIntent
+          )
+            return { kind: 'live' };
+          await this.#persistLifecycle(
+            workflowId,
+            runId,
+            {
+              ...current,
+              ...terminalStateFields('failed'),
+              error: {
+                name: 'RunInterruptedError',
+                message: RUN_INTERRUPTED_MESSAGE,
+              },
+              timestamp: now,
+            },
+            advanceLifecycle(currentLifecycle, { interruptedAt: now }),
+            now,
+            source,
+            silent,
+          );
+        } catch (error) {
+          if (error instanceof SettlementMissError) return { kind: 'live' };
+          throw error;
+        }
+        return {
+          kind: 'interrupted',
+          summary: await this.#summaryAfterPersist(
+            workflowId,
+            runId,
+            source,
+            runProvenance(state),
+          ),
+        };
+      }),
+    );
+  }
+
+  /**
+   * The run's row, when no leg has marked it live within RUN_LEG_SILENT_MS and
+   * the storage can compare-and-set it; `undefined` otherwise.
+   */
+  async #silentRow(
+    source: CapturedWorkflowStorage,
+    workflowId: string,
+    runId: string,
+    now: number,
+  ): Promise<RawWorkflowSnapshot | undefined> {
+    if (source.storage !== 'd1' || !source.touch || !source.replace)
+      return undefined;
+    const raw = await source.readSnapshot.call(source.capability, {
+      workflowId,
+      runId,
+    });
+    return raw && rowSilent(raw, now) ? raw : undefined;
   }
 
   /** @internal Settle the exact selected terminal generation before managed cleanup. */
@@ -2885,16 +3135,14 @@ export class RunnerRuntime {
     const lifecycle: RunLifecycleState | undefined =
       replacementDeadline === undefined && replacementOperations === undefined
         ? storedLifecycle
-        : {
-            ...(storedLifecycle ?? { version: 1 as const, revision: 0 }),
-            revision: nextLifecycleRevision(storedLifecycle?.revision ?? 0),
+        : advanceLifecycle(storedLifecycle, {
             ...(replacementDeadline === undefined
               ? {}
               : { deadlineAt: replacementDeadline }),
             ...(replacementOperations === undefined
               ? {}
               : { economicOperations: replacementOperations }),
-          };
+          });
     const requestContext = await this.#requestContextFor(
       workflowId,
       runId,
@@ -2931,6 +3179,10 @@ export class RunnerRuntime {
     });
   }
 
+  /**
+   * With `expected`, a compare-and-set against that exact row, serialized as
+   * Mastra's own persist does; a miss throws SettlementMissError.
+   */
   async #persistLifecycle(
     workflowId: string,
     runId: string,
@@ -2938,6 +3190,7 @@ export class RunnerRuntime {
     lifecycle: RunLifecycleState,
     now: number,
     source: CapturedWorkflowStorage,
+    expected?: RawWorkflowSnapshot,
   ): Promise<WorkflowRunState> {
     const workflows = source.workflows;
     const persisted: WorkflowRunState = {
@@ -2948,6 +3201,16 @@ export class RunnerRuntime {
       },
       timestamp: now,
     };
+    if (expected) {
+      if (source.storage !== 'd1' || !source.replace)
+        throw new Error('settlement storage cannot compare-and-set');
+      const replaced = await source.replace.call(source.capability, expected, {
+        snapshot: JSON.stringify(persisted),
+        updatedAt: new Date(now).toISOString(),
+      });
+      if (!replaced) throw new SettlementMissError();
+      return persisted;
+    }
     await source.persist.call(workflows, {
       workflowName: workflowId,
       runId,
