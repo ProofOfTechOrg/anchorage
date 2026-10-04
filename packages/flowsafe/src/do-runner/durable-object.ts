@@ -20,6 +20,7 @@ import {
   isExecutionPrincipalId,
   isExecutionPrincipalKind,
 } from '../approval-api/principal.js';
+import { errorMessageOf } from './cause-chain.js';
 import type { DurableObjectRunnerState, WebSocketLike } from './cf-types.js';
 import { newWebSocketPair, safeSend } from './cf-types.js';
 import {
@@ -142,6 +143,17 @@ export interface DurableObjectRunLifecycleHooks {
     dispatchId: string,
     runId: string,
   ): Promise<void>;
+  /**
+   * File the approvals of a run the object left suspended with no host request
+   * behind it (docs/do-runner-design.md, "Approvals the run object files").
+   * Called from the object's alarm, under its operation lock, with an
+   * authoritative summary. Steps listed in `summary.suspensionTimers` are
+   * timers the object resumes itself and must get no approval;
+   * `reconcileApprovalsForSummary` skips them. Best effort: a failure is
+   * logged and never retried, and a host read with approval reconciliation
+   * files what it missed, so it must be idempotent beside that read.
+   */
+  reconcileApprovals?(workflowId: string, summary: RunSummary): Promise<void>;
 }
 
 const RUN_OWNER_RECOVERY_KEY = 'flowsafe:run-owner-recovery:v1';
@@ -413,7 +425,11 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
     return undefined;
   }
 
-  /** Required when the host exposes terminate or deadline lifecycle routes. */
+  /**
+   * Required when the host exposes terminate or deadline lifecycle routes.
+   * Its optional `reconcileApprovals` files the approvals the object reaches
+   * from its alarm.
+   */
   protected runLifecycle(
     _env: TEnv,
   ): DurableObjectRunLifecycleHooks | undefined {
@@ -465,10 +481,15 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
   // populated for idFromName-created ids; it is absent under node tests
   // (state undefined / minimal stubs), where the runtime's own validation
   // still applies.
+  /** Does `workflowId:runId` name this object's run (or does it carry no name)? */
+  #isOwnRun(workflowId: string, runId: string): boolean {
+    const name = this.state?.id?.name;
+    return name === undefined || name === `${workflowId}:${runId}`;
+  }
+
   #assertRunIdentity(workflowId: string, runId: string): void {
     const name = this.state?.id?.name;
-    if (name === undefined) return;
-    if (name !== `${workflowId}:${runId}`) {
+    if (!this.#isOwnRun(workflowId, runId)) {
       throw new Error(
         `DO identity mismatch: instance is '${name}' but the request names '${workflowId}:${runId}' — refusing`,
       );
@@ -1230,6 +1251,48 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
     }
   }
 
+  /**
+   * File the approvals of this object's run, suspended at a boundary the
+   * object reached on its own, through the lifecycle's `reconcileApprovals`.
+   * `known` is an authoritative summary already in hand; without one the run
+   * is read. Never throws: the boundary has already happened, and a host read
+   * with reconciliation files what a failure here misses.
+   */
+  async #reconcileApprovalsBestEffort(
+    workflowId: string,
+    runId: string,
+    known?: RunSummary,
+  ): Promise<void> {
+    // A foreign record names another object's run: nothing here to file.
+    if (!this.#isOwnRun(workflowId, runId)) return;
+    try {
+      const hooks = this.runLifecycle(this.env);
+      if (!hooks?.reconcileApprovals) return;
+      const summary =
+        known ??
+        (await this.#authoritativeStatusOrUnreadable(
+          this.#ensureRuntime(),
+          workflowId,
+          runId,
+        ));
+      if (summary?.status !== 'suspended' || !isReadableRunSummary(summary))
+        return;
+      await hooks.reconcileApprovals(
+        workflowId,
+        await this.#withSuspensionTimers(workflowId, summary),
+      );
+    } catch (error) {
+      console.error(
+        JSON.stringify({
+          type: 'reconcile-error',
+          workflowId,
+          runId,
+          error: errorMessageOf(error),
+        }),
+      );
+    }
+  }
+
   // An entry is keyed by the DOT-JOINED suspended path, exactly as the summary
   // keys the two fence fields read below, so the path is joined here too. The
   // wake reads the rehydrated projection, which splits a stored key on every
@@ -1267,13 +1330,14 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
    * and the budget would bound one burst instead of the suspension. The merge
    * carries the tombstone while the fence is unchanged and drops it when the
    * suspension moves on, so a later suspension of the same step starts fresh.
+   * Answers whether this charge abandoned the entry.
    */
   async #chargeSuspensionDeadlineAttempt(
     stored: SuspensionDeadlineRecord,
     entry: SuspensionDeadlineEntry,
     now: number,
     error: unknown,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const { workflowId, runId } = stored;
     const remaining = entriesWithoutStep(stored.entries, entry.step);
     const attempts = (entry.attempts ?? 0) + 1;
@@ -1286,7 +1350,7 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
         ...remaining,
         tombstoned(entry),
       ]);
-      return;
+      return true;
     }
     console.error(
       `suspension deadline wake for step '${entry.step}' of run '${runId}' failed (attempt ${attempts})`,
@@ -1313,6 +1377,7 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
         nextAttemptAt: now + SUSPENSION_DEADLINE_RETRY_MS * 2 ** (attempts - 1),
       },
     ]);
+    return false;
   }
 
   /**
@@ -1503,6 +1568,9 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
         summary,
         stored,
       );
+      // A timeout resume that stopped after persisting the next suspension
+      // reaches here with no host request to file its approval.
+      await this.#reconcileApprovalsBestEffort(workflowId, runId, summary);
       return;
     }
     const next = await this.#withLeg(
@@ -1545,6 +1613,10 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
       console.error('suspension deadline broadcast failed', error);
     }
     await this.#reconcileSuspensionDeadlinesBestEffort(workflowId, runId, next);
+    // From a fresh read, not `next`: the live projection keys a nested gate
+    // differently from the stored one a host read files against.
+    if (next.status === 'suspended')
+      await this.#reconcileApprovalsBestEffort(workflowId, runId);
   }
 
   /**
@@ -1760,13 +1832,26 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
       // entry in hand — the record itself unreadable, or the re-derivation
       // above — has nothing to charge, so it keeps the watchdog cadence.
       if (!stored || !entry) return false;
+      let abandoned: boolean;
       try {
-        await this.#chargeSuspensionDeadlineAttempt(stored, entry, now, error);
-        return true;
+        abandoned = await this.#chargeSuspensionDeadlineAttempt(
+          stored,
+          entry,
+          now,
+          error,
+        );
       } catch (ledgerError) {
         console.error('suspension deadline ledger update failed', ledgerError);
         return false;
       }
+      // A step whose timer this object gave up on gets the approval a person
+      // can resume it with.
+      if (abandoned)
+        await this.#reconcileApprovalsBestEffort(
+          stored.workflowId,
+          stored.runId,
+        );
+      return true;
     }
   }
 
@@ -1940,13 +2025,17 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
       : { ...base, phase: 'prepared-unfenced', execution };
   }
 
-  async #recoverPendingRunOwner(): Promise<void> {
+  /** The recovered run's summary, or undefined when none was recovered. */
+  async #recoverPendingRunOwner(): Promise<
+    { workflowId: string; summary: RunSummary } | undefined
+  > {
     const stored = await this.state?.storage?.get<unknown>(
       RUN_OWNER_RECOVERY_KEY,
     );
-    if (stored !== undefined) {
-      await this.#recoverRunOwner(this.#runOwnerRecovery(stored));
-    }
+    if (stored === undefined) return undefined;
+    const recovery = this.#runOwnerRecovery(stored);
+    const summary = await this.#recoverRunOwner(recovery);
+    return summary ? { workflowId: recovery.workflowId, summary } : undefined;
   }
 
   /**
@@ -2170,6 +2259,10 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
         runId,
         summary,
       );
+    } else if (settled.kind === 'durable') {
+      // A leg that stopped after persisting a suspension reached it with no
+      // host request to file its approval.
+      await this.#reconcileApprovalsBestEffort(workflowId, runId);
     }
     await this.#clearLegMarker(marker.token);
   }
@@ -2198,7 +2291,14 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
       }
       let recoveryError: unknown;
       try {
-        await this.#recoverPendingRunOwner();
+        const recovered = await this.#recoverPendingRunOwner();
+        // Only the alarm files: its recovery has no host request behind it.
+        if (recovered)
+          await this.#reconcileApprovalsBestEffort(
+            recovered.workflowId,
+            recovered.summary.runId,
+            recovered.summary,
+          );
       } catch (error) {
         recoveryError = error;
       }

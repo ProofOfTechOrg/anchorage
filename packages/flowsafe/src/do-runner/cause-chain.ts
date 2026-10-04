@@ -84,6 +84,18 @@ export function findInCauseChain(
   return false;
 }
 
+/**
+ * An error's message for a log line, from any thrown value; a value whose
+ * conversion throws reads as `unreadable error`.
+ */
+export function errorMessageOf(error: unknown): string {
+  try {
+    return String(error instanceof Error ? error.message : error);
+  } catch {
+    return 'unreadable error';
+  }
+}
+
 /** An error's own message, however it was thrown. */
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);

@@ -16,6 +16,7 @@ import {
 import { durableKeyValueStorageFixture } from '../../test-support/durable-key-value-storage.js';
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import {
+  type ApprovalRecord,
   ApprovalService,
   D1ResourceOwnershipStore,
   type ExecutionPrincipal,
@@ -3199,6 +3200,40 @@ function timedRuntime(
       return { topic: inputData.topic, settledBy: 'timeout' };
     }),
   );
+  // A timer that waits again after every resume, its own timeout included.
+  singleStepWorkflow(
+    'timed-timer-polling',
+    timedStep('gate', async ({ suspend }) =>
+      suspend({
+        [SUSPENSION_TIMER_PAYLOAD_KEY]: true,
+        [SUSPENSION_DEADLINE_PAYLOAD_KEY]: TIMED_DEADLINE_MS,
+      }),
+    ),
+  );
+  // A timer, then an approval gate the run reaches once the timer expires.
+  createWorkflow({
+    id: 'timed-timer-gate',
+    inputSchema: z.object({ topic: z.string() }),
+    outputSchema: z.object({ topic: z.string(), settledBy: z.string() }),
+  })
+    .then(
+      timedStep('wait', async ({ inputData, resumeData, suspend }) =>
+        isSuspensionTimeoutResumeData(resumeData)
+          ? { topic: inputData.topic, settledBy: 'timeout' }
+          : suspend({
+              [SUSPENSION_TIMER_PAYLOAD_KEY]: true,
+              [SUSPENSION_DEADLINE_PAYLOAD_KEY]: TIMED_DEADLINE_MS,
+            }),
+      ),
+    )
+    .then(
+      timedStep('gate', async ({ inputData, resumeData, suspend }) =>
+        resumeData
+          ? { topic: inputData.topic, settledBy: 'signal' }
+          : suspend({ reason: 'awaiting approval' }),
+      ),
+    )
+    .commit();
   singleStepWorkflow(
     'timed-escalating',
     timedStep('gate', async ({ inputData, resumeData, suspend }) => {
@@ -9750,5 +9785,310 @@ describe('DurableObjectRunner start recovery leg evidence', () => {
     } finally {
       log.mockRestore();
     }
+  });
+});
+
+describe('DurableObjectRunner approvals the run object files', () => {
+  /** Lifecycle hooks whose `reconcileApprovals` files through a real service. */
+  function filingLifecycle(env: TestEnv) {
+    const service = new ApprovalService({
+      store: new InMemoryApprovalStore(),
+      executionFence: 'none',
+    });
+    const filed: ApprovalRecord[] = [];
+    const reconcile = vi.fn(async (workflowId: string, summary: RunSummary) => {
+      filed.push(
+        ...(await reconcileApprovalsForSummary(
+          service,
+          workflowId,
+          summary,
+          'approval-reconciler',
+        )),
+      );
+    });
+    env.lifecycle = {
+      abandonApprovals: async () => undefined,
+      reconcileApprovals: reconcile,
+    };
+    return { filed, reconcile };
+  }
+
+  /** An armed entry one failed wake short of abandonment, due now. */
+  function lastAttemptEntry(suspendedAt: number): SuspensionDeadlineEntry {
+    return {
+      ...armedEntry('gate', suspendedAt),
+      attempts: MAX_SUSPENSION_DEADLINE_ATTEMPTS - 1,
+      nextAttemptAt: Date.now() - 1,
+    };
+  }
+
+  /** A timer suspension with a requester, as an authoritative read shows it. */
+  function timerFence(runId: string, suspendedAt: number): RunSummary {
+    return {
+      ...suspendedFence(runId, suspendedAt),
+      suspendPayload: {
+        gate: {
+          [SUSPENSION_TIMER_PAYLOAD_KEY]: true,
+          [SUSPENSION_DEADLINE_PAYLOAD_KEY]: TIMED_DEADLINE_MS,
+        },
+      },
+      requestedBy: OWNER_PRINCIPAL.id,
+      requestedByKind: 'human',
+    };
+  }
+
+  it('files the gate a timeout resume reaches after a timer', async () => {
+    // #given a run waiting in a timer, with an approval gate after it
+    const { state, values } = durableKeyValueStorageFixture();
+    const env = timedEnv();
+    const { filed } = filingLifecycle(env);
+    const runner = new TestRunner(state, env);
+    await startTimed(runner, 'run-gate-after-timer', 'timed-timer-gate');
+    elapseDeadlines(values);
+
+    // #when the timer expires
+    await runner.alarm();
+
+    // #then
+    expect(filed).toMatchObject([
+      {
+        runId: 'run-gate-after-timer',
+        stepPath: ['gate'],
+        requestedBy: OWNER_PRINCIPAL.id,
+        requestedByKind: 'human',
+      },
+    ]);
+  });
+
+  it('files nothing for a timer that waits again after its timeout', async () => {
+    // #given a timer that suspends again on every resume
+    const { state, values } = durableKeyValueStorageFixture();
+    const env = timedEnv();
+    const { filed, reconcile } = filingLifecycle(env);
+    const runner = new TestRunner(state, env);
+    await startTimed(runner, 'run-polling', 'timed-timer-polling');
+    elapseDeadlines(values);
+
+    // #when the timer expires and waits again
+    await runner.alarm();
+
+    // #then the object reconciled the run, and listed the timer it rearmed
+    expect(reconcile).toHaveBeenCalledOnce();
+    expect(filed).toEqual([]);
+  });
+
+  it('files the approval of a timer it abandons after its retry budget', async () => {
+    // #given a timer whose timeout resume fails on its last attempt
+    const { state, values } = durableKeyValueStorageFixture();
+    const env = timedEnv();
+    env.runtime = {
+      ...statusStub(async () => timerFence('run-abandoned-timer', 1)),
+      resume: vi.fn(async () => {
+        throw new Error('injected resume failure');
+      }),
+    } as unknown as RunnerRuntime;
+    const { filed } = filingLifecycle(env);
+    seedDeadlines(values, 'run-abandoned-timer', [lastAttemptEntry(1)]);
+    const runner = new TestRunner(state, env);
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    // #when the wake abandons the entry
+    try {
+      await runner.alarm();
+    } finally {
+      log.mockRestore();
+    }
+
+    // #then the step no object will resume gets an approval
+    expect(filed).toMatchObject([
+      {
+        runId: 'run-abandoned-timer',
+        stepPath: ['gate'],
+        requestedBy: OWNER_PRINCIPAL.id,
+      },
+    ]);
+  });
+
+  it('files nothing when it abandons a foreign record', async () => {
+    // #given an object named for one run holding a spent entry of another,
+    // whose ids read back as a suspended timer
+    const { storage, values } = durableKeyValueStorageFixture();
+    const state = {
+      id: { name: 'timed:run-mine' },
+      storage,
+    } as unknown as DurableObjectState;
+    const env = timedEnv();
+    env.runtime = {
+      ...statusStub(async () => timerFence('run-other', 1)),
+      resume: vi.fn(),
+    } as unknown as RunnerRuntime;
+    const { reconcile } = filingLifecycle(env);
+    seedDeadlines(values, 'run-other', [lastAttemptEntry(1)]);
+    const runner = new TestRunner(state, env);
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    // #when the wake tombstones it
+    try {
+      await runner.alarm();
+    } finally {
+      log.mockRestore();
+    }
+
+    // #then
+    expect(storedDeadlines(values)?.entries).toMatchObject([
+      { attempts: MAX_SUSPENSION_DEADLINE_ATTEMPTS },
+    ]);
+    expect(reconcile).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    'the hook rejects',
+    'the hooks cannot be built',
+  ] as const)('does not charge a timeout resume that ran when %s', async (failure) => {
+    // #given a timer with a gate after it, and filing that fails
+    const { state, values } = durableKeyValueStorageFixture();
+    const env = timedEnv();
+    env.lifecycle = {
+      abandonApprovals: async () => undefined,
+      reconcileApprovals: async () => {
+        throw new Error('approval store down');
+      },
+    };
+    class UnbuildableLifecycleRunner extends TestRunner {
+      protected override runLifecycle(): DurableObjectRunLifecycleHooks {
+        throw new Error('lifecycle hooks cannot be built');
+      }
+    }
+    const runner =
+      failure === 'the hook rejects'
+        ? new TestRunner(state, env)
+        : new UnbuildableLifecycleRunner(state, env);
+    await startTimed(runner, 'run-filing-fails', 'timed-timer-gate');
+    elapseDeadlines(values);
+    const logged: string[] = [];
+    const log = vi
+      .spyOn(console, 'error')
+      .mockImplementation((...args: unknown[]) => {
+        logged.push(String(args[0]));
+      });
+
+    // #when
+    try {
+      await expect(runner.alarm()).resolves.toBeUndefined();
+    } finally {
+      log.mockRestore();
+    }
+
+    // #then the timer was consumed, nothing was charged, and the failure logged
+    expect(storedDeadlines(values)).toBeUndefined();
+    expect(
+      logged.some((line) => line.includes('"type":"reconcile-error"')),
+    ).toBe(true);
+  });
+
+  it('files the gate a wake finds its entry moved on to', async () => {
+    // #given an entry armed for one suspension of the gate, and a run that a
+    // stopped timeout resume left suspended at the gate again
+    const { state, values } = durableKeyValueStorageFixture();
+    const env = timedEnv();
+    env.runtime = {
+      ...statusStub(async () => ({
+        ...suspendedFence('run-moved-on', 2),
+        requestedBy: OWNER_PRINCIPAL.id,
+        requestedByKind: 'human',
+      })),
+      resume: vi.fn(),
+    } as unknown as RunnerRuntime;
+    const { filed } = filingLifecycle(env);
+    seedDeadlines(values, 'run-moved-on', [
+      { ...armedEntry('gate', 1), deadlineAt: Date.now() - 1 },
+    ]);
+    const runner = new TestRunner(state, env);
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    // #when
+    try {
+      await runner.alarm();
+    } finally {
+      log.mockRestore();
+    }
+
+    // #then
+    expect(filed).toMatchObject([
+      { runId: 'run-moved-on', stepPath: ['gate'], suspendedAt: 2 },
+    ]);
+  });
+
+  it('files the gate of a run whose stopped leg had already suspended it', async () => {
+    // #given a suspended run and the marker of a resume leg that stopped
+    // without clearing it
+    const storage = testStorage();
+    const journal = durableKeyValueStorageFixture();
+    const env = {
+      ...makeProductionEnv(storage),
+      runtime: holdingRuntime(storage),
+    };
+    const { filed } = filingLifecycle(env);
+    const runner = new TestRunner(journal.state, env);
+    await runner.fetch(
+      post('/runs', {
+        workflowId: 'holding-resume',
+        runId: 'run-stopped-suspended',
+        inputData: {},
+      }),
+    );
+    journal.values.set('flowsafe:run-leg:v1', {
+      version: 1,
+      workflowId: 'holding-resume',
+      runId: 'run-stopped-suspended',
+      token: 'leg-stopped-after-suspending',
+      trigger: 'resume',
+      startedAt: Date.now(),
+    });
+
+    // #when
+    await runner.alarm();
+
+    // #then
+    expect(filed).toMatchObject([
+      { runId: 'run-stopped-suspended', stepPath: ['hold'] },
+    ]);
+  });
+
+  it.each([
+    'alarm',
+    'dispatch-status',
+  ] as const)('files a recovered suspended start when the %s recovers it only if that is the alarm', async (via) => {
+    // #given a start that suspended at its gate and left its recovery journal
+    const fixture = workflowIngressFixture(true);
+    let journal: unknown;
+    const put = fixture.journal.storage.put.bind(fixture.journal.storage);
+    vi.spyOn(fixture.journal.storage, 'put').mockImplementation(
+      async (key, value) => {
+        if (key === 'flowsafe:run-owner-recovery:v1')
+          journal = structuredClone(value);
+        await put(key, value);
+      },
+    );
+    expect(
+      (await fixture.runner.fetch(post('/runs', WORKFLOW_START_BODY))).status,
+    ).toBe(200);
+    fixture.journal.values.set('flowsafe:run-owner-recovery:v1', journal);
+    const { filed } = filingLifecycle(fixture.env);
+
+    // #when the journal is recovered
+    if (via === 'alarm') await fixture.runner.alarm();
+    else
+      await fixture.runner.fetch(
+        deploymentIdentityRequest('http://do/runs/gated/c-run/dispatch-status'),
+      );
+
+    // #then the alarm filed it; a route leaves filing to the host it answers
+    expect(fixture.journal.values.has('flowsafe:run-owner-recovery:v1')).toBe(
+      false,
+    );
+    expect(filed).toMatchObject(
+      via === 'alarm' ? [{ runId: 'c-run', stepPath: ['gate'] }] : [],
+    );
   });
 });

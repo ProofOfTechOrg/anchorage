@@ -31,6 +31,7 @@ import {
 import type { ResumeRunFn } from './approval-bridge.js';
 import type { RunnerStubLike } from './do-run-topology.js';
 import {
+  createFlowsafeRunnerLifecycle,
   createFlowsafeWorker,
   type FlowsafeWorkerConfig,
   type FlowsafeWorkerEnv,
@@ -3479,5 +3480,41 @@ describe('proof activation Worker composition', () => {
         reason: { code: 'IDEMPOTENT_START_PENDING' },
       });
     await h.flush();
+  });
+});
+
+describe('createFlowsafeRunnerLifecycle', () => {
+  it("files a suspended run's approval against its requester from the run object", async () => {
+    // #given the hooks a Runner DO gets for this Worker's environment
+    const { env } = makeEnv();
+    const lifecycle = createFlowsafeRunnerLifecycle(
+      { systemPrincipalId: 'flowsafe-system' },
+      env,
+    );
+
+    // #when the run object reconciles a run suspended at a gate
+    await lifecycle.reconcileApprovals?.('wf', {
+      runId: 'run-object-filed',
+      status: 'suspended',
+      suspended: [['gate']],
+      suspendedAt: { gate: 1 },
+      requestedBy: 'alice',
+      requestedByKind: 'human',
+    });
+
+    // #then the Worker's approval store holds it, for a workflow resume
+    const records = await approvalStoreFactoryFor(env.DB)
+      .store()
+      .list({ workflowId: 'wf', runId: 'run-object-filed' });
+    expect(records).toMatchObject([
+      {
+        stepPath: ['gate'],
+        status: 'pending',
+        requestedBy: 'alice',
+        requestedByKind: 'human',
+        suspendedAt: 1,
+      },
+    ]);
+    expect(records[0]).not.toHaveProperty('resumeTarget');
   });
 });
