@@ -2670,9 +2670,9 @@ export class RunnerRuntime {
        * so an initial row is repaired only once silent for RUN_LEG_SILENT_MS.
        * Both stamp the repaired row so the leg's later writes are refused,
        * except `touched` on storage without the touch, which has no silence to
-       * wait for. Omitted, the row is repaired at once and unstamped.
+       * wait for.
        */
-      startLeg?: 'unwound' | 'touched';
+      startLeg: 'unwound' | 'touched';
     },
   ): Promise<RecoveredStart | null> {
     const execution = normalizeD1RunExecutionIdentity(value);
@@ -2740,9 +2740,7 @@ export class RunnerRuntime {
     if (
       !isPathSafeId(attemptToken) ||
       typeof isOwnerQuiescent !== 'function' ||
-      (startLeg !== undefined &&
-        startLeg !== 'unwound' &&
-        startLeg !== 'touched')
+      (startLeg !== 'unwound' && startLeg !== 'touched')
     )
       throw new InvalidRunRequestError('start recovery authority is malformed');
     if (claim && !this.#startIdempotency)

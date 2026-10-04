@@ -376,7 +376,7 @@ Use `GET /admin/inventory` while the fence remains `draining`. A drain is proven
 
 The host mints opaque, path-safe run and thread ids. `RunnerRuntime.start()` requires a host-owned run id and has no generation fallback. The id scopes the snapshot, Durable Object, approval lookup, stream address, and artifact path, but it carries no customer identity.
 
-Callers that need exactly-once start behavior supply an `idempotencyKey`, never a run ID. The key is available on `POST /runs`, trusted agent-host starts, and `streamUntilPersisted()`. A retry returns the same persisted run. `IDEMPOTENT_START_PENDING` includes `pendingSince`; re-probe the point-in-time `IDEMPOTENT_START_UNRESOLVABLE` result before acting. A key remains valid until its reservation-retention horizon expires.
+Callers that need exactly-once start behavior supply an `idempotencyKey`, never a run ID. The key is available on `POST /runs`, trusted agent-host starts, and `streamUntilPersisted()`. A retry returns the same persisted run. `IDEMPOTENT_START_PENDING` includes `pendingSince`; re-probe the point-in-time `IDEMPOTENT_START_UNRESOLVABLE` result before acting. For an agent start, keep re-probing for at least seven minutes after its last activity before choosing a fresh key: until the thread object repairs a start whose leg stopped or runs on another instance, its replay answers `IDEMPOTENT_START_UNRESOLVABLE`. A key remains valid until its reservation-retention horizon expires.
 
 ### Pass application context at start
 

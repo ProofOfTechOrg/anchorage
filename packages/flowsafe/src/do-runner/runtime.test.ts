@@ -1257,6 +1257,7 @@ describe('root-local stored summaries', () => {
                 {
                   attemptToken: 'summary-attempt',
                   isOwnerQuiescent: () => true,
+                  startLeg: 'unwound',
                 },
               )
               .then((value) =>
@@ -1655,7 +1656,11 @@ describe('summary compatibility', () => {
             runId: 'absent',
             startToken: 'absent',
           },
-          { attemptToken: 'summary-attempt', isOwnerQuiescent: () => true },
+          {
+            attemptToken: 'summary-attempt',
+            isOwnerQuiescent: () => true,
+            startLeg: 'unwound',
+          },
         ),
       ).resolves.toBeNull();
       await f.runtime.start('summary-root-workflow', rootSummaryStartOptions);
@@ -1668,7 +1673,11 @@ describe('summary compatibility', () => {
             runId: 'summary-run',
             startToken: 'wrong',
           },
-          { attemptToken: 'summary-attempt', isOwnerQuiescent: () => true },
+          {
+            attemptToken: 'summary-attempt',
+            isOwnerQuiescent: () => true,
+            startLeg: 'unwound',
+          },
         ),
       ).rejects.toThrow('run start recovery is unresolved');
       expect(f.row()).toEqual(before);
@@ -1727,7 +1736,11 @@ describe('summary compatibility', () => {
             runId: started.runId,
             startToken: 'valid',
           },
-          { attemptToken: 'valid', isOwnerQuiescent: () => true },
+          {
+            attemptToken: 'valid',
+            isOwnerQuiescent: () => true,
+            startLeg: 'unwound',
+          },
         ),
       ).rejects.toBeInstanceOf(ExecutionFenceUnreadableError);
       expect(remove).not.toHaveBeenCalled();
@@ -3519,6 +3532,7 @@ describe('RunnerRuntime', () => {
         {
           attemptToken: 123 as unknown as string,
           isOwnerQuiescent: () => true,
+          startLeg: 'unwound',
         },
       ),
     ).rejects.toThrow('start recovery authority is malformed');
@@ -4164,6 +4178,7 @@ describe('RunnerRuntime ownership changes during operations', () => {
       const pending = f.runtime.recoverStartAttempt(state.execution, {
         attemptToken: 'H',
         isOwnerQuiescent: () => true,
+        startLeg: 'unwound',
       });
       const foreign = repoint(f.workflow);
       const result = await pending.catch((error: unknown) => error);
@@ -8011,6 +8026,7 @@ describe('Runtime activation', () => {
         .recoverStartAttempt(state.execution, {
           attemptToken: 'H',
           isOwnerQuiescent: async () => quiescent as boolean,
+          startLeg: 'unwound',
         })
         .catch((error) => error);
       expect(await f.row()).toEqual(before);
@@ -8040,6 +8056,7 @@ describe('Runtime activation', () => {
         f.runtime.recoverStartAttempt(initial.execution, {
           attemptToken: 'H',
           isOwnerQuiescent: async () => true,
+          startLeg: 'unwound',
         }),
       ).resolves.toMatchObject({
         kind: 'ordinary',
@@ -8228,6 +8245,7 @@ describe('Runtime activation', () => {
     try {
       const { execution, claim } = await preparedPendingFixture(f);
       assert(f.capability);
+      Reflect.deleteProperty(f.capability, 'touchRun');
       const original = f.capability.terminalizeInitialAdmission;
       const read = vi.spyOn(f.capability, 'readSnapshot');
       f.capability.terminalizeInitialAdmission = async (input) => {
@@ -8249,6 +8267,7 @@ describe('Runtime activation', () => {
           attemptToken: 'H',
           isOwnerQuiescent: async () => true,
           startReservation: claim,
+          startLeg: 'touched',
         })
         .catch((error) => error);
       expect(
@@ -8269,7 +8288,6 @@ describe('Runtime activation', () => {
   });
 
   it.each([
-    { evidence: 'none', startLeg: undefined, stamped: false },
     { evidence: 'unwound', startLeg: 'unwound', stamped: true },
     { evidence: 'touched', startLeg: 'touched', stamped: true },
     {
@@ -8298,7 +8316,7 @@ describe('Runtime activation', () => {
           attemptToken: 'H',
           isOwnerQuiescent: async () => true,
           startReservation: claim,
-          ...(startLeg === undefined ? {} : { startLeg }),
+          startLeg,
         })
         .finally(() => now.mockRestore());
       expect(recovered).toMatchObject({
@@ -8324,19 +8342,22 @@ describe('Runtime activation', () => {
   });
 
   it('stamps a repaired start without changing its summary', async () => {
-    // #given the same stopped start repaired without and with the stamp
+    // #given the same stopped start repaired on storage without the touch,
+    // which does not stamp, and with the stamp
     const summaries: Record<string, unknown>[] = [];
-    for (const startLeg of [undefined, 'unwound'] as const) {
+    for (const stamped of [false, true]) {
       const f = await runtimeActivationFixture();
       try {
         const { execution, claim } = await preparedPendingFixture(f);
+        assert(f.capability);
+        if (!stamped) Reflect.deleteProperty(f.capability, 'touchRun');
 
         // #when
         const recovered = await f.runtime.recoverStartAttempt(execution, {
           attemptToken: 'H',
           isOwnerQuiescent: async () => true,
           startReservation: claim,
-          ...(startLeg === undefined ? {} : { startLeg }),
+          startLeg: stamped ? 'unwound' : 'touched',
         });
 
         assert(recovered?.kind === 'ordinary');
@@ -8393,6 +8414,7 @@ describe('Runtime activation', () => {
         .recoverStartAttempt(execution, {
           attemptToken: 'H',
           startReservation: claim,
+          startLeg: 'unwound',
           isOwnerQuiescent: async () => {
             Object.defineProperty(f.workflows, FENCED_WORKFLOW_STORAGE, {
               value: other.capability,
@@ -8448,6 +8470,7 @@ describe('Runtime activation', () => {
           attemptToken: 'H',
           startReservation: claim,
           isOwnerQuiescent: () => true,
+          startLeg: 'unwound',
         })
         .catch((error) => error);
       expect(await f.row()).toEqual(before);
@@ -8477,6 +8500,7 @@ describe('Runtime activation', () => {
           attemptToken: 'H',
           startReservation: claim,
           isOwnerQuiescent: () => true,
+          startLeg: 'unwound',
         })
         .catch((error) => error);
       expect((await f.row())?.status).toBe('failed');
@@ -8490,6 +8514,7 @@ describe('Runtime activation', () => {
           attemptToken: 'H',
           startReservation: claim,
           isOwnerQuiescent: () => true,
+          startLeg: 'unwound',
         }),
       ).resolves.toMatchObject({
         kind: 'ordinary',
@@ -8532,6 +8557,7 @@ describe('Runtime activation', () => {
           attemptToken: 'H',
           startReservation: original,
           isOwnerQuiescent: () => true,
+          startLeg: 'unwound',
         })
         .catch((error) => error);
       expect(await f.row()).toEqual(before);
@@ -8668,6 +8694,7 @@ describe('Runtime activation', () => {
         attemptToken: 'H',
         startReservation: claim,
         isOwnerQuiescent: () => true,
+        startLeg: 'unwound',
       });
       expect((await f.row())?.status).toBe(status);
       expect((await f.reservations.readForAdmission(claim.key))?.state).toBe(
@@ -8694,6 +8721,7 @@ describe('Runtime activation', () => {
           attemptToken: 'H',
           startReservation: claim,
           isOwnerQuiescent: () => true,
+          startLeg: 'unwound',
         }),
       ).resolves.toMatchObject({
         kind: 'lifecycle',
@@ -9390,6 +9418,7 @@ describe('Runtime activation', () => {
           attemptToken: 'H',
           isOwnerQuiescent: () => true,
           expectedTarget: expectedAgentTarget(),
+          startLeg: 'unwound',
         })
         .catch((error) => error);
       expect(
@@ -9442,6 +9471,7 @@ describe('Runtime activation', () => {
           attemptToken: 'H',
           isOwnerQuiescent: () => true,
           expectedTarget: { kind: 'workflow' },
+          startLeg: 'unwound',
         })
         .catch((error) => error);
       expect(await f.row()).toEqual(before);
@@ -9482,6 +9512,7 @@ describe('Runtime activation', () => {
         .recoverStartAttempt(execution, {
           attemptToken: 'H',
           expectedTarget,
+          startLeg: 'unwound',
           isOwnerQuiescent: async () => {
             if (phase === 'quiescence') {
               entered.resolve();
@@ -9571,6 +9602,7 @@ describe('Runtime activation', () => {
           attemptToken: 'H',
           isOwnerQuiescent: () => true,
           expectedTarget: expectedAgentTarget(),
+          startLeg: 'unwound',
         })
         .catch((error) => error);
       expect((await f.row())?.status).toBe('failed');
@@ -9622,6 +9654,7 @@ describe('Runtime activation', () => {
         attemptToken: 'H',
         isOwnerQuiescent: () => true,
         expectedTarget: expectedAgentTarget(),
+        startLeg: 'unwound',
       });
       expect(
         (await f.row())?.requestContext?.['flowsafe.runProvenance']
@@ -9651,6 +9684,7 @@ describe('Runtime activation', () => {
           attemptToken: 'H',
           isOwnerQuiescent: () => true,
           expectedTarget: { kind: 'workflow' },
+          startLeg: 'unwound',
         }),
       ).resolves.toMatchObject({
         kind: 'ordinary',
@@ -9692,7 +9726,11 @@ describe('Runtime activation', () => {
             runId: 'd1-run',
             startToken: 'S1',
           },
-          { attemptToken: 'initial-H', isOwnerQuiescent: () => true },
+          {
+            attemptToken: 'initial-H',
+            isOwnerQuiescent: () => true,
+            startLeg: 'unwound',
+          },
         ),
       ).resolves.toMatchObject({
         kind: 'ordinary',
@@ -9734,6 +9772,7 @@ describe('Runtime activation', () => {
             attemptToken: 'H',
             isOwnerQuiescent: quiescent,
             expectedTarget: expectedTarget as never,
+            startLeg: 'unwound',
           },
         )
         .catch((error) => error);
@@ -9789,6 +9828,7 @@ describe('Runtime activation', () => {
           attemptToken: 'H',
           isOwnerQuiescent: () => true,
           expectedTarget: { kind: 'workflow' },
+          startLeg: 'unwound',
         })
         .catch((error) => error);
       expect((await f.row())?.status).toBe('failed');
@@ -9829,6 +9869,7 @@ describe('Runtime activation', () => {
             attemptToken: 'H',
             isOwnerQuiescent: quiescent,
             expectedTarget: { ...expectedAgentTarget(), ...invalid } as never,
+            startLeg: 'unwound',
           },
         )
         .catch((error) => error);
@@ -9856,6 +9897,7 @@ describe('Runtime activation', () => {
         .recoverStartAttempt(execution, {
           attemptToken: 'H',
           expectedTarget,
+          startLeg: 'unwound',
           isOwnerQuiescent: async () => {
             entered.resolve();
             await release.promise;
@@ -10304,7 +10346,11 @@ describe('legacy Runtime observations', () => {
             runId: 'd1-run',
             startToken: 'legacy-H',
           },
-          { attemptToken: 'legacy-H', isOwnerQuiescent: () => true },
+          {
+            attemptToken: 'legacy-H',
+            isOwnerQuiescent: () => true,
+            startLeg: 'unwound',
+          },
         )
         .catch((error) => error);
       const proof = await f.runtime
@@ -10377,6 +10423,7 @@ describe('legacy Runtime observations', () => {
           attemptToken: 'H',
           isOwnerQuiescent: () => true,
           startReservation: claim,
+          startLeg: 'unwound',
         })
         .catch((error) => error);
       expect((await f.row())?.status).toBe('failed');

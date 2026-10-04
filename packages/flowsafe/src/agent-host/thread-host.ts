@@ -57,6 +57,7 @@ import {
 import {
   type D1RunExecutionIdentity,
   ExecutionFenceUnreadableError,
+  isRunStartPendingError,
   normalizeD1RunExecutionIdentity,
   normalizeMutationEpoch,
   normalizeRunExecutionIdentity,
@@ -1774,6 +1775,11 @@ export function createThreadAgentHost(
                   owner: principalOwner(stored.runRecord.principal),
                   threaded: stored.threaded,
                 },
+                // Agent legs touch their row while they run.
+                startLeg:
+                  ownFrame !== undefined && unwoundExecutions.has(ownFrame)
+                    ? 'unwound'
+                    : 'touched',
               },
             );
           } else {
@@ -1934,7 +1940,21 @@ export function createThreadAgentHost(
             prefix: AGENT_OWNER_RECOVERY_PREFIX,
           });
           for (const [key, stored] of pending) {
-            await recoverOwner(scope, key, stored);
+            try {
+              await recoverOwner(scope, key, stored);
+            } catch (error) {
+              // A start whose leg may still run, or whose row has not gone
+              // silent, settled nothing: its journal and the wake stay for a
+              // later alarm, and the other journals are still recovered.
+              if (!isRunStartPendingError(error)) throw error;
+              console.error(
+                JSON.stringify({
+                  type: 'agent-start-recovery-pending',
+                  threadId: scope.threadId,
+                  runId: stored.runId,
+                }),
+              );
+            }
           }
           await withRecoveryLock(async () => {
             const remaining = await storage.list({
