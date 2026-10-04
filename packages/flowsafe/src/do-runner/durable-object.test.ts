@@ -7288,11 +7288,13 @@ describe('host activation workflow recovery barriers', () => {
         scheduleId: 'barrier-schedule',
         dispatchId: 'barrier-dispatch',
       };
-      await workflows?.persistWorkflowSnapshot({
-        workflowName: 'gated',
-        runId: 'c-run',
-        snapshot,
-      });
+      // Raw: the settled-row guard refuses this same-revision rewrite of a
+      // terminated row through persistWorkflowSnapshot.
+      await fixture.env.DB?.prepare(
+        'UPDATE mastra_workflow_snapshot SET snapshot = ? WHERE workflow_name = ? AND run_id = ?',
+      )
+        .bind(JSON.stringify(snapshot), 'gated', 'c-run')
+        .run();
     }
     const completion = vi.spyOn(fixture.runtime, 'completeTerminalCleanup');
     const releaseOwner = vi.spyOn(fixture.env.owners, 'release');
@@ -8509,8 +8511,7 @@ describe('host workflow unfenced recovery', () => {
     ).toEqual(journal);
     expect(fixture.journal.alarms.at(-1)).toBeGreaterThan(Date.now());
     expect(recoverStartAttemptSpy).not.toHaveBeenCalled();
-    if (status === 'pending') expect(outcome).toMatchObject({ status: 503 });
-    else expect(outcome).toBeUndefined();
+    expect(outcome).toBeUndefined();
   });
 });
 
@@ -8983,6 +8984,7 @@ function holdingRuntime(
   storage: MastraCompositeStore,
   hold: Promise<void> = new Promise<void>(() => undefined),
   entered: () => void = () => undefined,
+  after: () => void = () => undefined,
 ): RunnerRuntime {
   const { createWorkflow, createStep, runtime } = init(
     { storage },
@@ -9012,6 +9014,36 @@ function holdingRuntime(
       )
       .commit();
   holding('holding');
+  // `holding` followed by a second step, to show where a leg stops.
+  createWorkflow({
+    id: 'holding-then',
+    inputSchema: z.object({}),
+    outputSchema: z.object({}),
+  })
+    .then(
+      createStep({
+        id: 'hold',
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+        execute: async () => {
+          entered();
+          await hold;
+          return {};
+        },
+      }),
+    )
+    .then(
+      createStep({
+        id: 'after',
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+        execute: async () => {
+          after();
+          return {};
+        },
+      }),
+    )
+    .commit();
   holding('holding-resume', { reason: 'awaiting approval' });
   holding('holding-deadline', {
     reason: 'awaiting a signal',
@@ -9031,6 +9063,22 @@ async function afterLegSilence<T>(wake: () => Promise<T>): Promise<T> {
   } finally {
     now.mockRestore();
   }
+}
+
+/** A run's stored snapshot, parsed from its raw row. */
+async function storedSnapshot(
+  storage: MastraCompositeStore,
+  workflowId: string,
+  runId: string,
+): Promise<Record<string, unknown> | undefined> {
+  const { results } = await testDatabase(storage)
+    .prepare(
+      'SELECT snapshot FROM mastra_workflow_snapshot WHERE workflow_name = ? AND run_id = ?',
+    )
+    .bind(workflowId, runId)
+    .all<{ snapshot: string }>();
+  const row = results[0];
+  return row && JSON.parse(row.snapshot);
 }
 
 describe('DurableObjectRunner interrupted legs', () => {
@@ -9204,6 +9252,69 @@ describe('DurableObjectRunner interrupted legs', () => {
       'running',
     );
     expect(journal.values.has('flowsafe:run-leg:v1')).toBe(true);
+  });
+
+  it.each([
+    'settled INTERRUPTED',
+    'terminated',
+  ] as const)('keeps a run %s and stops the leg it ended, still running on its outgoing instance, before its next step', async (ending) => {
+    // #given a start leg held mid-step on an outgoing instance, and the new
+    // instance ending the run: settling it once its row has gone silent (a
+    // leg whose touches stopped reaching D1), or terminating it
+    const storage = testStorage();
+    const journal = durableKeyValueStorageFixture();
+    const hold = deferredSignal();
+    const entered = deferredSignal();
+    const steps = vi.fn(entered.resolve);
+    const next = vi.fn();
+    const outgoing = new TestRunner(journal.state, {
+      ...makeProductionEnv(storage),
+      runtime: holdingRuntime(storage, hold.promise, steps, next),
+    });
+    const leg = outgoing
+      .fetch(
+        post('/runs', {
+          workflowId: 'holding-then',
+          runId: 'run-outgoing-ended',
+          inputData: {},
+        }),
+      )
+      .catch(() => undefined);
+    await entered.promise;
+    const incoming = new TestRunner(journal.state, {
+      ...makeProductionEnv(storage),
+      runtime: holdingRuntime(storage),
+    });
+    if (ending === 'settled INTERRUPTED')
+      await afterLegSilence(() => incoming.alarm());
+    else
+      expect(
+        (
+          await incoming.fetch(
+            post('/runs/holding-then/run-outgoing-ended/terminate', {}),
+          )
+        ).status,
+      ).toBe(200);
+    const ended = await storedSnapshot(
+      storage,
+      'holding-then',
+      'run-outgoing-ended',
+    );
+    expect(ended).toMatchObject({
+      status: ending === 'terminated' ? 'cancelled' : 'failed',
+    });
+
+    // #when the outgoing leg's step returns and its engine writes on
+    hold.resolve();
+    await leg;
+
+    // #then the row the new instance wrote stands, the held step ran once,
+    // and the refused write ended the leg before its next step
+    expect(
+      await storedSnapshot(storage, 'holding-then', 'run-outgoing-ended'),
+    ).toEqual(ended);
+    expect(steps).toHaveBeenCalledOnce();
+    expect(next).not.toHaveBeenCalled();
   });
 
   it('marks its run row live on an interval while the leg runs', async () => {
@@ -9537,5 +9648,107 @@ describe('DurableObjectRunner interrupted legs', () => {
     // #then no wake stays armed for a run with nothing pending
     expect(((await resumed.json()) as RunSummary).status).toBe('success');
     expect(events.at(-1)).toBe('deleteAlarm');
+  });
+});
+
+describe('DurableObjectRunner start recovery leg evidence', () => {
+  /** A start whose leg stops right after admission, before its first write. */
+  async function strandedStartFixture() {
+    const fixture = workflowIngressFixture(true);
+    const workflows = (await fixture.storage.getStore(
+      'workflows',
+    )) as FencedWorkflowsStorageD1;
+    const native = workflows[FENCED_WORKFLOW_STORAGE];
+    if (!native) throw new Error('missing managed owned workflow capability');
+    const capability: FencedWorkflowAdmissionCapability = {
+      ...native,
+      withInitialAdmission: async (input, create) =>
+        ({
+          ...(await native.withInitialAdmission(input, create)),
+          witness: undefined,
+        }) as never,
+    };
+    Object.defineProperty(workflows, FENCED_WORKFLOW_STORAGE, {
+      value: capability,
+      configurable: true,
+    });
+    const lifecycle = async () => {
+      const snapshot = await workflows.loadWorkflowSnapshot({
+        workflowName: 'gated',
+        runId: 'c-run',
+      });
+      return {
+        status: snapshot?.status,
+        stamped:
+          (
+            snapshot?.requestContext?.['flowsafe.runLifecycle'] as
+              | Record<string, unknown>
+              | undefined
+          )?.startOutcomeUnknownAt !== undefined,
+      };
+    };
+    return { ...fixture, lifecycle };
+  }
+
+  it('repairs and stamps a start at once when its own leg unwound in this object', async () => {
+    // #given a start whose leg stops after admission in this object
+    const fixture = await strandedStartFixture();
+
+    // #when the start route recovers its own failed leg
+    const response = await fixture.runner.fetch(
+      post('/runs', WORKFLOW_START_BODY),
+    );
+
+    // #then
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ status: 'failed' });
+    expect(await fixture.lifecycle()).toEqual({
+      status: 'failed',
+      stamped: true,
+    });
+  });
+
+  it('leaves a stopped start to the alarm until its row is silent, then repairs and stamps it', async () => {
+    // #given a start whose leg stopped after admission and whose own
+    // recovery failed, leaving the run object's journal for its alarm
+    const fixture = await strandedStartFixture();
+    vi.spyOn(fixture.runtime, 'recoverStartAttempt').mockRejectedValueOnce(
+      new Error('recovery lost'),
+    );
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await fixture.runner.fetch(post('/runs', WORKFLOW_START_BODY));
+
+      // #when the alarm wakes while the row is fresh
+      const woke = Date.now();
+      await fixture.runner.alarm();
+
+      // #then the start stays pending for a leg that may still run, on the
+      // 60 s recovery cadence
+      const next = await fixture.journal.state.storage?.getAlarm();
+      expect(next).toBeGreaterThan(woke);
+      expect(next).toBeLessThanOrEqual(Date.now() + 60_000);
+      expect(await fixture.lifecycle()).toEqual({
+        status: 'pending',
+        stamped: false,
+      });
+      expect(fixture.journal.values.has('flowsafe:run-owner-recovery:v1')).toBe(
+        true,
+      );
+
+      // #when it wakes once the row has been silent for six minutes
+      await afterLegSilence(() => fixture.runner.alarm());
+
+      // #then
+      expect(await fixture.lifecycle()).toEqual({
+        status: 'failed',
+        stamped: true,
+      });
+      expect(fixture.journal.values.has('flowsafe:run-owner-recovery:v1')).toBe(
+        false,
+      );
+    } finally {
+      log.mockRestore();
+    }
   });
 });

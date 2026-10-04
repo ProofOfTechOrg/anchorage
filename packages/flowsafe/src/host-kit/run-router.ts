@@ -24,6 +24,7 @@ import {
   RunAlreadyExistsError,
   RunLifecycleBlockedError,
   RunNotSuspendedError,
+  RunSettledConflictError,
   type RunSummary,
   RunTerminalConflictError,
   requireStartIdempotency,
@@ -265,7 +266,8 @@ function errorResponse(error: unknown): Response {
   if (
     error instanceof RunNotSuspendedError ||
     error instanceof RunAlreadyExistsError ||
-    error instanceof RunTerminalConflictError
+    error instanceof RunTerminalConflictError ||
+    error instanceof RunSettledConflictError
   ) {
     return json({ error: error.message }, 409);
   }

@@ -41,6 +41,7 @@ import { createHostPubSub } from './pubsub.js';
 import {
   RunLifecycleBlockedError as LeafRunLifecycleBlockedError,
   parseRunLifecycle,
+  RunSettledConflictError,
 } from './run-lifecycle.js';
 import {
   type AuthoritativeStartState,
@@ -401,6 +402,7 @@ describe('authoritative start state', () => {
                 replayPrincipals: [{ kind: 'human', id: 'owner' }],
               },
             };
+          f.sql.exec('DELETE FROM mastra_workflow_snapshot');
           await f.seed(snapshot);
           const selected = await f.runtime.authoritativeStartState(
             'd1-workflow',
@@ -8256,6 +8258,118 @@ describe('Runtime activation', () => {
     }
   });
 
+  it.each([
+    { evidence: 'none', startLeg: undefined, stamped: false },
+    { evidence: 'unwound', startLeg: 'unwound', stamped: true },
+    { evidence: 'touched', startLeg: 'touched', stamped: true },
+    {
+      evidence: 'touched without a touch',
+      startLeg: 'touched',
+      stamped: false,
+    },
+  ] as const)('repairs a stopped start with leg evidence $evidence, refusing the leg a later write when stamped', async ({
+    evidence,
+    startLeg,
+    stamped,
+  }) => {
+    // #given an admitted start whose leg stopped before its first write, its
+    // row silent for six minutes
+    const f = await runtimeActivationFixture();
+    try {
+      const { execution, claim } = await preparedPendingFixture(f);
+      assert(f.capability);
+      if (evidence === 'touched without a touch')
+        Reflect.deleteProperty(f.capability, 'touchRun');
+      const admitted = await f.row();
+      assert(admitted);
+      const now = vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 360_001);
+      const recovered = await f.runtime
+        .recoverStartAttempt(execution, {
+          attemptToken: 'H',
+          isOwnerQuiescent: async () => true,
+          startReservation: claim,
+          ...(startLeg === undefined ? {} : { startLeg }),
+        })
+        .finally(() => now.mockRestore());
+      expect(recovered).toMatchObject({
+        kind: 'ordinary',
+        summary: { status: 'failed' },
+      });
+
+      // #when the stopped leg's engine writes on
+      const late = await f.workflows
+        .persistWorkflowSnapshot({
+          workflowName: f.workflow.id,
+          runId: 'activation-run',
+          snapshot: { ...admitted, status: 'running' },
+        })
+        .catch((error: unknown) => error);
+
+      // #then a stamped repair stands
+      expect((await f.row())?.status).toBe(stamped ? 'failed' : 'running');
+      if (stamped) expect(late).toBeInstanceOf(RunSettledConflictError);
+    } finally {
+      f.close();
+    }
+  });
+
+  it('stamps a repaired start without changing its summary', async () => {
+    // #given the same stopped start repaired without and with the stamp
+    const summaries: Record<string, unknown>[] = [];
+    for (const startLeg of [undefined, 'unwound'] as const) {
+      const f = await runtimeActivationFixture();
+      try {
+        const { execution, claim } = await preparedPendingFixture(f);
+
+        // #when
+        const recovered = await f.runtime.recoverStartAttempt(execution, {
+          attemptToken: 'H',
+          isOwnerQuiescent: async () => true,
+          startReservation: claim,
+          ...(startLeg === undefined ? {} : { startLeg }),
+        });
+
+        assert(recovered?.kind === 'ordinary');
+        const {
+          createdAt: _created,
+          updatedAt: _updated,
+          ...summary
+        } = recovered.summary;
+        summaries.push(summary);
+      } finally {
+        f.close();
+      }
+    }
+
+    // #then
+    expect(summaries[1]).toEqual(summaries[0]);
+  });
+
+  it('leaves a start whose leg marks its row live to that leg until the row is silent', async () => {
+    // #given an admitted start whose row was written moments ago
+    const f = await runtimeActivationFixture();
+    try {
+      const { execution, claim } = await preparedPendingFixture(f);
+      assert(f.capability);
+      const address = { workflowId: f.workflow.id, runId: 'activation-run' };
+      const before = await f.capability.readSnapshot(address);
+
+      // #when recovery runs for a leg that touches its row
+      const recovering = f.runtime.recoverStartAttempt(execution, {
+        attemptToken: 'H',
+        isOwnerQuiescent: async () => true,
+        startReservation: claim,
+        startLeg: 'touched',
+      });
+
+      // #then the start stays pending and its row untouched
+      await expect(recovering).rejects.toBeInstanceOf(RunStartPendingError);
+      expect(await f.capability.readSnapshot(address)).toEqual(before);
+    } finally {
+      f.close();
+    }
+  });
+
   it('preserves the captured source across owning quiescence and read replacement', async () => {
     const f = await runtimeActivationFixture(),
       other = await runtimeActivationFixture();
@@ -9091,11 +9205,13 @@ describe('Runtime activation', () => {
         const snapshot = await f.row();
         assert(snapshot);
         snapshot.runId = 'foreign-run';
-        await f.workflows.persistWorkflowSnapshot({
-          workflowName: f.workflow.id,
-          runId: 'activation-run',
-          snapshot,
-        });
+        // Raw: the settled-row guard refuses this same-revision rewrite of a
+        // terminated row through persistWorkflowSnapshot.
+        f.sql
+          .prepare(
+            'UPDATE activation_mastra_workflow_snapshot SET snapshot = ? WHERE workflow_name = ? AND run_id = ?',
+          )
+          .run(JSON.stringify(snapshot), f.workflow.id, 'activation-run');
       }
       const before = await f.row();
       const persist = vi.spyOn(f.workflows, 'persistWorkflowSnapshot');
@@ -10388,6 +10504,125 @@ describe('RunnerRuntime.settleInterruptedRun', () => {
     // #then
     expect(early).toEqual({ kind: 'live' });
     expect(late).toMatchObject({ kind: 'interrupted' });
+  });
+
+  it.each([
+    ['an INTERRUPTED', 'touch'],
+    ['an INTERRUPTED', 'write'],
+    ['a recorded cancellation', 'touch'],
+    ['a recorded cancellation', 'write'],
+  ] as const)('reads %s settlement as live when a %s lands after its silence read', async (settlement, landed) => {
+    // #given a silent stranded row, and a writer that lands on it just after
+    // settlement reads it silent
+    const storage = createD1Storage({
+      binding: sqliteUnitDatabase(openSqlite()) as D1DatabaseBinding,
+    });
+    const { app, workflow } = await strandedRun('running', storage);
+    if (settlement === 'a recorded cancellation')
+      await app.runtime.cancelActiveExecution(
+        workflow.id,
+        'stranded-run',
+        'cancelled',
+        [{ kind: 'human', id: 'owner' }],
+      );
+    const workflows = (await storage.getStore(
+      'workflows',
+    )) as FencedWorkflowsStorageD1;
+    const native = workflows[FENCED_WORKFLOW_STORAGE];
+    assert(native);
+    const address = { workflowId: workflow.id, runId: 'stranded-run' };
+    const land = async () => {
+      // A second on, so the touch moves `updatedAt` within one millisecond too.
+      if (landed === 'touch')
+        return native.touchRun?.(address, Date.now() + 1_000);
+      const current = await workflows.loadWorkflowSnapshot({
+        workflowName: workflow.id,
+        runId: 'stranded-run',
+      });
+      assert(current);
+      await workflows.persistWorkflowSnapshot({
+        workflowName: workflow.id,
+        runId: 'stranded-run',
+        snapshot: { ...current, timestamp: current.timestamp + 1 },
+      });
+    };
+    let landing: Promise<unknown> | undefined;
+    Object.defineProperty(workflows, FENCED_WORKFLOW_STORAGE, {
+      value: {
+        ...native,
+        readSnapshot: async (read: typeof address) => {
+          const row = await native.readSnapshot(read);
+          landing ??= land();
+          await landing;
+          return row;
+        },
+      },
+      configurable: true,
+    });
+
+    // #when
+    const settled = await app.runtime.settleInterruptedRun(
+      workflow.id,
+      'stranded-run',
+      Date.now() + 360_001,
+    );
+
+    // #then the landed write stands
+    expect(settled).toEqual({ kind: 'live' });
+    const row = await native.readSnapshot(address);
+    assert(row);
+    expect(JSON.parse(row.snapshot)).toMatchObject({ status: 'running' });
+  });
+
+  it('reads an INTERRUPTED settlement as live when its silent row differs from the state it decided on', async () => {
+    // #given a stranded row that a writer with a lagging clock rewrites, without
+    // a fresh `updatedAt`, between settlement's load and its silence read
+    const sql = openSqlite();
+    const storage = createD1Storage({
+      binding: sqliteUnitDatabase(sql) as D1DatabaseBinding,
+    });
+    const { app, workflow } = await strandedRun('running', storage);
+    const workflows = (await storage.getStore(
+      'workflows',
+    )) as FencedWorkflowsStorageD1;
+    const native = workflows[FENCED_WORKFLOW_STORAGE];
+    assert(native);
+    const address = { workflowId: workflow.id, runId: 'stranded-run' };
+    Object.defineProperty(workflows, FENCED_WORKFLOW_STORAGE, {
+      value: {
+        ...native,
+        readSnapshot: async (read: typeof address) => {
+          const row = await native.readSnapshot(read);
+          assert(row);
+          sql
+            .prepare(
+              'UPDATE mastra_workflow_snapshot SET snapshot = ? WHERE run_id = ?',
+            )
+            .run(
+              JSON.stringify({
+                ...JSON.parse(row.snapshot),
+                status: 'waiting',
+              }),
+              'stranded-run',
+            );
+          return native.readSnapshot(read);
+        },
+      },
+      configurable: true,
+    });
+
+    // #when
+    const settled = await app.runtime.settleInterruptedRun(
+      workflow.id,
+      'stranded-run',
+      Date.now() + 360_001,
+    );
+
+    // #then
+    expect(settled).toEqual({ kind: 'live' });
+    const row = await native.readSnapshot(address);
+    assert(row);
+    expect(JSON.parse(row.snapshot)).toMatchObject({ status: 'waiting' });
   });
 
   it('never settles a run whose storage cannot mark legs live', async () => {

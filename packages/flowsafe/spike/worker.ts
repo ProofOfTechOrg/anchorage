@@ -635,7 +635,7 @@ const SPIKE_ACTORS = new Map<string, ApprovalActor>([
 // workflow's first step writes a durable D1 row instead, so the spike can count
 // executions directly across a process death and across a concurrent burst.
 const COUNTED_WORKFLOW_ID = 'demo-idempotent';
-// IL1-IL3: a step that counts its execution and then waits ten minutes in memory,
+// IL1-IL4: a step that counts its execution and then waits ten minutes in memory,
 // the shape of a leg the platform ends mid-step.
 const INTERRUPT_WORKFLOW_ID = 'demo-interrupt';
 const APPLICATION_CONTEXT_KEY = 'spike.attribution';
@@ -2863,12 +2863,16 @@ async function handleSuspensionDeadlineProbe(
   return json({ status: response.status, armed: await response.json() });
 }
 
-// --- Interrupted-leg probe (IL1-IL3) ---------------------------------------
+// --- Interrupted-leg probe (IL1-IL4) ---------------------------------------
 // LOCAL-ONLY, like every other spike probe. `GET /interrupt/rows` lists the
 // demo-interrupt rows, whose run ids the stalled start never returns to its
 // client. `POST /interrupt/silence?runId=` ages one row's `updatedAt` past the
 // silence the run object requires before it settles a leg (RUN_LEG_SILENT_MS),
 // standing in for minutes of wall clock after the process running the leg died.
+// `POST /interrupt/stale-write?runId=` writes what a leg that outlived the
+// settlement would: the row's own snapshot back at `running`, without the
+// settled lifecycle, through flowsafe's D1 workflow storage. It then writes
+// the settled row's successor, its lifecycle one revision on.
 const INTERRUPT_SILENCE_MS = 7 * 60_000;
 
 async function handleInterruptProbe(
@@ -2903,6 +2907,52 @@ async function handleInterruptProbe(
       )
       .run();
     return json({ changes: result.meta.changes });
+  }
+  if (request.method === 'POST' && url.pathname === '/interrupt/stale-write') {
+    const runId = url.searchParams.get('runId');
+    if (!isPathSafeId(runId)) {
+      return json({ error: 'a path-safe runId is required' }, 404);
+    }
+    const storage = createD1Storage({ binding: env.DB as unknown as never });
+    await storage.init();
+    const workflows = await storage.getStore('workflows');
+    const stored = await workflows?.loadWorkflowSnapshot({
+      workflowName: INTERRUPT_WORKFLOW_ID,
+      runId,
+    });
+    if (!workflows || !stored) return json({ error: 'run not found' }, 404);
+    const { 'flowsafe.runLifecycle': settled, ...context } =
+      stored.requestContext ?? {};
+    const outcome = (write: Promise<void>) =>
+      write.then(
+        () => null,
+        (error: unknown) => (error instanceof Error ? error.name : 'unknown'),
+      );
+    const refused = await outcome(
+      workflows.persistWorkflowSnapshot({
+        workflowName: INTERRUPT_WORKFLOW_ID,
+        runId,
+        snapshot: { ...stored, status: 'running', requestContext: context },
+      }),
+    );
+    const lifecycle = settled as { revision: number };
+    const successor = await outcome(
+      workflows.persistWorkflowSnapshot({
+        workflowName: INTERRUPT_WORKFLOW_ID,
+        runId,
+        snapshot: {
+          ...stored,
+          requestContext: {
+            ...context,
+            'flowsafe.runLifecycle': {
+              ...lifecycle,
+              revision: lifecycle.revision + 1,
+            },
+          },
+        },
+      }),
+    );
+    return json({ refused, successor });
   }
   return null;
 }
@@ -3111,7 +3161,7 @@ const handler: ExportedHandler<Env> = {
     const executionCountProbe = await handleExecutionCountProbe(routed, env);
     if (executionCountProbe) return executionCountProbe;
 
-    // Interrupted-leg rows and silence (IL1-IL3) — local, unauthenticated,
+    // Interrupted-leg rows, silence and stale write (IL1-IL4) — local, unauthenticated,
     // ahead of the routers.
     const interruptProbe = await handleInterruptProbe(routed, env);
     if (interruptProbe) return interruptProbe;

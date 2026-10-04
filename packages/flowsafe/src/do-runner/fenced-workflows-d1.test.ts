@@ -8,7 +8,7 @@ import {
   createWorkflow,
   type WorkflowRunState,
 } from '@mastra/core/workflows';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import { z } from 'zod';
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import {
@@ -35,7 +35,9 @@ import { FencedWorkflowsStorageD1 } from './fenced-workflows-d1.js';
 import { isDefinitiveInitialAdmissionRefusal } from './initial-admission-refusal.js';
 import {
   RUN_LIFECYCLE_CONTEXT_KEY,
+  RUN_SETTLING_MARKERS,
   RunLifecycleBlockedError,
+  RunSettledConflictError,
 } from './run-lifecycle.js';
 import {
   StartIdempotencyStore,
@@ -3315,5 +3317,288 @@ describe('owned initial workflow admission', () => {
       create,
     );
     expect(receiver).toBeUndefined();
+  });
+});
+
+describe('settled-row guard on unscoped persistence', () => {
+  type Marker = (typeof RUN_SETTLING_MARKERS)[number];
+  const TERMINAL = {
+    status: 'cancelled',
+    error: { code: 'CANCELLED', message: 'run was cancelled' },
+    transitionedAt: 100,
+    replayPrincipals: [OWNER],
+  };
+  /** Per marker: a settled lifecycle, and changes to its successor identity. */
+  const SETTLED: Record<
+    Marker,
+    { lifecycle: Record<string, unknown>; changes: Record<string, unknown>[] }
+  > = {
+    terminal: {
+      lifecycle: { version: 1, revision: 3, terminal: TERMINAL },
+      changes: [
+        { terminal: { ...TERMINAL, transitionedAt: 101 } },
+        {
+          terminal: {
+            ...TERMINAL,
+            status: 'timed_out',
+            error: { code: 'TIMED_OUT', message: 'run deadline expired' },
+          },
+        },
+      ],
+    },
+    interruptedAt: {
+      lifecycle: { version: 1, revision: 3, interruptedAt: 100 },
+      changes: [{ interruptedAt: 101 }],
+    },
+    startOutcomeUnknownAt: {
+      lifecycle: { version: 1, revision: 3, startOutcomeUnknownAt: 100 },
+      changes: [{ startOutcomeUnknownAt: 101 }],
+    },
+  };
+
+  function snapshot(
+    status: WorkflowRunState['status'],
+    lifecycle?: Record<string, unknown>,
+  ): WorkflowRunState {
+    return {
+      ...pending(),
+      status,
+      ...(lifecycle
+        ? { requestContext: { [RUN_LIFECYCLE_CONTEXT_KEY]: lifecycle } }
+        : {}),
+    };
+  }
+
+  function persist(
+    domain: {
+      persistWorkflowSnapshot: WorkflowsStorageD1['persistWorkflowSnapshot'];
+    },
+    value: WorkflowRunState,
+  ) {
+    return domain.persistWorkflowSnapshot({
+      workflowName: 'workflow',
+      runId: 'run',
+      snapshot: value,
+    });
+  }
+
+  it.each(
+    RUN_SETTLING_MARKERS,
+  )('refuses a write over a row settled by %s unless it advances the revision and keeps the settlement', async (marker) => {
+    // #given a row settled by the marker
+    const h = await fixture();
+    const { lifecycle, changes } = SETTLED[marker];
+    await persist(h.domain, snapshot('failed', lifecycle));
+    const settled = h.rows();
+    const without = Object.fromEntries(
+      Object.entries(lifecycle).filter(([key]) => key !== marker),
+    );
+
+    // #when stale writers and a changed or dropped settlement write over it
+    const refused = await Promise.all(
+      [
+        snapshot('running'),
+        snapshot('success', lifecycle),
+        snapshot('failed', { ...lifecycle, revision: '4' }),
+        ...changes.map((changed) =>
+          snapshot('failed', { ...lifecycle, revision: 4, ...changed }),
+        ),
+        snapshot('failed', { ...without, revision: 4 }),
+      ].map((value) =>
+        persist(h.domain, value).catch((error: unknown) => error),
+      ),
+    );
+
+    // #then each is refused and the row keeps its bytes
+    for (const error of refused)
+      expect(error).toBeInstanceOf(RunSettledConflictError);
+    expect(h.rows()).toEqual(settled);
+
+    // #when its successor advances the revision with the settlement intact
+    const successor = { ...lifecycle, revision: 4, cleanupCompletedAt: 200 };
+    await persist(h.domain, snapshot('failed', successor));
+
+    // #then
+    expect(
+      JSON.parse((h.rows()[0] as { snapshot: string }).snapshot).requestContext[
+        RUN_LIFECYCLE_CONTEXT_KEY
+      ],
+    ).toEqual(successor);
+  });
+
+  it.each([
+    ['no lifecycle', undefined],
+    ['a deadline only', { version: 1, revision: 2, deadlineAt: 50 }],
+    [
+      'a recorded intent only',
+      {
+        version: 1,
+        revision: 2,
+        transitionIntent: {
+          status: 'cancelled',
+          requestedAt: 50,
+          replayPrincipals: [OWNER],
+        },
+      },
+    ],
+  ] as const)('overwrites a row with %s', async (_, lifecycle) => {
+    // #given an unsettled row
+    const h = await fixture();
+    await persist(h.domain, snapshot('running', lifecycle));
+
+    // #when a write without a lifecycle lands
+    await persist(h.domain, snapshot('success'));
+
+    // #then
+    expect(h.rows()).toMatchObject([
+      { snapshot: JSON.stringify(snapshot('success')) },
+    ]);
+  });
+
+  it.each([
+    [
+      'writes a snapshot nested past its depth limit over an unsettled row',
+      'deep incoming',
+      undefined,
+      true,
+    ],
+    [
+      'refuses a snapshot nested past its depth limit over a settled row',
+      'deep incoming',
+      SETTLED.interruptedAt.lifecycle,
+      false,
+    ],
+    [
+      'writes over stored bytes that are not JSON',
+      'invalid stored',
+      undefined,
+      true,
+    ],
+  ] as const)('%s', async (_, unreadable, lifecycle, written) => {
+    // #given a stored row, and JSON SQLite cannot read on one side
+    const h = await fixture();
+    await persist(h.domain, snapshot('failed', lifecycle));
+    if (unreadable === 'invalid stored')
+      h.sql
+        .prepare('UPDATE mastra_workflow_snapshot SET snapshot = ?')
+        .run('{not json');
+    let deep: unknown = 'leaf';
+    for (let depth = 0; depth < 1_100; depth++) deep = { deep };
+    const value = {
+      ...snapshot('running'),
+      ...(unreadable === 'deep incoming' ? { result: deep } : {}),
+    } as WorkflowRunState;
+
+    // #when
+    const outcome = await persist(h.domain, value).catch(
+      (error: unknown) => error,
+    );
+
+    // #then
+    if (written) {
+      expect(outcome).toBeUndefined();
+      expect(h.rows()).toMatchObject([{ snapshot: JSON.stringify(value) }]);
+    } else expect(outcome).toBeInstanceOf(RunSettledConflictError);
+  });
+
+  it('writes the same rows as @mastra/cloudflare-d1 for new and existing runs', async () => {
+    // #given the guarded domain and Mastra's own, each on its own database,
+    // under one fixed clock
+    vi.useFakeTimers({
+      now: Date.parse('2026-02-03T04:05:06.007Z'),
+      toFake: ['Date'],
+    });
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
+    const guarded = await fixture();
+    const plainSql = openSqlite();
+    const plain = new WorkflowsStorageD1({
+      binding: sqliteUnitDatabase(plainSql) as never,
+    });
+    await plain.init();
+    const writes = [
+      { runId: 'defaulted' },
+      { runId: 'string-resource', resourceId: 'resource-1' },
+      {
+        runId: 'object-resource',
+        resourceId: { tenant: 't' } as unknown as string,
+      },
+      {
+        runId: 'date-resource',
+        resourceId: new Date(0) as unknown as string,
+      },
+      {
+        runId: 'given-times',
+        createdAt: new Date('2026-01-01T00:00:00.000Z'),
+        updatedAt: new Date('2026-01-02T00:00:00.000Z'),
+      },
+      { runId: 'defaulted', resourceId: 'changed-on-conflict' },
+      {
+        runId: 'given-times',
+        createdAt: new Date('2027-01-01T00:00:00.000Z'),
+      },
+    ];
+
+    // #when both persist the same sequence
+    for (const write of writes)
+      for (const domain of [guarded.domain, plain])
+        await domain.persistWorkflowSnapshot({
+          workflowName: 'workflow',
+          snapshot: { ...pending(), runId: write.runId },
+          ...write,
+        });
+
+    // #then
+    const rows = (sql: ReturnType<typeof openSqlite>) =>
+      sql
+        .prepare('SELECT * FROM mastra_workflow_snapshot ORDER BY run_id')
+        .all();
+    expect(rows(guarded.sql)).toEqual(rows(plainSql));
+  });
+});
+
+describe('owned initial terminalization outcome marker', () => {
+  it('lets a recorded intent, not the outcome marker, settle a marked repair', async () => {
+    // #given an admitted row whose cancellation was recorded
+    const h = await terminalFixture();
+    const request = h.replace((runSnapshot) => {
+      runSnapshot.requestContext[RUN_LIFECYCLE_CONTEXT_KEY] = {
+        version: 1,
+        revision: 1,
+        transitionIntent: {
+          status: 'cancelled',
+          requestedAt: 1,
+          replayPrincipals: [{ kind: 'service', id: 'original' }],
+        },
+      };
+    });
+
+    // #when
+    const result = await h.capability.terminalizeInitialAdmission({
+      ...request,
+      markOutcomeUnknown: true,
+    });
+
+    // #then
+    if (result.kind === 'conflict') throw new Error('unexpected conflict');
+    const lifecycle = JSON.parse(result.row.snapshot).requestContext[
+      RUN_LIFECYCLE_CONTEXT_KEY
+    ];
+    expect(lifecycle.terminal).toMatchObject({ status: 'cancelled' });
+    expect(lifecycle).not.toHaveProperty('startOutcomeUnknownAt');
+  });
+
+  it('refuses a marker flag other than true without writing', async () => {
+    const h = await terminalFixture();
+    const before = h.rows();
+
+    const outcome = h.capability.terminalizeInitialAdmission({
+      ...h.request,
+      markOutcomeUnknown: 'yes' as unknown as true,
+    });
+
+    await expect(outcome).rejects.toBeInstanceOf(InvalidExecutionIdentityError);
+    expect(h.rows()).toEqual(before);
   });
 });

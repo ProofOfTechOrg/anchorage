@@ -53,6 +53,20 @@ export class RunLifecycleBlockedError extends Error {
   }
 }
 
+/**
+ * A snapshot write over a settled run row that does not advance the row's
+ * lifecycle: the settlement stands, and the writer (typically an execution leg
+ * still running on another instance) is refused.
+ */
+export class RunSettledConflictError extends Error {
+  constructor(workflowId: string, runId: string) {
+    super(
+      `run '${runId}' of workflow '${workflowId}' is already settled; the write does not advance its lifecycle`,
+    );
+    this.name = 'RunSettledConflictError';
+  }
+}
+
 export interface RunTerminalCleanup {
   revision: number;
   status: RunTerminalStatus;
@@ -87,9 +101,17 @@ export interface RunLifecycleState {
   deadlineAt?: number;
   /**
    * Epoch milliseconds at which the run object settled a run whose execution
-   * leg ended mid-step as `failed`. Only the run object writes it.
+   * leg ended mid-step as `failed`. Only the run object writes it. A settling
+   * marker: see RUN_SETTLING_MARKERS.
    */
   interruptedAt?: number;
+  /**
+   * Epoch milliseconds at which start recovery ended a run whose start leg
+   * stopped as `StartOutcomeUnknown`. A settling marker only
+   * (RUN_SETTLING_MARKERS), so the guard refuses that leg's later writes; it
+   * is not part of the run's summary.
+   */
+  startOutcomeUnknownAt?: number;
   economicOperations?: RunEconomicOperation[];
   scheduleDispatch?: RunScheduleDispatch;
   transitionIntent?: {
@@ -110,6 +132,29 @@ export interface RunLifecycleState {
   };
 }
 
+/**
+ * Lifecycle fields whose presence settles a run row. A write over a settled
+ * row is admitted only when it advances the revision and carries
+ * RUN_SETTLED_IDENTITY_PATHS unchanged; `FencedWorkflowsStorageD1` renders its
+ * settled-row guard from both lists.
+ */
+export const RUN_SETTLING_MARKERS = [
+  'terminal',
+  'interruptedAt',
+  'startOutcomeUnknownAt',
+] as const satisfies readonly (keyof RunLifecycleState)[];
+
+type RunSettledIdentityPath =
+  | Exclude<(typeof RUN_SETTLING_MARKERS)[number], 'terminal'>
+  | `terminal.${keyof NonNullable<RunLifecycleState['terminal']>}`;
+
+export const RUN_SETTLED_IDENTITY_PATHS = [
+  'interruptedAt',
+  'startOutcomeUnknownAt',
+  'terminal.status',
+  'terminal.transitionedAt',
+] as const satisfies readonly RunSettledIdentityPath[];
+
 export function nextLifecycleRevision(current: number): number {
   if (
     !Number.isSafeInteger(current) ||
@@ -118,6 +163,19 @@ export function nextLifecycleRevision(current: number): number {
   )
     throw new Error('run lifecycle revision cannot advance');
   return current + 1;
+}
+
+/** The next revision of a lifecycle, or of a new one, with `patch` applied. */
+export function advanceLifecycle(
+  lifecycle: RunLifecycleState | undefined,
+  patch: Omit<Partial<RunLifecycleState>, 'version' | 'revision'>,
+): RunLifecycleState {
+  return {
+    ...lifecycle,
+    ...patch,
+    version: 1,
+    revision: nextLifecycleRevision(lifecycle?.revision ?? 0),
+  };
 }
 
 export function terminalCleanupFor(
@@ -338,7 +396,9 @@ export function parseRunLifecycle(
     !Number.isSafeInteger(stored.revision) ||
     (stored.revision as number) < 1 ||
     (stored.deadlineAt !== undefined && !validTime(stored.deadlineAt)) ||
-    (stored.interruptedAt !== undefined && !validTime(stored.interruptedAt))
+    (stored.interruptedAt !== undefined && !validTime(stored.interruptedAt)) ||
+    (stored.startOutcomeUnknownAt !== undefined &&
+      !validTime(stored.startOutcomeUnknownAt))
   ) {
     throw new Error('stored run lifecycle is malformed');
   }
@@ -351,6 +411,9 @@ export function parseRunLifecycle(
     ...(stored.interruptedAt === undefined
       ? {}
       : { interruptedAt: stored.interruptedAt as number }),
+    ...(stored.startOutcomeUnknownAt === undefined
+      ? {}
+      : { startOutcomeUnknownAt: stored.startOutcomeUnknownAt as number }),
     ...(stored.economicOperations === undefined
       ? {}
       : { economicOperations: economicOperations(stored.economicOperations) }),

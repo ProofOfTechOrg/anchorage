@@ -57,6 +57,12 @@ export interface InitialTerminalizationRequest {
   readonly execution: D1RunExecutionIdentity;
   readonly attemptToken: string;
   readonly nowMs: number;
+  /**
+   * Stamp `startOutcomeUnknownAt` on a no-intent terminalization, so the
+   * settled-row guard refuses the start leg's later writes. Set it only with
+   * evidence that the leg stopped.
+   */
+  readonly markOutcomeUnknown?: true;
 }
 
 /** A terminal-write observation, never admission or no-insert authority. */
@@ -93,4 +99,14 @@ export interface FencedWorkflowAdmissionCapability {
     address: { workflowId: string; runId: string },
     nowMs: number,
   ): Promise<void>;
+  /**
+   * Replace the snapshot and `updatedAt` of the exact row `expected` names, or
+   * report `false` when any of its columns changed since. It writes the bytes
+   * it is given, outside the settled-row guard. Settlement needs it beside
+   * `touchRun`: without it a run whose leg stops is never settled.
+   */
+  replaceSnapshot?(
+    expected: RawWorkflowSnapshot,
+    replacement: { snapshot: string; updatedAt: string },
+  ): Promise<boolean>;
 }

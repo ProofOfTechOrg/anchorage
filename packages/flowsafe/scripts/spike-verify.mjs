@@ -1046,7 +1046,7 @@ async function main() {
     },
   );
 
-  // --- Interrupted leg (IL1-IL3): a step the process dies under -------------
+  // --- Interrupted leg (IL1-IL4): a step the process dies under -------------
   // A start parks its one step in a ten-minute in-memory wait, and the A2 kill
   // ends that leg mid-step. The restarted run object must settle the run as
   // failed INTERRUPTED from its own wake, without running the step again.
@@ -2705,6 +2705,41 @@ async function main() {
     },
   );
 
+  await step(
+    'IL4 interrupted leg: a late write from a leg that outlived the settlement ' +
+      'is refused on D1',
+    async () => {
+      const stale = await http(
+        'POST',
+        `/interrupt/stale-write?runId=${encodeURIComponent(interruptedRun.runId)}`,
+      );
+      assert(
+        stale.status === 200 &&
+          stale.body.refused === 'RunSettledConflictError',
+        "the run row's settled-row guard refused a write that does not advance " +
+          'its settled lifecycle',
+        stale,
+      );
+      assert(
+        stale.body.successor === null,
+        'the guard admitted the settled lifecycle advanced one revision',
+        stale,
+      );
+      const seen = await http(
+        'GET',
+        `/runs/${INTERRUPT_WORKFLOW_ID}/${encodeURIComponent(interruptedRun.runId)}`,
+        { headers: AUTH.viewer },
+      );
+      assert(
+        seen.status === 200 &&
+          seen.body.status === 'failed' &&
+          seen.body.errorEnvelope?.code === 'INTERRUPTED',
+        'the run still reads failed INTERRUPTED after the refused write',
+        seen,
+      );
+    },
+  );
+
   // --- Execution fence (F1): the migration control, on real workerd ---------
   // Unit tests can prove the store's compare-and-set. What they cannot prove is
   // that a fence written by one process still refuses work in the NEXT one, and
@@ -3397,10 +3432,11 @@ try {
       "reserved deadline key armed the run DO's own fenced wake, and after a " +
       'kill+restart that wake fired on the restarted object and resumed the run ' +
       "ITSELF with the timeout envelope under the run's requester — no client " +
-      'called resume. Interrupted legs (IL1-IL3): a start whose step was still ' +
-      'waiting when its process was killed read running after the restart, and ' +
+      'called resume. Interrupted legs (IL1-IL4): a start whose step was still ' +
+      'waiting when its process was killed read running after the restart, ' +
       "once its row had gone silent the run's own object settled it as failed " +
-      'INTERRUPTED without running the step again. ' +
+      'INTERRUPTED without running the step again, and a late write without ' +
+      'the settlement was refused on D1. ' +
       'The deployment execution fence (F1): provisioning seeded ' +
       'an explicit open fence, draining refused new starts with 503 ' +
       'EXECUTION_FENCED while still resuming an outstanding approval to ' +

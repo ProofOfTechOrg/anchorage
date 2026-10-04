@@ -252,6 +252,7 @@ export {
   RunLifecycleBlockedError,
   RunNotSuspendedError,
   RunnerRuntime,
+  RunSettledConflictError,
   RunStateUnreadableError,
   RunTerminalConflictError,
   UnknownRunError,

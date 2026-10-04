@@ -42,11 +42,15 @@ import {
 import { definitiveInitialAdmissionRefusal } from './initial-admission-refusal.js';
 import { isPathSafeId } from './path-safe-id.js';
 import {
+  advanceLifecycle,
   hasDisputedSettlement,
   parseRunLifecycle,
   projectTerminalLifecycle,
   RUN_LIFECYCLE_CONTEXT_KEY,
+  RUN_SETTLED_IDENTITY_PATHS,
+  RUN_SETTLING_MARKERS,
   RunLifecycleBlockedError,
+  RunSettledConflictError,
   terminalCleanupFor,
 } from './run-lifecycle.js';
 import {
@@ -400,13 +404,153 @@ function captureStatementResult(result: unknown) {
       ),
     ),
   );
-  const meta = record(result).meta;
-  const hasChanges = meta !== undefined && 'changes' in record(meta);
+  const meta: unknown = (result as { meta?: unknown }).meta;
+  if (
+    meta !== undefined &&
+    (meta === null || typeof meta !== 'object' || Array.isArray(meta))
+  )
+    throw new Error('workflow snapshot result is malformed');
   return {
     results,
-    ...(hasChanges ? { meta: { changes: record(meta).changes } } : {}),
+    ...(meta !== undefined && 'changes' in meta
+      ? { meta: { changes: (meta as { changes: unknown }).changes } }
+      : {}),
   };
 }
+
+/** Rows one write statement returned, which `meta.changes` must agree with. */
+function writtenRowCount({
+  results,
+  meta,
+}: ReturnType<typeof captureStatementResult>): number {
+  if (
+    results.length > 1 ||
+    (meta &&
+      (!Number.isSafeInteger(meta.changes) || meta.changes !== results.length))
+  )
+    throw new Error('statement changes disagree with returned rows');
+  return results.length;
+}
+
+/** Exact-row compare-and-set of a snapshot row's `snapshot` and `updatedAt`. */
+function prepareSnapshotReplace(
+  database: InitialAdmissionDatabase,
+  expected: RawWorkflowSnapshot,
+  replacement: { snapshot: string; updatedAt: string },
+): SnapshotStatement {
+  return database
+    .prepare(`UPDATE "${expected.tablePrefix}mastra_workflow_snapshot"
+    SET snapshot = ?1, updatedAt = ?2
+    WHERE workflow_name = ?3 AND run_id = ?4
+      AND snapshot = ?5 AND createdAt IS ?6 AND updatedAt IS ?7
+      AND resourceId IS ?8
+    RETURNING workflow_name, run_id, resourceId, snapshot, createdAt, updatedAt`)
+    .bind(
+      replacement.snapshot,
+      replacement.updatedAt,
+      expected.workflowId,
+      expected.runId,
+      expected.snapshot,
+      expected.createdAt,
+      expected.updatedAt,
+      expected.resourceId,
+    );
+}
+
+/** The replaced row, or undefined when the compare-and-set matched nothing. */
+function decodeSnapshotReplace(
+  result: unknown,
+  expected: RawWorkflowSnapshot,
+): RawWorkflowSnapshot | undefined {
+  const captured = captureStatementResult(result);
+  writtenRowCount(captured);
+  return decodeRawWorkflowSnapshotResult(captured, expected);
+}
+
+async function replaceSnapshotRow(
+  database: InitialAdmissionDatabase,
+  tablePrefix: string,
+  expected: RawWorkflowSnapshot,
+  replacement: { snapshot: string; updatedAt: string },
+): Promise<boolean> {
+  if (
+    expected.tablePrefix !== tablePrefix ||
+    !isPathSafeId(expected.workflowId) ||
+    !isPathSafeId(expected.runId) ||
+    typeof replacement.snapshot !== 'string' ||
+    typeof replacement.updatedAt !== 'string'
+  )
+    throw new Error('workflow snapshot replacement is malformed');
+  const result = await prepareSnapshotReplace(
+    database,
+    expected,
+    replacement,
+  ).all();
+  return decodeSnapshotReplace(result, expected) !== undefined;
+}
+
+/**
+ * The columns @mastra/cloudflare-d1's `persistWorkflowSnapshot` writes for a
+ * new row (its `serializeValue` rules for `resourceId`). On an existing row it
+ * changes only `snapshot` and `updatedAt`.
+ */
+function mastraSnapshotRow(args: PersistInput, nowIso: string) {
+  const { workflowName, runId, resourceId, snapshot, createdAt, updatedAt } = {
+    workflowName: args.workflowName,
+    runId: args.runId,
+    resourceId: args.resourceId,
+    snapshot: args.snapshot,
+    createdAt: args.createdAt,
+    updatedAt: args.updatedAt,
+  } satisfies Record<keyof PersistInput, unknown>;
+  const resource: unknown = resourceId;
+  return {
+    workflowName,
+    runId,
+    resourceId:
+      resource == null
+        ? null
+        : resource instanceof Date
+          ? resource.toISOString()
+          : typeof resource === 'object'
+            ? JSON.stringify(resource)
+            : resource,
+    snapshot: JSON.stringify(snapshot),
+    createdAt: createdAt ? createdAt.toISOString() : nowIso,
+    updatedAt: updatedAt ? updatedAt.toISOString() : nowIso,
+  };
+}
+
+function lifecyclePath(path: string): string {
+  return `'$.requestContext."${RUN_LIFECYCLE_CONTEXT_KEY}".${path}'`;
+}
+
+function lifecycleSql(column: string, path: string): string {
+  return `json_extract(${column}, ${lifecyclePath(path)})`;
+}
+
+const STORED_UNSETTLED_SQL = RUN_SETTLING_MARKERS.map(
+  (marker) => `${lifecycleSql('snapshot', marker)} IS NULL`,
+).join(' AND ');
+
+/**
+ * Upsert condition over a stored row: unsettled, or the incoming write
+ * advances the revision and keeps the settlement. JSON SQLite cannot read
+ * (malformed, or nested past its depth limit) is written as Mastra's upsert
+ * writes it, except an unreadable write over a settled row. CASE, unlike OR,
+ * never evaluates json_extract on JSON its guard found unreadable.
+ */
+const SETTLED_ROW_GUARD_SQL = `CASE
+    WHEN NOT json_valid(snapshot) THEN 1
+    WHEN NOT json_valid(excluded.snapshot) THEN ${STORED_UNSETTLED_SQL}
+    ELSE (${STORED_UNSETTLED_SQL})
+      OR (json_type(excluded.snapshot, ${lifecyclePath('revision')}) = 'integer'
+        AND ${lifecycleSql('excluded.snapshot', 'revision')} > ${lifecycleSql('snapshot', 'revision')}
+        AND ${RUN_SETTLED_IDENTITY_PATHS.map(
+          (path) =>
+            `${lifecycleSql('excluded.snapshot', path)} IS ${lifecycleSql('snapshot', path)}`,
+        ).join(' AND ')})
+    END`;
 
 function terminalizationUnreadable(
   cause: unknown,
@@ -467,6 +611,7 @@ function prepareTerminalization(
     execution: rawExecution,
     attemptToken,
     nowMs,
+    markOutcomeUnknown,
   } = record(source);
   const execution = normalizeD1RunExecutionIdentity(rawExecution);
   const {
@@ -490,7 +635,8 @@ function prepareTerminalization(
     !isPathSafeId(attemptToken) ||
     typeof nowMs !== 'number' ||
     !Number.isSafeInteger(nowMs) ||
-    nowMs < 0
+    nowMs < 0 ||
+    (markOutcomeUnknown !== undefined && markOutcomeUnknown !== true)
   )
     throw new InvalidExecutionIdentityError('admission');
   let nowIso: string;
@@ -582,6 +728,14 @@ function prepareTerminalization(
     } catch (error) {
       throw terminalizationUnreadable(error);
     }
+  } else if (markOutcomeUnknown) {
+    try {
+      nextContext[RUN_LIFECYCLE_CONTEXT_KEY] = advanceLifecycle(lifecycle, {
+        startOutcomeUnknownAt: nowMs,
+      });
+    } catch (error) {
+      throw terminalizationUnreadable(error);
+    }
   }
   const replacement = Object.freeze({
     ...expected,
@@ -596,7 +750,11 @@ function prepareTerminalization(
   return { expected, replacement, provenance, cleanup };
 }
 
-/** Owned initial admission and repair; unscoped persistence delegates to the adapter. */
+/**
+ * Owned initial admission and repair. On a binding with `batch()`, unscoped
+ * persistence is an owned upsert that refuses to overwrite a settled run row
+ * (RunSettledConflictError); otherwise it delegates to the adapter.
+ */
 export class FencedWorkflowsStorageD1 extends WorkflowsStorageD1 {
   readonly [FENCED_WORKFLOW_STORAGE]?: FencedWorkflowAdmissionCapability;
   readonly #admission?: FencedWorkflowAdmissionCapability;
@@ -640,6 +798,10 @@ export class FencedWorkflowsStorageD1 extends WorkflowsStorageD1 {
             },
             nowMs,
           ),
+        replaceSnapshot: (
+          expected: RawWorkflowSnapshot,
+          replacement: { snapshot: string; updatedAt: string },
+        ) => replaceSnapshotRow(database, tablePrefix, expected, replacement),
       });
       this[FENCED_WORKFLOW_STORAGE] = this.#admission;
     }
@@ -693,24 +855,11 @@ export class FencedWorkflowsStorageD1 extends WorkflowsStorageD1 {
         };
         let result: unknown;
         try {
-          result = await database
-            .prepare(`UPDATE "${expected.tablePrefix}mastra_workflow_snapshot"
-          SET snapshot = ?1, updatedAt = ?2
-          WHERE workflow_name = ?3 AND run_id = ?4
-            AND snapshot = ?5 AND createdAt IS ?6 AND updatedAt IS ?7
-            AND resourceId IS ?8
-          RETURNING workflow_name, run_id, resourceId, snapshot, createdAt, updatedAt`)
-            .bind(
-              replacement.snapshot,
-              replacement.updatedAt,
-              expected.workflowId,
-              expected.runId,
-              expected.snapshot,
-              expected.createdAt,
-              expected.updatedAt,
-              expected.resourceId,
-            )
-            .all();
+          result = await prepareSnapshotReplace(
+            database,
+            expected,
+            replacement,
+          ).all();
         } catch (error) {
           try {
             const recovered = await readback();
@@ -721,17 +870,7 @@ export class FencedWorkflowsStorageD1 extends WorkflowsStorageD1 {
           throw terminalizationUnreadable(error);
         }
         try {
-          const captured = captureStatementResult(result);
-          const row = decodeRawWorkflowSnapshotResult(captured, expected);
-          const changes = captured.meta?.changes;
-          if (
-            captured.meta &&
-            (!Number.isSafeInteger(changes) ||
-              changes !== captured.results.length)
-          )
-            throw new Error(
-              'terminalization changes disagree with returned rows',
-            );
+          const row = decodeSnapshotReplace(result, expected);
           if (!row) return await readback();
           if (!sameFields({ ...row }, { ...replacement }))
             throw new Error('terminalization returned a different row');
@@ -788,7 +927,11 @@ export class FencedWorkflowsStorageD1 extends WorkflowsStorageD1 {
 
   override async persistWorkflowSnapshot(args: PersistInput): Promise<void> {
     const scope = this.#scopes.getStore();
-    if (!scope) return super.persistWorkflowSnapshot(args);
+    if (!scope) {
+      const capability = this.#admission;
+      if (!capability) return super.persistWorkflowSnapshot(args);
+      return this.#persistUnlessSettled(capability, args);
+    }
     if (
       !scope.open ||
       scope.attempted ||
@@ -811,12 +954,37 @@ export class FencedWorkflowsStorageD1 extends WorkflowsStorageD1 {
     }
   }
 
+  async #persistUnlessSettled(
+    capability: FencedWorkflowAdmissionCapability,
+    args: PersistInput,
+  ): Promise<void> {
+    const row = mastraSnapshotRow(args, new Date().toISOString());
+    const result = await capability.database
+      .prepare(`INSERT INTO "${capability.tablePrefix}mastra_workflow_snapshot"
+      (workflow_name, run_id, resourceId, snapshot, createdAt, updatedAt)
+      VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+      ON CONFLICT (workflow_name, run_id) DO UPDATE
+        SET snapshot = excluded.snapshot, updatedAt = excluded.updatedAt
+        WHERE ${SETTLED_ROW_GUARD_SQL}
+      RETURNING workflow_name`)
+      .bind(
+        row.workflowName,
+        row.runId,
+        row.resourceId,
+        row.snapshot,
+        row.createdAt,
+        row.updatedAt,
+      )
+      .all();
+    if (writtenRowCount(captureStatementResult(result)) === 0)
+      throw new RunSettledConflictError(row.workflowName, row.runId);
+  }
+
   #initialRow(
     args: PersistInput,
     input: InitialRunAdmission,
   ): { row: RawWorkflowSnapshot; nowMs: number } {
-    const { snapshot: original, resourceId, createdAt, updatedAt } = args;
-    const snapshot = { ...original };
+    const snapshot = { ...args.snapshot };
     assertInitialSnapshot(snapshot, input.execution.runId);
     const provenance = decodeInitialRunProvenance(
       { ...record(input.requestContext[PROVENANCE]), initialAdmission: true },
@@ -830,19 +998,17 @@ export class FencedWorkflowsStorageD1 extends WorkflowsStorageD1 {
     if (!Number.isSafeInteger(nowMs) || nowMs < 0)
       throw new InvalidExecutionIdentityError('admission');
     const nowIso = new Date(nowMs).toISOString();
-    const resource: unknown = resourceId;
-    const serializedResource =
-      resource == null
-        ? null
-        : resource instanceof Date
-          ? resource.toISOString()
-          : typeof resource === 'object'
-            ? JSON.stringify(resource)
-            : resource;
+    // Before the snapshot serializes: a toJSON that rewrites the context then
+    // fails the comparison below.
+    const contextBytes = JSON.stringify(snapshot.requestContext);
+    const {
+      resourceId: serializedResource,
+      snapshot: bytes,
+      createdAt: created,
+      updatedAt: updated,
+    } = mastraSnapshotRow({ ...args, snapshot }, nowIso);
     if (serializedResource !== null && typeof serializedResource !== 'string')
       throw new InvalidExecutionIdentityError('admission');
-    const contextBytes = JSON.stringify(snapshot.requestContext);
-    const bytes = JSON.stringify(snapshot);
     const serialized = record(JSON.parse(bytes));
     assertInitialSnapshot(serialized, input.execution.runId);
     if (JSON.stringify(serialized.requestContext) !== contextBytes)
@@ -857,8 +1023,6 @@ export class FencedWorkflowsStorageD1 extends WorkflowsStorageD1 {
           input.execution.workflowId)
     )
       throw new InvalidExecutionIdentityError('admission');
-    const created = createdAt ? createdAt.toISOString() : nowIso;
-    const updated = updatedAt ? updatedAt.toISOString() : nowIso;
     if (typeof created !== 'string' || typeof updated !== 'string')
       throw new InvalidExecutionIdentityError('admission');
     const row: RawWorkflowSnapshot = Object.freeze({
@@ -1018,16 +1182,7 @@ export class FencedWorkflowsStorageD1 extends WorkflowsStorageD1 {
   ): boolean {
     try {
       const captured = captureBatchResults(result, input.reservation ? 3 : 2);
-      const counts = captured.map(({ results, meta }) => {
-        if (
-          results.length > 1 ||
-          (meta &&
-            (!Number.isSafeInteger(meta.changes) ||
-              meta.changes !== results.length))
-        )
-          throw new Error('initial statement changes contradict returned rows');
-        return results.length;
-      });
+      const counts = captured.map(writtenRowCount);
       if (counts[0] === 0) {
         if (counts.some((count) => count !== 0))
           throw new Error('zero INSERT changed a participant');

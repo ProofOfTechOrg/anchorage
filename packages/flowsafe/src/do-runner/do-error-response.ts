@@ -20,6 +20,7 @@ import {
   RunAlreadyExistsError,
   RunLifecycleBlockedError,
   RunNotSuspendedError,
+  RunSettledConflictError,
   RunStateUnreadableError,
   RunTerminalConflictError,
   UnknownRunError,
@@ -54,6 +55,7 @@ function statusOf(error: unknown): number | undefined {
     error instanceof RunNotSuspendedError ||
     error instanceof RunAlreadyExistsError ||
     error instanceof RunTerminalConflictError ||
+    error instanceof RunSettledConflictError ||
     error instanceof RunLifecycleBlockedError
   ) {
     return 409;

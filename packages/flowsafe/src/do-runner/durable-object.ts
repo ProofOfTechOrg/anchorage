@@ -1804,6 +1804,7 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
         isOwnerQuiescent: quiescent,
         startReservation: recovery.startReservation,
         expectedTarget: { kind: 'workflow' },
+        startLeg: ownFrame?.unwound === true ? 'unwound' : 'touched',
       });
     } else if (recovery.phase === 'prepared-unfenced') {
       const state = this.#matchingRunState(
@@ -2220,6 +2221,11 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
             'run owner recovery could not read authoritative state',
             recoveryError,
           );
+        } else if (isRunStartPendingError(recoveryError)) {
+          // Not rethrown either: a start whose leg may still run, or whose
+          // row the touch rule does not yet read as silent, settled nothing.
+          // The journal survives, and the arm below keeps the 60 s cadence
+          // without workerd's immediate retries.
         } else {
           if (converged) await this.#rearmRunOwnerRecovery();
           throw recoveryError;
