@@ -502,6 +502,64 @@ async function replaceSnapshotRow(
 }
 
 /**
+ * The timestamp is bound as JSON text because a bound JS number would be
+ * stored as a REAL (`456.0`). A request context that is not an object makes
+ * json_set write nothing yet still count a row, so the predicate refuses it.
+ */
+async function patchLifecycleRow(
+  database: InitialAdmissionDatabase,
+  tablePrefix: string,
+  address: { workflowId: string; runId: string },
+  expected: { status: string; lifecycleRevision?: number },
+  patch: { lifecycle: object; timestamp: number; updatedAt: string },
+): Promise<boolean> {
+  const { workflowId, runId } = address;
+  const { status, lifecycleRevision } = expected;
+  const { lifecycle, timestamp, updatedAt } = patch;
+  if (
+    !isPathSafeId(workflowId) ||
+    !isPathSafeId(runId) ||
+    typeof status !== 'string' ||
+    (lifecycleRevision !== undefined &&
+      !Number.isSafeInteger(lifecycleRevision)) ||
+    lifecycle === null ||
+    typeof lifecycle !== 'object' ||
+    Array.isArray(lifecycle) ||
+    !Number.isSafeInteger(timestamp) ||
+    timestamp < 0 ||
+    typeof updatedAt !== 'string' ||
+    !isCanonicalIsoTime(updatedAt)
+  )
+    throw new Error('workflow lifecycle patch is malformed');
+  const result = await database
+    .prepare(`UPDATE "${tablePrefix}mastra_workflow_snapshot"
+    SET snapshot = json_set(snapshot,
+        '$.requestContext."${RUN_LIFECYCLE_CONTEXT_KEY}"', json(?1),
+        '$.timestamp', json(?2)),
+      updatedAt = ?3
+    WHERE workflow_name = ?4 AND run_id = ?5
+      AND CASE
+        WHEN NOT json_valid(snapshot) THEN 0
+        WHEN coalesce(json_type(snapshot, '$.requestContext'), 'object') <> 'object' THEN 0
+        ELSE json_extract(snapshot, '$.status') = ?6
+          AND ${lifecycleSql('snapshot', 'revision')} IS ?7
+          AND ${STORED_UNSETTLED_SQL}
+        END
+    RETURNING workflow_name`)
+    .bind(
+      JSON.stringify(lifecycle),
+      String(timestamp),
+      updatedAt,
+      workflowId,
+      runId,
+      status,
+      lifecycleRevision ?? null,
+    )
+    .all();
+  return writtenRowCount(captureStatementResult(result)) === 1;
+}
+
+/**
  * The columns @mastra/cloudflare-d1's `persistWorkflowSnapshot` writes for a
  * new row (its `serializeValue` rules for `resourceId`). On an existing row it
  * changes only `snapshot` and `updatedAt`.
@@ -814,6 +872,15 @@ export class FencedWorkflowsStorageD1 extends WorkflowsStorageD1 {
           expected: RawWorkflowSnapshot,
           replacement: { snapshot: string; updatedAt: string },
         ) => replaceSnapshotRow(database, tablePrefix, expected, replacement),
+        patchRunLifecycle: (
+          address: { workflowId: string; runId: string },
+          expected: { status: string; lifecycleRevision?: number },
+          patch: {
+            lifecycle: object;
+            timestamp: number;
+            updatedAt: string;
+          },
+        ) => patchLifecycleRow(database, tablePrefix, address, expected, patch),
       });
       this[FENCED_WORKFLOW_STORAGE] = this.#admission;
     }

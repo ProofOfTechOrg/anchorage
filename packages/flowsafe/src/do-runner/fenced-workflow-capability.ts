@@ -111,4 +111,22 @@ export interface FencedWorkflowAdmissionCapability {
     expected: RawWorkflowSnapshot,
     replacement: { snapshot: string; updatedAt: string },
   ): Promise<boolean>;
+  /**
+   * Write the run's lifecycle, `timestamp` and `updatedAt` and no other part of
+   * its snapshot, but only while the stored status is `expected.status`, the
+   * stored lifecycle's revision is `expected.lifecycleRevision` (or it has no
+   * lifecycle, when that is omitted) and the row is not settled; otherwise
+   * resolve `false`, writing nothing. A write that leaves the status and
+   * lifecycle alone, such as a leg's step progress, does not make it miss. It
+   * rejects, writing nothing, a malformed address, expectation or patch.
+   */
+  patchRunLifecycle?(
+    address: { workflowId: string; runId: string },
+    expected: { status: string; lifecycleRevision?: number },
+    patch: {
+      lifecycle: object;
+      timestamp: number;
+      updatedAt: string;
+    },
+  ): Promise<boolean>;
 }

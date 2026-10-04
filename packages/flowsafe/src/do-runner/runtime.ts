@@ -120,7 +120,10 @@ import {
   type StartReservationReading,
 } from './start-reservation-contract.js';
 import { validateTablePrefix } from './table-prefix.js';
-import type { RawWorkflowSnapshot } from './workflow-snapshot-row.js';
+import {
+  parseSnapshotObject,
+  type RawWorkflowSnapshot,
+} from './workflow-snapshot-row.js';
 
 export {
   RunLifecycleBlockedError,
@@ -867,8 +870,30 @@ function rowSilent(raw: RawWorkflowSnapshot, now: number): boolean {
   return now - touchedAt >= RUN_LEG_SILENT_MS;
 }
 
-/** A settlement compare-and-set found its row changed since the silence read. */
-class SettlementMissError extends Error {}
+/** A compare-and-set write found the run's row changed since the read it decided from. */
+class RowChangedError extends Error {
+  constructor() {
+    super('the run row changed since it was read');
+    this.name = 'RowChangedError';
+  }
+}
+
+/**
+ * Compare-and-set passes a lifecycle transition makes before it answers that
+ * the run's row keeps changing. A touch moves the row at most once per
+ * RUN_LEG_TOUCH_MS, so a miss it causes clears on the next pass; only a leg on
+ * another instance writing snapshots back to back misses every time.
+ */
+const LIFECYCLE_WRITE_ATTEMPTS = 5;
+
+function snapshotOfRow(row: RawWorkflowSnapshot): WorkflowRunState {
+  const state = parseSnapshotObject(row.snapshot) as
+    | WorkflowRunState
+    | undefined;
+  if (state === undefined || state.runId !== row.runId)
+    throw new RunStateUnreadableError(row.workflowId, row.runId);
+  return state;
+}
 
 const TERMINABLE_RUN_STATUSES = new Set<RunStatus>([
   'running',
@@ -1135,6 +1160,7 @@ type CapturedWorkflowStorage = {
       readonly terminalize: FencedWorkflowAdmissionCapability['terminalizeInitialAdmission'];
       readonly touch?: FencedWorkflowAdmissionCapability['touchRun'];
       readonly replace?: FencedWorkflowAdmissionCapability['replaceSnapshot'];
+      readonly patch?: FencedWorkflowAdmissionCapability['patchRunLifecycle'];
     }
 );
 
@@ -1143,6 +1169,17 @@ type ActiveRun = {
   lifecycle?: RunLifecycleState;
   requestContext?: RequestContext;
   source?: CapturedWorkflowStorage;
+};
+
+type TerminalTransitionOptions = {
+  cas?: RunLifecycleCas;
+  replayPrincipals?: readonly RunLifecyclePrincipal[];
+  replayingPrincipal?: RunLifecyclePrincipal;
+};
+
+type TransitionRead = {
+  state: WorkflowRunState;
+  row?: RawWorkflowSnapshot;
 };
 
 /** @internal An owning recovery's selected durable outcome. */
@@ -1889,20 +1926,16 @@ export class RunnerRuntime {
     now = Date.now(),
   ): Promise<boolean> {
     this.#getWorkflow(workflowId);
-    const prepared = await this.#withLifecycleLock(
-      workflowId,
-      runId,
-      async () => {
+    const prepared = await this.#withLifecycleLock(workflowId, runId, () =>
+      this.#retryOnRowChange(workflowId, runId, async () => {
         const source =
           this.#activeRuns.get(this.#runKey(workflowId, runId))?.source ??
           (await this.#captureWorkflowStorage(workflowId));
-        const state = await source.load.call(source.workflows, {
-          workflowName: workflowId,
+        const { state, row } = await this.#readForTransition(
+          source,
+          workflowId,
           runId,
-        });
-        if (!state) throw new UnknownRunError(workflowId, runId);
-        if (state.runId !== runId)
-          throw new RunStateUnreadableError(workflowId, runId);
+        );
         const key = this.#runKey(workflowId, runId);
         const active = this.#activeRuns.get(key);
         const lifecycle = effectiveLifecycle(
@@ -1966,13 +1999,14 @@ export class RunnerRuntime {
               : {}),
           },
         });
-        await this.#persistLifecycle(
+        await this.#persistIntent(
           workflowId,
           runId,
           state,
           intent,
           now,
           source,
+          row,
         );
         if (active) {
           active.lifecycle = intent;
@@ -1981,7 +2015,7 @@ export class RunnerRuntime {
         if (!active?.run) return undefined;
         this.#terminalAbortIntents.set(key, intendedStatus);
         return { run: active.run, key };
-      },
+      }),
     );
     if (!prepared) return false;
     try {
@@ -2063,45 +2097,36 @@ export class RunnerRuntime {
     replayingPrincipal?: RunLifecyclePrincipal,
   ): Promise<RunLifecycleTransitionResult> {
     this.#getWorkflow(workflowId);
-    return this.#withRunLock(workflowId, runId, () =>
-      this.#transitionTerminalLocked(workflowId, runId, status, now, {
-        cas,
-        replayPrincipals,
-        replayingPrincipal,
-      }),
-    );
+    return this.#withRunLock(workflowId, runId, async () => {
+      const source = await this.#captureWorkflowStorage(workflowId);
+      return this.#retryOnRowChange(workflowId, runId, async () =>
+        this.#transitionTerminalLocked(
+          workflowId,
+          runId,
+          status,
+          now,
+          { cas, replayPrincipals, replayingPrincipal },
+          source,
+          await this.#readForTransition(source, workflowId, runId),
+        ),
+      );
+    });
   }
 
   /**
-   * #transitionTerminal's body, for a caller already holding the run lock.
-   * With `expected`, the write is a compare-and-set against that exact row and
-   * a miss throws SettlementMissError.
+   * Decide a terminal transition from one read of the run's row and write it,
+   * for a caller holding the run lock. Where the read carries the row, the
+   * write is a compare-and-set against it and a miss throws RowChangedError.
    */
   async #transitionTerminalLocked(
     workflowId: string,
     runId: string,
     status: RunTerminalStatus,
     now: number,
-    {
-      cas,
-      replayPrincipals,
-      replayingPrincipal,
-      expected,
-    }: {
-      cas?: RunLifecycleCas;
-      replayPrincipals?: readonly RunLifecyclePrincipal[];
-      replayingPrincipal?: RunLifecyclePrincipal;
-      expected?: RawWorkflowSnapshot;
-    } = {},
+    { cas, replayPrincipals, replayingPrincipal }: TerminalTransitionOptions,
+    source: CapturedWorkflowStorage,
+    { state, row }: TransitionRead,
   ): Promise<RunLifecycleTransitionResult> {
-    const source = await this.#captureWorkflowStorage(workflowId);
-    const state = await source.load.call(source.workflows, {
-      workflowName: workflowId,
-      runId,
-    });
-    if (!state) throw new UnknownRunError(workflowId, runId);
-    if (state.runId !== runId)
-      throw new RunStateUnreadableError(workflowId, runId);
     const lifecycle = lifecycleFromRequestContext(state.requestContext);
     if (lifecycle?.terminal) {
       if (
@@ -2210,7 +2235,7 @@ export class RunnerRuntime {
       next,
       now,
       source,
-      expected,
+      row,
     );
     this.#terminalAbortIntents.delete(this.#runKey(workflowId, runId));
     return {
@@ -2371,6 +2396,7 @@ export class RunnerRuntime {
       terminalizeInitialAdmission: terminalize,
       touchRun: touch,
       replaceSnapshot: replace,
+      patchRunLifecycle: patch,
     } = capability;
     if (
       typeof prefix !== 'string' ||
@@ -2379,6 +2405,7 @@ export class RunnerRuntime {
       typeof terminalize !== 'function' ||
       (touch !== undefined && typeof touch !== 'function') ||
       (replace !== undefined && typeof replace !== 'function') ||
+      (patch !== undefined && typeof patch !== 'function') ||
       !database ||
       typeof database.prepare !== 'function' ||
       typeof database.batch !== 'function'
@@ -2401,6 +2428,7 @@ export class RunnerRuntime {
       terminalize,
       ...(touch === undefined ? {} : { touch }),
       ...(replace === undefined ? {} : { replace }),
+      ...(patch === undefined ? {} : { patch }),
     };
   }
 
@@ -2897,6 +2925,9 @@ export class RunnerRuntime {
         // silent row: a write that lands after the read makes it miss (`live`).
         const silent = await this.#silentRow(source, workflowId, runId, now);
         if (!silent) return { kind: 'live' };
+        // The write replaces the silent row, so it is built from that row; one
+        // that moved since the decision above waits for the next wake.
+        const current = snapshotOfRow(silent);
         try {
           if (recorded)
             return {
@@ -2908,14 +2939,11 @@ export class RunnerRuntime {
                 runId,
                 recorded.status,
                 now,
-                { expected: silent },
+                {},
+                source,
+                { state: current, row: silent },
               ),
             };
-          // The write replaces the silent row, so it is built from that row;
-          // one that moved since the decision above waits for the next wake.
-          const current = JSON.parse(silent.snapshot) as WorkflowRunState;
-          if (current.runId !== runId)
-            throw new RunStateUnreadableError(workflowId, runId);
           const currentLifecycle = lifecycleFromRequestContext(
             current.requestContext,
           );
@@ -2944,7 +2972,7 @@ export class RunnerRuntime {
             silent,
           );
         } catch (error) {
-          if (error instanceof SettlementMissError) return { kind: 'live' };
+          if (error instanceof RowChangedError) return { kind: 'live' };
           throw error;
         }
         return {
@@ -2977,6 +3005,62 @@ export class RunnerRuntime {
       runId,
     });
     return raw && rowSilent(raw, now) ? raw : undefined;
+  }
+
+  /**
+   * The run's snapshot for a lifecycle transition, with the exact row it was
+   * parsed from where the storage can compare-and-set that row, so the write
+   * lands only on the row the decision read. Other storage answers the
+   * snapshot alone and keeps its unconditional write.
+   */
+  async #readForTransition(
+    source: CapturedWorkflowStorage,
+    workflowId: string,
+    runId: string,
+  ): Promise<TransitionRead> {
+    if (source.storage === 'd1' && source.replace) {
+      const row = await source.readSnapshot.call(source.capability, {
+        workflowId,
+        runId,
+      });
+      if (!row) throw new UnknownRunError(workflowId, runId);
+      return { state: snapshotOfRow(row), row };
+    }
+    const state = await source.load.call(source.workflows, {
+      workflowName: workflowId,
+      runId,
+    });
+    if (!state) throw new UnknownRunError(workflowId, runId);
+    if (state.runId !== runId)
+      throw new RunStateUnreadableError(workflowId, runId);
+    return { state };
+  }
+
+  /**
+   * Repeat one read-decide-write pass until its compare-and-set lands or it
+   * decides without writing, for at most LIFECYCLE_WRITE_ATTEMPTS passes. A
+   * miss means the row changed after the read, so the next pass decides again
+   * from the row as it now stands.
+   */
+  async #retryOnRowChange<T>(
+    workflowId: string,
+    runId: string,
+    pass: () => Promise<T>,
+  ): Promise<T> {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await pass();
+      } catch (error) {
+        if (!(error instanceof RowChangedError)) throw error;
+        if (attempt >= LIFECYCLE_WRITE_ATTEMPTS)
+          throw new RunStateUnreadableError(workflowId, runId, {
+            cause: new Error(
+              `the run row changed on each of ${LIFECYCLE_WRITE_ATTEMPTS} compare-and-set attempts`,
+              { cause: error },
+            ),
+          });
+      }
+    }
   }
 
   /** @internal Settle the exact selected terminal generation before managed cleanup. */
@@ -3181,7 +3265,7 @@ export class RunnerRuntime {
 
   /**
    * With `expected`, a compare-and-set against that exact row, serialized as
-   * Mastra's own persist does; a miss throws SettlementMissError.
+   * Mastra's own persist does; a miss throws RowChangedError.
    */
   async #persistLifecycle(
     workflowId: string,
@@ -3203,12 +3287,12 @@ export class RunnerRuntime {
     };
     if (expected) {
       if (source.storage !== 'd1' || !source.replace)
-        throw new Error('settlement storage cannot compare-and-set');
+        throw new Error('storage cannot compare-and-set the run row');
       const replaced = await source.replace.call(source.capability, expected, {
         snapshot: JSON.stringify(persisted),
         updatedAt: new Date(now).toISOString(),
       });
-      if (!replaced) throw new SettlementMissError();
+      if (!replaced) throw new RowChangedError();
       return persisted;
     }
     await source.persist.call(workflows, {
@@ -3218,6 +3302,51 @@ export class RunnerRuntime {
       updatedAt: new Date(now),
     });
     return persisted;
+  }
+
+  /**
+   * Persist a cancellation intent through `patchRunLifecycle` where the storage
+   * has it, otherwise as #persistLifecycle does; a miss throws RowChangedError.
+   * The patch also misses on a snapshot SQLite cannot parse, which the
+   * whole-row compare-and-set still replaces, so that write is tried before
+   * the miss counts as a row change.
+   */
+  async #persistIntent(
+    workflowId: string,
+    runId: string,
+    state: WorkflowRunState,
+    intent: RunLifecycleState,
+    now: number,
+    source: CapturedWorkflowStorage,
+    row: RawWorkflowSnapshot | undefined,
+  ): Promise<void> {
+    if (source.storage === 'd1' && source.patch) {
+      const patched = await source.patch.call(
+        source.capability,
+        { workflowId, runId },
+        {
+          status: state.status,
+          lifecycleRevision: lifecycleFromRequestContext(state.requestContext)
+            ?.revision,
+        },
+        {
+          lifecycle: intent,
+          timestamp: now,
+          updatedAt: new Date(now).toISOString(),
+        },
+      );
+      if (patched) return;
+      if (!row) throw new RowChangedError();
+    }
+    await this.#persistLifecycle(
+      workflowId,
+      runId,
+      state,
+      intent,
+      now,
+      source,
+      row,
+    );
   }
 
   async #summaryAfterPersist(

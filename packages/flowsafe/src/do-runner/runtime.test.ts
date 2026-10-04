@@ -55,7 +55,9 @@ import {
   type RunnerRuntime,
   RunStateUnreadableError,
   type RunSummary,
+  RunTerminalConflictError,
   type StartRunOptions,
+  UnknownRunError,
   UnknownWorkflowError,
 } from './runtime.js';
 import { StartIdempotencyStore } from './start-idempotency.js';
@@ -1402,7 +1404,7 @@ describe('root-local stored summaries', () => {
         ),
       ).resolves.toEqual(completed);
       expect(windows).toEqual(
-        Array.from({ length: 5 }, () => [
+        Array.from({ length: 8 }, () => [
           ['summary-root-workflow', 'summary-run'],
         ]),
       );
@@ -10384,82 +10386,84 @@ describe('legacy Runtime observations', () => {
   });
 });
 
-describe('RunnerRuntime.settleInterruptedRun', () => {
-  function holdingApp(
-    hold: Promise<void>,
-    entered: () => void,
-    storage: MastraCompositeStore = new InMemoryStore(),
-  ) {
-    const app = init(
-      { storage },
-      { executionFence: 'none', startIdempotency: 'none' },
-    );
-    const schema = z.object({});
-    const workflow = app
-      .createWorkflow({
-        id: 'interrupt-workflow',
+function holdingApp(
+  hold: Promise<void>,
+  entered: () => void,
+  storage: MastraCompositeStore = new InMemoryStore(),
+) {
+  const app = init(
+    { storage },
+    { executionFence: 'none', startIdempotency: 'none' },
+  );
+  const schema = z.object({});
+  const workflow = app
+    .createWorkflow({
+      id: 'interrupt-workflow',
+      inputSchema: schema,
+      outputSchema: schema,
+    })
+    .then(
+      app.createStep({
+        id: 'hold',
         inputSchema: schema,
         outputSchema: schema,
-      })
-      .then(
-        app.createStep({
-          id: 'hold',
-          inputSchema: schema,
-          outputSchema: schema,
-          execute: async () => {
-            entered();
-            await hold;
-            throw Object.assign(new Error('step gave up'), {
-              name: 'RunInterruptedError',
-            });
-          },
-        }),
-      )
-      .commit();
-    return { app, workflow };
-  }
+        execute: async () => {
+          entered();
+          await hold;
+          throw Object.assign(new Error('step gave up'), {
+            name: 'RunInterruptedError',
+          });
+        },
+      }),
+    )
+    .commit();
+  return { app, workflow };
+}
 
-  /**
-   * A run another runtime left mid-step, rewritten to `status`, and a fresh
-   * runtime over the same storage that drives nothing. `startedAt` is the
-   * clock reading before the row's last write.
-   */
-  async function strandedRun(
-    status: 'running' | 'waiting' | 'paused' = 'running',
-    storage: MastraCompositeStore = createD1Storage({
-      binding: sqliteUnitDatabase(openSqlite()) as D1DatabaseBinding,
-    }),
-  ) {
-    await storage.init();
-    const startedAt = Date.now();
-    const entered = deferredSignal();
-    const stranded = holdingApp(
-      new Promise<void>(() => undefined),
-      entered.resolve,
-      storage,
-    );
-    void stranded.app.runtime.start(stranded.workflow.id, {
-      runId: 'stranded-run',
-      inputData: {},
-    });
-    await entered.promise;
-    const workflows = await storage.getStore('workflows');
-    const snapshot = await workflows?.loadWorkflowSnapshot({
-      workflowName: stranded.workflow.id,
-      runId: 'stranded-run',
-    });
-    assert(workflows && snapshot);
-    await workflows.persistWorkflowSnapshot({
-      workflowName: stranded.workflow.id,
-      runId: 'stranded-run',
-      snapshot: { ...snapshot, status },
-    });
-    return {
-      startedAt,
-      ...holdingApp(Promise.resolve(), () => undefined, storage),
-    };
-  }
+/**
+ * A run another runtime left mid-step, rewritten to `status`, and a fresh
+ * runtime over the same storage that drives nothing. `startedAt` is the
+ * clock reading before the row's last write.
+ */
+async function strandedRun(
+  status: 'running' | 'waiting' | 'paused' = 'running',
+  storage: MastraCompositeStore = createD1Storage({
+    binding: sqliteUnitDatabase(openSqlite()) as D1DatabaseBinding,
+  }),
+  start: { deadlineMs?: number } = {},
+) {
+  await storage.init();
+  const startedAt = Date.now();
+  const entered = deferredSignal();
+  const stranded = holdingApp(
+    new Promise<void>(() => undefined),
+    entered.resolve,
+    storage,
+  );
+  void stranded.app.runtime.start(stranded.workflow.id, {
+    runId: 'stranded-run',
+    inputData: {},
+    ...start,
+  });
+  await entered.promise;
+  const workflows = await storage.getStore('workflows');
+  const snapshot = await workflows?.loadWorkflowSnapshot({
+    workflowName: stranded.workflow.id,
+    runId: 'stranded-run',
+  });
+  assert(workflows && snapshot);
+  await workflows.persistWorkflowSnapshot({
+    workflowName: stranded.workflow.id,
+    runId: 'stranded-run',
+    snapshot: { ...snapshot, status },
+  });
+  return {
+    startedAt,
+    ...holdingApp(Promise.resolve(), () => undefined, storage),
+  };
+}
 
+describe('RunnerRuntime.settleInterruptedRun', () => {
   it.each([
     'running',
     'waiting',
@@ -10718,5 +10722,462 @@ describe('RunnerRuntime.settleInterruptedRun', () => {
     const summary = await app.runtime.status(workflow.id, 'borrowed-name');
     expect(summary?.status).toBe('failed');
     expect(summary?.errorEnvelope).toBeUndefined();
+  });
+});
+
+describe('RunnerRuntime lifecycle transitions on D1 storage', () => {
+  const owner = { kind: 'human', id: 'owner' } as const;
+  const lifecycleKey = 'flowsafe.runLifecycle';
+
+  /**
+   * After each of the next `times` reads of the run row, by either read path
+   * a lifecycle transition may take, rewrites the row from `edit` before the
+   * reader continues. `edit` is given the current snapshot, read through the
+   * unwrapped original, and a distinct `attempt` to make each rewrite's bytes
+   * differ.
+   */
+  function landAfterReads(
+    workflows: FencedWorkflowsStorageD1,
+    edit: (current: WorkflowRunState, attempt: number) => WorkflowRunState,
+    times = 1,
+  ): void {
+    const load = workflows.loadWorkflowSnapshot.bind(workflows);
+    const native = workflows[FENCED_WORKFLOW_STORAGE];
+    assert(native);
+    let landed = 0;
+    const land = async (workflowName: string, runId: string) => {
+      if (landed >= times) return;
+      landed += 1;
+      const current = await load({ workflowName, runId });
+      assert(current);
+      await workflows.persistWorkflowSnapshot({
+        workflowName,
+        runId,
+        snapshot: edit(current, landed),
+      });
+    };
+    workflows.loadWorkflowSnapshot = async (args) => {
+      const state = await load(args);
+      await land(args.workflowName, args.runId);
+      return state;
+    };
+    Object.defineProperty(workflows, FENCED_WORKFLOW_STORAGE, {
+      value: {
+        ...native,
+        readSnapshot: async (read: { workflowId: string; runId: string }) => {
+          const row = await native.readSnapshot(read);
+          await land(read.workflowId, read.runId);
+          return row;
+        },
+      },
+      configurable: true,
+    });
+  }
+
+  async function racingRun(start: { deadlineMs?: number } = {}) {
+    const sql = openSqlite();
+    const storage = createD1Storage({
+      binding: sqliteUnitDatabase(sql) as D1DatabaseBinding,
+    });
+    const run = await strandedRun('running', storage, start);
+    const workflows = (await storage.getStore(
+      'workflows',
+    )) as FencedWorkflowsStorageD1;
+    const load = workflows.loadWorkflowSnapshot.bind(workflows);
+    const stored = async () => {
+      const state = await load({
+        workflowName: run.workflow.id,
+        runId: 'stranded-run',
+      });
+      assert(state);
+      return state;
+    };
+    const storedCas = async () => {
+      const lifecycle = (await stored()).requestContext?.[lifecycleKey];
+      return {
+        expectedRevision: lifecycle.revision,
+        expectedDeadlineAt: lifecycle.deadlineAt,
+      };
+    };
+    return { ...run, sql, workflows, stored, storedCas };
+  }
+
+  const finishes = (current: WorkflowRunState): WorkflowRunState => ({
+    ...current,
+    status: 'success',
+    result: { done: true },
+  });
+
+  const keepsRunning = (
+    current: WorkflowRunState,
+    attempt: number,
+  ): WorkflowRunState => ({
+    ...current,
+    timestamp: current.timestamp + attempt,
+  });
+
+  const waits = (current: WorkflowRunState): WorkflowRunState => ({
+    ...current,
+    status: 'waiting',
+  });
+
+  it.each([
+    'terminate',
+    'run-deadline timeout',
+  ] as const)('keeps a result a leg wrote between the %s read and its write', async (route) => {
+    // #given a stranded run whose leg writes its result just after the
+    // transition reads the row
+    const { app, workflow, workflows, stored, storedCas } = await racingRun(
+      route === 'terminate' ? {} : { deadlineMs: 1 },
+    );
+    const cas = route === 'terminate' ? undefined : await storedCas();
+    landAfterReads(workflows, finishes);
+
+    // #when the transition is requested
+    const transition = cas
+      ? app.runtime.timeOut(
+          workflow.id,
+          'stranded-run',
+          cas,
+          Date.now() + 1_000,
+        )
+      : app.runtime.terminate(workflow.id, 'stranded-run');
+
+    // #then it answers the conflict and the result stands
+    await expect(transition).rejects.toBeInstanceOf(RunTerminalConflictError);
+    expect(await stored()).toMatchObject({
+      status: 'success',
+      result: { done: true },
+    });
+  });
+
+  it.each([
+    { label: 'terminate', route: 'terminate', patch: true },
+    { label: 'run-deadline timeout', route: 'timeout', patch: true },
+    {
+      label: 'terminate on storage that only replaces whole rows',
+      route: 'terminate',
+      patch: false,
+    },
+  ] as const)('keeps a result a leg wrote between the cancellation-intent read and its write ($label)', async ({
+    route,
+    patch,
+  }) => {
+    // #given a stranded run whose leg writes its result just after the intent
+    // pass reads the row
+    const { app, workflow, workflows, stored, storedCas } = await racingRun(
+      route === 'terminate' ? {} : { deadlineMs: 1 },
+    );
+    const cas = route === 'terminate' ? undefined : await storedCas();
+    const native = workflows[FENCED_WORKFLOW_STORAGE];
+    assert(native);
+    if (!patch)
+      Object.defineProperty(workflows, FENCED_WORKFLOW_STORAGE, {
+        value: { ...native, patchRunLifecycle: undefined },
+        configurable: true,
+      });
+    landAfterReads(workflows, finishes);
+
+    // #when the intent is requested
+    const cancelling = cas
+      ? app.runtime.cancelActiveExecution(
+          workflow.id,
+          'stranded-run',
+          'timed_out',
+          [owner],
+          cas,
+          Date.now() + 1_000,
+        )
+      : app.runtime.cancelActiveExecution(
+          workflow.id,
+          'stranded-run',
+          'cancelled',
+          [owner],
+        );
+
+    // #then it answers the conflict, and the result stands without an intent
+    await expect(cancelling).rejects.toBeInstanceOf(RunTerminalConflictError);
+    const row = await stored();
+    expect(row).toMatchObject({ status: 'success', result: { done: true } });
+    expect(
+      row.requestContext?.[lifecycleKey]?.transitionIntent,
+    ).toBeUndefined();
+  });
+
+  it('lands the cancellation intent while the leg keeps rewriting the row', async () => {
+    // #given a stranded run whose leg rewrites the row, still running, after
+    // each of up to five reads: enough to make a whole-row compare-and-set
+    // miss on every attempt, which the intent patch does not
+    const { app, workflow, workflows, stored } = await racingRun();
+    landAfterReads(workflows, keepsRunning, 5);
+
+    // #when the intent is requested
+    const cancelled = await app.runtime.cancelActiveExecution(
+      workflow.id,
+      'stranded-run',
+      'cancelled',
+      [owner],
+    );
+
+    // #then no leg here is cancelled, and the intent is stored on the running row
+    expect(cancelled).toBe(false);
+    const row = await stored();
+    expect(row.status).toBe('running');
+    expect(row.requestContext?.[lifecycleKey]).toMatchObject({
+      transitionIntent: { status: 'cancelled' },
+    });
+  });
+
+  it('records the run-deadline timeout after its intent decides again from a changed row', async () => {
+    // #given a stranded run whose status changes, still terminable, just after
+    // the deadline route's intent pass reads it
+    const { app, workflow, workflows, stored, storedCas } = await racingRun({
+      deadlineMs: 1,
+    });
+    const cas = await storedCas();
+    landAfterReads(workflows, waits);
+    const now = Date.now() + 1_000;
+
+    // #when the intent is requested and then the timeout
+    await app.runtime.cancelActiveExecution(
+      workflow.id,
+      'stranded-run',
+      'timed_out',
+      [owner],
+      cas,
+      now,
+    );
+    const intent = (await stored()).requestContext?.[lifecycleKey]
+      ?.transitionIntent;
+    const timedOut = await app.runtime.timeOut(
+      workflow.id,
+      'stranded-run',
+      cas,
+      now,
+    );
+
+    // #then the intent landed on the changed row and the timeout is recorded
+    expect(intent).toMatchObject({ status: 'timed_out', ...cas });
+    expect(timedOut).toMatchObject({
+      transitioned: true,
+      casMatched: true,
+      summary: { status: 'timed_out' },
+    });
+  });
+
+  it.each([
+    1, 4,
+  ])('lands the terminal write after %i leg writes that keep the run running', async (writes) => {
+    // #given a stranded run whose leg rewrites the row, still running, after
+    // each of the first reads
+    const { app, workflow, workflows, stored } = await racingRun();
+    landAfterReads(workflows, keepsRunning, writes);
+
+    // #when
+    const terminated = await app.runtime.terminate(workflow.id, 'stranded-run');
+
+    // #then the transition decides again from the rewritten row and lands
+    expect(terminated).toMatchObject({
+      transitioned: true,
+      summary: { status: 'cancelled' },
+    });
+    expect((await stored()).status).toBe('cancelled');
+  });
+
+  it('answers that the run state is not readable while its row changes on every attempt', async () => {
+    // #given a stranded run whose row is rewritten after each of up to five
+    // reads, one per attempt
+    const { app, workflow, workflows, stored } = await racingRun();
+    landAfterReads(workflows, keepsRunning, 5);
+
+    // #when
+    const terminating = app.runtime.terminate(workflow.id, 'stranded-run');
+
+    // #then
+    await expect(terminating).rejects.toBeInstanceOf(RunStateUnreadableError);
+    expect((await stored()).status).toBe('running');
+  });
+
+  it('records the cancellation of a run whose snapshot nests past the depth SQLite reads', async () => {
+    // #given a stranded run whose stored snapshot SQLite cannot parse as JSON
+    const { app, workflow, sql } = await racingRun();
+    const { snapshot } = sql
+      .prepare('SELECT snapshot FROM mastra_workflow_snapshot')
+      .get() as { snapshot: string };
+    let result: unknown = 'leaf';
+    for (let level = 0; level < 1_100; level++) result = [result];
+    sql
+      .prepare('UPDATE mastra_workflow_snapshot SET snapshot = ?')
+      .run(JSON.stringify({ ...JSON.parse(snapshot), result }));
+
+    // #when the terminate route's intent pass runs, then its terminal pass
+    const cancelled = await app.runtime.cancelActiveExecution(
+      workflow.id,
+      'stranded-run',
+      'cancelled',
+      [owner],
+    );
+    const intent = JSON.parse(
+      (
+        sql.prepare('SELECT snapshot FROM mastra_workflow_snapshot').get() as {
+          snapshot: string;
+        }
+      ).snapshot,
+    ).requestContext?.[lifecycleKey]?.transitionIntent;
+    const terminated = await app.runtime.terminate(workflow.id, 'stranded-run');
+
+    // #then the intent was stored and the run is recorded cancelled
+    expect(cancelled).toBe(false);
+    expect(intent).toMatchObject({ status: 'cancelled' });
+    expect(terminated).toMatchObject({
+      transitioned: true,
+      summary: { status: 'cancelled' },
+    });
+  });
+
+  it('answers that the run is unknown when its row is absent', async () => {
+    // #given D1 storage that holds no run
+    const storage = createD1Storage({
+      binding: sqliteUnitDatabase(openSqlite()) as D1DatabaseBinding,
+    });
+    await storage.init();
+    const { app, workflow } = holdingApp(
+      Promise.resolve(),
+      () => undefined,
+      storage,
+    );
+
+    // #when / #then
+    await expect(
+      app.runtime.terminate(workflow.id, 'no-such-run'),
+    ).rejects.toBeInstanceOf(UnknownRunError);
+  });
+
+  it.each([
+    { label: 'is not a JSON object', rewrite: () => '[]' },
+    {
+      label: 'belongs to another run',
+      rewrite: (snapshot: string) =>
+        JSON.stringify({ ...JSON.parse(snapshot), runId: 'other-run' }),
+    },
+  ])('refuses to decide from a row whose snapshot $label', async ({
+    rewrite,
+  }) => {
+    // #given a stranded run whose stored snapshot is rewritten
+    const { app, workflow, sql } = await racingRun();
+    const { snapshot } = sql
+      .prepare('SELECT snapshot FROM mastra_workflow_snapshot')
+      .get() as { snapshot: string };
+    const rewritten = rewrite(snapshot);
+    sql
+      .prepare('UPDATE mastra_workflow_snapshot SET snapshot = ?')
+      .run(rewritten);
+
+    // #when
+    const terminating = app.runtime.terminate(workflow.id, 'stranded-run');
+
+    // #then it answers that the state is not readable and writes nothing
+    await expect(terminating).rejects.toBeInstanceOf(RunStateUnreadableError);
+    expect(
+      sql.prepare('SELECT snapshot FROM mastra_workflow_snapshot').get(),
+    ).toEqual({ snapshot: rewritten });
+  });
+
+  it('lands the cancellation intent of a leg in this runtime that keeps writing, then stops the leg', async () => {
+    // #given a leg looping through fast steps that each write the row. The unit
+    // loop never lands a write inside the intent pass's read-to-write window on
+    // its own, so the wrapper stands in for the leg's interleaving write: it
+    // rewrites the row after each read while the leg is active.
+    const storage = createD1Storage({
+      binding: sqliteUnitDatabase(openSqlite()) as D1DatabaseBinding,
+    });
+    await storage.init();
+    const app = init(
+      { storage },
+      { executionFence: 'none', startIdempotency: 'none' },
+    );
+    const schema = z.object({});
+    let ticks = 0;
+    const looping = deferredSignal();
+    const workflow = app
+      .createWorkflow({
+        id: 'looping-workflow',
+        inputSchema: schema,
+        outputSchema: schema,
+      })
+      .dowhile(
+        app.createStep({
+          id: 'tick',
+          inputSchema: schema,
+          outputSchema: schema,
+          execute: async () => {
+            ticks += 1;
+            if (ticks === 10) looping.resolve();
+            return {};
+          },
+        }),
+        async () => ticks < 5_000,
+      )
+      .commit();
+    const workflows = (await storage.getStore(
+      'workflows',
+    )) as FencedWorkflowsStorageD1;
+    const native = workflows[FENCED_WORKFLOW_STORAGE];
+    assert(native);
+    const load = workflows.loadWorkflowSnapshot.bind(workflows);
+    Object.defineProperty(workflows, FENCED_WORKFLOW_STORAGE, {
+      value: {
+        ...native,
+        readSnapshot: async (read: { workflowId: string; runId: string }) => {
+          const row = await native.readSnapshot(read);
+          if (
+            ticks >= 10 &&
+            app.runtime.isRunActive(read.workflowId, read.runId)
+          ) {
+            const current = await load({
+              workflowName: read.workflowId,
+              runId: read.runId,
+            });
+            assert(current);
+            await workflows.persistWorkflowSnapshot({
+              workflowName: read.workflowId,
+              runId: read.runId,
+              snapshot: keepsRunning(current, 1),
+            });
+          }
+          return row;
+        },
+      },
+      configurable: true,
+    });
+    const leg = app.runtime.start(workflow.id, {
+      runId: 'looping-run',
+      inputData: {},
+    });
+    await looping.promise;
+
+    // #when it is terminated while it loops, as the terminate route does
+    const cancelled = await app.runtime.cancelActiveExecution(
+      workflow.id,
+      'looping-run',
+      'cancelled',
+      [owner],
+    );
+    const left = await leg;
+    const intent = (
+      await load({ workflowName: workflow.id, runId: 'looping-run' })
+    )?.requestContext?.[lifecycleKey]?.transitionIntent;
+    const terminated = await app.runtime.terminate(workflow.id, 'looping-run');
+
+    // #then the intent was stored, the leg stopped short of its loop, and the
+    // run reads cancelled
+    expect(cancelled).toBe(true);
+    expect(intent).toMatchObject({ status: 'cancelled' });
+    expect(left.status).toBe('canceled');
+    expect(ticks).toBeLessThan(5_000);
+    expect(terminated).toMatchObject({
+      transitioned: true,
+      summary: { status: 'cancelled' },
+    });
   });
 });
