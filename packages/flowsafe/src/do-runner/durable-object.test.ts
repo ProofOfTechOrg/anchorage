@@ -16,6 +16,7 @@ import {
 import { durableKeyValueStorageFixture } from '../../test-support/durable-key-value-storage.js';
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import {
+  ApprovalAuthzError,
   type ApprovalRecord,
   ApprovalService,
   D1ResourceOwnershipStore,
@@ -9791,8 +9792,9 @@ describe('DurableObjectRunner start recovery leg evidence', () => {
 describe('DurableObjectRunner approvals the run object files', () => {
   /** Lifecycle hooks whose `reconcileApprovals` files through a real service. */
   function filingLifecycle(env: TestEnv) {
+    const store = new InMemoryApprovalStore();
     const service = new ApprovalService({
-      store: new InMemoryApprovalStore(),
+      store,
       executionFence: 'none',
     });
     const filed: ApprovalRecord[] = [];
@@ -9810,7 +9812,7 @@ describe('DurableObjectRunner approvals the run object files', () => {
       abandonApprovals: async () => undefined,
       reconcileApprovals: reconcile,
     };
-    return { filed, reconcile };
+    return { filed, reconcile, service, store };
   }
 
   /** An armed entry one failed wake short of abandonment, due now. */
@@ -9858,6 +9860,31 @@ describe('DurableObjectRunner approvals the run object files', () => {
         requestedByKind: 'human',
       },
     ]);
+  });
+
+  it("refuses the run's requester the gate a timeout resume reaches after a timer", async () => {
+    // #given a run waiting in a timer, with an approval gate after it, and the
+    // gate filed once the timer's timeout resumes the run
+    const { state, values } = durableKeyValueStorageFixture();
+    const env = timedEnv();
+    const { filed, service, store } = filingLifecycle(env);
+    const runner = new TestRunner(state, env);
+    await startTimed(runner, 'run-sod-after-timer', 'timed-timer-gate');
+    elapseDeadlines(values);
+    await runner.alarm();
+    const [record] = filed;
+    if (filed.length !== 1 || !record) throw new Error('expected one record');
+
+    // #when the run's requester, wearing a reviewing role, decides it
+    const decision = service.decide(
+      record.id,
+      { decision: 'approve' },
+      { id: OWNER_PRINCIPAL.id, role: 'admin' },
+    );
+
+    // #then separation of duties refuses them and the gate stays open
+    await expect(decision).rejects.toBeInstanceOf(ApprovalAuthzError);
+    expect(await store.get(record.id)).toMatchObject({ status: 'pending' });
   });
 
   it('files nothing for a timer that waits again after its timeout', async () => {

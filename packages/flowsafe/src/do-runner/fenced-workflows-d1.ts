@@ -79,6 +79,7 @@ import {
 import { validateTablePrefix } from './table-prefix.js';
 import {
   decodeRawWorkflowSnapshotResult,
+  parseSnapshotObject,
   prepareRawWorkflowSnapshotRead,
   type RawWorkflowSnapshot,
   readRawWorkflowSnapshot,
@@ -467,25 +468,36 @@ function decodeSnapshotReplace(
   return decodeRawWorkflowSnapshotResult(captured, expected);
 }
 
+/**
+ * Run retention compares a row's stored `updatedAt` with its cutoff as text, so
+ * only the `Date.prototype.toISOString()` form orders correctly.
+ */
+function isCanonicalIsoTime(text: string): boolean {
+  const ms = Date.parse(text);
+  return Number.isFinite(ms) && new Date(ms).toISOString() === text;
+}
+
 async function replaceSnapshotRow(
   database: InitialAdmissionDatabase,
   tablePrefix: string,
   expected: RawWorkflowSnapshot,
   replacement: { snapshot: string; updatedAt: string },
 ): Promise<boolean> {
+  const { snapshot, updatedAt } = replacement;
   if (
     expected.tablePrefix !== tablePrefix ||
     !isPathSafeId(expected.workflowId) ||
     !isPathSafeId(expected.runId) ||
-    typeof replacement.snapshot !== 'string' ||
-    typeof replacement.updatedAt !== 'string'
+    typeof snapshot !== 'string' ||
+    typeof updatedAt !== 'string' ||
+    parseSnapshotObject(snapshot) === undefined ||
+    !isCanonicalIsoTime(updatedAt)
   )
     throw new Error('workflow snapshot replacement is malformed');
-  const result = await prepareSnapshotReplace(
-    database,
-    expected,
-    replacement,
-  ).all();
+  const result = await prepareSnapshotReplace(database, expected, {
+    snapshot,
+    updatedAt,
+  }).all();
   return decodeSnapshotReplace(result, expected) !== undefined;
 }
 

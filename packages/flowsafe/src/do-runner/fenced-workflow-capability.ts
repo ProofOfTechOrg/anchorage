@@ -102,7 +102,9 @@ export interface FencedWorkflowAdmissionCapability {
   /**
    * Replace the snapshot and `updatedAt` of the exact row `expected` names, or
    * report `false` when any of its columns changed since. It writes the bytes
-   * it is given, outside the settled-row guard. Settlement needs it beside
+   * it is given, outside the settled-row guard, and rejects, writing nothing,
+   * a `snapshot` that is not a JSON object or an `updatedAt` that is not in
+   * `Date.prototype.toISOString()` form. Settlement needs it beside
    * `touchRun`: without it a run whose leg stops is never settled.
    */
   replaceSnapshot?(

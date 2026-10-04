@@ -308,7 +308,9 @@ export class FlowsafeRunner extends DurableObjectRunner<Env> {
   }
 
   protected runLifecycle(env: Env) {
-    return createFlowsafeRunnerLifecycle(workerConfig, env);
+    return createFlowsafeRunnerLifecycle(workerConfig, env, {
+      waitUntil: this.state?.waitUntil?.bind(this.state),
+    });
   }
 }
 

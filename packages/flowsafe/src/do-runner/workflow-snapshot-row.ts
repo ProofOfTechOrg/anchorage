@@ -115,6 +115,25 @@ export async function touchRawWorkflowSnapshot(
     .run();
 }
 
+/**
+ * @internal The workflow snapshot a run row's `snapshot` text holds, when that
+ * text is a JSON object; `undefined` for any other JSON value and for text
+ * that is not JSON.
+ */
+export function parseSnapshotObject(
+  text: string,
+): Record<string, unknown> | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed))
+    return undefined;
+  return parsed as Record<string, unknown>;
+}
+
 /** @internal Decode exact stored bytes without JSON or timestamp coercion. */
 export function decodeRawWorkflowSnapshotResult(
   result: unknown,

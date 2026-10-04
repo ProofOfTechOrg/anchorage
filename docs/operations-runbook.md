@@ -88,6 +88,8 @@ pnpm --dir packages/agent-starter exec wrangler d1 execute anchorage-agent-start
 
 Deploy only when `open_agent_approvals` is zero. Do not close these records through direct SQL mutation.
 
+During a gradual deployment from a flowsafe version earlier than 0.24.0, a Worker still on the earlier version answers a keyed start replay of an `INTERRUPTED` run with `503 persisted start is not readable`, because that version does not recognize the `INTERRUPTED` error code. Retry the replay once every Worker version runs 0.24.0 or later; the run itself is unaffected.
+
 ## Provision a deployment
 
 Choose one stable deployment tag per organization. It must match `^[a-z0-9]{3,32}$` and is provisioning material, not a display name or request claim.

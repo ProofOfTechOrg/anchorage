@@ -3558,6 +3558,70 @@ describe('settled-row guard on unscoped persistence', () => {
   });
 });
 
+describe('snapshot replacement input', () => {
+  const VALID_TIME = '2026-10-04T00:00:00.000Z';
+
+  it.each([
+    {
+      label: 'snapshot is not JSON',
+      replacement: { snapshot: '{', updatedAt: VALID_TIME },
+    },
+    {
+      label: 'snapshot is a JSON array',
+      replacement: { snapshot: '[]', updatedAt: VALID_TIME },
+    },
+    {
+      label: 'snapshot is JSON null',
+      replacement: { snapshot: 'null', updatedAt: VALID_TIME },
+    },
+    {
+      label: 'snapshot is a JSON number',
+      replacement: { snapshot: '1', updatedAt: VALID_TIME },
+    },
+    {
+      label: 'updatedAt is a date without a time',
+      replacement: {
+        snapshot: JSON.stringify(pending()),
+        updatedAt: '2026-10-04',
+      },
+    },
+    {
+      label: 'updatedAt is not a time',
+      replacement: {
+        snapshot: JSON.stringify(pending()),
+        updatedAt: 'not a time',
+      },
+    },
+    {
+      label: 'updatedAt is an ISO time without milliseconds',
+      replacement: {
+        snapshot: JSON.stringify(pending()),
+        updatedAt: '2026-10-04T00:00:00Z',
+      },
+    },
+  ])('refuses a replacement whose $label and leaves the row', async ({
+    replacement,
+  }) => {
+    // #given a persisted run row
+    const h = await fixture();
+    await h.domain.persistWorkflowSnapshot({
+      workflowName: 'workflow',
+      runId: 'run',
+      snapshot: pending(),
+    });
+    const address = { workflowId: 'workflow', runId: 'run' };
+    const row = await h.capability.readSnapshot(address);
+    if (!row) throw new Error('run row missing');
+
+    // #when the exact row is replaced with the malformed input
+    const replaced = h.capability.replaceSnapshot?.(row, replacement);
+
+    // #then it rejects and the row keeps its bytes
+    await expect(replaced).rejects.toThrow();
+    expect(await h.capability.readSnapshot(address)).toEqual(row);
+  });
+});
+
 describe('owned initial terminalization outcome marker', () => {
   it('lets a recorded intent, not the outcome marker, settle a marked repair', async () => {
     // #given an admitted row whose cancellation was recorded

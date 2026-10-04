@@ -34,11 +34,12 @@
 // CURRENT suspension fingerprint, requiring a NEW decision — deliberately:
 // an approval that aged past retention should not silently re-arm the grant
 // it already spent. One separation-of-duties relaxation applies only in this
-// recovery path: the re-filed record's requestedBy is the system principal
-// rather than a human, so the reviewer who decided the purged record MAY
-// legally decide its replacement — there is no human "who advanced the run
-// to this suspension" left to attribute it to. Operators should still set
-// APPROVAL_RETENTION_DAYS well beyond any expected resume-retry window: a
+// recovery path: the purge removed an approved record from the run's approved
+// history, so the cross-gate check no longer counts that approval, and the
+// reviewer who made it MAY decide the replacement unless another approved
+// record of the run bars them. The replacement's requestedBy is the run's
+// recorded requester, so that requester stays barred. Operators should still
+// set APPROVAL_RETENTION_DAYS well beyond any expected resume-retry window: a
 // re-decision is real reviewer work, not a free retry.
 //
 // reconcileApprovalsForSummary's healing is not limited to this purge-then-

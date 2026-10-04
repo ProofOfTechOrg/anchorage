@@ -997,12 +997,14 @@ describe('approval queue end to end', () => {
     expect(harness.publishes()).toBe(2);
   });
 
-  it('refuses the gate-A approver at gate B even when gate B was reconcile-filed by the system principal', async () => {
-    // The reconcile hole: resumeRunWithRequeue attributes gate B to the gate-A
-    // decider (so the requestedBy self-check already bars them), but
-    // reconcileApprovalsForSummary files gate B as the SYSTEM principal — which the
-    // requestedBy check never blocks. The cross-gate bar catches it anyway,
-    // derived from the run's own APPROVED history.
+  it("refuses the gate-A approver at gate B even when gate B's requester is a system principal", async () => {
+    // The gap this closes: resumeRunWithRequeue attributes gate B to the gate-A
+    // decider (so the requestedBy self-check already bars them), but a gate
+    // filed by reconciliation carries the run's recorded requester, which is
+    // not always the gate-A approver (a system-started run, or a timeout resume
+    // recorded by flowsafe before 0.24.0, records a system principal). The
+    // cross-gate bar catches it anyway, derived from the run's own APPROVED
+    // history.
     const harness = buildHarness();
     const started = await harness.runtime.start('double-launch', {
       runId: `acme_${crypto.randomUUID()}`,
@@ -1031,7 +1033,7 @@ describe('approval queue end to end', () => {
     });
     expect(harness.publishes()).toBe(1);
 
-    // gate B is RECONCILE-filed: attributed to the system principal, not the reviewer
+    // gate B is filed with a system requester, not the reviewer
     const { record: recordB } = await harness.service.createAsPrincipal(
       {
         workflowId: 'double-launch',

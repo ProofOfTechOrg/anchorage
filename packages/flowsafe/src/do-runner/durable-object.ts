@@ -1613,8 +1613,9 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
       console.error('suspension deadline broadcast failed', error);
     }
     await this.#reconcileSuspensionDeadlinesBestEffort(workflowId, runId, next);
-    // From a fresh read, not `next`: the live projection keys a nested gate
-    // differently from the stored one a host read files against.
+    // From a fresh authoritative read, not `next`: a host status read files
+    // against the stored projection, so filing from it keys a gate the way that
+    // read does.
     if (next.status === 'suspended')
       await this.#reconcileApprovalsBestEffort(workflowId, runId);
   }

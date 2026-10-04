@@ -2740,6 +2740,33 @@ async function main() {
     },
   );
 
+  // --- Terminate cleanup (TC1): the write that advances a settled run -------
+  // Its run is terminal before the fence scenarios' drain inventory reads.
+  await step(
+    'TC1 terminate: the cleanup write that advances a settled run is admitted on D1',
+    async () => {
+      const started = await http('POST', '/runs', {
+        body: RUN_BODY,
+        headers: AUTH.operator,
+      });
+      assert(
+        started.status === 200 && started.body.status === 'suspended',
+        'the run suspended at its gate',
+        started,
+      );
+      const path = `/runs/${RUN_BODY.workflowId}/${encodeURIComponent(started.body.runId)}`;
+      const terminated = await http('POST', `${path}/terminate`, {
+        headers: AUTH.operator,
+      });
+      assert(
+        terminated.status === 200 && terminated.body.status === 'cancelled',
+        "terminate settled the run, and its cleanup's revision-advancing write " +
+          'landed over the settled row',
+        terminated,
+      );
+    },
+  );
+
   // --- Execution fence (F1): the migration control, on real workerd ---------
   // Unit tests can prove the store's compare-and-set. What they cannot prove is
   // that a fence written by one process still refuses work in the NEXT one, and
@@ -3436,7 +3463,8 @@ try {
       'waiting when its process was killed read running after the restart, ' +
       "once its row had gone silent the run's own object settled it as failed " +
       'INTERRUPTED without running the step again, and a late write without ' +
-      'the settlement was refused on D1. ' +
+      'the settlement was refused on D1. Terminate cleanup (TC1): a terminate ' +
+      'of a suspended run landed its cleanup write over the settled row on D1. ' +
       'The deployment execution fence (F1): provisioning seeded ' +
       'an explicit open fence, draining refused new starts with 503 ' +
       'EXECUTION_FENCED while still resuming an outstanding approval to ' +
