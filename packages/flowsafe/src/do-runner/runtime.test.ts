@@ -2574,6 +2574,7 @@ describe('Runtime capture', () => {
     ],
     ['requester', { requestedByKind: undefined }, InvalidRunRequestError],
     ['deadline', { deadlineMs: -1 }, InvalidRunRequestError],
+    ['leg abort', { legAbort: {} }, InvalidRunRequestError],
     ['dispatch', { scheduleDispatch: [] }, Error],
     ['operations', { economicOperations: [null] }, Error],
   ] as const)('validates supplied fields before fence and storage (%s)', async (_label, changes, errorType) => {
@@ -3705,6 +3706,27 @@ describe('RunnerRuntime', () => {
       resumeData: { approvedBy: 'carol' },
     });
     expect(resumed.status).toBe('success');
+  });
+
+  it('refuses a resume whose legAbort is not an AbortController and keeps the run resumable', async () => {
+    // #given
+    const { runtime } = buildRuntime(new InMemoryStore());
+    const started = await runtime.start('demo-approval', {
+      runId: crypto.randomUUID(),
+      inputData: { topic: 'leg-abort' },
+    });
+
+    // #when / #then
+    await expect(
+      runtime.resume('demo-approval', started.runId, {
+        step: 'approval',
+        resumeData: { approvedBy: 'carol' },
+        legAbort: {} as AbortController,
+      }),
+    ).rejects.toBeInstanceOf(InvalidRunRequestError);
+    expect(await runtime.status('demo-approval', started.runId)).toMatchObject({
+      status: 'suspended',
+    });
   });
 
   it('classifies a resume targeting a non-suspended step as InvalidRunRequestError', async () => {
@@ -11320,11 +11342,13 @@ describe('RunnerRuntime leg liveness touch', () => {
   function startHeldLeg(
     storage: MastraCompositeStore,
     options: Parameters<typeof abortableApp>[1] = {},
+    legAbort?: AbortController,
   ) {
     const leg = abortableApp(storage, options);
     const started = leg.app.runtime.start(WORKFLOW_ID, {
       runId: RUN_ID,
       inputData: {},
+      ...(legAbort ? { legAbort } : {}),
     });
     onTestFinished(async () => {
       leg.release.resolve();
@@ -11434,6 +11458,33 @@ describe('RunnerRuntime leg liveness touch', () => {
         runId: RUN_ID,
       }),
     );
+  });
+
+  it('aborts a leg abort controller after the engine run when it cancels the leg', async () => {
+    // #given a leg started with an abort controller, held in its first step
+    const { storage } = await d1Storage();
+    const legAbort = new AbortController();
+    const leg = startHeldLeg(storage, {}, legAbort);
+    await leg.entered.promise;
+    const aborted: string[] = [];
+    leg.observed.signal?.addEventListener('abort', () => {
+      aborted.push('engine');
+    });
+    legAbort.signal.addEventListener('abort', () => {
+      aborted.push('legAbort');
+    });
+
+    // #when the runtime cancels the leg for a terminate
+    const cancelled = await leg.app.runtime.cancelActiveExecution(
+      WORKFLOW_ID,
+      RUN_ID,
+      'cancelled',
+      [{ kind: 'human', id: 'owner' }],
+    );
+
+    // #then both are aborted, the engine run first
+    expect(cancelled).toBe(true);
+    expect(aborted).toEqual(['engine', 'legAbort']);
   });
 
   it('leaves a leg whose row is live running', async () => {

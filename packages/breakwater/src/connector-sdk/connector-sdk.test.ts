@@ -4035,6 +4035,45 @@ describe('atomic idempotency (reserve path)', () => {
     expect(execute).toHaveBeenCalledTimes(2);
   });
 
+  it('keeps the reservation pending when execute throws after its abort signal fired', async () => {
+    // #given — a keyed connector cut by an abort signal mid-call, which may
+    // already have taken effect at the provider
+    const store = spyAtomicStore();
+    const abort = new AbortController();
+    const execute = vi
+      .fn(async () => ({ ok: true }))
+      .mockImplementationOnce(async () => {
+        abort.abort();
+        throw new Error('request aborted');
+      });
+    const tool = createConnector({
+      id: 'salesforce.createContact',
+      description: 'Create a Salesforce contact',
+      execute,
+      permissions: { sideEffect: 'write', idempotencyKey: true },
+      policies: { idempotencyStore: store },
+    });
+    const cut = {
+      ...makeContext({ idempotencyKey: 'k1' }),
+      abortSignal: abort.signal,
+    };
+
+    // #when — the cut call fails and the same key is called again
+    await expect(run(tool, input, cut)).rejects.toThrow('request aborted');
+    const second = await run(
+      tool,
+      input,
+      makeContext({ idempotencyKey: 'k1' }),
+    ).catch((error: unknown) => error);
+
+    // #then — the pending reservation refuses the second call, so the effect
+    // is not repeated
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(store.release).not.toHaveBeenCalled();
+    expect(second).toBeInstanceOf(ConnectorPolicyError);
+    expect((second as ConnectorPolicyError).policy).toBe('idempotency');
+  });
+
   it('validates output before finalizing and keeps an invalid result pending', async () => {
     // #given — the connector returns a value outside its declared schema
     const audit = new AuditLogger();

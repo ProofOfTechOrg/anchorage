@@ -423,7 +423,7 @@ const INSTALLED_SERVICE_REASON =
  * ownership and disputed-settlement checks.
  */
 const DIRECT_ABORT_REASON =
-  "a direct abort bypasses the terminate route's ownership check and disputed-settlement refusal, stops running tools, and can reach another thread's run in the isolate through core's global run registry; cancel through the terminate route";
+  "a direct abort bypasses the terminate route's ownership check and disputed-settlement refusal, and can reach another thread's run in the isolate through core's global run registry; cancel through the terminate route";
 
 type GuardedDurableCallOptionRule =
   | { readonly kind: 'refused'; readonly why: string }
@@ -1809,6 +1809,7 @@ export class FlowsafeDurableAgent<
   async #rehydrateRegistry(options: {
     runId: string;
     requestContext: RequestContext;
+    abortController: AbortController;
     memory?: DurableAgentStreamOptions<TOutput>['memory'];
   }): Promise<void> {
     const wrappedAgent = this.#wrappedAgent;
@@ -1880,6 +1881,8 @@ export class FlowsafeDurableAgent<
     };
     const registryEntry = {
       ...preparation.registryEntry,
+      abortController: options.abortController,
+      abortSignal: options.abortController.signal,
       cleanup,
     };
     this.runRegistryInternal.registerWithMessageList(
@@ -1923,6 +1926,7 @@ export class FlowsafeDurableAgent<
       : options.memory;
     let rehydrated = false;
     let leg: ResumedThreadLeg | undefined;
+    const legAbort = new AbortController();
     try {
       const summary = await this.#runtime.resume(
         this.getWorkflow().id,
@@ -1934,6 +1938,7 @@ export class FlowsafeDurableAgent<
             : {}),
           requestedBy: options.requestedBy,
           requestedByKind: 'human',
+          legAbort,
           prepareExecution: async (requestContext) => {
             const offset = (
               await this.pubsub.getHistory(AGENT_STREAM_TOPIC(options.runId))
@@ -1941,6 +1946,7 @@ export class FlowsafeDurableAgent<
             await this.#rehydrateRegistry({
               runId: options.runId,
               requestContext,
+              abortController: legAbort,
               ...(memory !== undefined ? { memory } : {}),
             });
             rehydrated = true;
@@ -2360,6 +2366,10 @@ export class FlowsafeDurableAgent<
       const scheduleDispatch = this.#startScheduleDispatches.get(runId);
       const idempotencyKey = this.#startIdempotencyKeys.get(runId);
       const authority = this.#startAuthorities.get(runId);
+      // stream() composes a caller's abortSignal into this controller and
+      // registers it before this method runs; every model and tool call of the
+      // leg reads a signal derived from it.
+      const legAbort = this.runRegistryInternal.get(runId)?.abortController;
       if (requestedBy === undefined || requestedByKind === undefined) {
         if (requestedBy !== undefined || requestedByKind !== undefined) {
           throw new InvalidRunRequestError(
@@ -2413,6 +2423,11 @@ export class FlowsafeDurableAgent<
         await this.#settleRefusedStart(runId, refusal);
         return;
       }
+      if (legAbort === undefined) {
+        console.error(
+          JSON.stringify({ type: 'agent-leg-abort-unavailable', runId }),
+        );
+      }
       const workflow = this.getWorkflow();
       summary = await this.#runtime.start(workflow.id, {
         runId,
@@ -2428,6 +2443,7 @@ export class FlowsafeDurableAgent<
         onPreparedStartIdentity: authority.onPreparedStartIdentity,
         runOwnerGuard: authority.runOwnerGuard,
         startReservation: authority.startReservation,
+        ...(legAbort === undefined ? {} : { legAbort }),
       });
       waiter?.resolve();
     } catch (error) {

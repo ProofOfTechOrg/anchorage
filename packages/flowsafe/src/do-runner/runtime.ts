@@ -826,6 +826,14 @@ export type StartRunOptions = {
     readonly owner: StartIdentity['owner'];
     readonly reservationToken: string;
   };
+  /**
+   * @internal An abort controller the runtime aborts wherever it aborts the
+   * leg: when the liveness touch finds the run settled by another instance,
+   * which can happen before the leg's engine run exists, and when a terminate
+   * handled in this isolate cancels the leg, after the engine run's own abort.
+   * Never request-context data.
+   */
+  readonly legAbort?: AbortController;
 } & OptionalRunRequester;
 
 export type ResumeRunOptions = {
@@ -838,6 +846,8 @@ export type ResumeRunOptions = {
    * @internal
    */
   prepareExecution?: (requestContext: RequestContext) => Promise<void>;
+  /** @internal See {@link StartRunOptions.legAbort}. */
+  readonly legAbort?: AbortController;
   /** Replace the persisted deadline relative to this resume. */
   deadlineMs?: number;
   /** Trusted settlement projection for the resumed execution leg. */
@@ -924,6 +934,11 @@ function relativeDeadline(
   return deadlineAt;
 }
 
+function assertLegAbort(legAbort: unknown): void {
+  if (legAbort !== undefined && !(legAbort instanceof AbortController))
+    throw new InvalidRunRequestError('legAbort is malformed');
+}
+
 function captureStartRunOptions(source: StartRunOptions): StartRunOptions {
   const {
     runId,
@@ -943,7 +958,9 @@ function captureStartRunOptions(source: StartRunOptions): StartRunOptions {
     onPreparedStartIdentity,
     runOwnerGuard: rawGuard,
     startReservation: rawReservation,
+    legAbort,
   } = source;
+  assertLegAbort(legAbort);
   if (requestedBy !== undefined && !isExecutionPrincipalId(requestedBy)) {
     throw new InvalidRunRequestError('requestedBy is malformed');
   }
@@ -1089,6 +1106,7 @@ function captureStartRunOptions(source: StartRunOptions): StartRunOptions {
     onPreparedStartIdentity,
     runOwnerGuard,
     startReservation,
+    legAbort,
   };
   return Object.freeze(
     requestedBy !== undefined && requestedByKind !== undefined
@@ -1167,6 +1185,7 @@ type CapturedWorkflowStorage = {
 
 type ActiveRun = {
   run?: { cancel(): Promise<void>; readonly abortController: AbortController };
+  legAbort?: AbortController;
   lifecycle?: RunLifecycleState;
   requestContext?: RequestContext;
   source?: CapturedWorkflowStorage;
@@ -1555,7 +1574,9 @@ export class RunnerRuntime {
       );
       return await this.#withRunLock(workflowId, runId, async () => {
         const activeKey = this.#runKey(workflowId, runId);
-        const active: ActiveRun = {};
+        const active: ActiveRun = options.legAbort
+          ? { legAbort: options.legAbort }
+          : {};
         if (this.#activeRuns.has(activeKey))
           throw new RunAlreadyExistsError(workflowId, runId, 'running');
         const leaveLeg = this.#registerLeg(
@@ -1765,11 +1786,13 @@ export class RunnerRuntime {
     runId: string,
     options: ResumeRunOptions = {},
   ): Promise<RunSummary> {
+    const { legAbort } = options;
+    assertLegAbort(legAbort);
     this.#getWorkflow(workflowId);
     const proof = await this.#assertResumeFence(workflowId, runId);
     return this.#withRunLock(workflowId, runId, async () => {
       const activeKey = this.#runKey(workflowId, runId);
-      const active: ActiveRun = {};
+      const active: ActiveRun = legAbort ? { legAbort } : {};
       if (this.#activeRuns.has(activeKey))
         throw new RunTerminalConflictError(workflowId, runId, 'running');
       const leaveLeg = this.#registerLeg(activeKey, active, workflowId, runId);
@@ -1942,6 +1965,11 @@ export class RunnerRuntime {
         );
         const key = this.#runKey(workflowId, runId);
         const active = this.#activeRuns.get(key);
+        const cancelTarget = () => {
+          if (!active?.run) return undefined;
+          this.#terminalAbortIntents.set(key, intendedStatus);
+          return { run: active.run, legAbort: active.legAbort, key };
+        };
         const lifecycle = effectiveLifecycle(
           lifecycleFromRequestContext(state.requestContext),
           active?.lifecycle,
@@ -1961,9 +1989,7 @@ export class RunnerRuntime {
             (existingIntent.expectedRevision === cas.expectedRevision &&
               existingIntent.expectedDeadlineAt === cas.expectedDeadlineAt))
         ) {
-          if (!active?.run) return undefined;
-          this.#terminalAbortIntents.set(key, intendedStatus);
-          return { run: active.run, key };
+          return cancelTarget();
         }
         if (
           cas &&
@@ -2016,9 +2042,7 @@ export class RunnerRuntime {
           active.lifecycle = intent;
           active.requestContext?.set(RUN_LIFECYCLE_CONTEXT_KEY, intent);
         }
-        if (!active?.run) return undefined;
-        this.#terminalAbortIntents.set(key, intendedStatus);
-        return { run: active.run, key };
+        return cancelTarget();
       }),
     );
     if (!prepared) return false;
@@ -2028,6 +2052,9 @@ export class RunnerRuntime {
       this.#terminalAbortIntents.delete(prepared.key);
       throw error;
     }
+    // After `run.cancel()` has aborted the engine run, so the engine's
+    // cancellation precedes any abort error from a call in flight.
+    prepared.legAbort?.abort();
     return true;
   }
 
@@ -2915,20 +2942,25 @@ export class RunnerRuntime {
    * Never `run.cancel()`: it reads the stored status first and returns without
    * aborting on `failed`, which an interruption or a start repair writes. The
    * reason is named `AbortError`, which Mastra and the AI SDK read as an abort,
-   * and carries the settlement as its cause.
+   * and carries the settlement as its cause. The leg's `legAbort` takes the
+   * same reason, so a model or tool call in flight stops with the engine.
    */
   #abortSettledLeg(workflowId: string, runId: string): void {
     const active = this.#activeRuns.get(this.#runKey(workflowId, runId));
-    if (!active?.run || active.run.abortController.signal.aborted) return;
+    const unaborted = [active?.run?.abortController, active?.legAbort].filter(
+      (controller): controller is AbortController =>
+        controller !== undefined && !controller.signal.aborted,
+    );
+    if (unaborted.length === 0) return;
     console.error(
       JSON.stringify({ type: 'run-leg-settled-abort', workflowId, runId }),
     );
     const conflict = new RunSettledConflictError(workflowId, runId);
-    active.run.abortController.abort(
-      Object.assign(new Error(conflict.message, { cause: conflict }), {
-        name: 'AbortError',
-      }),
+    const reason = Object.assign(
+      new Error(conflict.message, { cause: conflict }),
+      { name: 'AbortError' },
     );
+    for (const controller of unaborted) controller.abort(reason);
   }
 
   /**

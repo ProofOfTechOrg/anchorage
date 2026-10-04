@@ -1745,8 +1745,10 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
             // The consume stays INSIDE the attempt so denied calls, replays,
             // and joins never spend budget.
             const attempt = (async () => {
+              let executeStarted = false;
               try {
                 await consumeRateLimit(requestContext, isolationScope);
+                executeStarted = true;
                 const result = await config.execute(
                   typedInput,
                   context,
@@ -1769,8 +1771,15 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
               } catch (error) {
                 // Validation happens after the connector may already have
                 // completed its side effect, so keep the reservation pending
-                // instead of making an immediate retry duplicate it.
-                if (!isInstanceOf(error, OutputValidationFailure)) {
+                // instead of making an immediate retry duplicate it. An
+                // execute cut by an abort signal may equally have taken effect
+                // before the signal reached its request.
+                const cutByAbort =
+                  executeStarted && context.abortSignal?.aborted === true;
+                if (
+                  !isInstanceOf(error, OutputValidationFailure) &&
+                  !cutByAbort
+                ) {
                   try {
                     await store.release(storageKey, token);
                   } catch (releaseError) {
