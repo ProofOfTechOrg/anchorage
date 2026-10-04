@@ -72,7 +72,7 @@ import { readBoundedBody } from '../http-body.js';
 import {
   abandonApprovalsForRun,
   type ResumeRunFn,
-  reconcileApprovalsForSummary,
+  reconcileApprovalsForSummaryAndEndedSuspension,
 } from './approval-bridge.js';
 import { bearerActorAuthenticator } from './bearer-auth.js';
 import {
@@ -576,12 +576,13 @@ export function createFlowsafeRunnerLifecycle<Env extends FlowsafeWorkerEnv>(
         status,
         config.systemPrincipalId,
       ).then(() => undefined),
-    reconcileApprovals: (workflowId, summary) =>
-      reconcileApprovalsForSummary(
+    reconcileApprovals: (workflowId, summary, ended) =>
+      reconcileApprovalsForSummaryAndEndedSuspension(
         service,
         workflowId,
         summary,
         config.systemPrincipalId,
+        ended,
       ).then(() => undefined),
     ...(options.discardScheduleDispatch
       ? { discardScheduleDispatch: options.discardScheduleDispatch }

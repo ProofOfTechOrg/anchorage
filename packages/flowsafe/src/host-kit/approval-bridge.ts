@@ -18,7 +18,11 @@ import {
   type TrustedAutomationPrincipal,
   trustAutomationPrincipal,
 } from '../approval-api/index.js';
-import type { RunSummary } from '../do-runner/index.js';
+import type {
+  DurableObjectRunLifecycleHooks,
+  RunSummary,
+} from '../do-runner/index.js';
+import { isTerminalRunStatus } from '../do-runner/run-terminal-state.js';
 
 function errorMessage(error: unknown): string {
   try {
@@ -354,24 +358,110 @@ export async function abandonApprovalsForRun(
   terminalStatus: 'cancelled' | 'timed_out',
   systemPrincipalId: string,
 ): Promise<ApprovalRecord[]> {
-  const principal = bookkeepingPrincipal(systemPrincipalId, ABANDON_PURPOSE);
+  return supersedeOpenApprovals(
+    service,
+    workflowId,
+    runId,
+    bookkeepingPrincipal(systemPrincipalId, ABANDON_PURPOSE),
+    `abandoned: run ${terminalStatus}`,
+  );
+}
+
+/**
+ * Supersedes the run's open approvals that `filter` accepts. A record whose
+ * compare-and-set loses to a real decision keeps that decision and is left out
+ * of the result.
+ */
+async function supersedeOpenApprovals(
+  service: ApprovalService,
+  workflowId: string,
+  runId: string,
+  principal: TrustedAutomationPrincipal,
+  reason: string,
+  filter: (record: ApprovalRecord) => boolean = () => true,
+): Promise<ApprovalRecord[]> {
   const records = await listAllApprovals(
     service,
     { workflowId, runId },
     principalActor(principal),
   );
-  const abandoned: ApprovalRecord[] = [];
-  const reason = `abandoned: run ${terminalStatus}`;
+  const superseded: ApprovalRecord[] = [];
   for (const record of records) {
-    if (!OPEN_STATUSES.includes(record.status)) continue;
+    if (!OPEN_STATUSES.includes(record.status) || !filter(record)) continue;
     const updated = await service.supersedeStaleAsPrincipal(
       record.id,
       principal,
       reason,
     );
-    if (updated) abandoned.push(updated);
+    if (updated) superseded.push(updated);
   }
-  return abandoned;
+  return superseded;
+}
+
+/**
+ * The body of the run object's `reconcileApprovals` hook. It reconciles
+ * `summary` like `reconcileApprovalsForSummary`. When `ended` names a
+ * suspension a timeout resume ended, it then closes the approvals nothing can
+ * decide any more: the open ones bound to exactly that suspension, which leaves
+ * a record filed for another suspension of the step alone, or every open one of
+ * the run once `summary` is terminal, because a finished run's sibling gates
+ * cannot be decided either. A first suspension's record carries no
+ * resumeCount; the entry's 0 matches it. The close runs even when the
+ * reconcile fails, and a failure is thrown once both ran: the one that
+ * occurred, or one error carrying both messages.
+ */
+export async function reconcileApprovalsForSummaryAndEndedSuspension(
+  service: ApprovalService,
+  workflowId: string,
+  summary: RunSummary,
+  systemPrincipalId: string,
+  ended?: Parameters<
+    NonNullable<DurableObjectRunLifecycleHooks['reconcileApprovals']>
+  >[2],
+): Promise<ApprovalRecord[]> {
+  let filed: ApprovalRecord[] = [];
+  const failures: unknown[] = [];
+  try {
+    filed = await reconcileApprovalsForSummary(
+      service,
+      workflowId,
+      summary,
+      systemPrincipalId,
+    );
+  } catch (error) {
+    failures.push(error);
+  }
+  if (ended) {
+    const runFinished = isTerminalRunStatus(summary.status);
+    try {
+      await supersedeOpenApprovals(
+        service,
+        workflowId,
+        summary.runId,
+        bookkeepingPrincipal(systemPrincipalId, RECONCILE_PURPOSE),
+        runFinished
+          ? 'superseded: run ended after a timeout resume'
+          : 'superseded: suspension ended by its timeout',
+        runFinished
+          ? undefined
+          : (record) =>
+              stepKeyOf(record.stepPath) === ended.step &&
+              record.suspendedAt === ended.suspendedAt &&
+              (record.resumeCount ?? 0) === ended.resumeCount,
+      );
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  const [first, second] = failures;
+  if (failures.length === 2) {
+    throw new Error(
+      `reconcileApprovalsForSummaryAndEndedSuspension: reconciling the summary failed (${errorMessage(first)}) and closing the ended suspension failed (${errorMessage(second)})`,
+      { cause: first },
+    );
+  }
+  if (failures.length === 1) throw first;
+  return filed;
 }
 
 /**
