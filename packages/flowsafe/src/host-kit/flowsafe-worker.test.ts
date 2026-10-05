@@ -3517,4 +3517,54 @@ describe('createFlowsafeRunnerLifecycle', () => {
     ]);
     expect(records[0]).not.toHaveProperty('resumeTarget');
   });
+
+  it('closes the approval of the suspension a timeout resume ended and files the gate the run reached', async () => {
+    // #given the hooks, and the approval filed for a gate's first suspension,
+    // which carries no resumeCount
+    const { env } = makeEnv();
+    const lifecycle = createFlowsafeRunnerLifecycle(
+      { systemPrincipalId: 'flowsafe-system' },
+      env,
+    );
+    const runId = 'run-timeout-ended';
+    await lifecycle.reconcileApprovals?.('wf', {
+      runId,
+      status: 'suspended',
+      suspended: [['gate']],
+      suspendedAt: { gate: 1 },
+      requestedBy: 'alice',
+      requestedByKind: 'human',
+    });
+
+    // #when the gate's timeout resume leaves the run suspended at the next gate
+    await lifecycle.reconcileApprovals?.(
+      'wf',
+      {
+        runId,
+        status: 'suspended',
+        suspended: [['next']],
+        suspendedAt: { next: 2 },
+        requestedBy: 'alice',
+        requestedByKind: 'human',
+      },
+      { step: 'gate', suspendedAt: 1, resumeCount: 0 },
+    );
+
+    // #then the ended gate's approval is closed by the reconciler, and the
+    // next gate's is open
+    const records = await approvalStoreFactoryFor(env.DB)
+      .store()
+      .list({ workflowId: 'wf', runId });
+    expect(
+      Object.fromEntries(
+        records.map((record) => [
+          record.stepPath?.join('.'),
+          [record.status, record.decidedBy],
+        ]),
+      ),
+    ).toEqual({
+      gate: ['rejected', 'flowsafe-system'],
+      next: ['pending', undefined],
+    });
+  });
 });

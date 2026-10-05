@@ -1370,15 +1370,16 @@ describe('ApprovalService self-approval control', () => {
 });
 
 describe('ApprovalService cross-gate separation of duties', () => {
-  // The reconcile hole this closes: resumeRunWithRequeue attributes gate B to
-  // the gate-A decider (so the requestedBy self-check already bars them), but
-  // reconcileApprovalsForSummary files gate B as the SYSTEM principal — which the
-  // requestedBy check never blocks. The bar below is derived from the run's
-  // APPROVED history instead, so it catches BOTH filings.
+  // The gap this closes: resumeRunWithRequeue attributes gate B to the gate-A
+  // decider (so the requestedBy self-check already bars them), but a gate filed
+  // by reconciliation carries the run's recorded requester, which is not always
+  // the gate-A approver (a system-started run, or a timeout resume recorded by
+  // flowsafe before 0.24.0, records a system principal). The bar below is derived
+  // from the run's APPROVED history instead, so it catches BOTH filings.
 
-  it('refuses the gate-A approver at gate B even when gate B is filed by the system principal (reconcile path)', async () => {
+  it("refuses the gate-A approver at gate B even when gate B's requester is a system principal", async () => {
     // #given — ray approves gate A; the run advances and re-suspends at gate B,
-    // which is reconcile-filed attributed to the system principal (NOT ray)
+    // whose recorded requester is a system principal (NOT ray)
     const harness = makeHarness();
     const gateA = await seedPending(harness, {
       runId: 'acme_run-seq',
@@ -1423,7 +1424,8 @@ describe('ApprovalService cross-gate separation of duties', () => {
   });
 
   it('lets a DIFFERENT reviewer decide gate B', async () => {
-    // #given — same run: ray approved gate A, gate B is reconcile-filed
+    // #given — same run: ray approved gate A, gate B's requester is a system
+    // principal
     const harness = makeHarness();
     const gateA = await seedPending(harness, {
       runId: 'acme_run-seq',

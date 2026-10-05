@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import {
@@ -19,8 +19,12 @@ import {
 } from '../do-runner/constants.js';
 import type { RunSummary } from '../do-runner/index.js';
 // requestedConnectors is module-internal (not on the barrel): it is the
-// primitive beneath queueApprovalForSuspension, tested here directly.
-import { requestedConnectors } from './approval-bridge.js';
+// primitive beneath queueApprovalForSuspension, tested here directly. The run
+// object's hook body is internal too.
+import {
+  reconcileApprovalsForSummaryAndEndedSuspension,
+  requestedConnectors,
+} from './approval-bridge.js';
 import {
   abandonApprovalsForRun,
   queueApprovalForSuspension,
@@ -1610,5 +1614,171 @@ describe('reconcileApprovalsForSummary', () => {
     // (grants.ts), so the superseded record is excluded by its STATUS, not
     // merely because its fingerprint went stale
     expect(grants).toEqual([]);
+  });
+});
+
+describe('reconcileApprovalsForSummaryAndEndedSuspension', () => {
+  const ENDED = { step: 'gate', suspendedAt: 1000, resumeCount: 0 };
+
+  /** Two parallel gates suspended together, each with its approval open. */
+  async function parallelGatesFiled() {
+    const store = new InMemoryApprovalStore();
+    const service = new ApprovalService({ store, executionFence: 'none' });
+    const runId = 'run-parallel-ended';
+    await reconcileApprovalsForSummary(
+      service,
+      'wf',
+      {
+        runId,
+        status: 'suspended',
+        suspended: [['gate'], ['other']],
+        suspendedAt: { gate: 1000, other: 1000 },
+        requestedBy: 'starter',
+      },
+      SYSTEM,
+    );
+    return { store, service, runId };
+  }
+
+  async function statusByStep(
+    store: InMemoryApprovalStore,
+    runId: string,
+  ): Promise<Record<string, string>> {
+    const records = await store.list({ runId });
+    return Object.fromEntries(
+      records.map((record) => [record.stepPath?.join('.'), record.status]),
+    );
+  }
+
+  it('closes the ended suspension although reconciling the summary throws, and throws that failure', async () => {
+    // #given an approval open for the ended gate, and a suspended summary
+    // with no requester, which cannot be filed
+    const { store, service, runId } = await parallelGatesFiled();
+    const unfileable: RunSummary = {
+      runId,
+      status: 'suspended',
+      suspended: [['next']],
+      suspendedAt: { next: 2000 },
+    };
+
+    // #when
+    const outcome = reconcileApprovalsForSummaryAndEndedSuspension(
+      service,
+      'wf',
+      unfileable,
+      SYSTEM,
+      ENDED,
+    );
+
+    // #then
+    await expect(outcome).rejects.toThrow('no durable requester provenance');
+    expect((await statusByStep(store, runId)).gate).toBe('rejected');
+  });
+
+  it('throws an error carrying both failures when reconciling and closing both throw', async () => {
+    // #given the unfileable summary again, and a store whose reads fail
+    const { service, runId } = await parallelGatesFiled();
+    vi.spyOn(service, 'list').mockRejectedValue(new Error('store unavailable'));
+    const unfileable: RunSummary = {
+      runId,
+      status: 'suspended',
+      suspended: [['next']],
+      suspendedAt: { next: 2000 },
+    };
+
+    // #when
+    const failure = await reconcileApprovalsForSummaryAndEndedSuspension(
+      service,
+      'wf',
+      unfileable,
+      SYSTEM,
+      ENDED,
+    ).catch((error: unknown) => error);
+
+    // #then
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toContain(
+      'no durable requester provenance',
+    );
+    expect((failure as Error).message).toContain('store unavailable');
+  });
+
+  it('reconciles the summary before it closes the ended suspension', async () => {
+    // #given a run that moved on to a next gate, with the ended gate's
+    // approval still open
+    const { service, runId } = await parallelGatesFiled();
+    const filing = vi.spyOn(service, 'createAsPrincipal');
+    const closing = vi.spyOn(service, 'supersedeStaleAsPrincipal');
+
+    // #when
+    await reconcileApprovalsForSummaryAndEndedSuspension(
+      service,
+      'wf',
+      {
+        runId,
+        status: 'suspended',
+        suspended: [['next']],
+        suspendedAt: { next: 2000 },
+        requestedBy: 'starter',
+      },
+      SYSTEM,
+      ENDED,
+    );
+
+    // #then the next gate was filed before the ended gate was closed
+    expect(filing).toHaveBeenCalledOnce();
+    expect(closing).toHaveBeenCalledOnce();
+    expect(Math.max(...filing.mock.invocationCallOrder)).toBeLessThan(
+      Math.min(...closing.mock.invocationCallOrder),
+    );
+  });
+
+  it('leaves a sibling gate approval open while the run is still suspended at it', async () => {
+    // #given
+    const { store, service, runId } = await parallelGatesFiled();
+
+    // #when the gate's timeout resume leaves the run suspended at its sibling
+    await reconcileApprovalsForSummaryAndEndedSuspension(
+      service,
+      'wf',
+      {
+        runId,
+        status: 'suspended',
+        suspended: [['other']],
+        suspendedAt: { other: 1000 },
+        requestedBy: 'starter',
+      },
+      SYSTEM,
+      ENDED,
+    );
+
+    // #then
+    expect(await statusByStep(store, runId)).toEqual({
+      gate: 'rejected',
+      other: 'pending',
+    });
+  });
+
+  it.each([
+    'success',
+    'failed',
+  ] as const)('closes every open approval of a run that finished as %s after the timeout resume', async (status) => {
+    // #given
+    const { store, service, runId } = await parallelGatesFiled();
+
+    // #when the gate's timeout resume ends the run
+    await reconcileApprovalsForSummaryAndEndedSuspension(
+      service,
+      'wf',
+      { runId, status },
+      SYSTEM,
+      ENDED,
+    );
+
+    // #then no approval of the finished run can be decided any more
+    expect(await statusByStep(store, runId)).toEqual({
+      gate: 'rejected',
+      other: 'rejected',
+    });
   });
 });

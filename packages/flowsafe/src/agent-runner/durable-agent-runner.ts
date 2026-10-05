@@ -73,6 +73,7 @@ import {
   prepareForDurableExecution,
 } from '@mastra/core/agent/durable';
 import type { MastraDBMessage } from '@mastra/core/agent/message-list';
+import { MastraTimeoutError } from '@mastra/core/loop';
 import type { Mastra } from '@mastra/core/mastra';
 import type { RequestContext } from '@mastra/core/request-context';
 import type { AnyWorkflow, WorkflowRunStatus } from '@mastra/core/workflows';
@@ -423,7 +424,7 @@ const INSTALLED_SERVICE_REASON =
  * ownership and disputed-settlement checks.
  */
 const DIRECT_ABORT_REASON =
-  "a direct abort bypasses the terminate route's ownership check and disputed-settlement refusal, stops running tools, and can reach another thread's run in the isolate through core's global run registry; cancel through the terminate route";
+  "a direct abort bypasses the terminate route's ownership check and disputed-settlement refusal, and can reach another thread's run in the isolate through core's global run registry; cancel through the terminate route";
 
 type GuardedDurableCallOptionRule =
   | { readonly kind: 'refused'; readonly why: string }
@@ -870,6 +871,54 @@ function bindResumedLegLifecycle<T extends { status: WorkflowRunStatus }>(
       return typeof value === 'function' ? value.bind(target) : value;
     },
   });
+}
+
+// The rehydrated registry entry bypasses core's private budget installer, so a
+// resumed leg composes `modelSettings.timeout.totalMs` with its abort signal
+// here, with the same pass-through rule and timeout reason as core's
+// createTimeoutAbortSignal. The parent listener stays attached after cleanup,
+// which also runs when core evicts the entry mid-leg and must not unlink the
+// leg's own abort.
+function composeTotalBudget(
+  parent: AbortSignal,
+  totalMs: number | undefined,
+): { signal: AbortSignal; cleanup: () => void } {
+  if (
+    typeof totalMs !== 'number' ||
+    !Number.isFinite(totalMs) ||
+    totalMs <= 0
+  ) {
+    return { signal: parent, cleanup: () => undefined };
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    controller.abort(
+      new MastraTimeoutError({ timeoutType: 'total', timeoutMs: totalMs }),
+    );
+  }, totalMs);
+  // Node's timer handle has unref; the Workers runtime returns a number.
+  (timer as unknown as { unref?: () => void }).unref?.();
+  const onParentAbort = () => controller.abort(parent.reason);
+  if (parent.aborted) onParentAbort();
+  else parent.addEventListener('abort', onParentAbort, { once: true });
+  return {
+    signal: controller.signal,
+    cleanup: () => clearTimeout(timer),
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function persistedModelSettings(
+  workflowInput: unknown,
+): Record<string, unknown> | undefined {
+  if (!isRecord(workflowInput) || !isRecord(workflowInput.options)) {
+    return undefined;
+  }
+  const { modelSettings } = workflowInput.options;
+  return isRecord(modelSettings) ? modelSettings : undefined;
 }
 
 /**
@@ -1809,7 +1858,9 @@ export class FlowsafeDurableAgent<
   async #rehydrateRegistry(options: {
     runId: string;
     requestContext: RequestContext;
+    abortController: AbortController;
     memory?: DurableAgentStreamOptions<TOutput>['memory'];
+    modelSettings?: Record<string, unknown>;
   }): Promise<void> {
     const wrappedAgent = this.#wrappedAgent;
     let inputProcessors: Awaited<
@@ -1845,9 +1896,12 @@ export class FlowsafeDurableAgent<
       },
     });
     const preparationOptions =
-      options.memory !== undefined
+      options.memory !== undefined || options.modelSettings !== undefined
         ? ({
-            memory: options.memory,
+            ...(options.memory !== undefined ? { memory: options.memory } : {}),
+            ...(options.modelSettings !== undefined
+              ? { modelSettings: options.modelSettings }
+              : {}),
           } as NonNullable<
             Parameters<DurableAgent<TAgentId, TTools, TOutput>['prepare']>[1]
           >)
@@ -1872,14 +1926,21 @@ export class FlowsafeDurableAgent<
     preparation.registryEntry.inputProcessors = inputProcessors;
     preparation.registryEntry.llmRequestInputProcessors =
       llmRequestInputProcessors;
+    const budget = composeTotalBudget(
+      options.abortController.signal,
+      preparation.registryEntry.timeoutTotalMs,
+    );
     let cleaned = false;
     const cleanup = () => {
       if (cleaned) return;
       cleaned = true;
+      budget.cleanup();
       preparation.registryEntry.cleanup?.();
     };
     const registryEntry = {
       ...preparation.registryEntry,
+      abortController: options.abortController,
+      abortSignal: budget.signal,
       cleanup,
     };
     this.runRegistryInternal.registerWithMessageList(
@@ -1923,6 +1984,7 @@ export class FlowsafeDurableAgent<
       : options.memory;
     let rehydrated = false;
     let leg: ResumedThreadLeg | undefined;
+    const legAbort = new AbortController();
     try {
       const summary = await this.#runtime.resume(
         this.getWorkflow().id,
@@ -1934,14 +1996,18 @@ export class FlowsafeDurableAgent<
             : {}),
           requestedBy: options.requestedBy,
           requestedByKind: 'human',
-          prepareExecution: async (requestContext) => {
+          legAbort,
+          prepareExecution: async (requestContext, workflowInput) => {
             const offset = (
               await this.pubsub.getHistory(AGENT_STREAM_TOPIC(options.runId))
             ).length;
+            const modelSettings = persistedModelSettings(workflowInput);
             await this.#rehydrateRegistry({
               runId: options.runId,
               requestContext,
+              abortController: legAbort,
               ...(memory !== undefined ? { memory } : {}),
+              ...(modelSettings !== undefined ? { modelSettings } : {}),
             });
             rehydrated = true;
             const observed = await this.observe(options.runId, { offset });
@@ -2360,6 +2426,10 @@ export class FlowsafeDurableAgent<
       const scheduleDispatch = this.#startScheduleDispatches.get(runId);
       const idempotencyKey = this.#startIdempotencyKeys.get(runId);
       const authority = this.#startAuthorities.get(runId);
+      // stream() composes a caller's abortSignal into this controller and
+      // registers it before this method runs; every model and tool call of the
+      // leg reads a signal derived from it.
+      const legAbort = this.runRegistryInternal.get(runId)?.abortController;
       if (requestedBy === undefined || requestedByKind === undefined) {
         if (requestedBy !== undefined || requestedByKind !== undefined) {
           throw new InvalidRunRequestError(
@@ -2413,6 +2483,11 @@ export class FlowsafeDurableAgent<
         await this.#settleRefusedStart(runId, refusal);
         return;
       }
+      if (legAbort === undefined) {
+        console.error(
+          JSON.stringify({ type: 'agent-leg-abort-unavailable', runId }),
+        );
+      }
       const workflow = this.getWorkflow();
       summary = await this.#runtime.start(workflow.id, {
         runId,
@@ -2428,6 +2503,7 @@ export class FlowsafeDurableAgent<
         onPreparedStartIdentity: authority.onPreparedStartIdentity,
         runOwnerGuard: authority.runOwnerGuard,
         startReservation: authority.startReservation,
+        ...(legAbort === undefined ? {} : { legAbort }),
       });
       waiter?.resolve();
     } catch (error) {

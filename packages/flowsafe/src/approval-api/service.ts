@@ -561,10 +561,10 @@ export class ApprovalService {
       }
       // Cross-gate causal SoD: a reviewer who APPROVED an earlier gate of THIS
       // run advanced it to the gate now before them, so they must not also
-      // decide this one. requestedBy attribution cannot carry this on its own —
-      // reconcileApprovalsForSummary files the next gate as the SYSTEM principal,
-      // which the requestedBy check above never blocks — so the bar is derived
-      // from the run's own APPROVED history instead.
+      // decide this one. requestedBy attribution cannot carry this on its own:
+      // a gate's requestedBy is the run's recorded requester when it is filed,
+      // which need not be the reviewer who approved an earlier gate, so the bar
+      // is derived from the run's own APPROVED history instead.
       //
       // Read the COMPLETE approved history via the shared complete-reader (the
       // same drain-all-pages helper connectorGrantsForLeg uses, so the SoD

@@ -24,6 +24,7 @@ import {
 } from '@mastra/core/agent/message-list';
 import { EventEmitterPubSub } from '@mastra/core/events';
 import type { MastraModelConfig } from '@mastra/core/llm';
+import { MastraTimeoutError } from '@mastra/core/loop';
 import { Mastra } from '@mastra/core/mastra';
 import { MockMemory } from '@mastra/core/memory';
 import {
@@ -51,6 +52,7 @@ import {
   expect,
   expectTypeOf,
   it,
+  onTestFinished,
   vi,
 } from 'vitest';
 import { z } from 'zod';
@@ -78,6 +80,10 @@ import {
   type StartRunOptions,
 } from '../do-runner/index.js';
 import { init } from '../do-runner/init.js';
+import {
+  RUN_LIFECYCLE_CONTEXT_KEY,
+  RunSettledConflictError,
+} from '../do-runner/run-lifecycle.js';
 import {
   RunStateUnreadableError,
   UnknownRunError,
@@ -525,6 +531,11 @@ async function realAgentBridgeFixture(
     chunks?: readonly string[];
     tools?: Record<string, ReturnType<typeof createTool>>;
   },
+  toolLoop?: {
+    model: MastraModelConfig;
+    tools: Record<string, ReturnType<typeof createTool>>;
+    totalMs?: number;
+  },
 ) {
   const sql = openSqlite() as ReturnType<typeof openSqlite> & { close(): void };
   const binding = sqliteUnitDatabase(sql) as ExecutionFenceDatabase;
@@ -603,7 +614,15 @@ async function realAgentBridgeFixture(
           name: 'Writer',
           instructions: 'Return done.',
           ...(threaded ? { memory: new MockMemory() } : {}),
-          model,
+          ...(toolLoop ? { tools: toolLoop.tools } : {}),
+          ...(toolLoop?.totalMs !== undefined
+            ? {
+                defaultOptions: {
+                  modelSettings: { timeout: { totalMs: toolLoop.totalMs } },
+                },
+              }
+            : {}),
+          model: toolLoop?.model ?? model,
         }),
     runtime,
     cache: false,
@@ -4420,6 +4439,529 @@ describe('FlowsafeDurableAgent.executeWorkflow failed run', () => {
     // #then the failed status is surfaced to observe()/onError via emitError
     expect(emitError).toHaveBeenCalledWith('run-1', expect.any(Error));
     expect(emitError.mock.calls[0]?.[1]?.message).toBe('boom');
+  });
+});
+
+describe('FlowsafeDurableAgent abort of the model and tool calls in flight', () => {
+  const RUN_ID = 'abort-run';
+  const HOLD_TOOL = 'hold';
+  const OPERATOR = { kind: 'human', id: 'operator-1' } as const;
+  const TOTAL_BUDGET_MS = 5_000;
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  type StreamCall = (options: {
+    abortSignal?: AbortSignal;
+  }) => Promise<unknown>;
+
+  /** Calls `hold` on its first call and answers with text after that. */
+  function toolThenTextModel(onCall: () => void): MastraModelConfig {
+    const text = localModelFixture(() => undefined);
+    const textStream = (text as unknown as { doStream: StreamCall }).doStream;
+    const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
+    let calls = 0;
+    return {
+      ...(text as object),
+      modelId: 'tool-then-text',
+      doStream: async (options: Parameters<StreamCall>[0]) => {
+        onCall();
+        calls += 1;
+        if (calls > 1) return textStream(options);
+        return {
+          stream: new ReadableStream({
+            start(controller) {
+              controller.enqueue({ type: 'stream-start', warnings: [] });
+              controller.enqueue({
+                type: 'tool-call',
+                toolCallId: 'call-1',
+                toolName: HOLD_TOOL,
+                input: '{}',
+              });
+              controller.enqueue({
+                type: 'finish',
+                finishReason: 'tool-calls',
+                usage,
+              });
+              controller.close();
+            },
+          }),
+        };
+      },
+    } as unknown as MastraModelConfig;
+  }
+
+  /** A text model whose first call holds until `release`. */
+  function heldModel(
+    held: { signal?: AbortSignal; modelCalls: number },
+    entered: { resolve(): void },
+    release: { promise: Promise<void> },
+  ): MastraModelConfig {
+    const text = localModelFixture(() => {
+      held.modelCalls += 1;
+    });
+    const textStream = (text as unknown as { doStream: StreamCall }).doStream;
+    return {
+      ...(text as object),
+      doStream: async (options: Parameters<StreamCall>[0]) => {
+        held.signal = options.abortSignal;
+        entered.resolve();
+        await release.promise;
+        return textStream(options);
+      },
+    } as unknown as MastraModelConfig;
+  }
+
+  /**
+   * A durable agent over D1. `maxSteps` of 2 leaves room for a second model
+   * call, which `observed.modelCalls` counts, so a test can fail on one.
+   */
+  async function heldToolAgent(
+    options: {
+      requireApproval?: boolean;
+      honourSignal?: boolean;
+      holdModel?: boolean;
+      totalMs?: number;
+    } = {},
+  ) {
+    const entered = bridgeDeferred();
+    const release = bridgeDeferred();
+    const observed: { signal?: AbortSignal; modelCalls: number } = {
+      modelCalls: 0,
+    };
+    const hold = createTool({
+      id: HOLD_TOOL,
+      description: 'Holds until released',
+      inputSchema: z.object({}),
+      ...(options.requireApproval ? { requireApproval: true } : {}),
+      execute: async (_input, context) => {
+        const signal = context?.abortSignal;
+        observed.signal = signal;
+        entered.resolve();
+        const aborted =
+          options.honourSignal && signal
+            ? new Promise<never>((_resolve, reject) =>
+                signal.addEventListener('abort', () => reject(signal.reason), {
+                  once: true,
+                }),
+              )
+            : undefined;
+        await (aborted
+          ? Promise.race([release.promise, aborted])
+          : release.promise);
+        return { held: true };
+      },
+    });
+    const f = await realAgentBridgeFixture(
+      undefined,
+      undefined,
+      false,
+      undefined,
+      {
+        model: options.holdModel
+          ? heldModel(observed, entered, release)
+          : toolThenTextModel(() => {
+              observed.modelCalls += 1;
+            }),
+        tools: { [HOLD_TOOL]: hold },
+        ...(options.totalMs !== undefined ? { totalMs: options.totalMs } : {}),
+      },
+    );
+    const workflowId = f.agent.getWorkflow().id;
+    const legs: Promise<unknown>[] = [];
+    const results: Array<{ cleanup(): void }> = [];
+    onTestFinished(async () => {
+      release.resolve();
+      await Promise.allSettled(legs);
+      for (const result of results) result.cleanup();
+      registryFor(f.agent).clear();
+      globalRunRegistry.delete(RUN_ID);
+      f.start.mockRestore();
+      f.sql.close();
+    });
+    const track = <T>(leg: Promise<T>): Promise<T> => {
+      legs.push(leg);
+      void leg.catch(() => undefined);
+      return leg;
+    };
+    return {
+      ...f,
+      workflowId,
+      entered,
+      release,
+      observed,
+      startLeg: (
+        callOptions: {
+          abortSignal?: AbortSignal;
+          modelSettings?: { timeout: { totalMs: number } };
+        } = {},
+      ) =>
+        track(
+          f.agent
+            .streamUntilPersisted(
+              'Hold.',
+              {
+                runId: RUN_ID,
+                maxSteps: 2,
+                disableBackgroundTasks: true,
+                ...callOptions,
+              },
+              'operator-1',
+              'human',
+              `${RUN_ID}-attempt`,
+              undefined,
+              undefined,
+              startAuthority(),
+            )
+            .then((result) => {
+              results.push(result);
+              return result;
+            }),
+        ),
+      resumeLeg: () =>
+        track(
+          f.agent.resumeViaRuntime({
+            runId: RUN_ID,
+            requestedBy: 'reviewer-1',
+            resumeData: { approved: true },
+          }),
+        ),
+      /** Writes the row as another instance leaves a run it settled. */
+      settle: (status: string, lifecycle: Record<string, unknown>) => {
+        const written = f.sql
+          .prepare(
+            `UPDATE mastra_workflow_snapshot
+              SET snapshot = json_set(snapshot, '$.status', ?,
+                '$.requestContext."${RUN_LIFECYCLE_CONTEXT_KEY}"', json(?))
+              WHERE workflow_name = ? AND run_id = ?`,
+          )
+          .run(status, JSON.stringify(lifecycle), workflowId, RUN_ID);
+        expect(written).toMatchObject({ changes: 1 });
+      },
+    };
+  }
+
+  it('aborts the tool call in flight of a start leg whose run another instance settled', async () => {
+    // #given a start leg held in its tool call, on a run another instance
+    // repaired as an unknown start outcome
+    const h = await heldToolAgent();
+    const leg = h.startLeg();
+    await h.entered.promise;
+    h.settle('failed', { version: 1, revision: 1, startOutcomeUnknownAt: 1 });
+
+    // #when the leg's touch runs
+    await h.runtime.touchRun(h.workflowId, RUN_ID);
+
+    // #then the tool's signal is aborted
+    expect(h.observed.signal?.aborted).toBe(true);
+
+    // #when the tool returns
+    h.release.resolve();
+
+    // #then the start answers, the run reads as the other instance left it,
+    // and the loop made no second model call
+    await expect(leg).resolves.toMatchObject({ runId: RUN_ID });
+    expect(await h.runtime.status(h.workflowId, RUN_ID)).toMatchObject({
+      status: 'failed',
+    });
+    expect(h.observed.modelCalls).toBe(1);
+  });
+
+  it('aborts the tool call in flight of a resumed leg whose run another instance settled', async () => {
+    // #given a run suspended at a tool approval, resumed and held in the
+    // approved tool call, on a run another instance terminated
+    const h = await heldToolAgent({ requireApproval: true });
+    await h.startLeg();
+    expect(await h.runtime.status(h.workflowId, RUN_ID)).toMatchObject({
+      status: 'suspended',
+    });
+    const resumed = h.resumeLeg();
+    await h.entered.promise;
+    h.settle('canceled', {
+      version: 1,
+      revision: 100,
+      terminal: {
+        status: 'cancelled',
+        error: { code: 'CANCELLED', message: 'run was cancelled' },
+        transitionedAt: 1,
+        replayPrincipals: [OPERATOR],
+      },
+    });
+
+    // #when the leg's touch runs
+    await h.runtime.touchRun(h.workflowId, RUN_ID);
+
+    // #then the tool's signal is aborted
+    expect(h.observed.signal?.aborted).toBe(true);
+
+    // #when the tool returns
+    h.release.resolve();
+
+    // #then the resume refuses the leg's write, the run reads as the other
+    // instance left it, and the loop made no second model call
+    await expect(resumed).rejects.toBeInstanceOf(RunSettledConflictError);
+    expect(await h.runtime.status(h.workflowId, RUN_ID)).toMatchObject({
+      status: 'cancelled',
+    });
+    expect(h.observed.modelCalls).toBe(1);
+  });
+
+  it('aborts the tool call in flight of a resumed leg with a total timeout once the agent default time budget elapses', async () => {
+    // #given an agent whose default options carry a total time budget, and a
+    // run suspended at a tool approval
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const h = await heldToolAgent({
+      requireApproval: true,
+      totalMs: TOTAL_BUDGET_MS,
+    });
+    await h.startLeg();
+    expect(await h.runtime.status(h.workflowId, RUN_ID)).toMatchObject({
+      status: 'suspended',
+    });
+
+    // #when the resumed leg holds in the approved tool call until the budget
+    // elapses
+    const resumed = h.resumeLeg();
+    await h.entered.promise;
+    await vi.advanceTimersByTimeAsync(TOTAL_BUDGET_MS);
+
+    // #then the tool's signal is aborted with the total timeout
+    expect(h.observed.signal?.aborted).toBe(true);
+    expect(h.observed.signal?.reason).toBeInstanceOf(MastraTimeoutError);
+    expect(h.observed.signal?.reason).toMatchObject({
+      timeoutType: 'total',
+      timeoutMs: TOTAL_BUDGET_MS,
+    });
+
+    // #when the tool returns
+    vi.useRealTimers();
+    h.release.resolve();
+
+    // #then the resume answers with the run ended as a failed model step, as
+    // the budget ends a start leg's run, and the loop made no second model call
+    await expect(resumed).resolves.toMatchObject({
+      status: 'success',
+      result: { stepResult: { reason: 'error' } },
+    });
+    expect(h.observed.modelCalls).toBe(1);
+  });
+
+  it('aborts the tool call in flight of a resumed leg with a total timeout once the time budget its start call set elapses', async () => {
+    // #given an agent with no default time budget, and a run whose start call
+    // set a total budget and which is suspended at a tool approval
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const h = await heldToolAgent({ requireApproval: true });
+    await h.startLeg({
+      modelSettings: { timeout: { totalMs: TOTAL_BUDGET_MS } },
+    });
+    expect(await h.runtime.status(h.workflowId, RUN_ID)).toMatchObject({
+      status: 'suspended',
+    });
+
+    // #when the resumed leg holds in the approved tool call until the budget
+    // elapses
+    const resumed = h.resumeLeg();
+    await h.entered.promise;
+    await vi.advanceTimersByTimeAsync(TOTAL_BUDGET_MS);
+
+    // #then the tool's signal is aborted with the total timeout
+    expect(h.observed.signal?.aborted).toBe(true);
+    expect(h.observed.signal?.reason).toBeInstanceOf(MastraTimeoutError);
+    expect(h.observed.signal?.reason).toMatchObject({
+      timeoutType: 'total',
+      timeoutMs: TOTAL_BUDGET_MS,
+    });
+
+    // #when the tool returns
+    vi.useRealTimers();
+    h.release.resolve();
+
+    // #then the resume answers with the run ended as a failed model step, and
+    // the loop made no second model call
+    await expect(resumed).resolves.toMatchObject({
+      status: 'success',
+      result: { stepResult: { reason: 'error' } },
+    });
+    expect(h.observed.modelCalls).toBe(1);
+  });
+
+  it('aborts the tool call in flight of a resumed leg with the settlement as its reason when a time budget is configured', async () => {
+    // #given a run suspended at a tool approval, on an agent whose default
+    // options carry a total time budget that has not elapsed, resumed and held
+    // in the approved tool call, on a run another instance terminated
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const h = await heldToolAgent({
+      requireApproval: true,
+      totalMs: TOTAL_BUDGET_MS,
+    });
+    await h.startLeg();
+    void h.resumeLeg();
+    await h.entered.promise;
+    h.settle('canceled', {
+      version: 1,
+      revision: 100,
+      terminal: {
+        status: 'cancelled',
+        error: { code: 'CANCELLED', message: 'run was cancelled' },
+        transitionedAt: 1,
+        replayPrincipals: [OPERATOR],
+      },
+    });
+
+    // #when the leg's touch runs
+    await h.runtime.touchRun(h.workflowId, RUN_ID);
+
+    // #then the tool's signal carries the settlement, not a timeout
+    expect(h.observed.signal?.reason).toMatchObject({
+      name: 'AbortError',
+      cause: expect.any(RunSettledConflictError),
+    });
+  });
+
+  it('aborts the tool call in flight of a start leg when the caller aborts its signal', async () => {
+    // #given a start leg held in its tool call, started with a caller's signal
+    const h = await heldToolAgent();
+    const caller = new AbortController();
+    const leg = h.startLeg({ abortSignal: caller.signal });
+    await h.entered.promise;
+
+    // #when the caller aborts
+    caller.abort();
+
+    // #then the tool's signal is aborted
+    expect(h.observed.signal?.aborted).toBe(true);
+
+    // #when the tool returns
+    h.release.resolve();
+
+    // #then the start answers, the run ends successfully with the abort as its
+    // stop reason, and the loop made no second model call
+    await expect(leg).resolves.toMatchObject({ runId: RUN_ID });
+    expect(await h.runtime.status(h.workflowId, RUN_ID)).toMatchObject({
+      status: 'success',
+      result: { stepResult: { reason: 'abort' } },
+    });
+    expect(h.observed.modelCalls).toBe(1);
+  });
+
+  it('aborts the tool call in flight when the isolate that runs the leg cancels it', async () => {
+    // #given a start leg held in its tool call
+    const h = await heldToolAgent();
+    const leg = h.startLeg();
+    await h.entered.promise;
+
+    // #when the isolate's runtime cancels the leg for a terminate
+    const cancelled = await h.runtime.cancelActiveExecution(
+      h.workflowId,
+      RUN_ID,
+      'cancelled',
+      [OPERATOR],
+    );
+
+    // #then it cancelled a leg, and the tool's signal is aborted
+    expect(cancelled).toBe(true);
+    expect(h.observed.signal?.aborted).toBe(true);
+
+    // #when the tool returns
+    h.release.resolve();
+
+    // #then the start answers, the run reads as the engine's cancellation
+    // left it, and the loop made no second model call
+    await expect(leg).resolves.toMatchObject({ runId: RUN_ID });
+    expect(await h.runtime.status(h.workflowId, RUN_ID)).toMatchObject({
+      status: 'canceled',
+    });
+    expect(h.observed.modelCalls).toBe(1);
+  });
+
+  it('ends a run as cancelled when an in-isolate terminate cuts a tool call that honours its signal', async () => {
+    // #given a start leg held in a tool call that rejects once its signal is
+    // aborted
+    const h = await heldToolAgent({ honourSignal: true });
+    const leg = h.startLeg();
+    await h.entered.promise;
+
+    // #when the isolate cancels the leg and records the terminate
+    await h.runtime.cancelActiveExecution(h.workflowId, RUN_ID, 'cancelled', [
+      OPERATOR,
+    ]);
+    const terminated = await h.runtime.terminate(h.workflowId, RUN_ID);
+
+    // #then the terminate transitions the run to cancelled, the start answers,
+    // and the loop made no second model call
+    expect(terminated).toMatchObject({
+      transitioned: true,
+      summary: { status: 'cancelled' },
+    });
+    await expect(leg).resolves.toMatchObject({ runId: RUN_ID });
+    expect(await h.runtime.status(h.workflowId, RUN_ID)).toMatchObject({
+      status: 'cancelled',
+    });
+    expect(h.observed.modelCalls).toBe(1);
+  });
+
+  it('leaves the tool call running when the terminate cannot record its intent', async () => {
+    // #given a start leg held in its tool call, on storage whose lifecycle
+    // patch fails
+    const h = await heldToolAgent();
+    const capability = h.workflows[FENCED_WORKFLOW_STORAGE];
+    assert(capability);
+    Object.defineProperty(h.workflows, FENCED_WORKFLOW_STORAGE, {
+      value: {
+        ...capability,
+        patchRunLifecycle: async () => {
+          throw new Error('D1 unavailable');
+        },
+      },
+      configurable: true,
+    });
+    const leg = h.startLeg();
+    await h.entered.promise;
+
+    // #when the terminate's intent write fails
+    await expect(
+      h.runtime.cancelActiveExecution(h.workflowId, RUN_ID, 'cancelled', [
+        OPERATOR,
+      ]),
+    ).rejects.toThrow('D1 unavailable');
+
+    // #then the tool's signal is not aborted
+    expect(h.observed.signal?.aborted).toBe(false);
+
+    // #when the tool returns
+    h.release.resolve();
+
+    // #then the run completes: the loop made its second model call
+    await expect(leg).resolves.toMatchObject({ runId: RUN_ID });
+    expect(await h.runtime.status(h.workflowId, RUN_ID)).toMatchObject({
+      status: 'success',
+    });
+    expect(h.observed.modelCalls).toBe(2);
+  });
+
+  it('aborts the model call in flight of a start leg whose run another instance settled', async () => {
+    // #given a start leg held in its model call, on a run another instance
+    // repaired as an unknown start outcome
+    const h = await heldToolAgent({ holdModel: true });
+    const leg = h.startLeg();
+    await h.entered.promise;
+    h.settle('failed', { version: 1, revision: 1, startOutcomeUnknownAt: 1 });
+
+    // #when the leg's touch runs
+    await h.runtime.touchRun(h.workflowId, RUN_ID);
+
+    // #then the model call's signal is aborted
+    expect(h.observed.signal?.aborted).toBe(true);
+
+    // #when the model call returns
+    h.release.resolve();
+
+    // #then the start answers and the run reads as the other instance left it
+    await expect(leg).resolves.toMatchObject({ runId: RUN_ID });
+    expect(await h.runtime.status(h.workflowId, RUN_ID)).toMatchObject({
+      status: 'failed',
+    });
   });
 });
 

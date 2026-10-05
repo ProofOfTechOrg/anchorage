@@ -843,6 +843,75 @@ describe('D1 execution domains', () => {
     });
   });
 
+  it('lets exactly one of two concurrent guarded updates claim a suspended run and stores no guard', async () => {
+    // #given a suspended run
+    const binding = sqliteUnitDatabase(openSqlite()) as never;
+    const storage = createD1Storage({
+      binding,
+      domains: createBackgroundTaskD1Domains({ binding }),
+    });
+    await storage.init();
+    const workflows = await storage.getStore('workflows');
+    const address = { workflowName: '__background-task', runId: 'task-1' };
+    await workflows?.persistWorkflowSnapshot({
+      ...address,
+      snapshot: {
+        ...createEmptyWorkflowSnapshot('task-1'),
+        status: 'suspended',
+      },
+    });
+
+    // #when two callers claim it concurrently, each guarded on `suspended`
+    const results = await Promise.all([
+      workflows?.updateWorkflowState({
+        ...address,
+        opts: { status: 'running', expectedStatus: 'suspended' },
+      }),
+      workflows?.updateWorkflowState({
+        ...address,
+        opts: { status: 'running', expectedStatus: 'suspended' },
+      }),
+    ]);
+
+    // #then one claim lands and the other writes nothing
+    expect(results.filter((result) => result !== undefined)).toHaveLength(1);
+    expect(results.filter((result) => result === undefined)).toHaveLength(1);
+    const stored = await workflows?.loadWorkflowSnapshot(address);
+    expect(stored?.status).toBe('running');
+    expect(stored).not.toHaveProperty('expectedStatus');
+  });
+
+  it('writes nothing and resolves undefined when the stored status does not match the guard', async () => {
+    // #given a run stored as `success`
+    const binding = sqliteUnitDatabase(openSqlite()) as never;
+    const storage = createD1Storage({
+      binding,
+      domains: createBackgroundTaskD1Domains({ binding }),
+    });
+    await storage.init();
+    const workflows = await storage.getStore('workflows');
+    const address = { workflowName: '__background-task', runId: 'task-1' };
+    await workflows?.persistWorkflowSnapshot({
+      ...address,
+      snapshot: { ...createEmptyWorkflowSnapshot('task-1'), status: 'success' },
+    });
+    const before = await workflows?.getWorkflowRunById(address);
+
+    // #when a caller guards on `suspended`
+    const result = await workflows?.updateWorkflowState({
+      ...address,
+      opts: { status: 'running', expectedStatus: 'suspended' },
+    });
+
+    // #then it resolves undefined and the stored row, `updatedAt` included, is
+    // unchanged
+    expect(result).toBeUndefined();
+    expect(await workflows?.loadWorkflowSnapshot(address)).toMatchObject({
+      status: 'success',
+    });
+    expect(await workflows?.getWorkflowRunById(address)).toEqual(before);
+  });
+
   it('paginates deployment tasks and cascades internal snapshot deletion', async () => {
     const binding = sqliteUnitDatabase(openSqlite()) as never;
     const storage = createD1Storage({

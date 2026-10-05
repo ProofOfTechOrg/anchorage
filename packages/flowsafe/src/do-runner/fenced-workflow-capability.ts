@@ -92,21 +92,49 @@ export interface FencedWorkflowAdmissionCapability {
     request: InitialTerminalizationRequest,
   ): Promise<InitialTerminalizationResult>;
   /**
-   * Mark an executing leg's run row live by its `updatedAt` alone. Without it
-   * a run whose leg stops is never settled automatically.
+   * Mark an executing leg's run row live by its `updatedAt` alone, and report
+   * what the row holds: `live`, `settled` (another writer settled the run; the
+   * row is left as it is), or `absent`. The runtime aborts the leg on
+   * `settled`, so report it only when the same storage refuses that leg's later
+   * writes over the row, as the settled-row guard does; a capability without
+   * such a guard resolves nothing, which is no evidence and aborts nothing.
+   * Without `touchRun` a run whose leg stops is never settled automatically.
    */
   touchRun?(
     address: { workflowId: string; runId: string },
     nowMs: number,
-  ): Promise<void>;
+  ): Promise<
+    // biome-ignore lint/suspicious/noConfusingVoidType: an implementation resolving nothing stays assignable
+    'live' | 'settled' | 'absent' | void
+  >;
   /**
    * Replace the snapshot and `updatedAt` of the exact row `expected` names, or
    * report `false` when any of its columns changed since. It writes the bytes
-   * it is given, outside the settled-row guard. Settlement needs it beside
+   * it is given, outside the settled-row guard, and rejects, writing nothing,
+   * a `snapshot` that is not a JSON object or an `updatedAt` that is not in
+   * `Date.prototype.toISOString()` form. Settlement needs it beside
    * `touchRun`: without it a run whose leg stops is never settled.
    */
   replaceSnapshot?(
     expected: RawWorkflowSnapshot,
     replacement: { snapshot: string; updatedAt: string },
+  ): Promise<boolean>;
+  /**
+   * Write the run's lifecycle, `timestamp` and `updatedAt` and no other part of
+   * its snapshot, but only while the stored status is `expected.status`, the
+   * stored lifecycle's revision is `expected.lifecycleRevision` (or it has no
+   * lifecycle, when that is omitted) and the row is not settled; otherwise
+   * resolve `false`, writing nothing. A write that leaves the status and
+   * lifecycle alone, such as a leg's step progress, does not make it miss. It
+   * rejects, writing nothing, a malformed address, expectation or patch.
+   */
+  patchRunLifecycle?(
+    address: { workflowId: string; runId: string },
+    expected: { status: string; lifecycleRevision?: number },
+    patch: {
+      lifecycle: object;
+      timestamp: number;
+      updatedAt: string;
+    },
   ): Promise<boolean>;
 }

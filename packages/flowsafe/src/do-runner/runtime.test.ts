@@ -8,7 +8,15 @@ import {
   createConnector,
   invokeConnector,
 } from '@proofoftech/breakwater/connector-sdk';
-import { assert, describe, expect, expectTypeOf, it, vi } from 'vitest';
+import {
+  assert,
+  describe,
+  expect,
+  expectTypeOf,
+  it,
+  onTestFinished,
+  vi,
+} from 'vitest';
 import { z } from 'zod';
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import {
@@ -55,7 +63,9 @@ import {
   type RunnerRuntime,
   RunStateUnreadableError,
   type RunSummary,
+  RunTerminalConflictError,
   type StartRunOptions,
+  UnknownRunError,
   UnknownWorkflowError,
 } from './runtime.js';
 import { StartIdempotencyStore } from './start-idempotency.js';
@@ -1247,6 +1257,7 @@ describe('root-local stored summaries', () => {
                 {
                   attemptToken: 'summary-attempt',
                   isOwnerQuiescent: () => true,
+                  startLeg: 'unwound',
                 },
               )
               .then((value) =>
@@ -1402,7 +1413,7 @@ describe('root-local stored summaries', () => {
         ),
       ).resolves.toEqual(completed);
       expect(windows).toEqual(
-        Array.from({ length: 5 }, () => [
+        Array.from({ length: 8 }, () => [
           ['summary-root-workflow', 'summary-run'],
         ]),
       );
@@ -1645,7 +1656,11 @@ describe('summary compatibility', () => {
             runId: 'absent',
             startToken: 'absent',
           },
-          { attemptToken: 'summary-attempt', isOwnerQuiescent: () => true },
+          {
+            attemptToken: 'summary-attempt',
+            isOwnerQuiescent: () => true,
+            startLeg: 'unwound',
+          },
         ),
       ).resolves.toBeNull();
       await f.runtime.start('summary-root-workflow', rootSummaryStartOptions);
@@ -1658,7 +1673,11 @@ describe('summary compatibility', () => {
             runId: 'summary-run',
             startToken: 'wrong',
           },
-          { attemptToken: 'summary-attempt', isOwnerQuiescent: () => true },
+          {
+            attemptToken: 'summary-attempt',
+            isOwnerQuiescent: () => true,
+            startLeg: 'unwound',
+          },
         ),
       ).rejects.toThrow('run start recovery is unresolved');
       expect(f.row()).toEqual(before);
@@ -1717,7 +1736,11 @@ describe('summary compatibility', () => {
             runId: started.runId,
             startToken: 'valid',
           },
-          { attemptToken: 'valid', isOwnerQuiescent: () => true },
+          {
+            attemptToken: 'valid',
+            isOwnerQuiescent: () => true,
+            startLeg: 'unwound',
+          },
         ),
       ).rejects.toBeInstanceOf(ExecutionFenceUnreadableError);
       expect(remove).not.toHaveBeenCalled();
@@ -2551,6 +2574,7 @@ describe('Runtime capture', () => {
     ],
     ['requester', { requestedByKind: undefined }, InvalidRunRequestError],
     ['deadline', { deadlineMs: -1 }, InvalidRunRequestError],
+    ['leg abort', { legAbort: {} }, InvalidRunRequestError],
     ['dispatch', { scheduleDispatch: [] }, Error],
     ['operations', { economicOperations: [null] }, Error],
   ] as const)('validates supplied fields before fence and storage (%s)', async (_label, changes, errorType) => {
@@ -3509,6 +3533,7 @@ describe('RunnerRuntime', () => {
         {
           attemptToken: 123 as unknown as string,
           isOwnerQuiescent: () => true,
+          startLeg: 'unwound',
         },
       ),
     ).rejects.toThrow('start recovery authority is malformed');
@@ -3681,6 +3706,27 @@ describe('RunnerRuntime', () => {
       resumeData: { approvedBy: 'carol' },
     });
     expect(resumed.status).toBe('success');
+  });
+
+  it('refuses a resume whose legAbort is not an AbortController and keeps the run resumable', async () => {
+    // #given
+    const { runtime } = buildRuntime(new InMemoryStore());
+    const started = await runtime.start('demo-approval', {
+      runId: crypto.randomUUID(),
+      inputData: { topic: 'leg-abort' },
+    });
+
+    // #when / #then
+    await expect(
+      runtime.resume('demo-approval', started.runId, {
+        step: 'approval',
+        resumeData: { approvedBy: 'carol' },
+        legAbort: {} as AbortController,
+      }),
+    ).rejects.toBeInstanceOf(InvalidRunRequestError);
+    expect(await runtime.status('demo-approval', started.runId)).toMatchObject({
+      status: 'suspended',
+    });
   });
 
   it('classifies a resume targeting a non-suspended step as InvalidRunRequestError', async () => {
@@ -4154,6 +4200,7 @@ describe('RunnerRuntime ownership changes during operations', () => {
       const pending = f.runtime.recoverStartAttempt(state.execution, {
         attemptToken: 'H',
         isOwnerQuiescent: () => true,
+        startLeg: 'unwound',
       });
       const foreign = repoint(f.workflow);
       const result = await pending.catch((error: unknown) => error);
@@ -8001,6 +8048,7 @@ describe('Runtime activation', () => {
         .recoverStartAttempt(state.execution, {
           attemptToken: 'H',
           isOwnerQuiescent: async () => quiescent as boolean,
+          startLeg: 'unwound',
         })
         .catch((error) => error);
       expect(await f.row()).toEqual(before);
@@ -8030,6 +8078,7 @@ describe('Runtime activation', () => {
         f.runtime.recoverStartAttempt(initial.execution, {
           attemptToken: 'H',
           isOwnerQuiescent: async () => true,
+          startLeg: 'unwound',
         }),
       ).resolves.toMatchObject({
         kind: 'ordinary',
@@ -8218,6 +8267,7 @@ describe('Runtime activation', () => {
     try {
       const { execution, claim } = await preparedPendingFixture(f);
       assert(f.capability);
+      Reflect.deleteProperty(f.capability, 'touchRun');
       const original = f.capability.terminalizeInitialAdmission;
       const read = vi.spyOn(f.capability, 'readSnapshot');
       f.capability.terminalizeInitialAdmission = async (input) => {
@@ -8239,6 +8289,7 @@ describe('Runtime activation', () => {
           attemptToken: 'H',
           isOwnerQuiescent: async () => true,
           startReservation: claim,
+          startLeg: 'touched',
         })
         .catch((error) => error);
       expect(
@@ -8259,7 +8310,6 @@ describe('Runtime activation', () => {
   });
 
   it.each([
-    { evidence: 'none', startLeg: undefined, stamped: false },
     { evidence: 'unwound', startLeg: 'unwound', stamped: true },
     { evidence: 'touched', startLeg: 'touched', stamped: true },
     {
@@ -8288,7 +8338,7 @@ describe('Runtime activation', () => {
           attemptToken: 'H',
           isOwnerQuiescent: async () => true,
           startReservation: claim,
-          ...(startLeg === undefined ? {} : { startLeg }),
+          startLeg,
         })
         .finally(() => now.mockRestore());
       expect(recovered).toMatchObject({
@@ -8314,19 +8364,22 @@ describe('Runtime activation', () => {
   });
 
   it('stamps a repaired start without changing its summary', async () => {
-    // #given the same stopped start repaired without and with the stamp
+    // #given the same stopped start repaired on storage without the touch,
+    // which does not stamp, and with the stamp
     const summaries: Record<string, unknown>[] = [];
-    for (const startLeg of [undefined, 'unwound'] as const) {
+    for (const stamped of [false, true]) {
       const f = await runtimeActivationFixture();
       try {
         const { execution, claim } = await preparedPendingFixture(f);
+        assert(f.capability);
+        if (!stamped) Reflect.deleteProperty(f.capability, 'touchRun');
 
         // #when
         const recovered = await f.runtime.recoverStartAttempt(execution, {
           attemptToken: 'H',
           isOwnerQuiescent: async () => true,
           startReservation: claim,
-          ...(startLeg === undefined ? {} : { startLeg }),
+          startLeg: stamped ? 'unwound' : 'touched',
         });
 
         assert(recovered?.kind === 'ordinary');
@@ -8383,6 +8436,7 @@ describe('Runtime activation', () => {
         .recoverStartAttempt(execution, {
           attemptToken: 'H',
           startReservation: claim,
+          startLeg: 'unwound',
           isOwnerQuiescent: async () => {
             Object.defineProperty(f.workflows, FENCED_WORKFLOW_STORAGE, {
               value: other.capability,
@@ -8438,6 +8492,7 @@ describe('Runtime activation', () => {
           attemptToken: 'H',
           startReservation: claim,
           isOwnerQuiescent: () => true,
+          startLeg: 'unwound',
         })
         .catch((error) => error);
       expect(await f.row()).toEqual(before);
@@ -8467,6 +8522,7 @@ describe('Runtime activation', () => {
           attemptToken: 'H',
           startReservation: claim,
           isOwnerQuiescent: () => true,
+          startLeg: 'unwound',
         })
         .catch((error) => error);
       expect((await f.row())?.status).toBe('failed');
@@ -8480,6 +8536,7 @@ describe('Runtime activation', () => {
           attemptToken: 'H',
           startReservation: claim,
           isOwnerQuiescent: () => true,
+          startLeg: 'unwound',
         }),
       ).resolves.toMatchObject({
         kind: 'ordinary',
@@ -8522,6 +8579,7 @@ describe('Runtime activation', () => {
           attemptToken: 'H',
           startReservation: original,
           isOwnerQuiescent: () => true,
+          startLeg: 'unwound',
         })
         .catch((error) => error);
       expect(await f.row()).toEqual(before);
@@ -8658,6 +8716,7 @@ describe('Runtime activation', () => {
         attemptToken: 'H',
         startReservation: claim,
         isOwnerQuiescent: () => true,
+        startLeg: 'unwound',
       });
       expect((await f.row())?.status).toBe(status);
       expect((await f.reservations.readForAdmission(claim.key))?.state).toBe(
@@ -8684,6 +8743,7 @@ describe('Runtime activation', () => {
           attemptToken: 'H',
           startReservation: claim,
           isOwnerQuiescent: () => true,
+          startLeg: 'unwound',
         }),
       ).resolves.toMatchObject({
         kind: 'lifecycle',
@@ -9380,6 +9440,7 @@ describe('Runtime activation', () => {
           attemptToken: 'H',
           isOwnerQuiescent: () => true,
           expectedTarget: expectedAgentTarget(),
+          startLeg: 'unwound',
         })
         .catch((error) => error);
       expect(
@@ -9432,6 +9493,7 @@ describe('Runtime activation', () => {
           attemptToken: 'H',
           isOwnerQuiescent: () => true,
           expectedTarget: { kind: 'workflow' },
+          startLeg: 'unwound',
         })
         .catch((error) => error);
       expect(await f.row()).toEqual(before);
@@ -9472,6 +9534,7 @@ describe('Runtime activation', () => {
         .recoverStartAttempt(execution, {
           attemptToken: 'H',
           expectedTarget,
+          startLeg: 'unwound',
           isOwnerQuiescent: async () => {
             if (phase === 'quiescence') {
               entered.resolve();
@@ -9561,6 +9624,7 @@ describe('Runtime activation', () => {
           attemptToken: 'H',
           isOwnerQuiescent: () => true,
           expectedTarget: expectedAgentTarget(),
+          startLeg: 'unwound',
         })
         .catch((error) => error);
       expect((await f.row())?.status).toBe('failed');
@@ -9612,6 +9676,7 @@ describe('Runtime activation', () => {
         attemptToken: 'H',
         isOwnerQuiescent: () => true,
         expectedTarget: expectedAgentTarget(),
+        startLeg: 'unwound',
       });
       expect(
         (await f.row())?.requestContext?.['flowsafe.runProvenance']
@@ -9641,6 +9706,7 @@ describe('Runtime activation', () => {
           attemptToken: 'H',
           isOwnerQuiescent: () => true,
           expectedTarget: { kind: 'workflow' },
+          startLeg: 'unwound',
         }),
       ).resolves.toMatchObject({
         kind: 'ordinary',
@@ -9682,7 +9748,11 @@ describe('Runtime activation', () => {
             runId: 'd1-run',
             startToken: 'S1',
           },
-          { attemptToken: 'initial-H', isOwnerQuiescent: () => true },
+          {
+            attemptToken: 'initial-H',
+            isOwnerQuiescent: () => true,
+            startLeg: 'unwound',
+          },
         ),
       ).resolves.toMatchObject({
         kind: 'ordinary',
@@ -9724,6 +9794,7 @@ describe('Runtime activation', () => {
             attemptToken: 'H',
             isOwnerQuiescent: quiescent,
             expectedTarget: expectedTarget as never,
+            startLeg: 'unwound',
           },
         )
         .catch((error) => error);
@@ -9779,6 +9850,7 @@ describe('Runtime activation', () => {
           attemptToken: 'H',
           isOwnerQuiescent: () => true,
           expectedTarget: { kind: 'workflow' },
+          startLeg: 'unwound',
         })
         .catch((error) => error);
       expect((await f.row())?.status).toBe('failed');
@@ -9819,6 +9891,7 @@ describe('Runtime activation', () => {
             attemptToken: 'H',
             isOwnerQuiescent: quiescent,
             expectedTarget: { ...expectedAgentTarget(), ...invalid } as never,
+            startLeg: 'unwound',
           },
         )
         .catch((error) => error);
@@ -9846,6 +9919,7 @@ describe('Runtime activation', () => {
         .recoverStartAttempt(execution, {
           attemptToken: 'H',
           expectedTarget,
+          startLeg: 'unwound',
           isOwnerQuiescent: async () => {
             entered.resolve();
             await release.promise;
@@ -10294,7 +10368,11 @@ describe('legacy Runtime observations', () => {
             runId: 'd1-run',
             startToken: 'legacy-H',
           },
-          { attemptToken: 'legacy-H', isOwnerQuiescent: () => true },
+          {
+            attemptToken: 'legacy-H',
+            isOwnerQuiescent: () => true,
+            startLeg: 'unwound',
+          },
         )
         .catch((error) => error);
       const proof = await f.runtime
@@ -10367,6 +10445,7 @@ describe('legacy Runtime observations', () => {
           attemptToken: 'H',
           isOwnerQuiescent: () => true,
           startReservation: claim,
+          startLeg: 'unwound',
         })
         .catch((error) => error);
       expect((await f.row())?.status).toBe('failed');
@@ -10384,82 +10463,84 @@ describe('legacy Runtime observations', () => {
   });
 });
 
-describe('RunnerRuntime.settleInterruptedRun', () => {
-  function holdingApp(
-    hold: Promise<void>,
-    entered: () => void,
-    storage: MastraCompositeStore = new InMemoryStore(),
-  ) {
-    const app = init(
-      { storage },
-      { executionFence: 'none', startIdempotency: 'none' },
-    );
-    const schema = z.object({});
-    const workflow = app
-      .createWorkflow({
-        id: 'interrupt-workflow',
+function holdingApp(
+  hold: Promise<void>,
+  entered: () => void,
+  storage: MastraCompositeStore = new InMemoryStore(),
+) {
+  const app = init(
+    { storage },
+    { executionFence: 'none', startIdempotency: 'none' },
+  );
+  const schema = z.object({});
+  const workflow = app
+    .createWorkflow({
+      id: 'interrupt-workflow',
+      inputSchema: schema,
+      outputSchema: schema,
+    })
+    .then(
+      app.createStep({
+        id: 'hold',
         inputSchema: schema,
         outputSchema: schema,
-      })
-      .then(
-        app.createStep({
-          id: 'hold',
-          inputSchema: schema,
-          outputSchema: schema,
-          execute: async () => {
-            entered();
-            await hold;
-            throw Object.assign(new Error('step gave up'), {
-              name: 'RunInterruptedError',
-            });
-          },
-        }),
-      )
-      .commit();
-    return { app, workflow };
-  }
+        execute: async () => {
+          entered();
+          await hold;
+          throw Object.assign(new Error('step gave up'), {
+            name: 'RunInterruptedError',
+          });
+        },
+      }),
+    )
+    .commit();
+  return { app, workflow };
+}
 
-  /**
-   * A run another runtime left mid-step, rewritten to `status`, and a fresh
-   * runtime over the same storage that drives nothing. `startedAt` is the
-   * clock reading before the row's last write.
-   */
-  async function strandedRun(
-    status: 'running' | 'waiting' | 'paused' = 'running',
-    storage: MastraCompositeStore = createD1Storage({
-      binding: sqliteUnitDatabase(openSqlite()) as D1DatabaseBinding,
-    }),
-  ) {
-    await storage.init();
-    const startedAt = Date.now();
-    const entered = deferredSignal();
-    const stranded = holdingApp(
-      new Promise<void>(() => undefined),
-      entered.resolve,
-      storage,
-    );
-    void stranded.app.runtime.start(stranded.workflow.id, {
-      runId: 'stranded-run',
-      inputData: {},
-    });
-    await entered.promise;
-    const workflows = await storage.getStore('workflows');
-    const snapshot = await workflows?.loadWorkflowSnapshot({
-      workflowName: stranded.workflow.id,
-      runId: 'stranded-run',
-    });
-    assert(workflows && snapshot);
-    await workflows.persistWorkflowSnapshot({
-      workflowName: stranded.workflow.id,
-      runId: 'stranded-run',
-      snapshot: { ...snapshot, status },
-    });
-    return {
-      startedAt,
-      ...holdingApp(Promise.resolve(), () => undefined, storage),
-    };
-  }
+/**
+ * A run another runtime left mid-step, rewritten to `status`, and a fresh
+ * runtime over the same storage that drives nothing. `startedAt` is the
+ * clock reading before the row's last write.
+ */
+async function strandedRun(
+  status: 'running' | 'waiting' | 'paused' = 'running',
+  storage: MastraCompositeStore = createD1Storage({
+    binding: sqliteUnitDatabase(openSqlite()) as D1DatabaseBinding,
+  }),
+  start: { deadlineMs?: number } = {},
+) {
+  await storage.init();
+  const startedAt = Date.now();
+  const entered = deferredSignal();
+  const stranded = holdingApp(
+    new Promise<void>(() => undefined),
+    entered.resolve,
+    storage,
+  );
+  void stranded.app.runtime.start(stranded.workflow.id, {
+    runId: 'stranded-run',
+    inputData: {},
+    ...start,
+  });
+  await entered.promise;
+  const workflows = await storage.getStore('workflows');
+  const snapshot = await workflows?.loadWorkflowSnapshot({
+    workflowName: stranded.workflow.id,
+    runId: 'stranded-run',
+  });
+  assert(workflows && snapshot);
+  await workflows.persistWorkflowSnapshot({
+    workflowName: stranded.workflow.id,
+    runId: 'stranded-run',
+    snapshot: { ...snapshot, status },
+  });
+  return {
+    startedAt,
+    ...holdingApp(Promise.resolve(), () => undefined, storage),
+  };
+}
 
+describe('RunnerRuntime.settleInterruptedRun', () => {
   it.each([
     'running',
     'waiting',
@@ -10718,5 +10799,804 @@ describe('RunnerRuntime.settleInterruptedRun', () => {
     const summary = await app.runtime.status(workflow.id, 'borrowed-name');
     expect(summary?.status).toBe('failed');
     expect(summary?.errorEnvelope).toBeUndefined();
+  });
+});
+
+describe('RunnerRuntime lifecycle transitions on D1 storage', () => {
+  const owner = { kind: 'human', id: 'owner' } as const;
+  const lifecycleKey = 'flowsafe.runLifecycle';
+
+  /**
+   * After each of the next `times` reads of the run row, by either read path
+   * a lifecycle transition may take, rewrites the row from `edit` before the
+   * reader continues. `edit` is given the current snapshot, read through the
+   * unwrapped original, and a distinct `attempt` to make each rewrite's bytes
+   * differ.
+   */
+  function landAfterReads(
+    workflows: FencedWorkflowsStorageD1,
+    edit: (current: WorkflowRunState, attempt: number) => WorkflowRunState,
+    times = 1,
+  ): void {
+    const load = workflows.loadWorkflowSnapshot.bind(workflows);
+    const native = workflows[FENCED_WORKFLOW_STORAGE];
+    assert(native);
+    let landed = 0;
+    const land = async (workflowName: string, runId: string) => {
+      if (landed >= times) return;
+      landed += 1;
+      const current = await load({ workflowName, runId });
+      assert(current);
+      await workflows.persistWorkflowSnapshot({
+        workflowName,
+        runId,
+        snapshot: edit(current, landed),
+      });
+    };
+    workflows.loadWorkflowSnapshot = async (args) => {
+      const state = await load(args);
+      await land(args.workflowName, args.runId);
+      return state;
+    };
+    Object.defineProperty(workflows, FENCED_WORKFLOW_STORAGE, {
+      value: {
+        ...native,
+        readSnapshot: async (read: { workflowId: string; runId: string }) => {
+          const row = await native.readSnapshot(read);
+          await land(read.workflowId, read.runId);
+          return row;
+        },
+      },
+      configurable: true,
+    });
+  }
+
+  async function racingRun(start: { deadlineMs?: number } = {}) {
+    const sql = openSqlite();
+    const storage = createD1Storage({
+      binding: sqliteUnitDatabase(sql) as D1DatabaseBinding,
+    });
+    const run = await strandedRun('running', storage, start);
+    const workflows = (await storage.getStore(
+      'workflows',
+    )) as FencedWorkflowsStorageD1;
+    const load = workflows.loadWorkflowSnapshot.bind(workflows);
+    const stored = async () => {
+      const state = await load({
+        workflowName: run.workflow.id,
+        runId: 'stranded-run',
+      });
+      assert(state);
+      return state;
+    };
+    const storedCas = async () => {
+      const lifecycle = (await stored()).requestContext?.[lifecycleKey];
+      return {
+        expectedRevision: lifecycle.revision,
+        expectedDeadlineAt: lifecycle.deadlineAt,
+      };
+    };
+    return { ...run, sql, workflows, stored, storedCas };
+  }
+
+  const finishes = (current: WorkflowRunState): WorkflowRunState => ({
+    ...current,
+    status: 'success',
+    result: { done: true },
+  });
+
+  const keepsRunning = (
+    current: WorkflowRunState,
+    attempt: number,
+  ): WorkflowRunState => ({
+    ...current,
+    timestamp: current.timestamp + attempt,
+  });
+
+  const waits = (current: WorkflowRunState): WorkflowRunState => ({
+    ...current,
+    status: 'waiting',
+  });
+
+  it.each([
+    'terminate',
+    'run-deadline timeout',
+  ] as const)('keeps a result a leg wrote between the %s read and its write', async (route) => {
+    // #given a stranded run whose leg writes its result just after the
+    // transition reads the row
+    const { app, workflow, workflows, stored, storedCas } = await racingRun(
+      route === 'terminate' ? {} : { deadlineMs: 1 },
+    );
+    const cas = route === 'terminate' ? undefined : await storedCas();
+    landAfterReads(workflows, finishes);
+
+    // #when the transition is requested
+    const transition = cas
+      ? app.runtime.timeOut(
+          workflow.id,
+          'stranded-run',
+          cas,
+          Date.now() + 1_000,
+        )
+      : app.runtime.terminate(workflow.id, 'stranded-run');
+
+    // #then it answers the conflict and the result stands
+    await expect(transition).rejects.toBeInstanceOf(RunTerminalConflictError);
+    expect(await stored()).toMatchObject({
+      status: 'success',
+      result: { done: true },
+    });
+  });
+
+  it.each([
+    { label: 'terminate', route: 'terminate', patch: true },
+    { label: 'run-deadline timeout', route: 'timeout', patch: true },
+    {
+      label: 'terminate on storage that only replaces whole rows',
+      route: 'terminate',
+      patch: false,
+    },
+  ] as const)('keeps a result a leg wrote between the cancellation-intent read and its write ($label)', async ({
+    route,
+    patch,
+  }) => {
+    // #given a stranded run whose leg writes its result just after the intent
+    // pass reads the row
+    const { app, workflow, workflows, stored, storedCas } = await racingRun(
+      route === 'terminate' ? {} : { deadlineMs: 1 },
+    );
+    const cas = route === 'terminate' ? undefined : await storedCas();
+    const native = workflows[FENCED_WORKFLOW_STORAGE];
+    assert(native);
+    if (!patch)
+      Object.defineProperty(workflows, FENCED_WORKFLOW_STORAGE, {
+        value: { ...native, patchRunLifecycle: undefined },
+        configurable: true,
+      });
+    landAfterReads(workflows, finishes);
+
+    // #when the intent is requested
+    const cancelling = cas
+      ? app.runtime.cancelActiveExecution(
+          workflow.id,
+          'stranded-run',
+          'timed_out',
+          [owner],
+          cas,
+          Date.now() + 1_000,
+        )
+      : app.runtime.cancelActiveExecution(
+          workflow.id,
+          'stranded-run',
+          'cancelled',
+          [owner],
+        );
+
+    // #then it answers the conflict, and the result stands without an intent
+    await expect(cancelling).rejects.toBeInstanceOf(RunTerminalConflictError);
+    const row = await stored();
+    expect(row).toMatchObject({ status: 'success', result: { done: true } });
+    expect(
+      row.requestContext?.[lifecycleKey]?.transitionIntent,
+    ).toBeUndefined();
+  });
+
+  it('lands the cancellation intent while the leg keeps rewriting the row', async () => {
+    // #given a stranded run whose leg rewrites the row, still running, after
+    // each of up to five reads: enough to make a whole-row compare-and-set
+    // miss on every attempt, which the intent patch does not
+    const { app, workflow, workflows, stored } = await racingRun();
+    landAfterReads(workflows, keepsRunning, 5);
+
+    // #when the intent is requested
+    const cancelled = await app.runtime.cancelActiveExecution(
+      workflow.id,
+      'stranded-run',
+      'cancelled',
+      [owner],
+    );
+
+    // #then no leg here is cancelled, and the intent is stored on the running row
+    expect(cancelled).toBe(false);
+    const row = await stored();
+    expect(row.status).toBe('running');
+    expect(row.requestContext?.[lifecycleKey]).toMatchObject({
+      transitionIntent: { status: 'cancelled' },
+    });
+  });
+
+  it('records the run-deadline timeout after its intent decides again from a changed row', async () => {
+    // #given a stranded run whose status changes, still terminable, just after
+    // the deadline route's intent pass reads it
+    const { app, workflow, workflows, stored, storedCas } = await racingRun({
+      deadlineMs: 1,
+    });
+    const cas = await storedCas();
+    landAfterReads(workflows, waits);
+    const now = Date.now() + 1_000;
+
+    // #when the intent is requested and then the timeout
+    await app.runtime.cancelActiveExecution(
+      workflow.id,
+      'stranded-run',
+      'timed_out',
+      [owner],
+      cas,
+      now,
+    );
+    const intent = (await stored()).requestContext?.[lifecycleKey]
+      ?.transitionIntent;
+    const timedOut = await app.runtime.timeOut(
+      workflow.id,
+      'stranded-run',
+      cas,
+      now,
+    );
+
+    // #then the intent landed on the changed row and the timeout is recorded
+    expect(intent).toMatchObject({ status: 'timed_out', ...cas });
+    expect(timedOut).toMatchObject({
+      transitioned: true,
+      casMatched: true,
+      summary: { status: 'timed_out' },
+    });
+  });
+
+  it.each([
+    1, 4,
+  ])('lands the terminal write after %i leg writes that keep the run running', async (writes) => {
+    // #given a stranded run whose leg rewrites the row, still running, after
+    // each of the first reads
+    const { app, workflow, workflows, stored } = await racingRun();
+    landAfterReads(workflows, keepsRunning, writes);
+
+    // #when
+    const terminated = await app.runtime.terminate(workflow.id, 'stranded-run');
+
+    // #then the transition decides again from the rewritten row and lands
+    expect(terminated).toMatchObject({
+      transitioned: true,
+      summary: { status: 'cancelled' },
+    });
+    expect((await stored()).status).toBe('cancelled');
+  });
+
+  it('answers that the run state is not readable while its row changes on every attempt', async () => {
+    // #given a stranded run whose row is rewritten after each of up to five
+    // reads, one per attempt
+    const { app, workflow, workflows, stored } = await racingRun();
+    landAfterReads(workflows, keepsRunning, 5);
+
+    // #when
+    const terminating = app.runtime.terminate(workflow.id, 'stranded-run');
+
+    // #then
+    await expect(terminating).rejects.toBeInstanceOf(RunStateUnreadableError);
+    expect((await stored()).status).toBe('running');
+  });
+
+  it('records the cancellation of a run whose snapshot nests past the depth SQLite reads', async () => {
+    // #given a stranded run whose stored snapshot SQLite cannot parse as JSON
+    const { app, workflow, sql } = await racingRun();
+    const { snapshot } = sql
+      .prepare('SELECT snapshot FROM mastra_workflow_snapshot')
+      .get() as { snapshot: string };
+    let result: unknown = 'leaf';
+    for (let level = 0; level < 1_100; level++) result = [result];
+    sql
+      .prepare('UPDATE mastra_workflow_snapshot SET snapshot = ?')
+      .run(JSON.stringify({ ...JSON.parse(snapshot), result }));
+
+    // #when the terminate route's intent pass runs, then its terminal pass
+    const cancelled = await app.runtime.cancelActiveExecution(
+      workflow.id,
+      'stranded-run',
+      'cancelled',
+      [owner],
+    );
+    const intent = JSON.parse(
+      (
+        sql.prepare('SELECT snapshot FROM mastra_workflow_snapshot').get() as {
+          snapshot: string;
+        }
+      ).snapshot,
+    ).requestContext?.[lifecycleKey]?.transitionIntent;
+    const terminated = await app.runtime.terminate(workflow.id, 'stranded-run');
+
+    // #then the intent was stored and the run is recorded cancelled
+    expect(cancelled).toBe(false);
+    expect(intent).toMatchObject({ status: 'cancelled' });
+    expect(terminated).toMatchObject({
+      transitioned: true,
+      summary: { status: 'cancelled' },
+    });
+  });
+
+  it('answers that the run is unknown when its row is absent', async () => {
+    // #given D1 storage that holds no run
+    const storage = createD1Storage({
+      binding: sqliteUnitDatabase(openSqlite()) as D1DatabaseBinding,
+    });
+    await storage.init();
+    const { app, workflow } = holdingApp(
+      Promise.resolve(),
+      () => undefined,
+      storage,
+    );
+
+    // #when / #then
+    await expect(
+      app.runtime.terminate(workflow.id, 'no-such-run'),
+    ).rejects.toBeInstanceOf(UnknownRunError);
+  });
+
+  it.each([
+    { label: 'is not a JSON object', rewrite: () => '[]' },
+    {
+      label: 'belongs to another run',
+      rewrite: (snapshot: string) =>
+        JSON.stringify({ ...JSON.parse(snapshot), runId: 'other-run' }),
+    },
+  ])('refuses to decide from a row whose snapshot $label', async ({
+    rewrite,
+  }) => {
+    // #given a stranded run whose stored snapshot is rewritten
+    const { app, workflow, sql } = await racingRun();
+    const { snapshot } = sql
+      .prepare('SELECT snapshot FROM mastra_workflow_snapshot')
+      .get() as { snapshot: string };
+    const rewritten = rewrite(snapshot);
+    sql
+      .prepare('UPDATE mastra_workflow_snapshot SET snapshot = ?')
+      .run(rewritten);
+
+    // #when
+    const terminating = app.runtime.terminate(workflow.id, 'stranded-run');
+
+    // #then it answers that the state is not readable and writes nothing
+    await expect(terminating).rejects.toBeInstanceOf(RunStateUnreadableError);
+    expect(
+      sql.prepare('SELECT snapshot FROM mastra_workflow_snapshot').get(),
+    ).toEqual({ snapshot: rewritten });
+  });
+
+  it('lands the cancellation intent of a leg in this runtime that keeps writing, then stops the leg', async () => {
+    // #given a leg looping through fast steps that each write the row. The unit
+    // loop never lands a write inside the intent pass's read-to-write window on
+    // its own, so the wrapper stands in for the leg's interleaving write: it
+    // rewrites the row after each read while the leg is active.
+    const storage = createD1Storage({
+      binding: sqliteUnitDatabase(openSqlite()) as D1DatabaseBinding,
+    });
+    await storage.init();
+    const app = init(
+      { storage },
+      { executionFence: 'none', startIdempotency: 'none' },
+    );
+    const schema = z.object({});
+    let ticks = 0;
+    const looping = deferredSignal();
+    const workflow = app
+      .createWorkflow({
+        id: 'looping-workflow',
+        inputSchema: schema,
+        outputSchema: schema,
+      })
+      .dowhile(
+        app.createStep({
+          id: 'tick',
+          inputSchema: schema,
+          outputSchema: schema,
+          execute: async () => {
+            ticks += 1;
+            if (ticks === 10) looping.resolve();
+            return {};
+          },
+        }),
+        async () => ticks < 5_000,
+      )
+      .commit();
+    const workflows = (await storage.getStore(
+      'workflows',
+    )) as FencedWorkflowsStorageD1;
+    const native = workflows[FENCED_WORKFLOW_STORAGE];
+    assert(native);
+    const load = workflows.loadWorkflowSnapshot.bind(workflows);
+    Object.defineProperty(workflows, FENCED_WORKFLOW_STORAGE, {
+      value: {
+        ...native,
+        readSnapshot: async (read: { workflowId: string; runId: string }) => {
+          const row = await native.readSnapshot(read);
+          if (
+            ticks >= 10 &&
+            app.runtime.isRunActive(read.workflowId, read.runId)
+          ) {
+            const current = await load({
+              workflowName: read.workflowId,
+              runId: read.runId,
+            });
+            assert(current);
+            await workflows.persistWorkflowSnapshot({
+              workflowName: read.workflowId,
+              runId: read.runId,
+              snapshot: keepsRunning(current, 1),
+            });
+          }
+          return row;
+        },
+      },
+      configurable: true,
+    });
+    const leg = app.runtime.start(workflow.id, {
+      runId: 'looping-run',
+      inputData: {},
+    });
+    await looping.promise;
+
+    // #when it is terminated while it loops, as the terminate route does
+    const cancelled = await app.runtime.cancelActiveExecution(
+      workflow.id,
+      'looping-run',
+      'cancelled',
+      [owner],
+    );
+    const left = await leg;
+    const intent = (
+      await load({ workflowName: workflow.id, runId: 'looping-run' })
+    )?.requestContext?.[lifecycleKey]?.transitionIntent;
+    const terminated = await app.runtime.terminate(workflow.id, 'looping-run');
+
+    // #then the intent was stored, the leg stopped short of its loop, and the
+    // run reads cancelled
+    expect(cancelled).toBe(true);
+    expect(intent).toMatchObject({ status: 'cancelled' });
+    expect(left.status).toBe('canceled');
+    expect(ticks).toBeLessThan(5_000);
+    expect(terminated).toMatchObject({
+      transitioned: true,
+      summary: { status: 'cancelled' },
+    });
+  });
+});
+
+describe('RunnerRuntime leg liveness touch', () => {
+  const WORKFLOW_ID = 'abortable-workflow';
+  const RUN_ID = 'touched-run';
+
+  async function d1Storage() {
+    const sql = openSqlite();
+    const storage = createD1Storage({
+      binding: sqliteUnitDatabase(sql) as D1DatabaseBinding,
+    });
+    await storage.init();
+    return { sql, storage };
+  }
+
+  /**
+   * Two steps: `hold` records the `abortSignal` it receives, signals `entered`
+   * and waits for `release`; `after` counts its executions. `quietAfterHold`
+   * drops the engine's `running` writes once `hold` has begun, so nothing but
+   * an abort stands between the steps; `suspends` makes `hold` suspend until it
+   * is resumed.
+   */
+  function abortableApp(
+    storage: MastraCompositeStore,
+    options: { quietAfterHold?: boolean; suspends?: boolean } = {},
+  ) {
+    const app = init(
+      { storage },
+      { executionFence: 'none', startIdempotency: 'none' },
+    );
+    const schema = z.object({});
+    const entered = deferredSignal();
+    const release = deferredSignal();
+    const observed: { signal?: AbortSignal; afterRuns: number } = {
+      afterRuns: 0,
+    };
+    const workflow = app
+      .createWorkflow({
+        id: WORKFLOW_ID,
+        inputSchema: schema,
+        outputSchema: schema,
+        ...(options.quietAfterHold
+          ? {
+              options: {
+                shouldPersistSnapshot: ({ workflowStatus }) =>
+                  workflowStatus !== 'running' || observed.signal === undefined,
+              },
+            }
+          : {}),
+      })
+      .then(
+        app.createStep({
+          id: 'hold',
+          inputSchema: schema,
+          outputSchema: schema,
+          suspendSchema: schema,
+          resumeSchema: schema,
+          execute: async ({ abortSignal, resumeData, suspend }) => {
+            if (options.suspends && !resumeData) return suspend({});
+            observed.signal = abortSignal;
+            entered.resolve();
+            await release.promise;
+            return {};
+          },
+        }),
+      )
+      .then(
+        app.createStep({
+          id: 'after',
+          inputSchema: schema,
+          outputSchema: schema,
+          execute: async () => {
+            observed.afterRuns += 1;
+            return {};
+          },
+        }),
+      )
+      .commit();
+    return { app, workflow, entered, release, observed };
+  }
+
+  /** Starts a leg that stays in `hold` until the test ends or releases it. */
+  function startHeldLeg(
+    storage: MastraCompositeStore,
+    options: Parameters<typeof abortableApp>[1] = {},
+    legAbort?: AbortController,
+  ) {
+    const leg = abortableApp(storage, options);
+    const started = leg.app.runtime.start(WORKFLOW_ID, {
+      runId: RUN_ID,
+      inputData: {},
+      ...(legAbort ? { legAbort } : {}),
+    });
+    onTestFinished(async () => {
+      leg.release.resolve();
+      await started.catch(() => undefined);
+    });
+    return { ...leg, started };
+  }
+
+  const SETTLEMENTS = [
+    { settled: 'terminated', summary: { status: 'cancelled' } },
+    {
+      settled: 'interrupted',
+      summary: { status: 'failed', errorEnvelope: { code: 'INTERRUPTED' } },
+    },
+  ] as const;
+
+  /** A held leg, and its run row after another instance settled the run. */
+  async function holdLegSettledElsewhere(
+    settled: (typeof SETTLEMENTS)[number]['settled'],
+    options: Parameters<typeof abortableApp>[1] = {},
+  ) {
+    const { sql, storage } = await d1Storage();
+    const leg = startHeldLeg(storage, options);
+    await leg.entered.promise;
+    const other = abortableApp(storage);
+    if (settled === 'terminated')
+      await other.app.runtime.terminate(WORKFLOW_ID, RUN_ID);
+    else
+      await other.app.runtime.settleInterruptedRun(
+        WORKFLOW_ID,
+        RUN_ID,
+        Date.now() + 360_001,
+      );
+    const rows = () =>
+      sql.prepare('SELECT * FROM mastra_workflow_snapshot').all();
+    return { leg, rows, settledRows: rows() };
+  }
+
+  it.each(
+    SETTLEMENTS,
+  )('aborts a leg whose run another instance $settled at its next touch', async ({
+    settled,
+    summary,
+  }) => {
+    // #given a leg held in its first step, on a run another instance settled
+    const { leg, rows, settledRows } = await holdLegSettledElsewhere(settled);
+
+    // #when the leg's touch runs
+    await leg.app.runtime.touchRun(WORKFLOW_ID, RUN_ID);
+
+    // #then the step in flight sees its signal aborted, with the settlement as
+    // the cause
+    expect(leg.observed.signal?.aborted).toBe(true);
+    expect(leg.observed.signal?.reason).toMatchObject({
+      name: 'AbortError',
+      cause: expect.any(RunSettledConflictError),
+    });
+
+    // #when the step returns
+    leg.release.resolve();
+    const ended = await leg.started;
+
+    // #then the start answers the settled summary and the settlement stands
+    expect(ended).toMatchObject(summary);
+    expect(rows()).toEqual(settledRows);
+  });
+
+  it.each(
+    SETTLEMENTS,
+  )('starts no further step on a leg whose run another instance $settled when the engine writes nothing between steps', async ({
+    settled,
+  }) => {
+    // #given a leg held in its first step, on a workflow whose engine writes
+    // nothing once that step has begun, and a run another instance settled
+    const { leg } = await holdLegSettledElsewhere(settled, {
+      quietAfterHold: true,
+    });
+
+    // #when the leg's touch runs and the step returns
+    await leg.app.runtime.touchRun(WORKFLOW_ID, RUN_ID);
+    leg.release.resolve();
+    await leg.started;
+
+    // #then the second step never ran
+    expect(leg.observed.afterRuns).toBe(0);
+  });
+
+  it('logs the abort of a settled leg once however many touches follow', async () => {
+    // #given a held leg whose run another instance terminated
+    const logged = vi
+      .spyOn(console, 'error')
+      .mockImplementation(() => undefined);
+    onTestFinished(() => {
+      logged.mockRestore();
+    });
+    const { leg } = await holdLegSettledElsewhere('terminated');
+
+    // #when two touches run
+    await leg.app.runtime.touchRun(WORKFLOW_ID, RUN_ID);
+    await leg.app.runtime.touchRun(WORKFLOW_ID, RUN_ID);
+
+    // #then one structured line says so
+    expect(logged).toHaveBeenCalledExactlyOnceWith(
+      JSON.stringify({
+        type: 'run-leg-settled-abort',
+        workflowId: WORKFLOW_ID,
+        runId: RUN_ID,
+      }),
+    );
+  });
+
+  it('aborts a leg abort controller after the engine run when it cancels the leg', async () => {
+    // #given a leg started with an abort controller, held in its first step
+    const { storage } = await d1Storage();
+    const legAbort = new AbortController();
+    const leg = startHeldLeg(storage, {}, legAbort);
+    await leg.entered.promise;
+    const aborted: string[] = [];
+    leg.observed.signal?.addEventListener('abort', () => {
+      aborted.push('engine');
+    });
+    legAbort.signal.addEventListener('abort', () => {
+      aborted.push('legAbort');
+    });
+
+    // #when the runtime cancels the leg for a terminate
+    const cancelled = await leg.app.runtime.cancelActiveExecution(
+      WORKFLOW_ID,
+      RUN_ID,
+      'cancelled',
+      [{ kind: 'human', id: 'owner' }],
+    );
+
+    // #then both are aborted, the engine run first
+    expect(cancelled).toBe(true);
+    expect(aborted).toEqual(['engine', 'legAbort']);
+  });
+
+  it('leaves a leg whose row is live running', async () => {
+    // #given a leg held in its first step, on a row nobody settled
+    const { storage } = await d1Storage();
+    const leg = startHeldLeg(storage);
+    await leg.entered.promise;
+
+    // #when its touch runs
+    await leg.app.runtime.touchRun(WORKFLOW_ID, RUN_ID);
+
+    // #then the step's signal is not aborted
+    expect(leg.observed.signal?.aborted).toBe(false);
+
+    // #when the step returns
+    leg.release.resolve();
+    const ended = await leg.started;
+
+    // #then the run completes both steps
+    expect(ended.status).toBe('success');
+    expect(leg.observed.afterRuns).toBe(1);
+  });
+
+  it.each([
+    'start',
+    'resume',
+    'engine failure',
+  ] as const)('touches the row every interval while the leg runs and stops when it ends (%s)', async (kind) => {
+    // #given a leg held in a step, with interval timers faked
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    const { storage } = await d1Storage();
+    const leg = abortableApp(storage, { suspends: kind === 'resume' });
+    const touch = vi.spyOn(leg.app.runtime, 'touchRun').mockResolvedValue();
+    if (kind === 'engine failure') {
+      const create = leg.workflow.createRun.bind(leg.workflow);
+      vi.spyOn(leg.workflow, 'createRun').mockImplementation(
+        async (...args) => {
+          const run = await create(...args);
+          const engine = run.start.bind(run);
+          vi.spyOn(run, 'start').mockImplementation(async (...input) => {
+            await engine(...input);
+            throw new Error('engine lost its result');
+          });
+          return run;
+        },
+      );
+    }
+    let ended: Promise<unknown> = Promise.resolve();
+    try {
+      const first = leg.app.runtime.start(WORKFLOW_ID, {
+        runId: RUN_ID,
+        inputData: {},
+      });
+      if (kind === 'resume') {
+        await first;
+        touch.mockClear();
+        ended = leg.app.runtime.resume(WORKFLOW_ID, RUN_ID, { resumeData: {} });
+      } else ended = first;
+      await leg.entered.promise;
+
+      // #when the interval elapses twice while the leg runs
+      vi.advanceTimersByTime(60_000);
+
+      // #then it touched the row twice
+      expect(touch.mock.calls).toEqual([
+        [WORKFLOW_ID, RUN_ID],
+        [WORKFLOW_ID, RUN_ID],
+      ]);
+
+      // #when the leg ends and the interval elapses twice more
+      leg.release.resolve();
+      await Promise.allSettled([ended]);
+      vi.advanceTimersByTime(60_000);
+
+      // #then it touched no more
+      expect(touch).toHaveBeenCalledTimes(2);
+    } finally {
+      leg.release.resolve();
+      await Promise.allSettled([ended]);
+      vi.useRealTimers();
+    }
+  });
+
+  it('logs a touch that fails inside the interval and keeps the leg running', async () => {
+    // #given a leg held in a step whose touch rejects, with interval timers
+    // faked
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
+    const logged = vi
+      .spyOn(console, 'error')
+      .mockImplementation(() => undefined);
+    onTestFinished(() => {
+      logged.mockRestore();
+    });
+    const { storage } = await d1Storage();
+    const leg = startHeldLeg(storage);
+    const failure = new Error('D1 unavailable');
+    vi.spyOn(leg.app.runtime, 'touchRun').mockRejectedValue(failure);
+    await leg.entered.promise;
+
+    // #when the interval elapses once and the step returns
+    vi.advanceTimersByTime(30_000);
+    leg.release.resolve();
+    const ended = await leg.started;
+
+    // #then the failure is logged and the run completes
+    expect(logged).toHaveBeenCalledExactlyOnceWith(
+      'run leg liveness touch failed',
+      failure,
+    );
+    expect(ended.status).toBe('success');
   });
 });

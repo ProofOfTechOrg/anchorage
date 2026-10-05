@@ -1448,7 +1448,7 @@ describe('createRunRouter — POST /runs', () => {
     expect(await store.list({ status: 'pending' })).toEqual([]);
 
     const status = await handle(
-      req('/runs/open-flow/generated-run-id', { actor: ADMIN }),
+      req('/runs/open-flow/generated-run-id', { actor: REVIEWER }),
     );
     expect(status?.status).toBe(200);
     const [healed] = await store.list({ status: 'pending' });

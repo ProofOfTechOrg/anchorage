@@ -134,7 +134,10 @@ export interface RunRouterOptions {
    * what a given host's function actually blocks on. A throw is caught and
    * logged here, never surfaced to the caller: a broken reconcile must not
    * turn a working status read into a 500; the next poll simply retries.
-   * Absent => today's behavior (no reconciliation). Hosts wire
+   * Absent, a status read files nothing: a gate a DurableObjectRunner reaches
+   * on its own, such as the gate after a timer's timeout resume, is then filed
+   * only by the run object's DurableObjectRunLifecycleHooks.reconcileApprovals,
+   * and a host that wires neither never files it. Hosts wire
    * reconcileApprovalsOnStatus(systemPrincipalId) here, optionally wrapped for
    * waitUntil-detachment.
    */

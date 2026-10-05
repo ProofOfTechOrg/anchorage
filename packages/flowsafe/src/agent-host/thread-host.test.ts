@@ -39,10 +39,13 @@ import {
   type ExecutionFenceDatabase,
   ExecutionFenceStore,
   init,
+  RunSettledConflictError,
+  RunStartPendingError,
   RunStateUnreadableError,
   resourceIdFromKey,
   SUSPENSION_TIMEOUT_RESUME_KEY,
 } from '../do-runner/index.js';
+import { lifecycleFromRequestContext } from '../do-runner/run-lifecycle.js';
 import {
   D1SchedulesStorage,
   type ScheduleDatabase,
@@ -1741,6 +1744,56 @@ describe('createThreadAgentHost owner recovery', () => {
     expect(state.has(THREAD_BINDING_KEY)).toBe(true);
     expect(settle).not.toHaveBeenCalled();
     expect(alarmAt()).toBeDefined();
+  });
+
+  it('recovers the other journals while one start is still pending', async () => {
+    // #given a prepared journal whose start is still pending, listed ahead of
+    // the preparing journal of another run
+    const { host, scope, state, resources, alarmAt } = harness(['writer'], {
+      runtime: {
+        recoverStartAttempt: vi.fn(async () => {
+          throw new RunStartPendingError();
+        }),
+      },
+    });
+    seedRecoveryState(state, 'acme_run', ownerRecovery('acme_run'));
+    const preparing = ownerRecovery('acme_other', {
+      phase: 'preparing',
+      bindingPreexisting: true,
+    });
+    delete preparing.execution;
+    seedRecoveryState(state, 'acme_other', preparing);
+    await resources.reserveAll(
+      [{ kind: 'run', resourceId: 'acme_other' }],
+      { kind: 'human', id: 'operator-1' },
+      'token-acme_other',
+    );
+    const logged: string[] = [];
+    const log = vi
+      .spyOn(console, 'error')
+      .mockImplementation((...args: unknown[]) => {
+        logged.push(String(args[0]));
+      });
+
+    try {
+      // #when
+      await expect(host.recoverOwnership(scope)).resolves.toBeUndefined();
+    } finally {
+      log.mockRestore();
+    }
+
+    // #then the pending start keeps its journal and the wake, the other
+    // journal is rolled back, and the kept journal is logged
+    expect(state.has(TEST_OWNER_RECOVERY_KEY)).toBe(true);
+    expect(state.has(`${OWNER_RECOVERY_PREFIX}acme_other`)).toBe(false);
+    expect(alarmAt()).toBeDefined();
+    expect(logged.map((line) => JSON.parse(line))).toEqual([
+      {
+        type: 'agent-start-recovery-pending',
+        threadId: 'acme_thread',
+        runId: 'acme_run',
+      },
+    ]);
   });
 
   it('keeps an unthreaded nonterminal journal armed, then releases ephemeral claims at terminal state', async () => {
@@ -5211,6 +5264,19 @@ describe('host shares cold wrapper initialization', () => {
   });
 });
 
+const PAST_SILENCE_MS = 360_001; // past the six minutes a pending start's row must stay silent
+
+async function recoverPastSilence<T>(recovery: () => Promise<T>): Promise<T> {
+  const now = vi
+    .spyOn(Date, 'now')
+    .mockReturnValue(Date.now() + PAST_SILENCE_MS);
+  try {
+    return await recovery();
+  } finally {
+    now.mockRestore();
+  }
+}
+
 describe('host activation cold agent recovery', () => {
   async function coldFixture(
     threaded: boolean,
@@ -5389,7 +5455,7 @@ describe('host activation cold agent recovery', () => {
     expect(before?.status).toBe('pending');
     const start = vi.spyOn(fixture.app.runtime, 'start');
     await expect(
-      fixture.host.recoverOwnership(fixture.scope),
+      recoverPastSilence(() => fixture.host.recoverOwnership(fixture.scope)),
     ).resolves.toBeUndefined();
     const after = await fixture.workflows.loadWorkflowSnapshot({
       workflowName: fixture.execution.workflowId,
@@ -5493,7 +5559,7 @@ describe('host activation cold agent recovery', () => {
   ])('uses one authoritative recovery observation for the actual cold agent (threaded=%s)', async (threaded) => {
     const fixture = await coldFixture(threaded, 'fenced', 'pending');
     await expect(
-      fixture.host.recoverOwnership(fixture.scope),
+      recoverPastSilence(() => fixture.host.recoverOwnership(fixture.scope)),
     ).resolves.toBeUndefined();
     const raw = await fixture.nativeCapability.readSnapshot({
       workflowId: fixture.execution.workflowId,
@@ -5503,6 +5569,63 @@ describe('host activation cold agent recovery', () => {
     expect(fixture.state.has(TEST_OWNER_RECOVERY_KEY)).toBe(false);
     expect(fixture.rawReads).toHaveBeenCalledOnce();
     expect(fixture.terminalization).toHaveBeenCalledOnce();
+  });
+
+  it('waits for a pending agent start to go silent, then repairs it stamped', async () => {
+    // #given an admitted agent start whose row was written moments ago
+    const fixture = await coldFixture(true, 'fenced', 'pending');
+    const address = {
+      workflowName: fixture.execution.workflowId,
+      runId: fixture.execution.runId,
+    };
+    const admitted = await fixture.workflows.loadWorkflowSnapshot(address);
+    if (!admitted) throw new Error('missing cold snapshot');
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    try {
+      // #when recovery runs while the row is fresh
+      await expect(
+        fixture.host.recoverOwnership(fixture.scope),
+      ).resolves.toBeUndefined();
+
+      // #then the start stays pending with its journal and wake
+      expect(
+        (await fixture.workflows.loadWorkflowSnapshot(address))?.status,
+      ).toBe('pending');
+      expect(fixture.state.has(TEST_OWNER_RECOVERY_KEY)).toBe(true);
+      expect(fixture.alarmAt()).toBeDefined();
+      expect(fixture.terminalization).not.toHaveBeenCalled();
+
+      // #when recovery runs once the row has been silent past the window
+      await recoverPastSilence(() =>
+        fixture.host.recoverOwnership(fixture.scope),
+      );
+
+      // #then the start is repaired with the run lifecycle stamped
+      const repaired = await fixture.workflows.loadWorkflowSnapshot(address);
+      expect(repaired?.status).toBe('failed');
+      expect(
+        lifecycleFromRequestContext(repaired?.requestContext)
+          ?.startOutcomeUnknownAt,
+      ).toEqual(expect.any(Number));
+      expect(fixture.state.has(TEST_OWNER_RECOVERY_KEY)).toBe(false);
+
+      // #when the outgoing leg writes on
+      const late = await fixture.workflows
+        .persistWorkflowSnapshot({
+          ...address,
+          snapshot: { ...admitted, status: 'suspended' },
+        })
+        .catch((error: unknown) => error);
+
+      // #then the settled-row guard refuses the write
+      expect(late).toBeInstanceOf(RunSettledConflictError);
+      expect(
+        (await fixture.workflows.loadWorkflowSnapshot(address))?.status,
+      ).toBe('failed');
+    } finally {
+      log.mockRestore();
+    }
   });
 
   it.each([
@@ -5863,15 +5986,13 @@ describe('host activation owning quiescence', () => {
     await entered.promise;
     const journal = structuredClone(fixture.state.get(TEST_OWNER_RECOVERY_KEY));
     try {
-      const recovery = await fixture.host
-        .recoverOwnership(fixture.scope)
-        .catch((error: unknown) => error);
+      const recovery = await recoverPastSilence(() =>
+        fixture.host.recoverOwnership(fixture.scope),
+      ).catch((error: unknown) => error);
       expect(fixture.state.get(TEST_OWNER_RECOVERY_KEY)).toEqual(journal);
       expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(true);
-      expect(recovery).toMatchObject({
-        status: 503,
-        reason: { code: 'RUN_START_PENDING' },
-      });
+      expect(fixture.alarmAt()).toBeDefined();
+      expect(recovery).toBeUndefined();
     } finally {
       release.resolve();
       await outcome;
@@ -6236,9 +6357,9 @@ describe('host activation native agent zero admission', () => {
       .all();
     const state = structuredClone(fixture.fixture.state);
     try {
-      const outcome = await fixture.fixture.host
-        .recoverOwnership(fixture.fixture.scope)
-        .catch((error: unknown) => error);
+      const outcome = await recoverPastSilence(() =>
+        fixture.fixture.host.recoverOwnership(fixture.fixture.scope),
+      ).catch((error: unknown) => error);
       expect(
         fixture.sql
           .prepare(
@@ -6247,14 +6368,75 @@ describe('host activation native agent zero admission', () => {
           .all(),
       ).toEqual(owners);
       expect(fixture.fixture.state).toEqual(state);
+      expect(fixture.fixture.alarmAt()).toBeDefined();
       expect(fixture.effects()).toBe(0);
-      expect(outcome).toMatchObject({
-        status: 503,
-        reason: { code: 'RUN_START_PENDING' },
-      });
+      expect(outcome).toBeUndefined();
     } finally {
       release.resolve();
       await settled;
+    }
+  });
+
+  it('repairs at once and stamps a start whose own leg stopped in the object', async () => {
+    // #given a start whose leg stops with an ambiguous failure after its row
+    // is admitted
+    const { fixture, native, domain } = await nativeZeroFixture();
+    const address = {
+      workflowName: 'durable-agentic-loop',
+      runId: 'acme_run',
+    };
+    const leg: {
+      admitted?: Awaited<ReturnType<typeof domain.loadWorkflowSnapshot>>;
+    } = {};
+    Object.defineProperty(domain, FENCED_WORKFLOW_STORAGE, {
+      value: {
+        ...native,
+        withInitialAdmission: async (
+          input: Parameters<typeof native.withInitialAdmission>[0],
+          create: Parameters<typeof native.withInitialAdmission>[1],
+        ) => {
+          await native.withInitialAdmission(input, create);
+          leg.admitted = await domain.loadWorkflowSnapshot(address);
+          throw new Error('admission response lost');
+        },
+      },
+      configurable: true,
+    });
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    try {
+      // #when the start route recovers the leg it saw fail, with the row fresh
+      const outcome = await fixture.host
+        .start(fixture.scope, THREAD_START_INPUT)
+        .catch((error: unknown) => error);
+
+      // #then the row is repaired without waiting and carries the stamp
+      const repaired = await domain.loadWorkflowSnapshot(address);
+      if (!repaired) throw new Error('missing repaired snapshot');
+      expect(repaired.status).toBe('failed');
+      expect(
+        lifecycleFromRequestContext(repaired.requestContext)
+          ?.startOutcomeUnknownAt,
+      ).toEqual(expect.any(Number));
+      expect(fixture.state.has(TEST_OWNER_RECOVERY_KEY)).toBe(false);
+      expect(outcome).toMatchObject({
+        runId: 'acme_run',
+        summary: { status: 'failed' },
+      });
+
+      // #when the stopped leg writes on from the snapshot it holds
+      if (!leg.admitted) throw new Error('missing admitted snapshot');
+      const late = await domain
+        .persistWorkflowSnapshot({
+          ...address,
+          snapshot: { ...leg.admitted, status: 'running' },
+        })
+        .catch((error: unknown) => error);
+
+      // #then the settled-row guard refuses the write
+      expect(late).toBeInstanceOf(RunSettledConflictError);
+    } finally {
+      log.mockRestore();
     }
   });
 

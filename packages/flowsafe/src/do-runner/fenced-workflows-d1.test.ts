@@ -3556,6 +3556,371 @@ describe('settled-row guard on unscoped persistence', () => {
         .all();
     expect(rows(guarded.sql)).toEqual(rows(plainSql));
   });
+
+  describe('liveness touch', () => {
+    const ADDRESS = { workflowId: 'workflow', runId: 'run' };
+    const TOUCHED_MS = Date.parse('2030-01-02T03:04:05.006Z');
+    const TOUCHED_AT = new Date(TOUCHED_MS).toISOString();
+
+    it('marks an unsettled row live and moves its updatedAt', async () => {
+      // #given an unsettled row
+      const h = await fixture();
+      await persist(h.domain, snapshot('running'));
+      const [before] = h.rows() as { snapshot: string; updatedAt: string }[];
+
+      // #when
+      const touched = await h.capability.touchRun?.(ADDRESS, TOUCHED_MS);
+
+      // #then the row is live, with a new updatedAt and the same snapshot
+      expect(touched).toBe('live');
+      expect(h.rows()).toEqual([{ ...before, updatedAt: TOUCHED_AT }]);
+    });
+
+    it.each(
+      RUN_SETTLING_MARKERS,
+    )('reports a row settled by %s and leaves it as it is', async (marker) => {
+      // #given a row settled by the marker
+      const h = await fixture();
+      await persist(h.domain, snapshot('failed', SETTLED[marker].lifecycle));
+      const settled = h.rows();
+
+      // #when
+      const touched = await h.capability.touchRun?.(ADDRESS, TOUCHED_MS);
+
+      // #then
+      expect(touched).toBe('settled');
+      expect(h.rows()).toEqual(settled);
+    });
+
+    it('reports an absent row and writes none', async () => {
+      // #given no run row
+      const h = await fixture();
+
+      // #when
+      const touched = await h.capability.touchRun?.(ADDRESS, TOUCHED_MS);
+
+      // #then
+      expect(touched).toBe('absent');
+      expect(h.rows()).toEqual([]);
+    });
+
+    it('marks a row whose stored JSON is unreadable live', async () => {
+      // #given a row whose stored bytes are not JSON
+      const h = await fixture();
+      await persist(h.domain, snapshot('running'));
+      h.sql
+        .prepare('UPDATE mastra_workflow_snapshot SET snapshot = ?')
+        .run('{not json');
+
+      // #when
+      const touched = await h.capability.touchRun?.(ADDRESS, TOUCHED_MS);
+
+      // #then
+      expect(touched).toBe('live');
+      expect(h.rows()).toMatchObject([
+        { snapshot: '{not json', updatedAt: TOUCHED_AT },
+      ]);
+    });
+  });
+});
+
+describe('snapshot replacement input', () => {
+  const VALID_TIME = '2026-10-04T00:00:00.000Z';
+
+  it.each([
+    {
+      label: 'snapshot is not JSON',
+      replacement: { snapshot: '{', updatedAt: VALID_TIME },
+    },
+    {
+      label: 'snapshot is a JSON array',
+      replacement: { snapshot: '[]', updatedAt: VALID_TIME },
+    },
+    {
+      label: 'snapshot is JSON null',
+      replacement: { snapshot: 'null', updatedAt: VALID_TIME },
+    },
+    {
+      label: 'snapshot is a JSON number',
+      replacement: { snapshot: '1', updatedAt: VALID_TIME },
+    },
+    {
+      label: 'updatedAt is a date without a time',
+      replacement: {
+        snapshot: JSON.stringify(pending()),
+        updatedAt: '2026-10-04',
+      },
+    },
+    {
+      label: 'updatedAt is not a time',
+      replacement: {
+        snapshot: JSON.stringify(pending()),
+        updatedAt: 'not a time',
+      },
+    },
+    {
+      label: 'updatedAt is an ISO time without milliseconds',
+      replacement: {
+        snapshot: JSON.stringify(pending()),
+        updatedAt: '2026-10-04T00:00:00Z',
+      },
+    },
+  ])('refuses a replacement whose $label and leaves the row', async ({
+    replacement,
+  }) => {
+    // #given a persisted run row
+    const h = await fixture();
+    await h.domain.persistWorkflowSnapshot({
+      workflowName: 'workflow',
+      runId: 'run',
+      snapshot: pending(),
+    });
+    const address = { workflowId: 'workflow', runId: 'run' };
+    const row = await h.capability.readSnapshot(address);
+    if (!row) throw new Error('run row missing');
+
+    // #when the exact row is replaced with the malformed input
+    const replaced = h.capability.replaceSnapshot?.(row, replacement);
+
+    // #then it rejects and the row keeps its bytes
+    await expect(replaced).rejects.toThrow();
+    expect(await h.capability.readSnapshot(address)).toEqual(row);
+  });
+});
+
+describe('run lifecycle patch', () => {
+  const ADDRESS = { workflowId: 'workflow', runId: 'run' };
+  const UPDATED_AT = '2026-10-04T00:00:00.000Z';
+  const PATCH = {
+    lifecycle: {
+      version: 1 as const,
+      revision: 2,
+      transitionIntent: {
+        status: 'cancelled' as const,
+        requestedAt: 50,
+        replayPrincipals: [OWNER],
+      },
+    },
+    timestamp: 456,
+    updatedAt: UPDATED_AT,
+  };
+  const SETTLED = {
+    terminal: {
+      terminal: {
+        status: 'cancelled',
+        error: { code: 'CANCELLED', message: 'run was cancelled' },
+        transitionedAt: 100,
+        replayPrincipals: [OWNER],
+      },
+    },
+    interruptedAt: { interruptedAt: 100 },
+    startOutcomeUnknownAt: { startOutcomeUnknownAt: 100 },
+  } as const;
+
+  function nested(depth: number): unknown {
+    let value: unknown = 'leaf';
+    for (let level = 0; level < depth; level++) value = [value];
+    return value;
+  }
+
+  function running(requestContext?: Record<string, unknown>): WorkflowRunState {
+    return {
+      ...pending(),
+      status: 'running',
+      ...(requestContext ? { requestContext } : {}),
+    };
+  }
+
+  async function seeded(row: WorkflowRunState | string | undefined) {
+    const h = await fixture();
+    if (typeof row === 'string') {
+      await h.domain.persistWorkflowSnapshot({
+        workflowName: 'workflow',
+        runId: 'run',
+        snapshot: pending(),
+      });
+      h.sql
+        .prepare('UPDATE mastra_workflow_snapshot SET snapshot = ?')
+        .run(row);
+    } else if (row) {
+      await h.domain.persistWorkflowSnapshot({
+        workflowName: 'workflow',
+        runId: 'run',
+        snapshot: row,
+      });
+    }
+    return h;
+  }
+
+  it('writes the lifecycle and timestamp of the row it expects and no other field', async () => {
+    // #given a running row at lifecycle revision 1 with other context
+    const before = running({
+      app: { text: 'λ😀', fraction: 1.5 },
+      [RUN_LIFECYCLE_CONTEXT_KEY]: { version: 1, revision: 1 },
+    });
+    const h = await seeded(before);
+
+    // #when the patch names that status and revision
+    const patched = await h.capability.patchRunLifecycle?.(
+      ADDRESS,
+      { status: 'running', lifecycleRevision: 1 },
+      PATCH,
+    );
+
+    // #then only the lifecycle, the timestamp and `updatedAt` changed
+    expect(patched).toBe(true);
+    const row = await h.capability.readSnapshot(ADDRESS);
+    expect(JSON.parse(row?.snapshot ?? 'null')).toEqual({
+      ...before,
+      timestamp: 456,
+      requestContext: {
+        ...before.requestContext,
+        [RUN_LIFECYCLE_CONTEXT_KEY]: PATCH.lifecycle,
+      },
+    });
+    expect(row?.updatedAt).toBe(UPDATED_AT);
+  });
+
+  it('creates the request context of a row that has none', async () => {
+    // #given a running row with no request context
+    const h = await seeded(running());
+
+    // #when the patch expects no lifecycle
+    const patched = await h.capability.patchRunLifecycle?.(
+      ADDRESS,
+      { status: 'running' },
+      PATCH,
+    );
+
+    // #then
+    expect(patched).toBe(true);
+    const row = await h.capability.readSnapshot(ADDRESS);
+    expect(JSON.parse(row?.snapshot ?? 'null')).toEqual({
+      ...running(),
+      timestamp: 456,
+      requestContext: { [RUN_LIFECYCLE_CONTEXT_KEY]: PATCH.lifecycle },
+    });
+  });
+
+  it.each([
+    {
+      label: 'its status differs from the one expected',
+      row: running({
+        [RUN_LIFECYCLE_CONTEXT_KEY]: { version: 1, revision: 1 },
+      }),
+      expected: { status: 'waiting', lifecycleRevision: 1 },
+    },
+    {
+      label: 'its lifecycle revision differs from the one expected',
+      row: running({
+        [RUN_LIFECYCLE_CONTEXT_KEY]: { version: 1, revision: 3 },
+      }),
+      expected: { status: 'running', lifecycleRevision: 1 },
+    },
+    {
+      label: 'it has a lifecycle where none was expected',
+      row: running({
+        [RUN_LIFECYCLE_CONTEXT_KEY]: { version: 1, revision: 1 },
+      }),
+      expected: { status: 'running' },
+    },
+    {
+      label: 'it has no lifecycle where one was expected',
+      row: running({ other: true }),
+      expected: { status: 'running', lifecycleRevision: 1 },
+    },
+    {
+      label: 'its snapshot is not JSON',
+      row: '{',
+      expected: { status: 'running' },
+    },
+    {
+      label: 'its request context is not an object',
+      row: JSON.stringify({ ...running(), requestContext: 'text' }),
+      expected: { status: 'running' },
+    },
+    {
+      label: 'its snapshot nests past the depth SQLite reads',
+      row: JSON.stringify({ ...running(), result: nested(1_100) }),
+      expected: { status: 'running' },
+    },
+    {
+      label: 'the run has no row',
+      row: undefined,
+      expected: { status: 'running' },
+    },
+    ...(
+      Object.entries(SETTLED) as [
+        keyof typeof SETTLED,
+        Record<string, unknown>,
+      ][]
+    ).map(([marker, settled]) => ({
+      label: `it is settled by ${marker}`,
+      row: running({
+        [RUN_LIFECYCLE_CONTEXT_KEY]: { version: 1, revision: 1, ...settled },
+      }),
+      expected: { status: 'running', lifecycleRevision: 1 },
+    })),
+  ])('writes nothing when $label', async ({ row, expected }) => {
+    // #given the row
+    const h = await seeded(row);
+    const before = h.rows();
+
+    // #when the patch expects a different row
+    const patched = await h.capability.patchRunLifecycle?.(
+      ADDRESS,
+      expected,
+      PATCH,
+    );
+
+    // #then it reports no write and the table keeps its bytes
+    expect(patched).toBe(false);
+    expect(h.rows()).toEqual(before);
+  });
+
+  it.each([
+    {
+      label: 'lifecycle is an array',
+      call: [ADDRESS, { status: 'running' }, { ...PATCH, lifecycle: [] }],
+    },
+    {
+      label: 'timestamp is not an integer',
+      call: [ADDRESS, { status: 'running' }, { ...PATCH, timestamp: 1.5 }],
+    },
+    {
+      label: 'timestamp is negative',
+      call: [ADDRESS, { status: 'running' }, { ...PATCH, timestamp: -1 }],
+    },
+    {
+      label: 'updatedAt is not in toISOString form',
+      call: [
+        ADDRESS,
+        { status: 'running' },
+        { ...PATCH, updatedAt: '2026-10-04' },
+      ],
+    },
+    {
+      label: 'expected revision is not an integer',
+      call: [ADDRESS, { status: 'running', lifecycleRevision: 1.5 }, PATCH],
+    },
+    {
+      label: 'run address is not path safe',
+      call: [{ ...ADDRESS, runId: '../run' }, { status: 'running' }, PATCH],
+    },
+  ])('refuses a patch whose $label and writes nothing', async ({ call }) => {
+    // #given a running row
+    const h = await seeded(running());
+    const before = h.rows();
+
+    // #when the patch is malformed
+    const patched = (
+      h.capability.patchRunLifecycle as (...args: unknown[]) => Promise<boolean>
+    )(...call);
+
+    // #then it rejects and the table keeps its bytes
+    await expect(patched).rejects.toThrow();
+    expect(h.rows()).toEqual(before);
+  });
 });
 
 describe('owned initial terminalization outcome marker', () => {

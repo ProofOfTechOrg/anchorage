@@ -238,7 +238,9 @@ quota for a rejected execution. An execution or rate-limit failure before a
 successful side effect releases an owned idempotency reservation so a later
 attempt can retry. Output-validation failure after execution leaves an atomic
 reservation pending until stale takeover or operator recovery because an
-immediate release could duplicate the completed side effect.
+immediate release could duplicate the completed side effect. An execution that
+throws after its abort signal fired leaves the reservation pending for the same
+reason: the aborted call may already have taken effect.
 
 SDK events that reach the configured audit wrapper include `decisionCode`, `policyKind` and `retryable`. Arbitrary thrown values use static audit reasons rather than their exception text.
 

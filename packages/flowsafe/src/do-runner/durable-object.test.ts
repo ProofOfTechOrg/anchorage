@@ -16,6 +16,7 @@ import {
 import { durableKeyValueStorageFixture } from '../../test-support/durable-key-value-storage.js';
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import {
+  ApprovalAuthzError,
   type ApprovalRecord,
   ApprovalService,
   D1ResourceOwnershipStore,
@@ -23,9 +24,13 @@ import {
   encodeExecutionPrincipal,
   InMemoryApprovalStore,
   InMemoryResourceOwnershipStore,
+  OPEN_STATUSES,
   type ResourceOwnershipDatabase,
 } from '../approval-api/index.js';
-import { reconcileApprovalsForSummary } from '../host-kit/approval-bridge.js';
+import {
+  reconcileApprovalsForSummary,
+  reconcileApprovalsForSummaryAndEndedSuspension,
+} from '../host-kit/approval-bridge.js';
 import {
   createDoRunTopology,
   type RunnerNamespaceLike,
@@ -9791,18 +9796,22 @@ describe('DurableObjectRunner start recovery leg evidence', () => {
 describe('DurableObjectRunner approvals the run object files', () => {
   /** Lifecycle hooks whose `reconcileApprovals` files through a real service. */
   function filingLifecycle(env: TestEnv) {
+    const store = new InMemoryApprovalStore();
     const service = new ApprovalService({
-      store: new InMemoryApprovalStore(),
+      store,
       executionFence: 'none',
     });
     const filed: ApprovalRecord[] = [];
-    const reconcile = vi.fn(async (workflowId: string, summary: RunSummary) => {
+    const reconcile = vi.fn<
+      NonNullable<DurableObjectRunLifecycleHooks['reconcileApprovals']>
+    >(async (workflowId, summary, ended) => {
       filed.push(
-        ...(await reconcileApprovalsForSummary(
+        ...(await reconcileApprovalsForSummaryAndEndedSuspension(
           service,
           workflowId,
           summary,
           'approval-reconciler',
+          ended,
         )),
       );
     });
@@ -9810,7 +9819,7 @@ describe('DurableObjectRunner approvals the run object files', () => {
       abandonApprovals: async () => undefined,
       reconcileApprovals: reconcile,
     };
-    return { filed, reconcile };
+    return { filed, reconcile, service, store };
   }
 
   /** An armed entry one failed wake short of abandonment, due now. */
@@ -9858,6 +9867,31 @@ describe('DurableObjectRunner approvals the run object files', () => {
         requestedByKind: 'human',
       },
     ]);
+  });
+
+  it("refuses the run's requester the gate a timeout resume reaches after a timer", async () => {
+    // #given a run waiting in a timer, with an approval gate after it, and the
+    // gate filed once the timer's timeout resumes the run
+    const { state, values } = durableKeyValueStorageFixture();
+    const env = timedEnv();
+    const { filed, service, store } = filingLifecycle(env);
+    const runner = new TestRunner(state, env);
+    await startTimed(runner, 'run-sod-after-timer', 'timed-timer-gate');
+    elapseDeadlines(values);
+    await runner.alarm();
+    const [record] = filed;
+    if (filed.length !== 1 || !record) throw new Error('expected one record');
+
+    // #when the run's requester, wearing a reviewing role, decides it
+    const decision = service.decide(
+      record.id,
+      { decision: 'approve' },
+      { id: OWNER_PRINCIPAL.id, role: 'admin' },
+    );
+
+    // #then separation of duties refuses them and the gate stays open
+    await expect(decision).rejects.toBeInstanceOf(ApprovalAuthzError);
+    expect(await store.get(record.id)).toMatchObject({ status: 'pending' });
   });
 
   it('files nothing for a timer that waits again after its timeout', async () => {
@@ -10090,5 +10124,140 @@ describe('DurableObjectRunner approvals the run object files', () => {
     expect(filed).toMatchObject(
       via === 'alarm' ? [{ runId: 'c-run', stepPath: ['gate'] }] : [],
     );
+  });
+
+  it('closes the approval of a deadline gate whose timeout resume ended the run', async () => {
+    // #given a deadline gate whose approval a host status read filed
+    const { state, values } = durableKeyValueStorageFixture();
+    const env = timedEnv();
+    const { service, store } = filingLifecycle(env);
+    const runner = new TestRunner(state, env);
+    const runId = 'run-gate-timed-out';
+    const started = await startTimed(runner, runId);
+    const [record] = await reconcileApprovalsForSummary(
+      service,
+      'timed',
+      started,
+      'approval-reconciler',
+    );
+    if (!record) throw new Error('expected the gate to be filed');
+    elapseDeadlines(values);
+
+    // #when the deadline passes and the object resumes the gate with its timeout
+    await runner.alarm();
+
+    // #then the run ended, and the approval nothing can decide is closed
+    const status = await runner.fetch(
+      deploymentIdentityRequest(`http://do/runs/timed/${runId}`),
+    );
+    expect(await status.json()).toMatchObject({
+      status: 'success',
+      result: { settledBy: 'timeout' },
+    });
+    expect(await store.get(record.id)).toMatchObject({
+      status: 'rejected',
+      decidedBy: 'approval-reconciler',
+    });
+  });
+
+  it.each([
+    {
+      label: 'suspendedAt',
+      fingerprint: (suspendedAt: number) => ({
+        suspendedAt: { wait: suspendedAt + 1 },
+      }),
+    },
+    {
+      label: 'resumeCount',
+      fingerprint: (suspendedAt: number) => ({
+        suspendedAt: { wait: suspendedAt },
+        resumeCount: { wait: 1 },
+      }),
+    },
+  ])('keeps open an approval bound to another suspension of the step a timeout resume ended, with a different $label', async ({
+    fingerprint,
+  }) => {
+    // #given a timer that a gate follows, and an open approval for the
+    // timer's step bound to another suspension of it
+    const { state, values } = durableKeyValueStorageFixture();
+    const env = timedEnv();
+    const { reconcile, service, store } = filingLifecycle(env);
+    const runner = new TestRunner(state, env);
+    const runId = 'run-other-suspension';
+    const started = await startTimed(runner, runId, 'timed-timer-gate');
+    const suspendedAt = started.suspendedAt?.wait;
+    if (suspendedAt === undefined)
+      throw new Error('expected a suspended timer');
+    const [record] = await reconcileApprovalsForSummary(
+      service,
+      'timed-timer-gate',
+      {
+        runId,
+        status: 'suspended',
+        suspended: [['wait']],
+        requestedBy: OWNER_PRINCIPAL.id,
+        requestedByKind: 'human',
+        ...fingerprint(suspendedAt),
+      },
+      'approval-reconciler',
+    );
+    if (!record) throw new Error('expected the approval to be filed');
+    elapseDeadlines(values);
+
+    // #when the timer expires and the run suspends at the gate after it
+    await runner.alarm();
+
+    // #then the object named the suspension it ended, and left that approval
+    expect(reconcile).toHaveBeenCalledWith(
+      'timed-timer-gate',
+      expect.objectContaining({ status: 'suspended', suspended: [['gate']] }),
+      { step: 'wait', suspendedAt, resumeCount: 0 },
+    );
+    expect(await store.get(record.id)).toMatchObject({ status: 'pending' });
+  });
+
+  it('keeps the decision that wins the approval of a suspension a timeout resume ended', async () => {
+    // #given a deadline gate with an open approval that a reviewer approves
+    // after the object read it and before the object closes it
+    const { state, values } = durableKeyValueStorageFixture();
+    const env = timedEnv();
+    const { service, store } = filingLifecycle(env);
+    const runner = new TestRunner(state, env);
+    const runId = 'run-decision-wins';
+    const started = await startTimed(runner, runId);
+    const [record] = await reconcileApprovalsForSummary(
+      service,
+      'timed',
+      started,
+      'approval-reconciler',
+    );
+    if (!record) throw new Error('expected the gate to be filed');
+    const supersede = service.supersedeStaleAsPrincipal.bind(service);
+    const closing = vi
+      .spyOn(service, 'supersedeStaleAsPrincipal')
+      .mockImplementationOnce(async (id, principal, reason) => {
+        const now = new Date().toISOString();
+        await store.transition(id, OPEN_STATUSES, {
+          status: 'approved',
+          decidedBy: 'reviewer-1',
+          decision: 'approve',
+          decidedAt: now,
+          updatedAt: now,
+        });
+        return supersede(id, principal, reason);
+      });
+    elapseDeadlines(values);
+
+    // #when the deadline passes and the timeout resume ends the run
+    await runner.alarm();
+
+    // #then the object tried to close it, lost the compare-and-set, and the
+    // decision stands
+    expect(closing).toHaveBeenCalledOnce();
+    expect(await closing.mock.results[0]?.value).toBeNull();
+    expect(await store.get(record.id)).toMatchObject({
+      status: 'approved',
+      decidedBy: 'reviewer-1',
+    });
   });
 });

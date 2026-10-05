@@ -88,31 +88,22 @@ export function prepareRawWorkflowSnapshotRead(
 }
 
 /**
- * @internal Set a run row's `updatedAt` and nothing else: the liveness mark an
- * executing leg leaves from whichever instance runs it. It never writes the
- * snapshot, so it cannot clobber the engine's own concurrent write; a row
- * that does not exist yet is left absent.
+ * @internal The workflow snapshot a run row's `snapshot` text holds, when that
+ * text is a JSON object; `undefined` for any other JSON value and for text
+ * that is not JSON.
  */
-export async function touchRawWorkflowSnapshot(
-  db: Pick<SnapshotDatabase, 'prepare'>,
-  input: D1RunAddress,
-  nowMs: number,
-): Promise<void> {
-  const { tablePrefix, workflowId, runId } = input;
-  if (
-    typeof tablePrefix !== 'string' ||
-    !isPathSafeId(workflowId) ||
-    !isPathSafeId(runId) ||
-    !Number.isSafeInteger(nowMs) ||
-    nowMs < 0
-  )
-    throw new Error('workflow snapshot address is malformed');
-  const prefix = validateTablePrefix(tablePrefix)?.toLowerCase() ?? '';
-  await db
-    .prepare(`UPDATE "${prefix}mastra_workflow_snapshot" SET updatedAt = ?
-    WHERE workflow_name = ? AND run_id = ?`)
-    .bind(new Date(nowMs).toISOString(), workflowId, runId)
-    .run();
+export function parseSnapshotObject(
+  text: string,
+): Record<string, unknown> | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed))
+    return undefined;
+  return parsed as Record<string, unknown>;
 }
 
 /** @internal Decode exact stored bytes without JSON or timestamp coercion. */

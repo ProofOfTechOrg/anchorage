@@ -19,6 +19,7 @@ import type { Mastra } from '@mastra/core/mastra';
 import {
   type BackgroundTasksStorage,
   type MastraStorageDomains,
+  matchesExpectedWorkflowStatus,
   mergeWorkflowStepResult,
   type UpdateWorkflowStateOptions,
 } from '@mastra/core/storage';
@@ -168,7 +169,10 @@ export class DurableObjectWorkflowsStorageD1 extends FencedWorkflowsStorageD1 {
         typeof run.snapshot === 'string'
           ? (JSON.parse(run.snapshot) as WorkflowRunState)
           : run.snapshot;
-      const snapshot: WorkflowRunState = { ...current, ...args.opts };
+      const { expectedStatus, ...updates } = args.opts;
+      if (!matchesExpectedWorkflowStatus(current.status, expectedStatus))
+        return undefined;
+      const snapshot: WorkflowRunState = { ...current, ...updates };
       await this.#persistUnlocked({
         workflowName: args.workflowName,
         runId: args.runId,

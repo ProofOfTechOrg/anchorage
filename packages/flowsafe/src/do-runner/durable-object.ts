@@ -65,7 +65,6 @@ import {
   type InterruptedRunSettlement,
   InvalidRunRequestError,
   type RecoveredStart,
-  RUN_LEG_TOUCH_MS,
   RunAlreadyExistsError,
   type RunLifecycleCas,
   type RunLifecycleTransitionResult,
@@ -144,16 +143,39 @@ export interface DurableObjectRunLifecycleHooks {
     runId: string,
   ): Promise<void>;
   /**
-   * File the approvals of a run the object left suspended with no host request
-   * behind it (docs/do-runner-design.md, "Approvals the run object files").
-   * Called from the object's alarm, under its operation lock, with an
-   * authoritative summary. Steps listed in `summary.suspensionTimers` are
-   * timers the object resumes itself and must get no approval;
-   * `reconcileApprovalsForSummary` skips them. Best effort: a failure is
-   * logged and never retried, and a host read with approval reconciliation
-   * files what it missed, so it must be idempotent beside that read.
+   * Reconcile the approvals of a run at a boundary the object reached on its
+   * own, with no host request behind it (docs/do-runner-design.md, "Approvals
+   * the run object files"). Called from the object's alarm, under its
+   * operation lock, with an authoritative summary. Steps listed in
+   * `summary.suspensionTimers` are timers the object resumes itself and must
+   * get no approval; `reconcileApprovalsForSummary` skips them.
+   *
+   * After a suspension-deadline resume it is called whatever the run did next,
+   * so `summary` need not be suspended, and `ended` names the suspension that
+   * resume ended, which nothing can decide any more. An implementation
+   * honours `ended` by superseding each open record whose step, `suspendedAt`
+   * and `resumeCount` equal it exactly, counting a record's absent
+   * `resumeCount` as 0, and by leaving every other record alone while the run
+   * is suspended. `createFlowsafeRunnerLifecycle()` does, and once `summary`
+   * is terminal it supersedes every open record of the run. An implementation
+   * that ignores `ended` leaves such a record open.
+   *
+   * Best effort, one attempt: a failure is logged and never retried, and a
+   * host read with approval reconciliation files what it missed, so it must be
+   * idempotent beside that read. A failed read or hook, an eviction between the
+   * resume and this call, a resume that throws after its result was saved (the
+   * later wake names no ended suspension), or a host status read that files
+   * from a summary taken before the resume leaves the ended suspension's
+   * record open, and the SLA sweep escalates it.
    */
-  reconcileApprovals?(workflowId: string, summary: RunSummary): Promise<void>;
+  reconcileApprovals?(
+    workflowId: string,
+    summary: RunSummary,
+    ended?: Pick<
+      SuspensionDeadlineEntry,
+      'step' | 'suspendedAt' | 'resumeCount'
+    >,
+  ): Promise<void>;
 }
 
 const RUN_OWNER_RECOVERY_KEY = 'flowsafe:run-owner-recovery:v1';
@@ -1252,16 +1274,21 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
   }
 
   /**
-   * File the approvals of this object's run, suspended at a boundary the
-   * object reached on its own, through the lifecycle's `reconcileApprovals`.
+   * Reconcile the approvals of this object's run, at a boundary the object
+   * reached on its own, through the lifecycle's `reconcileApprovals`.
    * `known` is an authoritative summary already in hand; without one the run
-   * is read. Never throws: the boundary has already happened, and a host read
-   * with reconciliation files what a failure here misses.
+   * is read. `ended` is the suspension a timeout resume just ended; the hook
+   * then hears of it whatever the run did next. Never throws: the boundary has
+   * already happened, and a host read with reconciliation files what a failure
+   * here misses.
    */
   async #reconcileApprovalsBestEffort(
     workflowId: string,
     runId: string,
     known?: RunSummary,
+    ended?: Parameters<
+      NonNullable<DurableObjectRunLifecycleHooks['reconcileApprovals']>
+    >[2],
   ): Promise<void> {
     // A foreign record names another object's run: nothing here to file.
     if (!this.#isOwnRun(workflowId, runId)) return;
@@ -1275,11 +1302,15 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
           workflowId,
           runId,
         ));
-      if (summary?.status !== 'suspended' || !isReadableRunSummary(summary))
-        return;
+      if (!summary || !isReadableRunSummary(summary)) return;
+      // A run that is not suspended has nothing to file; the hook still hears
+      // of a suspension a timeout resume just ended, so it can close that
+      // approval.
+      if (summary.status !== 'suspended' && ended === undefined) return;
       await hooks.reconcileApprovals(
         workflowId,
         await this.#withSuspensionTimers(workflowId, summary),
+        ended,
       );
     } catch (error) {
       console.error(
@@ -1613,10 +1644,15 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
       console.error('suspension deadline broadcast failed', error);
     }
     await this.#reconcileSuspensionDeadlinesBestEffort(workflowId, runId, next);
-    // From a fresh read, not `next`: the live projection keys a nested gate
-    // differently from the stored one a host read files against.
-    if (next.status === 'suspended')
-      await this.#reconcileApprovalsBestEffort(workflowId, runId);
+    // From a fresh authoritative read, not `next`: a host status read files
+    // against the stored projection, so filing from it keys a gate the way that
+    // read does. The hook also receives the suspension this resume ended,
+    // whatever the run did next, so it can close an approval still open for it.
+    await this.#reconcileApprovalsBestEffort(workflowId, runId, undefined, {
+      step: entry.step,
+      suspendedAt: entry.suspendedAt,
+      resumeCount: entry.resumeCount,
+    });
   }
 
   /**
@@ -2049,11 +2085,12 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
    * shows a durable run — the read a cancelled invocation cannot make. A kept
    * marker is the next wake's to settle.
    *
-   * While the leg runs it also marks its run row live in D1 every
-   * RUN_LEG_TOUCH_MS. The marker says a leg began; the touch says one is still
-   * running, from whichever instance runs it — during a deploy an outgoing
-   * instance keeps executing a leg that never touches this object's storage,
-   * while the next wake already runs on the new instance.
+   * While the leg runs, the runtime marks its run row live in D1 every
+   * RUN_LEG_TOUCH_MS (RunnerRuntime.start and resume). The marker says a leg
+   * began; the touch says one is still running, from whichever instance runs
+   * it — during a deploy an outgoing instance keeps executing a leg that never
+   * touches this object's storage, while the next wake already runs on the new
+   * instance.
    *
    * `armed` is true where the caller already holds a wake within the recovery
    * delay: the start journal's, or the watchdog an alarm body opens with.
@@ -2073,13 +2110,6 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
       startedAt: Date.now(),
     };
     this.#legs.add(frame);
-    const touch = setInterval(() => {
-      runtime
-        .touchRun(workflowId, runId)
-        .catch((error: unknown) =>
-          console.error('run leg liveness touch failed', error),
-        );
-    }, RUN_LEG_TOUCH_MS);
     const clearIfDurable = async (summary: RunSummary | null) => {
       try {
         if (summary && isDurableRunStatus(summary.status))
@@ -2118,7 +2148,6 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
       await clearIfDurable(summary);
       return summary;
     } finally {
-      clearInterval(touch);
       this.#legs.delete(frame);
     }
   }

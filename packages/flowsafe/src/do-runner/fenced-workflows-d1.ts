@@ -79,12 +79,12 @@ import {
 import { validateTablePrefix } from './table-prefix.js';
 import {
   decodeRawWorkflowSnapshotResult,
+  parseSnapshotObject,
   prepareRawWorkflowSnapshotRead,
   type RawWorkflowSnapshot,
   readRawWorkflowSnapshot,
   type SnapshotStatement,
   snapshotResultRows,
-  touchRawWorkflowSnapshot,
 } from './workflow-snapshot-row.js';
 
 const PROVENANCE = 'flowsafe.runProvenance';
@@ -467,26 +467,95 @@ function decodeSnapshotReplace(
   return decodeRawWorkflowSnapshotResult(captured, expected);
 }
 
+/**
+ * Run retention compares a row's stored `updatedAt` with its cutoff as text, so
+ * only the `Date.prototype.toISOString()` form orders correctly.
+ */
+function isCanonicalIsoTime(text: string): boolean {
+  const ms = Date.parse(text);
+  return Number.isFinite(ms) && new Date(ms).toISOString() === text;
+}
+
 async function replaceSnapshotRow(
   database: InitialAdmissionDatabase,
   tablePrefix: string,
   expected: RawWorkflowSnapshot,
   replacement: { snapshot: string; updatedAt: string },
 ): Promise<boolean> {
+  const { snapshot, updatedAt } = replacement;
   if (
     expected.tablePrefix !== tablePrefix ||
     !isPathSafeId(expected.workflowId) ||
     !isPathSafeId(expected.runId) ||
-    typeof replacement.snapshot !== 'string' ||
-    typeof replacement.updatedAt !== 'string'
+    typeof snapshot !== 'string' ||
+    typeof updatedAt !== 'string' ||
+    parseSnapshotObject(snapshot) === undefined ||
+    !isCanonicalIsoTime(updatedAt)
   )
     throw new Error('workflow snapshot replacement is malformed');
-  const result = await prepareSnapshotReplace(
-    database,
-    expected,
-    replacement,
-  ).all();
+  const result = await prepareSnapshotReplace(database, expected, {
+    snapshot,
+    updatedAt,
+  }).all();
   return decodeSnapshotReplace(result, expected) !== undefined;
+}
+
+/**
+ * The timestamp is bound as JSON text because a bound JS number would be
+ * stored as a REAL (`456.0`). A request context that is not an object makes
+ * json_set write nothing yet still count a row, so the predicate refuses it.
+ */
+async function patchLifecycleRow(
+  database: InitialAdmissionDatabase,
+  tablePrefix: string,
+  address: { workflowId: string; runId: string },
+  expected: { status: string; lifecycleRevision?: number },
+  patch: { lifecycle: object; timestamp: number; updatedAt: string },
+): Promise<boolean> {
+  const { workflowId, runId } = address;
+  const { status, lifecycleRevision } = expected;
+  const { lifecycle, timestamp, updatedAt } = patch;
+  if (
+    !isPathSafeId(workflowId) ||
+    !isPathSafeId(runId) ||
+    typeof status !== 'string' ||
+    (lifecycleRevision !== undefined &&
+      !Number.isSafeInteger(lifecycleRevision)) ||
+    lifecycle === null ||
+    typeof lifecycle !== 'object' ||
+    Array.isArray(lifecycle) ||
+    !Number.isSafeInteger(timestamp) ||
+    timestamp < 0 ||
+    typeof updatedAt !== 'string' ||
+    !isCanonicalIsoTime(updatedAt)
+  )
+    throw new Error('workflow lifecycle patch is malformed');
+  const result = await database
+    .prepare(`UPDATE "${tablePrefix}mastra_workflow_snapshot"
+    SET snapshot = json_set(snapshot,
+        '$.requestContext."${RUN_LIFECYCLE_CONTEXT_KEY}"', json(?1),
+        '$.timestamp', json(?2)),
+      updatedAt = ?3
+    WHERE workflow_name = ?4 AND run_id = ?5
+      AND CASE
+        WHEN NOT json_valid(snapshot) THEN 0
+        WHEN coalesce(json_type(snapshot, '$.requestContext'), 'object') <> 'object' THEN 0
+        ELSE json_extract(snapshot, '$.status') = ?6
+          AND ${lifecycleSql('snapshot', 'revision')} IS ?7
+          AND ${STORED_UNSETTLED_SQL}
+        END
+    RETURNING workflow_name`)
+    .bind(
+      JSON.stringify(lifecycle),
+      String(timestamp),
+      updatedAt,
+      workflowId,
+      runId,
+      status,
+      lifecycleRevision ?? null,
+    )
+    .all();
+  return writtenRowCount(captureStatementResult(result)) === 1;
 }
 
 /**
@@ -551,6 +620,47 @@ const SETTLED_ROW_GUARD_SQL = `CASE
             `${lifecycleSql('excluded.snapshot', path)} IS ${lifecycleSql('snapshot', path)}`,
         ).join(' AND ')})
     END`;
+
+/**
+ * A stored row's liveness for a leg's touch: unsettled is live, and so is
+ * JSON SQLite cannot read, which the guard also writes over.
+ */
+const STORED_LIVE_SQL = `CASE WHEN NOT json_valid(snapshot) THEN 1 ELSE (${STORED_UNSETTLED_SQL}) END`;
+
+/**
+ * SQLite counts a matched row as changed even when `updatedAt` is set to
+ * itself, so on a settled row `meta.changes` and the returned row still agree.
+ * `SET` reads the row before the update and `RETURNING` after it, and the
+ * predicate reads only `snapshot`, which the statement leaves alone.
+ */
+async function touchRunRow(
+  database: InitialAdmissionDatabase,
+  tablePrefix: string,
+  address: { workflowId: string; runId: string },
+  nowMs: number,
+): Promise<'live' | 'settled' | 'absent'> {
+  const { workflowId, runId } = address;
+  if (
+    !isPathSafeId(workflowId) ||
+    !isPathSafeId(runId) ||
+    !Number.isSafeInteger(nowMs) ||
+    nowMs < 0
+  )
+    throw new Error('workflow snapshot address is malformed');
+  const result = await database
+    .prepare(`UPDATE "${tablePrefix}mastra_workflow_snapshot"
+    SET updatedAt = CASE WHEN ${STORED_LIVE_SQL} THEN ?1 ELSE updatedAt END
+    WHERE workflow_name = ?2 AND run_id = ?3
+    RETURNING ${STORED_LIVE_SQL} AS live`)
+    .bind(new Date(nowMs).toISOString(), workflowId, runId)
+    .all();
+  const captured = captureStatementResult(result);
+  if (writtenRowCount(captured) === 0) return 'absent';
+  const live: unknown = captured.results[0]?.live;
+  if (live === 1) return 'live';
+  if (live === 0) return 'settled';
+  throw new Error('workflow snapshot touch result is malformed');
+}
 
 function terminalizationUnreadable(
   cause: unknown,
@@ -788,20 +898,20 @@ export class FencedWorkflowsStorageD1 extends WorkflowsStorageD1 {
         touchRun: (
           address: { workflowId: string; runId: string },
           nowMs: number,
-        ) =>
-          touchRawWorkflowSnapshot(
-            database,
-            {
-              tablePrefix,
-              workflowId: address.workflowId,
-              runId: address.runId,
-            },
-            nowMs,
-          ),
+        ) => touchRunRow(database, tablePrefix, address, nowMs),
         replaceSnapshot: (
           expected: RawWorkflowSnapshot,
           replacement: { snapshot: string; updatedAt: string },
         ) => replaceSnapshotRow(database, tablePrefix, expected, replacement),
+        patchRunLifecycle: (
+          address: { workflowId: string; runId: string },
+          expected: { status: string; lifecycleRevision?: number },
+          patch: {
+            lifecycle: object;
+            timestamp: number;
+            updatedAt: string;
+          },
+        ) => patchLifecycleRow(database, tablePrefix, address, expected, patch),
       });
       this[FENCED_WORKFLOW_STORAGE] = this.#admission;
     }

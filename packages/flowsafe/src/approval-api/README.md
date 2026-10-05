@@ -24,7 +24,7 @@ decision. Grants never cross an HTTP boundary.
 The approval flow has six steps:
 
 1. The workflow suspends.
-2. The host bridge creates one record for each suspended step.
+2. The host bridge, or the run's Durable Object after a resume it drives itself, creates one record for each suspended step that `RunSummary.suspensionTimers` does not list.
 3. A reviewer decides the record through a compare-and-swap transition.
 4. The service resumes the run through its Durable Object.
 5. The runner derives grants from the deployment store.
