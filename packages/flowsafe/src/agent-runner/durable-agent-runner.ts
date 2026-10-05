@@ -73,6 +73,7 @@ import {
   prepareForDurableExecution,
 } from '@mastra/core/agent/durable';
 import type { MastraDBMessage } from '@mastra/core/agent/message-list';
+import { MastraTimeoutError } from '@mastra/core/loop';
 import type { Mastra } from '@mastra/core/mastra';
 import type { RequestContext } from '@mastra/core/request-context';
 import type { AnyWorkflow, WorkflowRunStatus } from '@mastra/core/workflows';
@@ -870,6 +871,54 @@ function bindResumedLegLifecycle<T extends { status: WorkflowRunStatus }>(
       return typeof value === 'function' ? value.bind(target) : value;
     },
   });
+}
+
+// The rehydrated registry entry bypasses core's private budget installer, so a
+// resumed leg composes `modelSettings.timeout.totalMs` with its abort signal
+// here, with the same pass-through rule and timeout reason as core's
+// createTimeoutAbortSignal. The parent listener stays attached after cleanup,
+// which also runs when core evicts the entry mid-leg and must not unlink the
+// leg's own abort.
+function composeTotalBudget(
+  parent: AbortSignal,
+  totalMs: number | undefined,
+): { signal: AbortSignal; cleanup: () => void } {
+  if (
+    typeof totalMs !== 'number' ||
+    !Number.isFinite(totalMs) ||
+    totalMs <= 0
+  ) {
+    return { signal: parent, cleanup: () => undefined };
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    controller.abort(
+      new MastraTimeoutError({ timeoutType: 'total', timeoutMs: totalMs }),
+    );
+  }, totalMs);
+  // Node's timer handle has unref; the Workers runtime returns a number.
+  (timer as unknown as { unref?: () => void }).unref?.();
+  const onParentAbort = () => controller.abort(parent.reason);
+  if (parent.aborted) onParentAbort();
+  else parent.addEventListener('abort', onParentAbort, { once: true });
+  return {
+    signal: controller.signal,
+    cleanup: () => clearTimeout(timer),
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function persistedModelSettings(
+  workflowInput: unknown,
+): Record<string, unknown> | undefined {
+  if (!isRecord(workflowInput) || !isRecord(workflowInput.options)) {
+    return undefined;
+  }
+  const { modelSettings } = workflowInput.options;
+  return isRecord(modelSettings) ? modelSettings : undefined;
 }
 
 /**
@@ -1811,6 +1860,7 @@ export class FlowsafeDurableAgent<
     requestContext: RequestContext;
     abortController: AbortController;
     memory?: DurableAgentStreamOptions<TOutput>['memory'];
+    modelSettings?: Record<string, unknown>;
   }): Promise<void> {
     const wrappedAgent = this.#wrappedAgent;
     let inputProcessors: Awaited<
@@ -1846,9 +1896,12 @@ export class FlowsafeDurableAgent<
       },
     });
     const preparationOptions =
-      options.memory !== undefined
+      options.memory !== undefined || options.modelSettings !== undefined
         ? ({
-            memory: options.memory,
+            ...(options.memory !== undefined ? { memory: options.memory } : {}),
+            ...(options.modelSettings !== undefined
+              ? { modelSettings: options.modelSettings }
+              : {}),
           } as NonNullable<
             Parameters<DurableAgent<TAgentId, TTools, TOutput>['prepare']>[1]
           >)
@@ -1873,16 +1926,21 @@ export class FlowsafeDurableAgent<
     preparation.registryEntry.inputProcessors = inputProcessors;
     preparation.registryEntry.llmRequestInputProcessors =
       llmRequestInputProcessors;
+    const budget = composeTotalBudget(
+      options.abortController.signal,
+      preparation.registryEntry.timeoutTotalMs,
+    );
     let cleaned = false;
     const cleanup = () => {
       if (cleaned) return;
       cleaned = true;
+      budget.cleanup();
       preparation.registryEntry.cleanup?.();
     };
     const registryEntry = {
       ...preparation.registryEntry,
       abortController: options.abortController,
-      abortSignal: options.abortController.signal,
+      abortSignal: budget.signal,
       cleanup,
     };
     this.runRegistryInternal.registerWithMessageList(
@@ -1939,15 +1997,17 @@ export class FlowsafeDurableAgent<
           requestedBy: options.requestedBy,
           requestedByKind: 'human',
           legAbort,
-          prepareExecution: async (requestContext) => {
+          prepareExecution: async (requestContext, workflowInput) => {
             const offset = (
               await this.pubsub.getHistory(AGENT_STREAM_TOPIC(options.runId))
             ).length;
+            const modelSettings = persistedModelSettings(workflowInput);
             await this.#rehydrateRegistry({
               runId: options.runId,
               requestContext,
               abortController: legAbort,
               ...(memory !== undefined ? { memory } : {}),
+              ...(modelSettings !== undefined ? { modelSettings } : {}),
             });
             rehydrated = true;
             const observed = await this.observe(options.runId, { offset });

@@ -1,0 +1,5 @@
+---
+"@proofoftech/flowsafe": patch
+---
+
+A durable-agent leg resumed through `resumeViaRuntime()` now enforces the total time budget of its run. Before this change the resumed leg ran with no total budget, so a tool or model call that held past it was never aborted. The leg arms the `modelSettings.timeout.totalMs` the run's start call set, else the one in the agent's default options when the run started (or the current default when the start resolved none), and the budget starts again on each resumed leg. When it elapses, the leg's model and tool calls in flight see their `abortSignal` aborted with a `MastraTimeoutError` whose `timeoutType` is `'total'`, and `resumeViaRuntime()` resolves with `status: 'success'` and `result.stepResult.reason: 'error'`. A host that treats the resumed leg's success as completion of the approved action must check that reason. A start leg whose budget elapses ends its run the same way, but its `streamUntilPersisted()` rejects with the `MastraTimeoutError`. A settlement or terminate abort of the leg still reaches those calls with its own reason.

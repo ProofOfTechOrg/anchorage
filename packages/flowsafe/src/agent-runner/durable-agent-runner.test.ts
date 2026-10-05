@@ -24,6 +24,7 @@ import {
 } from '@mastra/core/agent/message-list';
 import { EventEmitterPubSub } from '@mastra/core/events';
 import type { MastraModelConfig } from '@mastra/core/llm';
+import { MastraTimeoutError } from '@mastra/core/loop';
 import { Mastra } from '@mastra/core/mastra';
 import { MockMemory } from '@mastra/core/memory';
 import {
@@ -533,6 +534,7 @@ async function realAgentBridgeFixture(
   toolLoop?: {
     model: MastraModelConfig;
     tools: Record<string, ReturnType<typeof createTool>>;
+    totalMs?: number;
   },
 ) {
   const sql = openSqlite() as ReturnType<typeof openSqlite> & { close(): void };
@@ -613,6 +615,13 @@ async function realAgentBridgeFixture(
           instructions: 'Return done.',
           ...(threaded ? { memory: new MockMemory() } : {}),
           ...(toolLoop ? { tools: toolLoop.tools } : {}),
+          ...(toolLoop?.totalMs !== undefined
+            ? {
+                defaultOptions: {
+                  modelSettings: { timeout: { totalMs: toolLoop.totalMs } },
+                },
+              }
+            : {}),
           model: toolLoop?.model ?? model,
         }),
     runtime,
@@ -4437,6 +4446,11 @@ describe('FlowsafeDurableAgent abort of the model and tool calls in flight', () 
   const RUN_ID = 'abort-run';
   const HOLD_TOOL = 'hold';
   const OPERATOR = { kind: 'human', id: 'operator-1' } as const;
+  const TOTAL_BUDGET_MS = 5_000;
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
 
   type StreamCall = (options: {
     abortSignal?: AbortSignal;
@@ -4508,6 +4522,7 @@ describe('FlowsafeDurableAgent abort of the model and tool calls in flight', () 
       requireApproval?: boolean;
       honourSignal?: boolean;
       holdModel?: boolean;
+      totalMs?: number;
     } = {},
   ) {
     const entered = bridgeDeferred();
@@ -4550,6 +4565,7 @@ describe('FlowsafeDurableAgent abort of the model and tool calls in flight', () 
               observed.modelCalls += 1;
             }),
         tools: { [HOLD_TOOL]: hold },
+        ...(options.totalMs !== undefined ? { totalMs: options.totalMs } : {}),
       },
     );
     const workflowId = f.agent.getWorkflow().id;
@@ -4575,7 +4591,12 @@ describe('FlowsafeDurableAgent abort of the model and tool calls in flight', () 
       entered,
       release,
       observed,
-      startLeg: (callOptions: { abortSignal?: AbortSignal } = {}) =>
+      startLeg: (
+        callOptions: {
+          abortSignal?: AbortSignal;
+          modelSettings?: { timeout: { totalMs: number } };
+        } = {},
+      ) =>
         track(
           f.agent
             .streamUntilPersisted(
@@ -4684,6 +4705,118 @@ describe('FlowsafeDurableAgent abort of the model and tool calls in flight', () 
       status: 'cancelled',
     });
     expect(h.observed.modelCalls).toBe(1);
+  });
+
+  it('aborts the tool call in flight of a resumed leg with a total timeout once the agent default time budget elapses', async () => {
+    // #given an agent whose default options carry a total time budget, and a
+    // run suspended at a tool approval
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const h = await heldToolAgent({
+      requireApproval: true,
+      totalMs: TOTAL_BUDGET_MS,
+    });
+    await h.startLeg();
+    expect(await h.runtime.status(h.workflowId, RUN_ID)).toMatchObject({
+      status: 'suspended',
+    });
+
+    // #when the resumed leg holds in the approved tool call until the budget
+    // elapses
+    const resumed = h.resumeLeg();
+    await h.entered.promise;
+    await vi.advanceTimersByTimeAsync(TOTAL_BUDGET_MS);
+
+    // #then the tool's signal is aborted with the total timeout
+    expect(h.observed.signal?.aborted).toBe(true);
+    expect(h.observed.signal?.reason).toBeInstanceOf(MastraTimeoutError);
+    expect(h.observed.signal?.reason).toMatchObject({
+      timeoutType: 'total',
+      timeoutMs: TOTAL_BUDGET_MS,
+    });
+
+    // #when the tool returns
+    vi.useRealTimers();
+    h.release.resolve();
+
+    // #then the resume answers with the run ended as a failed model step, as
+    // the budget ends a start leg's run, and the loop made no second model call
+    await expect(resumed).resolves.toMatchObject({
+      status: 'success',
+      result: { stepResult: { reason: 'error' } },
+    });
+    expect(h.observed.modelCalls).toBe(1);
+  });
+
+  it('aborts the tool call in flight of a resumed leg with a total timeout once the time budget its start call set elapses', async () => {
+    // #given an agent with no default time budget, and a run whose start call
+    // set a total budget and which is suspended at a tool approval
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const h = await heldToolAgent({ requireApproval: true });
+    await h.startLeg({
+      modelSettings: { timeout: { totalMs: TOTAL_BUDGET_MS } },
+    });
+    expect(await h.runtime.status(h.workflowId, RUN_ID)).toMatchObject({
+      status: 'suspended',
+    });
+
+    // #when the resumed leg holds in the approved tool call until the budget
+    // elapses
+    const resumed = h.resumeLeg();
+    await h.entered.promise;
+    await vi.advanceTimersByTimeAsync(TOTAL_BUDGET_MS);
+
+    // #then the tool's signal is aborted with the total timeout
+    expect(h.observed.signal?.aborted).toBe(true);
+    expect(h.observed.signal?.reason).toBeInstanceOf(MastraTimeoutError);
+    expect(h.observed.signal?.reason).toMatchObject({
+      timeoutType: 'total',
+      timeoutMs: TOTAL_BUDGET_MS,
+    });
+
+    // #when the tool returns
+    vi.useRealTimers();
+    h.release.resolve();
+
+    // #then the resume answers with the run ended as a failed model step, and
+    // the loop made no second model call
+    await expect(resumed).resolves.toMatchObject({
+      status: 'success',
+      result: { stepResult: { reason: 'error' } },
+    });
+    expect(h.observed.modelCalls).toBe(1);
+  });
+
+  it('aborts the tool call in flight of a resumed leg with the settlement as its reason when a time budget is configured', async () => {
+    // #given a run suspended at a tool approval, on an agent whose default
+    // options carry a total time budget that has not elapsed, resumed and held
+    // in the approved tool call, on a run another instance terminated
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const h = await heldToolAgent({
+      requireApproval: true,
+      totalMs: TOTAL_BUDGET_MS,
+    });
+    await h.startLeg();
+    void h.resumeLeg();
+    await h.entered.promise;
+    h.settle('canceled', {
+      version: 1,
+      revision: 100,
+      terminal: {
+        status: 'cancelled',
+        error: { code: 'CANCELLED', message: 'run was cancelled' },
+        transitionedAt: 1,
+        replayPrincipals: [OPERATOR],
+      },
+    });
+
+    // #when the leg's touch runs
+    await h.runtime.touchRun(h.workflowId, RUN_ID);
+
+    // #then the tool's signal carries the settlement, not a timeout
+    expect(h.observed.signal?.reason).toMatchObject({
+      name: 'AbortError',
+      cause: expect.any(RunSettledConflictError),
+    });
   });
 
   it('aborts the tool call in flight of a start leg when the caller aborts its signal', async () => {

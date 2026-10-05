@@ -288,6 +288,11 @@ const RUN_STATE_FIELDS: WorkflowStateField[] = [
   'requestContext',
 ];
 
+const RESUME_STATE_FIELDS: WorkflowStateField[] = [
+  ...RUN_STATE_FIELDS,
+  'payload',
+];
+
 /** @internal One physical observation; this does not certify a logical root. */
 export type AuthoritativeStartState = {
   readonly provenance: ProgressRunProvenance;
@@ -843,9 +848,14 @@ export type ResumeRunOptions = {
   /**
    * Host preparation that must consume the exact trusted context this resume
    * will execute with. Runs once, inside the per-run lock, before createRun.
+   * Its second argument is the run's persisted workflow input, `undefined`
+   * when the snapshot holds none. Treat it as read-only.
    * @internal
    */
-  prepareExecution?: (requestContext: RequestContext) => Promise<void>;
+  prepareExecution?: (
+    requestContext: RequestContext,
+    workflowInput: unknown,
+  ) => Promise<void>;
   /** @internal See {@link StartRunOptions.legAbort}. */
   readonly legAbort?: AbortController;
   /** Replace the persisted deadline relative to this resume. */
@@ -1802,7 +1812,12 @@ export class RunnerRuntime {
       try {
         const source = await this.#captureWorkflowStorage(workflowId);
         active.source = source;
-        const state = await this.#workflowState(workflowId, runId, true);
+        const state = await this.#workflowState(
+          workflowId,
+          runId,
+          true,
+          RESUME_STATE_FIELDS,
+        );
         if (!state) throw new UnknownRunError(workflowId, runId);
         if (state.isFromInMemory)
           throw new RunStateUnreadableError(workflowId, runId);
@@ -1863,6 +1878,7 @@ export class RunnerRuntime {
           );
           await options.prepareExecution(
             new RequestContext(Object.entries(values)),
+            state.payload,
           );
           await this.#withLifecycleLock(workflowId, runId, check);
         }
@@ -3349,9 +3365,10 @@ export class RunnerRuntime {
     workflowId: string,
     runId: string,
     withNestedWorkflows = false,
+    fields: WorkflowStateField[] = RUN_STATE_FIELDS,
   ): Promise<WorkflowState | null> {
     return this.#getWorkflow(workflowId).getWorkflowRunById(runId, {
-      fields: RUN_STATE_FIELDS,
+      fields,
       withNestedWorkflows,
     });
   }
