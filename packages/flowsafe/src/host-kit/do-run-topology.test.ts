@@ -230,6 +230,56 @@ describe('createDoRunTopology', () => {
     });
   });
 
+  it.each([
+    {
+      label: 'a re-suspension record',
+      captured: { suspendedAt: 1_000, resumeCount: 2 },
+      named: { expectedSuspension: { suspendedAt: 1_000, resumeCount: 2 } },
+    },
+    {
+      label: 'a first-suspension record',
+      captured: { suspendedAt: 1_000 },
+      named: { expectedSuspension: { suspendedAt: 1_000 } },
+    },
+    {
+      label: 'a record without a captured suspension time',
+      captured: {},
+      named: {},
+    },
+  ])('sends the expected suspension of a decided record with its resume ($label)', async ({
+    captured,
+    named,
+  }) => {
+    const { topology, requests } = harness();
+
+    await topology.resumeRecord(
+      {
+        id: 'approval-1',
+        workflowId: 'workflow-1',
+        runId: 'run-1',
+        title: 'Gate',
+        connectors: [],
+        priority: 'normal',
+        status: 'approved',
+        decision: 'approve',
+        decidedBy: 'reviewer-1',
+        stepPath: ['gate'],
+        createdAt: '2026-10-06T00:00:00.000Z',
+        updatedAt: '2026-10-06T00:00:00.000Z',
+        ...captured,
+      },
+      'approve',
+    );
+
+    expect(JSON.parse(requests[0]?.init?.body ?? '')).toEqual({
+      step: ['gate'],
+      resumeData: { approved: true, decidedBy: 'reviewer-1' },
+      requestedBy: 'reviewer-1',
+      requestedByKind: 'human',
+      ...named,
+    });
+  });
+
   it('refuses a partial schedule source before addressing the namespace', async () => {
     const { topology, namespace } = harness();
 

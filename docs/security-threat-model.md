@@ -323,7 +323,7 @@ A host with only one human reviewer must consciously choose availability or sepa
 | Threat | Control | Residual |
 | --- | --- | --- |
 | Client forges approval in resume body | Stored grant derivation; raw resume is grant-free | A workflow must protect the actual side effect with a connector, not trust `resumeData.approved` |
-| Old approval reused at another gate | Exact step, `suspendedAt`, and `resumeCount` match | Trusted run-scoped grants intentionally span legs |
+| Old approval reused at another gate | Exact step, `suspendedAt`, and `resumeCount` match for grant minting and for the decision's resume | Trusted run-scoped grants intentionally span legs |
 | Reviewer races another reviewer | Store CAS and terminal-state immutability | Batch decisions are partial, not globally transactional |
 | Reviewer approves their own action | Requester and cross-gate history checks | Explicit exemptions weaken this control |
 | Requester decides the gate after a timeout | A suspension-deadline resume keeps the run's recorded requester, so separation of duties applies to the next gate as it would without the timeout | A run that records no requester, or whose recorded requester is the reserved deadline principal, resumes under that principal |

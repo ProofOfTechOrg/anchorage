@@ -596,6 +596,7 @@ The runner preserves stable statuses and structured refusal reasons across Durab
 | `InvalidStartIdempotencyRequestError` | `400` | `INVALID_START_IDEMPOTENCY_REQUEST` | The key or reservation request is malformed |
 | `InvalidInventoryRequestError` | `400` | `INVALID_INVENTORY_REQUEST` | The category, cursor, or limit is invalid |
 | `RunStateNotStorableError` | `422` | `RUN_STATE_NOT_STORABLE` | The run state SQLite cannot parse as JSON; it was not stored |
+| `SuspensionChangedError` | `409` | `SUSPENSION_CHANGED` | A resume named a suspension its step has since left |
 
 The runtime also distinguishes unknown workflows, unknown runs, duplicate runs, runs that are not suspended, client-fixable input or resume-data errors, and internal execution or storage failures.
 

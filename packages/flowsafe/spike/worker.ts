@@ -108,6 +108,7 @@ import {
   D1ApprovalStoreFactory,
   defaultResumeData,
   type ExecutionPrincipal,
+  expectedSuspensionFor,
   principalAuditFields,
   type ResourceClaim,
   type ResourceKind,
@@ -1959,6 +1960,7 @@ function buildApprovalService(
           body: JSON.stringify({
             step: record.stepPath,
             resumeData: defaultResumeData(record, decision),
+            ...expectedSuspensionFor(record),
             requestedBy: record.decidedBy,
             requestedByKind: 'human',
           }),

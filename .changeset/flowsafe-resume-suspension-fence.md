@@ -1,0 +1,5 @@
+---
+"@proofoftech/flowsafe": patch
+---
+
+A decided approval resumes its step only while the step is still at the suspension the approval was filed for. `resumeRecord`, `resumeViaRuntime` and the agent approval resumer pass the record's suspension to `RunnerRuntime.resume` through the new `ResumeRunOptions.expectedSuspension`, and the runtime refuses a mismatch with the new `SuspensionChangedError` (HTTP 409, `reason.code` `SUSPENSION_CHANGED`) before the step runs. The decision stays recorded and the decide response reports the refused resume; a workflow run's Durable Object files the step's current suspension at once, and other hosts file it at their next reconciling status read. A resumer that builds its own resume call or body gets the same check by spreading the new `expectedSuspensionFor(record)` into it. Before this change a decision on an approval for an earlier suspension resumed the step's current suspension with that decision's `resumeData`. Records without a captured suspension time, from earlier versions, resume as before.

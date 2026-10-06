@@ -15,6 +15,7 @@ import type {
 import {
   defaultResumeData,
   encodeExecutionPrincipal,
+  expectedSuspensionFor,
 } from '../approval-api/index.js';
 import {
   deploymentIdentityHeaders,
@@ -276,6 +277,7 @@ export function createDoRunTopology<Id>(
         {
           step: record.stepPath,
           resumeData: defaultResumeData(record, decision),
+          ...expectedSuspensionFor(record),
         },
         record.decidedBy,
         'human',

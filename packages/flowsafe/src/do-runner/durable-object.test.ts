@@ -9917,6 +9917,58 @@ describe('DurableObjectRunner approvals the run object files', () => {
     expect(await store.get(record.id)).toMatchObject({ status: 'pending' });
   });
 
+  it('refuses a resume naming a suspension its step has left, and files the current suspension at once', async () => {
+    // #given a gate whose timeout resume suspended it again, with the object's
+    // own filing of that suspension failed
+    const { state, values } = durableKeyValueStorageFixture();
+    const env = timedEnv();
+    const { runtime } = env;
+    if (!runtime) throw new Error('expected a runtime');
+    const { filed, reconcile } = filingLifecycle(env);
+    reconcile.mockRejectedValueOnce(new Error('filing unavailable'));
+    const runner = new TestRunner(state, env);
+    const started = await startTimed(
+      runner,
+      'run-moved-on',
+      'timed-escalating',
+    );
+    elapseDeadlines(values);
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await runner.alarm();
+    } finally {
+      log.mockRestore();
+    }
+    const moved = await runtime.status('timed-escalating', 'run-moved-on');
+    expect(filed).toEqual([]);
+
+    // #when a decision for the first suspension resumes the run
+    const response = await runner.fetch(
+      post('/runs/timed-escalating/run-moved-on/resume', {
+        step: 'gate',
+        resumeData: { approved: true },
+        expectedSuspension: { suspendedAt: started.suspendedAt?.gate },
+      }),
+    );
+
+    // #then it is refused, the run stays at its second suspension, and that
+    // suspension's approval is filed
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({
+      reason: { code: 'SUSPENSION_CHANGED' },
+    });
+    expect(
+      await runtime.status('timed-escalating', 'run-moved-on'),
+    ).toMatchObject({ status: 'suspended', resumeCount: { gate: 1 } });
+    expect(filed).toMatchObject([
+      {
+        stepPath: ['gate'],
+        suspendedAt: moved?.suspendedAt?.gate,
+        resumeCount: 1,
+      },
+    ]);
+  });
+
   it('keeps the approval it filed for the gate a timeout resume reached when a host read from before the resume reconciles', async () => {
     // #given a gate whose timeout resume suspended it again, and the approval
     // the object filed for that second suspension

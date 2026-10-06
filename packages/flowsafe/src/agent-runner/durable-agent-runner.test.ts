@@ -4674,6 +4674,33 @@ describe('FlowsafeDurableAgent abort of the model and tool calls in flight', () 
     expect(h.observed.modelCalls).toBe(1);
   });
 
+  it('refuses a resume naming another suspension of the tool approval, before the tool runs', async () => {
+    // #given a run suspended at a tool approval
+    const h = await heldToolAgent({ requireApproval: true });
+    await h.startLeg();
+
+    // #when a resume names a suspension the run is not at
+    const resumed = h.agent.resumeViaRuntime({
+      runId: RUN_ID,
+      requestedBy: 'reviewer-1',
+      resumeData: { approved: true },
+      expectedSuspension: { suspendedAt: 1 },
+    });
+    const outcome = await Promise.race([
+      resumed.then(
+        () => 'resumed',
+        (error: unknown) => error,
+      ),
+      h.entered.promise.then(() => 'tool ran'),
+    ]);
+
+    // #then it is refused before the tool runs, and the run stays suspended
+    expect(outcome).toMatchObject({ name: 'SuspensionChangedError' });
+    expect(await h.runtime.status(h.workflowId, RUN_ID)).toMatchObject({
+      status: 'suspended',
+    });
+  });
+
   it('aborts the tool call in flight of a resumed leg whose run another instance settled', async () => {
     // #given a run suspended at a tool approval, resumed and held in the
     // approved tool call, on a run another instance terminated

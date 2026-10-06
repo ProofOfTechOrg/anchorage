@@ -102,6 +102,7 @@ import { isTerminalRunStatus } from '../do-runner/run-terminal-state.js';
 import type {
   AuthoritativeStartState,
   LegacyRunState,
+  ResumeRunOptions,
   RunnerRuntime,
   RunSummary,
   StartRunOptions,
@@ -1974,6 +1975,7 @@ export class FlowsafeDurableAgent<
     step?: string | string[];
     resumeData?: unknown;
     memory?: DurableAgentStreamOptions<TOutput>['memory'];
+    expectedSuspension?: ResumeRunOptions['expectedSuspension'];
   }): Promise<RunSummary> {
     this.#assertCallerRunId(options.runId);
     const memory = this.#guardedCallOptionMapper
@@ -1993,6 +1995,9 @@ export class FlowsafeDurableAgent<
           ...(options.step !== undefined ? { step: options.step } : {}),
           ...(options.resumeData !== undefined
             ? { resumeData: options.resumeData }
+            : {}),
+          ...(options.expectedSuspension !== undefined
+            ? { expectedSuspension: options.expectedSuspension }
             : {}),
           requestedBy: options.requestedBy,
           requestedByKind: 'human',

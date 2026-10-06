@@ -3888,6 +3888,36 @@ describe('createThreadAgentHost', () => {
     );
   });
 
+  it('forwards the suspension an approval resume names to the agent resume', async () => {
+    const fixture = harness();
+    seedSuspendedApprovalRun(fixture);
+
+    const response = await fixture.host.route(
+      new Request('https://thread/_flowsafe/agent-host/resume', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          agentId: 'writer',
+          threadId: 'acme_thread',
+          resourceId: RESOURCE_ID,
+          runId: 'acme_run',
+          entryPath: 'approval.resume',
+          requestedBy: 'reviewer-1',
+          resumeData: { approved: true },
+          expectedSuspension: { suspendedAt: 1_000, resumeCount: 2 },
+        }),
+      }),
+      fixture.scope,
+    );
+
+    expect(response?.status).toBe(200);
+    expect(mocked.resumeViaRuntime).toHaveBeenCalledWith(
+      expect.objectContaining({
+        expectedSuspension: { suspendedAt: 1_000, resumeCount: 2 },
+      }),
+    );
+  });
+
   it.each([
     ['an overlong requester', 'r'.repeat(201)],
     ['an all-whitespace requester', ' '.repeat(200)],

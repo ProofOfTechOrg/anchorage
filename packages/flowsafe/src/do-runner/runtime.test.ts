@@ -6810,6 +6810,136 @@ describe('RunnerRuntime resumeCount projection (re-suspension)', () => {
     expect(reSuspended.resumedAt?.gate2x).toBeTypeOf('number');
   });
 
+  it('refuses a resume naming a suspension its step has left, before the step runs', async () => {
+    // #given a step resumed once and suspended again
+    const runtime = buildReSuspender();
+    const started = await runtime.start('resuspend', {
+      runId: crypto.randomUUID(),
+      inputData: {},
+    });
+    const reSuspended = await runtime.resume('resuspend', started.runId, {
+      step: 'gate2x',
+      resumeData: { go: true },
+    });
+
+    // #when a resume names the first suspension
+    const stale = runtime.resume('resuspend', started.runId, {
+      step: 'gate2x',
+      resumeData: { go: true },
+      expectedSuspension: { suspendedAt: started.suspendedAt?.gate2x ?? -1 },
+    });
+
+    // #then it is refused, and the step stays at its second suspension
+    await expect(stale).rejects.toMatchObject({
+      name: 'SuspensionChangedError',
+      status: 409,
+      reason: { code: 'SUSPENSION_CHANGED' },
+    });
+    await expect(
+      runtime.status('resuspend', started.runId),
+    ).resolves.toMatchObject({
+      status: 'suspended',
+      resumeCount: { gate2x: 1 },
+      suspendedAt: { gate2x: reSuspended.suspendedAt?.gate2x },
+    });
+  });
+
+  it('resumes when the named suspension is the one the step is at', async () => {
+    // #given a step at its first suspension
+    const runtime = buildReSuspender();
+    const started = await runtime.start('resuspend', {
+      runId: crypto.randomUUID(),
+      inputData: {},
+    });
+
+    // #when each resume names the suspension the step is at
+    const reSuspended = await runtime.resume('resuspend', started.runId, {
+      step: 'gate2x',
+      resumeData: { go: true },
+      expectedSuspension: { suspendedAt: started.suspendedAt?.gate2x ?? -1 },
+    });
+    const finished = await runtime.resume('resuspend', started.runId, {
+      step: 'gate2x',
+      resumeData: { go: true },
+      expectedSuspension: {
+        suspendedAt: reSuspended.suspendedAt?.gate2x ?? -1,
+        resumeCount: 1,
+      },
+    });
+
+    // #then both resume
+    expect(reSuspended.resumeCount?.gate2x).toBe(1);
+    expect(finished.status).toBe('success');
+  });
+
+  it.each([
+    { label: 'a resume count of 0', value: { suspendedAt: 1, resumeCount: 0 } },
+    { label: 'a value that is not an object', value: 'first' },
+  ])('refuses a named suspension with $label as a malformed request', async ({
+    value,
+  }) => {
+    // #given a step at its first suspension
+    const runtime = buildReSuspender();
+    const started = await runtime.start('resuspend', {
+      runId: crypto.randomUUID(),
+      inputData: {},
+    });
+
+    // #when a resume names a malformed suspension
+    const resumed = runtime.resume('resuspend', started.runId, {
+      step: 'gate2x',
+      resumeData: { go: true },
+      expectedSuspension: value as never,
+    });
+
+    // #then it is refused before the step runs
+    await expect(resumed).rejects.toMatchObject({
+      name: 'InvalidRunRequestError',
+    });
+    await expect(
+      runtime.status('resuspend', started.runId),
+    ).resolves.not.toHaveProperty('resumeCount.gate2x');
+  });
+
+  it('refuses a named suspension when the resumed step cannot be resolved', async () => {
+    // #given two steps suspended in parallel
+    const { createWorkflow, createStep, runtime } = init(
+      { storage: new InMemoryStore() },
+      { startIdempotency: 'none', executionFence: 'none' },
+    );
+    const gate = (id: string) =>
+      createStep({
+        id,
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+        suspendSchema: z.object({ reason: z.string() }),
+        execute: async ({ resumeData, suspend }) =>
+          resumeData ? {} : suspend({ reason: `${id} waits` }),
+      });
+    createWorkflow({
+      id: 'parallel-named',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+    })
+      .parallel([gate('gateA'), gate('gateB')])
+      .commit();
+    const started = await runtime.start('parallel-named', {
+      runId: crypto.randomUUID(),
+      inputData: {},
+    });
+
+    // #when a resume names a suspension but no step
+    const resumed = runtime.resume('parallel-named', started.runId, {
+      resumeData: { go: true },
+      expectedSuspension: { suspendedAt: 1 },
+    });
+
+    // #then it is refused as a malformed request
+    await expect(resumed).rejects.toMatchObject({
+      name: 'InvalidRunRequestError',
+    });
+  });
+
   it('prepares a host from one isolated copy of the trusted resume context', async () => {
     const legs: RunLeg[] = [];
     const storage = new InMemoryStore();

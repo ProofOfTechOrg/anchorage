@@ -54,6 +54,7 @@
 
 import type {
   RequestContextProvider,
+  ResumeRunOptions,
   RunLeg,
   RunnerRuntime,
   RunSummary,
@@ -252,6 +253,27 @@ export function defaultResumeData(
 }
 
 /**
+ * The suspension a decided record resumes, as
+ * `ResumeRunOptions.expectedSuspension`, for a resumer that builds its own
+ * resume call or request body. Spread it into the resume options or body: a
+ * record without a step or without a captured `suspendedAt` (run-scoped, or
+ * from an earlier version) names none and resumes unfenced.
+ */
+export function expectedSuspensionFor(record: ApprovalRecord): {
+  expectedSuspension?: NonNullable<ResumeRunOptions['expectedSuspension']>;
+} {
+  if (!record.stepPath?.length || record.suspendedAt === undefined) return {};
+  return {
+    expectedSuspension: {
+      suspendedAt: record.suspendedAt,
+      ...(record.resumeCount === undefined
+        ? {}
+        : { resumeCount: record.resumeCount }),
+    },
+  };
+}
+
+/**
  * ApprovalServiceOptions.resumeRun for same-process deployments: resumes the
  * decided run on a RunnerRuntime (rejects are resumed too — the workflow
  * learns the outcome from resumeData.approved). Cross-Worker deployments
@@ -278,6 +300,7 @@ export function resumeViaRuntime(
       resumeData: buildResumeData(record, decision),
       requestedBy: record.decidedBy,
       requestedByKind: 'human',
+      ...expectedSuspensionFor(record),
     });
   };
 }

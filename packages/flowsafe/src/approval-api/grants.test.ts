@@ -7,6 +7,7 @@ import {
   approvalGrantProvider,
   connectorGrantsForLeg,
   defaultResumeData,
+  expectedSuspensionFor,
   resumeViaRuntime,
 } from './grants.js';
 import { InMemoryApprovalStore } from './store.js';
@@ -587,6 +588,33 @@ describe('defaultResumeData', () => {
     expect(defaultResumeData(record({}), 'reject')).toEqual({
       approved: false,
     });
+  });
+});
+
+describe('expectedSuspensionFor', () => {
+  it.each([
+    {
+      label: 'a re-suspension record',
+      overrides: { stepPath: ['gate'], suspendedAt: 1_000, resumeCount: 2 },
+      expected: { expectedSuspension: { suspendedAt: 1_000, resumeCount: 2 } },
+    },
+    {
+      label: 'a first-suspension record',
+      overrides: { stepPath: ['gate'], suspendedAt: 1_000 },
+      expected: { expectedSuspension: { suspendedAt: 1_000 } },
+    },
+    {
+      label: 'a record without a captured suspension time',
+      overrides: { stepPath: ['gate'] },
+      expected: {},
+    },
+    {
+      label: 'a run-scoped record',
+      overrides: { runScoped: true, suspendedAt: 1_000 },
+      expected: {},
+    },
+  ])('derives the expected suspension of $label', ({ overrides, expected }) => {
+    expect(expectedSuspensionFor(record(overrides))).toEqual(expected);
   });
 });
 

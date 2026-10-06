@@ -48,6 +48,7 @@ import {
   BREAKWATER_WORKFLOW_SCOPE_KEY,
 } from './breakwater-keys.js';
 import { errorMessageOf, findInCauseChain } from './cause-chain.js';
+import { DoStatusError } from './do-status-error.js';
 import {
   assertMutationEpoch,
   type D1RunExecutionIdentity,
@@ -164,6 +165,22 @@ export class RunNotSuspendedError extends Error {
       `run '${runId}' of workflow '${workflowId}' is '${status}', not 'suspended'`,
     );
     this.name = 'RunNotSuspendedError';
+  }
+}
+
+/**
+ * A resume that names the suspension it is for, of a step that has since left
+ * it: resumed and suspended again, or no longer suspended at all.
+ */
+export class SuspensionChangedError extends DoStatusError {
+  readonly status = 409;
+  readonly reason = { code: 'SUSPENSION_CHANGED' } as const;
+
+  constructor(workflowId: string, runId: string, step: string) {
+    super(
+      `step '${step}' of run '${runId}' of workflow '${workflowId}' is no longer at the suspension the resume names`,
+    );
+    this.name = 'SuspensionChangedError';
   }
 }
 
@@ -868,6 +885,17 @@ export type ResumeRunOptions = {
   deadlineMs?: number;
   /** Trusted settlement projection for the resumed execution leg. */
   economicOperations?: readonly RunEconomicOperation[];
+  /**
+   * The suspension this resume is for, as a decided approval records it: the
+   * step's `suspendedAt` and its `resumeCount`, absent for a step's first
+   * suspension. When the resumed step is at another suspension the resume
+   * throws SuspensionChangedError before the step runs. The resumed step must
+   * be resolvable: named by `step`, or the only suspended step.
+   */
+  expectedSuspension?: {
+    readonly suspendedAt: number;
+    readonly resumeCount?: number;
+  };
 } & OptionalRunRequester;
 
 export interface RunLifecycleCas {
@@ -958,6 +986,32 @@ function assertLegAbort(legAbort: unknown): void {
 function assertRunInputDepth(field: string, value: unknown): void {
   if (exceedsRunInputDepth(value))
     throw new InvalidRunRequestError(runInputDepthMessage(field));
+}
+
+/**
+ * `resumeCount` is absent on a first suspension and 1, 2, … after it, so 0 is
+ * malformed rather than a suspension the step can be at.
+ */
+function captureExpectedSuspension(
+  value: unknown,
+): ResumeRunOptions['expectedSuspension'] {
+  if (value === undefined) return undefined;
+  if (value === null || typeof value !== 'object' || Array.isArray(value))
+    throw new InvalidRunRequestError('expectedSuspension is malformed');
+  const { suspendedAt, resumeCount } = value as Record<string, unknown>;
+  if (
+    !Number.isSafeInteger(suspendedAt) ||
+    (suspendedAt as number) < 0 ||
+    (resumeCount !== undefined &&
+      (!Number.isSafeInteger(resumeCount) || (resumeCount as number) < 1))
+  )
+    throw new InvalidRunRequestError('expectedSuspension is malformed');
+  return Object.freeze({
+    suspendedAt: suspendedAt as number,
+    ...(resumeCount === undefined
+      ? {}
+      : { resumeCount: resumeCount as number }),
+  });
 }
 
 function isRunStateNotStorable(error: unknown): boolean {
@@ -1864,6 +1918,9 @@ export class RunnerRuntime {
     const { legAbort } = options;
     assertLegAbort(legAbort);
     assertRunInputDepth('resumeData', options.resumeData);
+    const expectedSuspension = captureExpectedSuspension(
+      options.expectedSuspension,
+    );
     this.#getWorkflow(workflowId);
     const proof = await this.#assertResumeFence(workflowId, runId);
     return this.#withRunLock(workflowId, runId, async () => {
@@ -1901,11 +1958,7 @@ export class RunnerRuntime {
           workflowId,
           runId,
           state,
-          options.step,
-          options.requestedBy,
-          options.requestedByKind,
-          options.deadlineMs,
-          options.economicOperations,
+          { ...options, expectedSuspension },
         );
         provenance = prepared.provenance;
         const { requestContext, lifecycle, nextCounts } = prepared;
@@ -3327,17 +3380,29 @@ export class RunnerRuntime {
     workflowId: string,
     runId: string,
     state: WorkflowState,
-    selectedStep: string | string[] | undefined,
-    requestedBy?: string,
-    requestedByKind?: ExecutionPrincipalKind,
-    deadlineMs?: number,
-    economicOperations?: readonly RunEconomicOperation[],
+    options: Pick<
+      ResumeRunOptions,
+      | 'step'
+      | 'requestedBy'
+      | 'requestedByKind'
+      | 'deadlineMs'
+      | 'economicOperations'
+      | 'expectedSuspension'
+    >,
   ): Promise<{
     nextCounts: ReadonlyMap<string, number>;
     provenance: RunProvenance;
     requestContext: RequestContext;
     lifecycle?: RunLifecycleState;
   }> {
+    const {
+      step: selectedStep,
+      requestedBy,
+      requestedByKind,
+      deadlineMs,
+      economicOperations,
+      expectedSuspension,
+    } = options;
     if (requestedBy !== undefined && !isExecutionPrincipalId(requestedBy)) {
       throw new InvalidRunRequestError('requestedBy is malformed');
     }
@@ -3373,6 +3438,20 @@ export class RunnerRuntime {
         ? storedProvenance?.requestedByKind
         : requestedByKind;
     const priorCounts = new Map(storedProvenance?.resumeCounts ?? []);
+    // The pair the leg's grant minting reads below, compared as
+    // boundToCurrentSuspension compares it.
+    if (expectedSuspension !== undefined) {
+      if (stepKey === undefined)
+        throw new InvalidRunRequestError(
+          'expectedSuspension requires a resolvable resumed step',
+        );
+      if (
+        suspendedAtOf(state.steps, stepKey) !==
+          expectedSuspension.suspendedAt ||
+        priorCounts.get(stepKey) !== expectedSuspension.resumeCount
+      )
+        throw new SuspensionChangedError(workflowId, runId, stepKey);
+    }
     const nextCounts = new Map(priorCounts);
     if (stepKey !== undefined) {
       nextCounts.set(stepKey, nextResumeCount(nextCounts.get(stepKey) ?? 0));

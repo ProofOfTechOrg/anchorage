@@ -263,6 +263,32 @@ describe('createAgentThreadTopology', () => {
     expect(hits[1]?.url).toContain('offset=4');
   });
 
+  it('sends the suspension a decided record was filed for with its approval resume', async () => {
+    const { topology, hits } = harness();
+    const scoped = context();
+    const record = {
+      workflowId: 'durable-agentic-loop',
+      runId: 'acme_run',
+      decidedBy: 'reviewer-1',
+      stepPath: ['tool'],
+      suspendedAt: 1_000,
+      resumeCount: 2,
+      resumeTarget: {
+        kind: 'agent-thread',
+        agentId: 'writer',
+        threadId: 'acme_thread',
+        resourceId: 'acme_resource_acme_thread',
+        principal: scoped.value.actor,
+      },
+    } as ApprovalRecord;
+
+    await topology.resume(scoped.value, record, 'approve');
+
+    expect(JSON.parse(hits[0]?.init?.body ?? '{}')).toMatchObject({
+      expectedSuspension: { suspendedAt: 1_000, resumeCount: 2 },
+    });
+  });
+
   it('routes path-safe ids after context authorization', async () => {
     const { topology, hits } = harness();
     const scoped = context();

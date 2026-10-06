@@ -1119,6 +1119,94 @@ describe('approval queue end to end', () => {
     expect(harness.publishes()).toBe(0);
   });
 
+  it('refuses to resume a decided approval into a later suspension of its step', async () => {
+    // #given gate2x approved for its first suspension, whose resume suspended
+    // the same step again
+    const harness = buildHarness();
+    const started = await harness.runtime.start('relaunch', {
+      runId: `acme_${crypto.randomUUID()}`,
+      inputData: { topic: 'respun' },
+    });
+    const { record: first } = await harness.service.create(
+      {
+        workflowId: 'relaunch',
+        runId: started.runId,
+        stepPath: ['gate2x'],
+        suspendedAt: suspendedAtFor(started, ['gate2x']),
+        resumeCount: resumeCountFor(started, ['gate2x']),
+        title: 'Gate 2x — round 1',
+        connectors: ['blog-publisher'],
+      },
+      OPERATOR,
+    );
+    const decided = await harness.service.decide(
+      first.id,
+      { decision: 'approve' },
+      REVIEWER,
+    );
+    expect(decided.resume.summary).toMatchObject({ suspended: [['gate2x']] });
+
+    // #when the first suspension's decision resumes the run again
+    const replay = resumeViaRuntime(harness.runtime)(decided.record, 'approve');
+
+    // #then it is refused, and the step stays at its second suspension
+    await expect(replay).rejects.toMatchObject({
+      name: 'SuspensionChangedError',
+      status: 409,
+      reason: { code: 'SUSPENSION_CHANGED' },
+    });
+    const current = await harness.runtime.status('relaunch', started.runId);
+    expect(current).toMatchObject({
+      status: 'suspended',
+      suspended: [['gate2x']],
+    });
+    expect(resumeCountFor(current, ['gate2x'])).toBe(1);
+  });
+
+  it('reports the refused resume of an approval whose suspension the step has left', async () => {
+    // #given an approval filed for gate2x's first suspension, and the step
+    // resumed past it without a decision
+    const harness = buildHarness();
+    const started = await harness.runtime.start('relaunch', {
+      runId: `acme_${crypto.randomUUID()}`,
+      inputData: { topic: 'respun' },
+    });
+    const { record: first } = await harness.service.create(
+      {
+        workflowId: 'relaunch',
+        runId: started.runId,
+        stepPath: ['gate2x'],
+        suspendedAt: suspendedAtFor(started, ['gate2x']),
+        resumeCount: resumeCountFor(started, ['gate2x']),
+        title: 'Gate 2x — round 1',
+        connectors: ['blog-publisher'],
+      },
+      OPERATOR,
+    );
+    await harness.runtime.resume('relaunch', started.runId, {
+      step: 'gate2x',
+      resumeData: { approved: true },
+    });
+
+    // #when the approval is decided
+    const decided = await harness.service.decide(
+      first.id,
+      { decision: 'approve' },
+      REVIEWER,
+    );
+
+    // #then the decision stands, its resume is reported refused, and the step
+    // stays at its second suspension
+    expect(decided.record.status).toBe('approved');
+    expect(decided.resume).toMatchObject({ attempted: true, ok: false });
+    const current = await harness.runtime.status('relaunch', started.runId);
+    expect(current).toMatchObject({
+      status: 'suspended',
+      suspended: [['gate2x']],
+    });
+    expect(resumeCountFor(current, ['gate2x'])).toBe(1);
+  });
+
   it('a spent approval does not mint into a NO-PAYLOAD re-suspension (falsy-resume regression)', async () => {
     // The reported leak: Mastra stamps resumedAt only on a payload-bearing
     // resume, so a re-suspension reached via a falsy resume left the old

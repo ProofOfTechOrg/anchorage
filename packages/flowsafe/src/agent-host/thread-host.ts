@@ -69,6 +69,7 @@ import {
   DoStatusError,
   isPathSafeId,
   type RequestContextProvider,
+  type ResumeRunOptions,
   type RunSummary,
   resolveScheduleStartOwner,
   resourceIdFromKey,
@@ -2686,6 +2687,13 @@ export function createThreadAgentHost(
               requestedBy: requesterId,
               ...(step !== undefined ? { step } : {}),
               ...resumeFields,
+              // The runtime validates it.
+              ...(body.expectedSuspension === undefined
+                ? {}
+                : {
+                    expectedSuspension:
+                      body.expectedSuspension as ResumeRunOptions['expectedSuspension'],
+                  }),
               ...(snapshotExecution.threaded
                 ? {
                     memory: {
