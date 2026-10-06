@@ -11,6 +11,7 @@
   "include": [
     "packages/breakwater/worker-tests/**/*.ts",
     "packages/flowsafe/src/cloudflare-fidelity.workerd.test.ts",
+    "packages/flowsafe/src/do-runner/fenced-workflows-d1.workerd.test.ts",
     "packages/flowsafe/test-support/cloudflare-test-worker.ts",
     "packages/flowsafe/test-support/harness-probe.ts",
     "scripts/flowsafe-harness.test.ts",

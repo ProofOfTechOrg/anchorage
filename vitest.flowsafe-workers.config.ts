@@ -12,6 +12,15 @@ export default defineConfig(async () => {
         miniflare: {
           // The pool otherwise gives its runner today's unsupported date.
           compatibilityDate: '2025-06-01',
+          // @mastra/core imports Node modules this date provides only by flag;
+          // without the flag the test module fails to load.
+          compatibilityFlags: [
+            'nodejs_compat',
+            'enable_nodejs_os_module',
+            'enable_nodejs_fs_module',
+            'enable_nodejs_http_modules',
+            'enable_nodejs_child_process_module',
+          ],
         },
         wrangler: {
           configPath: './packages/flowsafe/spike/wrangler.jsonc',
