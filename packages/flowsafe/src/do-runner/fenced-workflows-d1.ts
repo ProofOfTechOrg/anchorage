@@ -51,6 +51,7 @@ import {
   RUN_SETTLING_MARKERS,
   RunLifecycleBlockedError,
   RunSettledConflictError,
+  RunStateNotStorableError,
   terminalCleanupFor,
 } from './run-lifecycle.js';
 import {
@@ -456,7 +457,10 @@ function writtenRowCount({
   return results.length;
 }
 
-/** Exact-row compare-and-set of a snapshot row's `snapshot` and `updatedAt`. */
+/**
+ * Exact-row compare-and-set of a snapshot row's `snapshot` and `updatedAt`. It
+ * matches nothing for a replacement SQLite cannot parse over a row it can.
+ */
 function prepareSnapshotReplace(
   database: InitialAdmissionDatabase,
   expected: RawWorkflowSnapshot,
@@ -468,6 +472,7 @@ function prepareSnapshotReplace(
     WHERE workflow_name = ?3 AND run_id = ?4
       AND snapshot = ?5 AND createdAt IS ?6 AND updatedAt IS ?7
       AND resourceId IS ?8
+      AND (json_valid(?1) OR NOT json_valid(?5))
     RETURNING workflow_name, run_id, resourceId, snapshot, createdAt, updatedAt`)
     .bind(
       replacement.snapshot,
@@ -521,7 +526,20 @@ async function replaceSnapshotRow(
     snapshot,
     updatedAt,
   }).all();
-  return decodeSnapshotReplace(result, expected) !== undefined;
+  if (decodeSnapshotReplace(result, expected) !== undefined) return true;
+  // A miss is a refusal when the bound texts alone decide it, and a row that
+  // changed otherwise.
+  const verdict = await decisionRow(
+    database,
+    'SELECT json_valid(?1) AS storable, json_valid(?2) AS expected_readable',
+    [snapshot, expected.snapshot],
+  );
+  if (
+    !decisionFlag(verdict, 'storable') &&
+    decisionFlag(verdict, 'expected_readable')
+  )
+    throw new RunStateNotStorableError(expected.workflowId, expected.runId);
+  return false;
 }
 
 /**
@@ -760,20 +778,26 @@ function decisionFlag(row: Record<string, unknown>, column: string): boolean {
   return value === 1;
 }
 
-/** Whether SQLite can read the row a write was refused over; undefined when it is gone. */
+/**
+ * Whether SQLite can read the row a write was refused over (undefined when it
+ * is gone), and whether it can read the refused write.
+ */
 async function probeRefusedWrite(
   database: InitialAdmissionDatabase,
   tablePrefix: string,
   address: { workflowId: string; runId: string },
-): Promise<{ readable: boolean | undefined }> {
+  incoming: string,
+): Promise<{ readable: boolean | undefined; storable: boolean }> {
   const row = await decisionRow(
     database,
     `SELECT (SELECT json_valid(snapshot) FROM "${tablePrefix}mastra_workflow_snapshot"
-      WHERE workflow_name = ?1 AND run_id = ?2) AS readable`,
-    [address.workflowId, address.runId],
+      WHERE workflow_name = ?1 AND run_id = ?2) AS readable,
+      json_valid(?3) AS storable`,
+    [address.workflowId, address.runId, incoming],
   );
   return {
     readable: row.readable === null ? undefined : decisionFlag(row, 'readable'),
+    storable: decisionFlag(row, 'storable'),
   };
 }
 
@@ -1316,6 +1340,11 @@ export class FencedWorkflowsStorageD1 extends WorkflowsStorageD1 {
     }
   }
 
+  /**
+   * The upsert refuses a snapshot SQLite cannot parse, and any write over a row
+   * SQLite cannot parse; the probe then sends such a row to
+   * writeOverUnreadableRow, so a row stored earlier stays writable.
+   */
   async #persistUnlessSettled(
     capability: FencedWorkflowAdmissionCapability,
     args: PersistInput,
@@ -1325,7 +1354,8 @@ export class FencedWorkflowsStorageD1 extends WorkflowsStorageD1 {
     const result = await database
       .prepare(`INSERT INTO "${tablePrefix}mastra_workflow_snapshot"
       (workflow_name, run_id, resourceId, snapshot, createdAt, updatedAt)
-      VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+      SELECT ?1, ?2, ?3, ?4, ?5, ?6
+      WHERE json_valid(?4)
       ON CONFLICT (workflow_name, run_id) DO UPDATE
         SET snapshot = excluded.snapshot, updatedAt = excluded.updatedAt
         WHERE ${SETTLED_ROW_GUARD_SQL}
@@ -1340,14 +1370,20 @@ export class FencedWorkflowsStorageD1 extends WorkflowsStorageD1 {
       )
       .all();
     if (writtenRowCount(captureStatementResult(result)) === 1) return;
-    // The guard refused a readable row; a row gone since the upsert met it is
-    // refused too, so a purged settlement is not written over.
-    const refused = await probeRefusedWrite(database, tablePrefix, {
-      workflowId: row.workflowName,
-      runId: row.runId,
-    });
-    if (refused.readable !== false)
+    // The guard refused a readable row, or the write is not storable; a row
+    // gone since the upsert met it is refused too, so a purged settlement is
+    // not written over.
+    const refused = await probeRefusedWrite(
+      database,
+      tablePrefix,
+      { workflowId: row.workflowName, runId: row.runId },
+      row.snapshot,
+    );
+    if (refused.readable !== false) {
+      if (!refused.storable)
+        throw new RunStateNotStorableError(row.workflowName, row.runId);
       throw new RunSettledConflictError(row.workflowName, row.runId);
+    }
     // Persists through this storage over one run's unreadable row run one at a
     // time, so they do not make each other's compare-and-set miss.
     await serializedByKey(
@@ -1488,7 +1524,7 @@ export class FencedWorkflowsStorageD1 extends WorkflowsStorageD1 {
         .prepare(`INSERT INTO "${row.tablePrefix}mastra_workflow_snapshot"
       (workflow_name, run_id, resourceId, snapshot, createdAt, updatedAt)
       SELECT ${fields.join(', ')}
-      WHERE ${fencePredicate} ${reservation} ${owner}
+      WHERE ${fencePredicate} AND json_valid(${fields[3]}) ${reservation} ${owner}
       ON CONFLICT (workflow_name, run_id) DO NOTHING
       RETURNING workflow_name, run_id, resourceId, snapshot, createdAt, updatedAt`)
         .bind(...values),
@@ -1546,7 +1582,12 @@ export class FencedWorkflowsStorageD1 extends WorkflowsStorageD1 {
     }
     const positive = this.#decodeBatch(result, input, row, observed, nowMs);
     if (positive) return Object.freeze({ execution: input.execution, row });
-    const refusal = await this.#diagnoseZero(database, input, observed);
+    const refusal = await this.#diagnoseZero(
+      database,
+      input,
+      observed,
+      row.snapshot,
+    );
     throw definitiveInitialAdmissionRefusal(input.execution, refusal);
   }
 
@@ -1699,8 +1740,19 @@ export class FencedWorkflowsStorageD1 extends WorkflowsStorageD1 {
     database: InitialAdmissionDatabase,
     input: InitialRunAdmission,
     observed: ExecutionFenceAdmissionObservation,
+    admissionSnapshot: string,
   ): Promise<DoStatusError> {
     try {
+      const admission = await decisionRow(
+        database,
+        'SELECT json_valid(?1) AS storable',
+        [admissionSnapshot],
+      );
+      if (!decisionFlag(admission, 'storable'))
+        return new RunStateNotStorableError(
+          input.execution.workflowId,
+          input.execution.runId,
+        );
       const [current, snapshot, reservation, owner] = await Promise.all([
         input.fence.readForAdmission(),
         readRawWorkflowSnapshot(database, input.execution, {

@@ -5,6 +5,7 @@ import type { MastraCompositeStore } from '@mastra/core/storage';
 import type { GuardedAgentHandle } from '@proofoftech/breakwater/agent';
 import { beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import { z } from 'zod';
+import { nestedArray } from '../../test-support/deep-json.js';
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import {
   AgentRunSelectorMismatchError,
@@ -2006,6 +2007,82 @@ describe('createThreadAgentHost', () => {
         dispatchId: DISPATCH_ID,
       }),
     ).rejects.toMatchObject({ status: 400 });
+    expect(mocked.stream).not.toHaveBeenCalled();
+    expect(reserve).not.toHaveBeenCalled();
+    expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(false);
+    expect(fixture.state.has(THREAD_BINDING_KEY)).toBe(false);
+    expect(fixture.state.has(TEST_OWNER_RECOVERY_KEY)).toBe(false);
+  });
+
+  it.each([
+    ['safeContext', { safeContext: { note: nestedArray(257) } }],
+    [
+      'messages',
+      {
+        prompt: undefined,
+        messages: [
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'text',
+                text: 'x',
+                providerMetadata: { app: nestedArray(257) },
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  ] as const)('refuses an agent start whose %s nests 257 levels deep before writing its journal', async (_field, deep) => {
+    // #given a start whose caller input nests 257 levels
+    const fixture = harness();
+    const reserve = vi.spyOn(fixture.resourceAccess, 'reserveAll');
+
+    // #when the host starts the run
+    const started = fixture.host.start(fixture.scope, {
+      ...THREAD_START_INPUT,
+      ...deep,
+    } as unknown as ThreadAgentStartInput);
+
+    // #then it is refused as a bad request before anything is stored or streamed
+    await expect(started).rejects.toMatchObject({ status: 400 });
+    expect(mocked.stream).not.toHaveBeenCalled();
+    expect(reserve).not.toHaveBeenCalled();
+    expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(false);
+    expect(fixture.state.has(THREAD_BINDING_KEY)).toBe(false);
+    expect(fixture.state.has(TEST_OWNER_RECOVERY_KEY)).toBe(false);
+  });
+
+  it('refuses a scheduled agent start whose stored context nests 257 levels deep', async () => {
+    // #given a schedule whose stored target context nests 257 levels
+    const fixture = harness();
+    await seedScheduleOwner(
+      fixture,
+      {
+        type: 'agent',
+        agentId: 'writer',
+        prompt: 'stored prompt',
+        requestContext: { note: nestedArray(257) },
+      },
+      HUMAN_OWNER,
+      SCHEDULE_ID,
+      DISPATCH_ID,
+      'acme_run',
+    );
+    const reserve = vi.spyOn(fixture.resourceAccess, 'reserveAll');
+
+    // #when the schedule fires
+    const fired = fixture.host.start(fixture.scope, {
+      ...THREAD_START_INPUT,
+      entryPath: 'schedule.fire',
+      threaded: false,
+      scheduleId: SCHEDULE_ID,
+      dispatchId: DISPATCH_ID,
+    });
+
+    // #then the start is refused as a bad request before anything is stored
+    await expect(fired).rejects.toMatchObject({ status: 400 });
     expect(mocked.stream).not.toHaveBeenCalled();
     expect(reserve).not.toHaveBeenCalled();
     expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(false);

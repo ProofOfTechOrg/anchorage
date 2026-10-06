@@ -10,6 +10,13 @@ export function nestedArray(levels: number): unknown {
   return value;
 }
 
+/** `levels` nested objects around a string leaf: JSON nesting depth `levels`. */
+export function nestedObject(levels: number): unknown {
+  let value: unknown = 'leaf';
+  for (let level = 0; level < levels; level++) value = { next: value };
+  return value;
+}
+
 /**
  * `snapshot` carrying a value nested past SQLite's JSON depth: under a key of
  * its request context when that is an object, where a tenant's value reaches a

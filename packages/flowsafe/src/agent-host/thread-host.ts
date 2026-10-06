@@ -79,6 +79,10 @@ import {
 import { isDefinitiveInitialAdmissionRefusal } from '../do-runner/initial-admission-refusal.js';
 import { mastraRegistryEntries } from '../do-runner/mastra-registry.js';
 import {
+  exceedsRunInputDepth,
+  runInputDepthMessage,
+} from '../do-runner/run-input-depth.js';
+import {
   lifecycleFromRequestContext,
   terminalCleanupFor,
 } from '../do-runner/run-lifecycle.js';
@@ -417,9 +421,15 @@ function safeContext(value: unknown): Record<string, unknown> {
     value === undefined ||
     (value !== null && typeof value === 'object' && !Array.isArray(value))
   ) {
-    return sanitizeStoredAgentContext(
+    const context = sanitizeStoredAgentContext(
       value as Record<string, unknown> | undefined,
     );
+    if (Object.values(context).some((item) => exceedsRunInputDepth(item)))
+      throw new AgentHostRequestError(
+        400,
+        runInputDepthMessage('a safeContext value'),
+      );
+    return context;
   }
   throw new AgentHostRequestError(400, 'safeContext must be an object');
 }
@@ -2113,6 +2123,11 @@ export function createThreadAgentHost(
       }
       try {
         assertNoGuardedSystemMessages(messagesSnapshot);
+        if (exceedsRunInputDepth(messagesSnapshot))
+          throw new AgentHostRequestError(
+            400,
+            runInputDepthMessage('agent input'),
+          );
         assertAcceptedCallProviderOptions(providerOptionsSnapshot);
       } catch (error) {
         if (error instanceof TypeError) {

@@ -236,6 +236,11 @@ const pendingTargetReceipt = async (): Promise<never> => {
   throw new Error('target receipt pending');
 };
 
+/** The lookup of a host that holds no such run, as the run-ownership check answers it. */
+const absentRunLookup = async (): Promise<never> => {
+  throw Object.assign(new Error('run not found'), { status: 404 });
+};
+
 describe('canPersistScheduledAgentSignal', () => {
   it('requires the registered schedule, thread, and resource to share one owner', async () => {
     const source = {
@@ -710,7 +715,127 @@ describe('createScheduleTick', () => {
   });
 
   it.each([
-    400, 403, 404,
+    400, 403, 404, 422,
+  ])('settles an unthreaded agent start refusal with status %s as failed when its run was never reserved', async (statusCode) => {
+    // #given an unthreaded agent schedule whose start the host refuses before
+    // it reserves a run, so the host answers 404 for the run's status
+    const store = new FakeStore();
+    store.seed(
+      workflowSchedule({
+        id: 'agent_refused',
+        target: { type: 'agent', agentId: 'a1', prompt: 'go' },
+        ownerType: 'agent',
+        ownerId: 'a1',
+      }),
+    );
+    const startAgent = vi.fn(async () => {
+      throw Object.assign(new Error('refused'), { status: statusCode });
+    });
+    const events: ScheduleTickAuditEvent[] = [];
+
+    // #when the schedule fires
+    const result = await createScheduleTick({
+      store,
+      start: vi.fn(),
+      startAgent,
+      status: absentRunLookup,
+      now: () => NOW,
+      audit: (event) => {
+        events.push(event);
+      },
+    })();
+
+    // #then the fire is recorded as failed, the schedule advances, and no
+    // deferred trigger is left to reconcile
+    expect(result).toMatchObject({ fired: 0, failed: 1, deferred: 0 });
+    expect(store.triggers[0]).toMatchObject({
+      outcome: 'failed',
+      error: 'refused',
+      metadata: { reason: 'dispatch-refused' },
+    });
+    expect(store.schedules.get('agent_refused')?.nextFireAt).toBeGreaterThan(
+      NOW,
+    );
+    expect(events).toEqual([
+      expect.objectContaining({
+        outcome: 'failed',
+        reason: 'dispatch-refused',
+      }),
+    ]);
+  });
+
+  it.each([
+    ['fails without a status', pendingTargetReceipt],
+    [
+      'answers 503',
+      async (): Promise<never> => {
+        throw Object.assign(new Error('pending'), { status: 503 });
+      },
+    ],
+  ] as const)('keeps an unthreaded agent start refusal deferred when the run status lookup %s', async (_, lookup) => {
+    // #given an unthreaded agent schedule whose start the host refused with a
+    // status that can follow a stored run, and a lookup that cannot say the run
+    // is absent
+    const store = new FakeStore();
+    store.seed(
+      workflowSchedule({
+        id: 'agent_unproven',
+        target: { type: 'agent', agentId: 'a1', prompt: 'go' },
+        ownerType: 'agent',
+        ownerId: 'a1',
+      }),
+    );
+
+    // #when the schedule fires
+    const result = await createScheduleTick({
+      store,
+      start: vi.fn(),
+      startAgent: async () => {
+        throw Object.assign(new Error('refused'), { status: 422 });
+      },
+      status: lookup,
+      now: () => NOW,
+    })();
+
+    // #then the fire stays deferred, so the run's own outcome decides it
+    expect(result).toMatchObject({ deferred: 1, failed: 0 });
+    expect(store.triggers[0]).toMatchObject({ outcome: 'deferred' });
+  });
+
+  it.each([
+    409, 502, 503,
+  ])('keeps an unthreaded agent start refusal with status %s deferred', async (statusCode) => {
+    // #given an unthreaded agent schedule whose start fails in a way a retry can clear
+    const store = new FakeStore();
+    store.seed(
+      workflowSchedule({
+        id: 'agent_retryable',
+        target: { type: 'agent', agentId: 'a1', prompt: 'go' },
+        ownerType: 'agent',
+        ownerId: 'a1',
+      }),
+    );
+
+    // #when the schedule fires
+    const result = await createScheduleTick({
+      store,
+      start: vi.fn(),
+      startAgent: async () => {
+        throw Object.assign(new Error('retryable refusal'), {
+          status: statusCode,
+        });
+      },
+      status: absentRunLookup,
+      now: () => NOW,
+    })();
+
+    // #then the trigger stays deferred
+    expect(result).toMatchObject({ deferred: 1, failed: 0 });
+    expect(store.triggers[0]).toMatchObject({ outcome: 'deferred' });
+  });
+
+  it.each([
+    400, 403, 404, 422,
   ])('settles a threaded signal refusal with status %s as failed and advances the schedule', async (statusCode) => {
     const store = new FakeStore();
     store.seed(threadedSchedule());

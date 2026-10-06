@@ -35,6 +35,10 @@ import {
   UnknownRunError,
   UnknownWorkflowError,
 } from '../do-runner/index.js';
+import {
+  exceedsRunInputDepth,
+  runInputDepthMessage,
+} from '../do-runner/run-input-depth.js';
 import { readBoundedBody } from '../http-body.js';
 import { internalErrorResponse } from '../internal-error-response.js';
 import { queueApprovalForSuspension } from './approval-bridge.js';
@@ -297,6 +301,16 @@ function errorResponse(error: unknown): Response {
 
 const MAX_RUN_BODY_BYTES = 1_048_576;
 
+/**
+ * Refuses tenant JSON the run object could not store, before anything claims a
+ * reservation or serializes the body to forward it: JSON.stringify throws on
+ * nesting a body within MAX_RUN_BODY_BYTES can reach.
+ */
+function assertRunInputDepth(field: string, value: unknown): void {
+  if (exceedsRunInputDepth(value))
+    throw new InvalidRunRequestError(runInputDepthMessage(field));
+}
+
 async function readJson(request: Request): Promise<unknown> {
   const raw = await readBoundedBody(
     request,
@@ -524,6 +538,9 @@ export function createRunRouter(options: RunRouterOptions): RunRouter {
           }
           assertNoReservedExecutionContext(requestContext);
         }
+        assertRunInputDepth('inputData', inputData);
+        for (const value of Object.values(requestContext ?? {}))
+          assertRunInputDepth('a requestContext value', value);
         body.requestContext = requestContext;
         await options.beforeStart?.(
           context,
@@ -713,6 +730,10 @@ export function createRunRouter(options: RunRouterOptions): RunRouter {
         runId
       ) {
         const body = (await readJson(request)) ?? {};
+        assertRunInputDepth(
+          'resumeData',
+          (body as { resumeData?: unknown }).resumeData,
+        );
         await options.beforeResume?.(context, workflowId, runId, body);
         return json(
           await options.resume(

@@ -8,6 +8,7 @@ import type {
 } from '@mastra/core/workflows';
 import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
+import { nestedArray } from '../../test-support/deep-json.js';
 import {
   deploymentIdentityDatabase,
   deploymentIdentityRequest,
@@ -1389,6 +1390,28 @@ describe('DurableObjectRunner.fetch', () => {
         target: { kind: 'workflow', id: 'gated' },
       },
     });
+  });
+
+  it('answers a start whose request context nests 257 levels deep with 400 and creates no run', async () => {
+    // #given a run object over a runtime
+    const fixture = workflowIngressFixture();
+
+    // #when a start arrives whose request context holds a value nested 257 levels
+    const response = await fixture.runner.fetch(
+      post('/runs', {
+        ...WORKFLOW_START_BODY,
+        requestContext: { app: nestedArray(257) },
+      }),
+    );
+
+    // #then it answers 400 and no run exists
+    expect(response.status).toBe(400);
+    await expect(
+      fixture.runtime.status(
+        WORKFLOW_START_BODY.workflowId,
+        WORKFLOW_START_BODY.runId,
+      ),
+    ).resolves.toBeNull();
   });
 
   it('rejects a start without a trusted execution principal before runtime or ownership work', async () => {

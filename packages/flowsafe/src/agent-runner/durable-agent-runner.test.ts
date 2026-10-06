@@ -57,6 +57,10 @@ import {
 } from 'vitest';
 import { z } from 'zod';
 
+import {
+  nestedArray,
+  PAST_SQLITE_JSON_DEPTH,
+} from '../../test-support/deep-json.js';
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import { createD1Storage } from '../do-runner/d1-storage.js';
 import { DoStatusError } from '../do-runner/do-status-error.js';
@@ -82,6 +86,7 @@ import {
 import { init } from '../do-runner/init.js';
 import {
   RUN_LIFECYCLE_CONTEXT_KEY,
+  RUN_STATE_NOT_STORABLE_MESSAGE,
   RunSettledConflictError,
 } from '../do-runner/run-lifecycle.js';
 import {
@@ -4523,6 +4528,7 @@ describe('FlowsafeDurableAgent abort of the model and tool calls in flight', () 
       honourSignal?: boolean;
       holdModel?: boolean;
       totalMs?: number;
+      toolResult?: unknown;
     } = {},
   ) {
     const entered = bridgeDeferred();
@@ -4550,7 +4556,7 @@ describe('FlowsafeDurableAgent abort of the model and tool calls in flight', () 
         await (aborted
           ? Promise.race([release.promise, aborted])
           : release.promise);
-        return { held: true };
+        return options.toolResult ?? { held: true };
       },
     });
     const f = await realAgentBridgeFixture(
@@ -4962,6 +4968,43 @@ describe('FlowsafeDurableAgent abort of the model and tool calls in flight', () 
     expect(await h.runtime.status(h.workflowId, RUN_ID)).toMatchObject({
       status: 'failed',
     });
+  });
+
+  it('fails an agent run whose tool output is too deep to store, publishes its error and releases its state', async () => {
+    // #given an agent whose tool returns a result nested past the depth SQLite
+    // parses
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const h = await heldToolAgent({
+      toolResult: { value: nestedArray(PAST_SQLITE_JSON_DEPTH) },
+    });
+    h.release.resolve();
+    const emitError = vi.spyOn(
+      h.agent as unknown as {
+        emitError: (runId: string, error: Error) => Promise<void>;
+      },
+      'emitError',
+    );
+
+    // #when a start leg runs the tool
+    await h.startLeg();
+
+    // #then the run fails at once with the storage refusal as its envelope
+    expect(await h.runtime.status(h.workflowId, RUN_ID)).toMatchObject({
+      status: 'failed',
+      errorEnvelope: { code: 'RUN_STATE_NOT_STORABLE' },
+    });
+
+    // #then the failure is published as the run's terminal error event
+    expect(emitError).toHaveBeenCalledOnce();
+    expect(emitError).toHaveBeenCalledWith(
+      RUN_ID,
+      expect.objectContaining({ message: RUN_STATE_NOT_STORABLE_MESSAGE }),
+    );
+
+    // #then the run's registry state is released once the cleanup delay has
+    // passed
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(h.agent.isRunLive(RUN_ID)).toBe(false);
   });
 });
 

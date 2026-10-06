@@ -178,4 +178,58 @@ describe('FencedWorkflowsStorageD1 on workerd D1', () => {
     expect(outgoing).toBe('settled');
     expect(await rows()).toEqual(settled);
   });
+
+  it('refuses a snapshot nested past the depth SQLite parses, over a readable row and for a run with no row', async () => {
+    // #given a run with no row, and a write nested past the depth SQLite parses
+    const { domain } = await fencedDomain();
+    const deep = withDeepValue(snapshot('running'));
+
+    // #when the write persists for the run with no row
+    const insert = persist(domain, deep);
+
+    // #then it is refused as state that cannot be stored and no row is inserted
+    await expect(insert).rejects.toMatchObject({
+      name: 'RunStateNotStorableError',
+      status: 422,
+    });
+    expect(await rows()).toEqual([]);
+
+    // #given the run now has a readable row
+    await persist(domain, snapshot('running'));
+    const stored = await rows();
+    expect(stored).toHaveLength(1);
+
+    // #when the same write persists over it
+    const update = persist(domain, deep);
+
+    // #then it is refused and the row keeps its bytes
+    await expect(update).rejects.toMatchObject({
+      name: 'RunStateNotStorableError',
+      status: 422,
+    });
+    expect(await rows()).toEqual(stored);
+  });
+
+  it('admits a successor nested past the depth over a row already stored too deep to parse', async () => {
+    // #given a run row settled as cancelled and stored nested past the depth
+    // SQLite parses
+    const { domain } = await fencedDomain();
+    await persist(domain, snapshot('failed', TERMINATED));
+    await storeAs('nested past the depth SQLite parses');
+
+    // #when the settlement's successor, itself nested past the depth, advances
+    // the revision with the settlement intact
+    const successor = withDeepValue(
+      snapshot('failed', {
+        ...TERMINATED,
+        revision: 4,
+        terminal: { ...TERMINATED.terminal, cleanupCompletedAt: 200 },
+      }),
+    );
+    await persist(domain, successor);
+
+    // #then it is stored as written
+    const [row] = await rows();
+    expect(row?.snapshot).toBe(JSON.stringify(successor));
+  });
 });

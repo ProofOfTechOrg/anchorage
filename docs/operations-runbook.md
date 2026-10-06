@@ -92,6 +92,15 @@ During a gradual deployment from a flowsafe version earlier than 0.24.0, a Worke
 
 A deploy from a flowsafe version earlier than 0.25.0 leaves outgoing agent legs that do not touch their run row, so the thread object repairs an agent start that goes more than six minutes without a write as `StartOutcomeUnknown`; [Durable agents](durable-agents.md#use-the-lower-level-durable-wrapper) describes the wait and the stamp. Deploy when no agent start is running, and check the effects of any agent run that reads `StartOutcomeUnknown` before you start another. From a version earlier than 0.24.0, drain agent starts first: the outgoing leg writes without the settled-row guard, so its write can land over the repair.
 
+A flowsafe version earlier than 0.26.0 stored run snapshots nested past SQLite's JSON depth limit. The deadline sweep, retention and the drain inventory cannot read such a row, so the run has no deadline, is never purged, and keeps a drain proof non-empty. List them in each database after the upgrade, with the deployment's `tablePrefix` in front of the table name (for example `flsmastra_workflow_snapshot` for the prefix `fls`):
+
+```bash
+wrangler d1 execute <database> --remote --config wrangler.jsonc \
+  --command "SELECT workflow_name, run_id FROM <prefix>mastra_workflow_snapshot WHERE NOT json_valid(snapshot)"
+```
+
+Terminate each listed run that is not terminal. Retention never removes these rows: remove a terminal one by hand from the tables `RUN_TTL_PURGE_TABLES` and `RUN_TTL_FLOWSAFE_PURGE_TABLES` name, after deleting its artifacts. During a gradual deployment from a version earlier than 0.26.0, a Worker still on the earlier version answers a keyed start replay of a run that failed with `RUN_STATE_NOT_STORABLE` with `503 persisted start is not readable`; retry it once every Worker runs 0.26.0 or later.
+
 ## Provision a deployment
 
 Choose one stable deployment tag per organization. It must match `^[a-z0-9]{3,32}$` and is provisioning material, not a display name or request claim.
@@ -261,6 +270,7 @@ Audit records are security evidence. Queue depth and SIEM ingestion status must 
 | Start returns duplicate-run conflict | Client retried after a response loss | Query the server-minted run id; do not mint a replacement blindly |
 | Run stays `suspended` after approval | Decision result and resume outcome | Read stored decision, status, and audit; redrive through trusted resume |
 | Run reads `failed` with `errorEnvelope.code: 'INTERRUPTED'` | `run-leg-interrupted` log line (workflow, run, leg trigger) and the step that was in flight | Its leg stopped mid-step and nothing re-ran it. Check the step's external effects before starting a new run; split a step that runs past one invocation |
+| Run reads `failed` with `errorEnvelope.code: 'RUN_STATE_NOT_STORABLE'` | The step that ran last and the data it returned, or for an agent the tool results and the thread's recalled messages | A step or tool returned data nested past the depth SQLite parses; the run stopped at that write and is not re-executed. Check the step's external effects, then bound or flatten the data before starting again; for an agent thread, see [durable agents](durable-agents.md) |
 | Run stays `running` with no progress | Run row `updatedAt`, `run-leg-reset` log lines, and the workflow storage | The run object settles it about six minutes after its last write. On workflow storage other than `FencedWorkflowsStorageD1`, or for a leg run by an older flowsafe version, terminate the run |
 | An agent run's status or terminate route answers `503 RUN_START_PENDING` and the thread logs `agent-start-recovery-pending` lines | The `runId` in the lines, and its run row's status and `updatedAt` | Expected for about seven minutes after the start's last touch: the thread object then repairs the start as `StartOutcomeUnknown` and the lines stop. If the same `runId` is still logged after that, its journal does not repair on its own. Check that the thread's runtime has the execution fence the start was prepared under: restore the wiring and the next wake repairs it. A journal prepared on an explicitly unfenced runtime never repairs a pending start, so check the agent's external effects and apply a tested, version-specific repair only as [Recovery rules](#recovery-rules) allow |
 | Durable agent resume fails after eviction | Prepare/observe registration and memory binding | Use `resumeViaRuntime()` through the thread topology; never raw inherited resume |

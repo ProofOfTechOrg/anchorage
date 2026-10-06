@@ -21,7 +21,7 @@ import {
   type ResourceOwnershipDatabase,
 } from '../approval-api/resource-ownership.js';
 import type { D1DatabaseBinding } from './cf-types.js';
-import { createD1Storage } from './d1-storage.js';
+import { createD1Storage, sweepExpiredRunDeadlines } from './d1-storage.js';
 import {
   ExecutionFenceUnreadableError,
   InvalidExecutionIdentityError,
@@ -1920,6 +1920,34 @@ describe('dormant reservation primitives', () => {
 });
 
 describe('owned initial workflow admission', () => {
+  it('refuses an admission whose request context nests past the depth SQLite parses, as a definitive refusal', async () => {
+    // #given an admission whose request context holds a value nested past the
+    // depth SQLite's JSON functions parse
+    const h = await fixture();
+    const deep = {
+      ...h.input,
+      requestContext: {
+        ...h.input.requestContext,
+        app: nestedArray(PAST_SQLITE_JSON_DEPTH),
+      },
+    };
+
+    // #when the run is admitted
+    const outcome = await h.admit(deep).catch((error: unknown) => error);
+
+    // #then it is refused as state that cannot be stored, before any effect,
+    // and no row is written
+    expect(outcome).toMatchObject({
+      status: 422,
+      reason: { code: 'RUN_STATE_NOT_STORABLE' },
+    });
+    expect(
+      isDefinitiveInitialAdmissionRefusal(outcome, h.input.execution),
+    ).toBe(true);
+    expect(h.rows()).toEqual([]);
+    expect(h.effects()).toBe(0);
+  });
+
   it.each([
     [
       'unsupported column',
@@ -3359,6 +3387,10 @@ describe('settled-row guard on unscoped persistence', () => {
       lifecycle: { version: 1, revision: 3, startOutcomeUnknownAt: 100 },
       changes: [{ startOutcomeUnknownAt: 101 }],
     },
+    stateNotStorableAt: {
+      lifecycle: { version: 1, revision: 3, stateNotStorableAt: 100 },
+      changes: [{ stateNotStorableAt: 101 }],
+    },
   };
 
   function snapshot(
@@ -3464,7 +3496,7 @@ describe('settled-row guard on unscoped persistence', () => {
   const isSnapshotReplace = (sql: string) =>
     sql.startsWith('UPDATE "mastra_workflow_snapshot"') &&
     sql.includes('SET snapshot = ?1, updatedAt = ?2');
-  const isProbe = (sql: string) => /AS readable$/.test(sql);
+  const isProbe = (sql: string) => sql.includes('AS readable');
   const isAdmission = (sql: string) => /^SELECT .* AS admitted$/s.test(sql);
   const isLiveDecision = (sql: string) => /^SELECT .* AS live$/s.test(sql);
   const isRowRead = (sql: string) =>
@@ -3545,60 +3577,95 @@ describe('settled-row guard on unscoped persistence', () => {
   });
 
   it.each([
-    [
-      'writes a snapshot nested past its depth limit over an unsettled row',
-      'deep incoming',
-      undefined,
-      true,
-    ],
-    [
-      'refuses a snapshot nested past its depth limit over a settled row',
-      'deep incoming',
-      SETTLED.interruptedAt.lifecycle,
-      false,
-    ],
-    [
-      'writes over stored bytes that are not JSON',
-      'invalid stored',
-      undefined,
-      true,
-    ],
+    ['an unsettled row', undefined],
+    ['a settled row', SETTLED.interruptedAt.lifecycle],
+  ] as const)('refuses a snapshot nested past its depth limit over %s', async (_, lifecycle) => {
+    // #given a stored row SQLite can read, and a write SQLite cannot parse
+    const h = await fixture();
+    await persist(h.domain, snapshot('failed', lifecycle));
+    const stored = h.rows();
+    const value = withDeepValue(snapshot('running'));
+    expect(
+      h.sql.prepare('SELECT json_valid(?) AS valid').get(JSON.stringify(value)),
+    ).toEqual({ valid: 0 });
+
+    // #when the write persists over it
+    const outcome = persist(h.domain, value);
+
+    // #then it is refused as state that cannot be stored, whether or not the
+    // row is settled, and the row keeps its bytes
+    await expect(outcome).rejects.toMatchObject({
+      name: 'RunStateNotStorableError',
+      status: 422,
+      reason: { code: 'RUN_STATE_NOT_STORABLE' },
+    });
+    expect(h.rows()).toEqual(stored);
+  });
+
+  it('refuses to insert a snapshot nested past its depth limit for a run with no row', async () => {
+    // #given an empty table
+    const h = await fixture();
+
+    // #when a write nested past the depth SQLite parses persists for a new run
+    const outcome = persist(h.domain, withDeepValue(snapshot('running')));
+
+    // #then it is refused as state that cannot be stored and no row is inserted
+    await expect(outcome).rejects.toMatchObject({
+      name: 'RunStateNotStorableError',
+      status: 422,
+      reason: { code: 'RUN_STATE_NOT_STORABLE' },
+    });
+    expect(h.rows()).toEqual([]);
+  });
+
+  it('keeps a run with an expired deadline selectable by the deadline sweep when its leg writes state nested past the depth limit', async () => {
+    // #given a running run whose deadline has passed
+    const h = await fixture();
+    const lifecycle = { version: 1, revision: 1, deadlineAt: 5 };
+    await persist(h.domain, snapshot('running', lifecycle));
+
+    // #when its leg writes state nested past the depth SQLite parses
+    await persist(
+      h.domain,
+      withDeepValue(snapshot('running', lifecycle)),
+    ).catch(() => undefined);
+
+    // #then the sweep still selects the run
+    const selected: string[] = [];
+    await sweepExpiredRunDeadlines(h.db, {
+      now: () => 1_000,
+      transition: async (candidate) => {
+        selected.push(candidate.runId);
+      },
+    });
+    expect(selected).toEqual(['run']);
+  });
+
+  it.each([
+    ['writes over stored bytes that are not JSON', 'invalid stored'],
     [
       'writes over an unsettled row whose stored snapshot nests past its depth limit',
       'deep stored',
-      undefined,
-      true,
     ],
-  ] as const)('%s', async (_, unreadable, lifecycle, written) => {
-    // #given a stored row, and JSON SQLite cannot read on one side
+  ] as const)('%s', async (_, unreadable) => {
+    // #given an unsettled row SQLite cannot read
     const h = await fixture();
-    await persist(h.domain, snapshot('failed', lifecycle));
+    await persist(h.domain, snapshot('failed'));
     if (unreadable === 'invalid stored')
       h.sql
         .prepare('UPDATE mastra_workflow_snapshot SET snapshot = ?')
         .run('{not json');
-    if (unreadable === 'deep stored') makeUnreadable(h);
-    const value =
-      unreadable === 'deep incoming'
-        ? withDeepValue(snapshot('running'))
-        : snapshot('running');
-    if (unreadable === 'deep incoming')
-      expect(
-        h.sql
-          .prepare('SELECT json_valid(?) AS valid')
-          .get(JSON.stringify(value)),
-      ).toEqual({ valid: 0 });
+    else makeUnreadable(h);
+    const value = snapshot('running');
 
-    // #when
+    // #when a readable write persists over it
     const outcome = await persist(h.domain, value).catch(
       (error: unknown) => error,
     );
 
-    // #then
-    if (written) {
-      expect(outcome).toBeUndefined();
-      expect(h.rows()).toMatchObject([{ snapshot: JSON.stringify(value) }]);
-    } else expect(outcome).toBeInstanceOf(RunSettledConflictError);
+    // #then it is written as given
+    expect(outcome).toBeUndefined();
+    expect(h.rows()).toMatchObject([{ snapshot: JSON.stringify(value) }]);
   });
 
   it('writes a deep successor over a settled row whose stored snapshot SQLite cannot parse', async () => {
@@ -4165,6 +4232,63 @@ describe('snapshot replacement input', () => {
     await expect(replaced).rejects.toThrow();
     expect(await h.capability.readSnapshot(address)).toEqual(row);
   });
+
+  it('refuses a replacement SQLite cannot parse over a row SQLite can parse', async () => {
+    // #given a persisted run row SQLite can parse
+    const h = await fixture();
+    await h.domain.persistWorkflowSnapshot({
+      workflowName: 'workflow',
+      runId: 'run',
+      snapshot: pending(),
+    });
+    const address = { workflowId: 'workflow', runId: 'run' };
+    const row = await h.capability.readSnapshot(address);
+    if (!row) throw new Error('run row missing');
+
+    // #when the exact row is replaced with a snapshot nested past the depth
+    // SQLite parses
+    const replaced = h.capability.replaceSnapshot?.(row, {
+      snapshot: JSON.stringify(withDeepValue(pending())),
+      updatedAt: '2026-10-04T00:00:00.000Z',
+    });
+
+    // #then it is refused as state that cannot be stored and the row keeps its bytes
+    await expect(replaced).rejects.toMatchObject({
+      name: 'RunStateNotStorableError',
+      status: 422,
+    });
+    expect(await h.capability.readSnapshot(address)).toEqual(row);
+  });
+
+  it('replaces a row SQLite cannot parse with a snapshot SQLite cannot parse', async () => {
+    // #given a persisted run row nested past the depth SQLite parses
+    const h = await fixture();
+    await h.domain.persistWorkflowSnapshot({
+      workflowName: 'workflow',
+      runId: 'run',
+      snapshot: pending(),
+    });
+    h.sql
+      .prepare('UPDATE mastra_workflow_snapshot SET snapshot = ?')
+      .run(JSON.stringify(withDeepValue(pending())));
+    const address = { workflowId: 'workflow', runId: 'run' };
+    const row = await h.capability.readSnapshot(address);
+    if (!row) throw new Error('run row missing');
+
+    // #when the exact row is replaced with another such snapshot
+    const replacement = JSON.stringify({
+      ...withDeepValue(pending()),
+      status: 'cancelled',
+    });
+    const replaced = await h.capability.replaceSnapshot?.(row, {
+      snapshot: replacement,
+      updatedAt: '2026-10-04T00:00:00.000Z',
+    });
+
+    // #then it is stored as given
+    expect(replaced).toBe(true);
+    expect(h.rows()).toMatchObject([{ snapshot: replacement }]);
+  });
 });
 
 describe('run lifecycle patch', () => {
@@ -4194,7 +4318,11 @@ describe('run lifecycle patch', () => {
     },
     interruptedAt: { interruptedAt: 100 },
     startOutcomeUnknownAt: { startOutcomeUnknownAt: 100 },
-  } as const;
+    stateNotStorableAt: { stateNotStorableAt: 100 },
+  } as const satisfies Record<
+    (typeof RUN_SETTLING_MARKERS)[number],
+    Record<string, unknown>
+  >;
 
   function running(requestContext?: Record<string, unknown>): WorkflowRunState {
     return {
