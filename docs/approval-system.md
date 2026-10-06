@@ -175,7 +175,7 @@ Recovery rules:
 1. Read the stored record and authoritative run status.
 2. Do not create another approval for the same suspension.
 3. For a workflow, invoke the trusted resume bridge again. If the step has moved on to another suspension, the redrive answers `SUSPENSION_CHANGED`; decide the approval of the current suspension instead. A resumer that builds its own resume call or request body passes `expectedSuspensionFor(record)` to get this check.
-4. For a durable agent, validate the persisted memory binding and redrive the trusted approval-resume bridge. It derives fresh trusted context and invokes [only Breakwater's reserved `processInput` steps](durable-agents.md#host-a-guarded-agent-catalog) during rehydration. It then restores both Mastra registries with the complete runtime processor lists, observes and registers the stream, and resumes through `RunnerRuntime`.
+4. For a durable agent, validate the persisted memory binding and redrive the trusted approval-resume bridge. It derives fresh trusted context and invokes [only Breakwater's reserved `processInput` steps](durable-agents.md#host-a-guarded-agent-catalog) during rehydration. It then restores both Mastra registries with the complete runtime processor lists, observes and registers the stream, and resumes through `RunnerRuntime`. If the step has moved on to another suspension, the redrive answers `SUSPENSION_CHANGED` before rehydration; decide the approval of the current suspension instead.
 5. Let `approvalGrantProvider()` derive the same approved capability from D1.
 6. If the run immediately suspends at another gate, queue a new approval for the new fingerprint.
 

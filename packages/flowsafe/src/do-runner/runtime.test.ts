@@ -6844,6 +6844,46 @@ describe('RunnerRuntime resumeCount projection (re-suspension)', () => {
     });
   });
 
+  it.each([
+    { label: 'no resume count', resumeCount: undefined },
+    { label: 'a later resume count', resumeCount: 2 },
+  ])('refuses a resume naming the current suspension time with $label', async ({
+    resumeCount,
+  }) => {
+    // #given a step resumed once and suspended again
+    const runtime = buildReSuspender();
+    const started = await runtime.start('resuspend', {
+      runId: crypto.randomUUID(),
+      inputData: {},
+    });
+    const reSuspended = await runtime.resume('resuspend', started.runId, {
+      step: 'gate2x',
+      resumeData: { go: true },
+    });
+
+    // #when a resume names the step's current suspension time with a resume
+    // count other than its own
+    const stale = runtime.resume('resuspend', started.runId, {
+      step: 'gate2x',
+      resumeData: { go: true },
+      expectedSuspension: {
+        suspendedAt: reSuspended.suspendedAt?.gate2x ?? -1,
+        ...(resumeCount === undefined ? {} : { resumeCount }),
+      },
+    });
+
+    // #then it is refused, and the step stays at its second suspension
+    await expect(stale).rejects.toMatchObject({
+      name: 'SuspensionChangedError',
+    });
+    await expect(
+      runtime.status('resuspend', started.runId),
+    ).resolves.toMatchObject({
+      status: 'suspended',
+      resumeCount: { gate2x: 1 },
+    });
+  });
+
   it('resumes when the named suspension is the one the step is at', async () => {
     // #given a step at its first suspension
     const runtime = buildReSuspender();

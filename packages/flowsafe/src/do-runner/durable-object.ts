@@ -146,9 +146,11 @@ export interface DurableObjectRunLifecycleHooks {
   ): Promise<void>;
   /**
    * Reconcile the approvals of a run at a boundary the object reached on its
-   * own, with no host request behind it (docs/do-runner-design.md, "Approvals
-   * the run object files"). Called from the object's alarm, under its
-   * operation lock, with an authoritative summary. Steps listed in
+   * own, with no host request to reconcile them (docs/do-runner-design.md,
+   * "Approvals the run object files"). Called under the object's operation
+   * lock with an authoritative summary: from its alarm, and from the resume
+   * route when the runtime refuses a resume because its step moved to
+   * another suspension. Steps listed in
    * `summary.suspensionTimers` are timers the object resumes itself and must
    * get no approval; `reconcileApprovalsForSummary` skips them.
    *
@@ -453,7 +455,7 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
   /**
    * Required when the host exposes terminate or deadline lifecycle routes.
    * Its optional `reconcileApprovals` files the approvals the object reaches
-   * from its alarm.
+   * from its alarm, or from a resume refused because its step moved on.
    */
   protected runLifecycle(
     _env: TEnv,

@@ -772,7 +772,7 @@ describe('createScheduleTick', () => {
         throw Object.assign(new Error('pending'), { status: 503 });
       },
     ],
-  ] as const)('keeps an unthreaded agent start refusal deferred when the run status lookup %s', async (_, lookup) => {
+  ] as const)('keeps an unthreaded agent start refusal deferred across reconcile passes when the run status lookup %s', async (_, lookup) => {
     // #given an unthreaded agent schedule whose start the host refused with a
     // status that can follow a stored run, and a lookup that cannot say the run
     // is absent
@@ -785,9 +785,7 @@ describe('createScheduleTick', () => {
         ownerId: 'a1',
       }),
     );
-
-    // #when the schedule fires
-    const result = await createScheduleTick({
+    const tick = createScheduleTick({
       store,
       start: vi.fn(),
       startAgent: async () => {
@@ -795,17 +793,63 @@ describe('createScheduleTick', () => {
       },
       status: lookup,
       now: () => NOW,
-    })();
+    });
+
+    // #when the schedule fires and a later tick reconciles the deferred fire
+    const fired = await tick();
+    const later = await tick();
 
     // #then the fire stays deferred, so the run's own outcome decides it
-    expect(result).toMatchObject({ deferred: 1, failed: 0 });
+    expect(fired).toMatchObject({ deferred: 1, failed: 0 });
+    expect(later).toMatchObject({ deferred: 1, failed: 0 });
     expect(store.triggers[0]).toMatchObject({ outcome: 'deferred' });
+  });
+
+  it('settles a deferred unthreaded agent start refusal as failed once a later lookup states the run does not exist', async () => {
+    // #given an unthreaded agent schedule whose start the host refused with
+    // 422 before it reserved a run, while the fire-time status lookup failed
+    const store = new FakeStore();
+    store.seed(
+      workflowSchedule({
+        id: 'agent_refused_later',
+        target: { type: 'agent', agentId: 'a1', prompt: 'go' },
+        ownerType: 'agent',
+        ownerId: 'a1',
+      }),
+    );
+    const status = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('target unavailable'))
+      .mockImplementation(absentRunLookup);
+    const tick = createScheduleTick({
+      store,
+      start: vi.fn(),
+      startAgent: async () => {
+        throw Object.assign(new Error('refused'), { status: 422 });
+      },
+      status,
+      now: () => NOW,
+    });
+    expect(await tick()).toMatchObject({ deferred: 1, failed: 0 });
+
+    // #when a later tick reconciles the deferred fire
+    const later = await tick();
+
+    // #then the fire is recorded as refused, and nothing is left deferred
+    expect(later).toMatchObject({ deferred: 0 });
+    expect(store.triggers).toHaveLength(1);
+    expect(store.triggers[0]).toMatchObject({
+      outcome: 'failed',
+      error: 'refused',
+      metadata: { reason: 'dispatch-refused' },
+    });
   });
 
   it.each([
     409, 502, 503,
-  ])('keeps an unthreaded agent start refusal with status %s deferred', async (statusCode) => {
-    // #given an unthreaded agent schedule whose start fails in a way a retry can clear
+  ])('keeps an unthreaded agent start refusal with status %s deferred across reconcile passes', async (statusCode) => {
+    // #given an unthreaded agent schedule whose start fails in a way a retry can
+    // clear, and a host that answers 404 for the run's status
     const store = new FakeStore();
     store.seed(
       workflowSchedule({
@@ -815,9 +859,7 @@ describe('createScheduleTick', () => {
         ownerId: 'a1',
       }),
     );
-
-    // #when the schedule fires
-    const result = await createScheduleTick({
+    const tick = createScheduleTick({
       store,
       start: vi.fn(),
       startAgent: async () => {
@@ -827,10 +869,15 @@ describe('createScheduleTick', () => {
       },
       status: absentRunLookup,
       now: () => NOW,
-    })();
+    });
+
+    // #when the schedule fires and a later tick reconciles the deferred fire
+    const fired = await tick();
+    const later = await tick();
 
     // #then the trigger stays deferred
-    expect(result).toMatchObject({ deferred: 1, failed: 0 });
+    expect(fired).toMatchObject({ deferred: 1, failed: 0 });
+    expect(later).toMatchObject({ deferred: 1, failed: 0 });
     expect(store.triggers[0]).toMatchObject({ outcome: 'deferred' });
   });
 

@@ -78,7 +78,9 @@ export interface DoRunTopology {
   ): Promise<RunSummary>;
   /**
    * ApprovalServiceOptions.resumeRun base: resume a DECIDED approval's run
-   * through its DO stub with the standard resumeData contract. Hand this to
+   * through its DO stub with the standard resumeData contract and the
+   * record's `expectedSuspensionFor(record)`, so a step that moved to another
+   * suspension refuses it with SuspensionChangedError. Hand this to
    * buildHostApprovalService, which wraps it in the SoD-guarded re-queue.
    */
   resumeRecord(

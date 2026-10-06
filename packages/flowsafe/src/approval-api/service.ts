@@ -162,7 +162,10 @@ export interface ApprovalServiceOptions {
    * after a decision (approve AND reject — the workflow learns the outcome via
    * resumeData). Decision-only queue records never call this seam. Same-Worker
    * deployments use resumeViaRuntime(runtime); cross-Worker ones fetch the
-   * run's DO.
+   * run's DO. A resume call or body built here carries
+   * `expectedSuspensionFor(record)`, so a decision for an earlier suspension
+   * of the step is refused instead of resuming its current one; without it
+   * the resume is unchecked.
    */
   resumeRun?: (
     record: ApprovalRecord,
@@ -988,7 +991,14 @@ export class ApprovalService {
           runId: record.runId,
         },
       });
-      return { attempted: true, ok: false, error: message };
+      const code = (error as { reason?: { code?: unknown } } | null)?.reason
+        ?.code;
+      return {
+        attempted: true,
+        ok: false,
+        error: message,
+        ...(typeof code === 'string' ? { code } : {}),
+      };
     }
   }
 

@@ -1195,10 +1195,14 @@ describe('approval queue end to end', () => {
       REVIEWER,
     );
 
-    // #then the decision stands, its resume is reported refused, and the step
-    // stays at its second suspension
+    // #then the decision stands, its resume is reported refused as a
+    // suspension change, and the step stays at its second suspension
     expect(decided.record.status).toBe('approved');
-    expect(decided.resume).toMatchObject({ attempted: true, ok: false });
+    expect(decided.resume).toMatchObject({
+      attempted: true,
+      ok: false,
+      code: 'SUSPENSION_CHANGED',
+    });
     const current = await harness.runtime.status('relaunch', started.runId);
     expect(current).toMatchObject({
       status: 'suspended',

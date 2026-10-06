@@ -1461,33 +1461,45 @@ describe('reconcileApprovalsForSummary', () => {
     ).toEqual([expect.objectContaining({ id: later?.id, status: 'pending' })]);
   });
 
-  it('leaves the approval of a later suspension alone on D1 approval storage when the summary predates it', async () => {
-    // #given the approval filed for the step's second suspension in D1
-    const store = new D1ApprovalStoreFactory(
-      sqliteUnitDatabase(openSqlite()) as never,
-      { workflowSnapshotTable: 'mastra_workflow_snapshot' },
-    ).store();
+  it('leaves a step alone when a decided approval belongs to a later suspension than the summary', async () => {
+    // #given decided approvals for the step's first and third suspensions,
+    // and a summary read during its second, which has none
+    const store = new InMemoryApprovalStore();
     const service = new ApprovalService({ store, executionFence: 'none' });
-    const current = suspendedSummary('acme_run-stale', 'gate', ['c'], 2000, 1);
-    const [later] = await reconcileApprovalsForSummary(
+    for (const [suspendedAt, resumeCount, reviewer] of [
+      [1000, undefined, REVIEWER],
+      [3000, 2, { ...REVIEWER, id: 'rhea' }],
+    ] as const) {
+      const [seeded] = await reconcileApprovalsForSummary(
+        service,
+        'wf',
+        suspendedSummary(
+          'acme_run-decided',
+          'gate',
+          ['c'],
+          suspendedAt,
+          resumeCount,
+        ),
+        SYSTEM,
+      );
+      await service.decide(seeded?.id ?? '', { decision: 'approve' }, reviewer);
+    }
+
+    // #when the summary read during the second suspension reconciles
+    const filed = await reconcileApprovalsForSummary(
       service,
       'wf',
-      current,
+      suspendedSummary('acme_run-decided', 'gate', ['c'], 2000, 1),
       SYSTEM,
     );
 
-    // #when a summary read during the first suspension reconciles
-    await reconcileApprovalsForSummary(
-      service,
-      'wf',
-      suspendedSummary('acme_run-stale', 'gate', ['c'], 1000),
-      SYSTEM,
-    );
-
-    // #then the later approval stays open and is the run's only record
+    // #then nothing is filed, and the two decided approvals stand
+    expect(filed).toEqual([]);
     expect(
-      await store.list({ workflowId: 'wf', runId: 'acme_run-stale' }),
-    ).toEqual([expect.objectContaining({ id: later?.id, status: 'pending' })]);
+      (await store.list({ workflowId: 'wf', runId: 'acme_run-decided' })).map(
+        (record) => record.status,
+      ),
+    ).toEqual(['approved', 'approved']);
   });
 
   it.each([

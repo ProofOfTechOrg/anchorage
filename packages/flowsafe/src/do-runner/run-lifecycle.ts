@@ -29,17 +29,23 @@ export function runTerminalError(
 }
 
 /**
+ * The reason the runtime aborts a leg with: named `AbortError`, which Mastra
+ * and the AI SDK read as an abort, with `cause` as its cause.
+ */
+export function legAbortReason(cause: Error): Error {
+  return Object.assign(new Error(cause.message, { cause }), {
+    name: 'AbortError',
+  });
+}
+
+/**
  * The reason a leg's abort carries when a terminal transition handled in its
- * isolate cuts it. It is named `AbortError`, which Mastra and the AI SDK read
- * as an abort, and its cause is the run's terminal error: the engine reports
+ * isolate cuts it. Its cause is the run's terminal error: the engine reports
  * such a leg only as `canceled`, whichever transition cut it.
  */
 export function terminalLegAbortReason(status: RunTerminalStatus): Error {
   const { name, message } = runTerminalError(status);
-  return Object.assign(
-    new Error(message, { cause: Object.assign(new Error(message), { name }) }),
-    { name: 'AbortError' },
-  );
+  return legAbortReason(Object.assign(new Error(message), { name }));
 }
 
 /** The terminal status a {@link terminalLegAbortReason} names, if `reason` is one. */

@@ -1787,19 +1787,36 @@ describe('agent bridge capture', () => {
   });
 
   it('bridge starts with the authority the host registered, not one supplied through Core input', async () => {
-    // #given a host start, and Core input carrying another authority
+    // #given a host start, and Core input carrying another authority with
+    // another owner, run owner guard and epoch
     const f = bridgeFixture();
     const pending = f.startHost();
+    const intruder = { kind: 'human', id: 'intruder-1' } as const;
     const input = {
       ...INPUT,
-      authority: { ...startAuthority(), mutationEpoch: 9 },
+      authority: {
+        ...startAuthority(),
+        mutationEpoch: 9,
+        startIdentity: {
+          owner: intruder,
+          target: { kind: 'agent', id: 'writer', threadId: 'thread-1' },
+        },
+        runOwnerGuard: { owner: intruder, reservationToken: 'forged' },
+      },
     };
 
     // #when the loop runs
     await Promise.all([pending, drive(f.agent, 'run-1', input)]);
 
-    // #then the run starts under the host's authority
-    expect(f.start.mock.lastCall?.[1]).toMatchObject({ mutationEpoch: 2 });
+    // #then the run starts under the host's authority and requester
+    const started = f.start.mock.lastCall?.[1];
+    expect(started).toMatchObject({
+      mutationEpoch: 2,
+      requestedBy: 'operator-1',
+      requestedByKind: 'human',
+      startIdentity: startAuthority().startIdentity,
+    });
+    expect(started?.runOwnerGuard).toBeUndefined();
   });
 
   it.each([
@@ -1842,57 +1859,34 @@ describe('agent bridge capture', () => {
     drives,
     succeeds,
   }) => {
+    // #given a host start that exits this way
     const f = bridgeFixture();
-    const nativeSet = Map.prototype.set;
-    const nativeDelete = Map.prototype.delete;
-    let authorityMap: Map<unknown, unknown> | undefined;
-    let deletions = 0;
-    const set = vi.spyOn(Map.prototype, 'set').mockImplementation(function (
-      this: Map<unknown, unknown>,
-      key,
-      value,
-    ) {
-      if (
-        key === 'run-1' &&
-        value &&
-        typeof value === 'object' &&
-        Object.hasOwn(value, 'authority')
-      )
-        authorityMap = this;
-      return nativeSet.call(this, key, value);
-    });
-    const remove = vi
-      .spyOn(Map.prototype, 'delete')
-      .mockImplementation(function (this: Map<unknown, unknown>, key) {
-        if (this === authorityMap && key === 'run-1') deletions++;
-        return nativeDelete.call(this, key);
-      });
     const failure = new InvalidRunRequestError('test refusal');
-    try {
-      if (streamThrows) f.stream.mockRejectedValueOnce(failure);
-      if (callsOnError)
-        f.stream.mockImplementationOnce(async (_messages, options) => {
-          await options?.onError?.({ error: failure } as never);
-          return f.streamResult as never;
-        });
-      if (runtimeRefuses) f.start.mockRejectedValueOnce(failure);
-      const pending = f.startHost();
-      const outcomes = await Promise.allSettled(
-        drives ? [pending, drive(f.agent, 'run-1', INPUT)] : [pending],
-      );
-      expect(outcomes[0]?.status).toBe(succeeds ? 'fulfilled' : 'rejected');
-      expect(authorityMap).toBeDefined();
-      expect(authorityMap?.size).toBe(0);
-      expect(deletions).toBe(1);
-      const next = { ...startAuthority(), mutationEpoch: 3 };
-      await Promise.all([f.startHost(next), drive(f.agent, 'run-1', INPUT)]);
-      expect(f.start.mock.lastCall?.[1]).toMatchObject({ mutationEpoch: 3 });
-      expect(authorityMap?.size).toBe(0);
-      expect(deletions).toBe(2);
-    } finally {
-      set.mockRestore();
-      remove.mockRestore();
-    }
+    if (streamThrows) f.stream.mockRejectedValueOnce(failure);
+    if (callsOnError)
+      f.stream.mockImplementationOnce(async (_messages, options) => {
+        await options?.onError?.({ error: failure } as never);
+        return f.streamResult as never;
+      });
+    if (runtimeRefuses) f.start.mockRejectedValueOnce(failure);
+
+    // #when it exits
+    const pending = f.startHost();
+    const outcomes = await Promise.allSettled(
+      drives ? [pending, drive(f.agent, 'run-1', INPUT)] : [pending],
+    );
+
+    // #then the start is no longer pending
+    expect(outcomes[0]?.status).toBe(succeeds ? 'fulfilled' : 'rejected');
+    expect(f.agent.isRunLive('run-1')).toBe(false);
+
+    // #when the same run id starts again under another authority
+    const next = { ...startAuthority(), mutationEpoch: 3 };
+    await Promise.all([f.startHost(next), drive(f.agent, 'run-1', INPUT)]);
+
+    // #then it starts under that authority, and is no longer pending after
+    expect(f.start.mock.lastCall?.[1]).toMatchObject({ mutationEpoch: 3 });
+    expect(f.agent.isRunLive('run-1')).toBe(false);
   });
 
   it.each([
@@ -4703,6 +4697,12 @@ describe('FlowsafeDurableAgent abort of the model and tool calls in flight', () 
     // #given a run suspended at a tool approval
     const h = await heldToolAgent({ requireApproval: true });
     await h.startLeg();
+    const emitError = vi.spyOn(
+      h.agent as unknown as {
+        emitError: (runId: string, error: Error) => Promise<void>;
+      },
+      'emitError',
+    );
 
     // #when a resume names a suspension the run is not at
     const resumed = h.agent.resumeViaRuntime({
@@ -4719,11 +4719,15 @@ describe('FlowsafeDurableAgent abort of the model and tool calls in flight', () 
       h.entered.promise.then(() => 'tool ran'),
     ]);
 
-    // #then it is refused before the tool runs, and the run stays suspended
+    // #then it is refused before the tool runs and before the leg is
+    // prepared: the run stays suspended, no terminal error is published, and
+    // its run state stays held
     expect(outcome).toMatchObject({ name: 'SuspensionChangedError' });
     expect(await h.runtime.status(h.workflowId, RUN_ID)).toMatchObject({
       status: 'suspended',
     });
+    expect(emitError).not.toHaveBeenCalled();
+    expect(h.agent.isRunLive(RUN_ID)).toBe(true);
   });
 
   it('aborts the tool call in flight of a resumed leg whose run another instance settled', async () => {
@@ -5167,13 +5171,13 @@ describe('FlowsafeDurableAgent abort of the model and tool calls in flight', () 
     const watcher = collect((await h.agent.observe(RUN_ID)).fullStream);
 
     // #when a terminate settles the run and the agent releases it
-    const ended = await h.runtime.terminateAsPrincipal(
+    await h.runtime.terminateAsPrincipal(
       h.workflowId,
       RUN_ID,
       OPERATOR,
       OPERATOR,
     );
-    await h.agent.releaseEndedRun(RUN_ID, ended.summary);
+    await h.agent.releaseEndedRun(RUN_ID);
 
     // #then the observer's stream ends with the cancellation, and neither run
     // registry holds the run
@@ -5199,13 +5203,13 @@ describe('FlowsafeDurableAgent abort of the model and tool calls in flight', () 
     const watcher = collect((await h.agent.observe(RUN_ID)).fullStream);
 
     // #when a terminate settles the run and the agent releases it
-    const ended = await h.runtime.terminateAsPrincipal(
+    await h.runtime.terminateAsPrincipal(
       h.workflowId,
       RUN_ID,
       OPERATOR,
       OPERATOR,
     );
-    await h.agent.releaseEndedRun(RUN_ID, ended.summary);
+    await h.agent.releaseEndedRun(RUN_ID);
 
     // #then the thread has no active run, the observer's stream ends with the
     // cancellation, and neither run registry holds the run
@@ -5235,17 +5239,39 @@ describe('FlowsafeDurableAgent abort of the model and tool calls in flight', () 
     await leg;
     expect(h.agent.isRunLive(RUN_ID)).toBe(true);
 
-    // #when the terminate that follows releases the run before Mastra's
-    // cleanup has run
-    await h.agent.releaseEndedRun(RUN_ID, {
-      runId: RUN_ID,
-      status: 'cancelled',
-    });
+    // #when the terminate that follows ends the run and releases it before
+    // Mastra's cleanup has run
+    await h.runtime.terminateAsPrincipal(
+      h.workflowId,
+      RUN_ID,
+      OPERATOR,
+      OPERATOR,
+    );
+    await h.agent.releaseEndedRun(RUN_ID);
 
     // #then the terminal error was published once, and neither run registry
     // holds the run
     expect(emitError).toHaveBeenCalledOnce();
     expect(h.agent.isRunLive(RUN_ID)).toBe(false);
+  });
+
+  it('leaves a run that has not ended when a release names it', async () => {
+    // #given a run suspended at a tool approval, which no transition ended
+    const h = await heldToolAgent({ requireApproval: true });
+    await h.startLeg();
+    const emitError = vi.spyOn(
+      h.agent as unknown as {
+        emitError: (runId: string, error: Error) => Promise<void>;
+      },
+      'emitError',
+    );
+
+    // #when a release names the run
+    await h.agent.releaseEndedRun(RUN_ID);
+
+    // #then nothing is published and the run stays live
+    expect(emitError).not.toHaveBeenCalled();
+    expect(h.agent.isRunLive(RUN_ID)).toBe(true);
   });
 
   it('leaves no abort-request subscription of a resumed run once it has ended', async () => {

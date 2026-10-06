@@ -1948,7 +1948,7 @@ export function createThreadAgentHost(
       return withDispatchLock(async () => {
         const storage = options.stateStorage();
         try {
-          const pending = await storage.list<AgentOwnerRecovery>({
+          const pending = await storage.list({
             prefix: AGENT_OWNER_RECOVERY_PREFIX,
           });
           let firstFailure: { error: unknown } | undefined;
@@ -2430,7 +2430,6 @@ export function createThreadAgentHost(
     },
     route: async (request, scope) => {
       let preflightedTermination = false;
-      let legCut = false;
       const preflightUrl = new URL(request.url);
       if (!preflightUrl.pathname.startsWith(AGENT_HOST_ROUTE_PREFIX))
         return null;
@@ -2511,7 +2510,7 @@ export function createThreadAgentHost(
         );
         const owner = await options.resourceAccess().owner('run', ref.runId);
         if (preflightUrl.searchParams.get('replay') !== '1') {
-          legCut = await scope.init.runtime.cancelActiveExecution(
+          await scope.init.runtime.cancelActiveExecution(
             await workflowIdFor(scope, ref.agentId),
             ref.runId,
             'cancelled',
@@ -2792,7 +2791,7 @@ export function createThreadAgentHost(
             .resourceAccess()
             .owner('run', ref.runId);
           if (!replayOnly && !preflightedTermination) {
-            legCut = await scopedRuntime.cancelActiveExecution(
+            await scopedRuntime.cancelActiveExecution(
               await workflowIdFor(scope, ref.agentId),
               ref.runId,
               'cancelled',
@@ -2818,23 +2817,22 @@ export function createThreadAgentHost(
             scope.principal,
             owner ?? scope.principal,
           );
-          if (!legCut) {
-            // No leg ran here to end the run's stream and registries; a run
-            // suspended in this object still holds both.
-            try {
-              await runtime?.agents
-                .get(ref.agentId)
-                ?.releaseEndedRun(ref.runId, transition.summary);
-            } catch (error) {
-              console.error(
-                JSON.stringify({
-                  type: 'agent-run-release-failed',
-                  threadId: scope.threadId,
-                  runId: ref.runId,
-                  error: errorMessageOf(error),
-                }),
-              );
-            }
+          // The dispatch lock this body holds orders the release after the
+          // runner tail of any start or resume leg here, so a cut leg's tail
+          // has published or claimed its terminal ERROR first. A leg cut after
+          // its engine suspended ends without one, and a run suspended in this
+          // object still holds its stream and registries.
+          try {
+            await runtime?.agents.get(ref.agentId)?.releaseEndedRun(ref.runId);
+          } catch (error) {
+            console.error(
+              JSON.stringify({
+                type: 'agent-run-release-failed',
+                threadId: scope.threadId,
+                runId: ref.runId,
+                error: errorMessageOf(error),
+              }),
+            );
           }
           const selected = await selectedAgentState(scope, ref, {
             includeLegacy: true,

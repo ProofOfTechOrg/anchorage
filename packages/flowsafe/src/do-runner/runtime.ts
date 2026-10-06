@@ -91,6 +91,7 @@ import {
   canonicalScheduleDispatch,
   failureEnvelope,
   hasDisputedSettlement,
+  legAbortReason,
   lifecycleFromRequestContext,
   projectTerminalLifecycle,
   RUN_FAILURE_MARKERS,
@@ -3084,8 +3085,7 @@ export class RunnerRuntime {
    * `cause` as the cause of one shared reason, so a model or tool call in
    * flight stops with the engine. Never `run.cancel()`: it reads the stored
    * status first and returns without aborting on `failed`, which an
-   * interruption or a start repair writes. The reason is named `AbortError`,
-   * which Mastra and the AI SDK read as an abort.
+   * interruption or a start repair writes.
    */
   #abortLeg(
     active: ActiveRun | undefined,
@@ -3100,9 +3100,7 @@ export class RunnerRuntime {
     );
     if (unaborted.length === 0) return;
     console.error(JSON.stringify({ type: logType, workflowId, runId }));
-    const reason = Object.assign(new Error(cause.message, { cause }), {
-      name: 'AbortError',
-    });
+    const reason = legAbortReason(cause);
     for (const controller of unaborted) controller.abort(reason);
   }
 
@@ -3437,7 +3435,14 @@ export class RunnerRuntime {
         ? storedProvenance?.requestedByKind
         : requestedByKind;
     const priorCounts = new Map(storedProvenance?.resumeCounts ?? []);
-    // The pair the leg's grant minting reads below, compared as
+    const leg: RunLeg = {
+      kind: 'resume',
+      step,
+      suspendedAt:
+        stepKey !== undefined ? suspendedAtOf(state.steps, stepKey) : undefined,
+      resumeCount: stepKey !== undefined ? priorCounts.get(stepKey) : undefined,
+    };
+    // The pair the leg's grant minting reads, compared as
     // boundToCurrentSuspension compares it.
     if (expectedSuspension !== undefined) {
       if (stepKey === undefined)
@@ -3445,9 +3450,8 @@ export class RunnerRuntime {
           'expectedSuspension requires a resolvable resumed step',
         );
       if (
-        suspendedAtOf(state.steps, stepKey) !==
-          expectedSuspension.suspendedAt ||
-        priorCounts.get(stepKey) !== expectedSuspension.resumeCount
+        leg.suspendedAt !== expectedSuspension.suspendedAt ||
+        leg.resumeCount !== expectedSuspension.resumeCount
       )
         throw new SuspensionChangedError(workflowId, runId, stepKey);
     }
@@ -3484,16 +3488,7 @@ export class RunnerRuntime {
     const requestContext = await this.#requestContextFor(
       workflowId,
       runId,
-      {
-        kind: 'resume',
-        step,
-        suspendedAt:
-          stepKey !== undefined
-            ? suspendedAtOf(state.steps, stepKey)
-            : undefined,
-        resumeCount:
-          stepKey !== undefined ? priorCounts?.get(stepKey) : undefined,
-      },
+      leg,
       provenance,
       undefined,
       lifecycle,

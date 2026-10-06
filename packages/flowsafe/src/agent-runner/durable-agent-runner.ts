@@ -100,6 +100,7 @@ import {
 } from '../do-runner/index.js';
 import { resourceIdFromKey } from '../do-runner/memory-id.js';
 import {
+  type RunTerminalStatus,
   runTerminalError,
   terminalStatusOfLegAbort,
 } from '../do-runner/run-lifecycle.js';
@@ -946,9 +947,15 @@ function legTerminalError(
       : summary.status === 'cancelled' || summary.status === 'timed_out'
         ? summary.status
         : undefined;
-  if (!status) return undefined;
+  return status ? endedRunError(status, summary.error) : undefined;
+}
+
+function endedRunError(
+  status: RunTerminalStatus,
+  storedError: string | undefined,
+): Error {
   const { name, message } = runTerminalError(status);
-  return Object.assign(new Error(summary.error ?? message), { name });
+  return Object.assign(new Error(storedError ?? message), { name });
 }
 
 function threadLegOutcome(
@@ -2093,20 +2100,33 @@ export class FlowsafeDurableAgent<
   }
 
   /**
-   * @internal Ends this isolate's state for a run a terminate settled while no
-   * leg of it ran here. A run with a start still pending here, or that this
-   * isolate holds nothing for, is left to its own path.
+   * @internal Ends this isolate's state for a run whose stored status a
+   * terminate or deadline settled, publishing its terminal ERROR unless a leg
+   * here already did. A run with a start still pending here, one this isolate
+   * holds nothing for, or one whose status is not cancelled or timed out, is
+   * left to its own path.
    */
-  async releaseEndedRun(runId: string, summary: RunSummary): Promise<void> {
+  async releaseEndedRun(runId: string): Promise<void> {
     this.#assertCallerRunId(runId);
-    if (this.#pendingStarts.has(runId) || !this.isRunLive(runId)) return;
-    const terminalError = legTerminalError(summary, 'Durable agent run failed');
-    if (terminalError)
-      await this.#endRunLocally(
-        runId,
-        terminalError,
-        threadLegOutcome(summary.status),
-      );
+    const holdsRun = () =>
+      !this.#pendingStarts.has(runId) && this.isRunLive(runId);
+    if (!holdsRun()) return;
+    const summary = await this.#runtime.authoritativeStatus(
+      this.getWorkflow().id,
+      runId,
+    );
+    // Mastra's delayed cleanup of a run whose leg published can run during the
+    // read; a release past it would publish a second terminal ERROR.
+    if (
+      (summary?.status !== 'cancelled' && summary?.status !== 'timed_out') ||
+      !holdsRun()
+    )
+      return;
+    await this.#endRunLocally(
+      runId,
+      endedRunError(summary.status, summary.error),
+      threadLegOutcome(summary.status),
+    );
   }
 
   #trackResumedLeg(runId: string): ResumedThreadLeg {

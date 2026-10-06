@@ -173,9 +173,11 @@ export interface ScheduleTickStartAgentInput {
  * Object's start route as a numeric `status` property. An adapter that reaches
  * the route through another hop must not forward that hop's own status as a
  * refusal. Statuses 400, 403, 404 and 422 fail this fire, and the schedule keeps
- * firing, when {@link ScheduleTickStatus} also states that the run does not
- * exist. Any other failure, and any other answer of the lookup, leaves the fire
- * deferred for later reconciliation.
+ * firing, once {@link ScheduleTickStatus} states that the run does not exist,
+ * at that fire or on a later pass. A lookup that returns `undefined` fails the
+ * fire after any other failure too, and one that returns a run resolves the
+ * fire from it; any other answer leaves the fire deferred for later
+ * reconciliation.
  */
 export type ScheduleTickStartAgent = (
   input: ScheduleTickStartAgentInput,
@@ -276,9 +278,17 @@ export interface ScheduleTickStatusResult {
 }
 
 /**
- * A lookup that throws with a numeric `status` of 404 states that the target
- * holds no such run; `undefined` states the same without an error. Any other
- * throw leaves the dispatch indeterminate.
+ * The target's answer for the run a fire dispatched, read after the dispatch
+ * failed and on each reconcile pass. `undefined` states that the target holds
+ * no such run, and the tick records the fire `failed`. A throw with a numeric
+ * `status` of 404 states the same only for a threadless agent start the
+ * target refused with 400, 403, 404 or 422, and the tick then records the
+ * fire `failed`. A threaded signal the target refused with one of those
+ * statuses is recorded `failed` whatever the lookup throws. Any other throw, a
+ * 404 for any other dispatch included, leaves the dispatch indeterminate: the
+ * fire stays deferred, and a reconcile pass sends a threaded signal again
+ * unless the throw carries `status` 503 with `reason.code`
+ * `RUN_START_PENDING`.
  */
 export type ScheduleTickStatus = (
   input: ScheduleTickDispatchRef,
@@ -860,6 +870,28 @@ export function createScheduleTick(
         result.reconciled += 1;
         await recordResolvedDispatch(ref, trigger, summary, result);
       } catch (error) {
+        // A start the target refused before it reserved a run leaves none in
+        // flight, so a lookup that states the run does not exist decides it.
+        if (
+          ref.target === 'agent' &&
+          ref.mode === 'start' &&
+          isPermanentDispatchError({
+            status: trigger.metadata?.refusedStatus,
+          }) &&
+          statusOf(error) === 404
+        ) {
+          if (
+            await recordRefusedDispatch(
+              ref,
+              trigger,
+              trigger.error ?? 'agent start refused',
+              result,
+            )
+          ) {
+            result.reconciled += 1;
+          }
+          continue;
+        }
         let pendingError = error;
         if (
           !isRunStartPendingError(error) &&
@@ -981,6 +1013,9 @@ export function createScheduleTick(
               statusError instanceof Error
                 ? statusError.message
                 : String(statusError),
+            ...(ref.target === 'agent' && isPermanentDispatchError(error)
+              ? { refusedStatus: statusOf(error) }
+              : {}),
           }),
         );
         await audit({
