@@ -23,7 +23,7 @@
 // functions, so throwing refusals preserve the durable-agent brand.
 //
 // Signal senders and queueMessage stay inherited because their starts reach
-// executeWorkflow's refusal for ids absent from #startRequesters, preserving
+// executeWorkflow's refusal for ids absent from #pendingStarts, preserving
 // the input verdict and publishing terminal ERROR.
 //
 // AgentThreadStreamRuntime's idle wake, continuation and queued-signal drains
@@ -95,6 +95,7 @@ import {
 import {
   InvalidRunRequestError,
   isPathSafeId,
+  type RunScheduleDispatch,
   RunStateUnreadableError,
 } from '../do-runner/index.js';
 import { resourceIdFromKey } from '../do-runner/memory-id.js';
@@ -156,6 +157,19 @@ export interface AgentStartAuthority {
     | ((execution: RunExecutionIdentity) => void | Promise<void>)
     | undefined;
   readonly runOwnerGuard?: StartRunOptions['runOwnerGuard'];
+}
+
+/**
+ * A host start `streamUntilPersisted()` registered for `executeWorkflow()`. The
+ * requester is `authority.startIdentity.owner`, which the capture checked
+ * against the requester pair.
+ */
+interface PendingStart {
+  readonly attemptToken: string;
+  readonly authority: AgentStartAuthority;
+  readonly scheduleDispatch?: Readonly<RunScheduleDispatch>;
+  readonly idempotencyKey?: string;
+  readonly persisted: { resolve(): void; reject(error: unknown): void };
 }
 
 /**
@@ -1013,27 +1027,7 @@ export class FlowsafeDurableAgent<
   readonly #guardedCallOptionMapper?: DurableCallOptionMapper;
   readonly #threadRuntime?: Mastra['agentThreadStreamRuntime'];
   readonly #resumedThreadLegs = new Map<string, Set<ResumedThreadLeg>>();
-  readonly #persistenceWaiters = new Map<
-    string,
-    {
-      resolve: () => void;
-      reject: (error: unknown) => void;
-    }
-  >();
-  readonly #startRequesters = new Map<string, string>();
-  readonly #startRequesterKinds = new Map<string, ExecutionPrincipalKind>();
-  readonly #startAttemptTokens = new Map<string, string>();
-  /**
-   * runId -> the reservation key the thread topology took for this start, so
-   * `executeWorkflow` can hand it to `RunnerRuntime.start` for the execution
-   * fence's proof-only match.
-   */
-  readonly #startIdempotencyKeys = new Map<string, string>();
-  readonly #startAuthorities = new Map<string, AgentStartAuthority>();
-  readonly #startScheduleDispatches = new Map<
-    string,
-    { scheduleId: string; dispatchId: string }
-  >();
+  readonly #pendingStarts = new Map<string, PendingStart>();
   // The host's exact options object receives one private, single-use re-entry ticket.
   readonly #hostStreamTickets = new WeakSet<object>();
   // The created signal of a start with neither a host ticket nor a request
@@ -1132,7 +1126,7 @@ export class FlowsafeDurableAgent<
 
   /**
    * Refuse every run id that is still registered on any start or core seam.
-   * `#startRequesters` alone is insufficient because `streamUntilPersisted()`
+   * `#pendingStarts` alone is insufficient because `streamUntilPersisted()`
    * removes it after the first summary while a suspended stream stays live.
    * The internal registry has no TTL, so it also covers long suspensions after
    * the global registry's TTL expires.
@@ -1152,8 +1146,7 @@ export class FlowsafeDurableAgent<
   /** @internal */
   isRunLive(runId: string): boolean {
     return (
-      this.#startRequesters.has(runId) ||
-      this.#persistenceWaiters.has(runId) ||
+      this.#pendingStarts.has(runId) ||
       globalRunRegistry.has(runId) ||
       this.runRegistryInternal.has(runId)
     );
@@ -1284,17 +1277,18 @@ export class FlowsafeDurableAgent<
       reject = rejectPromise;
     });
     void persisted.catch(() => undefined);
-    this.#persistenceWaiters.set(runId, { resolve, reject });
-    this.#startRequesters.set(runId, requestedBy);
-    this.#startRequesterKinds.set(runId, requestedByKind);
-    this.#startAttemptTokens.set(runId, attemptToken);
-    this.#startAuthorities.set(runId, capturedAuthority);
-    if (capturedScheduleDispatch) {
-      this.#startScheduleDispatches.set(runId, capturedScheduleDispatch);
-    }
-    if (idempotencyKey !== undefined) {
-      this.#startIdempotencyKeys.set(runId, idempotencyKey);
-    }
+    this.#pendingStarts.set(
+      runId,
+      Object.freeze({
+        attemptToken,
+        authority: capturedAuthority,
+        ...(capturedScheduleDispatch
+          ? { scheduleDispatch: capturedScheduleDispatch }
+          : {}),
+        ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
+        persisted: { resolve, reject },
+      }),
+    );
     const onError = callOptions.onError;
     try {
       const hostCallOptions: typeof callOptions = {
@@ -1313,13 +1307,7 @@ export class FlowsafeDurableAgent<
       await persisted;
       return result;
     } finally {
-      this.#persistenceWaiters.delete(runId);
-      this.#startRequesters.delete(runId);
-      this.#startRequesterKinds.delete(runId);
-      this.#startAttemptTokens.delete(runId);
-      this.#startScheduleDispatches.delete(runId);
-      this.#startIdempotencyKeys.delete(runId);
-      this.#startAuthorities.delete(runId);
+      this.#pendingStarts.delete(runId);
     }
   }
 
@@ -2419,30 +2407,16 @@ export class FlowsafeDurableAgent<
     workflowInput: DurableAgenticWorkflowInput,
   ): Promise<void> {
     this.#assertCallerRunId(runId);
-    const waiter = this.#persistenceWaiters.get(runId);
+    const start = this.#pendingStarts.get(runId);
     let summary: RunSummary;
     try {
-      // getWorkflow() is memoized and its id is the shared loop id the factory
-      // registered; driving that exact id keeps the started run and the
-      // registered workflow in lockstep.
-      const requestedBy = this.#startRequesters.get(runId);
-      const requestedByKind = this.#startRequesterKinds.get(runId);
-      const attemptToken = this.#startAttemptTokens.get(runId);
-      const scheduleDispatch = this.#startScheduleDispatches.get(runId);
-      const idempotencyKey = this.#startIdempotencyKeys.get(runId);
-      const authority = this.#startAuthorities.get(runId);
       // stream() composes a caller's abortSignal into this controller and
       // registers it before this method runs; every model and tool call of the
       // leg reads a signal derived from it.
       const legAbort = this.runRegistryInternal.get(runId)?.abortController;
-      if (requestedBy === undefined || requestedByKind === undefined) {
-        if (requestedBy !== undefined || requestedByKind !== undefined) {
-          throw new InvalidRunRequestError(
-            'requestedBy and requestedByKind must be provided together',
-          );
-        }
-        // No #startRequesters entry means the host start seam never registered
-        // this id, so core minted it below our boundary. Such a run has no
+      if (start === undefined) {
+        // No pending start means the host start seam never registered this
+        // id, so core minted it below our boundary. Such a run has no
         // ownership record or trusted engine-leg context. Preserve what the
         // input chain's verdict allows, including a signal stream() captured
         // for this id, then close the stream so core can clean up its maps and
@@ -2461,11 +2435,7 @@ export class FlowsafeDurableAgent<
         agentId: coreAgentId,
         ...payload
       } = workflowInput;
-      if (!authority) {
-        throw new InvalidRunRequestError(
-          'registered run is missing agent start authority',
-        );
-      }
+      const { authority } = start;
       if (
         coreRunId !== runId ||
         authority.startIdentity.target.id !== this.#wrappedAgent.id ||
@@ -2482,9 +2452,9 @@ export class FlowsafeDurableAgent<
         BREAKWATER_RBAC_PROCESSOR_ID
       ) {
         const refusal = new AgentAuthorizationDeniedError();
-        // The waiter's first rejection wins; publishing ERROR first supplies a
+        // The start's first rejection wins; publishing ERROR first supplies a
         // plain Error that doErrorResponse maps to 500.
-        waiter?.reject(refusal);
+        start.persisted.reject(refusal);
         await this.#settleRefusedStart(runId, refusal);
         return;
       }
@@ -2493,15 +2463,22 @@ export class FlowsafeDurableAgent<
           JSON.stringify({ type: 'agent-leg-abort-unavailable', runId }),
         );
       }
+      // getWorkflow() is memoized and its id is the shared loop id the factory
+      // registered; driving that exact id keeps the started run and the
+      // registered workflow in lockstep.
       const workflow = this.getWorkflow();
       summary = await this.#runtime.start(workflow.id, {
         runId,
         inputData: { ...payload, runId: coreRunId, agentId: coreAgentId },
-        ...(attemptToken === undefined ? {} : { attemptToken }),
-        ...(scheduleDispatch === undefined ? {} : { scheduleDispatch }),
-        ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
-        requestedBy,
-        requestedByKind,
+        attemptToken: start.attemptToken,
+        ...(start.scheduleDispatch === undefined
+          ? {}
+          : { scheduleDispatch: start.scheduleDispatch }),
+        ...(start.idempotencyKey === undefined
+          ? {}
+          : { idempotencyKey: start.idempotencyKey }),
+        requestedBy: authority.startIdentity.owner.id,
+        requestedByKind: authority.startIdentity.owner.kind,
         mutationEpoch: authority.mutationEpoch,
         startIdentity: authority.startIdentity,
         agentStart: authority.agentStart,
@@ -2510,9 +2487,9 @@ export class FlowsafeDurableAgent<
         startReservation: authority.startReservation,
         ...(legAbort === undefined ? {} : { legAbort }),
       });
-      waiter?.resolve();
+      start.persisted.resolve();
     } catch (error) {
-      waiter?.reject(error);
+      start?.persisted.reject(error);
       throw error;
     }
     // Mirror the base: a FAILED run emits an error onto the agent's stream so

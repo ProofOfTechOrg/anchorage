@@ -1781,41 +1781,20 @@ describe('agent bridge capture', () => {
     await f.startHost();
   });
 
-  it('bridge rejects authority supplied only through Core input', async () => {
+  it('bridge starts with the authority the host registered, not one supplied through Core input', async () => {
+    // #given a host start, and Core input carrying another authority
     const f = bridgeFixture();
-    const nativeSet = Map.prototype.set;
-    const spy = vi.spyOn(Map.prototype, 'set').mockImplementation(function (
-      this: Map<unknown, unknown>,
-      key,
-      value,
-    ) {
-      if (
-        key === 'run-1' &&
-        value &&
-        typeof value === 'object' &&
-        Object.hasOwn(value, 'startIdentity')
-      )
-        return this;
-      return nativeSet.call(this, key, value);
-    });
-    try {
-      const pending = f.startHost();
-      const input = { ...INPUT, authority: startAuthority() };
-      const results = await Promise.allSettled([
-        pending,
-        drive(f.agent, 'run-1', input),
-      ]);
-      expect(f.start).not.toHaveBeenCalled();
-      expect(results.map((result) => result.status)).toEqual([
-        'rejected',
-        'rejected',
-      ]);
-      for (const result of results)
-        if (result.status === 'rejected')
-          expect(result.reason).toBeInstanceOf(InvalidRunRequestError);
-    } finally {
-      spy.mockRestore();
-    }
+    const pending = f.startHost();
+    const input = {
+      ...INPUT,
+      authority: { ...startAuthority(), mutationEpoch: 9 },
+    };
+
+    // #when the loop runs
+    await Promise.all([pending, drive(f.agent, 'run-1', input)]);
+
+    // #then the run starts under the host's authority
+    expect(f.start.mock.lastCall?.[1]).toMatchObject({ mutationEpoch: 2 });
   });
 
   it.each([
@@ -1872,7 +1851,7 @@ describe('agent bridge capture', () => {
         key === 'run-1' &&
         value &&
         typeof value === 'object' &&
-        Object.hasOwn(value, 'startIdentity')
+        Object.hasOwn(value, 'authority')
       )
         authorityMap = this;
       return nativeSet.call(this, key, value);
