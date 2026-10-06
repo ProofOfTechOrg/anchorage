@@ -180,6 +180,7 @@ vi.mock('../agent-runner/index.js', async (importOriginal) => {
           return mocked.resumeViaRuntime(...args);
         },
         observe: mocked.observe,
+        releaseEndedRun: vi.fn(async () => undefined),
         runRegistry: {
           has: (runId: string) => runIds.has(runId),
         },
@@ -8460,5 +8461,67 @@ describe('host legacy cleanup wait guards', () => {
       expect(fixture.state.get(THREAD_BINDING_KEY)).toEqual(replacement);
     expect(fixture.approvals.list).toHaveBeenCalledOnce();
     expect(outcome).toBeInstanceOf(Error);
+  });
+});
+
+describe('host terminate of an agent run suspended in the object', () => {
+  async function suspendedRunHeldHere() {
+    const fixture = await hostAgentLifecycleFixture({ provenance: 'modern' });
+    const { globalRunRegistry } = await vi.importActual<
+      typeof import('@mastra/core/agent/durable')
+    >('@mastra/core/agent/durable');
+    globalRunRegistry.set('acme_run', { cleanup: () => undefined } as never);
+    onTestFinished(() => {
+      globalRunRegistry.delete('acme_run');
+      vi.restoreAllMocks();
+      fixture.sql.close();
+    });
+    const live = async () => {
+      const response = await fixture.host.route(
+        new Request(
+          'https://thread/_flowsafe/agent-host/runs/writer/acme_run/start-liveness',
+        ),
+        fixture.scope,
+      );
+      return ((await response?.json()) as { live: boolean }).live;
+    };
+    return { ...fixture, globalRunRegistry, live };
+  }
+
+  it('releases the run state the object holds for the run', async () => {
+    // #given a run suspended in this object, whose Mastra run state the object
+    // still holds
+    const fixture = await suspendedRunHeldHere();
+    expect(await fixture.live()).toBe(true);
+
+    // #when the run is terminated
+    const response = await fixture.host.route(
+      hostAgentLifecycleRequest('/terminate'),
+      fixture.scope,
+    );
+
+    // #then the terminate answers, and the object holds no run state for it
+    expect(response).toMatchObject({ status: 200 });
+    expect(await fixture.live()).toBe(false);
+  });
+
+  it('leaves the run state to the leg the terminate cut', async () => {
+    // #given a run whose Mastra run state the object holds, and a terminate
+    // that cuts a leg of it running here
+    const fixture = await suspendedRunHeldHere();
+    vi.spyOn(fixture.app.runtime, 'cancelActiveExecution').mockResolvedValue(
+      true,
+    );
+
+    // #when the run is terminated
+    const response = await fixture.host.route(
+      hostAgentLifecycleRequest('/terminate'),
+      fixture.scope,
+    );
+
+    // #then the terminate answers, and the run state stays for the leg's own
+    // end to release
+    expect(response).toMatchObject({ status: 200 });
+    expect(fixture.globalRunRegistry.has('acme_run')).toBe(true);
   });
 });

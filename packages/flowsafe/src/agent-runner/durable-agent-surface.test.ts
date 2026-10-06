@@ -1197,6 +1197,7 @@ describe('FlowsafeDurableAgent prototype surface inventory', () => {
       // FlowSafe's own members, which core has no say in.
       'constructor',
       'resumeViaRuntime',
+      'releaseEndedRun',
       'authoritativeAgentStartState',
       'isRunLive',
       'proofExecutionFor',

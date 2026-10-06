@@ -52,6 +52,7 @@ import {
   RunLifecycleBlockedError,
   RunSettledConflictError,
   RunStateNotStorableError,
+  runTerminalError,
   terminalCleanupFor,
 } from './run-lifecycle.js';
 import {
@@ -1191,13 +1192,7 @@ function prepareTerminalization(
       nextContext[RUN_LIFECYCLE_CONTEXT_KEY] = next;
       fields = {
         ...terminalStateFields(intent.status),
-        error: {
-          name:
-            intent.status === 'cancelled'
-              ? 'RunCancelledError'
-              : 'RunTimedOutError',
-          message: next.terminal.error.message,
-        },
+        error: runTerminalError(intent.status),
       };
       cleanup = terminalCleanupFor(next);
     } catch (error) {

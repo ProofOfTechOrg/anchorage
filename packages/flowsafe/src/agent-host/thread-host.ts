@@ -2430,6 +2430,7 @@ export function createThreadAgentHost(
     },
     route: async (request, scope) => {
       let preflightedTermination = false;
+      let legCut = false;
       const preflightUrl = new URL(request.url);
       if (!preflightUrl.pathname.startsWith(AGENT_HOST_ROUTE_PREFIX))
         return null;
@@ -2510,7 +2511,7 @@ export function createThreadAgentHost(
         );
         const owner = await options.resourceAccess().owner('run', ref.runId);
         if (preflightUrl.searchParams.get('replay') !== '1') {
-          await scope.init.runtime.cancelActiveExecution(
+          legCut = await scope.init.runtime.cancelActiveExecution(
             await workflowIdFor(scope, ref.agentId),
             ref.runId,
             'cancelled',
@@ -2791,7 +2792,7 @@ export function createThreadAgentHost(
             .resourceAccess()
             .owner('run', ref.runId);
           if (!replayOnly && !preflightedTermination) {
-            await scopedRuntime.cancelActiveExecution(
+            legCut = await scopedRuntime.cancelActiveExecution(
               await workflowIdFor(scope, ref.agentId),
               ref.runId,
               'cancelled',
@@ -2817,6 +2818,24 @@ export function createThreadAgentHost(
             scope.principal,
             owner ?? scope.principal,
           );
+          if (!legCut) {
+            // No leg ran here to end the run's stream and registries; a run
+            // suspended in this object still holds both.
+            try {
+              await runtime?.agents
+                .get(ref.agentId)
+                ?.releaseEndedRun(ref.runId, transition.summary);
+            } catch (error) {
+              console.error(
+                JSON.stringify({
+                  type: 'agent-run-release-failed',
+                  threadId: scope.threadId,
+                  runId: ref.runId,
+                  error: errorMessageOf(error),
+                }),
+              );
+            }
+          }
           const selected = await selectedAgentState(scope, ref, {
             includeLegacy: true,
           });

@@ -13,6 +13,47 @@ export const RUN_LIFECYCLE_CONTEXT_KEY = 'flowsafe.runLifecycle';
 
 export type RunTerminalStatus = 'cancelled' | 'timed_out';
 
+const RUN_TERMINAL_ERRORS = {
+  cancelled: { name: 'RunCancelledError', message: 'run was cancelled' },
+  timed_out: { name: 'RunTimedOutError', message: 'run deadline expired' },
+} as const satisfies Record<
+  RunTerminalStatus,
+  { name: string; message: string }
+>;
+
+/** The stored error of a terminal transition: the name consumers match on, and its message. */
+export function runTerminalError(
+  status: RunTerminalStatus,
+): (typeof RUN_TERMINAL_ERRORS)[RunTerminalStatus] {
+  return { ...RUN_TERMINAL_ERRORS[status] };
+}
+
+/**
+ * The reason a leg's abort carries when a terminal transition handled in its
+ * isolate cuts it. It is named `AbortError`, which Mastra and the AI SDK read
+ * as an abort, and its cause is the run's terminal error: the engine reports
+ * such a leg only as `canceled`, whichever transition cut it.
+ */
+export function terminalLegAbortReason(status: RunTerminalStatus): Error {
+  const { name, message } = runTerminalError(status);
+  return Object.assign(
+    new Error(message, { cause: Object.assign(new Error(message), { name }) }),
+    { name: 'AbortError' },
+  );
+}
+
+/** The terminal status a {@link terminalLegAbortReason} names, if `reason` is one. */
+export function terminalStatusOfLegAbort(
+  reason: unknown,
+): RunTerminalStatus | undefined {
+  if (!(reason instanceof Error) || !(reason.cause instanceof Error))
+    return undefined;
+  const { name } = reason.cause;
+  return (Object.keys(RUN_TERMINAL_ERRORS) as RunTerminalStatus[]).find(
+    (status) => RUN_TERMINAL_ERRORS[status].name === name,
+  );
+}
+
 const RUN_TERMINAL_ERROR_CODES = [
   'CANCELLED',
   'TIMED_OUT',
@@ -283,8 +324,7 @@ export function projectTerminalLifecycle(
       status,
       error: {
         code: status === 'cancelled' ? 'CANCELLED' : 'TIMED_OUT',
-        message:
-          status === 'cancelled' ? 'run was cancelled' : 'run deadline expired',
+        message: runTerminalError(status).message,
       },
       transitionedAt: nowMs,
       replayPrincipals,

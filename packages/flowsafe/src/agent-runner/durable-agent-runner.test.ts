@@ -9,6 +9,7 @@
 
 import { Agent, createSignal } from '@mastra/core/agent';
 import {
+  AGENT_CONTROL_TOPIC,
   AGENT_STREAM_TOPIC,
   AgentStreamEventTypes,
   DurableAgent,
@@ -540,6 +541,7 @@ async function realAgentBridgeFixture(
     model: MastraModelConfig;
     tools: Record<string, ReturnType<typeof createTool>>;
     totalMs?: number;
+    threadRuntime?: Mastra['agentThreadStreamRuntime'];
   },
 ) {
   const sql = openSqlite() as ReturnType<typeof openSqlite> & { close(): void };
@@ -632,6 +634,9 @@ async function realAgentBridgeFixture(
     runtime,
     cache: false,
     maxSteps: 1,
+    ...(toolLoop?.threadRuntime
+      ? { threadRuntime: toolLoop.threadRuntime }
+      : {}),
   });
   const start = vi.spyOn(runtime, 'start');
   return { sql, fence, workflows, counts, runtime, agent, start };
@@ -4431,6 +4436,8 @@ describe('FlowsafeDurableAgent abort of the model and tool calls in flight', () 
   const HOLD_TOOL = 'hold';
   const OPERATOR = { kind: 'human', id: 'operator-1' } as const;
   const TOTAL_BUDGET_MS = 5_000;
+  const THREAD = { thread: 'thread-1', resource: 'thread-1' } as const;
+  const THREAD_KEY = { threadId: 'thread-1', resourceId: 'thread-1' } as const;
 
   afterEach(() => {
     vi.useRealTimers();
@@ -4440,8 +4447,34 @@ describe('FlowsafeDurableAgent abort of the model and tool calls in flight', () 
     abortSignal?: AbortSignal;
   }) => Promise<unknown>;
 
-  /** Calls `hold` on its first call and answers with text after that. */
-  function toolThenTextModel(onCall: () => void): MastraModelConfig {
+  /** Reads `stream` into `chunks`; `closed()` turns true once it ends. */
+  function collect(stream: ReadableStream<{ type: string }>) {
+    const chunks: { type: string }[] = [];
+    let closed = false;
+    void (async () => {
+      for await (const chunk of stream) chunks.push(chunk);
+      closed = true;
+    })().catch(() => undefined);
+    return { chunks, closed: () => closed };
+  }
+
+  /** `stream` ends, and its last chunk is a terminal error named `name`. */
+  async function expectEndedWithError(
+    stream: ReturnType<typeof collect>,
+    name: string,
+  ) {
+    await vi.waitFor(() => expect(stream.closed()).toBe(true));
+    expect(stream.chunks.at(-1)).toMatchObject({
+      type: 'error',
+      payload: { error: { name } },
+    });
+  }
+
+  /** Calls `hold` on its first `toolCalls` calls and answers with text after that. */
+  function toolThenTextModel(
+    onCall: () => void,
+    toolCalls = 1,
+  ): MastraModelConfig {
     const text = localModelFixture(() => undefined);
     const textStream = (text as unknown as { doStream: StreamCall }).doStream;
     const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
@@ -4452,14 +4485,14 @@ describe('FlowsafeDurableAgent abort of the model and tool calls in flight', () 
       doStream: async (options: Parameters<StreamCall>[0]) => {
         onCall();
         calls += 1;
-        if (calls > 1) return textStream(options);
+        if (calls > toolCalls) return textStream(options);
         return {
           stream: new ReadableStream({
             start(controller) {
               controller.enqueue({ type: 'stream-start', warnings: [] });
               controller.enqueue({
                 type: 'tool-call',
-                toolCallId: 'call-1',
+                toolCallId: `call-${calls}`,
                 toolName: HOLD_TOOL,
                 input: '{}',
               });
@@ -4508,6 +4541,8 @@ describe('FlowsafeDurableAgent abort of the model and tool calls in flight', () 
       holdModel?: boolean;
       totalMs?: number;
       toolResult?: unknown;
+      threaded?: boolean;
+      toolCalls?: number;
     } = {},
   ) {
     const entered = bridgeDeferred();
@@ -4541,16 +4576,22 @@ describe('FlowsafeDurableAgent abort of the model and tool calls in flight', () 
     const f = await realAgentBridgeFixture(
       undefined,
       undefined,
-      false,
+      options.threaded ?? false,
       undefined,
       {
         model: options.holdModel
           ? heldModel(observed, entered, release)
           : toolThenTextModel(() => {
               observed.modelCalls += 1;
-            }),
+            }, options.toolCalls),
         tools: { [HOLD_TOOL]: hold },
         ...(options.totalMs !== undefined ? { totalMs: options.totalMs } : {}),
+        ...(options.threaded
+          ? {
+              threadRuntime: new Mastra({ logger: false })
+                .agentThreadStreamRuntime,
+            }
+          : {}),
       },
     );
     const workflowId = f.agent.getWorkflow().id;
@@ -4590,6 +4631,7 @@ describe('FlowsafeDurableAgent abort of the model and tool calls in flight', () 
                 runId: RUN_ID,
                 maxSteps: 2,
                 disableBackgroundTasks: true,
+                ...(options.threaded ? { memory: THREAD } : {}),
                 ...callOptions,
               },
               'operator-1',
@@ -4597,7 +4639,10 @@ describe('FlowsafeDurableAgent abort of the model and tool calls in flight', () 
               `${RUN_ID}-attempt`,
               undefined,
               undefined,
-              startAuthority(),
+              {
+                ...startAuthority(),
+                agentStart: { threaded: options.threaded ?? false },
+              },
             )
             .then((result) => {
               results.push(result);
@@ -4610,6 +4655,7 @@ describe('FlowsafeDurableAgent abort of the model and tool calls in flight', () 
             runId: RUN_ID,
             requestedBy: 'reviewer-1',
             resumeData: { approved: true },
+            ...(options.threaded ? { memory: THREAD } : {}),
           }),
         ),
       /** Writes the row as another instance leaves a run it settled. */
@@ -4976,7 +5022,7 @@ describe('FlowsafeDurableAgent abort of the model and tool calls in flight', () 
     });
   });
 
-  it('fails an agent run whose tool output is too deep to store, publishes its error and releases its state', async () => {
+  it('fails an agent run whose tool output is too deep to store, publishes its error, ends its stream and releases its state', async () => {
     // #given an agent whose tool returns a result nested past the depth SQLite
     // parses
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
@@ -4992,7 +5038,7 @@ describe('FlowsafeDurableAgent abort of the model and tool calls in flight', () 
     );
 
     // #when a start leg runs the tool
-    await h.startLeg();
+    const stream = collect((await h.startLeg()).fullStream);
 
     // #then the run fails at once with the storage refusal as its envelope
     expect(await h.runtime.status(h.workflowId, RUN_ID)).toMatchObject({
@@ -5007,10 +5053,246 @@ describe('FlowsafeDurableAgent abort of the model and tool calls in flight', () 
       expect.objectContaining({ message: RUN_STATE_NOT_STORABLE_MESSAGE }),
     );
 
+    // #then the start's stream ends
+    await vi.waitFor(() => expect(stream.closed()).toBe(true));
+
     // #then the run's registry state is released once the cleanup delay has
     // passed
     await vi.advanceTimersByTimeAsync(30_000);
     expect(h.agent.isRunLive(RUN_ID)).toBe(false);
+  });
+
+  it('releases the thread of a threaded agent run whose tool output is too deep to store', async () => {
+    // #given a threaded agent whose tool returns a result nested past the
+    // depth SQLite parses, held in that tool call while its run holds the
+    // thread
+    const h = await heldToolAgent({
+      threaded: true,
+      toolResult: { value: nestedArray(PAST_SQLITE_JSON_DEPTH) },
+    });
+    const leg = h.startLeg();
+    await h.entered.promise;
+    expect(h.agent.getActiveThreadRunId(THREAD_KEY)).toBe(RUN_ID);
+
+    // #when the tool returns and the run fails
+    h.release.resolve();
+    await leg;
+    expect(await h.runtime.status(h.workflowId, RUN_ID)).toMatchObject({
+      status: 'failed',
+    });
+
+    // #then the thread has no active run
+    await vi.waitFor(() =>
+      expect(h.agent.getActiveThreadRunId(THREAD_KEY)).toBeUndefined(),
+    );
+  });
+
+  it('ends the stream of a resumed leg the isolate cancels with a cancellation error and releases the run', async () => {
+    // #given a run suspended at a tool approval, resumed and held in the
+    // approved tool call, and an observer of the run
+    const h = await heldToolAgent({ requireApproval: true });
+    await h.startLeg();
+    const resumed = h.resumeLeg();
+    await h.entered.promise;
+    const watcher = collect((await h.agent.observe(RUN_ID)).fullStream);
+
+    // #when the isolate's runtime cancels the leg and the tool returns
+    await h.runtime.cancelActiveExecution(h.workflowId, RUN_ID, 'cancelled', [
+      OPERATOR,
+    ]);
+    h.release.resolve();
+    await resumed;
+
+    // #then the observer's stream ends with the cancellation, and neither run
+    // registry holds the run
+    await expectEndedWithError(watcher, 'RunCancelledError');
+    expect(h.agent.isRunLive(RUN_ID)).toBe(false);
+  });
+
+  it.each([
+    ['cancelled', 'RunCancelledError'],
+    ['timed_out', 'RunTimedOutError'],
+  ] as const)('ends the stream of a start leg the isolate cuts as %s with a %s, then releases the run', async (status, errorName) => {
+    // #given a start leg held in its tool call
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const h = await heldToolAgent();
+    const leg = h.startLeg();
+    await h.entered.promise;
+
+    // #when the isolate's runtime cuts the leg and the tool returns
+    await h.runtime.cancelActiveExecution(h.workflowId, RUN_ID, status, [
+      OPERATOR,
+    ]);
+    h.release.resolve();
+    const stream = collect((await leg).fullStream);
+
+    // #then the tool's abort names the run's terminal outcome, and the start's
+    // stream ends with it
+    expect(h.observed.signal?.reason).toMatchObject({
+      name: 'AbortError',
+      cause: { name: errorName },
+    });
+    await expectEndedWithError(stream, errorName);
+
+    // #then the run's registry state is released once the cleanup delay has
+    // passed
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(h.agent.isRunLive(RUN_ID)).toBe(false);
+  });
+
+  it('releases the thread of a threaded start leg the isolate cancels', async () => {
+    // #given a threaded start leg held in its tool call, which holds its thread
+    const h = await heldToolAgent({ threaded: true });
+    const leg = h.startLeg();
+    await h.entered.promise;
+    expect(h.agent.getActiveThreadRunId(THREAD_KEY)).toBe(RUN_ID);
+
+    // #when the isolate's runtime cancels the leg and the tool returns
+    await h.runtime.cancelActiveExecution(h.workflowId, RUN_ID, 'cancelled', [
+      OPERATOR,
+    ]);
+    h.release.resolve();
+    await leg;
+
+    // #then the thread has no active run
+    await vi.waitFor(() =>
+      expect(h.agent.getActiveThreadRunId(THREAD_KEY)).toBeUndefined(),
+    );
+  });
+
+  it('ends the stream of a run suspended here that a terminate settles and releases the run', async () => {
+    // #given a run suspended at a tool approval, and an observer of the run
+    const h = await heldToolAgent({ requireApproval: true });
+    await h.startLeg();
+    const watcher = collect((await h.agent.observe(RUN_ID)).fullStream);
+
+    // #when a terminate settles the run and the agent releases it
+    const ended = await h.runtime.terminateAsPrincipal(
+      h.workflowId,
+      RUN_ID,
+      OPERATOR,
+      OPERATOR,
+    );
+    await h.agent.releaseEndedRun(RUN_ID, ended.summary);
+
+    // #then the observer's stream ends with the cancellation, and neither run
+    // registry holds the run
+    await expectEndedWithError(watcher, 'RunCancelledError');
+    expect(h.agent.isRunLive(RUN_ID)).toBe(false);
+  });
+
+  it('releases the thread of a threaded run that a terminate settles after a resume suspended it again', async () => {
+    // #given a threaded run whose approved tool ran on resume and which then
+    // suspended at its second tool approval, holding its thread, and an
+    // observer of the run
+    const h = await heldToolAgent({
+      requireApproval: true,
+      threaded: true,
+      toolCalls: 2,
+    });
+    h.release.resolve();
+    await h.startLeg();
+    await expect(h.resumeLeg()).resolves.toMatchObject({
+      status: 'suspended',
+    });
+    expect(h.agent.getActiveThreadRunId(THREAD_KEY)).toBe(RUN_ID);
+    const watcher = collect((await h.agent.observe(RUN_ID)).fullStream);
+
+    // #when a terminate settles the run and the agent releases it
+    const ended = await h.runtime.terminateAsPrincipal(
+      h.workflowId,
+      RUN_ID,
+      OPERATOR,
+      OPERATOR,
+    );
+    await h.agent.releaseEndedRun(RUN_ID, ended.summary);
+
+    // #then the thread has no active run, the observer's stream ends with the
+    // cancellation, and neither run registry holds the run
+    await vi.waitFor(() =>
+      expect(h.agent.getActiveThreadRunId(THREAD_KEY)).toBeUndefined(),
+    );
+    await expectEndedWithError(watcher, 'RunCancelledError');
+    expect(h.agent.isRunLive(RUN_ID)).toBe(false);
+  });
+
+  it('publishes one terminal error when a run whose cut leg published it is released again', async () => {
+    // #given a start leg the isolate cancelled, which published the run's
+    // terminal error
+    const h = await heldToolAgent();
+    const emitError = vi.spyOn(
+      h.agent as unknown as {
+        emitError: (runId: string, error: Error) => Promise<void>;
+      },
+      'emitError',
+    );
+    const leg = h.startLeg();
+    await h.entered.promise;
+    await h.runtime.cancelActiveExecution(h.workflowId, RUN_ID, 'cancelled', [
+      OPERATOR,
+    ]);
+    h.release.resolve();
+    await leg;
+    expect(h.agent.isRunLive(RUN_ID)).toBe(true);
+
+    // #when the terminate that follows releases the run before Mastra's
+    // cleanup has run
+    await h.agent.releaseEndedRun(RUN_ID, {
+      runId: RUN_ID,
+      status: 'cancelled',
+    });
+
+    // #then the terminal error was published once, and neither run registry
+    // holds the run
+    expect(emitError).toHaveBeenCalledOnce();
+    expect(h.agent.isRunLive(RUN_ID)).toBe(false);
+  });
+
+  it('leaves no abort-request subscription of a resumed run once it has ended', async () => {
+    // #given a run suspended at a tool approval whose tool returns at once,
+    // and a count of subscriptions to the run's abort requests
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const h = await heldToolAgent({ requireApproval: true });
+    h.release.resolve();
+    const pubsub = h.runtime.pubsub;
+    assert(pubsub);
+    const topic = AGENT_CONTROL_TOPIC(RUN_ID);
+    const subscribe = vi.spyOn(pubsub, 'subscribe');
+    const unsubscribe = vi.spyOn(pubsub, 'unsubscribe');
+    const calls = (spy: { mock: { calls: unknown[][] } }) =>
+      spy.mock.calls.filter(([called]) => called === topic).length;
+
+    // #when the run starts, suspends, resumes to its end and Mastra's cleanup
+    // delay passes
+    await h.startLeg();
+    await expect(h.resumeLeg()).resolves.toMatchObject({ status: 'success' });
+    await vi.advanceTimersByTimeAsync(30_000);
+
+    // #then every subscription to the run's abort requests is gone
+    expect(calls(subscribe)).toBeGreaterThan(0);
+    expect(calls(subscribe) - calls(unsubscribe)).toBe(0);
+  });
+
+  it('aborts the tool call in flight of a start leg with a total budget after Mastra evicts its run entry', async () => {
+    // #given a start leg with a total time budget, held in its tool call,
+    // whose isolate-wide registry entry Mastra evicted
+    const h = await heldToolAgent({ totalMs: TOTAL_BUDGET_MS });
+    void h.startLeg();
+    await h.entered.promise;
+    const fillers: string[] = [];
+    onTestFinished(() => {
+      for (const id of fillers) globalRunRegistry.delete(id);
+    });
+    evictCoreRunEntry(fillers);
+    expect(globalRunRegistry.has(RUN_ID)).toBe(false);
+
+    // #when the isolate's runtime cancels the leg
+    await h.runtime.cancelActiveExecution(h.workflowId, RUN_ID, 'cancelled', [
+      OPERATOR,
+    ]);
+
+    // #then the tool's signal is aborted
+    expect(h.observed.signal?.aborted).toBe(true);
   });
 });
 

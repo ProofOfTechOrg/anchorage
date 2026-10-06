@@ -106,7 +106,9 @@ import {
   type RunTerminalCleanup,
   type RunTerminalErrorEnvelope,
   type RunTerminalStatus,
+  runTerminalError,
   terminalCleanupFor,
+  terminalLegAbortReason,
 } from './run-lifecycle.js';
 import {
   decodeProgressRunProvenance,
@@ -858,8 +860,9 @@ export type StartRunOptions = {
    * @internal An abort controller the runtime aborts wherever it aborts the
    * leg: when the liveness touch finds the run settled by another instance,
    * which can happen before the leg's engine run exists, and when a terminate
-   * handled in this isolate cancels the leg, after the engine run's own abort.
-   * Never request-context data.
+   * or a deadline handled in this isolate cancels the leg, after the engine
+   * run's own abort, with a {@link terminalLegAbortReason}. Never
+   * request-context data.
    */
   readonly legAbort?: AbortController;
 } & OptionalRunRequester;
@@ -2190,7 +2193,7 @@ export class RunnerRuntime {
     }
     // After `run.cancel()` has aborted the engine run, so the engine's
     // cancellation precedes any abort error from a call in flight.
-    prepared.legAbort?.abort();
+    prepared.legAbort?.abort(terminalLegAbortReason(intendedStatus));
     return true;
   }
 
@@ -2392,11 +2395,7 @@ export class RunnerRuntime {
       {
         ...state,
         ...terminalStateFields(status),
-        error: {
-          name:
-            status === 'cancelled' ? 'RunCancelledError' : 'RunTimedOutError',
-          message: next.terminal.error.message,
-        },
+        error: runTerminalError(status),
         timestamp: now,
       },
       next,
