@@ -547,6 +547,9 @@ async function replaceSnapshotRow(
  * The timestamp is bound as JSON text because a bound JS number would be
  * stored as a REAL (`456.0`). A request context that is not an object makes
  * json_set write nothing yet still count a row, so the predicate refuses it.
+ * The patch replaces the whole lifecycle, and a revision does not identify one
+ * across instances (a resume elsewhere reaches the same revision), so a stored
+ * dispute refuses it as it refuses recording an intent.
  */
 async function patchLifecycleRow(
   database: InitialAdmissionDatabase,
@@ -586,6 +589,7 @@ async function patchLifecycleRow(
         ELSE json_extract(snapshot, '$.status') = ?6
           AND ${lifecycleSql('snapshot', 'revision')} IS ?7
           AND ${STORED_UNSETTLED_SQL}
+          AND NOT ${disputedSql('snapshot')}
         END
     RETURNING workflow_name`)
     .bind(
@@ -652,6 +656,14 @@ function unsettledSql(stored: string): string {
 
 const STORED_UNSETTLED_SQL = unsettledSql('snapshot');
 
+/** Whether the lifecycle in `column` records a disputed economic operation. */
+function disputedSql(column: string): string {
+  return `EXISTS (
+    SELECT 1 FROM json_each(${column}, ${lifecyclePath('economicOperations')})
+    WHERE json_extract(value, '$.settlementState') = 'disputed'
+  )`;
+}
+
 /** A rule read as 1 or 0, as a WHERE or a CASE reads it: NULL reads 0. */
 function decisionSql(rule: string): string {
   return `CASE WHEN ${rule} THEN 1 ELSE 0 END`;
@@ -688,26 +700,38 @@ type LifecycleMerge = 'as written' | 'stored lifecycle' | 'stored intent';
 /**
  * How an admitted write over an unsettled row treats the stored run
  * lifecycle, following effectiveLifecycle's revision order in the runtime: a
- * write whose revision is lower or absent takes the stored lifecycle
- * (revisions only grow, so the write was serialized before the stored
- * lifecycle landed); a write of the same revision without a transitionIntent
- * takes the stored intent; any other write is stored as written. CASE reads
- * no field of text an earlier branch found unreadable, and a NULL comparison
- * falls through to 'as written'.
+ * write whose revision is lower or absent takes the stored lifecycle (a
+ * writer's revisions only grow, so the write was serialized before the stored
+ * lifecycle landed; only the dispute arm below lowers a stored revision); a
+ * write of the same revision without a transitionIntent
+ * takes the stored intent; any other write is stored as written. A stored
+ * intent never joins a write it was not checked against: a write that records
+ * a disputed economic operation is stored as written over an intent, as the
+ * dispute would have refused it, and a run-deadline intent does not join a
+ * write that moved its deadline. CASE reads no field of text an earlier branch
+ * found unreadable, and a NULL comparison falls through to 'as written'.
  */
 function lifecycleMergeSql(stored: string, incoming: string): string {
+  const storedIntent = `json_type(${stored}, ${lifecyclePath('transitionIntent')}) = 'object'`;
   return `CASE
     WHEN NOT json_valid(${stored}) OR NOT json_valid(${incoming}) THEN 'as written'
     WHEN NOT (${unsettledSql(stored)}) THEN 'as written'
     WHEN json_type(${stored}, ${lifecyclePath()}) IS NOT 'object' THEN 'as written'
     WHEN coalesce(json_type(${incoming}, '$.requestContext'), 'object') <> 'object'
       THEN 'as written'
+    WHEN ${storedIntent}
+      AND json_type(${incoming}, ${lifecyclePath('revision')}) = 'integer'
+      AND ${disputedSql(incoming)}
+      THEN 'as written'
     WHEN ${lifecycleSql(incoming, 'revision')} IS NULL
       OR ${lifecycleSql(incoming, 'revision')} < ${lifecycleSql(stored, 'revision')}
       THEN 'stored lifecycle'
     WHEN ${lifecycleSql(incoming, 'revision')} = ${lifecycleSql(stored, 'revision')}
-      AND json_type(${stored}, ${lifecyclePath('transitionIntent')}) = 'object'
+      AND ${storedIntent}
       AND ${lifecycleSql(incoming, 'transitionIntent')} IS NULL
+      AND (${lifecycleSql(stored, 'transitionIntent.expectedDeadlineAt')} IS NULL
+        OR ${lifecycleSql(incoming, 'deadlineAt')}
+          IS ${lifecycleSql(stored, 'transitionIntent.expectedDeadlineAt')})
       THEN 'stored intent'
     ELSE 'as written' END`;
 }

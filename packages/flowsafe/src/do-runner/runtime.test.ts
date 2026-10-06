@@ -11803,6 +11803,54 @@ describe('RunnerRuntime lifecycle transitions on D1 storage', () => {
     });
   });
 
+  it('refuses to terminate a run whose leg on another instance disputed an economic operation at the revision of the intent, and settles it as interrupted once the leg stops', async () => {
+    // #given a stranded run with a recorded cancellation intent, and a resume
+    // on another instance that advanced the lifecycle it read before the
+    // intent to the same revision with a disputed economic operation
+    const { app, workflow, workflows, stored } = await racingRun({
+      deadlineMs: 3_600_000,
+    });
+    const { requestContext } = await stored();
+    const read = requestContext?.[lifecycleKey];
+    await app.runtime.cancelActiveExecution(
+      workflow.id,
+      'stranded-run',
+      'cancelled',
+      [owner],
+    );
+    const disputed = {
+      ...read,
+      revision: read.revision + 1,
+      economicOperations: [{ id: 'charge-1', settlementState: 'disputed' }],
+    };
+
+    // #when that leg writes, and then the terminate's terminal pass runs
+    await workflows.persistWorkflowSnapshot({
+      workflowName: workflow.id,
+      runId: 'stranded-run',
+      snapshot: {
+        ...(await stored()),
+        requestContext: { ...requestContext, [lifecycleKey]: disputed },
+      },
+    });
+    const terminating = app.runtime.terminate(workflow.id, 'stranded-run');
+
+    // #then the dispute blocks the termination, as it blocks recording an
+    // intent, the stored lifecycle is the leg's, and once the leg stops the
+    // run settles as interrupted instead of refusing on every wake
+    await expect(terminating).rejects.toMatchObject({
+      reason: { code: 'DISPUTED_SETTLEMENT' },
+    });
+    expect((await stored()).requestContext?.[lifecycleKey]).toEqual(disputed);
+    await expect(
+      app.runtime.settleInterruptedRun(
+        workflow.id,
+        'stranded-run',
+        Date.now() + 360_001,
+      ),
+    ).resolves.toMatchObject({ kind: 'interrupted' });
+  });
+
   it('lands the cancellation intent while the leg keeps rewriting the row', async () => {
     // #given a stranded run whose leg rewrites the row, still running, after
     // each of up to five reads: enough to make a whole-row compare-and-set

@@ -3640,6 +3640,154 @@ describe('settled-row guard on unscoped persistence', () => {
     });
   });
 
+  const DISPUTED = [{ id: 'charge-1', settlementState: 'disputed' }];
+
+  it.each(
+    STORED_FORMS.flatMap((form) =>
+      (
+        [
+          ['the same revision', 3],
+          ['a lower revision', 2],
+        ] as const
+      ).map(([label, revision]) => [label, form, revision] as const),
+    ),
+  )('stores a write of %s that records a disputed economic operation over a recorded intent as written (stored %s)', async (_, form, revision) => {
+    // #given an unsettled row whose lifecycle records a cancellation intent at
+    // revision 3
+    const h = await fixture();
+    await persist(h.domain, snapshot('running', RECORDED));
+    storeAs(h, form);
+
+    // #when a write whose own lifecycle records a disputed economic operation
+    // lands
+    const disputed = { version: 1, revision, economicOperations: DISPUTED };
+    await persist(h.domain, snapshot('running', disputed));
+
+    // #then its lifecycle is stored without the intent: the dispute blocks the
+    // cancellation, as it blocks recording one
+    expect(storedLifecycle(h)).toEqual(disputed);
+  });
+
+  it.each([
+    {
+      label: 'the stored lifecycle records no intent',
+      stored: {
+        version: 1,
+        revision: 3,
+        economicOperations: [{ id: 'charge-1', settlementState: 'settled' }],
+      },
+      written: { version: 1, revision: 2, economicOperations: DISPUTED },
+    },
+    {
+      label: 'the write carries no revision',
+      stored: RECORDED,
+      written: { version: 1, economicOperations: DISPUTED },
+    },
+  ])('keeps the stored lifecycle under a stale write that records a disputed economic operation when $label', async ({
+    stored,
+    written,
+  }) => {
+    // #given an unsettled row with a run lifecycle at revision 3
+    const h = await fixture();
+    await persist(h.domain, snapshot('running', stored));
+
+    // #when a write serialized before it, which records a disputed economic
+    // operation, lands
+    await persist(h.domain, snapshot('running', written));
+
+    // #then the stored lifecycle stays
+    expect(storedLifecycle(h)).toEqual(stored);
+  });
+
+  const UNDISPUTED = [
+    { id: 'charge-1', settlementState: 'settled' },
+    { id: 'charge-2', settlementState: 'pending' },
+  ];
+
+  it.each([
+    {
+      label: 'the same revision',
+      written: { version: 1, revision: 3, economicOperations: UNDISPUTED },
+      kept: {
+        version: 1,
+        revision: 3,
+        economicOperations: UNDISPUTED,
+        transitionIntent: INTENT,
+      },
+    },
+    {
+      label: 'a lower revision',
+      written: { version: 1, revision: 2, economicOperations: UNDISPUTED },
+      kept: RECORDED,
+    },
+  ])('keeps a recorded intent under a write of $label that records economic operations without a dispute', async ({
+    written,
+    kept,
+  }) => {
+    // #given an unsettled row whose lifecycle records a cancellation intent at
+    // revision 3
+    const h = await fixture();
+    await persist(h.domain, snapshot('running', RECORDED));
+
+    // #when a write whose lifecycle records undisputed economic operations
+    // lands
+    await persist(h.domain, snapshot('running', written));
+
+    // #then the intent stays
+    expect(storedLifecycle(h)).toEqual(kept);
+  });
+
+  const DEADLINE_INTENT = {
+    status: 'timed_out',
+    requestedAt: 60,
+    replayPrincipals: [OWNER],
+    expectedRevision: 2,
+    expectedDeadlineAt: 50,
+  };
+
+  it.each(
+    STORED_FORMS.flatMap((form) =>
+      (
+        [
+          ['moved', 90, false],
+          ['kept', 50, true],
+        ] as const
+      ).map(([label, deadlineAt, carried]) => ({
+        label,
+        form,
+        deadlineAt,
+        carried,
+      })),
+    ),
+  )('carries a recorded run-deadline intent into a write of the same revision only when the write kept its deadline ($label, stored $form)', async ({
+    form,
+    deadlineAt,
+    carried,
+  }) => {
+    // #given an unsettled row whose lifecycle records a run-deadline intent at
+    // revision 3 for deadline 50
+    const h = await fixture();
+    await persist(
+      h.domain,
+      snapshot('running', {
+        version: 1,
+        revision: 3,
+        deadlineAt: 50,
+        transitionIntent: DEADLINE_INTENT,
+      }),
+    );
+    storeAs(h, form);
+
+    // #when a write whose own lifecycle reached revision 3 lands
+    const written = { version: 1, revision: 3, deadlineAt };
+    await persist(h.domain, snapshot('running', written));
+
+    // #then
+    expect(storedLifecycle(h)).toEqual(
+      carried ? { ...written, transitionIntent: DEADLINE_INTENT } : written,
+    );
+  });
+
   it('writes a lifecycle with a higher revision over the stored one', async () => {
     // #given an unsettled row whose lifecycle records an intent at revision 3
     const h = await fixture();
@@ -4500,6 +4648,17 @@ describe('run lifecycle patch', () => {
     {
       label: 'it has no lifecycle where one was expected',
       row: running({ other: true }),
+      expected: { status: 'running', lifecycleRevision: 1 },
+    },
+    {
+      label: 'its lifecycle records a disputed economic operation',
+      row: running({
+        [RUN_LIFECYCLE_CONTEXT_KEY]: {
+          version: 1,
+          revision: 1,
+          economicOperations: [{ id: 'charge-1', settlementState: 'disputed' }],
+        },
+      }),
       expected: { status: 'running', lifecycleRevision: 1 },
     },
     {

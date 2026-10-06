@@ -89,7 +89,7 @@ Retries of the same durable tool call reuse `toolCallId` and remain authorized. 
 - decide a record they requested;
 - decide a later gate when they approved an earlier gate that led to it.
 
-The second check pages the complete approved history for the run, so an older gate cannot disappear behind a bounded list.
+The second check pages the complete approved history for the run, so an older gate cannot disappear behind a bounded list. It counts each approval the decider gave before the gate was filed, including one whose resume answered `SUSPENSION_CHANGED` because the step had already left that suspension. That reviewer therefore cannot decide the approval filed for the step's current suspension either; another reviewer, or an exemption, decides it.
 
 Set `APPROVAL_ALLOW_SELF_DECISION` only when your operating model has no independent reviewer. Prefer a role list such as `admin` over `true`. Every permitted self-decision is marked in audit detail.
 

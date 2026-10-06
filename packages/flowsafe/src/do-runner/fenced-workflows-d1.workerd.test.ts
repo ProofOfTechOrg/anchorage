@@ -223,6 +223,38 @@ describe('FencedWorkflowsStorageD1 on workerd D1', () => {
     });
   });
 
+  it.each(
+    STORED_FORMS,
+  )('stores a write that records a disputed economic operation over a recorded intent as written (stored %s)', async (form) => {
+    // #given an unsettled row whose lifecycle records a cancellation intent
+    const { domain } = await fencedDomain();
+    await persist(
+      domain,
+      snapshot('running', {
+        version: 1,
+        revision: 3,
+        transitionIntent: {
+          status: 'cancelled',
+          requestedAt: 50,
+          replayPrincipals: [{ kind: 'human', id: 'Alice' }],
+        },
+      }),
+    );
+    await storeAs(form);
+
+    // #when a write whose own lifecycle reached revision 3 with a disputed
+    // economic operation lands
+    const disputed = {
+      version: 1,
+      revision: 3,
+      economicOperations: [{ id: 'charge-1', settlementState: 'disputed' }],
+    };
+    await persist(domain, snapshot('running', disputed));
+
+    // #then its lifecycle is stored without the intent
+    expect(await storedLifecycle()).toEqual(disputed);
+  });
+
   it('refuses a snapshot nested past the depth SQLite parses, over a readable row and for a run with no row', async () => {
     // #given a run with no row, and a write nested past the depth SQLite parses
     const { domain } = await fencedDomain();
