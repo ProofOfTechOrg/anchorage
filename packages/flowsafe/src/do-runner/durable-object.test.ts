@@ -9917,6 +9917,40 @@ describe('DurableObjectRunner approvals the run object files', () => {
     expect(await store.get(record.id)).toMatchObject({ status: 'pending' });
   });
 
+  it('keeps the approval it filed for the gate a timeout resume reached when a host read from before the resume reconciles', async () => {
+    // #given a gate whose timeout resume suspended it again, and the approval
+    // the object filed for that second suspension
+    const { state, values } = durableKeyValueStorageFixture();
+    const env = timedEnv();
+    const { filed, service, store } = filingLifecycle(env);
+    const runner = new TestRunner(state, env);
+    const started = await startTimed(
+      runner,
+      'run-stale-read',
+      'timed-escalating',
+    );
+    elapseDeadlines(values);
+    await runner.alarm();
+    const [record] = filed;
+    if (filed.length !== 1 || !record) throw new Error('expected one record');
+
+    // #when a host reconciles the summary it read before the resume
+    await reconcileApprovalsForSummary(
+      service,
+      'timed-escalating',
+      started,
+      'approval-reconciler',
+    );
+
+    // #then the object's approval is the run's only record, still open
+    expect(
+      await store.list({
+        workflowId: 'timed-escalating',
+        runId: 'run-stale-read',
+      }),
+    ).toEqual([expect.objectContaining({ id: record.id, status: 'pending' })]);
+  });
+
   it('files nothing for a timer that waits again after its timeout', async () => {
     // #given a timer that suspends again on every resume
     const { state, values } = durableKeyValueStorageFixture();

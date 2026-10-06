@@ -1424,6 +1424,120 @@ describe('reconcileApprovalsForSummary', () => {
     expect(await store.list({ status: 'pending' })).toEqual([]);
   });
 
+  it.each([
+    { label: 'gate', suspensionTimers: undefined },
+    { label: 'timer', suspensionTimers: ['gate'] },
+  ])('leaves the approval of a later suspension alone when the summary predates it ($label)', async ({
+    suspensionTimers,
+  }) => {
+    // #given the approval filed for the step's second suspension, and a
+    // summary read while the step was in its first
+    const store = new InMemoryApprovalStore();
+    const service = new ApprovalService({ store, executionFence: 'none' });
+    const stale: RunSummary = {
+      ...suspendedSummary('acme_run-stale', 'gate', ['c'], 1000),
+      ...(suspensionTimers ? { suspensionTimers } : {}),
+    };
+    const current = suspendedSummary('acme_run-stale', 'gate', ['c'], 2000, 1);
+    const [later] = await reconcileApprovalsForSummary(
+      service,
+      'wf',
+      current,
+      SYSTEM,
+    );
+
+    // #when the stale summary reconciles
+    const filed = await reconcileApprovalsForSummary(
+      service,
+      'wf',
+      stale,
+      SYSTEM,
+    );
+
+    // #then the later approval stays open and is the run's only record
+    expect(filed).toEqual([]);
+    expect(
+      await store.list({ workflowId: 'wf', runId: 'acme_run-stale' }),
+    ).toEqual([expect.objectContaining({ id: later?.id, status: 'pending' })]);
+  });
+
+  it('leaves the approval of a later suspension alone on D1 approval storage when the summary predates it', async () => {
+    // #given the approval filed for the step's second suspension in D1
+    const store = new D1ApprovalStoreFactory(
+      sqliteUnitDatabase(openSqlite()) as never,
+      { workflowSnapshotTable: 'mastra_workflow_snapshot' },
+    ).store();
+    const service = new ApprovalService({ store, executionFence: 'none' });
+    const current = suspendedSummary('acme_run-stale', 'gate', ['c'], 2000, 1);
+    const [later] = await reconcileApprovalsForSummary(
+      service,
+      'wf',
+      current,
+      SYSTEM,
+    );
+
+    // #when a summary read during the first suspension reconciles
+    await reconcileApprovalsForSummary(
+      service,
+      'wf',
+      suspendedSummary('acme_run-stale', 'gate', ['c'], 1000),
+      SYSTEM,
+    );
+
+    // #then the later approval stays open and is the run's only record
+    expect(
+      await store.list({ workflowId: 'wf', runId: 'acme_run-stale' }),
+    ).toEqual([expect.objectContaining({ id: later?.id, status: 'pending' })]);
+  });
+
+  it.each([
+    {
+      label: 'a record of an earlier suspension at the same count',
+      staleSuspension: suspendedSummary(
+        'acme_run-same',
+        'gate',
+        ['c'],
+        1000,
+        1,
+      ),
+      summary: suspendedSummary('acme_run-same', 'gate', ['c'], 2000, 1),
+    },
+    {
+      label: 'a record with no fingerprint, under a first suspension',
+      staleSuspension: {
+        ...suspendedSummary('acme_run-same', 'gate', [], 0),
+        suspendedAt: undefined,
+      },
+      summary: suspendedSummary('acme_run-same', 'gate', ['c'], 2000),
+    },
+  ])('supersedes an open record of the same suspension count and files the current one ($label)', async ({
+    staleSuspension,
+    summary,
+  }) => {
+    // #given an open record the summary's suspension has moved past
+    const store = new InMemoryApprovalStore();
+    const service = new ApprovalService({ store, executionFence: 'none' });
+    const [old] = await queueApprovalForSuspension(
+      service,
+      'wf',
+      staleSuspension,
+      'starter',
+      SYSTEM,
+    );
+
+    // #when the summary reconciles
+    const filed = await reconcileApprovalsForSummary(
+      service,
+      'wf',
+      summary,
+      SYSTEM,
+    );
+
+    // #then the old record is superseded and the current suspension is filed
+    expect((await store.get(old?.id ?? ''))?.status).toBe('rejected');
+    expect(filed).toMatchObject([{ suspendedAt: 2000, status: 'pending' }]);
+  });
+
   it('backs off when a concurrent decision wins the supersede CAS race (no clobber, no duplicate file)', async () => {
     // #given — a stale open record for gate1, and a store wrapped so the
     // FIRST attempt to CAS it to 'rejected' (supersedeStale's own transition)
