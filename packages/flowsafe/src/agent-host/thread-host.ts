@@ -54,6 +54,7 @@ import {
   assertExecutionPrincipal,
   isExecutionPrincipalId,
 } from '../approval-api/principal.js';
+import { errorMessageOf } from '../do-runner/cause-chain.js';
 import {
   type D1RunExecutionIdentity,
   ExecutionFenceUnreadableError,
@@ -1949,21 +1950,36 @@ export function createThreadAgentHost(
           const pending = await storage.list<AgentOwnerRecovery>({
             prefix: AGENT_OWNER_RECOVERY_PREFIX,
           });
+          let firstFailure: { error: unknown } | undefined;
           for (const [key, stored] of pending) {
+            // From the key: a malformed journal may carry no run id.
+            const runId = key.slice(AGENT_OWNER_RECOVERY_PREFIX.length);
+            // Journals recover independently: a failing one keeps its journal
+            // and the wake for a later alarm while the others are recovered.
             try {
               await recoverOwner(scope, key, stored);
             } catch (error) {
               // A start whose leg may still run, or whose row has not gone
-              // silent, settled nothing: its journal and the wake stay for a
-              // later alarm, and the other journals are still recovered.
-              if (!isRunStartPendingError(error)) throw error;
+              // silent, settled nothing.
+              if (isRunStartPendingError(error)) {
+                console.error(
+                  JSON.stringify({
+                    type: 'agent-start-recovery-pending',
+                    threadId: scope.threadId,
+                    runId,
+                  }),
+                );
+                continue;
+              }
               console.error(
                 JSON.stringify({
-                  type: 'agent-start-recovery-pending',
+                  type: 'agent-start-recovery-failed',
                   threadId: scope.threadId,
-                  runId: stored.runId,
+                  runId,
+                  error: errorMessageOf(error),
                 }),
               );
+              firstFailure ??= { error };
             }
           }
           await withRecoveryLock(async () => {
@@ -1976,6 +1992,7 @@ export function createThreadAgentHost(
               await storage.deleteAlarm();
             }
           });
+          if (firstFailure) throw firstFailure.error;
         } catch (error) {
           await withRecoveryLock(() => ensureOwnerRecoveryAlarm(storage));
           throw error;

@@ -39,6 +39,7 @@ import {
   doErrorResponse,
   type ExecutionFenceDatabase,
   ExecutionFenceStore,
+  ExecutionFenceUnreadableError,
   init,
   RunSettledConflictError,
   RunStartPendingError,
@@ -1793,6 +1794,91 @@ describe('createThreadAgentHost owner recovery', () => {
         type: 'agent-start-recovery-pending',
         threadId: 'acme_thread',
         runId: 'acme_run',
+      },
+    ]);
+  });
+
+  it.each([
+    {
+      kind: 'an unreadable execution fence',
+      failure: new ExecutionFenceUnreadableError(
+        'execution fence is not readable',
+      ),
+    },
+    {
+      kind: 'an unreadable run state',
+      failure: new RunStateUnreadableError('durable-agentic-loop', 'acme_run'),
+    },
+    {
+      kind: 'a malformed journal',
+      failure: new Error('stored agent owner recovery is malformed'),
+    },
+  ])('recovers the other journals when one fails with $kind, keeps the failing journal and reports it', async ({
+    kind,
+    failure,
+  }) => {
+    // #given a failing journal for one run, listed ahead of the preparing
+    // journal of another run
+    const malformed = kind === 'a malformed journal';
+    const { host, scope, state, resources, alarmAt } = harness(
+      ['writer'],
+      malformed
+        ? {}
+        : {
+            runtime: {
+              recoverStartAttempt: vi.fn(async () => {
+                throw failure;
+              }),
+            },
+          },
+    );
+    seedRecoveryState(
+      state,
+      'acme_run',
+      ownerRecovery(
+        'acme_run',
+        malformed ? { token: 'invalid/token' } : undefined,
+      ),
+    );
+    const preparing = ownerRecovery('acme_other', {
+      phase: 'preparing',
+      bindingPreexisting: true,
+    });
+    delete preparing.execution;
+    seedRecoveryState(state, 'acme_other', preparing);
+    await resources.reserveAll(
+      [{ kind: 'run', resourceId: 'acme_other' }],
+      { kind: 'human', id: 'operator-1' },
+      'token-acme_other',
+    );
+    const logged: string[] = [];
+    const log = vi
+      .spyOn(console, 'error')
+      .mockImplementation((...args: unknown[]) => {
+        logged.push(String(args[0]));
+      });
+
+    try {
+      // #when
+      await expect(host.recoverOwnership(scope)).rejects.toMatchObject({
+        name: failure.name,
+        message: failure.message,
+      });
+    } finally {
+      log.mockRestore();
+    }
+
+    // #then the other journal is rolled back, the failing one keeps its
+    // journal and the wake, and its failure is logged
+    expect(state.has(`${OWNER_RECOVERY_PREFIX}acme_other`)).toBe(false);
+    expect(state.has(TEST_OWNER_RECOVERY_KEY)).toBe(true);
+    expect(alarmAt()).toBeDefined();
+    expect(logged.map((line) => JSON.parse(line))).toEqual([
+      {
+        type: 'agent-start-recovery-failed',
+        threadId: 'acme_thread',
+        runId: 'acme_run',
+        error: failure.message,
       },
     ]);
   });
