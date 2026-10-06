@@ -100,6 +100,30 @@ interface AdmissionScope {
   failed: boolean;
 }
 
+/**
+ * @internal Runs `work` once every earlier call with the same `key` on `tails`
+ * has settled, in call order; a failed call does not block the next. An entry
+ * leaves `tails` when its last call settles. Each owner keeps its own `tails`:
+ * a caller that holds its queue across a call into another owner's would
+ * deadlock on a shared one.
+ */
+export function serializedByKey<T>(
+  tails: Map<string, Promise<unknown>>,
+  key: string,
+  work: () => Promise<T>,
+): Promise<T> {
+  const previous = tails.get(key) ?? Promise.resolve();
+  const current = previous.then(work, work);
+  const settled = current.then(
+    () => undefined,
+    () => undefined,
+  );
+  tails.set(key, settled);
+  return current.finally(() => {
+    if (tails.get(key) === settled) tails.delete(key);
+  });
+}
+
 /** @internal Match the pinned standalone resolver's property-presence precedence. */
 export function captureD1DomainConfig(config: D1DomainConfig): D1DomainConfig {
   if ('client' in config) {
@@ -533,7 +557,7 @@ async function patchLifecycleRow(
   const result = await database
     .prepare(`UPDATE "${tablePrefix}mastra_workflow_snapshot"
     SET snapshot = json_set(snapshot,
-        '$.requestContext."${RUN_LIFECYCLE_CONTEXT_KEY}"', json(?1),
+        ${lifecyclePath()}, json(?1),
         '$.timestamp', json(?2)),
       updatedAt = ?3
     WHERE workflow_name = ?4 AND run_id = ?5
@@ -590,42 +614,267 @@ function mastraSnapshotRow(args: PersistInput, nowIso: string) {
   };
 }
 
-function lifecyclePath(path: string): string {
-  return `'$.requestContext."${RUN_LIFECYCLE_CONTEXT_KEY}".${path}'`;
+const LIFECYCLE_JSON_PATH = `$.requestContext."${RUN_LIFECYCLE_CONTEXT_KEY}"`;
+
+/** The run lifecycle's JSON path, or one of its fields', as an SQL literal. */
+function lifecyclePath(path?: string): string {
+  return `'${LIFECYCLE_JSON_PATH}${path === undefined ? '' : `.${path}`}'`;
 }
 
 function lifecycleSql(column: string, path: string): string {
   return `json_extract(${column}, ${lifecyclePath(path)})`;
 }
 
-const STORED_UNSETTLED_SQL = RUN_SETTLING_MARKERS.map(
-  (marker) => `${lifecycleSql('snapshot', marker)} IS NULL`,
-).join(' AND ');
+function unsettledSql(stored: string): string {
+  return RUN_SETTLING_MARKERS.map(
+    (marker) => `${lifecycleSql(stored, marker)} IS NULL`,
+  ).join(' AND ');
+}
+
+const STORED_UNSETTLED_SQL = unsettledSql('snapshot');
+
+/** A rule read as 1 or 0, as a WHERE or a CASE reads it: NULL reads 0. */
+function decisionSql(rule: string): string {
+  return `CASE WHEN ${rule} THEN 1 ELSE 0 END`;
+}
 
 /**
  * Upsert condition over a stored row: unsettled, or the incoming write
- * advances the revision and keeps the settlement. JSON SQLite cannot read
- * (malformed, or nested past its depth limit) is written as Mastra's upsert
- * writes it, except an unreadable write over a settled row. CASE, unlike OR,
- * never evaluates json_extract on JSON its guard found unreadable.
+ * advances the revision and keeps the settlement. A stored row SQLite cannot
+ * read (malformed, or nested past its depth limit) fails it, and
+ * #persistUnlessSettled then evaluates it on that row's lifecycle. CASE,
+ * unlike OR, never evaluates json_extract on JSON its guard found unreadable.
  */
-const SETTLED_ROW_GUARD_SQL = `CASE
-    WHEN NOT json_valid(snapshot) THEN 1
-    WHEN NOT json_valid(excluded.snapshot) THEN ${STORED_UNSETTLED_SQL}
-    ELSE (${STORED_UNSETTLED_SQL})
-      OR (json_type(excluded.snapshot, ${lifecyclePath('revision')}) = 'integer'
-        AND ${lifecycleSql('excluded.snapshot', 'revision')} > ${lifecycleSql('snapshot', 'revision')}
+function settledRowGuardSql(stored: string, incoming: string): string {
+  return `CASE
+    WHEN NOT json_valid(${stored}) THEN 0
+    WHEN NOT json_valid(${incoming}) THEN ${unsettledSql(stored)}
+    ELSE (${unsettledSql(stored)})
+      OR (json_type(${incoming}, ${lifecyclePath('revision')}) = 'integer'
+        AND ${lifecycleSql(incoming, 'revision')} > ${lifecycleSql(stored, 'revision')}
         AND ${RUN_SETTLED_IDENTITY_PATHS.map(
           (path) =>
-            `${lifecycleSql('excluded.snapshot', path)} IS ${lifecycleSql('snapshot', path)}`,
+            `${lifecycleSql(incoming, path)} IS ${lifecycleSql(stored, path)}`,
         ).join(' AND ')})
     END`;
+}
+
+const SETTLED_ROW_GUARD_SQL = settledRowGuardSql(
+  'snapshot',
+  'excluded.snapshot',
+);
 
 /**
- * A stored row's liveness for a leg's touch: unsettled is live, and so is
- * JSON SQLite cannot read, which the guard also writes over.
+ * A stored row's liveness for a leg's touch: 1 unsettled, 0 settled, NULL for
+ * JSON SQLite cannot read, which touchRunRow decides on the row's lifecycle.
  */
-const STORED_LIVE_SQL = `CASE WHEN NOT json_valid(snapshot) THEN 1 ELSE (${STORED_UNSETTLED_SQL}) END`;
+function storedLiveSql(stored: string): string {
+  return `CASE WHEN json_valid(${stored}) THEN (${unsettledSql(stored)}) END`;
+}
+
+const STORED_LIVE_SQL = storedLiveSql('snapshot');
+
+/**
+ * Compare-and-set attempts a write over a row SQLite cannot read makes before
+ * answering that the row keeps changing.
+ */
+const UNREADABLE_ROW_WRITE_ATTEMPTS = 3;
+
+/**
+ * A snapshot's text parsed once for a decision over a row SQLite cannot read:
+ * the object, and the part the guard reads (its request context's run
+ * lifecycle) as JSON SQLite can parse. Text that is not a JSON object projects
+ * to `{}`, which holds no settlement; text `JSON.parse` fails on for a reason
+ * other than its syntax is unreadable.
+ */
+interface DecisionInput {
+  readonly snapshot?: Record<string, unknown>;
+  readonly projection: string;
+}
+
+function decisionInput(text: string): DecisionInput {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch (cause) {
+    if (cause instanceof SyntaxError) return { projection: '{}' };
+    throw new ExecutionFenceUnreadableError(
+      'workflow snapshot is not readable',
+      { cause },
+    );
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed))
+    return { projection: '{}' };
+  const snapshot = parsed as Record<string, unknown>;
+  if (!Object.hasOwn(snapshot, 'requestContext'))
+    return { snapshot, projection: '{}' };
+  const context: unknown = snapshot.requestContext;
+  if (context === null || typeof context !== 'object' || Array.isArray(context))
+    return { snapshot, projection: JSON.stringify({ requestContext: null }) };
+  return {
+    snapshot,
+    projection: JSON.stringify({
+      requestContext: Object.hasOwn(context, RUN_LIFECYCLE_CONTEXT_KEY)
+        ? {
+            [RUN_LIFECYCLE_CONTEXT_KEY]: (context as Record<string, unknown>)[
+              RUN_LIFECYCLE_CONTEXT_KEY
+            ],
+          }
+        : {},
+    }),
+  };
+}
+
+/**
+ * The single row of a statement that decides a refused write or a touch. A
+ * failure reads as an unreadable row, as readRawWorkflowSnapshot reports one.
+ */
+async function decisionRow(
+  database: InitialAdmissionDatabase,
+  sql: string,
+  values: readonly unknown[],
+): Promise<Record<string, unknown>> {
+  try {
+    const rows = snapshotResultRows(
+      await database
+        .prepare(sql)
+        .bind(...values)
+        .all(),
+    );
+    const row = rows[0];
+    if (rows.length !== 1 || row === undefined)
+      throw new Error('workflow snapshot decision is malformed');
+    return row;
+  } catch (cause) {
+    throw new ExecutionFenceUnreadableError(
+      'workflow snapshot is not readable',
+      { cause },
+    );
+  }
+}
+
+function decisionFlag(row: Record<string, unknown>, column: string): boolean {
+  const value = row[column];
+  if (value !== 0 && value !== 1)
+    throw new Error('workflow snapshot decision is malformed');
+  return value === 1;
+}
+
+/** Whether SQLite can read the row a write was refused over; undefined when it is gone. */
+async function probeRefusedWrite(
+  database: InitialAdmissionDatabase,
+  tablePrefix: string,
+  address: { workflowId: string; runId: string },
+): Promise<{ readable: boolean | undefined }> {
+  const row = await decisionRow(
+    database,
+    `SELECT (SELECT json_valid(snapshot) FROM "${tablePrefix}mastra_workflow_snapshot"
+      WHERE workflow_name = ?1 AND run_id = ?2) AS readable`,
+    [address.workflowId, address.runId],
+  );
+  return {
+    readable: row.readable === null ? undefined : decisionFlag(row, 'readable'),
+  };
+}
+
+/** The guard's verdict on a write over a stored row SQLite cannot read. */
+async function admitsOverUnreadableRow(
+  database: InitialAdmissionDatabase,
+  stored: DecisionInput,
+  incoming: DecisionInput,
+): Promise<boolean> {
+  return decisionFlag(
+    await decisionRow(
+      database,
+      `SELECT ${decisionSql(settledRowGuardSql('?1', '?2'))} AS admitted`,
+      [stored.projection, incoming.projection],
+    ),
+    'admitted',
+  );
+}
+
+/**
+ * A snapshot written over a row SQLite cannot read: the guard's rule decides it
+ * on the lifecycle parsed from the row just read, and an admitted write is a
+ * compare-and-set against that row. A miss reads the row again, so a row purged
+ * meanwhile is refused rather than inserted afresh.
+ */
+async function writeOverUnreadableRow(
+  database: InitialAdmissionDatabase,
+  tablePrefix: string,
+  row: {
+    workflowName: string;
+    runId: string;
+    snapshot: string;
+    updatedAt: string;
+  },
+): Promise<void> {
+  const address = { workflowId: row.workflowName, runId: row.runId };
+  const incoming = decisionInput(row.snapshot);
+  for (let attempt = 0; attempt < UNREADABLE_ROW_WRITE_ATTEMPTS; attempt++) {
+    const stored = await readRawWorkflowSnapshot(
+      database,
+      { tablePrefix, ...address },
+      { missingTable: 'error' },
+    );
+    if (
+      stored === undefined ||
+      !(await admitsOverUnreadableRow(
+        database,
+        decisionInput(stored.snapshot),
+        incoming,
+      ))
+    )
+      throw new RunSettledConflictError(row.workflowName, row.runId);
+    if (
+      await replaceSnapshotRow(database, tablePrefix, stored, {
+        snapshot: row.snapshot,
+        updatedAt: row.updatedAt,
+      })
+    )
+      return;
+  }
+  throw new ExecutionFenceUnreadableError(
+    'workflow snapshot write kept missing a changing row SQLite cannot parse',
+  );
+}
+
+/**
+ * The touch of a row SQLite cannot read: its parsed lifecycle decides, and
+ * `updatedAt` moves only on the exact row decided on. A row that changed in
+ * between reads live; the next touch decides again.
+ */
+async function touchUnreadableRow(
+  database: InitialAdmissionDatabase,
+  tablePrefix: string,
+  address: { workflowId: string; runId: string },
+  nowMs: number,
+): Promise<'live' | 'settled' | 'absent'> {
+  const stored = await readRawWorkflowSnapshot(
+    database,
+    { tablePrefix, ...address },
+    { missingTable: 'error' },
+  );
+  if (stored === undefined) return 'absent';
+  const live = decisionFlag(
+    await decisionRow(
+      database,
+      `SELECT ${decisionSql(storedLiveSql('?1'))} AS live`,
+      [decisionInput(stored.snapshot).projection],
+    ),
+    'live',
+  );
+  if (!live) return 'settled';
+  // Not replaceSnapshotRow, which refuses stored bytes that are not JSON.
+  decodeSnapshotReplace(
+    await prepareSnapshotReplace(database, stored, {
+      snapshot: stored.snapshot,
+      updatedAt: new Date(nowMs).toISOString(),
+    }).all(),
+    stored,
+  );
+  return 'live';
+}
 
 /**
  * SQLite counts a matched row as changed even when `updatedAt` is set to
@@ -659,6 +908,8 @@ async function touchRunRow(
   const live: unknown = captured.results[0]?.live;
   if (live === 1) return 'live';
   if (live === 0) return 'settled';
+  if (live === null)
+    return touchUnreadableRow(database, tablePrefix, address, nowMs);
   throw new Error('workflow snapshot touch result is malformed');
 }
 
@@ -869,6 +1120,7 @@ export class FencedWorkflowsStorageD1 extends WorkflowsStorageD1 {
   readonly [FENCED_WORKFLOW_STORAGE]?: FencedWorkflowAdmissionCapability;
   readonly #admission?: FencedWorkflowAdmissionCapability;
   readonly #scopes = new AsyncLocalStorage<AdmissionScope>();
+  readonly #unreadableRowTails = new Map<string, Promise<unknown>>();
 
   constructor(config: D1DomainConfig) {
     const captured = captureD1DomainConfig(config);
@@ -1069,8 +1321,9 @@ export class FencedWorkflowsStorageD1 extends WorkflowsStorageD1 {
     args: PersistInput,
   ): Promise<void> {
     const row = mastraSnapshotRow(args, new Date().toISOString());
-    const result = await capability.database
-      .prepare(`INSERT INTO "${capability.tablePrefix}mastra_workflow_snapshot"
+    const { database, tablePrefix } = capability;
+    const result = await database
+      .prepare(`INSERT INTO "${tablePrefix}mastra_workflow_snapshot"
       (workflow_name, run_id, resourceId, snapshot, createdAt, updatedAt)
       VALUES (?1, ?2, ?3, ?4, ?5, ?6)
       ON CONFLICT (workflow_name, run_id) DO UPDATE
@@ -1086,8 +1339,22 @@ export class FencedWorkflowsStorageD1 extends WorkflowsStorageD1 {
         row.updatedAt,
       )
       .all();
-    if (writtenRowCount(captureStatementResult(result)) === 0)
+    if (writtenRowCount(captureStatementResult(result)) === 1) return;
+    // The guard refused a readable row; a row gone since the upsert met it is
+    // refused too, so a purged settlement is not written over.
+    const refused = await probeRefusedWrite(database, tablePrefix, {
+      workflowId: row.workflowName,
+      runId: row.runId,
+    });
+    if (refused.readable !== false)
       throw new RunSettledConflictError(row.workflowName, row.runId);
+    // Persists through this storage over one run's unreadable row run one at a
+    // time, so they do not make each other's compare-and-set miss.
+    await serializedByKey(
+      this.#unreadableRowTails,
+      `${row.workflowName}\0${row.runId}`,
+      () => writeOverUnreadableRow(database, tablePrefix, row),
+    );
   }
 
   #initialRow(

@@ -18,6 +18,11 @@ import {
   vi,
 } from 'vitest';
 import { z } from 'zod';
+import {
+  nestedArray,
+  PAST_SQLITE_JSON_DEPTH,
+  withDeepValue,
+} from '../../test-support/deep-json.js';
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import {
   D1ResourceOwnershipStore,
@@ -79,6 +84,16 @@ import {
   suspensionDeadlinesOf,
   suspensionTimeoutResumeData,
 } from './suspension-deadline.js';
+
+function expectSnapshotUnreadable(sql: ReturnType<typeof openSqlite>) {
+  expect(
+    sql
+      .prepare(
+        'SELECT json_valid(snapshot) AS valid FROM mastra_workflow_snapshot',
+      )
+      .all(),
+  ).toEqual([{ valid: 0 }]);
+}
 
 function d1Snapshot(
   status: RunSummary['status'] = 'success',
@@ -11081,11 +11096,13 @@ describe('RunnerRuntime lifecycle transitions on D1 storage', () => {
     const { snapshot } = sql
       .prepare('SELECT snapshot FROM mastra_workflow_snapshot')
       .get() as { snapshot: string };
-    let result: unknown = 'leaf';
-    for (let level = 0; level < 1_100; level++) result = [result];
-    sql
-      .prepare('UPDATE mastra_workflow_snapshot SET snapshot = ?')
-      .run(JSON.stringify({ ...JSON.parse(snapshot), result }));
+    sql.prepare('UPDATE mastra_workflow_snapshot SET snapshot = ?').run(
+      JSON.stringify({
+        ...JSON.parse(snapshot),
+        result: nestedArray(PAST_SQLITE_JSON_DEPTH),
+      }),
+    );
+    expectSnapshotUnreadable(sql);
 
     // #when the terminate route's intent pass runs, then its terminal pass
     const cancelled = await app.runtime.cancelActiveExecution(
@@ -11384,7 +11401,7 @@ describe('RunnerRuntime leg liveness touch', () => {
       );
     const rows = () =>
       sql.prepare('SELECT * FROM mastra_workflow_snapshot').all();
-    return { leg, rows, settledRows: rows() };
+    return { leg, sql, rows, settledRows: rows() };
   }
 
   it.each(
@@ -11434,6 +11451,40 @@ describe('RunnerRuntime leg liveness touch', () => {
 
     // #then the second step never ran
     expect(leg.observed.afterRuns).toBe(0);
+  });
+
+  it('aborts a leg whose terminated run is stored too deep for SQLite to parse, and keeps the termination', async () => {
+    // #given a held leg whose run another instance terminated, with the stored
+    // snapshot nested past the depth SQLite parses
+    const { leg, sql, rows } = await holdLegSettledElsewhere('terminated');
+    const [terminated] = rows() as { snapshot: string }[];
+    sql
+      .prepare('UPDATE mastra_workflow_snapshot SET snapshot = ?')
+      .run(
+        JSON.stringify(
+          withDeepValue(JSON.parse(terminated?.snapshot ?? 'null')),
+        ),
+      );
+    expectSnapshotUnreadable(sql);
+
+    // #when the leg's touch runs
+    await leg.app.runtime.touchRun(WORKFLOW_ID, RUN_ID);
+
+    // #then the step in flight sees its signal aborted
+    expect(leg.observed.signal?.aborted).toBe(true);
+
+    // #when the step returns
+    leg.release.resolve();
+    const ended = await leg.started;
+
+    // #then the start answers cancelled, no further step ran, and the run
+    // stays cancelled
+    expect(ended).toMatchObject({ status: 'cancelled' });
+    expect(leg.observed.afterRuns).toBe(0);
+    const [stored] = rows() as { snapshot: string }[];
+    expect(JSON.parse(stored?.snapshot ?? 'null')).toMatchObject({
+      status: 'cancelled',
+    });
   });
 
   it('logs the abort of a settled leg once however many touches follow', async () => {

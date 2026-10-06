@@ -1,0 +1,5 @@
+---
+"@proofoftech/flowsafe": patch
+---
+
+`FencedWorkflowsStorageD1` no longer writes over a stored run snapshot that SQLite cannot parse as JSON, such as one nested more than 1,000 levels deep, without deciding it first. The settled-row guard refuses such a write in SQL; the storage then reads the row, evaluates the guard's rule on the run lifecycle it parses from it, and writes an admitted snapshot with a compare-and-set against that row. The liveness touch decides such a row the same way. A leg still running on another instance therefore can no longer overwrite the terminate, timeout, interruption or start repair of such a run, and its next touch aborts it. Before this change the guard wrote over such a row and the touch reported it live, so the leg kept running and its next write replaced the settlement. Stored bytes that are not JSON at all hold no settlement and are still written over. A write over such a row that keeps missing a changing row answers `503` (`EXECUTION_FENCE_UNREADABLE`). A leg run by an earlier flowsafe version during a deploy or rollback still writes over such a row.

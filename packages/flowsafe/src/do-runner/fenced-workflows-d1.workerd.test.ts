@@ -6,6 +6,7 @@ import { env } from 'cloudflare:workers';
 import type { WorkflowRunState } from '@mastra/core/workflows';
 import { beforeEach, describe, expect, it } from 'vitest';
 
+import { withDeepValue } from '../../test-support/deep-json.js';
 import { FENCED_WORKFLOW_STORAGE } from './fenced-workflow-capability.js';
 import { FencedWorkflowsStorageD1 } from './fenced-workflows-d1.js';
 import { RUN_LIFECYCLE_CONTEXT_KEY } from './run-lifecycle.js';
@@ -29,7 +30,10 @@ const TERMINATED = {
   },
 };
 
-const STORED_FORMS = ['readable'] as const;
+const STORED_FORMS = [
+  'readable',
+  'nested past the depth SQLite parses',
+] as const;
 
 async function fencedDomain() {
   const domain = new FencedWorkflowsStorageD1({ binding: db() as never });
@@ -86,15 +90,38 @@ async function storedLifecycle(): Promise<unknown> {
   ];
 }
 
+/**
+ * Leaves the run row in the form a test needs. The deep form rewrites the
+ * stored snapshot with a value nested past the depth SQLite parses, and
+ * asserts that this runtime's SQLite cannot parse it, so a SQLite with a
+ * higher depth limit fails the test instead of turning it into a readable-row
+ * test.
+ */
+async function storeAs(form: (typeof STORED_FORMS)[number]): Promise<void> {
+  if (form === 'readable') return;
+  const [row] = await rows();
+  await db()
+    .prepare('UPDATE mastra_workflow_snapshot SET snapshot = ?1')
+    .bind(JSON.stringify(withDeepValue(JSON.parse(String(row?.snapshot)))))
+    .run();
+  const stored = await db()
+    .prepare(
+      'SELECT json_valid(snapshot) AS valid FROM mastra_workflow_snapshot',
+    )
+    .all<{ valid: number }>();
+  expect(stored.results).toEqual([{ valid: 0 }]);
+}
+
 describe('FencedWorkflowsStorageD1 on workerd D1', () => {
   beforeEach(reset);
 
   it.each(
     STORED_FORMS,
-  )('refuses a stale write over a terminated row (stored %s) and admits its successor', async () => {
+  )('refuses a stale write over a terminated row (stored %s) and admits its successor', async (form) => {
     // #given a run row settled as cancelled
     const { domain } = await fencedDomain();
     await persist(domain, snapshot('failed', TERMINATED));
+    await storeAs(form);
     const settled = await rows();
     expect(settled).toHaveLength(1);
 
@@ -122,13 +149,14 @@ describe('FencedWorkflowsStorageD1 on workerd D1', () => {
 
   it.each(
     STORED_FORMS,
-  )('reports a terminated row settled and an unsettled row live to the liveness touch (stored %s)', async () => {
+  )('reports a terminated row settled and an unsettled row live to the liveness touch (stored %s)', async (form) => {
     const touchedAt = '2030-01-02T03:04:05.006Z';
     const touchedMs = Date.parse(touchedAt);
 
     // #given an unsettled row
     const { domain, capability } = await fencedDomain();
     await persist(domain, snapshot('running'));
+    await storeAs(form);
     const [unsettled] = await rows();
 
     // #when a leg touches it
@@ -140,6 +168,7 @@ describe('FencedWorkflowsStorageD1 on workerd D1', () => {
 
     // #given the row is then settled as cancelled
     await persist(domain, snapshot('failed', TERMINATED));
+    await storeAs(form);
     const settled = await rows();
 
     // #when a later touch arrives
