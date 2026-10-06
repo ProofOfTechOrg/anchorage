@@ -1,0 +1,5 @@
+---
+"@proofoftech/flowsafe": minor
+---
+
+Breaking: on `FencedWorkflowsStorageD1` storage a leg's write can no longer remove a recorded cancellation or timeout intent. Over a row that is not settled, a write whose run lifecycle has a lower revision than the stored one, or none, keeps the stored lifecycle, and a write of the same revision without an intent keeps the stored intent; the rest of the write lands. A run that completes after a terminate's intent landed is therefore recorded as cancelled, or as timed out on the run-deadline route, wherever its leg runs; before this change a completion written by a leg on another instance kept its result and the terminate answered `409`. It also closes a window in which a leg's write, serialized just before the intent landed, removed it, so a run whose isolate was then lost settled as `INTERRUPTED`, or stayed suspended, instead of cancelled. A run that completed before the intent landed still keeps its result and the terminate answers `409`. A leg run by an earlier flowsafe version during a deploy or rollback can still remove the intent.

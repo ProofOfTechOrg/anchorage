@@ -179,6 +179,50 @@ describe('FencedWorkflowsStorageD1 on workerd D1', () => {
     expect(await rows()).toEqual(settled);
   });
 
+  it.each(
+    STORED_FORMS,
+  )('keeps a recorded intent under a stale write, and carries it into a write of the same revision (stored %s)', async (form) => {
+    // #given an unsettled row whose lifecycle records a cancellation intent
+    const intent = {
+      status: 'cancelled',
+      requestedAt: 50,
+      replayPrincipals: [{ kind: 'human', id: 'Alice' }],
+    };
+    const recorded = { version: 1, revision: 3, transitionIntent: intent };
+    const { domain } = await fencedDomain();
+    await persist(domain, snapshot('running', recorded));
+    await storeAs(form);
+
+    // #when a leg's write serialized before the intent lands
+    await persist(domain, {
+      ...snapshot('running', { version: 1, revision: 2 }),
+      result: { progress: 1 },
+    });
+
+    // #then the write's state is stored and the intent stays
+    const [row] = await rows();
+    expect(JSON.parse(String(row?.snapshot))).toMatchObject({
+      result: { progress: 1 },
+    });
+    expect(await storedLifecycle()).toEqual(recorded);
+
+    // #when the row is left in the same form again, and a write whose own
+    // lifecycle reached revision 3 without the intent lands
+    await storeAs(form);
+    await persist(
+      domain,
+      snapshot('running', { version: 1, revision: 3, deadlineAt: 9 }),
+    );
+
+    // #then its lifecycle is stored with the intent added
+    expect(await storedLifecycle()).toEqual({
+      version: 1,
+      revision: 3,
+      deadlineAt: 9,
+      transitionIntent: intent,
+    });
+  });
+
   it('refuses a snapshot nested past the depth SQLite parses, over a readable row and for a run with no row', async () => {
     // #given a run with no row, and a write nested past the depth SQLite parses
     const { domain } = await fencedDomain();

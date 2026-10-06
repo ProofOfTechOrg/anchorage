@@ -682,6 +682,43 @@ const SETTLED_ROW_GUARD_SQL = settledRowGuardSql(
   'excluded.snapshot',
 );
 
+type LifecycleMerge = 'as written' | 'stored lifecycle' | 'stored intent';
+
+/**
+ * How an admitted write over an unsettled row treats the stored run
+ * lifecycle, following effectiveLifecycle's revision order in the runtime: a
+ * write whose revision is lower or absent takes the stored lifecycle
+ * (revisions only grow, so the write was serialized before the stored
+ * lifecycle landed); a write of the same revision without a transitionIntent
+ * takes the stored intent; any other write is stored as written. CASE reads
+ * no field of text an earlier branch found unreadable, and a NULL comparison
+ * falls through to 'as written'.
+ */
+function lifecycleMergeSql(stored: string, incoming: string): string {
+  return `CASE
+    WHEN NOT json_valid(${stored}) OR NOT json_valid(${incoming}) THEN 'as written'
+    WHEN NOT (${unsettledSql(stored)}) THEN 'as written'
+    WHEN json_type(${stored}, ${lifecyclePath()}) IS NOT 'object' THEN 'as written'
+    WHEN coalesce(json_type(${incoming}, '$.requestContext'), 'object') <> 'object'
+      THEN 'as written'
+    WHEN ${lifecycleSql(incoming, 'revision')} IS NULL
+      OR ${lifecycleSql(incoming, 'revision')} < ${lifecycleSql(stored, 'revision')}
+      THEN 'stored lifecycle'
+    WHEN ${lifecycleSql(incoming, 'revision')} = ${lifecycleSql(stored, 'revision')}
+      AND json_type(${stored}, ${lifecyclePath('transitionIntent')}) = 'object'
+      AND ${lifecycleSql(incoming, 'transitionIntent')} IS NULL
+      THEN 'stored intent'
+    ELSE 'as written' END`;
+}
+
+const UPSERT_SNAPSHOT_SQL = `CASE (${lifecycleMergeSql('snapshot', 'excluded.snapshot')})
+    WHEN 'stored lifecycle' THEN json_set(excluded.snapshot, ${lifecyclePath()},
+      snapshot -> ${lifecyclePath()})
+    WHEN 'stored intent' THEN json_set(excluded.snapshot,
+      ${lifecyclePath('transitionIntent')},
+      snapshot -> ${lifecyclePath('transitionIntent')})
+    ELSE excluded.snapshot END`;
+
 /**
  * A stored row's liveness for a leg's touch: 1 unsettled, 0 settled, NULL for
  * JSON SQLite cannot read, which touchRunRow decides on the row's lifecycle.
@@ -703,10 +740,12 @@ const UNREADABLE_ROW_WRITE_ATTEMPTS = 3;
  * the object, and the part the guard reads (its request context's run
  * lifecycle) as JSON SQLite can parse. Text that is not a JSON object projects
  * to `{}`, which holds no settlement; text `JSON.parse` fails on for a reason
- * other than its syntax is unreadable.
+ * other than its syntax is unreadable. `lifecycle` is the run lifecycle when
+ * it is an object.
  */
 interface DecisionInput {
   readonly snapshot?: Record<string, unknown>;
+  readonly lifecycle?: Record<string, unknown>;
   readonly projection: string;
 }
 
@@ -729,16 +768,20 @@ function decisionInput(text: string): DecisionInput {
   const context: unknown = snapshot.requestContext;
   if (context === null || typeof context !== 'object' || Array.isArray(context))
     return { snapshot, projection: JSON.stringify({ requestContext: null }) };
+  if (!Object.hasOwn(context, RUN_LIFECYCLE_CONTEXT_KEY))
+    return { snapshot, projection: JSON.stringify({ requestContext: {} }) };
+  const lifecycle: unknown = (context as Record<string, unknown>)[
+    RUN_LIFECYCLE_CONTEXT_KEY
+  ];
   return {
     snapshot,
+    ...(lifecycle !== null &&
+    typeof lifecycle === 'object' &&
+    !Array.isArray(lifecycle)
+      ? { lifecycle: lifecycle as Record<string, unknown> }
+      : {}),
     projection: JSON.stringify({
-      requestContext: Object.hasOwn(context, RUN_LIFECYCLE_CONTEXT_KEY)
-        ? {
-            [RUN_LIFECYCLE_CONTEXT_KEY]: (context as Record<string, unknown>)[
-              RUN_LIFECYCLE_CONTEXT_KEY
-            ],
-          }
-        : {},
+      requestContext: { [RUN_LIFECYCLE_CONTEXT_KEY]: lifecycle },
     }),
   };
 }
@@ -801,27 +844,68 @@ async function probeRefusedWrite(
   };
 }
 
-/** The guard's verdict on a write over a stored row SQLite cannot read. */
-async function admitsOverUnreadableRow(
+/**
+ * The guard's verdict on a write over a stored row SQLite cannot read, and how
+ * the upsert would merge the stored lifecycle into it.
+ */
+async function decideOverUnreadableRow(
   database: InitialAdmissionDatabase,
   stored: DecisionInput,
   incoming: DecisionInput,
-): Promise<boolean> {
-  return decisionFlag(
-    await decisionRow(
-      database,
-      `SELECT ${decisionSql(settledRowGuardSql('?1', '?2'))} AS admitted`,
-      [stored.projection, incoming.projection],
-    ),
-    'admitted',
+): Promise<{ admitted: boolean; merge: LifecycleMerge }> {
+  const row = await decisionRow(
+    database,
+    `SELECT ${decisionSql(settledRowGuardSql('?1', '?2'))} AS admitted,
+      ${lifecycleMergeSql('?1', '?2')} AS merge`,
+    [stored.projection, incoming.projection],
   );
+  const merge = row.merge;
+  if (
+    merge !== 'as written' &&
+    merge !== 'stored lifecycle' &&
+    merge !== 'stored intent'
+  )
+    throw new Error('workflow snapshot decision is malformed');
+  return { admitted: decisionFlag(row, 'admitted'), merge };
 }
 
 /**
- * A snapshot written over a row SQLite cannot read: the guard's rule decides it
- * on the lifecycle parsed from the row just read, and an admitted write is a
- * compare-and-set against that row. A miss reads the row again, so a row purged
- * meanwhile is refused rather than inserted afresh.
+ * The bytes an admitted write over a row SQLite cannot read stores, placing
+ * the stored lifecycle or its transitionIntent where the upsert's json_set
+ * places it: an object spread keeps an existing key's position and appends a
+ * new one.
+ */
+function mergedSnapshot(
+  stored: DecisionInput,
+  incoming: DecisionInput,
+  incomingText: string,
+  merge: LifecycleMerge,
+): string {
+  if (merge === 'as written' || !incoming.snapshot || !stored.lifecycle)
+    return incomingText;
+  const context = (incoming.snapshot.requestContext ?? {}) as Record<
+    string,
+    unknown
+  >;
+  const lifecycle =
+    merge === 'stored lifecycle'
+      ? stored.lifecycle
+      : {
+          ...incoming.lifecycle,
+          transitionIntent: stored.lifecycle.transitionIntent,
+        };
+  return JSON.stringify({
+    ...incoming.snapshot,
+    requestContext: { ...context, [RUN_LIFECYCLE_CONTEXT_KEY]: lifecycle },
+  });
+}
+
+/**
+ * A snapshot written over a row SQLite cannot read: the guard's rule and the
+ * lifecycle merge decide it on the lifecycle parsed from the row just read,
+ * and an admitted write is a compare-and-set against that row. A miss reads
+ * the row again, so a row purged meanwhile is refused rather than inserted
+ * afresh.
  */
 async function writeOverUnreadableRow(
   database: InitialAdmissionDatabase,
@@ -841,18 +925,24 @@ async function writeOverUnreadableRow(
       { tablePrefix, ...address },
       { missingTable: 'error' },
     );
-    if (
-      stored === undefined ||
-      !(await admitsOverUnreadableRow(
-        database,
-        decisionInput(stored.snapshot),
-        incoming,
-      ))
-    )
+    if (stored === undefined)
+      throw new RunSettledConflictError(row.workflowName, row.runId);
+    const storedInput = decisionInput(stored.snapshot);
+    const decision = await decideOverUnreadableRow(
+      database,
+      storedInput,
+      incoming,
+    );
+    if (!decision.admitted)
       throw new RunSettledConflictError(row.workflowName, row.runId);
     if (
       await replaceSnapshotRow(database, tablePrefix, stored, {
-        snapshot: row.snapshot,
+        snapshot: mergedSnapshot(
+          storedInput,
+          incoming,
+          row.snapshot,
+          decision.merge,
+        ),
         updatedAt: row.updatedAt,
       })
     )
@@ -1357,7 +1447,7 @@ export class FencedWorkflowsStorageD1 extends WorkflowsStorageD1 {
       SELECT ?1, ?2, ?3, ?4, ?5, ?6
       WHERE json_valid(?4)
       ON CONFLICT (workflow_name, run_id) DO UPDATE
-        SET snapshot = excluded.snapshot, updatedAt = excluded.updatedAt
+        SET snapshot = ${UPSERT_SNAPSHOT_SQL}, updatedAt = excluded.updatedAt
         WHERE ${SETTLED_ROW_GUARD_SQL}
       RETURNING workflow_name`)
       .bind(

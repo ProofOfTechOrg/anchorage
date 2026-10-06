@@ -3497,7 +3497,8 @@ describe('settled-row guard on unscoped persistence', () => {
     sql.startsWith('UPDATE "mastra_workflow_snapshot"') &&
     sql.includes('SET snapshot = ?1, updatedAt = ?2');
   const isProbe = (sql: string) => sql.includes('AS readable');
-  const isAdmission = (sql: string) => /^SELECT .* AS admitted$/s.test(sql);
+  const isAdmission = (sql: string) =>
+    /^SELECT .* AS admitted,\s+.* AS merge$/s.test(sql);
   const isLiveDecision = (sql: string) => /^SELECT .* AS live$/s.test(sql);
   const isRowRead = (sql: string) =>
     sql.startsWith('SELECT workflow_name, run_id, resourceId, snapshot');
@@ -3540,32 +3541,13 @@ describe('settled-row guard on unscoped persistence', () => {
     await persist(h.domain, snapshot('failed', successor));
 
     // #then
-    expect(
-      JSON.parse((h.rows()[0] as { snapshot: string }).snapshot).requestContext[
-        RUN_LIFECYCLE_CONTEXT_KEY
-      ],
-    ).toEqual(successor);
+    expect(storedLifecycle(h)).toEqual(successor);
   });
 
-  it.each([
-    ['no lifecycle', undefined],
-    ['a deadline only', { version: 1, revision: 2, deadlineAt: 50 }],
-    [
-      'a recorded intent only',
-      {
-        version: 1,
-        revision: 2,
-        transitionIntent: {
-          status: 'cancelled',
-          requestedAt: 50,
-          replayPrincipals: [OWNER],
-        },
-      },
-    ],
-  ] as const)('overwrites a row with %s', async (_, lifecycle) => {
-    // #given an unsettled row
+  it('overwrites a row with no lifecycle', async () => {
+    // #given an unsettled row without a run lifecycle
     const h = await fixture();
-    await persist(h.domain, snapshot('running', lifecycle));
+    await persist(h.domain, snapshot('running'));
 
     // #when a write without a lifecycle lands
     await persist(h.domain, snapshot('success'));
@@ -3574,6 +3556,101 @@ describe('settled-row guard on unscoped persistence', () => {
     expect(h.rows()).toMatchObject([
       { snapshot: JSON.stringify(snapshot('success')) },
     ]);
+  });
+
+  const INTENT = {
+    status: 'cancelled',
+    requestedAt: 50,
+    replayPrincipals: [OWNER],
+  };
+  const RECORDED = { version: 1, revision: 3, transitionIntent: INTENT };
+
+  function storedLifecycle(h: Awaited<ReturnType<typeof fixture>>) {
+    const [row] = h.rows() as { snapshot: string }[];
+    return JSON.parse(row?.snapshot ?? 'null').requestContext[
+      RUN_LIFECYCLE_CONTEXT_KEY
+    ];
+  }
+
+  it.each([
+    ['a deadline only', { version: 1, revision: 2, deadlineAt: 50 }],
+    [
+      'a recorded intent only',
+      { version: 1, revision: 2, transitionIntent: INTENT },
+    ],
+  ] as const)('keeps the stored lifecycle of a row with %s under a write that carries none', async (_, lifecycle) => {
+    // #given an unsettled row with a run lifecycle
+    const h = await fixture();
+    await persist(h.domain, snapshot('running', lifecycle));
+
+    // #when a write without a lifecycle lands
+    await persist(h.domain, snapshot('success'));
+
+    // #then the write lands and the stored lifecycle stays
+    expect(h.rows()).toMatchObject([
+      {
+        snapshot: JSON.stringify({
+          ...snapshot('success'),
+          requestContext: { [RUN_LIFECYCLE_CONTEXT_KEY]: lifecycle },
+        }),
+      },
+    ]);
+  });
+
+  it.each(
+    STORED_FORMS,
+  )('keeps a recorded intent under a stale write with a lower revision and lands the rest of the write (stored %s)', async (form) => {
+    // #given an unsettled row whose lifecycle records a cancellation intent
+    const h = await fixture();
+    await persist(h.domain, snapshot('running', RECORDED));
+    storeAs(h, form);
+
+    // #when a leg's write serialized before the intent lands
+    await persist(h.domain, {
+      ...snapshot('running', { version: 1, revision: 2 }),
+      result: { progress: 1 },
+    });
+
+    // #then the write's state is stored and the intent stays
+    const [row] = h.rows() as { snapshot: string }[];
+    expect(JSON.parse(row?.snapshot ?? 'null')).toMatchObject({
+      result: { progress: 1 },
+    });
+    expect(storedLifecycle(h)).toEqual(RECORDED);
+  });
+
+  it('carries a recorded intent into a write of the same revision that has none', async () => {
+    // #given an unsettled row whose lifecycle records an intent at revision 3
+    const h = await fixture();
+    await persist(h.domain, snapshot('running', RECORDED));
+
+    // #when a write whose own lifecycle reached revision 3 without the intent
+    // lands
+    await persist(
+      h.domain,
+      snapshot('running', { version: 1, revision: 3, deadlineAt: 9 }),
+    );
+
+    // #then its lifecycle is stored with the intent added
+    expect(storedLifecycle(h)).toEqual({
+      version: 1,
+      revision: 3,
+      deadlineAt: 9,
+      transitionIntent: INTENT,
+    });
+  });
+
+  it('writes a lifecycle with a higher revision over the stored one', async () => {
+    // #given an unsettled row whose lifecycle records an intent at revision 3
+    const h = await fixture();
+    await persist(h.domain, snapshot('running', RECORDED));
+
+    // #when a write with revision 4 and no intent lands
+    const newer = { version: 1, revision: 4, deadlineAt: 9 };
+    await persist(h.domain, snapshot('running', newer));
+
+    // #then its lifecycle replaces the stored one
+    expect(storedLifecycle(h)).toEqual(newer);
   });
 
   it.each([
@@ -3812,11 +3889,6 @@ describe('settled-row guard on unscoped persistence', () => {
 
   describe('decisions over a row SQLite cannot parse match the SQL decisions', () => {
     const KEY = RUN_LIFECYCLE_CONTEXT_KEY;
-    const INTENT = {
-      status: 'cancelled',
-      requestedAt: 50,
-      replayPrincipals: [OWNER],
-    };
     const NO_CONTEXT = undefined;
     const STORED_CONTEXTS = [
       { label: 'no request context', context: NO_CONTEXT },

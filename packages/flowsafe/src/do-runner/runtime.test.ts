@@ -11530,6 +11530,109 @@ describe('RunnerRuntime lifecycle transitions on D1 storage', () => {
     ).toBeUndefined();
   });
 
+  it('records the cancellation when a leg write serialized before the intent lands after it', async () => {
+    // #given a stranded run whose leg write, made from the row before the
+    // intent, lands right after the intent patch
+    const { app, workflow, workflows, stored } = await racingRun();
+    const before = await stored();
+    const native = workflows[FENCED_WORKFLOW_STORAGE];
+    assert(native?.patchRunLifecycle);
+    const patch = native.patchRunLifecycle.bind(native);
+    Object.defineProperty(workflows, FENCED_WORKFLOW_STORAGE, {
+      value: {
+        ...native,
+        patchRunLifecycle: async (
+          ...args: Parameters<typeof patch>
+        ): Promise<boolean> => {
+          const patched = await patch(...args);
+          if (patched)
+            await workflows.persistWorkflowSnapshot({
+              workflowName: workflow.id,
+              runId: 'stranded-run',
+              snapshot: before,
+            });
+          return patched;
+        },
+      },
+      configurable: true,
+    });
+
+    // #when the intent is recorded and the run later settles as stranded
+    await app.runtime.cancelActiveExecution(
+      workflow.id,
+      'stranded-run',
+      'cancelled',
+      [owner],
+    );
+    const settled = await app.runtime.settleInterruptedRun(
+      workflow.id,
+      'stranded-run',
+      Date.now() + 360_001,
+    );
+
+    // #then the recorded cancellation decides it
+    expect(settled).toMatchObject({
+      kind: 'transition',
+      transition: { summary: { status: 'cancelled' } },
+    });
+  });
+
+  it.each([
+    { label: 'terminate, no lifecycle', route: 'terminate', start: {} },
+    {
+      label: 'terminate, a lower revision',
+      route: 'terminate',
+      start: { deadlineMs: 3_600_000 },
+    },
+    {
+      label: 'run-deadline timeout, a lower revision',
+      route: 'timeout',
+      start: { deadlineMs: 1 },
+    },
+  ] as const)('records the transition of a run whose leg on another instance completes after the intent ($label)', async ({
+    route,
+    start,
+  }) => {
+    // #given a stranded run with a recorded intent
+    const { app, workflow, workflows, stored, storedCas } =
+      await racingRun(start);
+    const cas = route === 'terminate' ? undefined : await storedCas();
+    const now = Date.now() + 1_000;
+    const { requestContext } = await stored();
+    await (cas
+      ? app.runtime.cancelActiveExecution(
+          workflow.id,
+          'stranded-run',
+          'timed_out',
+          [owner],
+          cas,
+          now,
+        )
+      : app.runtime.cancelActiveExecution(
+          workflow.id,
+          'stranded-run',
+          'cancelled',
+          [owner],
+        ));
+
+    // #when its leg, holding the context from before the intent, writes its
+    // result
+    await workflows.persistWorkflowSnapshot({
+      workflowName: workflow.id,
+      runId: 'stranded-run',
+      snapshot: { ...finishes(await stored()), requestContext },
+    });
+    const transition = cas
+      ? app.runtime.timeOut(workflow.id, 'stranded-run', cas, now)
+      : app.runtime.terminate(workflow.id, 'stranded-run');
+
+    // #then the transition records the run with the intent's status
+    await expect(transition).resolves.toMatchObject({
+      transitioned: true,
+      summary: { status: cas ? 'timed_out' : 'cancelled' },
+    });
+  });
+
   it('lands the cancellation intent while the leg keeps rewriting the row', async () => {
     // #given a stranded run whose leg rewrites the row, still running, after
     // each of up to five reads: enough to make a whole-row compare-and-set
