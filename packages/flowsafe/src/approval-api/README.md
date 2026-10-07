@@ -13,6 +13,9 @@ decision. Grants never cross an HTTP boundary.
   deadlines, audit, notifications, streaming, and separation of duties. It
   resumes a decided run through an injected `resumeRun` callback. Use
   `resumeViaRuntime` in one process or a Durable Object stub across Workers.
+  A callback that builds its own resume call or request body passes
+  `expectedSuspensionFor(record)`, so a decision for an earlier suspension
+  of the step is refused instead of resuming its current one.
 - `router.ts`: REST surface. Returns null off-prefix so a host Worker composes it ahead of its own routes. It takes an `ActorResolver` and resolves it before reading a route body. There is no `/sla/sweep` route.
 - `grants.ts`: the seam between the queue and the runner. Plugs into the
   Durable Object runner's `requestContextForRun`. On every start or resume, it
@@ -100,7 +103,9 @@ never resumes a run.
   invokes `resumeRun`. `DecideResult.resume` reports any resume failure without
   rolling back the decision. Retry the run resume through the host's runtime
   or Durable Object path; do not submit the decision again. The stored decision
-  still derives the grant for that suspension.
+  still derives the grant for that suspension. A resume whose `code` is
+  `SUSPENSION_CHANGED` is refused on every retry: the step has moved on to
+  another suspension, so decide that suspension's approval instead.
 - **Enforce separation of duties by default**: `decide()` rejects the
   requester and a reviewer who approved an earlier sequential gate in the same
   run. Parallel gates filed before either decision do not trigger the

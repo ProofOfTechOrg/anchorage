@@ -5,6 +5,7 @@ import {
   isExecutionPrincipalId,
   isExecutionPrincipalKind,
 } from '../approval-api/principal-identity.js';
+import { DoStatusError } from './do-status-error.js';
 import { isPathSafeId } from './path-safe-id.js';
 
 /** Runtime-owned request-context key for durable run lifecycle metadata. */
@@ -12,10 +13,58 @@ export const RUN_LIFECYCLE_CONTEXT_KEY = 'flowsafe.runLifecycle';
 
 export type RunTerminalStatus = 'cancelled' | 'timed_out';
 
+const RUN_TERMINAL_ERRORS = {
+  cancelled: { name: 'RunCancelledError', message: 'run was cancelled' },
+  timed_out: { name: 'RunTimedOutError', message: 'run deadline expired' },
+} as const satisfies Record<
+  RunTerminalStatus,
+  { name: string; message: string }
+>;
+
+/** The stored error of a terminal transition: the name consumers match on, and its message. */
+export function runTerminalError(
+  status: RunTerminalStatus,
+): (typeof RUN_TERMINAL_ERRORS)[RunTerminalStatus] {
+  return { ...RUN_TERMINAL_ERRORS[status] };
+}
+
+/**
+ * The reason the runtime aborts a leg with: named `AbortError`, which Mastra
+ * and the AI SDK read as an abort, with `cause` as its cause.
+ */
+export function legAbortReason(cause: Error): Error {
+  return Object.assign(new Error(cause.message, { cause }), {
+    name: 'AbortError',
+  });
+}
+
+/**
+ * The reason a leg's abort carries when a terminal transition handled in its
+ * isolate cuts it. Its cause is the run's terminal error: the engine reports
+ * such a leg only as `canceled`, whichever transition cut it.
+ */
+export function terminalLegAbortReason(status: RunTerminalStatus): Error {
+  const { name, message } = runTerminalError(status);
+  return legAbortReason(Object.assign(new Error(message), { name }));
+}
+
+/** The terminal status a {@link terminalLegAbortReason} names, if `reason` is one. */
+export function terminalStatusOfLegAbort(
+  reason: unknown,
+): RunTerminalStatus | undefined {
+  if (!(reason instanceof Error) || !(reason.cause instanceof Error))
+    return undefined;
+  const { name } = reason.cause;
+  return (Object.keys(RUN_TERMINAL_ERRORS) as RunTerminalStatus[]).find(
+    (status) => RUN_TERMINAL_ERRORS[status].name === name,
+  );
+}
+
 const RUN_TERMINAL_ERROR_CODES = [
   'CANCELLED',
   'TIMED_OUT',
   'INTERRUPTED',
+  'RUN_STATE_NOT_STORABLE',
 ] as const;
 
 export interface RunTerminalErrorEnvelope {
@@ -37,6 +86,10 @@ export function isRunTerminalErrorCode(
 /** The `INTERRUPTED` envelope message of a run whose execution leg ended mid-step. */
 export const RUN_INTERRUPTED_MESSAGE =
   'Run execution stopped mid-step before a durable outcome was recorded; external effects may have occurred. This run will not be automatically re-executed.';
+
+/** The `RUN_STATE_NOT_STORABLE` envelope message of a run whose state could not be stored. */
+export const RUN_STATE_NOT_STORABLE_MESSAGE =
+  'Run state could not be stored because SQLite cannot parse it as JSON; the step that produced it may have had external effects. This run will not be automatically re-executed.';
 
 export interface RunLifecycleBlockedReason {
   code: 'DISPUTED_SETTLEMENT';
@@ -64,6 +117,19 @@ export class RunSettledConflictError extends Error {
       `run '${runId}' of workflow '${workflowId}' is already settled; the write does not advance its lifecycle`,
     );
     this.name = 'RunSettledConflictError';
+  }
+}
+
+/** A run snapshot SQLite cannot parse as JSON, refused before it is stored. */
+export class RunStateNotStorableError extends DoStatusError {
+  readonly status = 422;
+  readonly reason = { code: 'RUN_STATE_NOT_STORABLE' } as const;
+
+  constructor(workflowId: string, runId: string) {
+    super(
+      `run '${runId}' of workflow '${workflowId}' state cannot be stored: SQLite cannot parse it as JSON`,
+    );
+    this.name = 'RunStateNotStorableError';
   }
 }
 
@@ -112,6 +178,12 @@ export interface RunLifecycleState {
    * is not part of the run's summary.
    */
   startOutcomeUnknownAt?: number;
+  /**
+   * Epoch milliseconds at which the runtime recorded as `failed` a run whose
+   * leg's write was refused as state that cannot be stored. A settling marker
+   * (RUN_SETTLING_MARKERS).
+   */
+  stateNotStorableAt?: number;
   economicOperations?: RunEconomicOperation[];
   scheduleDispatch?: RunScheduleDispatch;
   transitionIntent?: {
@@ -142,15 +214,59 @@ export const RUN_SETTLING_MARKERS = [
   'terminal',
   'interruptedAt',
   'startOutcomeUnknownAt',
+  'stateNotStorableAt',
 ] as const satisfies readonly (keyof RunLifecycleState)[];
 
+type SettlingTimeMarker = Exclude<
+  (typeof RUN_SETTLING_MARKERS)[number],
+  'terminal'
+>;
+
+const SETTLING_TIME_MARKERS = RUN_SETTLING_MARKERS.filter(
+  (marker): marker is SettlingTimeMarker => marker !== 'terminal',
+);
+
 type RunSettledIdentityPath =
-  | Exclude<(typeof RUN_SETTLING_MARKERS)[number], 'terminal'>
+  | SettlingTimeMarker
   | `terminal.${keyof NonNullable<RunLifecycleState['terminal']>}`;
 
+/**
+ * The failure a settling marker records for a run the runtime fails itself:
+ * the error the snapshot stores and the envelope its summary carries.
+ */
+export const RUN_FAILURE_MARKERS = {
+  interruptedAt: {
+    errorName: 'RunInterruptedError',
+    envelope: { code: 'INTERRUPTED', message: RUN_INTERRUPTED_MESSAGE },
+  },
+  stateNotStorableAt: {
+    errorName: 'RunStateNotStorableError',
+    envelope: {
+      code: 'RUN_STATE_NOT_STORABLE',
+      message: RUN_STATE_NOT_STORABLE_MESSAGE,
+    },
+  },
+} as const satisfies Partial<
+  Record<
+    SettlingTimeMarker,
+    { errorName: string; envelope: RunTerminalErrorEnvelope }
+  >
+>;
+
+/** The envelope of the failure marker a lifecycle carries, if any. */
+export function failureEnvelope(
+  lifecycle: RunLifecycleState | undefined,
+): RunTerminalErrorEnvelope | undefined {
+  for (const marker of Object.keys(
+    RUN_FAILURE_MARKERS,
+  ) as (keyof typeof RUN_FAILURE_MARKERS)[])
+    if (lifecycle?.[marker] !== undefined)
+      return { ...RUN_FAILURE_MARKERS[marker].envelope };
+  return undefined;
+}
+
 export const RUN_SETTLED_IDENTITY_PATHS = [
-  'interruptedAt',
-  'startOutcomeUnknownAt',
+  ...SETTLING_TIME_MARKERS,
   'terminal.status',
   'terminal.transitionedAt',
 ] as const satisfies readonly RunSettledIdentityPath[];
@@ -214,8 +330,7 @@ export function projectTerminalLifecycle(
       status,
       error: {
         code: status === 'cancelled' ? 'CANCELLED' : 'TIMED_OUT',
-        message:
-          status === 'cancelled' ? 'run was cancelled' : 'run deadline expired',
+        message: runTerminalError(status).message,
       },
       transitionedAt: nowMs,
       replayPrincipals,
@@ -396,9 +511,9 @@ export function parseRunLifecycle(
     !Number.isSafeInteger(stored.revision) ||
     (stored.revision as number) < 1 ||
     (stored.deadlineAt !== undefined && !validTime(stored.deadlineAt)) ||
-    (stored.interruptedAt !== undefined && !validTime(stored.interruptedAt)) ||
-    (stored.startOutcomeUnknownAt !== undefined &&
-      !validTime(stored.startOutcomeUnknownAt))
+    SETTLING_TIME_MARKERS.some(
+      (marker) => stored[marker] !== undefined && !validTime(stored[marker]),
+    )
   ) {
     throw new Error('stored run lifecycle is malformed');
   }
@@ -408,12 +523,11 @@ export function parseRunLifecycle(
     ...(stored.deadlineAt === undefined
       ? {}
       : { deadlineAt: stored.deadlineAt as number }),
-    ...(stored.interruptedAt === undefined
-      ? {}
-      : { interruptedAt: stored.interruptedAt as number }),
-    ...(stored.startOutcomeUnknownAt === undefined
-      ? {}
-      : { startOutcomeUnknownAt: stored.startOutcomeUnknownAt as number }),
+    ...Object.fromEntries(
+      SETTLING_TIME_MARKERS.filter(
+        (marker) => stored[marker] !== undefined,
+      ).map((marker) => [marker, stored[marker] as number]),
+    ),
     ...(stored.economicOperations === undefined
       ? {}
       : { economicOperations: economicOperations(stored.economicOperations) }),

@@ -112,8 +112,10 @@ export interface FencedWorkflowAdmissionCapability {
    * report `false` when any of its columns changed since. It writes the bytes
    * it is given, outside the settled-row guard, and rejects, writing nothing,
    * a `snapshot` that is not a JSON object or an `updatedAt` that is not in
-   * `Date.prototype.toISOString()` form. Settlement needs it beside
-   * `touchRun`: without it a run whose leg stops is never settled.
+   * `Date.prototype.toISOString()` form. It also rejects a `snapshot` SQLite
+   * cannot parse, such as one nested past its JSON depth limit, over a row
+   * SQLite can parse, with `RunStateNotStorableError`. Settlement needs it
+   * beside `touchRun`: without it a run whose leg stops is never settled.
    */
   replaceSnapshot?(
     expected: RawWorkflowSnapshot,
@@ -123,7 +125,8 @@ export interface FencedWorkflowAdmissionCapability {
    * Write the run's lifecycle, `timestamp` and `updatedAt` and no other part of
    * its snapshot, but only while the stored status is `expected.status`, the
    * stored lifecycle's revision is `expected.lifecycleRevision` (or it has no
-   * lifecycle, when that is omitted) and the row is not settled; otherwise
+   * lifecycle, when that is omitted), the row is not settled and its lifecycle
+   * records no disputed economic operation; otherwise
    * resolve `false`, writing nothing. A write that leaves the status and
    * lifecycle alone, such as a leg's step progress, does not make it miss. It
    * rejects, writing nothing, a malformed address, expectation or patch.

@@ -467,7 +467,8 @@ export async function reconcileApprovalsForSummaryAndEndedSuspension(
 /**
  * Recovery primitive: given a run's suspended RunSummary, heals every
  * CURRENTLY suspended step whose exact (suspendedAt, resumeCount)
- * fingerprint has no approval record of ANY status, then files it fresh.
+ * fingerprint has no approval record of ANY status, and that has no record
+ * of a later suspension, then files it fresh.
  * Safe to call on every status() read of a suspended run, rather than only
  * after a confirmed bridge failure, because per step:
  *
@@ -479,6 +480,10 @@ export async function reconcileApprovalsForSummaryAndEndedSuspension(
  *    this exists for) re-queued the next gate — re-filing would double-file
  *    a gate correctly waiting on its own resume, the decide -> resume
  *    in-flight window;
+ *  - any record bound to a LATER suspension of the step (a greater
+ *    resumeCount) means the summary predates it — a status read outside the
+ *    run's lock can return such a summary — so the step is left alone:
+ *    nothing is superseded and nothing is filed;
  *  - otherwise, every STALE OPEN record for that step (pending/claimed/
  *    escalated, bound to a suspension the step has since moved past —
  *    produced e.g. by the raw grant-free resume route re-suspending the step
@@ -545,6 +550,13 @@ export async function reconcileApprovalsForSummary(
         record.resumeCount === resumeCount,
     );
     if (boundToCurrent) continue;
+    const summaryResumeCount = resumeCount ?? 0;
+    if (
+      stepRecords.some(
+        (record) => (record.resumeCount ?? 0) > summaryResumeCount,
+      )
+    )
+      continue;
 
     let lostRace = false;
     for (const record of stepRecords) {

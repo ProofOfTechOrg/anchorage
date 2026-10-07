@@ -23,7 +23,7 @@
 // functions, so throwing refusals preserve the durable-agent brand.
 //
 // Signal senders and queueMessage stay inherited because their starts reach
-// executeWorkflow's refusal for ids absent from #startRequesters, preserving
+// executeWorkflow's refusal for ids absent from #pendingStarts, preserving
 // the input verdict and publishing terminal ERROR.
 //
 // AgentThreadStreamRuntime's idle wake, continuation and queued-signal drains
@@ -95,13 +95,20 @@ import {
 import {
   InvalidRunRequestError,
   isPathSafeId,
+  type RunScheduleDispatch,
   RunStateUnreadableError,
 } from '../do-runner/index.js';
 import { resourceIdFromKey } from '../do-runner/memory-id.js';
+import {
+  type RunTerminalStatus,
+  runTerminalError,
+  terminalStatusOfLegAbort,
+} from '../do-runner/run-lifecycle.js';
 import { isTerminalRunStatus } from '../do-runner/run-terminal-state.js';
 import type {
   AuthoritativeStartState,
   LegacyRunState,
+  ResumeRunOptions,
   RunnerRuntime,
   RunSummary,
   StartRunOptions,
@@ -155,6 +162,19 @@ export interface AgentStartAuthority {
     | ((execution: RunExecutionIdentity) => void | Promise<void>)
     | undefined;
   readonly runOwnerGuard?: StartRunOptions['runOwnerGuard'];
+}
+
+/**
+ * A host start `streamUntilPersisted()` registered for `executeWorkflow()`. The
+ * requester is `authority.startIdentity.owner`, which the capture checked
+ * against the requester pair.
+ */
+interface PendingStart {
+  readonly attemptToken: string;
+  readonly authority: AgentStartAuthority;
+  readonly scheduleDispatch?: Readonly<RunScheduleDispatch>;
+  readonly idempotencyKey?: string;
+  readonly persisted: { resolve(): void; reject(error: unknown): void };
 }
 
 /**
@@ -907,6 +927,47 @@ function composeTotalBudget(
   };
 }
 
+/**
+ * The terminal ERROR a leg's run stream ends with when its run ended other
+ * than successfully. An engine cancel publishes no terminal event of its own,
+ * and the stream's consumers and Mastra's cleanup of the run wait for one. A
+ * leg cut in this isolate reads as the engine's `canceled`, so its abort
+ * reason names the transition that cut it.
+ */
+function legTerminalError(
+  summary: RunSummary,
+  failedMessage: string,
+  legSignal?: AbortSignal,
+): Error | undefined {
+  if (summary.status === 'failed')
+    return new Error(summary.error ?? failedMessage);
+  const status =
+    summary.status === 'canceled'
+      ? (terminalStatusOfLegAbort(legSignal?.reason) ?? 'cancelled')
+      : summary.status === 'cancelled' || summary.status === 'timed_out'
+        ? summary.status
+        : undefined;
+  return status ? endedRunError(status, summary.error) : undefined;
+}
+
+function endedRunError(
+  status: RunTerminalStatus,
+  storedError: string | undefined,
+): Error {
+  const { name, message } = runTerminalError(status);
+  return Object.assign(new Error(storedError ?? message), { name });
+}
+
+function threadLegOutcome(
+  status: RunSummary['status'],
+): ThreadLegTerminalOutcome {
+  return status === 'success'
+    ? 'success'
+    : status === 'canceled' || status === 'cancelled'
+      ? 'canceled'
+      : 'failed';
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -1012,27 +1073,10 @@ export class FlowsafeDurableAgent<
   readonly #guardedCallOptionMapper?: DurableCallOptionMapper;
   readonly #threadRuntime?: Mastra['agentThreadStreamRuntime'];
   readonly #resumedThreadLegs = new Map<string, Set<ResumedThreadLeg>>();
-  readonly #persistenceWaiters = new Map<
-    string,
-    {
-      resolve: () => void;
-      reject: (error: unknown) => void;
-    }
-  >();
-  readonly #startRequesters = new Map<string, string>();
-  readonly #startRequesterKinds = new Map<string, ExecutionPrincipalKind>();
-  readonly #startAttemptTokens = new Map<string, string>();
-  /**
-   * runId -> the reservation key the thread topology took for this start, so
-   * `executeWorkflow` can hand it to `RunnerRuntime.start` for the execution
-   * fence's proof-only match.
-   */
-  readonly #startIdempotencyKeys = new Map<string, string>();
-  readonly #startAuthorities = new Map<string, AgentStartAuthority>();
-  readonly #startScheduleDispatches = new Map<
-    string,
-    { scheduleId: string; dispatchId: string }
-  >();
+  // Registry entries whose run's terminal ERROR this isolate published or is
+  // publishing, so a later release cleans them without publishing a second one.
+  readonly #endedEntries = new WeakSet<object>();
+  readonly #pendingStarts = new Map<string, PendingStart>();
   // The host's exact options object receives one private, single-use re-entry ticket.
   readonly #hostStreamTickets = new WeakSet<object>();
   // The created signal of a start with neither a host ticket nor a request
@@ -1131,7 +1175,7 @@ export class FlowsafeDurableAgent<
 
   /**
    * Refuse every run id that is still registered on any start or core seam.
-   * `#startRequesters` alone is insufficient because `streamUntilPersisted()`
+   * `#pendingStarts` alone is insufficient because `streamUntilPersisted()`
    * removes it after the first summary while a suspended stream stays live.
    * The internal registry has no TTL, so it also covers long suspensions after
    * the global registry's TTL expires.
@@ -1151,8 +1195,7 @@ export class FlowsafeDurableAgent<
   /** @internal */
   isRunLive(runId: string): boolean {
     return (
-      this.#startRequesters.has(runId) ||
-      this.#persistenceWaiters.has(runId) ||
+      this.#pendingStarts.has(runId) ||
       globalRunRegistry.has(runId) ||
       this.runRegistryInternal.has(runId)
     );
@@ -1283,17 +1326,18 @@ export class FlowsafeDurableAgent<
       reject = rejectPromise;
     });
     void persisted.catch(() => undefined);
-    this.#persistenceWaiters.set(runId, { resolve, reject });
-    this.#startRequesters.set(runId, requestedBy);
-    this.#startRequesterKinds.set(runId, requestedByKind);
-    this.#startAttemptTokens.set(runId, attemptToken);
-    this.#startAuthorities.set(runId, capturedAuthority);
-    if (capturedScheduleDispatch) {
-      this.#startScheduleDispatches.set(runId, capturedScheduleDispatch);
-    }
-    if (idempotencyKey !== undefined) {
-      this.#startIdempotencyKeys.set(runId, idempotencyKey);
-    }
+    this.#pendingStarts.set(
+      runId,
+      Object.freeze({
+        attemptToken,
+        authority: capturedAuthority,
+        ...(capturedScheduleDispatch
+          ? { scheduleDispatch: capturedScheduleDispatch }
+          : {}),
+        ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
+        persisted: { resolve, reject },
+      }),
+    );
     const onError = callOptions.onError;
     try {
       const hostCallOptions: typeof callOptions = {
@@ -1312,13 +1356,7 @@ export class FlowsafeDurableAgent<
       await persisted;
       return result;
     } finally {
-      this.#persistenceWaiters.delete(runId);
-      this.#startRequesters.delete(runId);
-      this.#startRequesterKinds.delete(runId);
-      this.#startAttemptTokens.delete(runId);
-      this.#startScheduleDispatches.delete(runId);
-      this.#startIdempotencyKeys.delete(runId);
-      this.#startAuthorities.delete(runId);
+      this.#pendingStarts.delete(runId);
     }
   }
 
@@ -1952,6 +1990,9 @@ export class FlowsafeDurableAgent<
         resourceId: preparation.resourceId,
       },
     );
+    // The cache does not dispose an entry that `set` replaces (noDisposeOnSet),
+    // and the previous leg's entry holds Mastra's abort-request subscription.
+    globalRunRegistry.delete(options.runId);
     globalRunRegistry.set(options.runId, {
       ...registryEntry,
       messageList: preparation.messageList,
@@ -1974,6 +2015,7 @@ export class FlowsafeDurableAgent<
     step?: string | string[];
     resumeData?: unknown;
     memory?: DurableAgentStreamOptions<TOutput>['memory'];
+    expectedSuspension?: ResumeRunOptions['expectedSuspension'];
   }): Promise<RunSummary> {
     this.#assertCallerRunId(options.runId);
     const memory = this.#guardedCallOptionMapper
@@ -1993,6 +2035,9 @@ export class FlowsafeDurableAgent<
           ...(options.step !== undefined ? { step: options.step } : {}),
           ...(options.resumeData !== undefined
             ? { resumeData: options.resumeData }
+            : {}),
+          ...(options.expectedSuspension !== undefined
+            ? { expectedSuspension: options.expectedSuspension }
             : {}),
           requestedBy: options.requestedBy,
           requestedByKind: 'human',
@@ -2030,36 +2075,58 @@ export class FlowsafeDurableAgent<
           },
         },
       );
-      if (summary.status === 'failed') {
-        await this.#publishTerminalError(
+      const terminalError = legTerminalError(
+        summary,
+        'Durable agent workflow resume failed',
+        legAbort.signal,
+      );
+      if (terminalError)
+        await this.#endRunLocally(
           options.runId,
-          new Error(summary.error ?? 'Durable agent workflow resume failed'),
+          terminalError,
+          threadLegOutcome(summary.status),
         );
-        this.runRegistryInternal.cleanup(options.runId);
-        globalRunRegistry.delete(options.runId);
-      }
-      if (isTerminalRunStatus(summary.status)) {
+      else if (isTerminalRunStatus(summary.status))
         this.#completeResumedThreadLegs(
           options.runId,
-          summary.status === 'success'
-            ? 'success'
-            : summary.status === 'canceled' || summary.status === 'cancelled'
-              ? 'canceled'
-              : 'failed',
+          threadLegOutcome(summary.status),
         );
-      } else if (leg) {
-        leg.outcome = 'suspended';
-      }
+      else if (leg) leg.outcome = 'suspended';
       return summary;
     } catch (error) {
-      if (rehydrated) {
-        await this.#publishTerminalError(options.runId, error);
-        this.runRegistryInternal.cleanup(options.runId);
-        globalRunRegistry.delete(options.runId);
-        this.#completeResumedThreadLegs(options.runId, 'failed');
-      }
+      if (rehydrated) await this.#endRunLocally(options.runId, error, 'failed');
       throw error;
     }
+  }
+
+  /**
+   * @internal Ends this isolate's state for a run whose stored status a
+   * terminate or deadline settled, publishing its terminal ERROR unless a leg
+   * here already did. A run with a start still pending here, one this isolate
+   * holds nothing for, or one whose status is not cancelled or timed out, is
+   * left to its own path.
+   */
+  async releaseEndedRun(runId: string): Promise<void> {
+    this.#assertCallerRunId(runId);
+    const holdsRun = () =>
+      !this.#pendingStarts.has(runId) && this.isRunLive(runId);
+    if (!holdsRun()) return;
+    const summary = await this.#runtime.authoritativeStatus(
+      this.getWorkflow().id,
+      runId,
+    );
+    // Mastra's delayed cleanup of a run whose leg published can run during the
+    // read; a release past it would publish a second terminal ERROR.
+    if (
+      (summary?.status !== 'cancelled' && summary?.status !== 'timed_out') ||
+      !holdsRun()
+    )
+      return;
+    await this.#endRunLocally(
+      runId,
+      endedRunError(summary.status, summary.error),
+      threadLegOutcome(summary.status),
+    );
   }
 
   #trackResumedLeg(runId: string): ResumedThreadLeg {
@@ -2091,17 +2158,37 @@ export class FlowsafeDurableAgent<
   }
 
   async #settleRefusedStart(runId: string, refusal: Error): Promise<void> {
-    let published = false;
+    this.#replayedSignals.delete(runId);
+    if (!(await this.#endRunLocally(runId, refusal, 'failed', 2)))
+      throw refusal;
+  }
+
+  /**
+   * End this isolate's state for a run: publish its terminal ERROR unless it
+   * was published or is being published for the current registry entry,
+   * release both run registries, complete its resumed thread legs. Publishing
+   * comes first: `emitError()` ends spans through the live global registry
+   * entry. Resolves `false` only when every publication attempt failed.
+   */
+  async #endRunLocally(
+    runId: string,
+    error: unknown,
+    outcome: ThreadLegTerminalOutcome,
+    attempts = 1,
+  ): Promise<boolean> {
+    const entry = this.runRegistryInternal.get(runId);
+    let published = entry !== undefined && this.#endedEntries.has(entry);
+    if (entry) this.#endedEntries.add(entry);
     try {
-      published =
-        (await this.#publishTerminalError(runId, refusal)) ||
-        (await this.#publishTerminalError(runId, refusal));
+      for (let attempt = 0; !published && attempt < attempts; attempt++)
+        published = await this.#publishTerminalError(runId, error);
+      if (!published && entry) this.#endedEntries.delete(entry);
     } finally {
-      this.#replayedSignals.delete(runId);
       this.runRegistryInternal.cleanup(runId);
       globalRunRegistry.delete(runId);
+      this.#completeResumedThreadLegs(runId, outcome);
     }
-    if (!published) throw refusal;
+    return published;
   }
 
   /**
@@ -2414,30 +2501,17 @@ export class FlowsafeDurableAgent<
     workflowInput: DurableAgenticWorkflowInput,
   ): Promise<void> {
     this.#assertCallerRunId(runId);
-    const waiter = this.#persistenceWaiters.get(runId);
+    const start = this.#pendingStarts.get(runId);
+    // stream() composes a caller's abortSignal into this controller and
+    // registers it before this method runs; every model and tool call of the
+    // leg reads a signal derived from it.
+    const entry = this.runRegistryInternal.get(runId);
+    const legAbort = entry?.abortController;
     let summary: RunSummary;
     try {
-      // getWorkflow() is memoized and its id is the shared loop id the factory
-      // registered; driving that exact id keeps the started run and the
-      // registered workflow in lockstep.
-      const requestedBy = this.#startRequesters.get(runId);
-      const requestedByKind = this.#startRequesterKinds.get(runId);
-      const attemptToken = this.#startAttemptTokens.get(runId);
-      const scheduleDispatch = this.#startScheduleDispatches.get(runId);
-      const idempotencyKey = this.#startIdempotencyKeys.get(runId);
-      const authority = this.#startAuthorities.get(runId);
-      // stream() composes a caller's abortSignal into this controller and
-      // registers it before this method runs; every model and tool call of the
-      // leg reads a signal derived from it.
-      const legAbort = this.runRegistryInternal.get(runId)?.abortController;
-      if (requestedBy === undefined || requestedByKind === undefined) {
-        if (requestedBy !== undefined || requestedByKind !== undefined) {
-          throw new InvalidRunRequestError(
-            'requestedBy and requestedByKind must be provided together',
-          );
-        }
-        // No #startRequesters entry means the host start seam never registered
-        // this id, so core minted it below our boundary. Such a run has no
+      if (start === undefined) {
+        // No pending start means the host start seam never registered this
+        // id, so core minted it below our boundary. Such a run has no
         // ownership record or trusted engine-leg context. Preserve what the
         // input chain's verdict allows, including a signal stream() captured
         // for this id, then close the stream so core can clean up its maps and
@@ -2456,11 +2530,7 @@ export class FlowsafeDurableAgent<
         agentId: coreAgentId,
         ...payload
       } = workflowInput;
-      if (!authority) {
-        throw new InvalidRunRequestError(
-          'registered run is missing agent start authority',
-        );
-      }
+      const { authority } = start;
       if (
         coreRunId !== runId ||
         authority.startIdentity.target.id !== this.#wrappedAgent.id ||
@@ -2472,14 +2542,11 @@ export class FlowsafeDurableAgent<
       }
       // The agent registry retains the preparation refusal when the isolate-wide
       // registry evicts its entry before the first step.
-      if (
-        this.runRegistryInternal.get(runId)?.tripwire?.processorId ===
-        BREAKWATER_RBAC_PROCESSOR_ID
-      ) {
+      if (entry?.tripwire?.processorId === BREAKWATER_RBAC_PROCESSOR_ID) {
         const refusal = new AgentAuthorizationDeniedError();
-        // The waiter's first rejection wins; publishing ERROR first supplies a
+        // The start's first rejection wins; publishing ERROR first supplies a
         // plain Error that doErrorResponse maps to 500.
-        waiter?.reject(refusal);
+        start.persisted.reject(refusal);
         await this.#settleRefusedStart(runId, refusal);
         return;
       }
@@ -2488,15 +2555,36 @@ export class FlowsafeDurableAgent<
           JSON.stringify({ type: 'agent-leg-abort-unavailable', runId }),
         );
       }
+      // Mastra's total budget hands the leg's calls a signal whose link to this
+      // controller its own cleanup removes, and that cleanup also runs when the
+      // isolate-wide registry evicts the entry mid-leg; a signal linked to both
+      // keeps the leg's abort reaching the calls that already read it.
+      if (
+        entry?.abortSignal &&
+        legAbort &&
+        entry.abortSignal !== legAbort.signal
+      ) {
+        const linked = AbortSignal.any([entry.abortSignal, legAbort.signal]);
+        entry.abortSignal = linked;
+        const shared = globalRunRegistry.get(runId);
+        if (shared) shared.abortSignal = linked;
+      }
+      // getWorkflow() is memoized and its id is the shared loop id the factory
+      // registered; driving that exact id keeps the started run and the
+      // registered workflow in lockstep.
       const workflow = this.getWorkflow();
       summary = await this.#runtime.start(workflow.id, {
         runId,
         inputData: { ...payload, runId: coreRunId, agentId: coreAgentId },
-        ...(attemptToken === undefined ? {} : { attemptToken }),
-        ...(scheduleDispatch === undefined ? {} : { scheduleDispatch }),
-        ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
-        requestedBy,
-        requestedByKind,
+        attemptToken: start.attemptToken,
+        ...(start.scheduleDispatch === undefined
+          ? {}
+          : { scheduleDispatch: start.scheduleDispatch }),
+        ...(start.idempotencyKey === undefined
+          ? {}
+          : { idempotencyKey: start.idempotencyKey }),
+        requestedBy: authority.startIdentity.owner.id,
+        requestedByKind: authority.startIdentity.owner.kind,
         mutationEpoch: authority.mutationEpoch,
         startIdentity: authority.startIdentity,
         agentStart: authority.agentStart,
@@ -2505,21 +2593,28 @@ export class FlowsafeDurableAgent<
         startReservation: authority.startReservation,
         ...(legAbort === undefined ? {} : { legAbort }),
       });
-      waiter?.resolve();
+      start.persisted.resolve();
     } catch (error) {
-      waiter?.reject(error);
+      start?.persisted.reject(error);
       throw error;
     }
-    // Mirror the base: a FAILED run emits an error onto the agent's stream so
-    // observe()/onError see it. A SUSPENDED run is the approval-gate path — it
-    // returns normally and the host bridges the suspension to the approval
-    // queue. emitError publishes on this.pubsub, which the constructor defaults
-    // to the runtime's identity so the event reaches the run's observers.
-    if (summary.status === 'failed') {
-      await this.emitError(
-        runId,
-        new Error(summary.error ?? 'Durable agent workflow execution failed'),
-      );
+    // See legTerminalError. Mastra's start stream cleans its registries once
+    // the ERROR reaches it, so the start path publishes without releasing.
+    const terminalError = legTerminalError(
+      summary,
+      'Durable agent workflow execution failed',
+      legAbort?.signal,
+    );
+    if (terminalError && !(entry && this.#endedEntries.has(entry))) {
+      // The host's waiter already resolved, so a release can race this
+      // publication; the entry is claimed before it is awaited.
+      if (entry) this.#endedEntries.add(entry);
+      try {
+        await this.emitError(runId, terminalError);
+      } catch (error) {
+        if (entry) this.#endedEntries.delete(entry);
+        throw error;
+      }
     }
   }
 }

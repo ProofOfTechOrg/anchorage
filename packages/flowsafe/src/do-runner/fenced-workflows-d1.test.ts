@@ -10,13 +10,18 @@ import {
 } from '@mastra/core/workflows';
 import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import { z } from 'zod';
+import {
+  nestedArray,
+  PAST_SQLITE_JSON_DEPTH,
+  withDeepValue,
+} from '../../test-support/deep-json.js';
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import {
   D1ResourceOwnershipStore,
   type ResourceOwnershipDatabase,
 } from '../approval-api/resource-ownership.js';
 import type { D1DatabaseBinding } from './cf-types.js';
-import { createD1Storage } from './d1-storage.js';
+import { createD1Storage, sweepExpiredRunDeadlines } from './d1-storage.js';
 import {
   ExecutionFenceUnreadableError,
   InvalidExecutionIdentityError,
@@ -1915,6 +1920,34 @@ describe('dormant reservation primitives', () => {
 });
 
 describe('owned initial workflow admission', () => {
+  it('refuses an admission whose request context nests past the depth SQLite parses, as a definitive refusal', async () => {
+    // #given an admission whose request context holds a value nested past the
+    // depth SQLite's JSON functions parse
+    const h = await fixture();
+    const deep = {
+      ...h.input,
+      requestContext: {
+        ...h.input.requestContext,
+        app: nestedArray(PAST_SQLITE_JSON_DEPTH),
+      },
+    };
+
+    // #when the run is admitted
+    const outcome = await h.admit(deep).catch((error: unknown) => error);
+
+    // #then it is refused as state that cannot be stored, before any effect,
+    // and no row is written
+    expect(outcome).toMatchObject({
+      status: 422,
+      reason: { code: 'RUN_STATE_NOT_STORABLE' },
+    });
+    expect(
+      isDefinitiveInitialAdmissionRefusal(outcome, h.input.execution),
+    ).toBe(true);
+    expect(h.rows()).toEqual([]);
+    expect(h.effects()).toBe(0);
+  });
+
   it.each([
     [
       'unsupported column',
@@ -3354,6 +3387,10 @@ describe('settled-row guard on unscoped persistence', () => {
       lifecycle: { version: 1, revision: 3, startOutcomeUnknownAt: 100 },
       changes: [{ startOutcomeUnknownAt: 101 }],
     },
+    stateNotStorableAt: {
+      lifecycle: { version: 1, revision: 3, stateNotStorableAt: 100 },
+      changes: [{ stateNotStorableAt: 101 }],
+    },
   };
 
   function snapshot(
@@ -3382,13 +3419,98 @@ describe('settled-row guard on unscoped persistence', () => {
     });
   }
 
+  const STORED_FORMS = [
+    'readable',
+    'nested past the depth SQLite parses',
+  ] as const;
+  const SETTLED_FORMS = RUN_SETTLING_MARKERS.flatMap((marker) =>
+    STORED_FORMS.map((form) => [marker, form] as const),
+  );
+  const ADDRESS = { workflowId: 'workflow', runId: 'run' };
+  const TOUCHED_MS = Date.parse('2030-01-02T03:04:05.006Z');
+
+  function expectUnreadable(h: Awaited<ReturnType<typeof fixture>>) {
+    expect(
+      h.sql
+        .prepare(
+          'SELECT json_valid(snapshot) AS valid FROM mastra_workflow_snapshot',
+        )
+        .all(),
+    ).toEqual([{ valid: 0 }]);
+  }
+
+  /**
+   * Rewrites the run row, through SQL, with a value nested past SQLite's JSON
+   * depth and the `extra` top-level fields; returns the stored text.
+   */
+  function makeUnreadable(
+    h: Awaited<ReturnType<typeof fixture>>,
+    extra: Record<string, unknown> = {},
+  ): string {
+    const [row] = h.rows() as { snapshot: string }[];
+    const text = JSON.stringify({
+      ...withDeepValue(JSON.parse(row?.snapshot ?? 'null')),
+      ...extra,
+    });
+    h.sql.prepare('UPDATE mastra_workflow_snapshot SET snapshot = ?').run(text);
+    expectUnreadable(h);
+    return text;
+  }
+
+  function storeAs(
+    h: Awaited<ReturnType<typeof fixture>>,
+    form: (typeof STORED_FORMS)[number],
+  ) {
+    if (form !== 'readable') makeUnreadable(h);
+  }
+
+  /** Runs `effect` just before or just after each `.bind(...).all()` of a statement `matches` selects. */
+  function interceptStatements(
+    h: Awaited<ReturnType<typeof fixture>>,
+    when: 'before' | 'after',
+    matches: (sql: string) => boolean,
+    effect: () => void,
+  ) {
+    const prepare = h.db.prepare.bind(h.db);
+    vi.spyOn(h.db, 'prepare').mockImplementation((sql) => {
+      const statement = prepare(sql);
+      if (!matches(sql)) return statement;
+      const bind = statement.bind.bind(statement);
+      vi.spyOn(statement, 'bind').mockImplementation((...values) => {
+        const bound = bind(...values);
+        const all = bound.all.bind(bound);
+        vi.spyOn(bound, 'all').mockImplementation(async () => {
+          if (when === 'before') effect();
+          const result = await all();
+          if (when === 'after') effect();
+          return result as never;
+        });
+        return bound;
+      });
+      return statement;
+    });
+  }
+
+  const isUpsert = (sql: string) =>
+    sql.startsWith('INSERT INTO "mastra_workflow_snapshot"');
+  const isSnapshotReplace = (sql: string) =>
+    sql.startsWith('UPDATE "mastra_workflow_snapshot"') &&
+    sql.includes('SET snapshot = ?1, updatedAt = ?2');
+  const isProbe = (sql: string) => sql.includes('AS readable');
+  const isAdmission = (sql: string) =>
+    /^SELECT .* AS admitted,\s+.* AS merge$/s.test(sql);
+  const isLiveDecision = (sql: string) => /^SELECT .* AS live$/s.test(sql);
+  const isRowRead = (sql: string) =>
+    sql.startsWith('SELECT workflow_name, run_id, resourceId, snapshot');
+
   it.each(
-    RUN_SETTLING_MARKERS,
-  )('refuses a write over a row settled by %s unless it advances the revision and keeps the settlement', async (marker) => {
+    SETTLED_FORMS,
+  )('refuses a write over a row settled by %s (stored %s) unless it advances the revision and keeps the settlement', async (marker, form) => {
     // #given a row settled by the marker
     const h = await fixture();
     const { lifecycle, changes } = SETTLED[marker];
     await persist(h.domain, snapshot('failed', lifecycle));
+    storeAs(h, form);
     const settled = h.rows();
     const without = Object.fromEntries(
       Object.entries(lifecycle).filter(([key]) => key !== marker),
@@ -3419,32 +3541,13 @@ describe('settled-row guard on unscoped persistence', () => {
     await persist(h.domain, snapshot('failed', successor));
 
     // #then
-    expect(
-      JSON.parse((h.rows()[0] as { snapshot: string }).snapshot).requestContext[
-        RUN_LIFECYCLE_CONTEXT_KEY
-      ],
-    ).toEqual(successor);
+    expect(storedLifecycle(h)).toEqual(successor);
   });
 
-  it.each([
-    ['no lifecycle', undefined],
-    ['a deadline only', { version: 1, revision: 2, deadlineAt: 50 }],
-    [
-      'a recorded intent only',
-      {
-        version: 1,
-        revision: 2,
-        transitionIntent: {
-          status: 'cancelled',
-          requestedAt: 50,
-          replayPrincipals: [OWNER],
-        },
-      },
-    ],
-  ] as const)('overwrites a row with %s', async (_, lifecycle) => {
-    // #given an unsettled row
+  it('overwrites a row with no lifecycle', async () => {
+    // #given an unsettled row without a run lifecycle
     const h = await fixture();
-    await persist(h.domain, snapshot('running', lifecycle));
+    await persist(h.domain, snapshot('running'));
 
     // #when a write without a lifecycle lands
     await persist(h.domain, snapshot('success'));
@@ -3455,50 +3558,614 @@ describe('settled-row guard on unscoped persistence', () => {
     ]);
   });
 
+  const INTENT = {
+    status: 'cancelled',
+    requestedAt: 50,
+    replayPrincipals: [OWNER],
+  };
+  const RECORDED = { version: 1, revision: 3, transitionIntent: INTENT };
+
+  function storedLifecycle(h: Awaited<ReturnType<typeof fixture>>) {
+    const [row] = h.rows() as { snapshot: string }[];
+    return JSON.parse(row?.snapshot ?? 'null').requestContext[
+      RUN_LIFECYCLE_CONTEXT_KEY
+    ];
+  }
+
   it.each([
+    ['a deadline only', { version: 1, revision: 2, deadlineAt: 50 }],
     [
-      'writes a snapshot nested past its depth limit over an unsettled row',
-      'deep incoming',
-      undefined,
-      true,
+      'a recorded intent only',
+      { version: 1, revision: 2, transitionIntent: INTENT },
     ],
-    [
-      'refuses a snapshot nested past its depth limit over a settled row',
-      'deep incoming',
-      SETTLED.interruptedAt.lifecycle,
-      false,
-    ],
-    [
-      'writes over stored bytes that are not JSON',
-      'invalid stored',
-      undefined,
-      true,
-    ],
-  ] as const)('%s', async (_, unreadable, lifecycle, written) => {
-    // #given a stored row, and JSON SQLite cannot read on one side
+  ] as const)('keeps the stored lifecycle of a row with %s under a write that carries none', async (_, lifecycle) => {
+    // #given an unsettled row with a run lifecycle
+    const h = await fixture();
+    await persist(h.domain, snapshot('running', lifecycle));
+
+    // #when a write without a lifecycle lands
+    await persist(h.domain, snapshot('success'));
+
+    // #then the write lands and the stored lifecycle stays
+    expect(h.rows()).toMatchObject([
+      {
+        snapshot: JSON.stringify({
+          ...snapshot('success'),
+          requestContext: { [RUN_LIFECYCLE_CONTEXT_KEY]: lifecycle },
+        }),
+      },
+    ]);
+  });
+
+  it.each(
+    STORED_FORMS,
+  )('keeps a recorded intent under a stale write with a lower revision and lands the rest of the write (stored %s)', async (form) => {
+    // #given an unsettled row whose lifecycle records a cancellation intent
+    const h = await fixture();
+    await persist(h.domain, snapshot('running', RECORDED));
+    storeAs(h, form);
+
+    // #when a leg's write serialized before the intent lands
+    await persist(h.domain, {
+      ...snapshot('running', { version: 1, revision: 2 }),
+      result: { progress: 1 },
+    });
+
+    // #then the write's state is stored and the intent stays
+    const [row] = h.rows() as { snapshot: string }[];
+    expect(JSON.parse(row?.snapshot ?? 'null')).toMatchObject({
+      result: { progress: 1 },
+    });
+    expect(storedLifecycle(h)).toEqual(RECORDED);
+  });
+
+  it('carries a recorded intent into a write of the same revision that has none', async () => {
+    // #given an unsettled row whose lifecycle records an intent at revision 3
+    const h = await fixture();
+    await persist(h.domain, snapshot('running', RECORDED));
+
+    // #when a write whose own lifecycle reached revision 3 without the intent
+    // lands
+    await persist(
+      h.domain,
+      snapshot('running', { version: 1, revision: 3, deadlineAt: 9 }),
+    );
+
+    // #then its lifecycle is stored with the intent added
+    expect(storedLifecycle(h)).toEqual({
+      version: 1,
+      revision: 3,
+      deadlineAt: 9,
+      transitionIntent: INTENT,
+    });
+  });
+
+  const DISPUTED = [{ id: 'charge-1', settlementState: 'disputed' }];
+
+  it.each(
+    STORED_FORMS.flatMap((form) =>
+      (
+        [
+          ['the same revision', 3],
+          ['a lower revision', 2],
+        ] as const
+      ).map(([label, revision]) => [label, form, revision] as const),
+    ),
+  )('stores a write of %s that records a disputed economic operation over a recorded intent as written (stored %s)', async (_, form, revision) => {
+    // #given an unsettled row whose lifecycle records a cancellation intent at
+    // revision 3
+    const h = await fixture();
+    await persist(h.domain, snapshot('running', RECORDED));
+    storeAs(h, form);
+
+    // #when a write whose own lifecycle records a disputed economic operation
+    // lands
+    const disputed = { version: 1, revision, economicOperations: DISPUTED };
+    await persist(h.domain, snapshot('running', disputed));
+
+    // #then its lifecycle is stored without the intent: the dispute blocks the
+    // cancellation, as it blocks recording one
+    expect(storedLifecycle(h)).toEqual(disputed);
+  });
+
+  it.each([
+    {
+      label: 'the stored lifecycle records no intent',
+      stored: {
+        version: 1,
+        revision: 3,
+        economicOperations: [{ id: 'charge-1', settlementState: 'settled' }],
+      },
+      written: { version: 1, revision: 2, economicOperations: DISPUTED },
+    },
+    {
+      label: 'the write carries no revision',
+      stored: RECORDED,
+      written: { version: 1, economicOperations: DISPUTED },
+    },
+  ])('keeps the stored lifecycle under a stale write that records a disputed economic operation when $label', async ({
+    stored,
+    written,
+  }) => {
+    // #given an unsettled row with a run lifecycle at revision 3
+    const h = await fixture();
+    await persist(h.domain, snapshot('running', stored));
+
+    // #when a write serialized before it, which records a disputed economic
+    // operation, lands
+    await persist(h.domain, snapshot('running', written));
+
+    // #then the stored lifecycle stays
+    expect(storedLifecycle(h)).toEqual(stored);
+  });
+
+  const UNDISPUTED = [
+    { id: 'charge-1', settlementState: 'settled' },
+    { id: 'charge-2', settlementState: 'pending' },
+  ];
+
+  it.each([
+    {
+      label: 'the same revision',
+      written: { version: 1, revision: 3, economicOperations: UNDISPUTED },
+      kept: {
+        version: 1,
+        revision: 3,
+        economicOperations: UNDISPUTED,
+        transitionIntent: INTENT,
+      },
+    },
+    {
+      label: 'a lower revision',
+      written: { version: 1, revision: 2, economicOperations: UNDISPUTED },
+      kept: RECORDED,
+    },
+  ])('keeps a recorded intent under a write of $label that records economic operations without a dispute', async ({
+    written,
+    kept,
+  }) => {
+    // #given an unsettled row whose lifecycle records a cancellation intent at
+    // revision 3
+    const h = await fixture();
+    await persist(h.domain, snapshot('running', RECORDED));
+
+    // #when a write whose lifecycle records undisputed economic operations
+    // lands
+    await persist(h.domain, snapshot('running', written));
+
+    // #then the intent stays
+    expect(storedLifecycle(h)).toEqual(kept);
+  });
+
+  const DEADLINE_INTENT = {
+    status: 'timed_out',
+    requestedAt: 60,
+    replayPrincipals: [OWNER],
+    expectedRevision: 2,
+    expectedDeadlineAt: 50,
+  };
+
+  it.each(
+    STORED_FORMS.flatMap((form) =>
+      (
+        [
+          ['moved', 90, false],
+          ['kept', 50, true],
+        ] as const
+      ).map(([label, deadlineAt, carried]) => ({
+        label,
+        form,
+        deadlineAt,
+        carried,
+      })),
+    ),
+  )('carries a recorded run-deadline intent into a write of the same revision only when the write kept its deadline ($label, stored $form)', async ({
+    form,
+    deadlineAt,
+    carried,
+  }) => {
+    // #given an unsettled row whose lifecycle records a run-deadline intent at
+    // revision 3 for deadline 50
+    const h = await fixture();
+    await persist(
+      h.domain,
+      snapshot('running', {
+        version: 1,
+        revision: 3,
+        deadlineAt: 50,
+        transitionIntent: DEADLINE_INTENT,
+      }),
+    );
+    storeAs(h, form);
+
+    // #when a write whose own lifecycle reached revision 3 lands
+    const written = { version: 1, revision: 3, deadlineAt };
+    await persist(h.domain, snapshot('running', written));
+
+    // #then
+    expect(storedLifecycle(h)).toEqual(
+      carried ? { ...written, transitionIntent: DEADLINE_INTENT } : written,
+    );
+  });
+
+  it('writes a lifecycle with a higher revision over the stored one', async () => {
+    // #given an unsettled row whose lifecycle records an intent at revision 3
+    const h = await fixture();
+    await persist(h.domain, snapshot('running', RECORDED));
+
+    // #when a write with revision 4 and no intent lands
+    const newer = { version: 1, revision: 4, deadlineAt: 9 };
+    await persist(h.domain, snapshot('running', newer));
+
+    // #then its lifecycle replaces the stored one
+    expect(storedLifecycle(h)).toEqual(newer);
+  });
+
+  it.each([
+    ['an unsettled row', undefined],
+    ['a settled row', SETTLED.interruptedAt.lifecycle],
+  ] as const)('refuses a snapshot nested past its depth limit over %s', async (_, lifecycle) => {
+    // #given a stored row SQLite can read, and a write SQLite cannot parse
     const h = await fixture();
     await persist(h.domain, snapshot('failed', lifecycle));
+    const stored = h.rows();
+    const value = withDeepValue(snapshot('running'));
+    expect(
+      h.sql.prepare('SELECT json_valid(?) AS valid').get(JSON.stringify(value)),
+    ).toEqual({ valid: 0 });
+
+    // #when the write persists over it
+    const outcome = persist(h.domain, value);
+
+    // #then it is refused as state that cannot be stored, whether or not the
+    // row is settled, and the row keeps its bytes
+    await expect(outcome).rejects.toMatchObject({
+      name: 'RunStateNotStorableError',
+      status: 422,
+      reason: { code: 'RUN_STATE_NOT_STORABLE' },
+    });
+    expect(h.rows()).toEqual(stored);
+  });
+
+  it('refuses to insert a snapshot nested past its depth limit for a run with no row', async () => {
+    // #given an empty table
+    const h = await fixture();
+
+    // #when a write nested past the depth SQLite parses persists for a new run
+    const outcome = persist(h.domain, withDeepValue(snapshot('running')));
+
+    // #then it is refused as state that cannot be stored and no row is inserted
+    await expect(outcome).rejects.toMatchObject({
+      name: 'RunStateNotStorableError',
+      status: 422,
+      reason: { code: 'RUN_STATE_NOT_STORABLE' },
+    });
+    expect(h.rows()).toEqual([]);
+  });
+
+  it('keeps a run with an expired deadline selectable by the deadline sweep when its leg writes state nested past the depth limit', async () => {
+    // #given a running run whose deadline has passed
+    const h = await fixture();
+    const lifecycle = { version: 1, revision: 1, deadlineAt: 5 };
+    await persist(h.domain, snapshot('running', lifecycle));
+
+    // #when its leg writes state nested past the depth SQLite parses
+    await persist(
+      h.domain,
+      withDeepValue(snapshot('running', lifecycle)),
+    ).catch(() => undefined);
+
+    // #then the sweep still selects the run
+    const selected: string[] = [];
+    await sweepExpiredRunDeadlines(h.db, {
+      now: () => 1_000,
+      transition: async (candidate) => {
+        selected.push(candidate.runId);
+      },
+    });
+    expect(selected).toEqual(['run']);
+  });
+
+  it.each([
+    ['writes over stored bytes that are not JSON', 'invalid stored'],
+    [
+      'writes over an unsettled row whose stored snapshot nests past its depth limit',
+      'deep stored',
+    ],
+  ] as const)('%s', async (_, unreadable) => {
+    // #given an unsettled row SQLite cannot read
+    const h = await fixture();
+    await persist(h.domain, snapshot('failed'));
     if (unreadable === 'invalid stored')
       h.sql
         .prepare('UPDATE mastra_workflow_snapshot SET snapshot = ?')
         .run('{not json');
-    let deep: unknown = 'leaf';
-    for (let depth = 0; depth < 1_100; depth++) deep = { deep };
-    const value = {
-      ...snapshot('running'),
-      ...(unreadable === 'deep incoming' ? { result: deep } : {}),
-    } as WorkflowRunState;
+    else makeUnreadable(h);
+    const value = snapshot('running');
 
-    // #when
+    // #when a readable write persists over it
     const outcome = await persist(h.domain, value).catch(
       (error: unknown) => error,
     );
 
+    // #then it is written as given
+    expect(outcome).toBeUndefined();
+    expect(h.rows()).toMatchObject([{ snapshot: JSON.stringify(value) }]);
+  });
+
+  it('writes a deep successor over a settled row whose stored snapshot SQLite cannot parse', async () => {
+    // #given a settled row whose stored snapshot SQLite cannot parse
+    const { lifecycle } = SETTLED.terminal;
+    const h = await fixture();
+    await persist(h.domain, snapshot('failed', lifecycle));
+    makeUnreadable(h);
+
+    // #when the settlement's successor, itself nested past the limit, advances
+    // the revision with the settlement intact
+    const successor = withDeepValue(
+      snapshot('failed', {
+        ...lifecycle,
+        revision: 4,
+        cleanupCompletedAt: 200,
+      }),
+    );
+    await persist(h.domain, successor);
+
+    // #then it is stored as written
+    expect(h.rows()).toMatchObject([{ snapshot: JSON.stringify(successor) }]);
+  });
+
+  it('answers that the row keeps changing after three missed writes over a row SQLite cannot parse', async () => {
+    // #given an unsettled row SQLite cannot parse, which another writer
+    // rewrites to new unreadable bytes just before each compare-and-set
+    const h = await fixture();
+    await persist(h.domain, snapshot('running'));
+    makeUnreadable(h);
+    let compareAndSets = 0;
+    let lastRewrite = '';
+    interceptStatements(h, 'before', isSnapshotReplace, () => {
+      compareAndSets += 1;
+      lastRewrite = makeUnreadable(h, { attempt: compareAndSets });
+    });
+
+    // #when a write persists over it
+    const outcome = persist(h.domain, snapshot('running'));
+
+    // #then the storage answers 503, after three compare-and-sets, and the row
+    // holds the last rewrite
+    await expect(outcome).rejects.toMatchObject({
+      name: 'ExecutionFenceUnreadableError',
+      reason: { code: 'EXECUTION_FENCE_UNREADABLE' },
+    });
+    expect(compareAndSets).toBe(3);
+    expect(h.rows()).toMatchObject([{ snapshot: lastRewrite }]);
+  });
+
+  it('refuses a write whose row is purged after a missed compare-and-set', async () => {
+    // #given an unsettled row SQLite cannot parse, which is purged just before
+    // the write's first compare-and-set
+    const h = await fixture();
+    await persist(h.domain, snapshot('running'));
+    makeUnreadable(h);
+    interceptStatements(h, 'before', isSnapshotReplace, () => {
+      h.sql.prepare('DELETE FROM mastra_workflow_snapshot').run();
+    });
+
+    // #when a write persists over it
+    const outcome = persist(h.domain, snapshot('running'));
+
+    // #then it is refused, and its retry inserts no row in place of the purged one
+    await expect(outcome).rejects.toMatchObject({
+      name: 'RunSettledConflictError',
+    });
+    expect(h.rows()).toEqual([]);
+  });
+
+  it('writes every one of four concurrent snapshots nested past the depth over a row SQLite cannot parse', async () => {
+    // #given an unsettled row SQLite cannot parse
+    const h = await fixture();
+    await persist(h.domain, snapshot('running'));
+    makeUnreadable(h);
+
+    // #when four writes, each nested past the depth, persist at once
+    const outcomes = await Promise.allSettled(
+      [1, 2, 3, 4].map((n) =>
+        persist(h.domain, {
+          ...withDeepValue(snapshot('running')),
+          n,
+        } as WorkflowRunState),
+      ),
+    );
+
+    // #then all four land, the last of them is stored, and the row is still
+    // unreadable to SQLite
+    expect(outcomes.map(({ status }) => status)).toEqual([
+      'fulfilled',
+      'fulfilled',
+      'fulfilled',
+      'fulfilled',
+    ]);
+    const [stored] = h.rows() as { snapshot: string }[];
+    expect(JSON.parse(stored?.snapshot ?? 'null')).toMatchObject({ n: 4 });
+    expectUnreadable(h);
+  });
+
+  it.each([
+    { failing: 'probe', matches: isProbe },
+    { failing: 'row read', matches: isRowRead },
+    { failing: 'decision', matches: isAdmission },
+  ])('answers 503 and leaves the row when the $failing of a write over a row SQLite cannot parse fails', async ({
+    matches,
+  }) => {
+    // #given a row SQLite cannot parse, and one failing statement
+    const h = await fixture();
+    await persist(h.domain, snapshot('running'));
+    makeUnreadable(h);
+    const before = h.rows();
+    interceptStatements(h, 'before', matches, () => {
+      throw new Error('storage unavailable');
+    });
+
+    // #when a write over it persists
+    const outcome = persist(h.domain, snapshot('running'));
+
     // #then
-    if (written) {
-      expect(outcome).toBeUndefined();
-      expect(h.rows()).toMatchObject([{ snapshot: JSON.stringify(value) }]);
-    } else expect(outcome).toBeInstanceOf(RunSettledConflictError);
+    await expect(outcome).rejects.toMatchObject({
+      name: 'ExecutionFenceUnreadableError',
+      reason: { code: 'EXECUTION_FENCE_UNREADABLE' },
+    });
+    expect(h.rows()).toEqual(before);
+  });
+
+  it('refuses a write whose refused row is gone before it is probed', async () => {
+    // #given a settled row that is purged right after the upsert meets it
+    const h = await fixture();
+    await persist(h.domain, snapshot('failed', SETTLED.terminal.lifecycle));
+    interceptStatements(h, 'after', isUpsert, () => {
+      h.sql.prepare('DELETE FROM mastra_workflow_snapshot').run();
+    });
+
+    // #when a stale write persists
+    const outcome = persist(h.domain, snapshot('running'));
+
+    // #then it is refused, and no row is inserted in place of the purged one
+    await expect(outcome).rejects.toMatchObject({
+      name: 'RunSettledConflictError',
+    });
+    expect(h.rows()).toEqual([]);
+  });
+
+  describe('decisions over a row SQLite cannot parse match the SQL decisions', () => {
+    const KEY = RUN_LIFECYCLE_CONTEXT_KEY;
+    const NO_CONTEXT = undefined;
+    const STORED_CONTEXTS = [
+      { label: 'no request context', context: NO_CONTEXT },
+      { label: 'a null request context', context: null },
+      { label: 'an array request context', context: [] },
+      { label: 'an empty request context', context: {} },
+      { label: 'a lifecycle that is a number', context: { [KEY]: 5 } },
+      {
+        label: 'an unsettled lifecycle',
+        context: { [KEY]: { version: 1, revision: 3 } },
+      },
+      {
+        label: 'a lifecycle with an intent',
+        context: {
+          [KEY]: { version: 1, revision: 3, transitionIntent: INTENT },
+        },
+      },
+      {
+        label: 'a terminal lifecycle',
+        context: { [KEY]: { version: 1, revision: 3, terminal: TERMINAL } },
+      },
+    ];
+    const INCOMING_CONTEXTS = [
+      { label: 'no request context', context: NO_CONTEXT },
+      { label: 'an empty request context', context: {} },
+      {
+        label: 'revision 2',
+        context: { [KEY]: { version: 1, revision: 2 } },
+      },
+      {
+        label: 'revision 3 with a deadline',
+        context: { [KEY]: { version: 1, revision: 3, deadlineAt: 9 } },
+      },
+      {
+        label: 'revision 3 with an intent',
+        context: {
+          [KEY]: { version: 1, revision: 3, transitionIntent: INTENT },
+        },
+      },
+      {
+        label: 'revision 4',
+        context: { [KEY]: { version: 1, revision: 4 } },
+      },
+      {
+        label: 'revision 4 with the terminal',
+        context: { [KEY]: { version: 1, revision: 4, terminal: TERMINAL } },
+      },
+    ];
+    const PAIRS = STORED_CONTEXTS.flatMap((stored) =>
+      INCOMING_CONTEXTS.map((incoming) => ({ stored, incoming })),
+    );
+
+    function runningWith(context: unknown): WorkflowRunState {
+      return {
+        ...pending(),
+        status: 'running',
+        ...(context === NO_CONTEXT ? {} : { requestContext: context }),
+      } as WorkflowRunState;
+    }
+
+    it.each(
+      PAIRS,
+    )('writes over $stored.label with $incoming.label as SQLite does', async ({
+      stored,
+      incoming,
+    }) => {
+      // #given two rows holding the same stored snapshot, the second also
+      // carrying a value nested past the depth SQLite parses
+      const h = await fixture();
+      const at = '2026-10-04T00:00:00.000Z';
+      const storedSnapshot = runningWith(stored.context);
+      for (const [name, value] of [
+        ['sql-path', storedSnapshot],
+        ['worker-path', withDeepValue(storedSnapshot)],
+      ] as const)
+        h.sql
+          .prepare(
+            `INSERT INTO mastra_workflow_snapshot
+              (workflow_name, run_id, resourceId, snapshot, createdAt, updatedAt)
+              VALUES (?, 'run', NULL, ?, ?, ?)`,
+          )
+          .run(name, JSON.stringify(value), at, at);
+      expect(
+        h.sql
+          .prepare(
+            'SELECT workflow_name, json_valid(snapshot) AS valid FROM mastra_workflow_snapshot ORDER BY workflow_name',
+          )
+          .all(),
+      ).toEqual([
+        { workflow_name: 'sql-path', valid: 1 },
+        { workflow_name: 'worker-path', valid: 0 },
+      ]);
+      const row = (workflowName: string) =>
+        h.sql
+          .prepare(
+            'SELECT * FROM mastra_workflow_snapshot WHERE workflow_name = ?',
+          )
+          .get(workflowName);
+      const before = { sql: row('sql-path'), worker: row('worker-path') };
+
+      // #when the same incoming snapshot is persisted to each
+      const write = (workflowName: string) =>
+        h.domain
+          .persistWorkflowSnapshot({
+            workflowName,
+            runId: 'run',
+            snapshot: runningWith(incoming.context),
+          })
+          .then(
+            () => 'written' as const,
+            (error: unknown) => error,
+          );
+      const outcomes = [await write('sql-path'), await write('worker-path')];
+
+      // #then both are written with the same bytes, or both are refused and
+      // keep their rows
+      const [viaSql, viaWorker] = outcomes;
+      if (viaSql === 'written') {
+        expect(viaWorker).toBe('written');
+        expect((row('worker-path') as { snapshot: string }).snapshot).toBe(
+          (row('sql-path') as { snapshot: string }).snapshot,
+        );
+      } else {
+        expect(viaSql).toBeInstanceOf(RunSettledConflictError);
+        expect(viaWorker).toBeInstanceOf(RunSettledConflictError);
+        expect(row('sql-path')).toEqual(before.sql);
+        expect(row('worker-path')).toEqual(before.worker);
+      }
+    });
   });
 
   it('writes the same rows as @mastra/cloudflare-d1 for new and existing runs', async () => {
@@ -3558,14 +4225,18 @@ describe('settled-row guard on unscoped persistence', () => {
   });
 
   describe('liveness touch', () => {
-    const ADDRESS = { workflowId: 'workflow', runId: 'run' };
-    const TOUCHED_MS = Date.parse('2030-01-02T03:04:05.006Z');
     const TOUCHED_AT = new Date(TOUCHED_MS).toISOString();
 
-    it('marks an unsettled row live and moves its updatedAt', async () => {
-      // #given an unsettled row
+    it.each(
+      STORED_FORMS,
+    )('marks an unsettled row live and moves its updatedAt (stored %s)', async (form) => {
+      // #given an unsettled row with a run lifecycle
       const h = await fixture();
-      await persist(h.domain, snapshot('running'));
+      await persist(
+        h.domain,
+        snapshot('running', { version: 1, revision: 2, deadlineAt: 50 }),
+      );
+      storeAs(h, form);
       const [before] = h.rows() as { snapshot: string; updatedAt: string }[];
 
       // #when
@@ -3577,11 +4248,12 @@ describe('settled-row guard on unscoped persistence', () => {
     });
 
     it.each(
-      RUN_SETTLING_MARKERS,
-    )('reports a row settled by %s and leaves it as it is', async (marker) => {
+      SETTLED_FORMS,
+    )('reports a row settled by %s (stored %s) and leaves it as it is', async (marker, form) => {
       // #given a row settled by the marker
       const h = await fixture();
       await persist(h.domain, snapshot('failed', SETTLED[marker].lifecycle));
+      storeAs(h, form);
       const settled = h.rows();
 
       // #when
@@ -3604,7 +4276,7 @@ describe('settled-row guard on unscoped persistence', () => {
       expect(h.rows()).toEqual([]);
     });
 
-    it('marks a row whose stored JSON is unreadable live', async () => {
+    it('marks a row whose stored bytes are not JSON live', async () => {
       // #given a row whose stored bytes are not JSON
       const h = await fixture();
       await persist(h.domain, snapshot('running'));
@@ -3620,6 +4292,100 @@ describe('settled-row guard on unscoped persistence', () => {
       expect(h.rows()).toMatchObject([
         { snapshot: '{not json', updatedAt: TOUCHED_AT },
       ]);
+    });
+
+    it('reports a row live without moving it when its snapshot changes during the touch', async () => {
+      // #given an unsettled row SQLite cannot parse, which another writer
+      // rewrites right after the touch decided it
+      const h = await fixture();
+      await persist(h.domain, snapshot('running'));
+      makeUnreadable(h);
+      const [before] = h.rows() as { snapshot: string; updatedAt: string }[];
+      let rewrite = '';
+      interceptStatements(h, 'after', isLiveDecision, () => {
+        rewrite = makeUnreadable(h, { attempt: 1 });
+      });
+
+      // #when the leg touches it
+      const touched = await h.capability.touchRun?.(ADDRESS, TOUCHED_MS);
+
+      // #then the row reads live and keeps the other writer's bytes and its
+      // updatedAt
+      expect(touched).toBe('live');
+      expect(h.rows()).toEqual([{ ...before, snapshot: rewrite }]);
+    });
+
+    it.each([
+      { failing: 'row read', matches: isRowRead },
+      { failing: 'decision', matches: isLiveDecision },
+    ])('answers 503 and leaves the row when the $failing of a touch of a row SQLite cannot parse fails', async ({
+      matches,
+    }) => {
+      // #given a row SQLite cannot parse, and one failing statement
+      const h = await fixture();
+      await persist(h.domain, snapshot('running'));
+      makeUnreadable(h);
+      const before = h.rows();
+      interceptStatements(h, 'before', matches, () => {
+        throw new Error('storage unavailable');
+      });
+
+      // #when the leg touches it
+      const touched = h.capability.touchRun?.(ADDRESS, TOUCHED_MS);
+
+      // #then
+      await expect(touched).rejects.toMatchObject({
+        name: 'ExecutionFenceUnreadableError',
+        reason: { code: 'EXECUTION_FENCE_UNREADABLE' },
+      });
+      expect(h.rows()).toEqual(before);
+    });
+  });
+
+  describe('a lifecycle nested past the depth SQLite parses', () => {
+    /** A run row whose lifecycle itself, not a sibling of it, SQLite cannot parse. */
+    async function deepLifecycleRow() {
+      const h = await fixture();
+      await persist(h.domain, snapshot('running'));
+      h.sql.prepare('UPDATE mastra_workflow_snapshot SET snapshot = ?').run(
+        JSON.stringify(
+          snapshot('running', {
+            version: 1,
+            revision: 3,
+            filler: nestedArray(PAST_SQLITE_JSON_DEPTH),
+          }),
+        ),
+      );
+      expectUnreadable(h);
+      return h;
+    }
+
+    it('refuses a write over the row', async () => {
+      // #given
+      const h = await deepLifecycleRow();
+      const before = h.rows();
+
+      // #when a write persists over it
+      const outcome = persist(h.domain, snapshot('running'));
+
+      // #then the decision fails closed
+      await expect(outcome).rejects.toMatchObject({
+        name: 'RunSettledConflictError',
+      });
+      expect(h.rows()).toEqual(before);
+    });
+
+    it('reports the row settled to the liveness touch', async () => {
+      // #given
+      const h = await deepLifecycleRow();
+      const before = h.rows();
+
+      // #when the leg touches it
+      const touched = await h.capability.touchRun?.(ADDRESS, TOUCHED_MS);
+
+      // #then the decision fails closed
+      expect(touched).toBe('settled');
+      expect(h.rows()).toEqual(before);
     });
   });
 });
@@ -3686,6 +4452,63 @@ describe('snapshot replacement input', () => {
     await expect(replaced).rejects.toThrow();
     expect(await h.capability.readSnapshot(address)).toEqual(row);
   });
+
+  it('refuses a replacement SQLite cannot parse over a row SQLite can parse', async () => {
+    // #given a persisted run row SQLite can parse
+    const h = await fixture();
+    await h.domain.persistWorkflowSnapshot({
+      workflowName: 'workflow',
+      runId: 'run',
+      snapshot: pending(),
+    });
+    const address = { workflowId: 'workflow', runId: 'run' };
+    const row = await h.capability.readSnapshot(address);
+    if (!row) throw new Error('run row missing');
+
+    // #when the exact row is replaced with a snapshot nested past the depth
+    // SQLite parses
+    const replaced = h.capability.replaceSnapshot?.(row, {
+      snapshot: JSON.stringify(withDeepValue(pending())),
+      updatedAt: '2026-10-04T00:00:00.000Z',
+    });
+
+    // #then it is refused as state that cannot be stored and the row keeps its bytes
+    await expect(replaced).rejects.toMatchObject({
+      name: 'RunStateNotStorableError',
+      status: 422,
+    });
+    expect(await h.capability.readSnapshot(address)).toEqual(row);
+  });
+
+  it('replaces a row SQLite cannot parse with a snapshot SQLite cannot parse', async () => {
+    // #given a persisted run row nested past the depth SQLite parses
+    const h = await fixture();
+    await h.domain.persistWorkflowSnapshot({
+      workflowName: 'workflow',
+      runId: 'run',
+      snapshot: pending(),
+    });
+    h.sql
+      .prepare('UPDATE mastra_workflow_snapshot SET snapshot = ?')
+      .run(JSON.stringify(withDeepValue(pending())));
+    const address = { workflowId: 'workflow', runId: 'run' };
+    const row = await h.capability.readSnapshot(address);
+    if (!row) throw new Error('run row missing');
+
+    // #when the exact row is replaced with another such snapshot
+    const replacement = JSON.stringify({
+      ...withDeepValue(pending()),
+      status: 'cancelled',
+    });
+    const replaced = await h.capability.replaceSnapshot?.(row, {
+      snapshot: replacement,
+      updatedAt: '2026-10-04T00:00:00.000Z',
+    });
+
+    // #then it is stored as given
+    expect(replaced).toBe(true);
+    expect(h.rows()).toMatchObject([{ snapshot: replacement }]);
+  });
 });
 
 describe('run lifecycle patch', () => {
@@ -3715,13 +4538,11 @@ describe('run lifecycle patch', () => {
     },
     interruptedAt: { interruptedAt: 100 },
     startOutcomeUnknownAt: { startOutcomeUnknownAt: 100 },
-  } as const;
-
-  function nested(depth: number): unknown {
-    let value: unknown = 'leaf';
-    for (let level = 0; level < depth; level++) value = [value];
-    return value;
-  }
+    stateNotStorableAt: { stateNotStorableAt: 100 },
+  } as const satisfies Record<
+    (typeof RUN_SETTLING_MARKERS)[number],
+    Record<string, unknown>
+  >;
 
   function running(requestContext?: Record<string, unknown>): WorkflowRunState {
     return {
@@ -3830,6 +4651,17 @@ describe('run lifecycle patch', () => {
       expected: { status: 'running', lifecycleRevision: 1 },
     },
     {
+      label: 'its lifecycle records a disputed economic operation',
+      row: running({
+        [RUN_LIFECYCLE_CONTEXT_KEY]: {
+          version: 1,
+          revision: 1,
+          economicOperations: [{ id: 'charge-1', settlementState: 'disputed' }],
+        },
+      }),
+      expected: { status: 'running', lifecycleRevision: 1 },
+    },
+    {
       label: 'its snapshot is not JSON',
       row: '{',
       expected: { status: 'running' },
@@ -3841,7 +4673,10 @@ describe('run lifecycle patch', () => {
     },
     {
       label: 'its snapshot nests past the depth SQLite reads',
-      row: JSON.stringify({ ...running(), result: nested(1_100) }),
+      row: JSON.stringify({
+        ...running(),
+        result: nestedArray(PAST_SQLITE_JSON_DEPTH),
+      }),
       expected: { status: 'running' },
     },
     {

@@ -146,7 +146,9 @@ export interface HostApprovalServiceOptions {
    * DO host, resumeViaRuntime(runtime) for an in-process one. Wrapped in
    * resumeRunWithRequeue here, so a run that re-suspends at a later gate
    * auto-queues its next approval(s) with SoD intact (the deciding reviewer
-   * becomes the next gate's requester).
+   * becomes the next gate's requester). Both pass the record's suspension, so
+   * a decision for an earlier suspension of the step is refused; a resumer
+   * built by hand passes `expectedSuspensionFor(record)` for the same check.
    */
   resumeRun: ResumeRunFn;
   /** Optional audit export queue (wrangler `queues` producer binding). */

@@ -75,7 +75,7 @@ Before deployment:
 7. Confirm internal-object, maintenance-admin, stream-ticket, OAuth, model, webhook, connector, and SIEM secrets are distinct.
 8. Confirm R2 artifact storage is passed to runtime, retention, and the deployment decommission inventory.
 9. Confirm audit Queue dead-letter policy and collector authorization.
-10. Confirm a rollback bundle remains compatible with the deployed database and migration tags.
+10. Confirm a rollback bundle remains compatible with the deployed database and migration tags; for a rollback to an earlier flowsafe release, also follow the rollback notes in this section.
 
 Before the first guarded agent-host deployment, drain approvals created by the legacy raw-agent target. Approve or reject them through the existing API so the state machine and audit record every transition, then verify that no open records remain:
 
@@ -91,6 +91,24 @@ Deploy only when `open_agent_approvals` is zero. Do not close these records thro
 During a gradual deployment from a flowsafe version earlier than 0.24.0, a Worker still on the earlier version answers a keyed start replay of an `INTERRUPTED` run with `503 persisted start is not readable`, because that version does not recognize the `INTERRUPTED` error code. Retry the replay once every Worker version runs 0.24.0 or later; the run itself is unaffected.
 
 A deploy from a flowsafe version earlier than 0.25.0 leaves outgoing agent legs that do not touch their run row, so the thread object repairs an agent start that goes more than six minutes without a write as `StartOutcomeUnknown`; [Durable agents](durable-agents.md#use-the-lower-level-durable-wrapper) describes the wait and the stamp. Deploy when no agent start is running, and check the effects of any agent run that reads `StartOutcomeUnknown` before you start another. From a version earlier than 0.24.0, drain agent starts first: the outgoing leg writes without the settled-row guard, so its write can land over the repair.
+
+Rolling back to 0.24.x from 0.25.0 or later brings back the 0.24.x agent start recovery: the thread object repairs a pending agent start about a minute after admission, without waiting for its leg to stop and without the stamp. An agent leg still running on the outgoing instance reads that repair as live, and its final write lands over it after the run's journal, run record and ownership are cleared. Roll back only when no agent start is pending, with the deployment's `tablePrefix` in front of the table name:
+
+```bash
+wrangler d1 execute <database> --remote --config wrangler.jsonc \
+  --command "SELECT run_id FROM <prefix>mastra_workflow_snapshot WHERE workflow_name = 'durable-agentic-loop' AND CASE WHEN json_valid(snapshot) THEN json_extract(snapshot, '$.status') = 'pending' ELSE 0 END"
+```
+
+After a rollback, check each agent run started in the hour before it: one that read `StartOutcomeUnknown` and later reads another status lost its repair; terminate it if it is suspended, and check the agent's external effects.
+
+A flowsafe version earlier than 0.26.0 stored run snapshots nested past SQLite's JSON depth limit. The deadline sweep, retention and the drain inventory cannot read such a row, so the run has no deadline, is never purged, and keeps a drain proof non-empty. List them in each database after the upgrade, with the deployment's `tablePrefix` in front of the table name (for example `flsmastra_workflow_snapshot` for the prefix `fls`):
+
+```bash
+wrangler d1 execute <database> --remote --config wrangler.jsonc \
+  --command "SELECT workflow_name, run_id FROM <prefix>mastra_workflow_snapshot WHERE NOT json_valid(snapshot)"
+```
+
+Terminate each listed run that is not terminal. Retention never removes these rows: remove a terminal one by hand from the tables `RUN_TTL_PURGE_TABLES` and `RUN_TTL_FLOWSAFE_PURGE_TABLES` name, after deleting its artifacts. During a gradual deployment from a version earlier than 0.26.0, a Worker still on the earlier version answers a keyed start replay of a run that failed with `RUN_STATE_NOT_STORABLE` with `503 persisted start is not readable`; retry it once every Worker runs 0.26.0 or later.
 
 ## Provision a deployment
 
@@ -259,10 +277,15 @@ Audit records are security evidence. Queue depth and SIEM ingestion status must 
 | Protected routes return 503 before routing | `DEPLOYMENT_TENANT`, `DEPLOYMENT_IDENTITY_SECRET`, D1 sentinel, or a wrong database/object binding | Restore the verified one-to-one bindings and secret. Never overwrite the sentinel to adopt a database |
 | A foreign resource returns 403 instead of 404 | Route ownership ordering | Treat as an information-oracle regression and fix the shared boundary |
 | Start returns duplicate-run conflict | Client retried after a response loss | Query the server-minted run id; do not mint a replacement blindly |
-| Run stays `suspended` after approval | Decision result and resume outcome | Read stored decision, status, and audit; redrive through trusted resume |
+| Run stays `suspended` after approval | Decision result and resume outcome | Read stored decision, status, and audit; redrive through trusted resume. A resume outcome with `code: 'SUSPENSION_CHANGED'` is refused on every redrive: decide the approval of the step's current suspension instead |
+| A reviewer is refused the approval of a step's current suspension as having advanced the run at an earlier gate | Whether that reviewer's earlier approval of the step answered `SUSPENSION_CHANGED` on resume | Expected: the separation-of-duties check counts that approval although it advanced nothing. Have another reviewer decide, or use a configured exemption |
 | Run reads `failed` with `errorEnvelope.code: 'INTERRUPTED'` | `run-leg-interrupted` log line (workflow, run, leg trigger) and the step that was in flight | Its leg stopped mid-step and nothing re-ran it. Check the step's external effects before starting a new run; split a step that runs past one invocation |
+| Run reads `failed` with `errorEnvelope.code: 'RUN_STATE_NOT_STORABLE'` | The step that ran last and the data it returned, or for an agent the tool results and the thread's recalled messages | A step or tool returned data nested past the depth SQLite parses; the run stopped at that write and is not re-executed. Check the step's external effects, then bound or flatten the data before starting again; for an agent thread, see [durable agents](durable-agents.md) |
 | Run stays `running` with no progress | Run row `updatedAt`, `run-leg-reset` log lines, and the workflow storage | The run object settles it about six minutes after its last write. On workflow storage other than `FencedWorkflowsStorageD1`, or for a leg run by an older flowsafe version, terminate the run |
 | An agent run's status or terminate route answers `503 RUN_START_PENDING` and the thread logs `agent-start-recovery-pending` lines | The `runId` in the lines, and its run row's status and `updatedAt` | Expected for about seven minutes after the start's last touch: the thread object then repairs the start as `StartOutcomeUnknown` and the lines stop. If the same `runId` is still logged after that, its journal does not repair on its own. Check that the thread's runtime has the execution fence the start was prepared under: restore the wiring and the next wake repairs it. A journal prepared on an explicitly unfenced runtime never repairs a pending start, so check the agent's external effects and apply a tested, version-specific repair only as [Recovery rules](#recovery-rules) allow |
+| The thread logs `agent-start-recovery-failed` lines for one `runId` | The `error` in the lines; that the agent is still in the catalog with the same workflow; that `startIdempotency` and the execution fence are wired; that a scheduled agent's host provides `discardScheduleDispatch`; whether the run has a row in the workflow snapshot table | Fix the configuration the error names. The line carries only the outermost error, and `run start recovery is unresolved` names none: an unwired `startIdempotency`, a prepared start whose run row is absent and a failure inside the runtime's recovery all read that way, so check each item in the previous column. The next wake retries the journal. A prepared start whose run row is absent is the next row |
+| Every agent start on one thread answers `409 thread is blocked by run '<runId>'`, and that run's status and terminate routes answer `404` | Whether `<runId>` has a row in the workflow snapshot table, and the thread's `agent-start-recovery-failed` lines for it | The start was prepared but its run row was never written (an isolate eviction, or an admission error that is not a definitive refusal). The thread keeps the start's journal and run record so that an unkeyed retry cannot execute the run twice, and stays blocked. Start the work on another thread; do not delete the journal or the run record by hand |
+| A suspended run has no open approval bound to its current gate's suspension, and one of the step's approvals reads `rejected` with `superseded: stale suspension fingerprint` | The run's approvals and its `suspendedAt` and `resumeCount` | A status read taken before a timeout resume superseded that gate's approval on a version earlier than 0.26.0, and the gate cannot be filed again. Terminate the run, or resume it through the raw resume route, which carries no approval grant, so a connector-protected step denies. Do not reopen the record through direct SQL |
 | Durable agent resume fails after eviction | Prepare/observe registration and memory binding | Use `resumeViaRuntime()` through the thread topology; never raw inherited resume |
 | Agent stream returns 409 | In-memory replay cache was evicted or the isolate restarted | Read the authoritative status route; reconnect only for events still present in the configured cache |
 | Connector says approval missing after an approved record | Fingerprint, connector id, workflow, run, and deployment store | Confirm the record matches current step, `suspendedAt`, `resumeCount`, and exact connector id |

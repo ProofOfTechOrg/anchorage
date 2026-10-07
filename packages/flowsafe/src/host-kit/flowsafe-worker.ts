@@ -323,7 +323,12 @@ export interface FlowsafeRunnerLifecycleConfig<Env extends FlowsafeWorkerEnv> {
    * across principal kinds.
    */
   systemPrincipalId: string;
-  /** Compose approval-driven resume handling, including agent-thread targets. */
+  /**
+   * Compose approval-driven resume handling, including agent-thread targets.
+   * `fallback` checks that the step is still at the record's suspension; a
+   * resume the composed function builds itself passes
+   * `expectedSuspensionFor(record)` for that check.
+   */
   buildResumeRun?: (fallback: ResumeRunFn, env: Env) => ResumeRunFn;
   /** Reviewer-facing notification transport used by the same service. */
   notify?: (env: Env) => ApprovalNotificationSink | undefined;

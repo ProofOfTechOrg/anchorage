@@ -54,6 +54,7 @@ import {
   assertExecutionPrincipal,
   isExecutionPrincipalId,
 } from '../approval-api/principal.js';
+import { errorMessageOf } from '../do-runner/cause-chain.js';
 import {
   type D1RunExecutionIdentity,
   ExecutionFenceUnreadableError,
@@ -68,6 +69,7 @@ import {
   DoStatusError,
   isPathSafeId,
   type RequestContextProvider,
+  type ResumeRunOptions,
   type RunSummary,
   resolveScheduleStartOwner,
   resourceIdFromKey,
@@ -78,6 +80,10 @@ import {
 } from '../do-runner/index.js';
 import { isDefinitiveInitialAdmissionRefusal } from '../do-runner/initial-admission-refusal.js';
 import { mastraRegistryEntries } from '../do-runner/mastra-registry.js';
+import {
+  exceedsRunInputDepth,
+  runInputDepthMessage,
+} from '../do-runner/run-input-depth.js';
 import {
   lifecycleFromRequestContext,
   terminalCleanupFor,
@@ -417,9 +423,15 @@ function safeContext(value: unknown): Record<string, unknown> {
     value === undefined ||
     (value !== null && typeof value === 'object' && !Array.isArray(value))
   ) {
-    return sanitizeStoredAgentContext(
+    const context = sanitizeStoredAgentContext(
       value as Record<string, unknown> | undefined,
     );
+    if (Object.values(context).some((item) => exceedsRunInputDepth(item)))
+      throw new AgentHostRequestError(
+        400,
+        runInputDepthMessage('a safeContext value'),
+      );
+    return context;
   }
   throw new AgentHostRequestError(400, 'safeContext must be an object');
 }
@@ -1936,24 +1948,39 @@ export function createThreadAgentHost(
       return withDispatchLock(async () => {
         const storage = options.stateStorage();
         try {
-          const pending = await storage.list<AgentOwnerRecovery>({
+          const pending = await storage.list({
             prefix: AGENT_OWNER_RECOVERY_PREFIX,
           });
+          let firstFailure: { error: unknown } | undefined;
           for (const [key, stored] of pending) {
+            // From the key: a malformed journal may carry no run id.
+            const runId = key.slice(AGENT_OWNER_RECOVERY_PREFIX.length);
+            // Journals recover independently: a failing one keeps its journal
+            // and the wake for a later alarm while the others are recovered.
             try {
               await recoverOwner(scope, key, stored);
             } catch (error) {
               // A start whose leg may still run, or whose row has not gone
-              // silent, settled nothing: its journal and the wake stay for a
-              // later alarm, and the other journals are still recovered.
-              if (!isRunStartPendingError(error)) throw error;
+              // silent, settled nothing.
+              if (isRunStartPendingError(error)) {
+                console.error(
+                  JSON.stringify({
+                    type: 'agent-start-recovery-pending',
+                    threadId: scope.threadId,
+                    runId,
+                  }),
+                );
+                continue;
+              }
               console.error(
                 JSON.stringify({
-                  type: 'agent-start-recovery-pending',
+                  type: 'agent-start-recovery-failed',
                   threadId: scope.threadId,
-                  runId: stored.runId,
+                  runId,
+                  error: errorMessageOf(error),
                 }),
               );
+              firstFailure ??= { error };
             }
           }
           await withRecoveryLock(async () => {
@@ -1966,6 +1993,7 @@ export function createThreadAgentHost(
               await storage.deleteAlarm();
             }
           });
+          if (firstFailure) throw firstFailure.error;
         } catch (error) {
           await withRecoveryLock(() => ensureOwnerRecoveryAlarm(storage));
           throw error;
@@ -2113,6 +2141,11 @@ export function createThreadAgentHost(
       }
       try {
         assertNoGuardedSystemMessages(messagesSnapshot);
+        if (exceedsRunInputDepth(messagesSnapshot))
+          throw new AgentHostRequestError(
+            400,
+            runInputDepthMessage('agent input'),
+          );
         assertAcceptedCallProviderOptions(providerOptionsSnapshot);
       } catch (error) {
         if (error instanceof TypeError) {
@@ -2654,6 +2687,13 @@ export function createThreadAgentHost(
               requestedBy: requesterId,
               ...(step !== undefined ? { step } : {}),
               ...resumeFields,
+              // The runtime validates it.
+              ...(body.expectedSuspension === undefined
+                ? {}
+                : {
+                    expectedSuspension:
+                      body.expectedSuspension as ResumeRunOptions['expectedSuspension'],
+                  }),
               ...(snapshotExecution.threaded
                 ? {
                     memory: {
@@ -2777,6 +2817,23 @@ export function createThreadAgentHost(
             scope.principal,
             owner ?? scope.principal,
           );
+          // The dispatch lock this body holds orders the release after the
+          // runner tail of any start or resume leg here, so a cut leg's tail
+          // has published or claimed its terminal ERROR first. A leg cut after
+          // its engine suspended ends without one, and a run suspended in this
+          // object still holds its stream and registries.
+          try {
+            await runtime?.agents.get(ref.agentId)?.releaseEndedRun(ref.runId);
+          } catch (error) {
+            console.error(
+              JSON.stringify({
+                type: 'agent-run-release-failed',
+                threadId: scope.threadId,
+                runId: ref.runId,
+                error: errorMessageOf(error),
+              }),
+            );
+          }
           const selected = await selectedAgentState(scope, ref, {
             includeLegacy: true,
           });

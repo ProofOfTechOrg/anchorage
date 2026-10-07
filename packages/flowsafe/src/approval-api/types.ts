@@ -591,13 +591,20 @@ export interface ResumeOutcome {
   /** RunSummary (or whatever resumeRun returns) on success. */
   summary?: unknown;
   error?: string;
+  /**
+   * The `reason.code` the failed resume's error carried, if any. A
+   * `SUSPENSION_CHANGED` refusal is permanent: the step left the suspension
+   * this decision was for, and a redrive of it is refused again.
+   */
+  code?: string;
 }
 
 export interface DecideResult {
   record: ApprovalRecord;
   /**
    * The decision is durable regardless of this outcome — a failed resume is
-   * retryable (the run stays suspended; grants derive from the store).
+   * retryable (the run stays suspended; grants derive from the store) unless
+   * its `code` is `SUSPENSION_CHANGED`.
    */
   resume: ResumeOutcome;
 }

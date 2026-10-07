@@ -316,7 +316,7 @@ const agentSurface = Object.getOwnPropertyNames(Agent.prototype).filter(
 const delegatingToGuard = [
   // Registers this agent as a remote wake target, so an idle signal reaches
   // its guarded stream() with the pubsub-supplied run id. Containment comes from
-  // executeWorkflow refusing ids without a #startRequesters entry, since a
+  // executeWorkflow refusing ids without a #pendingStarts entry, since a
   // pubsub-supplied id can satisfy the caller-id pattern.
   'claimThreadOwnership',
   'queueMessage',
@@ -1197,6 +1197,7 @@ describe('FlowsafeDurableAgent prototype surface inventory', () => {
       // FlowSafe's own members, which core has no say in.
       'constructor',
       'resumeViaRuntime',
+      'releaseEndedRun',
       'authoritativeAgentStartState',
       'isRunLive',
       'proofExecutionFor',

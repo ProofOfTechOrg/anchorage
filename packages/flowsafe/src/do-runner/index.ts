@@ -253,8 +253,10 @@ export {
   RunNotSuspendedError,
   RunnerRuntime,
   RunSettledConflictError,
+  RunStateNotStorableError,
   RunStateUnreadableError,
   RunTerminalConflictError,
+  SuspensionChangedError,
   UnknownRunError,
   UnknownWorkflowError,
 } from './runtime.js';

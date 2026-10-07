@@ -47,6 +47,8 @@ import {
   BREAKWATER_ISOLATION_SCOPE_KEY,
   BREAKWATER_WORKFLOW_SCOPE_KEY,
 } from './breakwater-keys.js';
+import { errorMessageOf, findInCauseChain } from './cause-chain.js';
+import { DoStatusError } from './do-status-error.js';
 import {
   assertMutationEpoch,
   type D1RunExecutionIdentity,
@@ -79,25 +81,35 @@ import { mastraRegistryEntries } from './mastra-registry.js';
 import { isPathSafeId } from './path-safe-id.js';
 import type { HostPubSub } from './pubsub.js';
 import {
+  exceedsRunInputDepth,
+  runInputDepthMessage,
+} from './run-input-depth.js';
+import {
   advanceLifecycle,
   canonicalEconomicOperations,
   canonicalReplayPrincipals,
   canonicalScheduleDispatch,
+  failureEnvelope,
   hasDisputedSettlement,
+  legAbortReason,
   lifecycleFromRequestContext,
   projectTerminalLifecycle,
-  RUN_INTERRUPTED_MESSAGE,
+  RUN_FAILURE_MARKERS,
   RUN_LIFECYCLE_CONTEXT_KEY,
+  RUN_SETTLING_MARKERS,
   type RunEconomicOperation,
   RunLifecycleBlockedError,
   type RunLifecyclePrincipal,
   type RunLifecycleState,
   type RunScheduleDispatch,
   RunSettledConflictError,
+  RunStateNotStorableError,
   type RunTerminalCleanup,
   type RunTerminalErrorEnvelope,
   type RunTerminalStatus,
+  runTerminalError,
   terminalCleanupFor,
+  terminalLegAbortReason,
 } from './run-lifecycle.js';
 import {
   decodeProgressRunProvenance,
@@ -130,6 +142,7 @@ export {
   RunLifecycleBlockedError,
   type RunLifecycleBlockedReason,
   RunSettledConflictError,
+  RunStateNotStorableError,
 } from './run-lifecycle.js';
 export type { RunStatus } from './run-terminal-state.js';
 
@@ -155,6 +168,22 @@ export class RunNotSuspendedError extends Error {
       `run '${runId}' of workflow '${workflowId}' is '${status}', not 'suspended'`,
     );
     this.name = 'RunNotSuspendedError';
+  }
+}
+
+/**
+ * A resume that names the suspension it is for, of a step that has since left
+ * it: resumed and suspended again, or no longer suspended at all.
+ */
+export class SuspensionChangedError extends DoStatusError {
+  readonly status = 409;
+  readonly reason = { code: 'SUSPENSION_CHANGED' } as const;
+
+  constructor(workflowId: string, runId: string, step: string) {
+    super(
+      `step '${step}' of run '${runId}' of workflow '${workflowId}' is no longer at the suspension the resume names`,
+    );
+    this.name = 'SuspensionChangedError';
   }
 }
 
@@ -566,11 +595,8 @@ function summarizeState(
     summary.result = state.result;
   } else if (state.status === 'failed') {
     if (state.error) summary.error = errorText(state.error);
-    if (lifecycle?.interruptedAt !== undefined)
-      summary.errorEnvelope = {
-        code: 'INTERRUPTED',
-        message: RUN_INTERRUPTED_MESSAGE,
-      };
+    const envelope = failureEnvelope(lifecycle);
+    if (envelope) summary.errorEnvelope = envelope;
   } else if (state.status === 'suspended') {
     const suspendedKeys = Object.keys(state.suspendedPaths ?? {});
     summary.suspended = suspendedKeys.map((key) => key.split('.'));
@@ -835,8 +861,9 @@ export type StartRunOptions = {
    * @internal An abort controller the runtime aborts wherever it aborts the
    * leg: when the liveness touch finds the run settled by another instance,
    * which can happen before the leg's engine run exists, and when a terminate
-   * handled in this isolate cancels the leg, after the engine run's own abort.
-   * Never request-context data.
+   * or a deadline handled in this isolate cancels the leg, after the engine
+   * run's own abort, with a {@link terminalLegAbortReason}. Never
+   * request-context data.
    */
   readonly legAbort?: AbortController;
 } & OptionalRunRequester;
@@ -862,6 +889,17 @@ export type ResumeRunOptions = {
   deadlineMs?: number;
   /** Trusted settlement projection for the resumed execution leg. */
   economicOperations?: readonly RunEconomicOperation[];
+  /**
+   * The suspension this resume is for, as a decided approval records it: the
+   * step's `suspendedAt` and its `resumeCount`, absent for a step's first
+   * suspension. When the resumed step is at another suspension the resume
+   * throws SuspensionChangedError before the step runs. The resumed step must
+   * be resolvable: named by `step`, or the only suspended step.
+   */
+  expectedSuspension?: {
+    readonly suspendedAt: number;
+    readonly resumeCount?: number;
+  };
 } & OptionalRunRequester;
 
 export interface RunLifecycleCas {
@@ -947,6 +985,45 @@ function relativeDeadline(
 function assertLegAbort(legAbort: unknown): void {
   if (legAbort !== undefined && !(legAbort instanceof AbortController))
     throw new InvalidRunRequestError('legAbort is malformed');
+}
+
+function assertRunInputDepth(field: string, value: unknown): void {
+  if (exceedsRunInputDepth(value))
+    throw new InvalidRunRequestError(runInputDepthMessage(field));
+}
+
+/**
+ * `resumeCount` is absent on a first suspension and 1, 2, … after it, so 0 is
+ * malformed rather than a suspension the step can be at.
+ */
+function captureExpectedSuspension(
+  value: unknown,
+): ResumeRunOptions['expectedSuspension'] {
+  if (value === undefined) return undefined;
+  if (value === null || typeof value !== 'object' || Array.isArray(value))
+    throw new InvalidRunRequestError('expectedSuspension is malformed');
+  const { suspendedAt, resumeCount } = value as Record<string, unknown>;
+  if (
+    !Number.isSafeInteger(suspendedAt) ||
+    (suspendedAt as number) < 0 ||
+    (resumeCount !== undefined &&
+      (!Number.isSafeInteger(resumeCount) || (resumeCount as number) < 1))
+  )
+    throw new InvalidRunRequestError('expectedSuspension is malformed');
+  return Object.freeze({
+    suspendedAt: suspendedAt as number,
+    ...(resumeCount === undefined
+      ? {}
+      : { resumeCount: resumeCount as number }),
+  });
+}
+
+function isRunStateNotStorable(error: unknown): boolean {
+  return findInCauseChain(
+    error,
+    (link) => link instanceof RunStateNotStorableError,
+    { rootOnly: false },
+  );
 }
 
 function captureStartRunOptions(source: StartRunOptions): StartRunOptions {
@@ -1169,6 +1246,44 @@ function effectiveLifecycle(
     ...((persisted.terminal ?? active.terminal)
       ? { terminal: persisted.terminal ?? active.terminal }
       : {}),
+  };
+}
+
+/**
+ * A stored request context with a leg's values laid over it, and the lifecycle
+ * that results. Summary selection reads the attempt token in the context that
+ * results, so every writer of a leg's outcome builds it here.
+ */
+function overlayLegContext(stored: unknown, overlay: Record<string, unknown>) {
+  const persisted =
+    stored !== null && typeof stored === 'object' && !Array.isArray(stored)
+      ? (stored as Record<string, unknown>)
+      : {};
+  const context: Record<string, unknown> = { ...persisted, ...overlay };
+  const persistedLifecycle = lifecycleFromRequestContext(persisted);
+  return {
+    context,
+    persistedLifecycle,
+    lifecycle: effectiveLifecycle(
+      persistedLifecycle,
+      lifecycleFromRequestContext(context),
+    ),
+  };
+}
+
+/** The request-context keys summary selection reads from a run's stored context. */
+const SELECTION_CONTEXT_KEYS = [
+  RUN_PROVENANCE_CONTEXT_KEY,
+  RUN_LIFECYCLE_CONTEXT_KEY,
+] as const;
+
+/** The state with which the runtime fails a run by one of its failure markers. */
+function failedByMarker(marker: keyof typeof RUN_FAILURE_MARKERS, now: number) {
+  const { errorName, envelope } = RUN_FAILURE_MARKERS[marker];
+  return {
+    ...terminalStateFields('failed'),
+    error: { name: errorName, message: envelope.message },
+    timestamp: now,
   };
 }
 
@@ -1570,6 +1685,13 @@ export class RunnerRuntime {
         await this.#startIdempotency.releaseReservation(claim);
     };
     try {
+      // An agent's loop input also carries the thread history memory recalls,
+      // which the caller did not send; the agent host bounds the caller's part.
+      if (options.agentStart === undefined)
+        assertRunInputDepth('inputData', options.inputData);
+      assertRunInputDepth('initialState', options.initialState);
+      for (const value of Object.values(options.storedRequestContext ?? {}))
+        assertRunInputDepth('a requestContext value', value);
       const workflow = this.#getWorkflow(workflowId);
       if (
         startIdentity?.target.kind === 'workflow' &&
@@ -1768,6 +1890,7 @@ export class RunnerRuntime {
               await this.#startIdempotency.releaseReservation(claim);
           }
           if (engineEntered && provenance && !outcomeReadStarted) {
+            await this.#failUnstorableLeg(workflowId, runId, active, error);
             const recovered = await this.#summaryForAttempt(
               workflowId,
               runId,
@@ -1798,6 +1921,10 @@ export class RunnerRuntime {
   ): Promise<RunSummary> {
     const { legAbort } = options;
     assertLegAbort(legAbort);
+    assertRunInputDepth('resumeData', options.resumeData);
+    const expectedSuspension = captureExpectedSuspension(
+      options.expectedSuspension,
+    );
     this.#getWorkflow(workflowId);
     const proof = await this.#assertResumeFence(workflowId, runId);
     return this.#withRunLock(workflowId, runId, async () => {
@@ -1835,11 +1962,7 @@ export class RunnerRuntime {
           workflowId,
           runId,
           state,
-          options.step,
-          options.requestedBy,
-          options.requestedByKind,
-          options.deadlineMs,
-          options.economicOperations,
+          { ...options, expectedSuspension },
         );
         provenance = prepared.provenance;
         const { requestContext, lifecycle, nextCounts } = prepared;
@@ -1932,6 +2055,7 @@ export class RunnerRuntime {
         );
       } catch (error) {
         if (engineEntered && provenance && !outcomeReadStarted) {
+          await this.#failUnstorableLeg(workflowId, runId, active, error);
           const recovered = await this.#summaryForAttempt(
             workflowId,
             runId,
@@ -2070,7 +2194,7 @@ export class RunnerRuntime {
     }
     // After `run.cancel()` has aborted the engine run, so the engine's
     // cancellation precedes any abort error from a call in flight.
-    prepared.legAbort?.abort();
+    prepared.legAbort?.abort(terminalLegAbortReason(intendedStatus));
     return true;
   }
 
@@ -2272,11 +2396,7 @@ export class RunnerRuntime {
       {
         ...state,
         ...terminalStateFields(status),
-        error: {
-          name:
-            status === 'cancelled' ? 'RunCancelledError' : 'RunTimedOutError',
-          message: next.terminal.error.message,
-        },
+        error: runTerminalError(status),
         timestamp: now,
       },
       next,
@@ -2920,7 +3040,14 @@ export class RunnerRuntime {
       { workflowId, runId },
       now,
     );
-    if (touched === 'settled') this.#abortSettledLeg(workflowId, runId);
+    if (touched === 'settled')
+      this.#abortLeg(
+        this.#activeRuns.get(this.#runKey(workflowId, runId)),
+        new RunSettledConflictError(workflowId, runId),
+        'run-leg-settled-abort',
+        workflowId,
+        runId,
+      );
   }
 
   /**
@@ -2954,28 +3081,26 @@ export class RunnerRuntime {
   }
 
   /**
-   * Abort the leg this runtime drives for a run another instance settled.
-   * Never `run.cancel()`: it reads the stored status first and returns without
-   * aborting on `failed`, which an interruption or a start repair writes. The
-   * reason is named `AbortError`, which Mastra and the AI SDK read as an abort,
-   * and carries the settlement as its cause. The leg's `legAbort` takes the
-   * same reason, so a model or tool call in flight stops with the engine.
+   * Abort the engine and the `legAbort` of a leg this runtime drives, with
+   * `cause` as the cause of one shared reason, so a model or tool call in
+   * flight stops with the engine. Never `run.cancel()`: it reads the stored
+   * status first and returns without aborting on `failed`, which an
+   * interruption or a start repair writes.
    */
-  #abortSettledLeg(workflowId: string, runId: string): void {
-    const active = this.#activeRuns.get(this.#runKey(workflowId, runId));
+  #abortLeg(
+    active: ActiveRun | undefined,
+    cause: Error,
+    logType: string,
+    workflowId: string,
+    runId: string,
+  ): void {
     const unaborted = [active?.run?.abortController, active?.legAbort].filter(
       (controller): controller is AbortController =>
         controller !== undefined && !controller.signal.aborted,
     );
     if (unaborted.length === 0) return;
-    console.error(
-      JSON.stringify({ type: 'run-leg-settled-abort', workflowId, runId }),
-    );
-    const conflict = new RunSettledConflictError(workflowId, runId);
-    const reason = Object.assign(
-      new Error(conflict.message, { cause: conflict }),
-      { name: 'AbortError' },
-    );
+    console.error(JSON.stringify({ type: logType, workflowId, runId }));
+    const reason = legAbortReason(cause);
     for (const controller of unaborted) controller.abort(reason);
   }
 
@@ -3066,15 +3191,7 @@ export class RunnerRuntime {
           await this.#persistLifecycle(
             workflowId,
             runId,
-            {
-              ...current,
-              ...terminalStateFields('failed'),
-              error: {
-                name: 'RunInterruptedError',
-                message: RUN_INTERRUPTED_MESSAGE,
-              },
-              timestamp: now,
-            },
+            { ...current, ...failedByMarker('interruptedAt', now) },
             advanceLifecycle(currentLifecycle, { interruptedAt: now }),
             now,
             source,
@@ -3260,17 +3377,29 @@ export class RunnerRuntime {
     workflowId: string,
     runId: string,
     state: WorkflowState,
-    selectedStep: string | string[] | undefined,
-    requestedBy?: string,
-    requestedByKind?: ExecutionPrincipalKind,
-    deadlineMs?: number,
-    economicOperations?: readonly RunEconomicOperation[],
+    options: Pick<
+      ResumeRunOptions,
+      | 'step'
+      | 'requestedBy'
+      | 'requestedByKind'
+      | 'deadlineMs'
+      | 'economicOperations'
+      | 'expectedSuspension'
+    >,
   ): Promise<{
     nextCounts: ReadonlyMap<string, number>;
     provenance: RunProvenance;
     requestContext: RequestContext;
     lifecycle?: RunLifecycleState;
   }> {
+    const {
+      step: selectedStep,
+      requestedBy,
+      requestedByKind,
+      deadlineMs,
+      economicOperations,
+      expectedSuspension,
+    } = options;
     if (requestedBy !== undefined && !isExecutionPrincipalId(requestedBy)) {
       throw new InvalidRunRequestError('requestedBy is malformed');
     }
@@ -3306,6 +3435,26 @@ export class RunnerRuntime {
         ? storedProvenance?.requestedByKind
         : requestedByKind;
     const priorCounts = new Map(storedProvenance?.resumeCounts ?? []);
+    const leg: RunLeg = {
+      kind: 'resume',
+      step,
+      suspendedAt:
+        stepKey !== undefined ? suspendedAtOf(state.steps, stepKey) : undefined,
+      resumeCount: stepKey !== undefined ? priorCounts.get(stepKey) : undefined,
+    };
+    // The pair the leg's grant minting reads, compared as
+    // boundToCurrentSuspension compares it.
+    if (expectedSuspension !== undefined) {
+      if (stepKey === undefined)
+        throw new InvalidRunRequestError(
+          'expectedSuspension requires a resolvable resumed step',
+        );
+      if (
+        leg.suspendedAt !== expectedSuspension.suspendedAt ||
+        leg.resumeCount !== expectedSuspension.resumeCount
+      )
+        throw new SuspensionChangedError(workflowId, runId, stepKey);
+    }
     const nextCounts = new Map(priorCounts);
     if (stepKey !== undefined) {
       nextCounts.set(stepKey, nextResumeCount(nextCounts.get(stepKey) ?? 0));
@@ -3339,16 +3488,7 @@ export class RunnerRuntime {
     const requestContext = await this.#requestContextFor(
       workflowId,
       runId,
-      {
-        kind: 'resume',
-        step,
-        suspendedAt:
-          stepKey !== undefined
-            ? suspendedAtOf(state.steps, stepKey)
-            : undefined,
-        resumeCount:
-          stepKey !== undefined ? priorCounts?.get(stepKey) : undefined,
-      },
+      leg,
       provenance,
       undefined,
       lifecycle,
@@ -3545,6 +3685,86 @@ export class RunnerRuntime {
     }
   }
 
+  /**
+   * When `error` is a storage refusal of state that cannot be stored, record
+   * the leg's run as failed and stop the leg. The row still holds the last
+   * state the run stored, and only the keys summary selection reads are laid
+   * over it from the leg's context: the other values may be the ones SQLite
+   * cannot parse. The marker makes the settled-row guard refuse the leg's later
+   * writes. Never throws: the caller's summary read follows.
+   */
+  async #failUnstorableLeg(
+    workflowId: string,
+    runId: string,
+    active: ActiveRun,
+    error: unknown,
+  ): Promise<void> {
+    if (!isRunStateNotStorable(error)) return;
+    const { source, requestContext } = active;
+    if (source?.storage === 'd1' && source.replace && requestContext) {
+      const live = Object.fromEntries(requestContext.entries());
+      const overlay = Object.fromEntries(
+        SELECTION_CONTEXT_KEYS.filter((key) => key in live).map((key) => [
+          key,
+          live[key],
+        ]),
+      );
+      try {
+        await this.#withLifecycleLock(workflowId, runId, () =>
+          this.#retryOnRowChange(workflowId, runId, async () => {
+            const { state, row } = await this.#readForTransition(
+              source,
+              workflowId,
+              runId,
+            );
+            const { context, lifecycle } = overlayLegContext(
+              state.requestContext,
+              overlay,
+            );
+            if (
+              !TERMINABLE_RUN_STATUSES.has(state.status as RunStatus) ||
+              lifecycle?.transitionIntent !== undefined ||
+              RUN_SETTLING_MARKERS.some(
+                (marker) => lifecycle?.[marker] !== undefined,
+              )
+            )
+              return;
+            const now = Date.now();
+            await this.#persistLifecycle(
+              workflowId,
+              runId,
+              {
+                ...state,
+                ...failedByMarker('stateNotStorableAt', now),
+                requestContext: context,
+              },
+              advanceLifecycle(lifecycle, { stateNotStorableAt: now }),
+              now,
+              source,
+              row,
+            );
+          }),
+        );
+      } catch (settleError) {
+        console.error(
+          JSON.stringify({
+            type: 'run-state-not-storable-settle-failed',
+            workflowId,
+            runId,
+            error: errorMessageOf(settleError),
+          }),
+        );
+      }
+    }
+    this.#abortLeg(
+      active,
+      new RunStateNotStorableError(workflowId, runId),
+      'run-leg-state-not-storable-abort',
+      workflowId,
+      runId,
+    );
+  }
+
   async #reconcileTerminalState(
     workflowId: string,
     runId: string,
@@ -3588,25 +3808,16 @@ export class RunnerRuntime {
           expected,
           proof,
         );
-      const persistedContext =
-        snapshot.requestContext !== null &&
-        typeof snapshot.requestContext === 'object' &&
-        !Array.isArray(snapshot.requestContext)
-          ? snapshot.requestContext
-          : {};
       // Core merges resume context over the prior snapshot. Terminal-only
       // repair must persist that same effective context, including application
       // keys the current provider intentionally omitted.
-      const authoritativeContext = {
-        ...persistedContext,
-        ...Object.fromEntries(requestContext.entries()),
-      };
-      const persistedLifecycle = lifecycleFromRequestContext(persistedContext);
-      const authoritativeLifecycle =
-        lifecycleFromRequestContext(authoritativeContext);
-      const reconciledLifecycle = effectiveLifecycle(
+      const {
+        context: authoritativeContext,
         persistedLifecycle,
-        authoritativeLifecycle,
+        lifecycle: reconciledLifecycle,
+      } = overlayLegContext(
+        snapshot.requestContext,
+        Object.fromEntries(requestContext.entries()),
       );
       if (reconciledLifecycle) {
         authoritativeContext[RUN_LIFECYCLE_CONTEXT_KEY] = reconciledLifecycle;

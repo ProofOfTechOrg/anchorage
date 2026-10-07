@@ -27,6 +27,7 @@ import type { StepResult, WorkflowRunState } from '@mastra/core/workflows';
 import {
   captureD1DomainConfig,
   FencedWorkflowsStorageD1,
+  serializedByKey,
 } from '../do-runner/fenced-workflows-d1.js';
 import type { D1DatabaseBinding } from '../do-runner/index.js';
 import { validateTablePrefix } from '../do-runner/table-prefix.js';
@@ -86,17 +87,7 @@ export class DurableObjectWorkflowsStorageD1 extends FencedWorkflowsStorageD1 {
     runId: string,
     work: () => Promise<T>,
   ): Promise<T> {
-    const key = `${workflowName}\0${runId}`;
-    const previous = this.#tails.get(key) ?? Promise.resolve();
-    const current = previous.then(work, work);
-    const settled = current.then(
-      () => undefined,
-      () => undefined,
-    );
-    this.#tails.set(key, settled);
-    return current.finally(() => {
-      if (this.#tails.get(key) === settled) this.#tails.delete(key);
-    });
+    return serializedByKey(this.#tails, `${workflowName}\0${runId}`, work);
   }
 
   #persistUnlocked(

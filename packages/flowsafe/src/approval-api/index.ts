@@ -49,6 +49,7 @@ export {
   approvalGrantProvider,
   connectorGrantsForLeg,
   defaultResumeData,
+  expectedSuspensionFor,
   resumeViaRuntime,
 } from './grants.js';
 export type {

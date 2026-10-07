@@ -11,6 +11,7 @@ import {
   parseRunLifecycle,
   projectTerminalLifecycle,
   RUN_LIFECYCLE_CONTEXT_KEY,
+  RUN_SETTLING_MARKERS,
   RunLifecycleBlockedError,
   type RunLifecycleBlockedReason,
   type RunLifecycleState,
@@ -479,15 +480,17 @@ describe('lifecycle metadata compatibility', () => {
     expect(parseRunLifecycle(lifecycle)).toStrictEqual(lifecycle);
   });
 
-  it('keeps a stored interruption time and refuses one that is not a time', () => {
+  it.each(
+    RUN_SETTLING_MARKERS.filter((marker) => marker !== 'terminal'),
+  )('keeps a stored %s time and refuses one that is not a time', (marker) => {
     const lifecycle: RunLifecycleState = {
       version: 1,
       revision: 2,
-      interruptedAt: 1_751_883_300_000,
+      [marker]: 1_751_883_300_000,
     };
     expect(parseRunLifecycle(lifecycle)).toStrictEqual(lifecycle);
-    for (const interruptedAt of [-1, 1.5, '1751883300000', null]) {
-      expect(() => parseRunLifecycle({ ...lifecycle, interruptedAt })).toThrow(
+    for (const time of [-1, 1.5, '1751883300000', null]) {
+      expect(() => parseRunLifecycle({ ...lifecycle, [marker]: time })).toThrow(
         'stored run lifecycle is malformed',
       );
     }

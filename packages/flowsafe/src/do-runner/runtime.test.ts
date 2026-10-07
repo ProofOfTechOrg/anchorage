@@ -18,6 +18,12 @@ import {
   vi,
 } from 'vitest';
 import { z } from 'zod';
+import {
+  nestedArray,
+  nestedObject,
+  PAST_SQLITE_JSON_DEPTH,
+  withDeepValue,
+} from '../../test-support/deep-json.js';
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import {
   D1ResourceOwnershipStore,
@@ -79,6 +85,16 @@ import {
   suspensionDeadlinesOf,
   suspensionTimeoutResumeData,
 } from './suspension-deadline.js';
+
+function expectSnapshotUnreadable(sql: ReturnType<typeof openSqlite>) {
+  expect(
+    sql
+      .prepare(
+        'SELECT json_valid(snapshot) AS valid FROM mastra_workflow_snapshot',
+      )
+      .all(),
+  ).toEqual([{ valid: 0 }]);
+}
 
 function d1Snapshot(
   status: RunSummary['status'] = 'success',
@@ -2226,6 +2242,539 @@ describe('economic format safety', () => {
     } finally {
       f.sql.close();
     }
+  });
+});
+
+describe('RunnerRuntime run state SQLite cannot store', () => {
+  const schema = z.any();
+
+  /** A workflow over memory storage whose one step suspends until it is resumed. */
+  function nestedInputApp() {
+    const app = init(
+      { storage: new InMemoryStore() },
+      { executionFence: 'none', startIdempotency: 'none' },
+    );
+    app
+      .createWorkflow({
+        id: 'nested-input',
+        inputSchema: schema,
+        outputSchema: schema,
+        stateSchema: schema,
+      })
+      .then(
+        app.createStep({
+          id: 'gate',
+          inputSchema: schema,
+          outputSchema: schema,
+          stateSchema: schema,
+          suspendSchema: schema,
+          resumeSchema: schema,
+          execute: async ({ resumeData, suspend }) => {
+            if (!resumeData) return suspend({});
+            return {};
+          },
+        }),
+      )
+      .commit();
+    return app;
+  }
+
+  function storedRow(sql: ReturnType<typeof openSqlite>, workflowId: string) {
+    const row = sql
+      .prepare(
+        'SELECT json_valid(snapshot) AS valid, snapshot FROM mastra_workflow_snapshot WHERE workflow_name = ?',
+      )
+      .get(workflowId) as { valid: number; snapshot: string };
+    return { valid: row.valid, snapshot: JSON.parse(row.snapshot) };
+  }
+
+  /** D1 storage and the workflows these tests run; `shared` is the storage another instance already uses. */
+  async function deepOutputApp(
+    requestContextForRun?: RequestContextProvider,
+    shared?: {
+      sql: ReturnType<typeof openSqlite>;
+      storage: MastraCompositeStore;
+    },
+  ) {
+    const sql = shared?.sql ?? openSqlite();
+    const storage =
+      shared?.storage ??
+      createD1Storage({
+        binding: sqliteUnitDatabase(sql) as D1DatabaseBinding,
+      });
+    if (!shared) await storage.init();
+    const app = init(
+      { storage },
+      {
+        executionFence: 'none',
+        startIdempotency: 'none',
+        requestContextForRun,
+      },
+    );
+    const entered = deferredSignal();
+    const release = deferredSignal();
+    const deep = { value: nestedArray(PAST_SQLITE_JSON_DEPTH) };
+    const oneStep = (
+      workflowId: string,
+      stepId: string,
+      execute: Parameters<typeof app.createStep>[0]['execute'],
+    ) =>
+      app
+        .createWorkflow({
+          id: workflowId,
+          inputSchema: schema,
+          outputSchema: schema,
+        })
+        .then(
+          app.createStep({
+            id: stepId,
+            inputSchema: schema,
+            outputSchema: schema,
+            suspendSchema: schema,
+            resumeSchema: schema,
+            execute,
+          }),
+        )
+        .commit();
+    oneStep('deep-context', 'cache', async ({ requestContext }) => {
+      requestContext.set('cache', nestedArray(PAST_SQLITE_JSON_DEPTH));
+      return {};
+    });
+    oneStep('shallow-on-resume', 'gate', async ({ resumeData, suspend }) => {
+      if (!resumeData) return suspend({});
+      return {};
+    });
+    oneStep('held-deep', 'hold', async () => {
+      entered.resolve();
+      await release.promise;
+      return deep;
+    });
+    oneStep('deep-output', 'produce', async () => deep);
+    oneStep('deep-on-resume', 'gate', async ({ resumeData, suspend }) => {
+      if (!resumeData) return suspend({});
+      return deep;
+    });
+    const workflows = (await storage.getStore(
+      'workflows',
+    )) as FencedWorkflowsStorageD1;
+    return { sql, storage, app, workflows, entered, release };
+  }
+
+  it.each([
+    ['inputData', 'inputData', { inputData: nestedObject(257) }],
+    ['initialState', 'initialState', { initialState: nestedObject(257) }],
+    [
+      'requestContext value',
+      'requestContext',
+      { storedRequestContext: { app: nestedObject(257) } },
+    ],
+  ] as const)('refuses a start whose %s nests 257 levels deep', async (_, field, deep) => {
+    // #given a workflow and a start request whose one tenant value nests 257 levels
+    const { runtime } = nestedInputApp();
+
+    // #when the run is started
+    const started = runtime.start('nested-input', {
+      runId: 'deep-start',
+      inputData: {},
+      ...deep,
+    });
+
+    // #then it is refused as an invalid request naming the field, and no run exists
+    await expect(started).rejects.toMatchObject({
+      name: 'InvalidRunRequestError',
+      message: expect.stringContaining(field),
+    });
+    await expect(runtime.status('nested-input', 'deep-start')).resolves.toBe(
+      null,
+    );
+  });
+
+  it('starts a run whose input nests exactly 256 levels deep', async () => {
+    // #given a workflow
+    const { runtime } = nestedInputApp();
+
+    // #when the run is started with input nested 256 levels
+    const started = runtime.start('nested-input', {
+      runId: 'deep-start',
+      inputData: nestedObject(256),
+    });
+
+    // #then it runs to its suspension
+    await expect(started).resolves.toMatchObject({ status: 'suspended' });
+  });
+
+  it('refuses a resume whose resumeData nests 257 levels deep and leaves the run suspended', async () => {
+    // #given a suspended run
+    const { runtime } = nestedInputApp();
+    await runtime.start('nested-input', {
+      runId: 'deep-resume',
+      inputData: {},
+    });
+
+    // #when it is resumed with data nested 257 levels
+    const resumed = runtime.resume('nested-input', 'deep-resume', {
+      step: 'gate',
+      resumeData: nestedObject(257),
+    });
+
+    // #then the resume is refused as an invalid request and the run stays suspended
+    await expect(resumed).rejects.toMatchObject({
+      name: 'InvalidRunRequestError',
+      message: expect.stringContaining('resumeData'),
+    });
+    await expect(
+      runtime.status('nested-input', 'deep-resume'),
+    ).resolves.toMatchObject({ status: 'suspended' });
+  });
+
+  it('does not bound the loop input of an agent start', async () => {
+    // #given a workflow and an agent start, whose loop input carries thread
+    // history the caller did not send
+    const { runtime } = nestedInputApp();
+
+    // #when the run is started with input nested 300 levels
+    const started = runtime.start('nested-input', {
+      runId: 'agent-loop',
+      inputData: nestedObject(300),
+      requestedBy: 'operator-1',
+      requestedByKind: 'human',
+      startIdentity: {
+        owner: { kind: 'human', id: 'operator-1' },
+        target: { kind: 'agent', id: 'agent-1', threadId: 'thread-1' },
+      },
+      agentStart: { threaded: false },
+    });
+
+    // #then it is not refused for its depth
+    await expect(started).resolves.toMatchObject({ status: 'suspended' });
+  });
+
+  it('refuses an agent start whose initial state nests 257 levels deep', async () => {
+    // #given a workflow and an agent start
+    const { runtime } = nestedInputApp();
+
+    // #when the run is started with an initial state nested 257 levels
+    const started = runtime.start('nested-input', {
+      runId: 'agent-state',
+      inputData: {},
+      initialState: nestedObject(257),
+      requestedBy: 'operator-1',
+      requestedByKind: 'human',
+      startIdentity: {
+        owner: { kind: 'human', id: 'operator-1' },
+        target: { kind: 'agent', id: 'agent-1', threadId: 'thread-1' },
+      },
+      agentStart: { threaded: false },
+    });
+
+    // #then it is refused as an invalid request
+    await expect(started).rejects.toMatchObject({
+      name: 'InvalidRunRequestError',
+      message: expect.stringContaining('initialState'),
+    });
+  });
+
+  it.each([
+    'start',
+    'resume',
+  ] as const)('fails a run at once when its leg returns state too deep to store (%s)', async (leg) => {
+    // #given D1 storage and a run whose step returns state nested past the
+    // depth SQLite parses
+    const { sql, app, workflows } = await deepOutputApp();
+    const workflowId = leg === 'start' ? 'deep-output' : 'deep-on-resume';
+
+    // #when the leg runs
+    const summary =
+      leg === 'start'
+        ? await app.runtime.start(workflowId, {
+            runId: 'deep-run',
+            inputData: {},
+          })
+        : await app.runtime
+            .start(workflowId, { runId: 'deep-run', inputData: {} })
+            .then(() =>
+              app.runtime.resume(workflowId, 'deep-run', {
+                step: 'gate',
+                resumeData: { ok: true },
+              }),
+            );
+
+    // #then the run fails at once with the storage refusal as its envelope
+    expect(summary).toMatchObject({
+      status: 'failed',
+      errorEnvelope: { code: 'RUN_STATE_NOT_STORABLE' },
+    });
+
+    // #then the stored row is one SQLite parses, and records the settlement
+    const { valid, snapshot } = storedRow(sql, workflowId);
+    expect(valid).toBe(1);
+    expect(snapshot.requestContext['flowsafe.runLifecycle']).toMatchObject({
+      stateNotStorableAt: expect.any(Number),
+    });
+
+    // #when a stale write persists over it
+    const stale = workflows.persistWorkflowSnapshot({
+      workflowName: workflowId,
+      runId: 'deep-run',
+      snapshot: { ...snapshot, status: 'running' },
+    });
+
+    // #then the settlement refuses it
+    await expect(stale).rejects.toMatchObject({
+      name: 'RunSettledConflictError',
+    });
+  });
+
+  it('stores a settlement SQLite parses when a step put the deep value in its request context', async () => {
+    // #given a step that caches a value nested past the depth SQLite parses in
+    // its request context, which the engine writes with every snapshot
+    const { sql, app } = await deepOutputApp();
+
+    // #when the leg runs
+    const summary = await app.runtime.start('deep-context', {
+      runId: 'deep-context-run',
+      inputData: {},
+    });
+
+    // #then the run fails at once with the storage refusal as its envelope
+    expect(summary).toMatchObject({
+      status: 'failed',
+      errorEnvelope: { code: 'RUN_STATE_NOT_STORABLE' },
+    });
+
+    // #then the settlement is a row SQLite parses
+    expect(storedRow(sql, 'deep-context').valid).toBe(1);
+  });
+
+  it('stores a settlement SQLite parses when the host supplies the deep value to a resume leg', async () => {
+    // #given a suspended run, and a host whose request context for its resume
+    // legs holds a value nested past the depth SQLite parses
+    const { sql, app } = await deepOutputApp((_workflowId, _runId, leg) =>
+      leg.kind === 'resume'
+        ? { cache: nestedArray(PAST_SQLITE_JSON_DEPTH) }
+        : undefined,
+    );
+    await app.runtime.start('shallow-on-resume', {
+      runId: 'host-deep-run',
+      inputData: {},
+    });
+
+    // #when the run is resumed
+    const summary = await app.runtime.resume(
+      'shallow-on-resume',
+      'host-deep-run',
+      {
+        step: 'gate',
+        resumeData: { ok: true },
+      },
+    );
+
+    // #then the run fails at once with the storage refusal as its envelope
+    expect(summary).toMatchObject({
+      status: 'failed',
+      errorEnvelope: { code: 'RUN_STATE_NOT_STORABLE' },
+    });
+
+    // #then the settlement is a row SQLite parses
+    expect(storedRow(sql, 'shallow-on-resume').valid).toBe(1);
+  });
+
+  it('aborts the leg when it fails the run at once', async () => {
+    // #given a leg with an abort controller, whose step returns state nested
+    // past the depth SQLite parses
+    const { app } = await deepOutputApp();
+    const legAbort = new AbortController();
+
+    // #when the leg runs
+    const summary = await app.runtime.start('deep-output', {
+      runId: 'aborted-run',
+      inputData: {},
+      legAbort,
+    });
+
+    // #then the run fails at once, and the leg's model and tool calls in flight
+    // are told to stop
+    expect(summary).toMatchObject({
+      status: 'failed',
+      errorEnvelope: { code: 'RUN_STATE_NOT_STORABLE' },
+    });
+    expect(legAbort.signal.aborted).toBe(true);
+    expect(legAbort.signal.reason).toMatchObject({
+      name: 'AbortError',
+      cause: { name: 'RunStateNotStorableError' },
+    });
+  });
+
+  it('settles a run over its pending initial row when the first engine write is refused', async () => {
+    // #given a fenced runtime, and an agent start whose loop input nests past
+    // the depth SQLite parses, as recalled thread history can
+    const f = await ownedRuntimeFixture();
+    f.createWorkflow({
+      id: 'deep-input',
+      inputSchema: schema,
+      outputSchema: schema,
+    })
+      .then(
+        f.createStep({
+          id: 'quiet',
+          inputSchema: schema,
+          outputSchema: schema,
+          execute: async () => ({}),
+        }),
+      )
+      .commit();
+    const landed: string[] = [];
+    const persist = f.workflows.persistWorkflowSnapshot.bind(f.workflows);
+    vi.spyOn(f.workflows, 'persistWorkflowSnapshot').mockImplementation(
+      async (args) => {
+        await persist(args);
+        landed.push(args.snapshot.status);
+      },
+    );
+
+    // #when the leg runs
+    const summary = await f.runtime.start('deep-input', {
+      runId: 'pending-run',
+      mutationEpoch: 2,
+      inputData: nestedArray(PAST_SQLITE_JSON_DEPTH),
+      requestedBy: 'operator-1',
+      requestedByKind: 'human',
+      startIdentity: {
+        owner: { kind: 'human', id: 'operator-1' },
+        target: { kind: 'agent', id: 'writer', threadId: 'thread-1' },
+      },
+      agentStart: { threaded: false },
+    });
+
+    // #then nothing but the admission row landed before the settlement, which
+    // reads as this leg's failed outcome
+    expect(landed).toEqual(['pending']);
+    expect(summary).toMatchObject({
+      status: 'failed',
+      errorEnvelope: { code: 'RUN_STATE_NOT_STORABLE' },
+    });
+
+    // #then the stored row is one SQLite parses, without the admission stamp
+    const stored = storedRow(f.sql, 'deep-input');
+    expect(stored.valid).toBe(1);
+    expect(stored.snapshot.status).toBe('failed');
+    expect(
+      stored.snapshot.requestContext['flowsafe.runProvenance'],
+    ).not.toHaveProperty('initialAdmission');
+  });
+
+  describe('a leg whose write is refused while another instance changed its run', () => {
+    const OPERATOR = { kind: 'human' as const, id: 'operator-1' };
+
+    /** A `held-deep` leg held in its step, and a second instance on its storage. */
+    async function heldDeepLeg() {
+      const leg = await deepOutputApp();
+      const other = await deepOutputApp(undefined, leg);
+      const outcome = leg.app.runtime
+        .start('held-deep', { runId: 'held-run', inputData: {} })
+        .then(
+          (summary) => summary,
+          (error: unknown) => error,
+        );
+      onTestFinished(async () => {
+        leg.release.resolve();
+        await outcome;
+      });
+      await leg.entered.promise;
+      return {
+        ...leg,
+        other,
+        outcome,
+        stored: () => storedRow(leg.sql, 'held-deep').snapshot,
+      };
+    }
+
+    it('keeps a recorded cancellation, which the terminate then completes', async () => {
+      // #given a held leg whose run another instance recorded a cancellation for
+      const h = await heldDeepLeg();
+      await h.other.app.runtime.cancelActiveExecution(
+        'held-deep',
+        'held-run',
+        'cancelled',
+        [OPERATOR],
+      );
+
+      // #when the step returns state nested past the depth SQLite parses
+      h.release.resolve();
+      await h.outcome;
+
+      // #then the run was not recorded as failed, and the terminate cancels it
+      const lifecycle = h.stored().requestContext['flowsafe.runLifecycle'];
+      expect(lifecycle).toMatchObject({
+        transitionIntent: { status: 'cancelled' },
+      });
+      expect(lifecycle).not.toHaveProperty('stateNotStorableAt');
+      await expect(
+        h.other.app.runtime.terminate('held-deep', 'held-run'),
+      ).resolves.toMatchObject({
+        transitioned: true,
+        summary: { status: 'cancelled' },
+      });
+    });
+
+    it('keeps a run another instance settled', async () => {
+      // #given a held leg whose run another instance terminated
+      const h = await heldDeepLeg();
+      await h.other.app.runtime.terminate('held-deep', 'held-run');
+
+      // #when the step returns state nested past the depth SQLite parses
+      h.release.resolve();
+      const ended = await h.outcome;
+
+      // #then the run stays cancelled, and the leg answers that outcome
+      expect(h.stored()).toMatchObject({ status: 'cancelled' });
+      expect(
+        h.stored().requestContext['flowsafe.runLifecycle'],
+      ).not.toHaveProperty('stateNotStorableAt');
+      expect(ended).toMatchObject({ status: 'cancelled' });
+    });
+
+    it('keeps a run whose lifecycle records a settlement while its status still reads running', async () => {
+      // #given a held leg whose run row records an interruption
+      const h = await heldDeepLeg();
+      const lifecycle = { version: 1, revision: 3, interruptedAt: 1 };
+      h.sql
+        .prepare(
+          `UPDATE mastra_workflow_snapshot SET snapshot = json_set(snapshot, '$.requestContext."flowsafe.runLifecycle"', json(?)) WHERE workflow_name = ?`,
+        )
+        .run(JSON.stringify(lifecycle), 'held-deep');
+
+      // #when the step returns state nested past the depth SQLite parses
+      h.release.resolve();
+      await h.outcome;
+
+      // #then the row keeps the lifecycle it had and records no further failure
+      expect(h.stored()).toMatchObject({
+        status: 'running',
+        requestContext: { 'flowsafe.runLifecycle': lifecycle },
+      });
+    });
+
+    it('keeps a run whose status is not one a run can still leave', async () => {
+      // #given a held leg whose run row reads success
+      const h = await heldDeepLeg();
+      h.sql
+        .prepare(
+          `UPDATE mastra_workflow_snapshot SET snapshot = json_set(snapshot, '$.status', 'success') WHERE workflow_name = ?`,
+        )
+        .run('held-deep');
+
+      // #when the step returns state nested past the depth SQLite parses
+      h.release.resolve();
+      await h.outcome;
+
+      // #then the row keeps its status and records no failure
+      expect(h.stored()).toMatchObject({ status: 'success' });
+      expect(
+        h.stored().requestContext?.['flowsafe.runLifecycle']
+          ?.stateNotStorableAt,
+      ).toBeUndefined();
+    });
   });
 });
 
@@ -6259,6 +6808,176 @@ describe('RunnerRuntime resumeCount projection (re-suspension)', () => {
     expect(reSuspended.resumeCount?.gate2x).toBe(1);
     expect(reSuspended.suspendedAt?.gate2x).toBeTypeOf('number');
     expect(reSuspended.resumedAt?.gate2x).toBeTypeOf('number');
+  });
+
+  it('refuses a resume naming a suspension its step has left, before the step runs', async () => {
+    // #given a step resumed once and suspended again
+    const runtime = buildReSuspender();
+    const started = await runtime.start('resuspend', {
+      runId: crypto.randomUUID(),
+      inputData: {},
+    });
+    const reSuspended = await runtime.resume('resuspend', started.runId, {
+      step: 'gate2x',
+      resumeData: { go: true },
+    });
+
+    // #when a resume names the first suspension
+    const stale = runtime.resume('resuspend', started.runId, {
+      step: 'gate2x',
+      resumeData: { go: true },
+      expectedSuspension: { suspendedAt: started.suspendedAt?.gate2x ?? -1 },
+    });
+
+    // #then it is refused, and the step stays at its second suspension
+    await expect(stale).rejects.toMatchObject({
+      name: 'SuspensionChangedError',
+      status: 409,
+      reason: { code: 'SUSPENSION_CHANGED' },
+    });
+    await expect(
+      runtime.status('resuspend', started.runId),
+    ).resolves.toMatchObject({
+      status: 'suspended',
+      resumeCount: { gate2x: 1 },
+      suspendedAt: { gate2x: reSuspended.suspendedAt?.gate2x },
+    });
+  });
+
+  it.each([
+    { label: 'no resume count', resumeCount: undefined },
+    { label: 'a later resume count', resumeCount: 2 },
+  ])('refuses a resume naming the current suspension time with $label', async ({
+    resumeCount,
+  }) => {
+    // #given a step resumed once and suspended again
+    const runtime = buildReSuspender();
+    const started = await runtime.start('resuspend', {
+      runId: crypto.randomUUID(),
+      inputData: {},
+    });
+    const reSuspended = await runtime.resume('resuspend', started.runId, {
+      step: 'gate2x',
+      resumeData: { go: true },
+    });
+
+    // #when a resume names the step's current suspension time with a resume
+    // count other than its own
+    const stale = runtime.resume('resuspend', started.runId, {
+      step: 'gate2x',
+      resumeData: { go: true },
+      expectedSuspension: {
+        suspendedAt: reSuspended.suspendedAt?.gate2x ?? -1,
+        ...(resumeCount === undefined ? {} : { resumeCount }),
+      },
+    });
+
+    // #then it is refused, and the step stays at its second suspension
+    await expect(stale).rejects.toMatchObject({
+      name: 'SuspensionChangedError',
+    });
+    await expect(
+      runtime.status('resuspend', started.runId),
+    ).resolves.toMatchObject({
+      status: 'suspended',
+      resumeCount: { gate2x: 1 },
+    });
+  });
+
+  it('resumes when the named suspension is the one the step is at', async () => {
+    // #given a step at its first suspension
+    const runtime = buildReSuspender();
+    const started = await runtime.start('resuspend', {
+      runId: crypto.randomUUID(),
+      inputData: {},
+    });
+
+    // #when each resume names the suspension the step is at
+    const reSuspended = await runtime.resume('resuspend', started.runId, {
+      step: 'gate2x',
+      resumeData: { go: true },
+      expectedSuspension: { suspendedAt: started.suspendedAt?.gate2x ?? -1 },
+    });
+    const finished = await runtime.resume('resuspend', started.runId, {
+      step: 'gate2x',
+      resumeData: { go: true },
+      expectedSuspension: {
+        suspendedAt: reSuspended.suspendedAt?.gate2x ?? -1,
+        resumeCount: 1,
+      },
+    });
+
+    // #then both resume
+    expect(reSuspended.resumeCount?.gate2x).toBe(1);
+    expect(finished.status).toBe('success');
+  });
+
+  it.each([
+    { label: 'a resume count of 0', value: { suspendedAt: 1, resumeCount: 0 } },
+    { label: 'a value that is not an object', value: 'first' },
+  ])('refuses a named suspension with $label as a malformed request', async ({
+    value,
+  }) => {
+    // #given a step at its first suspension
+    const runtime = buildReSuspender();
+    const started = await runtime.start('resuspend', {
+      runId: crypto.randomUUID(),
+      inputData: {},
+    });
+
+    // #when a resume names a malformed suspension
+    const resumed = runtime.resume('resuspend', started.runId, {
+      step: 'gate2x',
+      resumeData: { go: true },
+      expectedSuspension: value as never,
+    });
+
+    // #then it is refused before the step runs
+    await expect(resumed).rejects.toMatchObject({
+      name: 'InvalidRunRequestError',
+    });
+    await expect(
+      runtime.status('resuspend', started.runId),
+    ).resolves.not.toHaveProperty('resumeCount.gate2x');
+  });
+
+  it('refuses a named suspension when the resumed step cannot be resolved', async () => {
+    // #given two steps suspended in parallel
+    const { createWorkflow, createStep, runtime } = init(
+      { storage: new InMemoryStore() },
+      { startIdempotency: 'none', executionFence: 'none' },
+    );
+    const gate = (id: string) =>
+      createStep({
+        id,
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+        suspendSchema: z.object({ reason: z.string() }),
+        execute: async ({ resumeData, suspend }) =>
+          resumeData ? {} : suspend({ reason: `${id} waits` }),
+      });
+    createWorkflow({
+      id: 'parallel-named',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+    })
+      .parallel([gate('gateA'), gate('gateB')])
+      .commit();
+    const started = await runtime.start('parallel-named', {
+      runId: crypto.randomUUID(),
+      inputData: {},
+    });
+
+    // #when a resume names a suspension but no step
+    const resumed = runtime.resume('parallel-named', started.runId, {
+      resumeData: { go: true },
+      expectedSuspension: { suspendedAt: 1 },
+    });
+
+    // #then it is refused as a malformed request
+    await expect(resumed).rejects.toMatchObject({
+      name: 'InvalidRunRequestError',
+    });
   });
 
   it('prepares a host from one isolated copy of the trusted resume context', async () => {
@@ -10981,6 +11700,157 @@ describe('RunnerRuntime lifecycle transitions on D1 storage', () => {
     ).toBeUndefined();
   });
 
+  it('records the cancellation when a leg write serialized before the intent lands after it', async () => {
+    // #given a stranded run whose leg write, made from the row before the
+    // intent, lands right after the intent patch
+    const { app, workflow, workflows, stored } = await racingRun();
+    const before = await stored();
+    const native = workflows[FENCED_WORKFLOW_STORAGE];
+    assert(native?.patchRunLifecycle);
+    const patch = native.patchRunLifecycle.bind(native);
+    Object.defineProperty(workflows, FENCED_WORKFLOW_STORAGE, {
+      value: {
+        ...native,
+        patchRunLifecycle: async (
+          ...args: Parameters<typeof patch>
+        ): Promise<boolean> => {
+          const patched = await patch(...args);
+          if (patched)
+            await workflows.persistWorkflowSnapshot({
+              workflowName: workflow.id,
+              runId: 'stranded-run',
+              snapshot: before,
+            });
+          return patched;
+        },
+      },
+      configurable: true,
+    });
+
+    // #when the intent is recorded and the run later settles as stranded
+    await app.runtime.cancelActiveExecution(
+      workflow.id,
+      'stranded-run',
+      'cancelled',
+      [owner],
+    );
+    const settled = await app.runtime.settleInterruptedRun(
+      workflow.id,
+      'stranded-run',
+      Date.now() + 360_001,
+    );
+
+    // #then the recorded cancellation decides it
+    expect(settled).toMatchObject({
+      kind: 'transition',
+      transition: { summary: { status: 'cancelled' } },
+    });
+  });
+
+  it.each([
+    { label: 'terminate, no lifecycle', route: 'terminate', start: {} },
+    {
+      label: 'terminate, a lower revision',
+      route: 'terminate',
+      start: { deadlineMs: 3_600_000 },
+    },
+    {
+      label: 'run-deadline timeout, a lower revision',
+      route: 'timeout',
+      start: { deadlineMs: 1 },
+    },
+  ] as const)('records the transition of a run whose leg on another instance completes after the intent ($label)', async ({
+    route,
+    start,
+  }) => {
+    // #given a stranded run with a recorded intent
+    const { app, workflow, workflows, stored, storedCas } =
+      await racingRun(start);
+    const cas = route === 'terminate' ? undefined : await storedCas();
+    const now = Date.now() + 1_000;
+    const { requestContext } = await stored();
+    await (cas
+      ? app.runtime.cancelActiveExecution(
+          workflow.id,
+          'stranded-run',
+          'timed_out',
+          [owner],
+          cas,
+          now,
+        )
+      : app.runtime.cancelActiveExecution(
+          workflow.id,
+          'stranded-run',
+          'cancelled',
+          [owner],
+        ));
+
+    // #when its leg, holding the context from before the intent, writes its
+    // result
+    await workflows.persistWorkflowSnapshot({
+      workflowName: workflow.id,
+      runId: 'stranded-run',
+      snapshot: { ...finishes(await stored()), requestContext },
+    });
+    const transition = cas
+      ? app.runtime.timeOut(workflow.id, 'stranded-run', cas, now)
+      : app.runtime.terminate(workflow.id, 'stranded-run');
+
+    // #then the transition records the run with the intent's status
+    await expect(transition).resolves.toMatchObject({
+      transitioned: true,
+      summary: { status: cas ? 'timed_out' : 'cancelled' },
+    });
+  });
+
+  it('refuses to terminate a run whose leg on another instance disputed an economic operation at the revision of the intent, and settles it as interrupted once the leg stops', async () => {
+    // #given a stranded run with a recorded cancellation intent, and a resume
+    // on another instance that advanced the lifecycle it read before the
+    // intent to the same revision with a disputed economic operation
+    const { app, workflow, workflows, stored } = await racingRun({
+      deadlineMs: 3_600_000,
+    });
+    const { requestContext } = await stored();
+    const read = requestContext?.[lifecycleKey];
+    await app.runtime.cancelActiveExecution(
+      workflow.id,
+      'stranded-run',
+      'cancelled',
+      [owner],
+    );
+    const disputed = {
+      ...read,
+      revision: read.revision + 1,
+      economicOperations: [{ id: 'charge-1', settlementState: 'disputed' }],
+    };
+
+    // #when that leg writes, and then the terminate's terminal pass runs
+    await workflows.persistWorkflowSnapshot({
+      workflowName: workflow.id,
+      runId: 'stranded-run',
+      snapshot: {
+        ...(await stored()),
+        requestContext: { ...requestContext, [lifecycleKey]: disputed },
+      },
+    });
+    const terminating = app.runtime.terminate(workflow.id, 'stranded-run');
+
+    // #then the dispute blocks the termination, as it blocks recording an
+    // intent, the stored lifecycle is the leg's, and once the leg stops the
+    // run settles as interrupted instead of refusing on every wake
+    await expect(terminating).rejects.toMatchObject({
+      reason: { code: 'DISPUTED_SETTLEMENT' },
+    });
+    expect((await stored()).requestContext?.[lifecycleKey]).toEqual(disputed);
+    await expect(
+      app.runtime.settleInterruptedRun(
+        workflow.id,
+        'stranded-run',
+        Date.now() + 360_001,
+      ),
+    ).resolves.toMatchObject({ kind: 'interrupted' });
+  });
+
   it('lands the cancellation intent while the leg keeps rewriting the row', async () => {
     // #given a stranded run whose leg rewrites the row, still running, after
     // each of up to five reads: enough to make a whole-row compare-and-set
@@ -11081,11 +11951,13 @@ describe('RunnerRuntime lifecycle transitions on D1 storage', () => {
     const { snapshot } = sql
       .prepare('SELECT snapshot FROM mastra_workflow_snapshot')
       .get() as { snapshot: string };
-    let result: unknown = 'leaf';
-    for (let level = 0; level < 1_100; level++) result = [result];
-    sql
-      .prepare('UPDATE mastra_workflow_snapshot SET snapshot = ?')
-      .run(JSON.stringify({ ...JSON.parse(snapshot), result }));
+    sql.prepare('UPDATE mastra_workflow_snapshot SET snapshot = ?').run(
+      JSON.stringify({
+        ...JSON.parse(snapshot),
+        result: nestedArray(PAST_SQLITE_JSON_DEPTH),
+      }),
+    );
+    expectSnapshotUnreadable(sql);
 
     // #when the terminate route's intent pass runs, then its terminal pass
     const cancelled = await app.runtime.cancelActiveExecution(
@@ -11384,7 +12256,7 @@ describe('RunnerRuntime leg liveness touch', () => {
       );
     const rows = () =>
       sql.prepare('SELECT * FROM mastra_workflow_snapshot').all();
-    return { leg, rows, settledRows: rows() };
+    return { leg, sql, rows, settledRows: rows() };
   }
 
   it.each(
@@ -11434,6 +12306,40 @@ describe('RunnerRuntime leg liveness touch', () => {
 
     // #then the second step never ran
     expect(leg.observed.afterRuns).toBe(0);
+  });
+
+  it('aborts a leg whose terminated run is stored too deep for SQLite to parse, and keeps the termination', async () => {
+    // #given a held leg whose run another instance terminated, with the stored
+    // snapshot nested past the depth SQLite parses
+    const { leg, sql, rows } = await holdLegSettledElsewhere('terminated');
+    const [terminated] = rows() as { snapshot: string }[];
+    sql
+      .prepare('UPDATE mastra_workflow_snapshot SET snapshot = ?')
+      .run(
+        JSON.stringify(
+          withDeepValue(JSON.parse(terminated?.snapshot ?? 'null')),
+        ),
+      );
+    expectSnapshotUnreadable(sql);
+
+    // #when the leg's touch runs
+    await leg.app.runtime.touchRun(WORKFLOW_ID, RUN_ID);
+
+    // #then the step in flight sees its signal aborted
+    expect(leg.observed.signal?.aborted).toBe(true);
+
+    // #when the step returns
+    leg.release.resolve();
+    const ended = await leg.started;
+
+    // #then the start answers cancelled, no further step ran, and the run
+    // stays cancelled
+    expect(ended).toMatchObject({ status: 'cancelled' });
+    expect(leg.observed.afterRuns).toBe(0);
+    const [stored] = rows() as { snapshot: string }[];
+    expect(JSON.parse(stored?.snapshot ?? 'null')).toMatchObject({
+      status: 'cancelled',
+    });
   });
 
   it('logs the abort of a settled leg once however many touches follow', async () => {

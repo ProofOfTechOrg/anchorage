@@ -65,12 +65,14 @@ import {
   type InterruptedRunSettlement,
   InvalidRunRequestError,
   type RecoveredStart,
+  type ResumeRunOptions,
   RunAlreadyExistsError,
   type RunLifecycleCas,
   type RunLifecycleTransitionResult,
   RunnerRuntime,
   RunStateUnreadableError,
   type RunSummary,
+  SuspensionChangedError,
   UnknownRunError,
 } from './runtime.js';
 import {
@@ -144,9 +146,11 @@ export interface DurableObjectRunLifecycleHooks {
   ): Promise<void>;
   /**
    * Reconcile the approvals of a run at a boundary the object reached on its
-   * own, with no host request behind it (docs/do-runner-design.md, "Approvals
-   * the run object files"). Called from the object's alarm, under its
-   * operation lock, with an authoritative summary. Steps listed in
+   * own, with no host request to reconcile them (docs/do-runner-design.md,
+   * "Approvals the run object files"). Called under the object's operation
+   * lock with an authoritative summary: from its alarm, and from the resume
+   * route when the runtime refuses a resume because its step moved to
+   * another suspension. Steps listed in
    * `summary.suspensionTimers` are timers the object resumes itself and must
    * get no approval; `reconcileApprovalsForSummary` skips them.
    *
@@ -358,6 +362,7 @@ interface ResumeBody {
   requestedBy?: unknown;
   requestedByKind?: unknown;
   deadlineMs?: unknown;
+  expectedSuspension?: unknown;
 }
 
 interface DeadlineBody {
@@ -450,7 +455,7 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
   /**
    * Required when the host exposes terminate or deadline lifecycle routes.
    * Its optional `reconcileApprovals` files the approvals the object reaches
-   * from its alarm.
+   * from its alarm, or from a resume refused because its step moved on.
    */
   protected runLifecycle(
     _env: TEnv,
@@ -2727,22 +2732,38 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
         // resumes — the suspended runs it is draining are waiting for exactly
         // these — and proof-only admits its one nominated run.
         await runtime.assertExistingRunAllowed(workflowId, runId);
-        const summary = await this.#withLeg(
-          workflowId,
-          runId,
-          'resume',
-          () =>
-            runtime.resume(workflowId, runId, {
-              step: body.step,
-              resumeData,
-              requestedBy,
-              requestedByKind,
-              ...(body.deadlineMs === undefined
-                ? {}
-                : { deadlineMs: body.deadlineMs as number }),
-            }),
-          false,
-        );
+        let summary: RunSummary;
+        try {
+          summary = await this.#withLeg(
+            workflowId,
+            runId,
+            'resume',
+            () =>
+              runtime.resume(workflowId, runId, {
+                step: body.step,
+                resumeData,
+                requestedBy,
+                requestedByKind,
+                ...(body.deadlineMs === undefined
+                  ? {}
+                  : { deadlineMs: body.deadlineMs as number }),
+                // The runtime validates it.
+                ...(body.expectedSuspension === undefined
+                  ? {}
+                  : {
+                      expectedSuspension:
+                        body.expectedSuspension as ResumeRunOptions['expectedSuspension'],
+                    }),
+              }),
+            false,
+          );
+        } catch (error) {
+          // The step moved on to another suspension: file that suspension's
+          // approval now rather than at the next host read.
+          if (error instanceof SuspensionChangedError)
+            await this.#reconcileApprovalsBestEffort(workflowId, runId);
+          throw error;
+        }
         // The leg armed a recovery-cadence wake for its marker. A boundary
         // that converged re-arms from what is left, which drops that wake
         // when nothing is pending; one that did not keeps its retry wake.

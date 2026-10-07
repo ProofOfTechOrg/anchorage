@@ -9,7 +9,7 @@ import {
 } from '@proofoftech/breakwater';
 import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
-
+import { nestedArray } from '../../test-support/deep-json.js';
 import { TEST_DEPLOYMENT_IDENTITY_SECRET } from '../../test-support/deployment-identity.js';
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import {
@@ -1460,6 +1460,93 @@ describe('createRunRouter — POST /runs', () => {
         { id: ADMIN.id, role: 'admin' },
       ),
     ).rejects.toThrow(/cannot decide their own approval/);
+  });
+});
+
+describe('createRunRouter — run input nested past 256 levels', () => {
+  const LEVELS = 100_000;
+  /** Nesting far past the depth the JSON serializer handles. */
+  const deep = `${'['.repeat(LEVELS)}${']'.repeat(LEVELS)}`;
+  /** A host `start` that serializes the run input, as the run object topology does. */
+  const serializing: RunRouterOptions['start'] = async ({
+    runId,
+    inputData,
+    requestContext,
+  }) => {
+    JSON.stringify({ inputData, requestContext });
+    return { runId, status: 'success' };
+  };
+
+  it.each([
+    ['inputData', `{"workflowId":"open-flow","inputData":${deep}}`],
+    [
+      'a requestContext value',
+      `{"workflowId":"open-flow","requestContext":{"app":${deep}}}`,
+    ],
+  ])('answers 400 for %s nested that deep and starts nothing', async (_, body) => {
+    // #given a host whose start serializes its input
+    const start = vi.fn(serializing);
+    const { handle } = makeHarness({ start });
+
+    // #when a start arrives whose body nests far past the serializer's depth
+    const response = await handle(req('/runs', { body }));
+
+    // #then it is refused as a bad request before the host start
+    expect(response?.status).toBe(400);
+    expect(start).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['257 levels', JSON.stringify(nestedArray(257))],
+    ['far past the serializer depth', deep],
+  ])('claims no reservation for a keyed start whose input nests %s', async (_, inputData) => {
+    // #given a keyed host whose start serializes its input
+    const start = vi.fn(serializing);
+    const { handle, store } = keyedHarness({ start });
+
+    // #when a keyed start arrives whose input nests past 256 levels
+    const response = await handle(
+      req('/runs', {
+        body: `{"workflowId":"open-flow","idempotencyKey":"deep-key","inputData":${inputData}}`,
+      }),
+    );
+
+    // #then it is refused as a bad request, and the key stays unreserved
+    expect(response?.status).toBe(400);
+    expect(start).not.toHaveBeenCalled();
+    await expect(store.read('deep-key')).resolves.toBeUndefined();
+  });
+
+  it('starts a run whose input nests exactly 256 levels deep', async () => {
+    // #given a host
+    const { handle, started } = makeHarness();
+
+    // #when a start arrives whose input nests 256 levels
+    const response = await handle(
+      req('/runs', {
+        body: `{"workflowId":"open-flow","inputData":${JSON.stringify(nestedArray(256))}}`,
+      }),
+    );
+
+    // #then it starts
+    expect(response?.status).toBe(200);
+    expect(started).toHaveLength(1);
+  });
+
+  it('answers 400 for resumeData nested that deep and resumes nothing', async () => {
+    // #given a host and a run its caller owns
+    const { handle, resumed } = makeHarness();
+
+    // #when a resume arrives whose data nests far past the serializer's depth
+    const response = await handle(
+      req('/runs/open-flow/r1/resume', {
+        body: `{"step":"gate","resumeData":${deep}}`,
+      }),
+    );
+
+    // #then it is refused as a bad request before the host resume
+    expect(response?.status).toBe(400);
+    expect(resumed).toEqual([]);
   });
 });
 

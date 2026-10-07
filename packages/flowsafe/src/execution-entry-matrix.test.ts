@@ -1878,6 +1878,27 @@ const FENCE_ERROR_AUTHORS: ReadonlyArray<{
       'Explicit initial-row terminalization never enters an engine or grants no-insert authority; malformed input observations or uncertain terminal writes refuse through this fixed operation boundary without replay.',
   },
   {
+    file: 'do-runner/fenced-workflows-d1.ts',
+    error: 'ExecutionFenceUnreadableError',
+    anchor: 'function decisionInput(',
+    effectBoundary:
+      'Stored or incoming snapshot text that JSON.parse fails on for a reason other than its syntax is refused before any decision or write, so nothing lands over the stored snapshot. A refused write is raised mid-leg, after steps that may already have run, and nothing retries it; the next touch decides again.',
+  },
+  {
+    file: 'do-runner/fenced-workflows-d1.ts',
+    error: 'ExecutionFenceUnreadableError',
+    anchor: 'async function decisionRow(',
+    effectBoundary:
+      'A failed probe or decision statement refuses the run-row write or touch that asked for it; the statement writes nothing, and the statement before it changed no row, so nothing lands over the stored snapshot. A refused write is raised mid-leg, after steps that may already have run, and nothing retries it; the next touch decides again.',
+  },
+  {
+    file: 'do-runner/fenced-workflows-d1.ts',
+    error: 'ExecutionFenceUnreadableError',
+    anchor: 'await replaceSnapshotRow(database, tablePrefix, stored, {',
+    effectBoundary:
+      "Every compare-and-set over a row SQLite cannot parse missed because another writer changed the row; the refused write landed nothing and the row holds the other writer's bytes. It is raised mid-leg, after steps that may already have run, and nothing retries it.",
+  },
+  {
     file: 'do-runner/run-provenance.ts',
     error: 'ExecutionFenceUnreadableError',
     anchor: 'const counts = decodeResumeCounts(resumeCounts);',

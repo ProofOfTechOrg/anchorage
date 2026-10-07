@@ -6,6 +6,7 @@ import {
   type ApprovalDecision,
   type ApprovalRecord,
   defaultResumeData,
+  expectedSuspensionFor,
 } from '../approval-api/index.js';
 import {
   isExecutionPrincipalId,
@@ -657,6 +658,7 @@ export function createAgentThreadTopology<Id>(
               runId: record.runId,
               step: record.stepPath,
               resumeData: defaultResumeData(record, decision),
+              ...expectedSuspensionFor(record),
               entryPath: 'approval.resume',
               requestedBy: record.decidedBy,
             }),

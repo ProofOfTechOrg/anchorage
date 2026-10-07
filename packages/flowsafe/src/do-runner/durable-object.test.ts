@@ -8,6 +8,7 @@ import type {
 } from '@mastra/core/workflows';
 import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
+import { nestedArray } from '../../test-support/deep-json.js';
 import {
   deploymentIdentityDatabase,
   deploymentIdentityRequest,
@@ -1389,6 +1390,28 @@ describe('DurableObjectRunner.fetch', () => {
         target: { kind: 'workflow', id: 'gated' },
       },
     });
+  });
+
+  it('answers a start whose request context nests 257 levels deep with 400 and creates no run', async () => {
+    // #given a run object over a runtime
+    const fixture = workflowIngressFixture();
+
+    // #when a start arrives whose request context holds a value nested 257 levels
+    const response = await fixture.runner.fetch(
+      post('/runs', {
+        ...WORKFLOW_START_BODY,
+        requestContext: { app: nestedArray(257) },
+      }),
+    );
+
+    // #then it answers 400 and no run exists
+    expect(response.status).toBe(400);
+    await expect(
+      fixture.runtime.status(
+        WORKFLOW_START_BODY.workflowId,
+        WORKFLOW_START_BODY.runId,
+      ),
+    ).resolves.toBeNull();
   });
 
   it('rejects a start without a trusted execution principal before runtime or ownership work', async () => {
@@ -9892,6 +9915,92 @@ describe('DurableObjectRunner approvals the run object files', () => {
     // #then separation of duties refuses them and the gate stays open
     await expect(decision).rejects.toBeInstanceOf(ApprovalAuthzError);
     expect(await store.get(record.id)).toMatchObject({ status: 'pending' });
+  });
+
+  it('refuses a resume naming a suspension its step has left, and files the current suspension at once', async () => {
+    // #given a gate whose timeout resume suspended it again, with the object's
+    // own filing of that suspension failed
+    const { state, values } = durableKeyValueStorageFixture();
+    const env = timedEnv();
+    const { runtime } = env;
+    if (!runtime) throw new Error('expected a runtime');
+    const { filed, reconcile } = filingLifecycle(env);
+    reconcile.mockRejectedValueOnce(new Error('filing unavailable'));
+    const runner = new TestRunner(state, env);
+    const started = await startTimed(
+      runner,
+      'run-moved-on',
+      'timed-escalating',
+    );
+    elapseDeadlines(values);
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await runner.alarm();
+    } finally {
+      log.mockRestore();
+    }
+    const moved = await runtime.status('timed-escalating', 'run-moved-on');
+    expect(filed).toEqual([]);
+
+    // #when a decision for the first suspension resumes the run
+    const response = await runner.fetch(
+      post('/runs/timed-escalating/run-moved-on/resume', {
+        step: 'gate',
+        resumeData: { approved: true },
+        expectedSuspension: { suspendedAt: started.suspendedAt?.gate },
+      }),
+    );
+
+    // #then it is refused, the run stays at its second suspension, and that
+    // suspension's approval is filed
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({
+      reason: { code: 'SUSPENSION_CHANGED' },
+    });
+    expect(
+      await runtime.status('timed-escalating', 'run-moved-on'),
+    ).toMatchObject({ status: 'suspended', resumeCount: { gate: 1 } });
+    expect(filed).toMatchObject([
+      {
+        stepPath: ['gate'],
+        suspendedAt: moved?.suspendedAt?.gate,
+        resumeCount: 1,
+      },
+    ]);
+  });
+
+  it('keeps the approval it filed for the gate a timeout resume reached when a host read from before the resume reconciles', async () => {
+    // #given a gate whose timeout resume suspended it again, and the approval
+    // the object filed for that second suspension
+    const { state, values } = durableKeyValueStorageFixture();
+    const env = timedEnv();
+    const { filed, service, store } = filingLifecycle(env);
+    const runner = new TestRunner(state, env);
+    const started = await startTimed(
+      runner,
+      'run-stale-read',
+      'timed-escalating',
+    );
+    elapseDeadlines(values);
+    await runner.alarm();
+    const [record] = filed;
+    if (filed.length !== 1 || !record) throw new Error('expected one record');
+
+    // #when a host reconciles the summary it read before the resume
+    await reconcileApprovalsForSummary(
+      service,
+      'timed-escalating',
+      started,
+      'approval-reconciler',
+    );
+
+    // #then the object's approval is the run's only record, still open
+    expect(
+      await store.list({
+        workflowId: 'timed-escalating',
+        runId: 'run-stale-read',
+      }),
+    ).toEqual([expect.objectContaining({ id: record.id, status: 'pending' })]);
   });
 
   it('files nothing for a timer that waits again after its timeout', async () => {
