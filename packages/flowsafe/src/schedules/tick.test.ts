@@ -5,14 +5,29 @@
 
 import type { Schedule, ScheduleTrigger } from '@mastra/core/storage';
 import { describe, expect, it, vi } from 'vitest';
+import {
+  nestedArray,
+  PAST_SQLITE_JSON_DEPTH,
+} from '../../test-support/deep-json.js';
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import {
   type ExecutionFenceDatabase,
   ExecutionFenceStore,
   RESERVED_EXECUTION_CONTEXT_KEYS,
 } from '../do-runner/index.js';
-import type { ScheduleFireClaim } from './schedules-d1.js';
-import { createScheduleTargetPolicy } from './target-policy.js';
+import {
+  MAX_RUN_INPUT_DEPTH,
+  runInputDepthMessage,
+} from '../do-runner/run-input-depth.js';
+import {
+  D1SchedulesStorage,
+  type ScheduleDatabase,
+  type ScheduleFireClaim,
+} from './schedules-d1.js';
+import {
+  createScheduleTargetPolicy,
+  scheduleWithCreatorRole,
+} from './target-policy.js';
 import {
   buildScheduledLegContext,
   canPersistScheduledAgentSignal,
@@ -1027,6 +1042,288 @@ describe('createScheduleTick', () => {
     expect(store.schedules.get('agent_malformed')?.nextFireAt).toBeGreaterThan(
       NOW,
     );
+  });
+
+  it.each([
+    {
+      label: 'a workflow inputData',
+      field: 'inputData',
+      schedule: workflowSchedule({
+        target: {
+          type: 'workflow',
+          workflowId: 'wf',
+          inputData: { topic: nestedArray(MAX_RUN_INPUT_DEPTH) },
+        },
+      }),
+    },
+    {
+      label: 'a threaded agent stream request-context value',
+      field: 'an ifIdle.streamOptions.requestContext value',
+      schedule: threadedSchedule({
+        target: {
+          type: 'agent',
+          agentId: 'a1',
+          prompt: 'go',
+          threadId: 'acme_thread',
+          resourceId: 'acme_resource',
+          ifIdle: {
+            streamOptions: {
+              requestContext: { app: nestedArray(MAX_RUN_INPUT_DEPTH + 1) },
+            },
+          },
+        },
+      }),
+    },
+    {
+      label: 'a workflow target field the bound does not name',
+      field: 'the schedule target',
+      schedule: workflowSchedule({
+        target: {
+          type: 'workflow',
+          workflowId: 'wf',
+          extra: nestedArray(MAX_RUN_INPUT_DEPTH + 4),
+        } as Schedule['target'],
+      }),
+    },
+  ])('fails a fire whose stored $label nests past the run-input bound without dispatching it', async ({
+    field,
+    schedule,
+  }) => {
+    // #given a due schedule whose stored target nests past the bound
+    const store = new FakeStore();
+    store.seed(schedule);
+    const start = vi.fn();
+    const signalAgent = vi.fn();
+    const audit = vi.fn();
+
+    // #when the tick fires it
+    const result = await createScheduleTick({
+      store,
+      start,
+      signalAgent,
+      status: pendingTargetReceipt,
+      audit,
+      now: () => NOW,
+    })();
+
+    // #then the fire is recorded and audited as failed with no dispatch
+    // record, and the schedule advances
+    expect(result).toMatchObject({ failed: 1, fired: 0, deferred: 0 });
+    expect(audit).toHaveBeenCalledWith(
+      expect.objectContaining({ outcome: 'failed', reason: 'input-too-deep' }),
+    );
+    expect(start).not.toHaveBeenCalled();
+    expect(signalAgent).not.toHaveBeenCalled();
+    expect(store.triggers).toHaveLength(1);
+    expect(store.triggers[0]).toMatchObject({
+      outcome: 'failed',
+      error: runInputDepthMessage(field),
+      metadata: { reason: 'input-too-deep' },
+    });
+    expect(store.triggers[0]?.metadata?.dispatchRef).toBeUndefined();
+    expect(store.schedules.get(schedule.id)?.nextFireAt).toBeGreaterThan(NOW);
+  });
+
+  it('settles a deferred fire whose stored dispatch target nests past the bound without looking it up', async () => {
+    // #given a deferred threadless agent start whose stored dispatch record
+    // carries a provider option nested past the depth SQLite parses
+    const store = new FakeStore();
+    store.triggers.push({
+      id: 'dispatch-deep',
+      scheduleId: 'agent_deep',
+      runId: 'run-deep',
+      scheduledFireAt: NOW,
+      actualFireAt: NOW,
+      outcome: 'deferred',
+      metadata: {
+        dispatchState: 'prepared',
+        dispatchRef: {
+          scheduleId: 'agent_deep',
+          dispatchId: 'dispatch-deep',
+          runId: 'run-deep',
+          target: 'agent',
+          mode: 'start',
+          agentId: 'a1',
+          threadId: 'topology-thread',
+          agentTarget: {
+            type: 'agent',
+            agentId: 'a1',
+            prompt: 'go',
+            providerOptions: { vendor: nestedArray(PAST_SQLITE_JSON_DEPTH) },
+          },
+        },
+      },
+    });
+    const status = vi.fn(pendingTargetReceipt);
+
+    // #when the tick reconciles it
+    const result = await createScheduleTick({
+      store,
+      start: vi.fn(),
+      startAgent: vi.fn(),
+      status,
+      now: () => NOW,
+    })();
+
+    // #then the fire is settled as malformed and nothing is left deferred
+    expect(status).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ failed: 1, deferred: 0 });
+    expect(store.triggers[0]).toMatchObject({
+      outcome: 'failed',
+      metadata: { reason: 'invalid-deferred-dispatch' },
+    });
+  });
+
+  it('settles a deferred fire SQLite cannot parse on D1 storage and keeps firing due schedules', async () => {
+    // #given D1 storage holding a due workflow schedule, and a deferred fire of
+    // another schedule whose dispatch record nests past the depth SQLite parses
+    const store = new D1SchedulesStorage(
+      sqliteUnitDatabase(openSqlite()) as unknown as ScheduleDatabase,
+    );
+    await store.createSchedule(
+      scheduleWithCreatorRole(workflowSchedule(), 'operator'),
+    );
+    await store.createSchedule(
+      scheduleWithCreatorRole(
+        workflowSchedule({ id: 'schedule_deep', nextFireAt: NOW + 60_000 }),
+        'operator',
+      ),
+    );
+    await store.recordTrigger({
+      id: 'dispatch-deep',
+      scheduleId: 'schedule_deep',
+      runId: 'run-deep',
+      scheduledFireAt: NOW - 5000,
+      actualFireAt: NOW - 5000,
+      outcome: 'deferred',
+      metadata: {
+        dispatchState: 'prepared',
+        dispatchRef: {
+          scheduleId: 'schedule_deep',
+          dispatchId: 'dispatch-deep',
+          runId: 'run-deep',
+          target: 'workflow',
+          workflowId: 'wf',
+          workflowTarget: {
+            type: 'workflow',
+            workflowId: 'wf',
+            inputData: { topic: nestedArray(PAST_SQLITE_JSON_DEPTH) },
+          },
+        },
+      },
+    });
+    const start = vi.fn(async () => ({ runId: 'run-1', status: 'running' }));
+
+    // #when the tick runs
+    const result = await createScheduleTick({ store, start, now: () => NOW })();
+
+    // #then the due schedule fires, and the deep fire is settled as malformed
+    // and no longer listed
+    expect(result).toMatchObject({ fired: 1 });
+    expect(start).toHaveBeenCalledOnce();
+    expect(await store.listDeferredTriggers()).toEqual([]);
+    expect(await store.listTriggers('schedule_deep')).toEqual([
+      expect.objectContaining({
+        outcome: 'failed',
+        metadata: expect.objectContaining({
+          reason: 'invalid-deferred-dispatch',
+        }),
+      }),
+    ]);
+  });
+
+  it('fires due schedules and then fails the pass when listing the deferred fires fails', async () => {
+    // #given a due workflow schedule and a store whose deferred listing throws
+    const store = new FakeStore();
+    store.seed(workflowSchedule());
+    const start = vi.fn(async () => ({ runId: 'run-1', status: 'running' }));
+
+    // #when the tick runs
+    const pass = createScheduleTick({
+      store: forwardingStore(store, {
+        listDeferredTriggers: async () => {
+          throw new Error('malformed JSON');
+        },
+      }),
+      start,
+      now: () => NOW,
+    })();
+
+    // #then the due schedule still fires, and the pass fails with the
+    // listing's error
+    await expect(pass).rejects.toThrow('malformed JSON');
+    expect(start).toHaveBeenCalledOnce();
+  });
+
+  it('reconciles the deferred fires after one whose malformed settlement cannot be written', async () => {
+    // #given a malformed deferred fire whose settlement write fails, listed
+    // ahead of a deferred workflow fire whose run the target holds
+    const store = new FakeStore();
+    store.triggers.push(
+      {
+        id: 'dispatch-bad',
+        scheduleId: 'schedule_bad',
+        runId: 'run-bad',
+        scheduledFireAt: NOW - 2000,
+        actualFireAt: NOW - 2000,
+        outcome: 'deferred',
+        metadata: { dispatchRef: { scheduleId: 'schedule_bad' } },
+      },
+      {
+        id: 'dispatch-good',
+        scheduleId: 'schedule_good',
+        runId: 'run-good',
+        scheduledFireAt: NOW - 1000,
+        actualFireAt: NOW - 1000,
+        outcome: 'deferred',
+        metadata: {
+          dispatchRef: {
+            scheduleId: 'schedule_good',
+            dispatchId: 'dispatch-good',
+            runId: 'run-good',
+            target: 'workflow',
+            workflowId: 'wf',
+            workflowTarget: {
+              type: 'workflow',
+              workflowId: 'wf',
+              inputData: { topic: 'x' },
+            },
+          },
+        },
+      },
+    );
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    // #when the tick reconciles them
+    let result: Awaited<ReturnType<ReturnType<typeof createScheduleTick>>>;
+    try {
+      result = await createScheduleTick({
+        store: forwardingStore(store, {
+          recordTrigger: async (trigger) => {
+            if (trigger.id === 'dispatch-bad')
+              throw new Error('settlement write failed');
+            await store.recordTrigger(trigger);
+          },
+        }),
+        start: vi.fn(),
+        status: async () => ({ runId: 'run-good', status: 'running' }),
+        now: () => NOW,
+      })();
+    } finally {
+      log.mockRestore();
+    }
+
+    // #then the fire after the failed write is still reconciled, and the
+    // unwritten one is counted as still deferred
+    expect(
+      store.triggers.find((trigger) => trigger.id === 'dispatch-good'),
+    ).toMatchObject({ outcome: 'published' });
+    expect(result).toMatchObject({
+      failed: 0,
+      reconciled: 1,
+      fired: 1,
+      deferred: 1,
+    });
   });
 
   it('audits an unadvanceable cron, writes no trigger, and leaves the row due', async () => {

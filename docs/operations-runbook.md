@@ -110,6 +110,13 @@ wrangler d1 execute <database> --remote --config wrangler.jsonc \
 
 Terminate each listed run that is not terminal. Retention never removes these rows: remove a terminal one by hand from the tables `RUN_TTL_PURGE_TABLES` and `RUN_TTL_FLOWSAFE_PURGE_TABLES` name, after deleting its artifacts. During a gradual deployment from a version earlier than 0.26.0, a Worker still on the earlier version answers a keyed start replay of a run that failed with `RUN_STATE_NOT_STORABLE` with `503 persisted start is not readable`; retry it once every Worker runs 0.26.0 or later.
 
+Before 0.26.1, a schedule target value nested about 1,000 levels deep could leave a deferred fire whose metadata SQLite cannot parse; every later tick then logged `schedule-tick-error` with `malformed JSON`, and no schedule in the deployment fired. The upgraded tick settles such a fire as `failed` with reason `invalid-deferred-dispatch` without a status lookup, and fails each later fire of a target nested more than 256 levels deep with reason `input-too-deep`. A settled agent fire may still have started its run: check the agent's external effects before running its work again. During a gradual deployment, a Worker on an earlier version still accepts such a target and still stops on its fires, so finish the rollout first. Before a rollback to an earlier version, update or delete each schedule whose target an earlier tick would copy into a fire record SQLite cannot parse, whether or not it has fired since the upgrade. The query nests each stored target four levels deeper, as a fire record does with a margin, and lists those SQLite cannot parse:
+
+```bash
+wrangler d1 execute <database> --remote --config wrangler.jsonc \
+  --command "SELECT id FROM <prefix>mastra_schedules WHERE NOT json_valid('[[[[' || target || ']]]]')"
+```
+
 ## Provision a deployment
 
 Choose one stable deployment tag per organization. It must match `^[a-z0-9]{3,32}$` and is provisioning material, not a display name or request claim.
@@ -295,7 +302,7 @@ Audit records are security evidence. Queue depth and SIEM ingestion status must 
 | Egress policy allowed an unexpected socket | Connector bypassed runtime fetch | Route the transport through guarded fetch and add infrastructure egress control |
 | Live updates stop but HTTP works | Hub binding, ticket secret/expiry, socket liveness | Let client poll; repair stream configuration without disabling authorization |
 | Subscription changed but polling did not | Reconcile response/audit and provider alarm | Retry `reconcilePolling()` against committed subscriptions |
-| Schedule did not fire | Maintenance alarm status, active status, CAS winner, run cap, and stored metadata | Re-arm maintenance or correct the stored row; do not bypass the tick guard |
+| Schedule did not fire | Maintenance alarm status, active status, CAS winner, run cap, stored metadata, and `schedule-tick-error` lines | Re-arm maintenance or correct the stored row; do not bypass the tick guard. A fire recorded `failed` with reason `input-too-deep` has a stored target value nested more than 256 levels deep: update the schedule with a shallower value or delete it |
 | Purge removed a snapshot but left R2 | Artifact store omitted or delete failed | Restore row/key evidence if available, repair paired purge, scan known prefix |
 | Audit is absent while requests succeed | Sink, Queue, consumer, SIEM | Restore export, preserve local ring/Logs, assess evidence gap |
 | Agent CLI error lacks output | Expected safe diagnostics | Inspect the isolated workspace/vendor logs under appropriate access; do not weaken public error safety |
