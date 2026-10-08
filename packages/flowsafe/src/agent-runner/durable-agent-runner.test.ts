@@ -5026,6 +5026,31 @@ describe('FlowsafeDurableAgent abort of the model and tool calls in flight', () 
     });
   });
 
+  it('does not store the run again when a resumed leg suspends at its next approval after its row was deleted', async () => {
+    // #given a run resumed into its approved tool call, with a second tool
+    // approval ahead, whose run row was deleted
+    const h = await heldToolAgent({ requireApproval: true, toolCalls: 2 });
+    await h.startLeg();
+    const resumed = h.resumeLeg();
+    await h.entered.promise;
+    h.sql
+      .prepare('DELETE FROM mastra_workflow_snapshot WHERE workflow_name = ?')
+      .run(h.workflowId);
+
+    // #when the tool returns and the leg reaches the second approval
+    h.release.resolve();
+    await Promise.allSettled([resumed]);
+
+    // #then the run's row was not stored again
+    expect(
+      h.sql
+        .prepare(
+          'SELECT run_id FROM mastra_workflow_snapshot WHERE workflow_name = ?',
+        )
+        .all(h.workflowId),
+    ).toEqual([]);
+  });
+
   it('fails an agent run whose tool output is too deep to store, publishes its error, ends its stream and releases its state', async () => {
     // #given an agent whose tool returns a result nested past the depth SQLite
     // parses

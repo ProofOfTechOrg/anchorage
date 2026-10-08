@@ -31,7 +31,7 @@ import {
 } from '../approval-api/resource-ownership.js';
 import { createBackgroundTaskD1Domains } from '../background-tasks/d1-storage.js';
 import type { D1DatabaseBinding } from './cf-types.js';
-import { createD1Storage } from './d1-storage.js';
+import { createD1Storage, purgeExpiredWorkflowRuns } from './d1-storage.js';
 import {
   type D1RunExecutionIdentity,
   ExecutionFenceUnreadableError,
@@ -12218,11 +12218,10 @@ const RUN_ID = 'touched-run';
 
 async function d1Storage() {
   const sql = openSqlite();
-  const storage = createD1Storage({
-    binding: sqliteUnitDatabase(sql) as D1DatabaseBinding,
-  });
+  const binding = sqliteUnitDatabase(sql) as D1DatabaseBinding;
+  const storage = createD1Storage({ binding });
   await storage.init();
-  return { sql, storage };
+  return { sql, binding, storage };
 }
 
 /**
@@ -12232,18 +12231,23 @@ async function d1Storage() {
  * `shouldPersistSnapshot`: `'quiet-after-hold'` drops the engine's `running`
  * writes once `hold` has begun, so nothing but an abort stands between the
  * steps; `statuses` stores only the snapshots of those workflow statuses.
+ * `executionFence` makes the runtime fenced, over the fence's own database.
  */
 function abortableApp(
   storage: MastraCompositeStore,
   options: {
     persistence?: 'quiet-after-hold' | { statuses: readonly string[] };
     suspends?: boolean;
+    executionFence?: ExecutionFenceStore;
   } = {},
 ) {
   const { persistence } = options;
   const app = init(
     { storage },
-    { executionFence: 'none', startIdempotency: 'none' },
+    {
+      executionFence: options.executionFence ?? 'none',
+      startIdempotency: 'none',
+    },
   );
   const schema = z.object({});
   const entered = deferredSignal();
@@ -12344,8 +12348,7 @@ describe('RunnerRuntime leg liveness touch', () => {
         RUN_ID,
         Date.now() + 360_001,
       );
-    const rows = () =>
-      sql.prepare('SELECT * FROM mastra_workflow_snapshot').all();
+    const rows = () => storedRows(sql);
     return { leg, sql, rows, settledRows: rows() };
   }
 
@@ -12430,6 +12433,168 @@ describe('RunnerRuntime leg liveness touch', () => {
     expect(JSON.parse(stored?.snapshot ?? 'null')).toMatchObject({
       status: 'cancelled',
     });
+  });
+
+  function storedRows(sql: ReturnType<typeof openSqlite>) {
+    return sql.prepare('SELECT * FROM mastra_workflow_snapshot').all();
+  }
+
+  /**
+   * Another instance terminates the run and completes its cleanup, and
+   * retention with a zero horizon removes its row.
+   */
+  async function terminatedAndPurged(
+    sql: ReturnType<typeof openSqlite>,
+    storage: MastraCompositeStore,
+    executionFence?: ExecutionFenceStore,
+  ) {
+    const other = abortableApp(storage, { executionFence });
+    const { cleanup } = await other.app.runtime.terminate(WORKFLOW_ID, RUN_ID);
+    await other.app.runtime.completeTerminalCleanup(
+      WORKFLOW_ID,
+      RUN_ID,
+      cleanup.revision,
+    );
+    await purgeExpiredWorkflowRuns(
+      sqliteUnitDatabase(sql) as Parameters<typeof purgeExpiredWorkflowRuns>[0],
+      {
+        ttlMs: 0,
+        now: () => Date.now() + 1_000,
+        advanceCursor: async () => {},
+      },
+    );
+    assert.deepEqual(storedRows(sql), []);
+  }
+
+  it('aborts a fenced start leg whose run another instance terminated and retention removed, at its next touch, and does not store the run again', async () => {
+    // #given a fenced start leg held in its first step, on a workflow that
+    // stores only the snapshots its admission, its abort and its completion
+    // write, on a run another instance terminated and retention removed
+    const { sql, binding, storage } = await d1Storage();
+    const executionFence = new ExecutionFenceStore(
+      binding as ExecutionFenceDatabase,
+    );
+    await executionFence.seed('open');
+    const leg = startHeldLeg(storage, {
+      executionFence,
+      persistence: { statuses: ['pending', 'canceled', 'success'] },
+    });
+    await leg.entered.promise;
+    await terminatedAndPurged(sql, storage, executionFence);
+
+    // #when the leg's touch runs and the step returns
+    await leg.app.runtime.touchRun(WORKFLOW_ID, RUN_ID);
+    leg.release.resolve();
+    await Promise.allSettled([leg.started]);
+
+    // #then no row was stored, the step's signal was aborted, the start
+    // answers a settled conflict, and the second step never ran
+    expect(storedRows(sql)).toEqual([]);
+    expect(leg.observed.signal?.aborted).toBe(true);
+    await expect(leg.started).rejects.toBeInstanceOf(RunSettledConflictError);
+    expect(leg.observed.afterRuns).toBe(0);
+  });
+
+  it('leaves a leg running whose touch finds no row before the leg stored one', async () => {
+    // #given a leg held in its first step, on a workflow that stores only its
+    // success snapshot, so the run has no row yet
+    const { sql, storage } = await d1Storage();
+    const leg = startHeldLeg(storage, {
+      persistence: { statuses: ['success'] },
+    });
+    await leg.entered.promise;
+    assert.deepEqual(storedRows(sql), []);
+
+    // #when the leg's touch runs
+    await leg.app.runtime.touchRun(WORKFLOW_ID, RUN_ID);
+
+    // #then the step's signal is not aborted
+    expect(leg.observed.signal?.aborted).toBe(false);
+
+    // #when the step returns
+    leg.release.resolve();
+    const ended = await leg.started;
+
+    // #then the run completes both steps
+    expect(ended.status).toBe('success');
+    expect(leg.observed.afterRuns).toBe(1);
+  });
+
+  it('runs a leg to its end on a capability without withStoredRun', async () => {
+    // #given storage whose capability omits withStoredRun, and a leg held in
+    // its first step
+    const { storage } = await d1Storage();
+    const workflows = (await storage.getStore(
+      'workflows',
+    )) as FencedWorkflowsStorageD1;
+    const native = workflows[FENCED_WORKFLOW_STORAGE];
+    assert(native);
+    Object.defineProperty(workflows, FENCED_WORKFLOW_STORAGE, {
+      value: Object.fromEntries(
+        Object.entries(native).filter(([member]) => member !== 'withStoredRun'),
+      ),
+      configurable: true,
+    });
+    const leg = startHeldLeg(storage);
+    await leg.entered.promise;
+
+    // #when the leg's touch runs
+    await leg.app.runtime.touchRun(WORKFLOW_ID, RUN_ID);
+
+    // #then the step's signal is not aborted
+    expect(leg.observed.signal?.aborted).toBe(false);
+
+    // #when the step returns
+    leg.release.resolve();
+
+    // #then the run completes both steps
+    await expect(leg.started).resolves.toMatchObject({ status: 'success' });
+    expect(leg.observed.afterRuns).toBe(1);
+  });
+
+  it('refuses the next write of a leg whose run another instance terminated and retention removed, and does not store the run again', async () => {
+    // #given a leg held in its first step, on a run another instance
+    // terminated and retention removed
+    const { sql, storage } = await d1Storage();
+    const leg = startHeldLeg(storage);
+    await leg.entered.promise;
+    await terminatedAndPurged(sql, storage);
+
+    // #when the step returns
+    leg.release.resolve();
+
+    // #then the leg's write is refused, the second step never ran, and no row
+    // was stored
+    await expect(leg.started).rejects.toBeInstanceOf(RunSettledConflictError);
+    expect(leg.observed.afterRuns).toBe(0);
+    expect(storedRows(sql)).toEqual([]);
+  });
+
+  it('answers a settled conflict when a resumed leg on a workflow that skips its terminal snapshot ends after retention removed its run', async () => {
+    // #given a run suspended and resumed into a held step, on a workflow that
+    // stores only its suspended snapshot, whose run another instance
+    // terminated and retention removed
+    const { sql, storage } = await d1Storage();
+    const leg = abortableApp(storage, {
+      suspends: true,
+      persistence: { statuses: ['suspended'] },
+    });
+    await leg.app.runtime.start(WORKFLOW_ID, { runId: RUN_ID, inputData: {} });
+    const resumed = leg.app.runtime.resume(WORKFLOW_ID, RUN_ID, {
+      resumeData: {},
+    });
+    onTestFinished(async () => {
+      leg.release.resolve();
+      await resumed.catch(() => undefined);
+    });
+    await leg.entered.promise;
+    await terminatedAndPurged(sql, storage);
+
+    // #when the step returns
+    leg.release.resolve();
+
+    // #then the resume answers a settled conflict
+    await expect(resumed).rejects.toBeInstanceOf(RunSettledConflictError);
   });
 
   it('logs the abort of a settled leg once however many touches follow', async () => {

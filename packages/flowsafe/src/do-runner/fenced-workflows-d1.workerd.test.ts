@@ -320,6 +320,29 @@ describe('FencedWorkflowsStorageD1 on workerd D1', () => {
     expect(await rows()).toEqual(stored);
   });
 
+  it('refuses, inside a stored-run scope, to insert a run row deleted since the leg stored it', async () => {
+    // #given a leg that stored its run row inside its scope, and the row
+    // deleted since
+    const { domain, capability } = await fencedDomain();
+    const scope = { ...ADDRESS, rowStored: false };
+    await capability.withStoredRun?.(scope, () =>
+      persist(domain, snapshot('running')),
+    );
+    expect(scope.rowStored).toBe(true);
+    await db().prepare('DELETE FROM mastra_workflow_snapshot').run();
+
+    // #when the leg writes its run again inside the same scope
+    const again = capability.withStoredRun?.(scope, () =>
+      persist(domain, snapshot('running')),
+    );
+
+    // #then it is refused and no row is stored
+    await expect(again).rejects.toMatchObject({
+      name: 'RunSettledConflictError',
+    });
+    expect(await rows()).toEqual([]);
+  });
+
   it('admits a successor nested past the depth over a row already stored too deep to parse', async () => {
     // #given a run row settled as cancelled and stored nested past the depth
     // SQLite parses

@@ -1295,6 +1295,10 @@ function failedByMarker(marker: keyof typeof RUN_FAILURE_MARKERS, now: number) {
   };
 }
 
+type StoredRunScope = Parameters<
+  NonNullable<FencedWorkflowAdmissionCapability['withStoredRun']>
+>[0];
+
 type CapturedWorkflowStorage = {
   readonly workflows: WorkflowsStorage;
   readonly read: WorkflowsStorage['getWorkflowRunById'];
@@ -1313,6 +1317,7 @@ type CapturedWorkflowStorage = {
       readonly touch?: FencedWorkflowAdmissionCapability['touchRun'];
       readonly replace?: FencedWorkflowAdmissionCapability['replaceSnapshot'];
       readonly patch?: FencedWorkflowAdmissionCapability['patchRunLifecycle'];
+      readonly enterStoredRun?: FencedWorkflowAdmissionCapability['withStoredRun'];
     }
 );
 
@@ -1322,6 +1327,7 @@ type ActiveRun = {
   lifecycle?: RunLifecycleState;
   requestContext?: RequestContext;
   source?: CapturedWorkflowStorage;
+  storedRunScope?: StoredRunScope;
 };
 
 type TerminalTransitionOptions = {
@@ -1745,6 +1751,8 @@ export class RunnerRuntime {
             );
           const source = await this.#captureWorkflowStorage(workflowId);
           active.source = source;
+          if (this.#withStoredRunOf(source))
+            active.storedRunScope = { workflowId, runId, rowStored: false };
           provenance = {
             version: 2,
             startToken: crypto.randomUUID(),
@@ -1784,91 +1792,96 @@ export class RunnerRuntime {
             ]);
           const capturedExecution = execution;
           const capturedProvenance = provenance;
-          const { executionPromise } = await this.#withLifecycleLock(
-            workflowId,
-            runId,
-            async () => {
-              let run: Awaited<ReturnType<AnyWorkflow['createRun']>>;
-              if (this.#executionFence) {
-                if (source.storage !== 'd1')
-                  throw new Error(
-                    'fenced workflow storage capability is unavailable',
-                  );
-                const d1Execution =
-                  normalizeD1RunExecutionIdentity(capturedExecution);
-                admissionEntered = true;
-                const admitted = await source.admit.call(
-                  source.capability,
-                  {
-                    execution: d1Execution,
-                    attemptToken: capturedProvenance.attemptToken,
-                    mutationEpoch: options.mutationEpoch,
-                    startIdentity,
-                    requestContext: Object.fromEntries(
-                      requestContext.entries(),
-                    ),
-                    fence: this.#executionFence,
-                    reservationStore: claim
-                      ? this.#startIdempotency
-                      : undefined,
-                    reservation: claim,
-                    proof,
-                    runOwnerGuard: options.runOwnerGuard,
-                    onInitialWriteAttempt: () => {
-                      candidate = workflow.runs.get(runId);
+          await this.#inStoredRunScope(active, async () => {
+            const { executionPromise } = await this.#withLifecycleLock(
+              workflowId,
+              runId,
+              async () => {
+                let run: Awaited<ReturnType<AnyWorkflow['createRun']>>;
+                if (this.#executionFence) {
+                  if (source.storage !== 'd1')
+                    throw new Error(
+                      'fenced workflow storage capability is unavailable',
+                    );
+                  const d1Execution =
+                    normalizeD1RunExecutionIdentity(capturedExecution);
+                  admissionEntered = true;
+                  const admitted = await source.admit.call(
+                    source.capability,
+                    {
+                      execution: d1Execution,
+                      attemptToken: capturedProvenance.attemptToken,
+                      mutationEpoch: options.mutationEpoch,
+                      startIdentity,
+                      requestContext: Object.fromEntries(
+                        requestContext.entries(),
+                      ),
+                      fence: this.#executionFence,
+                      reservationStore: claim
+                        ? this.#startIdempotency
+                        : undefined,
+                      reservation: claim,
+                      proof,
+                      runOwnerGuard: options.runOwnerGuard,
+                      onInitialWriteAttempt: () => {
+                        candidate = workflow.runs.get(runId);
+                      },
                     },
-                  },
-                  () => this.#createRun(workflowId, runId),
-                );
-                if (
-                  !admitted?.witness ||
-                  !sameExecution(admitted.witness.execution, d1Execution)
-                )
-                  throw new RunStateUnreadableError(workflowId, runId);
-                const witnessed = this.#projectD1StartState(
-                  source,
-                  workflowId,
-                  runId,
-                  admitted.witness.row,
-                );
-                if (
-                  witnessed.kind !== 'initial' ||
-                  !sameExecution(witnessed.execution, d1Execution) ||
-                  witnessed.provenance.initialAdmission !== true ||
-                  witnessed.provenance.attemptToken !==
-                    capturedProvenance.attemptToken
-                )
-                  throw new RunStateUnreadableError(workflowId, runId);
-                run = admitted.value as Awaited<
-                  ReturnType<AnyWorkflow['createRun']>
-                >;
-              } else {
-                if (claim && startIdentity && this.#startIdempotency)
-                  await this.#startIdempotency.bindPreparedStart(claim, {
-                    ...capturedExecution,
-                    ...startIdentity,
-                  });
-                run = await this.#createRun(workflowId, runId);
-              }
-              active.run = run;
-              engineEntered = true;
-              return {
-                executionPromise: run.start({
-                  inputData: options.inputData,
-                  initialState: options.initialState,
-                  requestContext,
-                }),
-              };
-            },
-          );
-          const result = await executionPromise;
-          await this.#reconcileTerminalState(
-            workflowId,
-            runId,
-            result,
-            requestContext,
-            source,
-          );
+                    () => this.#createRun(workflowId, runId),
+                  );
+                  if (
+                    !admitted?.witness ||
+                    !sameExecution(admitted.witness.execution, d1Execution)
+                  )
+                    throw new RunStateUnreadableError(workflowId, runId);
+                  const witnessed = this.#projectD1StartState(
+                    source,
+                    workflowId,
+                    runId,
+                    admitted.witness.row,
+                  );
+                  if (
+                    witnessed.kind !== 'initial' ||
+                    !sameExecution(witnessed.execution, d1Execution) ||
+                    witnessed.provenance.initialAdmission !== true ||
+                    witnessed.provenance.attemptToken !==
+                      capturedProvenance.attemptToken
+                  )
+                    throw new RunStateUnreadableError(workflowId, runId);
+                  if (active.storedRunScope)
+                    active.storedRunScope.rowStored = true;
+                  run = admitted.value as Awaited<
+                    ReturnType<AnyWorkflow['createRun']>
+                  >;
+                } else {
+                  if (claim && startIdentity && this.#startIdempotency)
+                    await this.#startIdempotency.bindPreparedStart(claim, {
+                      ...capturedExecution,
+                      ...startIdentity,
+                    });
+                  run = await this.#createRun(workflowId, runId);
+                }
+                active.run = run;
+                engineEntered = true;
+                return {
+                  executionPromise: run.start({
+                    inputData: options.inputData,
+                    initialState: options.initialState,
+                    requestContext,
+                  }),
+                };
+              },
+            );
+            const result = await executionPromise;
+            await this.#reconcileTerminalState(
+              workflowId,
+              runId,
+              result,
+              requestContext,
+              source,
+              active.storedRunScope?.rowStored === true,
+            );
+          });
           outcomeReadStarted = true;
           const selected = await this.#completedStartState(
             source,
@@ -1956,6 +1969,8 @@ export class RunnerRuntime {
         if (!state) throw new UnknownRunError(workflowId, runId);
         if (state.isFromInMemory)
           throw new RunStateUnreadableError(workflowId, runId);
+        if (this.#withStoredRunOf(source))
+          active.storedRunScope = { workflowId, runId, rowStored: true };
         const prior = runProvenance(state);
         if (
           proof &&
@@ -2013,32 +2028,36 @@ export class RunnerRuntime {
           );
           await this.#withLifecycleLock(workflowId, runId, check);
         }
-        const run = await this.#createRun(workflowId, runId);
-        const { executionPromise } = await this.#withLifecycleLock(
-          workflowId,
-          runId,
-          async () => {
-            await check();
-            active.run = run;
-            engineEntered = true;
-            return {
-              executionPromise: run.resume({
-                step: options.step,
-                resumeData: options.resumeData,
-                requestContext,
-              }),
-            };
-          },
-        );
-        const result = await executionPromise;
-        await this.#reconcileTerminalState(
-          workflowId,
-          runId,
-          result,
-          requestContext,
-          source,
-          proof,
-        );
+        const result = await this.#inStoredRunScope(active, async () => {
+          const run = await this.#createRun(workflowId, runId);
+          const { executionPromise } = await this.#withLifecycleLock(
+            workflowId,
+            runId,
+            async () => {
+              await check();
+              active.run = run;
+              engineEntered = true;
+              return {
+                executionPromise: run.resume({
+                  step: options.step,
+                  resumeData: options.resumeData,
+                  requestContext,
+                }),
+              };
+            },
+          );
+          const resumed = await executionPromise;
+          await this.#reconcileTerminalState(
+            workflowId,
+            runId,
+            resumed,
+            requestContext,
+            source,
+            active.storedRunScope?.rowStored === true,
+            proof,
+          );
+          return resumed;
+        });
         if (provenance.version === 2) {
           const execution = runExecutionIdentityFor(
             { tablePrefix: source.tablePrefix, workflowId, runId },
@@ -2572,6 +2591,7 @@ export class RunnerRuntime {
       touchRun: touch,
       replaceSnapshot: replace,
       patchRunLifecycle: patch,
+      withStoredRun: enterStoredRun,
     } = capability;
     if (
       typeof prefix !== 'string' ||
@@ -2581,6 +2601,7 @@ export class RunnerRuntime {
       (touch !== undefined && typeof touch !== 'function') ||
       (replace !== undefined && typeof replace !== 'function') ||
       (patch !== undefined && typeof patch !== 'function') ||
+      (enterStoredRun !== undefined && typeof enterStoredRun !== 'function') ||
       !database ||
       typeof database.prepare !== 'function' ||
       typeof database.batch !== 'function'
@@ -2604,6 +2625,7 @@ export class RunnerRuntime {
       ...(touch === undefined ? {} : { touch }),
       ...(replace === undefined ? {} : { replace }),
       ...(patch === undefined ? {} : { patch }),
+      ...(enterStoredRun === undefined ? {} : { enterStoredRun }),
     };
   }
 
@@ -3031,10 +3053,11 @@ export class RunnerRuntime {
   /**
    * @internal Mark this run's row live for an executing leg, from whichever
    * instance runs it; the evidence #silentRow reads. When the row reads
-   * settled, the leg this runtime drives for the run is aborted: its engine
-   * starts no further step, and its step in flight sees its `abortSignal`
-   * aborted. A storage source without the touch leaves nothing to read, so its
-   * runs are never settled here.
+   * settled, or, on storage with `withStoredRun`, absent after the leg stored
+   * it, the leg this runtime drives for the run is aborted: its engine starts
+   * no further step, and its step in flight sees its `abortSignal` aborted. A
+   * storage source without the touch leaves nothing to read, so its runs are
+   * never settled here.
    */
   async touchRun(
     workflowId: string,
@@ -3048,9 +3071,13 @@ export class RunnerRuntime {
       { workflowId, runId },
       now,
     );
-    if (touched === 'settled')
+    const active = this.#activeRuns.get(this.#runKey(workflowId, runId));
+    if (
+      touched === 'settled' ||
+      (touched === 'absent' && active?.storedRunScope?.rowStored === true)
+    )
       this.#abortLeg(
-        this.#activeRuns.get(this.#runKey(workflowId, runId)),
+        active,
         new RunSettledConflictError(workflowId, runId),
         'run-leg-settled-abort',
         workflowId,
@@ -3110,6 +3137,26 @@ export class RunnerRuntime {
     console.error(JSON.stringify({ type: logType, workflowId, runId }));
     const reason = legAbortReason(cause);
     for (const controller of unaborted) controller.abort(reason);
+  }
+
+  #withStoredRunOf(
+    source: CapturedWorkflowStorage | undefined,
+  ): FencedWorkflowAdmissionCapability['withStoredRun'] {
+    return source?.storage === 'd1'
+      ? source.enterStoredRun?.bind(source.capability)
+      : undefined;
+  }
+
+  /** Run a leg's writes of its own run inside the storage's stored-run scope. */
+  #inStoredRunScope<T>(
+    active: ActiveRun,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const withStoredRun = this.#withStoredRunOf(active.source);
+    const { storedRunScope } = active;
+    return withStoredRun && storedRunScope
+      ? withStoredRun(storedRunScope, operation)
+      : operation();
   }
 
   /**
@@ -3782,6 +3829,7 @@ export class RunnerRuntime {
     result: CoreRunResult,
     requestContext: RequestContext,
     source: CapturedWorkflowStorage,
+    rowStored: boolean,
     proof?: D1RunExecutionIdentity,
   ): Promise<void> {
     const opts = terminalStateUpdate(result);
@@ -3793,6 +3841,10 @@ export class RunnerRuntime {
         runId,
       });
       if (!snapshot) {
+        // A row gone after this leg stored it was removed by retention, either
+        // after another instance settled the run or after this leg's own
+        // terminal write (`success` or `failed`).
+        if (rowStored) throw new RunSettledConflictError(workflowId, runId);
         throw new Error(
           `RunnerRuntime: run '${runId}' of workflow '${workflowId}' completed without a durable snapshot`,
         );

@@ -98,6 +98,8 @@ export interface FencedWorkflowAdmissionCapability {
    * `settled`, so report it only when the same storage refuses that leg's later
    * writes over the row, as the settled-row guard does; a capability without
    * such a guard resolves nothing, which is no evidence and aborts nothing.
+   * With `withStoredRun`, the runtime also aborts a leg on `absent` once that
+   * leg stored its row, so report `absent` only for a row that is gone.
    * Without `touchRun` a run whose leg stops is never settled automatically.
    */
   touchRun?(
@@ -151,4 +153,24 @@ export interface FencedWorkflowAdmissionCapability {
       updatedAt: string;
     },
   ): Promise<boolean>;
+  /**
+   * Run `operation`, a whole leg of the run `scope` names, inside `scope`.
+   * When a write inside it stores the run's row, the storage sets
+   * `scope.rowStored` on the `scope` object it is passed. The runtime also
+   * sets it after a fenced admission and when a resume begins, and reads it in
+   * the liveness touch and in the end-of-leg reconcile. Once it is `true`, a
+   * write of that run that finds no row is refused, writing nothing, with
+   * `RunSettledConflictError`, or with `RunStateNotStorableError` for a
+   * snapshot SQLite cannot parse. Writes of any other run address are not
+   * guarded. A capability that copies `scope` instead of using the object it
+   * is passed loses the insert guard until its own first write.
+   */
+  withStoredRun?<T>(
+    scope: {
+      readonly workflowId: string;
+      readonly runId: string;
+      rowStored: boolean;
+    },
+    operation: () => Promise<T>,
+  ): Promise<T>;
 }

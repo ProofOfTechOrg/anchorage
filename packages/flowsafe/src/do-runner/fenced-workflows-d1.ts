@@ -543,6 +543,25 @@ async function replaceSnapshotRow(
   return false;
 }
 
+type StoredRunScope = Parameters<
+  NonNullable<FencedWorkflowAdmissionCapability['withStoredRun']>
+>[0];
+
+function assertStoredRunScope(
+  scope: StoredRunScope,
+  operation: () => Promise<unknown>,
+): void {
+  if (
+    scope === null ||
+    typeof scope !== 'object' ||
+    !isPathSafeId(scope.workflowId) ||
+    !isPathSafeId(scope.runId) ||
+    typeof scope.rowStored !== 'boolean' ||
+    typeof operation !== 'function'
+  )
+    throw new Error('stored run scope is malformed');
+}
+
 type PatchRunLifecycleArgs = Parameters<
   NonNullable<FencedWorkflowAdmissionCapability['patchRunLifecycle']>
 >;
@@ -1266,6 +1285,7 @@ export class FencedWorkflowsStorageD1 extends WorkflowsStorageD1 {
   readonly [FENCED_WORKFLOW_STORAGE]?: FencedWorkflowAdmissionCapability;
   readonly #admission?: FencedWorkflowAdmissionCapability;
   readonly #scopes = new AsyncLocalStorage<AdmissionScope>();
+  readonly #storedRuns = new AsyncLocalStorage<StoredRunScope>();
   readonly #unreadableRowTails = new Map<string, Promise<unknown>>();
 
   constructor(config: D1DomainConfig) {
@@ -1303,6 +1323,10 @@ export class FencedWorkflowsStorageD1 extends WorkflowsStorageD1 {
         ) => replaceSnapshotRow(database, tablePrefix, expected, replacement),
         patchRunLifecycle: (...args: PatchRunLifecycleArgs) =>
           patchLifecycleRow(database, tablePrefix, ...args),
+        withStoredRun: <T>(
+          scope: StoredRunScope,
+          operation: () => Promise<T>,
+        ) => this.#withStoredRun(scope, operation),
       });
       this[FENCED_WORKFLOW_STORAGE] = this.#admission;
     }
@@ -1426,6 +1450,14 @@ export class FencedWorkflowsStorageD1 extends WorkflowsStorageD1 {
     }
   }
 
+  async #withStoredRun<T>(
+    scope: StoredRunScope,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    assertStoredRunScope(scope, operation);
+    return this.#storedRuns.run(scope, operation);
+  }
+
   override async persistWorkflowSnapshot(args: PersistInput): Promise<void> {
     const scope = this.#scopes.getStore();
     if (!scope) {
@@ -1466,11 +1498,23 @@ export class FencedWorkflowsStorageD1 extends WorkflowsStorageD1 {
   ): Promise<void> {
     const row = mastraSnapshotRow(args, new Date().toISOString());
     const { database, tablePrefix } = capability;
+    const leg = this.#storedRuns.getStore();
+    const ownRun =
+      leg?.workflowId === row.workflowName && leg.runId === row.runId
+        ? leg
+        : undefined;
+    // The leg stored this run's row and the row is gone: another instance
+    // settled the run and retention removed it, so inserting the row would
+    // store the run again as unsettled.
+    const insertGuard = ownRun?.rowStored
+      ? `AND EXISTS (SELECT 1 FROM "${tablePrefix}mastra_workflow_snapshot"
+          WHERE workflow_name = ?1 AND run_id = ?2)`
+      : '';
     const result = await database
       .prepare(`INSERT INTO "${tablePrefix}mastra_workflow_snapshot"
       (workflow_name, run_id, resourceId, snapshot, createdAt, updatedAt)
       SELECT ?1, ?2, ?3, ?4, ?5, ?6
-      WHERE json_valid(?4)
+      WHERE json_valid(?4) ${insertGuard}
       ON CONFLICT (workflow_name, run_id) DO UPDATE
         SET snapshot = ${UPSERT_SNAPSHOT_SQL}, updatedAt = excluded.updatedAt
         WHERE ${SETTLED_ROW_GUARD_SQL}
@@ -1484,7 +1528,10 @@ export class FencedWorkflowsStorageD1 extends WorkflowsStorageD1 {
         row.updatedAt,
       )
       .all();
-    if (writtenRowCount(captureStatementResult(result)) === 1) return;
+    if (writtenRowCount(captureStatementResult(result)) === 1) {
+      if (ownRun) ownRun.rowStored = true;
+      return;
+    }
     // The guard refused a readable row, or the write is not storable; a row
     // gone since the upsert met it is refused too, so a purged settlement is
     // not written over.
@@ -1506,6 +1553,7 @@ export class FencedWorkflowsStorageD1 extends WorkflowsStorageD1 {
       `${row.workflowName}\0${row.runId}`,
       () => writeOverUnreadableRow(database, tablePrefix, row),
     );
+    if (ownRun) ownRun.rowStored = true;
   }
 
   #initialRow(
