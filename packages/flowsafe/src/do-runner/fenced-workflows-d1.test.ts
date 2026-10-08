@@ -4573,7 +4573,22 @@ describe('run lifecycle patch', () => {
     return h;
   }
 
-  it('writes the lifecycle and timestamp of the row it expects and no other field', async () => {
+  it.each([
+    {
+      label: 'status and revision',
+      expected: { status: 'running', lifecycleRevision: 1 },
+    },
+    {
+      label: 'status, revision and lifecycle',
+      expected: {
+        status: 'running',
+        lifecycleRevision: 1,
+        lifecycle: { version: 1, revision: 1 },
+      },
+    },
+  ])('writes the lifecycle and timestamp of the row it expects by $label and no other field', async ({
+    expected,
+  }) => {
     // #given a running row at lifecycle revision 1 with other context
     const before = running({
       app: { text: 'λ😀', fraction: 1.5 },
@@ -4581,10 +4596,10 @@ describe('run lifecycle patch', () => {
     });
     const h = await seeded(before);
 
-    // #when the patch names that status and revision
+    // #when the patch names that row
     const patched = await h.capability.patchRunLifecycle?.(
       ADDRESS,
-      { status: 'running', lifecycleRevision: 1 },
+      expected,
       PATCH,
     );
 
@@ -4637,6 +4652,22 @@ describe('run lifecycle patch', () => {
         [RUN_LIFECYCLE_CONTEXT_KEY]: { version: 1, revision: 3 },
       }),
       expected: { status: 'running', lifecycleRevision: 1 },
+    },
+    {
+      label:
+        'its lifecycle differs from the one expected at the expected revision',
+      row: running({
+        [RUN_LIFECYCLE_CONTEXT_KEY]: {
+          version: 1,
+          revision: 1,
+          deadlineAt: 99,
+        },
+      }),
+      expected: {
+        status: 'running',
+        lifecycleRevision: 1,
+        lifecycle: { version: 1, revision: 1, deadlineAt: 10 },
+      },
     },
     {
       label: 'it has a lifecycle where none was expected',
@@ -4737,6 +4768,10 @@ describe('run lifecycle patch', () => {
     {
       label: 'expected revision is not an integer',
       call: [ADDRESS, { status: 'running', lifecycleRevision: 1.5 }, PATCH],
+    },
+    {
+      label: 'expected lifecycle is an array',
+      call: [ADDRESS, { status: 'running', lifecycle: [] }, PATCH],
     },
     {
       label: 'run address is not path safe',

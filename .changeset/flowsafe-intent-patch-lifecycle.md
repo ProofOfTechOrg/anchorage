@@ -1,0 +1,5 @@
+---
+"@proofoftech/flowsafe": patch
+---
+
+`FencedWorkflowAdmissionCapability.patchRunLifecycle` accepts an optional `expected.lifecycle`, the run lifecycle the caller read, and then writes only while the stored lifecycle is exactly that value. Pass it as read from the row, with its `lifecycleRevision`. `FencedWorkflowsStorageD1` implements it by comparing the stored JSON text, so a lifecycle rebuilt from parsed fields misses, and the runtime passes it. A cancellation or timeout intent therefore no longer replaces a run lifecycle that a resume on another instance advanced to the same revision. Before, that resume's deadline and economic-operation states were lost, and a run-deadline timeout whose deadline check the resume had made stale could still time the run out. A custom capability that ignores the field keeps the earlier behavior. During a deploy or a rollback, a terminate or a run-deadline timeout run by an earlier flowsafe version can still record its intent over a lifecycle it did not read.

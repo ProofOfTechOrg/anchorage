@@ -125,15 +125,26 @@ export interface FencedWorkflowAdmissionCapability {
    * Write the run's lifecycle, `timestamp` and `updatedAt` and no other part of
    * its snapshot, but only while the stored status is `expected.status`, the
    * stored lifecycle's revision is `expected.lifecycleRevision` (or it has no
-   * lifecycle, when that is omitted), the row is not settled and its lifecycle
-   * records no disputed economic operation; otherwise
-   * resolve `false`, writing nothing. A write that leaves the status and
-   * lifecycle alone, such as a leg's step progress, does not make it miss. It
-   * rejects, writing nothing, a malformed address, expectation or patch.
+   * lifecycle, when that is omitted), the stored lifecycle is exactly
+   * `expected.lifecycle` when that is given, the row is not settled and its
+   * lifecycle records no disputed economic operation; otherwise
+   * resolve `false`, writing nothing. Pass `expected.lifecycle` as read from the
+   * row, with the `lifecycleRevision` it carries: another writer can reach the
+   * same revision with a different lifecycle, and `lifecycle` without the
+   * matching `lifecycleRevision` misses on every attempt.
+   * `FencedWorkflowsStorageD1` compares the stored JSON text, so there a
+   * lifecycle rebuilt from parsed fields, whose keys can come out in another
+   * order, misses as well. A write that leaves the status and lifecycle alone,
+   * such as a leg's step progress, does not make it miss. It rejects, writing
+   * nothing, a malformed address, expectation or patch.
    */
   patchRunLifecycle?(
     address: { workflowId: string; runId: string },
-    expected: { status: string; lifecycleRevision?: number },
+    expected: {
+      status: string;
+      lifecycleRevision?: number;
+      lifecycle?: object;
+    },
     patch: {
       lifecycle: object;
       timestamp: number;

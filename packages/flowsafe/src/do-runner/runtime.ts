@@ -940,8 +940,9 @@ class RowChangedError extends Error {
 /**
  * Compare-and-set passes a lifecycle transition makes before it answers that
  * the run's row keeps changing. A touch moves the row at most once per
- * RUN_LEG_TOUCH_MS, so a miss it causes clears on the next pass; only a leg on
- * another instance writing snapshots back to back misses every time.
+ * RUN_LEG_TOUCH_MS, so a miss it causes clears on the next pass; a leg writing
+ * snapshots back to back misses every time when it runs on another instance,
+ * or, over a row SQLite cannot parse, in this object too.
  */
 const LIFECYCLE_WRITE_ATTEMPTS = 5;
 
@@ -1232,17 +1233,24 @@ function effectiveLifecycle(
 ): RunLifecycleState | undefined {
   if (!persisted) return active;
   if (!active) return persisted;
+  // As lifecycleMergeSql decides: a stored intent never joins a lifecycle it
+  // was not checked against.
+  if (persisted.transitionIntent && hasDisputedSettlement(active))
+    return active;
   if (persisted.revision > active.revision) return persisted;
   if (active.revision > persisted.revision) return active;
+  const { transitionIntent: storedIntent, ...persistedWithoutIntent } =
+    persisted;
+  const transitionIntent =
+    storedIntent &&
+    (storedIntent.expectedDeadlineAt === undefined ||
+      storedIntent.expectedDeadlineAt === active.deadlineAt)
+      ? storedIntent
+      : active.transitionIntent;
   return {
-    ...persisted,
+    ...persistedWithoutIntent,
     ...active,
-    ...((persisted.transitionIntent ?? active.transitionIntent)
-      ? {
-          transitionIntent:
-            persisted.transitionIntent ?? active.transitionIntent,
-        }
-      : {}),
+    ...(transitionIntent ? { transitionIntent } : {}),
     ...((persisted.terminal ?? active.terminal)
       ? { terminal: persisted.terminal ?? active.terminal }
       : {}),
@@ -3578,6 +3586,9 @@ export class RunnerRuntime {
           status: state.status,
           lifecycleRevision: lifecycleFromRequestContext(state.requestContext)
             ?.revision,
+          // As read from the row: the patch compares stored JSON text, and the
+          // parsed lifecycle orders its keys differently.
+          lifecycle: state.requestContext?.[RUN_LIFECYCLE_CONTEXT_KEY],
         },
         {
           lifecycle: intent,

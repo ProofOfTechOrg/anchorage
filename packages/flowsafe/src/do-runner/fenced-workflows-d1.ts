@@ -543,23 +543,28 @@ async function replaceSnapshotRow(
   return false;
 }
 
+type PatchRunLifecycleArgs = Parameters<
+  NonNullable<FencedWorkflowAdmissionCapability['patchRunLifecycle']>
+>;
+
 /**
  * The timestamp is bound as JSON text because a bound JS number would be
  * stored as a REAL (`456.0`). A request context that is not an object makes
  * json_set write nothing yet still count a row, so the predicate refuses it.
- * The patch replaces the whole lifecycle, and a revision does not identify one
- * across instances (a resume elsewhere reaches the same revision), so a stored
- * dispute refuses it as it refuses recording an intent.
+ * The patch replaces the whole lifecycle, so, when the caller passes
+ * `expected.lifecycle`, it matches that lifecycle and not only its revision,
+ * which a resume on another instance reaches as well; a stored dispute refuses
+ * it as it refuses recording an intent.
  */
 async function patchLifecycleRow(
   database: InitialAdmissionDatabase,
   tablePrefix: string,
-  address: { workflowId: string; runId: string },
-  expected: { status: string; lifecycleRevision?: number },
-  patch: { lifecycle: object; timestamp: number; updatedAt: string },
+  address: PatchRunLifecycleArgs[0],
+  expected: PatchRunLifecycleArgs[1],
+  patch: PatchRunLifecycleArgs[2],
 ): Promise<boolean> {
   const { workflowId, runId } = address;
-  const { status, lifecycleRevision } = expected;
+  const { status, lifecycleRevision, lifecycle: expectedLifecycle } = expected;
   const { lifecycle, timestamp, updatedAt } = patch;
   if (
     !isPathSafeId(workflowId) ||
@@ -567,6 +572,10 @@ async function patchLifecycleRow(
     typeof status !== 'string' ||
     (lifecycleRevision !== undefined &&
       !Number.isSafeInteger(lifecycleRevision)) ||
+    (expectedLifecycle !== undefined &&
+      (expectedLifecycle === null ||
+        typeof expectedLifecycle !== 'object' ||
+        Array.isArray(expectedLifecycle))) ||
     lifecycle === null ||
     typeof lifecycle !== 'object' ||
     Array.isArray(lifecycle) ||
@@ -590,6 +599,7 @@ async function patchLifecycleRow(
           AND ${lifecycleSql('snapshot', 'revision')} IS ?7
           AND ${STORED_UNSETTLED_SQL}
           AND NOT ${disputedSql('snapshot')}
+          AND (?8 IS NULL OR (snapshot -> ${lifecyclePath()}) IS json(?8))
         END
     RETURNING workflow_name`)
     .bind(
@@ -600,6 +610,9 @@ async function patchLifecycleRow(
       runId,
       status,
       lifecycleRevision ?? null,
+      expectedLifecycle === undefined
+        ? null
+        : JSON.stringify(expectedLifecycle),
     )
     .all();
   return writtenRowCount(captureStatementResult(result)) === 1;
@@ -1288,15 +1301,8 @@ export class FencedWorkflowsStorageD1 extends WorkflowsStorageD1 {
           expected: RawWorkflowSnapshot,
           replacement: { snapshot: string; updatedAt: string },
         ) => replaceSnapshotRow(database, tablePrefix, expected, replacement),
-        patchRunLifecycle: (
-          address: { workflowId: string; runId: string },
-          expected: { status: string; lifecycleRevision?: number },
-          patch: {
-            lifecycle: object;
-            timestamp: number;
-            updatedAt: string;
-          },
-        ) => patchLifecycleRow(database, tablePrefix, address, expected, patch),
+        patchRunLifecycle: (...args: PatchRunLifecycleArgs) =>
+          patchLifecycleRow(database, tablePrefix, ...args),
       });
       this[FENCED_WORKFLOW_STORAGE] = this.#admission;
     }

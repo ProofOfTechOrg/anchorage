@@ -11521,10 +11521,10 @@ describe('RunnerRuntime.settleInterruptedRun', () => {
   });
 });
 
-describe('RunnerRuntime lifecycle transitions on D1 storage', () => {
-  const owner = { kind: 'human', id: 'owner' } as const;
-  const lifecycleKey = 'flowsafe.runLifecycle';
+const owner = { kind: 'human', id: 'owner' } as const;
+const lifecycleKey = 'flowsafe.runLifecycle';
 
+describe('RunnerRuntime lifecycle transitions on D1 storage', () => {
   /**
    * After each of the next `times` reads of the run row, by either read path
    * a lifecycle transition may take, rewrites the row from `edit` before the
@@ -11851,11 +11851,39 @@ describe('RunnerRuntime lifecycle transitions on D1 storage', () => {
     ).resolves.toMatchObject({ kind: 'interrupted' });
   });
 
-  it('lands the cancellation intent while the leg keeps rewriting the row', async () => {
+  it.each([
+    { label: 'no lifecycle', start: {}, reorderKeys: false },
+    {
+      label:
+        'a lifecycle whose stored keys are not in the order the parser builds',
+      start: { deadlineMs: 3_600_000 },
+      reorderKeys: true,
+    },
+  ])('lands the cancellation intent while the leg keeps rewriting the row ($label)', async ({
+    start,
+    reorderKeys,
+  }) => {
     // #given a stranded run whose leg rewrites the row, still running, after
     // each of up to five reads: enough to make a whole-row compare-and-set
     // miss on every attempt, which the intent patch does not
-    const { app, workflow, workflows, stored } = await racingRun();
+    const { app, workflow, workflows, stored } = await racingRun(start);
+    if (reorderKeys) {
+      const row = await stored();
+      const parsed = row.requestContext?.[lifecycleKey];
+      assert(parsed);
+      const { deadlineAt, version, revision } = parsed;
+      await workflows.persistWorkflowSnapshot({
+        workflowName: workflow.id,
+        runId: 'stranded-run',
+        snapshot: {
+          ...row,
+          requestContext: {
+            ...row.requestContext,
+            [lifecycleKey]: { deadlineAt, version, revision },
+          },
+        },
+      });
+    }
     landAfterReads(workflows, keepsRunning, 5);
 
     // #when the intent is requested
@@ -11871,6 +11899,60 @@ describe('RunnerRuntime lifecycle transitions on D1 storage', () => {
     const row = await stored();
     expect(row.status).toBe('running');
     expect(row.requestContext?.[lifecycleKey]).toMatchObject({
+      transitionIntent: { status: 'cancelled' },
+    });
+  });
+
+  it('does not time out a run whose deadline a write of the intent revision moved after the deadline route read it', async () => {
+    // #given a stranded run with a recorded cancellation, and a write of the
+    // same revision that moves the deadline and lands just after the deadline
+    // route's intent pass reads the row
+    const { app, workflow, workflows, stored, storedCas } = await racingRun({
+      deadlineMs: 1,
+    });
+    await app.runtime.cancelActiveExecution(
+      workflow.id,
+      'stranded-run',
+      'cancelled',
+      [owner],
+    );
+    const cas = await storedCas();
+    const movedDeadlineAt = cas.expectedDeadlineAt + 3_600_000;
+    landAfterReads(workflows, (current) => ({
+      ...current,
+      requestContext: {
+        ...current.requestContext,
+        [lifecycleKey]: {
+          version: 1,
+          revision: cas.expectedRevision,
+          deadlineAt: movedDeadlineAt,
+        },
+      },
+    }));
+    const now = Date.now() + 1_000;
+
+    // #when the deadline route records its intent and then times the run out
+    await app.runtime.cancelActiveExecution(
+      workflow.id,
+      'stranded-run',
+      'timed_out',
+      [owner],
+      cas,
+      now,
+    );
+    const timedOut = await app.runtime.timeOut(
+      workflow.id,
+      'stranded-run',
+      cas,
+      now,
+    );
+
+    // #then its check is stale, and the moved deadline and the cancellation
+    // stay stored
+    expect(timedOut).toMatchObject({ transitioned: false, casMatched: false });
+    expect((await stored()).requestContext?.[lifecycleKey]).toMatchObject({
+      revision: cas.expectedRevision,
+      deadlineAt: movedDeadlineAt,
       transitionIntent: { status: 'cancelled' },
     });
   });
@@ -12131,85 +12213,93 @@ describe('RunnerRuntime lifecycle transitions on D1 storage', () => {
   });
 });
 
-describe('RunnerRuntime leg liveness touch', () => {
-  const WORKFLOW_ID = 'abortable-workflow';
-  const RUN_ID = 'touched-run';
+const WORKFLOW_ID = 'abortable-workflow';
+const RUN_ID = 'touched-run';
 
-  async function d1Storage() {
-    const sql = openSqlite();
-    const storage = createD1Storage({
-      binding: sqliteUnitDatabase(sql) as D1DatabaseBinding,
-    });
-    await storage.init();
-    return { sql, storage };
-  }
+async function d1Storage() {
+  const sql = openSqlite();
+  const storage = createD1Storage({
+    binding: sqliteUnitDatabase(sql) as D1DatabaseBinding,
+  });
+  await storage.init();
+  return { sql, storage };
+}
 
-  /**
-   * Two steps: `hold` records the `abortSignal` it receives, signals `entered`
-   * and waits for `release`; `after` counts its executions. `quietAfterHold`
-   * drops the engine's `running` writes once `hold` has begun, so nothing but
-   * an abort stands between the steps; `suspends` makes `hold` suspend until it
-   * is resumed.
-   */
-  function abortableApp(
-    storage: MastraCompositeStore,
-    options: { quietAfterHold?: boolean; suspends?: boolean } = {},
-  ) {
-    const app = init(
-      { storage },
-      { executionFence: 'none', startIdempotency: 'none' },
-    );
-    const schema = z.object({});
-    const entered = deferredSignal();
-    const release = deferredSignal();
-    const observed: { signal?: AbortSignal; afterRuns: number } = {
-      afterRuns: 0,
-    };
-    const workflow = app
-      .createWorkflow({
-        id: WORKFLOW_ID,
+/**
+ * The `hold` step records the `abortSignal` it receives, signals `entered` and
+ * waits for `release`; the `after` step counts its executions. `suspends`
+ * makes `hold` suspend until it is resumed. `persistence` sets the workflow's
+ * `shouldPersistSnapshot`: `'quiet-after-hold'` drops the engine's `running`
+ * writes once `hold` has begun, so nothing but an abort stands between the
+ * steps; `statuses` stores only the snapshots of those workflow statuses.
+ */
+function abortableApp(
+  storage: MastraCompositeStore,
+  options: {
+    persistence?: 'quiet-after-hold' | { statuses: readonly string[] };
+    suspends?: boolean;
+  } = {},
+) {
+  const { persistence } = options;
+  const app = init(
+    { storage },
+    { executionFence: 'none', startIdempotency: 'none' },
+  );
+  const schema = z.object({});
+  const entered = deferredSignal();
+  const release = deferredSignal();
+  const observed: { signal?: AbortSignal; afterRuns: number } = {
+    afterRuns: 0,
+  };
+  const workflow = app
+    .createWorkflow({
+      id: WORKFLOW_ID,
+      inputSchema: schema,
+      outputSchema: schema,
+      ...(persistence
+        ? {
+            options: {
+              shouldPersistSnapshot: ({ workflowStatus }) =>
+                persistence === 'quiet-after-hold'
+                  ? workflowStatus !== 'running' ||
+                    observed.signal === undefined
+                  : persistence.statuses.includes(workflowStatus),
+            },
+          }
+        : {}),
+    })
+    .then(
+      app.createStep({
+        id: 'hold',
         inputSchema: schema,
         outputSchema: schema,
-        ...(options.quietAfterHold
-          ? {
-              options: {
-                shouldPersistSnapshot: ({ workflowStatus }) =>
-                  workflowStatus !== 'running' || observed.signal === undefined,
-              },
-            }
-          : {}),
-      })
-      .then(
-        app.createStep({
-          id: 'hold',
-          inputSchema: schema,
-          outputSchema: schema,
-          suspendSchema: schema,
-          resumeSchema: schema,
-          execute: async ({ abortSignal, resumeData, suspend }) => {
-            if (options.suspends && !resumeData) return suspend({});
-            observed.signal = abortSignal;
-            entered.resolve();
-            await release.promise;
-            return {};
-          },
-        }),
-      )
-      .then(
-        app.createStep({
-          id: 'after',
-          inputSchema: schema,
-          outputSchema: schema,
-          execute: async () => {
-            observed.afterRuns += 1;
-            return {};
-          },
-        }),
-      )
-      .commit();
-    return { app, workflow, entered, release, observed };
-  }
+        suspendSchema: schema,
+        resumeSchema: schema,
+        execute: async ({ abortSignal, resumeData, suspend }) => {
+          if (options.suspends && !resumeData) return suspend({});
+          observed.signal = abortSignal;
+          entered.resolve();
+          await release.promise;
+          return {};
+        },
+      }),
+    )
+    .then(
+      app.createStep({
+        id: 'after',
+        inputSchema: schema,
+        outputSchema: schema,
+        execute: async () => {
+          observed.afterRuns += 1;
+          return {};
+        },
+      }),
+    )
+    .commit();
+  return { app, workflow, entered, release, observed };
+}
 
+describe('RunnerRuntime leg liveness touch', () => {
   /** Starts a leg that stays in `hold` until the test ends or releases it. */
   function startHeldLeg(
     storage: MastraCompositeStore,
@@ -12296,7 +12386,7 @@ describe('RunnerRuntime leg liveness touch', () => {
     // #given a leg held in its first step, on a workflow whose engine writes
     // nothing once that step has begun, and a run another instance settled
     const { leg } = await holdLegSettledElsewhere(settled, {
-      quietAfterHold: true,
+      persistence: 'quiet-after-hold',
     });
 
     // #when the leg's touch runs and the step returns
@@ -12504,5 +12594,187 @@ describe('RunnerRuntime leg liveness touch', () => {
       failure,
     );
     expect(ended.status).toBe('success');
+  });
+});
+
+describe('RunnerRuntime end-of-leg write over an intent another instance recorded', () => {
+  const disputedOperations = [{ id: 'charge-1', settlementState: 'disputed' }];
+
+  /**
+   * A run suspended at revision 1 with a deadline, and its resume held in
+   * `hold` on one instance. The workflow stores only its `suspended`
+   * snapshots, so the resume's lifecycle reaches the row when its leg ends.
+   * `other` is a second instance over the same storage.
+   */
+  async function resumeHeldElsewhere(
+    resume: NonNullable<Parameters<RunnerRuntime['resume']>[2]>,
+  ) {
+    const { sql, storage } = await d1Storage();
+    const leg = abortableApp(storage, {
+      suspends: true,
+      persistence: { statuses: ['suspended'] },
+    });
+    await leg.app.runtime.start(WORKFLOW_ID, {
+      runId: RUN_ID,
+      inputData: {},
+      deadlineMs: 1,
+    });
+    const stored = () =>
+      JSON.parse(
+        (
+          sql
+            .prepare('SELECT snapshot FROM mastra_workflow_snapshot')
+            .get() as { snapshot: string }
+        ).snapshot,
+      );
+    const resuming = leg.app.runtime.resume(WORKFLOW_ID, RUN_ID, {
+      resumeData: {},
+      ...resume,
+    });
+    onTestFinished(async () => {
+      leg.release.resolve();
+      await resuming.catch(() => undefined);
+    });
+    await leg.entered.promise;
+    return {
+      leg,
+      resuming,
+      stored,
+      deadlineAt: stored().requestContext[lifecycleKey].deadlineAt as number,
+      other: abortableApp(storage),
+    };
+  }
+
+  it('keeps the result of a run whose resume on another instance moved its deadline after a run-deadline intent landed, on a workflow that skips its terminal snapshot', async () => {
+    // #given a resume that moves the run's deadline, held in its step, and a
+    // run-deadline intent for the old deadline that another instance recorded
+    const { leg, resuming, other, stored, deadlineAt } =
+      await resumeHeldElsewhere({ deadlineMs: 3_600_000 });
+    const cas = { expectedRevision: 1, expectedDeadlineAt: deadlineAt };
+    const now = Date.now() + 1_000;
+    await other.app.runtime.cancelActiveExecution(
+      WORKFLOW_ID,
+      RUN_ID,
+      'timed_out',
+      [owner],
+      cas,
+      now,
+    );
+    expect(
+      stored().requestContext[lifecycleKey].transitionIntent,
+    ).toMatchObject({ status: 'timed_out', expectedDeadlineAt: deadlineAt });
+
+    // #when the resume completes and the deadline route then runs
+    leg.release.resolve();
+    await resuming;
+    const timedOut = await other.app.runtime.timeOut(
+      WORKFLOW_ID,
+      RUN_ID,
+      cas,
+      now,
+    );
+
+    // #then the intent did not join the resume's lifecycle, the deadline check
+    // is stale, and the run keeps its completion and its result
+    expect(timedOut).toMatchObject({
+      transitioned: false,
+      casMatched: false,
+      summary: { status: 'success', result: {} },
+    });
+  });
+
+  it('aborts the leg of a resume that kept its deadline when the deadline route reaches its instance after a run-deadline intent landed elsewhere', async () => {
+    // #given a resume that keeps the run's deadline and advances its revision,
+    // held in its step, and a run-deadline intent for that deadline that
+    // another instance recorded
+    const { leg, other, deadlineAt } = await resumeHeldElsewhere({
+      economicOperations: [{ id: 'charge-1', settlementState: 'settled' }],
+    });
+    const cas = { expectedRevision: 1, expectedDeadlineAt: deadlineAt };
+    const now = Date.now() + 1_000;
+    await other.app.runtime.cancelActiveExecution(
+      WORKFLOW_ID,
+      RUN_ID,
+      'timed_out',
+      [owner],
+      cas,
+      now,
+    );
+
+    // #when the route reaches the resume's own instance
+    const cancelled = await leg.app.runtime.cancelActiveExecution(
+      WORKFLOW_ID,
+      RUN_ID,
+      'timed_out',
+      [owner],
+      cas,
+      now,
+    );
+
+    // #then the recorded intent is the one it decides on, and the leg is
+    // aborted
+    expect(cancelled).toBe(true);
+    expect(leg.observed.signal?.aborted).toBe(true);
+  });
+
+  it('refuses to time out a completed run whose resume recorded a disputed economic operation while two intents landed on another instance', async () => {
+    // #given a resume that records a disputed economic operation, held in its
+    // step, and two intents that another instance recorded after it
+    const { leg, resuming, other, stored, deadlineAt } =
+      await resumeHeldElsewhere({ economicOperations: disputedOperations });
+    const cas = { expectedRevision: 2, expectedDeadlineAt: deadlineAt };
+    const now = Date.now() + 1_000;
+    await other.app.runtime.cancelActiveExecution(
+      WORKFLOW_ID,
+      RUN_ID,
+      'cancelled',
+      [owner],
+    );
+    await other.app.runtime.cancelActiveExecution(
+      WORKFLOW_ID,
+      RUN_ID,
+      'timed_out',
+      [owner],
+      cas,
+      now,
+    );
+
+    // #when the resume completes and the deadline route then runs
+    leg.release.resolve();
+    await resuming;
+    const timingOut = other.app.runtime.timeOut(WORKFLOW_ID, RUN_ID, cas, now);
+
+    // #then the dispute blocks the timeout and the run keeps its completion
+    await expect(timingOut).rejects.toMatchObject({
+      reason: { code: 'DISPUTED_SETTLEMENT' },
+    });
+    expect(stored().status).toBe('success');
+  });
+
+  it('stores the lifecycle of a resume that disputed an economic operation without the intent another instance recorded at its revision', async () => {
+    // #given a resume that records a disputed economic operation, held in its
+    // step, and one intent that another instance recorded at the resume's
+    // revision
+    const { leg, resuming, other, stored, deadlineAt } =
+      await resumeHeldElsewhere({ economicOperations: disputedOperations });
+    await other.app.runtime.cancelActiveExecution(
+      WORKFLOW_ID,
+      RUN_ID,
+      'cancelled',
+      [owner],
+    );
+
+    // #when the resume completes
+    leg.release.resolve();
+    await resuming;
+
+    // #then the stored lifecycle is the resume's, with no intent beside the
+    // dispute
+    expect(stored().requestContext[lifecycleKey]).toEqual({
+      version: 1,
+      revision: 2,
+      deadlineAt,
+      economicOperations: disputedOperations,
+    });
   });
 });

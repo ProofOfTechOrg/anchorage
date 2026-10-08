@@ -255,6 +255,40 @@ describe('FencedWorkflowsStorageD1 on workerd D1', () => {
     expect(await storedLifecycle()).toEqual(disputed);
   });
 
+  it('lands a lifecycle patch whose expected lifecycle is the stored one as the runtime reads it', async () => {
+    // #given a running row whose lifecycle holds non-ASCII text, read back as
+    // the runtime reads it
+    const { domain, capability } = await fencedDomain();
+    await persist(
+      domain,
+      snapshot('running', {
+        version: 1,
+        revision: 1,
+        economicOperations: [
+          { id: 'charge-1', settlementState: 'settled-λ😀' },
+        ],
+      }),
+    );
+    const row = await capability.readSnapshot(ADDRESS);
+    const readLifecycle = JSON.parse(String(row?.snapshot)).requestContext[
+      RUN_LIFECYCLE_CONTEXT_KEY
+    ];
+
+    // #when the patch expects that lifecycle
+    const patched = await capability.patchRunLifecycle?.(
+      ADDRESS,
+      { status: 'running', lifecycleRevision: 1, lifecycle: readLifecycle },
+      {
+        lifecycle: { version: 1, revision: 2 },
+        timestamp: 456,
+        updatedAt: '2026-10-04T00:00:00.000Z',
+      },
+    );
+
+    // #then it lands
+    expect(patched).toBe(true);
+  });
+
   it('refuses a snapshot nested past the depth SQLite parses, over a readable row and for a run with no row', async () => {
     // #given a run with no row, and a write nested past the depth SQLite parses
     const { domain } = await fencedDomain();
