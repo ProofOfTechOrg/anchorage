@@ -9,7 +9,7 @@ import {
   MAINTENANCE_RECEIPT_HEADER,
   mintAsymmetricMaintenanceCapability,
   verifyMaintenanceReceipt,
-} from '@proofoftech/flowsafe/host-kit';
+} from '@proofoftech/flowsafe/host-kit/maintenance-capability';
 import { ActiveRouteAttestationError } from './active-route.js';
 import {
   applicationSecretNames,

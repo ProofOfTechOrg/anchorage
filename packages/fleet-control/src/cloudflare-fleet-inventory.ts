@@ -2043,6 +2043,14 @@ export async function advanceCloudflareFleetInventoryStage(
   input: FleetInventoryStageInput,
 ): Promise<FleetInventoryStageResult> {
   assertWorkerAttachmentProviderRequestBudget(input.maxProviderRequests);
+  if (
+    input.options.dispatchNamespace !== undefined &&
+    input.options.dispatchNamespace !== deps.dispatchNamespace()
+  ) {
+    throw new TypeError(
+      'fleet inventory dispatch namespace does not match the client',
+    );
+  }
   const stage = fleetInventoryStageFromUnknown(input.stage);
   const budget = new RequestBudget(input.maxProviderRequests, stage.step);
   const resumed =

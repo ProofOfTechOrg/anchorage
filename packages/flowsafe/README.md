@@ -44,6 +44,7 @@ Compatibility:
 | `@proofoftech/flowsafe/do-runner/testing` | Timeout resume fixtures for workflow tests |
 | `@proofoftech/flowsafe/approval-ui` | Styling-library-agnostic React dashboard, DOM-free API client, headless hook, and live transport |
 | `@proofoftech/flowsafe/host-kit` | Authenticator and verifier seams, topologies, run/stream routers, approval bridges, and composed Worker |
+| `@proofoftech/flowsafe/host-kit/maintenance-capability` | Maintenance capability signing, verification, and result receipts without host composition imports |
 | `@proofoftech/flowsafe/host-kit/module` | Import-safe workflow module contract |
 | `@proofoftech/flowsafe/artifacts` | R2 artifact store and in-memory test bucket |
 | `@proofoftech/flowsafe/audit-export` | Cloudflare Queue producer sink and NDJSON SIEM consumer |

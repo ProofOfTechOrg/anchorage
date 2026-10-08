@@ -26,6 +26,8 @@ The plain backend rejects external artifacts before creating a resource. Switch 
 
 Import `createCloudflareControlPlane` from `@proofoftech/fleet-control/cloudflare-control-plane` in a dedicated trusted Worker. The factory constructs the ordinary backend and durable stores from your bindings. Your host authorizes requested operations and resolves their specifications and credentials. Keep this Worker separate from tenant application Workers.
 
+For external artifacts in a dispatch namespace, use [`createCloudflareWorkersForPlatformsControlPlane`](#host-the-workers-for-platforms-control-plane) from the same entry point.
+
 ### Bind durable state and provider credentials
 
 Use native D1 bindings for Fleet state and shared provider-quota reservations, plus a private R2 bucket for database exports. Replicas sharing a provider quota must use the same quota database and nonsecret scope. Preserve export bucket identity and receipt authority while operations remain active.
@@ -95,6 +97,37 @@ const control = createCloudflareControlPlane({
 ```
 
 The Queue binding and any management authentication secret belong to your handler. They are not factory options. Continuation tokens identify work to compare against Fleet D1; the factory has no token-signing secret.
+
+### Host the Workers for Platforms control plane
+
+`createCloudflareWorkersForPlatformsControlPlane()` provisions external artifacts with dispatch-native trusted state. First [provision the shared platform Workers](#deploy-the-workers-for-platforms-control-plane). Supply the same native Fleet D1, quota D1 and private R2 export options as the ordinary factory, then add the platform configuration:
+
+```typescript
+import { createCloudflareWorkersForPlatformsControlPlane } from
+  '@proofoftech/fleet-control/cloudflare-control-plane';
+
+const control = createCloudflareWorkersForPlatformsControlPlane({
+  ...trustedControlPlaneOptions,
+  dispatchNamespace: env.DISPATCH_NAMESPACE,
+  hostRoutingKvId: env.HOST_ROUTING_KV_ID,
+  auditQueueName: env.AUDIT_QUEUE_NAME,
+  sharedOutboundWorkerName: env.OUTBOUND_WORKER_NAME,
+  stateEgressRootSecret: env.STATE_EGRESS_ROOT_SECRET,
+  platformProfileFor: (spec) => trustedProfileFor(spec),
+});
+```
+
+`trustedControlPlaneOptions` is the host configuration shown above. Resolve `trustedProfileFor` from host-owned release artifacts and signing material; never accept it from a job or tenant request. The profile must describe the trusted state artifact compatible with the requested release. Keep the Ed25519 private key and state-egress root secret in the trusted control plane.
+
+Use a dedicated Fleet database for one immutable account, dispatch namespace, HOSTS KV, audit queue, outbound Worker and signing configuration. Do not repoint that database at another platform: a reserved deployment may not yet contain its state-resource snapshot. Once that snapshot exists, lifecycle entry checks its namespace, outbound Worker and audit queue under the deployment lease. Replicas may share the database when their configuration agrees. They must also share the provider quota scope and quota database.
+
+Specifications use `authoredBy: 'external'` and declare Durable Object binding names and class names; the backend chooses their scripts and namespaces. The factory refuses ordinary deployments, platform catalogs and backend-switch records. Use the root backend-switch API for adopted ordinary state, and the root WFP backend for platform-authored catalogs.
+
+Inventory starts bind the configured dispatch namespace and HOSTS KV in durable options. Continuations, including stale and finalized replays, must match that scope. The factory refuses older inventory runs without a persisted namespace; start a new operation after resolving any active legacy run through its original executor.
+
+Use `advanceFleetInventory()`, `advanceFleetAudit()`, `advanceFleetMigration()` and `advanceDecommissionDeployment()` with the [continuation delivery rules](#advance-work-before-acknowledging-delivery). Their existing operation-specific bounds apply. `provisionDeployment()` and `rollbackExternalRelease()` remain resumable single-deployment calls; they do not yield after each provider action or impose a caller-selected request budget. Size the invocation for its migration history and artifact topology. Rollback requires the exact current and retained specifications, deployment secrets, and any required settlement host.
+
+External deployments require export-backed decommissioning, including failed provisioning once execution may have occurred. This factory omits `advanceCleanupDeployment()`. Retain the private R2 export bucket and receipt authority until decommissioning and receipt retention finish.
 
 ### Advance work before acknowledging delivery
 

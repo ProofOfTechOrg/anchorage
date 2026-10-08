@@ -518,6 +518,54 @@ const EMPTY_OPTIONS: FleetInventoryRunOptions = {
 
 describe('advanceCloudflareFleetInventoryStage', () => {
   it.each([
+    'other-dispatch',
+    undefined,
+  ])('refuses a bound namespace before provider work with client namespace %s', async (dispatchNamespace) => {
+    const { deps, calls, dispatchRequests } = harness({ dispatchNamespace });
+    const options = {
+      ...EMPTY_OPTIONS,
+      dispatchNamespace: 'anchorage-dispatch',
+      hostRoutingKvId: 'hosts',
+      includeDispatchNamespace: true,
+    };
+    const progress = initialProgress(options);
+    await expect(
+      advanceCloudflareFleetInventoryStage(deps, {
+        stage: progress.stage,
+        options,
+        progress,
+        maxProviderRequests: 1_000,
+      }),
+    ).rejects.toThrow(/dispatch namespace/);
+    expect(calls).toEqual([]);
+    expect(dispatchRequests).toEqual([]);
+  });
+
+  it('advances an inventory bound to the client namespace', async () => {
+    const { deps, calls } = harness({
+      dispatchNamespace: 'anchorage-dispatch',
+    });
+    const options = {
+      ...EMPTY_OPTIONS,
+      dispatchNamespace: 'anchorage-dispatch',
+      hostRoutingKvId: 'hosts',
+      includeDispatchNamespace: true,
+    };
+    const progress = initialProgress(options);
+    const result = await advanceCloudflareFleetInventoryStage(deps, {
+      stage: progress.stage,
+      options,
+      progress,
+      maxProviderRequests: 1_000,
+    });
+    expect(calls).toEqual(['kv-keys:']);
+    expect(result.nextStage).toEqual({
+      step: 'dispatch-pages',
+      pageOrdinal: 0,
+    });
+  });
+
+  it.each([
     'bücher.example',
     '例子.example',
     'ｘ',

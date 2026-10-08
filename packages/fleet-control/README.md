@@ -37,7 +37,7 @@ Fleet Control does not install a runtime Wrangler dependency. Keep the selected 
 | Export | Contents |
 | --- | --- |
 | `@proofoftech/fleet-control` | Provisioning, migration, promotion, rollback, decommission, inventory, fleet state, and the Cloudflare client and rate coordinator. |
-| `@proofoftech/fleet-control/cloudflare-control-plane` | Trusted ordinary-Worker control-plane factory, bounded lifecycle operations, D1 adapter and shared quota coordinator, R2 export store, and their data and error types. |
+| `@proofoftech/fleet-control/cloudflare-control-plane` | Trusted ordinary-Worker and external Workers for Platforms control-plane factories, bounded lifecycle operations, D1 adapter and shared quota coordinator, R2 export store, and their data and error types. |
 | `@proofoftech/fleet-control/workers/dispatch` | Platform dispatch Worker that routes to a deployment's user script under a verified maintenance capability. |
 | `@proofoftech/fleet-control/workers/outbound` | Shared outbound Worker: the declared-egress proxy and the named `StateEgress` entrypoint. |
 | `@proofoftech/fleet-control/workers/audit-consumer` | Control-plane queue consumer for backend-owned deployment audit events. |
@@ -47,6 +47,8 @@ The `workers/*` entries are deployment artifacts for the platform's own Workers.
 The root entry exposes `plainWorkerIngressModule(spec)` for upload-budget checks and ordinary Worker ingress tests. Keep its returned module separate from the input specification; the backend appends it during upload.
 
 Import `createCloudflareControlPlane` from `cloudflare-control-plane` in a [dedicated trusted control-plane Worker](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/fleet-control.md#run-the-trusted-control-plane-in-a-worker). Supply direct Fleet and quota D1 bindings, a private export R2 binding, and a host-owned Cloudflare token. Authorize incoming operations before calling the factory's methods. Never expose the token, bindings, or factory to a tenant-serving Worker. Queue delivery tokens identify requested work; durable Fleet state determines whether it can advance.
+
+For external artifacts with dispatch-native trusted state, use `createCloudflareWorkersForPlatformsControlPlane` from that entry. Its [WFP host configuration](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/fleet-control.md#host-the-workers-for-platforms-control-plane) fixes namespace, routing, trusted artifacts and signing authority. It supports lifecycle continuations and exact-spec rollback; provisioning and rollback remain single-deployment calls.
 
 Size inventory and audit workloads for the [documented memory and read-cost envelope](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/fleet-control.md#audit-an-account-under-a-request-budget). A provider-request budget does not establish a memory or CPU bound.
 
