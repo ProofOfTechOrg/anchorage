@@ -1737,12 +1737,15 @@ export class D1SchedulesStorage extends SchedulesStorage {
         'deferred trigger limit must be a nonnegative safe integer',
       );
     }
+    // Metadata SQLite cannot parse orders by its fire time, so one such row
+    // reaches the tick to be settled instead of failing every listing.
     const { results } = await this.#db
       .prepare(
         `SELECT * FROM ${this.#triggers}
          WHERE outcome = 'deferred'
          ORDER BY COALESCE(
-           CAST(json_extract(metadata, '$.reconcileAfter') AS INTEGER),
+           CAST(CASE WHEN json_valid(metadata)
+             THEN json_extract(metadata, '$.reconcileAfter') END AS INTEGER),
            actualFireAt
          ) ASC, actualFireAt ASC
          LIMIT ?`,

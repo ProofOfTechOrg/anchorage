@@ -42,6 +42,12 @@ import {
   resolveScheduleStartOwner,
   stripReservedExecutionContext,
 } from '../do-runner/index.js';
+import {
+  exceedsDepth,
+  exceedsRunInputDepth,
+  MAX_RUN_INPUT_DEPTH,
+  runInputDepthMessage,
+} from '../do-runner/run-input-depth.js';
 import { nonnegativeSafeInteger } from '../numeric-config.js';
 import type {
   Schedule,
@@ -409,6 +415,37 @@ function contextObject(
   return value as Record<string, unknown>;
 }
 
+/**
+ * The first part of a stored schedule target nested past MAX_RUN_INPUT_DEPTH,
+ * named as a refusal names it. A fire's dispatch record embeds the target in
+ * trigger metadata that SQLite's JSON functions read. The whole-target bound
+ * sits four levels above the run-input bound, the depth of the deepest field
+ * named here, so a field a later Core version adds cannot pass unbounded.
+ */
+export function deepScheduleTargetField(target: unknown): string | undefined {
+  const stored = contextObject(target) ?? {};
+  const values = (field: string, value: unknown): Array<[string, unknown]> =>
+    Object.values(contextObject(value) ?? {}).map((item) => [field, item]);
+  const streamOptions = contextObject(
+    contextObject(stored.ifIdle)?.streamOptions,
+  );
+  const fields: Array<[string, unknown]> = [
+    ['inputData', stored.inputData],
+    ['initialState', stored.initialState],
+    ...values('a requestContext value', stored.requestContext),
+    ...values('a providerOptions value', stored.providerOptions),
+    ...values(
+      'an ifIdle.streamOptions.requestContext value',
+      streamOptions?.requestContext,
+    ),
+  ];
+  const deep = fields.find(([, value]) => exceedsRunInputDepth(value));
+  if (deep) return deep[0];
+  return exceedsDepth(target, MAX_RUN_INPUT_DEPTH + 4)
+    ? 'the schedule target'
+    : undefined;
+}
+
 function normalizeAndSanitizeWorkflowTarget(
   stored: WorkflowScheduleTarget,
 ): WorkflowScheduleTarget | undefined {
@@ -566,7 +603,8 @@ function scheduleTickDispatchRef(
       stored === null ||
       typeof stored !== 'object' ||
       Array.isArray(stored) ||
-      (stored as { type?: unknown }).type !== 'workflow'
+      (stored as { type?: unknown }).type !== 'workflow' ||
+      deepScheduleTargetField(stored) !== undefined
     ) {
       return undefined;
     }
@@ -598,7 +636,8 @@ function scheduleTickDispatchRef(
     stored === null ||
     typeof stored !== 'object' ||
     Array.isArray(stored) ||
-    (stored as { type?: unknown }).type !== 'agent'
+    (stored as { type?: unknown }).type !== 'agent' ||
+    deepScheduleTargetField(stored) !== undefined
   ) {
     return undefined;
   }
@@ -855,14 +894,23 @@ export function createScheduleTick(
     for (const trigger of pending) {
       const ref = scheduleTickDispatchRef(trigger.metadata?.dispatchRef);
       if (!ref) {
-        result.failed += 1;
-        result.reconciled += 1;
-        await store.recordTrigger({
-          ...trigger,
-          outcome: 'failed',
-          error: 'stored deferred dispatch is malformed',
-          metadata: triggerMetadata({ reason: 'invalid-deferred-dispatch' }),
-        });
+        try {
+          await store.recordTrigger({
+            ...trigger,
+            outcome: 'failed',
+            error: 'stored deferred dispatch is malformed',
+            metadata: triggerMetadata({ reason: 'invalid-deferred-dispatch' }),
+          });
+          result.failed += 1;
+          result.reconciled += 1;
+        } catch (bookkeepingError) {
+          result.deferred += 1;
+          logBookkeepingError(
+            trigger.scheduleId,
+            trigger.runId ?? undefined,
+            bookkeepingError,
+          );
+        }
         continue;
       }
       try {
@@ -1169,6 +1217,25 @@ export function createScheduleTick(
         target: targetType,
         outcome: 'failed',
         reason,
+      });
+      return;
+    }
+
+    const deepField = deepScheduleTargetField(schedule.target);
+    if (deepField !== undefined) {
+      result.failed += 1;
+      await store.recordTrigger({
+        ...claimTrigger,
+        runId: null,
+        outcome: 'failed',
+        error: runInputDepthMessage(deepField),
+        metadata: triggerMetadata({ reason: 'input-too-deep' }),
+      });
+      await audit({
+        scheduleId: schedule.id,
+        target: targetType,
+        outcome: 'failed',
+        reason: 'input-too-deep',
       });
       return;
     }
@@ -1589,7 +1656,15 @@ export function createScheduleTick(
       reconciled: 0,
       lost: 0,
     };
-    await reconcileDeferred(result);
+    // Reconciliation and the due fires are independent: a failed deferred
+    // listing still lets every due schedule fire, and then fails the pass so
+    // the maintenance duty reports it.
+    let reconcileFailure: { error: unknown } | undefined;
+    try {
+      await reconcileDeferred(result);
+    } catch (error) {
+      reconcileFailure = { error };
+    }
     for (const schedule of due) {
       // Per-schedule isolation: one wedged row (an unexpected store/audit throw)
       // must not abort the pass and strand every due schedule behind it.
@@ -1606,6 +1681,7 @@ export function createScheduleTick(
         );
       }
     }
+    if (reconcileFailure) throw reconcileFailure.error;
     return result;
   };
 }

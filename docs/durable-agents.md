@@ -388,6 +388,7 @@ The router:
 - lists deployment schedules under role checks;
 - limits schedule count and fire rate;
 - rejects reserved request-context keys on workflow and agent targets;
+- refuses with 400 a target whose `inputData`, `initialState`, request-context value, `providerOptions` value or `ifIdle.streamOptions.requestContext` value nests more than 256 levels deep, on create and update;
 - exposes trigger history as read-only data.
 
 The tick:
@@ -399,6 +400,9 @@ The tick:
 - consults the unattended-run cap when the host configures one;
 - starts workflow targets through `RunnerRuntime`;
 - starts agent targets through the injected thread topology callback;
+- records a fire whose stored target holds a value nested more than 256 levels deep as `failed` (`input-too-deep`) without dispatching it, whichever writer stored the target;
+- settles a deferred fire whose stored dispatch holds such a value as `failed` (`invalid-deferred-dispatch`) without a status lookup;
+- fires the due schedules when reconciling deferred fires fails, then fails the pass with that error;
 - isolates each schedule's failure and records the actual joined run id.
 
 A threadless agent schedule passes its stored `providerOptions` through the thread host's start check. A threaded fire carries them as the signal's message-level options whether the thread is busy or idle. On an idle wake, the host also forwards them as call-level options and applies `assertAcceptedCallProviderOptions()`. The guarded input chain reads message-level options on an idle wake, but an active run drains the signal after that chain runs. The starter's `scheduleProviderOptionsPolicy` denies options when either `providerOptionsCarryContent()` finds model-visible content or `assertAcceptedCallProviderOptions()` refuses the call-level options. Hosts that wire this policy should apply both Breakwater checks before the signal is created.

@@ -10,6 +10,7 @@ import type {
 } from '@mastra/core/storage';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { nestedArray } from '../../test-support/deep-json.js';
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 
 import {
@@ -29,6 +30,7 @@ import {
   InvalidMutationEpochError,
   MutationEpochMismatchError,
 } from '../do-runner/index.js';
+import { runInputDepthMessage } from '../do-runner/run-input-depth.js';
 import { RunRouteError } from '../host-kit/index.js';
 import {
   FENCED_SCHEDULE_STORAGE,
@@ -674,6 +676,91 @@ describe('createScheduleRouter — create', () => {
     expect(res.status).toBe(400);
     expect(res.body.error).toMatch(/surprise/);
   });
+
+  const AGENT_CREATE = { agentId: 'a1', prompt: 'go', cron: '*/5 * * * *' };
+
+  /** Create bodies whose one tenant value nests `levels` levels deep. */
+  const targetValueBodies = (levels: number) => [
+    {
+      field: 'inputData',
+      body: {
+        ...WORKFLOW_CREATE,
+        inputData: { topic: nestedArray(levels - 1) },
+      },
+    },
+    {
+      field: 'initialState',
+      body: {
+        ...WORKFLOW_CREATE,
+        initialState: { step: nestedArray(levels - 1) },
+      },
+    },
+    {
+      field: 'a requestContext value',
+      body: {
+        ...WORKFLOW_CREATE,
+        requestContext: { app: nestedArray(levels) },
+      },
+    },
+    {
+      field: 'a providerOptions value',
+      body: {
+        ...AGENT_CREATE,
+        providerOptions: { vendor: nestedArray(levels) },
+      },
+    },
+    {
+      field: 'an ifIdle.streamOptions.requestContext value',
+      body: {
+        ...AGENT_CREATE,
+        threadId: 'acme_thread',
+        resourceId: 'acme_resource',
+        ifIdle: {
+          streamOptions: { requestContext: { app: nestedArray(levels) } },
+        },
+      },
+    },
+  ];
+
+  it.each(
+    targetValueBodies(257),
+  )('400s + audits a schedule whose $field nests more than 256 levels, storing nothing', async ({
+    field,
+    body,
+  }) => {
+    // #given a create body with one tenant value nested 257 levels deep
+    const { call, store, events } = harness(ctx('acme', 'operator'));
+
+    // #when it is posted
+    const res = await call('POST', '/api/schedules', body);
+
+    // #then it is refused for that field, audited, and nothing is stored
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe(runInputDepthMessage(field));
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        operation: 'create',
+        outcome: 'rejected',
+        reason: 'input-too-deep',
+      }),
+    );
+    expect(store.m.size).toBe(0);
+  });
+
+  it.each(
+    targetValueBodies(256),
+  )('creates a schedule whose $field nests exactly 256 levels', async ({
+    body,
+  }) => {
+    // #given a create body with one tenant value at the bound
+    const { call } = harness(ctx('acme', 'operator'));
+
+    // #when it is posted
+    const res = await call('POST', '/api/schedules', body);
+
+    // #then it is accepted
+    expect(res.status).toBe(201);
+  });
 });
 
 describe('createScheduleRouter — resource-scoped reads', () => {
@@ -811,6 +898,28 @@ describe('createScheduleRouter — mutations', () => {
         reason: 'reserved-context-key',
       }),
     );
+  });
+
+  it('update 400s an inputData nested more than 256 levels and keeps the stored target', async () => {
+    // #given a stored workflow schedule
+    const { call, store, events, id } = await seed();
+    const before = store.m.get(id)?.target;
+
+    // #when an update nests its inputData 257 levels deep
+    const res = await call('PATCH', `/api/schedules/${id}`, {
+      inputData: { topic: nestedArray(256) },
+    });
+
+    // #then it is refused and audited, and the stored target is unchanged
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe(runInputDepthMessage('inputData'));
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        operation: 'update',
+        reason: 'input-too-deep',
+      }),
+    );
+    expect(store.m.get(id)?.target).toEqual(before);
   });
 
   it('update rejects a reserved key in the agent ifIdle.streamOptions.requestContext', async () => {

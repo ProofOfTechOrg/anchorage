@@ -541,6 +541,7 @@ export function createRunRouter(options: RunRouterOptions): RunRouter {
         assertRunInputDepth('inputData', inputData);
         for (const value of Object.values(requestContext ?? {}))
           assertRunInputDepth('a requestContext value', value);
+        assertRunInputDepth('deadlineMs', deadlineMs);
         body.requestContext = requestContext;
         await options.beforeStart?.(
           context,
@@ -730,10 +731,14 @@ export function createRunRouter(options: RunRouterOptions): RunRouter {
         runId
       ) {
         const body = (await readJson(request)) ?? {};
-        assertRunInputDepth(
-          'resumeData',
-          (body as { resumeData?: unknown }).resumeData,
-        );
+        // The refusal names no other key: a caller's key can be as long as
+        // the body.
+        if (typeof body === 'object')
+          for (const [field, value] of Object.entries(body))
+            assertRunInputDepth(
+              field === 'resumeData' ? field : 'a resume body field',
+              value,
+            );
         await options.beforeResume?.(context, workflowId, runId, body);
         return json(
           await options.resume(

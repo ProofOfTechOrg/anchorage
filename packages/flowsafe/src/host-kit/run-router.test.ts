@@ -1472,8 +1472,9 @@ describe('createRunRouter — run input nested past 256 levels', () => {
     runId,
     inputData,
     requestContext,
+    deadlineMs,
   }) => {
-    JSON.stringify({ inputData, requestContext });
+    JSON.stringify({ inputData, requestContext, deadlineMs });
     return { runId, status: 'success' };
   };
 
@@ -1483,6 +1484,7 @@ describe('createRunRouter — run input nested past 256 levels', () => {
       'a requestContext value',
       `{"workflowId":"open-flow","requestContext":{"app":${deep}}}`,
     ],
+    ['deadlineMs', `{"workflowId":"open-flow","deadlineMs":${deep}}`],
   ])('answers 400 for %s nested that deep and starts nothing', async (_, body) => {
     // #given a host whose start serializes its input
     const start = vi.fn(serializing);
@@ -1497,17 +1499,18 @@ describe('createRunRouter — run input nested past 256 levels', () => {
   });
 
   it.each([
-    ['257 levels', JSON.stringify(nestedArray(257))],
-    ['far past the serializer depth', deep],
-  ])('claims no reservation for a keyed start whose input nests %s', async (_, inputData) => {
+    ['inputData', '257 levels', JSON.stringify(nestedArray(257))],
+    ['inputData', 'far past the serializer depth', deep],
+    ['deadlineMs', 'far past the serializer depth', deep],
+  ])('claims no reservation for a keyed start whose %s nests %s', async (field, _, value) => {
     // #given a keyed host whose start serializes its input
     const start = vi.fn(serializing);
     const { handle, store } = keyedHarness({ start });
 
-    // #when a keyed start arrives whose input nests past 256 levels
+    // #when a keyed start arrives whose field nests past 256 levels
     const response = await handle(
       req('/runs', {
-        body: `{"workflowId":"open-flow","idempotencyKey":"deep-key","inputData":${inputData}}`,
+        body: `{"workflowId":"open-flow","idempotencyKey":"deep-key","${field}":${value}}`,
       }),
     );
 
@@ -1533,16 +1536,19 @@ describe('createRunRouter — run input nested past 256 levels', () => {
     expect(started).toHaveLength(1);
   });
 
-  it('answers 400 for resumeData nested that deep and resumes nothing', async () => {
+  it.each([
+    ['resumeData', `{"step":"gate","resumeData":${deep}}`],
+    ['step', `{"step":${deep}}`],
+    ['deadlineMs', `{"step":"gate","deadlineMs":${deep}}`],
+    ['expectedSuspension', `{"step":"gate","expectedSuspension":${deep}}`],
+    ['a field the router does not read', `{"step":"gate","note":${deep}}`],
+  ])('answers 400 for a resume whose %s nests that deep and resumes nothing', async (_, body) => {
     // #given a host and a run its caller owns
     const { handle, resumed } = makeHarness();
 
-    // #when a resume arrives whose data nests far past the serializer's depth
-    const response = await handle(
-      req('/runs/open-flow/r1/resume', {
-        body: `{"step":"gate","resumeData":${deep}}`,
-      }),
-    );
+    // #when a resume arrives whose body field nests far past the
+    // serializer's depth
+    const response = await handle(req('/runs/open-flow/r1/resume', { body }));
 
     // #then it is refused as a bad request before the host resume
     expect(response?.status).toBe(400);
