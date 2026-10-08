@@ -2844,6 +2844,7 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
 
   async uploadNamespacedStateWorker(options: {
     readonly spec: DeploymentSpec;
+    readonly appliedDurableObjectTag?: string | null;
     readonly database: DatabaseReference;
     readonly artifact: import('./types.js').TrustedWorkerArtifact;
     readonly artifactDigest: string;
@@ -2997,7 +2998,12 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
           : undefined,
         keep_bindings: ['secret_text'],
         main_module: options.artifact.mainModule,
-        migrations: dispatchMigrations(stateSpec),
+        migrations: workerMigrations(
+          stateSpec.durableObjectMigrations,
+          options.appliedDurableObjectTag === undefined
+            ? spec.previousDurableObjectTag
+            : (options.appliedDurableObjectTag ?? undefined),
+        ),
         tags: [
           FLEET_SCRIPT_TAG,
           'role:platform-state',

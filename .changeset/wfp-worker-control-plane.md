@@ -16,3 +16,5 @@ Handle Cloudflare’s `script` response field when verifying audit queue consume
 Allow Cloudflare’s empty prebuilt-pipeline metadata when attesting the shared dispatcher’s outbound binding.
 
 Preserve referenced Wasm sidecars in WFP conformance artifacts, verify their digests before upload, and run the exact upload modules in the local verifier.
+
+Select trusted-state Durable Object migrations from the owned live Worker, preserving initial class creation and retries after provider commits.

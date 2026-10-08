@@ -252,6 +252,7 @@ export interface WorkersForPlatformsApi {
   ): Promise<{ artifactVersion: string }>;
   uploadNamespacedStateWorker?(options: {
     readonly spec: DeploymentSpec;
+    readonly appliedDurableObjectTag?: string | null;
     readonly database: DatabaseReference;
     readonly artifact: import('./types.js').TrustedWorkerArtifact;
     readonly artifactDigest: string;
@@ -1085,6 +1086,7 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
       }
       await upload.call(this.#client, {
         spec: externalStateDeploymentSpec(spec, profile),
+        appliedDurableObjectTag: existing.durableObjectTag ?? null,
         database,
         artifact: profile.stateWorker,
         artifactDigest: target.stateArtifactDigest,
@@ -1129,6 +1131,7 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
     try {
       await upload.call(this.#client, {
         spec: externalStateDeploymentSpec(spec, profile),
+        appliedDurableObjectTag: null,
         database,
         artifact: profile.stateWorker,
         artifactDigest: target.stateArtifactDigest,

@@ -2209,6 +2209,10 @@ describe('WorkersForPlatformsBackend', () => {
     });
     expect(client.uploadedControlSpecs).toEqual([]);
     expect(client.controlWorkers.size).toBe(0);
+    expect(client.uploadedNamespacedState.at(-1)).toMatchObject({
+      appliedDurableObjectTag: null,
+      spec: { previousDurableObjectTag: 'state-v1' },
+    });
     expect(client.dispatchWorkers.get(stateName)).toMatchObject({
       databaseIds: ['db-acme'],
       durableObjectBindings: [
@@ -2640,12 +2644,13 @@ describe('WorkersForPlatformsBackend', () => {
       name: deployment.databaseName,
       created: false,
     };
-    const initial = await backend.ensurePlatformResources(
+    const record = platformConvergenceRecord(backend, deployment, database);
+    await backend.ensurePlatformResources(
       deployment,
       database,
       secrets,
       undefined,
-      platformConvergenceRecord(backend, deployment, database),
+      record,
       fence,
     );
     client.calls.length = 0;
@@ -2655,12 +2660,7 @@ describe('WorkersForPlatformsBackend', () => {
       database,
       secrets,
       backend.describeExternalPlatformTarget(deployment),
-      recordWithPlatformResources(
-        backend,
-        deployment,
-        initial.resources,
-        database,
-      ),
+      record,
       fence,
     );
 
@@ -2673,6 +2673,10 @@ describe('WorkersForPlatformsBackend', () => {
       'secrets',
     ]);
     expect(client.uploadedControlSpecs).toEqual([]);
+    expect(client.uploadedNamespacedState.at(-1)).toMatchObject({
+      appliedDurableObjectTag: 'state-v1',
+      spec: { previousDurableObjectTag: 'state-v1' },
+    });
   });
 
   it('rejects persisted ordinary platform resources before provider mutation', async () => {
@@ -3322,12 +3326,15 @@ describe('WorkersForPlatformsBackend', () => {
       ],
       namespaceIds: ['namespace:MaintenanceV1', 'namespace:MaintenanceV2'],
     });
-    expect(client.uploadedNamespacedState.at(-1)?.spec).toMatchObject({
-      previousDurableObjectTag: 'state-v1',
-      durableObjectMigrations: [
-        { tag: 'state-v1', newSqliteClasses: ['MaintenanceV1'] },
-        { tag: 'state-v2', newSqliteClasses: ['MaintenanceV2'] },
-      ],
+    expect(client.uploadedNamespacedState.at(-1)).toMatchObject({
+      appliedDurableObjectTag: 'state-v1',
+      spec: {
+        previousDurableObjectTag: 'state-v1',
+        durableObjectMigrations: [
+          { tag: 'state-v1', newSqliteClasses: ['MaintenanceV1'] },
+          { tag: 'state-v2', newSqliteClasses: ['MaintenanceV2'] },
+        ],
+      },
     });
 
     client.calls.length = 0;
@@ -3345,6 +3352,10 @@ describe('WorkersForPlatformsBackend', () => {
     expect(client.calls).toContain(
       `upload-namespaced:${externalStateScriptName(targetSpec)}`,
     );
+    expect(client.uploadedNamespacedState.at(-1)).toMatchObject({
+      appliedDurableObjectTag: 'state-v2',
+      spec: { previousDurableObjectTag: 'state-v1' },
+    });
   });
 
   it('rejects a same-tag rewrite of persisted trusted-state migration history', async () => {

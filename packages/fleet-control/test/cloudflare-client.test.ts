@@ -336,6 +336,133 @@ describe('CloudflareProvisioningClient', () => {
     ]);
   });
 
+  it.each([
+    {
+      kind: 'fresh state despite a desired v1 cursor',
+      appliedTag: null,
+      previousTag: 'state-v1',
+      appendV2: false,
+      migrations: {
+        new_tag: 'state-v1',
+        steps: [{ new_sqlite_classes: ['Maintenance'] }],
+      },
+    },
+    {
+      kind: 'already applied v1',
+      appliedTag: 'state-v1',
+      previousTag: undefined,
+      appendV2: false,
+      migrations: undefined,
+    },
+    {
+      kind: 'applied v1 advancing to desired v2',
+      appliedTag: 'state-v1',
+      previousTag: 'state-v2',
+      appendV2: true,
+      migrations: {
+        old_tag: 'state-v1',
+        new_tag: 'state-v2',
+        steps: [{ new_sqlite_classes: ['MaintenanceV2'] }],
+      },
+    },
+    {
+      kind: 'unknown applied cursor',
+      appliedTag: 'unknown',
+      previousTag: 'state-v1',
+      appendV2: false,
+      migrations: undefined,
+    },
+    {
+      kind: 'legacy previous cursor without an applied override',
+      appliedTag: undefined,
+      previousTag: 'state-v1',
+      appendV2: true,
+      migrations: {
+        old_tag: 'state-v1',
+        new_tag: 'state-v2',
+        steps: [{ new_sqlite_classes: ['MaintenanceV2'] }],
+      },
+    },
+    {
+      kind: 'legacy initial upload without either cursor',
+      appliedTag: undefined,
+      previousTag: undefined,
+      appendV2: false,
+      migrations: {
+        new_tag: 'state-v1',
+        steps: [{ new_sqlite_classes: ['Maintenance'] }],
+      },
+    },
+  ])('selects namespaced state migrations for $kind', async ({
+    appliedTag,
+    previousTag,
+    appendV2,
+    migrations,
+  }) => {
+    const spec = deployment({
+      durableObjectBindings: [
+        { name: 'MAINTENANCE', className: 'Maintenance' },
+      ],
+      durableObjectMigrations: [
+        { tag: 'state-v1', newSqliteClasses: ['Maintenance'] },
+        ...(appendV2
+          ? [{ tag: 'state-v2', newSqliteClasses: ['MaintenanceV2'] }]
+          : []),
+      ],
+      previousDurableObjectTag: previousTag,
+    });
+    const metadata: Array<Record<string, unknown>> = [];
+    const client = new CloudflareProvisioningClient({
+      accountId: 'account',
+      apiToken: 'inert',
+      dispatchNamespace: 'fleet',
+      rateCoordinator: testRateCoordinator(),
+      fetch: async (input, init) => {
+        const request = new Request(input, init);
+        if (request.url === 'data:,') return new Response('');
+        if (request.method === 'GET')
+          return envelope({
+            namespace_name: 'fleet',
+            trusted_workers: false,
+            script_count: 0,
+          });
+        expect(request.method).toBe('PUT');
+        const form = await request.formData();
+        metadata.push(JSON.parse(String(form.get('metadata'))));
+        return envelope({ etag: 'uploaded-version' });
+      },
+    });
+    const options = {
+      spec,
+      database: { id: 'db-acme', name: spec.databaseName, created: false },
+      artifact: {
+        mainModule: spec.mainModule,
+        modules: spec.modules,
+        compatibilityDate: spec.compatibilityDate,
+      },
+      artifactDigest: 'a'.repeat(64),
+      maintenanceCapabilityPublicKey: 'inert-public-key',
+      sharedOutboundWorkerName: 'fixture-outbound',
+      stateEgressCredentialDigest: 'b'.repeat(64),
+      ...(appliedTag !== undefined
+        ? { appliedDurableObjectTag: appliedTag }
+        : {}),
+    };
+    const upload = fenced(client, () =>
+      client.uploadNamespacedStateWorker(options),
+    );
+    if (appliedTag === 'unknown') {
+      await expect(upload).rejects.toThrow(
+        /absent from the ordered migration history/,
+      );
+      expect(metadata).toEqual([]);
+    } else {
+      await upload;
+      expect(metadata).toHaveLength(1);
+      expect(metadata[0]?.migrations).toEqual(migrations);
+    }
+  });
+
   it('fails closed for unfenced writes and request timeouts outside the lease TTL', async () => {
     let providerWrites = 0;
     const client = new CloudflareProvisioningClient({
