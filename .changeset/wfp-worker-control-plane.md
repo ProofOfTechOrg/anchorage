@@ -12,3 +12,5 @@ Expose FlowSafe's existing maintenance capability and receipt implementation thr
 Accept Cloudflare’s omitted namespace trust flag as its default untrusted mode during provisioning and inventory. Trusted and malformed trust values remain refused.
 
 Handle Cloudflare’s `script` response field when verifying audit queue consumers, avoiding false convergence failures.
+
+Allow Cloudflare’s empty prebuilt-pipeline metadata when attesting the shared dispatcher’s outbound binding.

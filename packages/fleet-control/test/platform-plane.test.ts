@@ -728,6 +728,75 @@ describe('platform plane provisioning', () => {
     ).rejects.toThrow(/drifted role bindings/);
   });
 
+  it('attests dispatch bindings with empty provider pipeline metadata', async () => {
+    class PipelineMetadataClient extends FakePlatformClient {
+      override async inspectControlWorker(scriptName: string) {
+        const inspection = await super.inspectControlWorker(scriptName);
+        if (!inspection) return undefined;
+        return {
+          ...inspection,
+          dispatchNamespaceBindings: inspection.dispatchNamespaceBindings.map(
+            (binding) => ({
+              ...binding,
+              outbound: {
+                ...(binding.outbound as Record<string, unknown>),
+                prebuilt_pipeline_id: null,
+              },
+            }),
+          ),
+        };
+      }
+    }
+
+    await expect(
+      provisionPlatformPlane({
+        client: new PipelineMetadataClient(),
+        store: new FakePlatformStore(),
+        spec: platformSpec(),
+      }),
+    ).resolves.toMatchObject({
+      dispatchArtifactVersion: 'etag:fleet-dispatch',
+    });
+  });
+
+  it.each([
+    {
+      label: 'non-null pipeline',
+      metadata: { prebuilt_pipeline_id: 'foreign-pipeline' },
+    },
+    {
+      label: 'unrelated empty field',
+      metadata: { prebuilt_pipeline_id: null, unexpected: null },
+    },
+  ])('rejects outbound metadata with $label', async ({ metadata }) => {
+    class UnexpectedMetadataClient extends FakePlatformClient {
+      override async inspectControlWorker(scriptName: string) {
+        const inspection = await super.inspectControlWorker(scriptName);
+        if (!inspection) return undefined;
+        return {
+          ...inspection,
+          dispatchNamespaceBindings: inspection.dispatchNamespaceBindings.map(
+            (binding) => ({
+              ...binding,
+              outbound: {
+                ...(binding.outbound as Record<string, unknown>),
+                ...metadata,
+              },
+            }),
+          ),
+        };
+      }
+    }
+
+    await expect(
+      provisionPlatformPlane({
+        client: new UnexpectedMetadataClient(),
+        store: new FakePlatformStore(),
+        spec: platformSpec(),
+      }),
+    ).rejects.toThrow(/drifted role bindings/u);
+  });
+
   it('attests exact binding sets independent of provider response order', async () => {
     class ReorderedBindingsClient extends FakePlatformClient {
       override async uploadControlWorker(spec: {
