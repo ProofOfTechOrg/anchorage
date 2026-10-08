@@ -858,12 +858,10 @@ export type StartRunOptions = {
     readonly reservationToken: string;
   };
   /**
-   * @internal An abort controller the runtime aborts wherever it aborts the
-   * leg: when the liveness touch finds the run settled by another instance,
-   * which can happen before the leg's engine run exists, and when a terminate
-   * or a deadline handled in this isolate cancels the leg, after the engine
-   * run's own abort, with a {@link terminalLegAbortReason}. Never
-   * request-context data.
+   * @internal An abort controller the runtime aborts when it stops the leg, or
+   * when a recorded cancellation or timeout refuses the leg before its engine
+   * run starts. The reason's `cause` names why; a cancellation's or timeout's
+   * reason is a {@link terminalLegAbortReason}. Never request-context data.
    */
   readonly legAbort?: AbortController;
 } & OptionalRunRequester;
@@ -2002,16 +2000,20 @@ export class RunnerRuntime {
           const currentLifecycle = lifecycleFromRequestContext(
             current.requestContext,
           );
-          if (
-            currentLifecycle?.terminal ||
-            currentLifecycle?.transitionIntent ||
-            this.#activeRuns.get(activeKey) !== active
-          )
+          const ending =
+            currentLifecycle?.terminal?.status ??
+            currentLifecycle?.transitionIntent?.status;
+          if (ending || this.#activeRuns.get(activeKey) !== active) {
+            // A leg refused before its engine run exists has nothing for a
+            // cancel to cut, so its abort names the run's end the way a cut
+            // leg's does.
+            if (ending) legAbort?.abort(terminalLegAbortReason(ending));
             throw new RunTerminalConflictError(
               workflowId,
               runId,
               current.status as RunStatus,
             );
+          }
           active.lifecycle = effectiveLifecycle(
             currentLifecycle,
             active.lifecycle,

@@ -39,9 +39,11 @@ export function legAbortReason(cause: Error): Error {
 }
 
 /**
- * The reason a leg's abort carries when a terminal transition handled in its
- * isolate cuts it. Its cause is the run's terminal error: the engine reports
- * such a leg only as `canceled`, whichever transition cut it.
+ * The reason a leg's abort carries when a cancellation or timeout ends it:
+ * one handled in its isolate that cuts it, or one recorded before its engine
+ * run exists, by any instance, that refuses it. Its cause is the run's
+ * terminal error: the engine reports a cut leg only as `canceled`, whichever
+ * transition cut it.
  */
 export function terminalLegAbortReason(status: RunTerminalStatus): Error {
   const { name, message } = runTerminalError(status);
@@ -57,6 +59,17 @@ export function terminalStatusOfLegAbort(
   const { name } = reason.cause;
   return (Object.keys(RUN_TERMINAL_ERRORS) as RunTerminalStatus[]).find(
     (status) => RUN_TERMINAL_ERRORS[status].name === name,
+  );
+}
+
+/**
+ * Whether `reason` is a {@link legAbortReason} for a leg whose run another
+ * instance settled or whose row is no longer stored, so a caller cannot assume
+ * a stored row to read.
+ */
+export function isSettledLegAbort(reason: unknown): boolean {
+  return (
+    reason instanceof Error && reason.cause instanceof RunSettledConflictError
   );
 }
 

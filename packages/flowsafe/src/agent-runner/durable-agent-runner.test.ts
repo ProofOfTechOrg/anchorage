@@ -81,7 +81,6 @@ import {
   InvalidMutationEpochError,
   InvalidRunRequestError,
   type RequestContextProvider,
-  type RunnerRuntime,
   type StartRunOptions,
 } from '../do-runner/index.js';
 import { init } from '../do-runner/init.js';
@@ -91,6 +90,7 @@ import {
   RunSettledConflictError,
 } from '../do-runner/run-lifecycle.js';
 import {
+  RunnerRuntime,
   RunStateUnreadableError,
   UnknownRunError,
 } from '../do-runner/runtime.js';
@@ -4432,6 +4432,28 @@ describe('FlowsafeDurableAgent abort of the model and tool calls in flight', () 
   const TOTAL_BUDGET_MS = 5_000;
   const THREAD = { thread: 'thread-1', resource: 'thread-1' } as const;
   const THREAD_KEY = { threadId: 'thread-1', resourceId: 'thread-1' } as const;
+  /** The lifecycle of a run another instance terminated. */
+  const OTHER_INSTANCE_CANCELLED = {
+    version: 1,
+    revision: 100,
+    terminal: {
+      status: 'cancelled',
+      error: { code: 'CANCELLED', message: 'run was cancelled' },
+      transitionedAt: 1,
+      replayPrincipals: [OPERATOR],
+    },
+  } as const;
+  /** The lifecycle of a run another instance timed out. */
+  const OTHER_INSTANCE_TIMED_OUT = {
+    version: 1,
+    revision: 100,
+    terminal: {
+      status: 'timed_out',
+      error: { code: 'TIMED_OUT', message: 'run deadline expired' },
+      transitionedAt: 1,
+      replayPrincipals: [OPERATOR],
+    },
+  } as const;
 
   afterEach(() => {
     vi.useRealTimers();
@@ -4667,6 +4689,23 @@ describe('FlowsafeDurableAgent abort of the model and tool calls in flight', () 
     };
   }
 
+  type HeldAgent = Awaited<ReturnType<typeof heldToolAgent>>;
+
+  /** The error of each terminal `error` event published on the run's stream, so far. */
+  function terminalErrorsPublished(agent: FlowsafeDurableAgent) {
+    const publish = vi.spyOn(agent.pubsub, 'publish');
+    return () =>
+      publish.mock.calls
+        .filter(
+          ([topic, event]) =>
+            topic === AGENT_STREAM_TOPIC(RUN_ID) &&
+            event.type === AgentStreamEventTypes.ERROR,
+        )
+        .map(
+          ([, event]) => event.data.error as { name: string; message: string },
+        );
+  }
+
   it('aborts the tool call in flight of a start leg whose run another instance settled', async () => {
     // #given a start leg held in its tool call, on a run another instance
     // repaired as an unknown start outcome
@@ -4740,16 +4779,7 @@ describe('FlowsafeDurableAgent abort of the model and tool calls in flight', () 
     });
     const resumed = h.resumeLeg();
     await h.entered.promise;
-    h.settle('canceled', {
-      version: 1,
-      revision: 100,
-      terminal: {
-        status: 'cancelled',
-        error: { code: 'CANCELLED', message: 'run was cancelled' },
-        transitionedAt: 1,
-        replayPrincipals: [OPERATOR],
-      },
-    });
+    h.settle('canceled', OTHER_INSTANCE_CANCELLED);
 
     // #when the leg's touch runs
     await h.runtime.touchRun(h.workflowId, RUN_ID);
@@ -4860,16 +4890,7 @@ describe('FlowsafeDurableAgent abort of the model and tool calls in flight', () 
     await h.startLeg();
     void h.resumeLeg();
     await h.entered.promise;
-    h.settle('canceled', {
-      version: 1,
-      revision: 100,
-      terminal: {
-        status: 'cancelled',
-        error: { code: 'CANCELLED', message: 'run was cancelled' },
-        transitionedAt: 1,
-        replayPrincipals: [OPERATOR],
-      },
-    });
+    h.settle('canceled', OTHER_INSTANCE_CANCELLED);
 
     // #when the leg's touch runs
     await h.runtime.touchRun(h.workflowId, RUN_ID);
@@ -5139,6 +5160,107 @@ describe('FlowsafeDurableAgent abort of the model and tool calls in flight', () 
   });
 
   it.each([
+    [
+      'a cancellation the isolate records',
+      async (h: HeldAgent) => {
+        await expect(
+          h.runtime.cancelActiveExecution(h.workflowId, RUN_ID, 'cancelled', [
+            OPERATOR,
+          ]),
+        ).resolves.toBe(false);
+      },
+    ],
+    [
+      'a cancellation another instance records',
+      async (h: HeldAgent) => {
+        h.settle('canceled', OTHER_INSTANCE_CANCELLED);
+      },
+    ],
+  ])('ends with a cancellation error the stream of a resume that %s refuses while it prepares', async (_source, refuse) => {
+    // #given a run suspended at a tool approval, an observer of its stream,
+    // and a cancellation recorded when the resume's preparation reads the
+    // stream's history
+    const h = await heldToolAgent({ requireApproval: true });
+    await h.startLeg();
+    const watcher = collect((await h.agent.observe(RUN_ID)).fullStream);
+    const { pubsub } = h.agent;
+    const getHistory = pubsub.getHistory.bind(pubsub);
+    vi.spyOn(pubsub, 'getHistory').mockImplementationOnce(
+      async (topic, offset) => {
+        await refuse(h);
+        return getHistory(topic, offset);
+      },
+    );
+
+    // #when the resume finds the cancellation recorded
+    await expect(h.resumeLeg()).rejects.toMatchObject({
+      name: 'RunTerminalConflictError',
+    });
+
+    // #then the observer's stream ends with the cancellation
+    await expectEndedWithError(watcher, 'RunCancelledError');
+  });
+
+  it.each<[string, (h: HeldAgent) => void, (thrown: Error) => string]>([
+    [
+      "after another instance's terminate, with a cancellation error",
+      (h) => h.settle('canceled', OTHER_INSTANCE_CANCELLED),
+      () => 'RunCancelledError',
+    ],
+    [
+      "after another instance's timeout, with a timeout error",
+      (h) => h.settle('timed_out', OTHER_INSTANCE_TIMED_OUT),
+      () => 'RunTimedOutError',
+    ],
+    [
+      "after another instance's terminate, with the leg's own error when the run's status cannot be read",
+      (h) => {
+        h.settle('canceled', OTHER_INSTANCE_CANCELLED);
+        vi.spyOn(h.runtime, 'authoritativeStatus').mockRejectedValueOnce(
+          new Error('status read failed'),
+        );
+      },
+      (thrown) => thrown.name,
+    ],
+    [
+      "after its run row was removed, with the leg's own error",
+      (h) => {
+        h.sql
+          .prepare(
+            'DELETE FROM mastra_workflow_snapshot WHERE workflow_name = ?',
+          )
+          .run(h.workflowId);
+      },
+      (thrown) => thrown.name,
+    ],
+  ])('ends the stream of a resumed leg that the liveness touch aborts %s', async (_label, change, endsWith) => {
+    // #given a run suspended at a tool approval, an observer of its stream,
+    // and a resume held in the approved tool call
+    const h = await heldToolAgent({ requireApproval: true });
+    await h.startLeg();
+    const watcher = collect((await h.agent.observe(RUN_ID)).fullStream);
+    const resumed = h.resumeLeg();
+    await h.entered.promise;
+
+    // #when the run changes under the leg, the leg's touch aborts it and the
+    // tool returns
+    change(h);
+    await h.runtime.touchRun(h.workflowId, RUN_ID);
+    h.release.resolve();
+    const thrown = await resumed.then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+
+    // #then the observer's stream ends with the error the run's stored outcome
+    // names, or with the leg's own error when no outcome is readable, and the
+    // agent holds nothing of the run
+    assert(thrown instanceof Error);
+    await expectEndedWithError(watcher, endsWith(thrown));
+    expect(h.agent.isRunLive(RUN_ID)).toBe(false);
+  });
+
+  it.each([
     ['cancelled', 'RunCancelledError'],
     ['timed_out', 'RunTimedOutError'],
   ] as const)('ends the stream of a start leg the isolate cuts as %s with a %s, then releases the run', async (status, errorName) => {
@@ -5278,6 +5400,72 @@ describe('FlowsafeDurableAgent abort of the model and tool calls in flight', () 
     // holds the run
     expect(emitError).toHaveBeenCalledOnce();
     expect(h.agent.isRunLive(RUN_ID)).toBe(false);
+  });
+
+  it('publishes one terminal error for a start leg that failed after its run suspended and that a terminate then ends', async () => {
+    // #given a start leg whose run suspended at a tool approval and whose
+    // start call then threw, which core published as the run's terminal error
+    const h = await heldToolAgent({ requireApproval: true });
+    const errors = terminalErrorsPublished(h.agent);
+    h.start.mockImplementationOnce(async (...args) => {
+      await RunnerRuntime.prototype.start.apply(h.runtime, args);
+      throw new Error('D1 unavailable');
+    });
+    await expect(h.startLeg()).rejects.toThrow('D1 unavailable');
+    await vi.waitFor(() => expect(errors()).toHaveLength(1));
+    expect(h.agent.isRunLive(RUN_ID)).toBe(true);
+
+    // #when a terminate ends the run and the agent releases it
+    await h.runtime.terminateAsPrincipal(
+      h.workflowId,
+      RUN_ID,
+      OPERATOR,
+      OPERATOR,
+    );
+    await h.agent.releaseEndedRun(RUN_ID);
+
+    // #then core's publication stays the run's only terminal error
+    expect(errors()).toEqual([{ name: 'Error', message: 'D1 unavailable' }]);
+    expect(h.agent.isRunLive(RUN_ID)).toBe(false);
+  });
+
+  it("publishes the cancellation once when the start leg's own publication of it fails", async () => {
+    // #given a start leg the isolate cancelled, whose own publication of the
+    // cancellation fails once
+    const consoleError = vi
+      .spyOn(console, 'error')
+      .mockImplementation(() => undefined);
+    onTestFinished(() => consoleError.mockRestore());
+    const h = await heldToolAgent();
+    const errors = terminalErrorsPublished(h.agent);
+    vi.spyOn(
+      h.agent as unknown as {
+        emitError: (runId: string, error: Error) => Promise<void>;
+      },
+      'emitError',
+    ).mockRejectedValueOnce(new Error('pubsub unavailable'));
+    const leg = h.startLeg();
+    await h.entered.promise;
+    await h.runtime.cancelActiveExecution(h.workflowId, RUN_ID, 'cancelled', [
+      OPERATOR,
+    ]);
+    h.release.resolve();
+    const stream = collect((await leg).fullStream);
+    expect(h.agent.isRunLive(RUN_ID)).toBe(true);
+
+    // #when the terminate that follows ends the run and releases it before
+    // Mastra's cleanup has run
+    await h.runtime.terminateAsPrincipal(
+      h.workflowId,
+      RUN_ID,
+      OPERATOR,
+      OPERATOR,
+    );
+    await h.agent.releaseEndedRun(RUN_ID);
+
+    // #then the stream ends with the cancellation, which was published once
+    await expectEndedWithError(stream, 'RunCancelledError');
+    expect(errors().map(({ name }) => name)).toEqual(['RunCancelledError']);
   });
 
   it('leaves a run that has not ended when a release names it', async () => {

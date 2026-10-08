@@ -62,6 +62,7 @@ import {
   InvalidRunRequestError,
   type LegacyRunState,
   type RequestContextProvider,
+  type ResumeRunOptions,
   RunAlreadyExistsError,
   type RunLeg,
   RunLifecycleBlockedError,
@@ -5197,6 +5198,31 @@ describe('RunnerRuntime run lifecycle', () => {
     return { runtime, entered, release, completed: () => completed };
   }
 
+  /** Starts a resume of a suspended run and returns once its host preparation is held. */
+  async function resumeHeldInPreparation(
+    runtime: RunnerRuntime,
+    runId: string,
+    options: ResumeRunOptions,
+  ) {
+    let preparationEntered!: () => void;
+    let releasePreparation!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      preparationEntered = resolve;
+    });
+    const preparation = new Promise<void>((resolve) => {
+      releasePreparation = resolve;
+    });
+    const resuming = runtime.resume('held-workflow', runId, {
+      ...options,
+      prepareExecution: async () => {
+        preparationEntered();
+        await preparation;
+      },
+    });
+    await entered;
+    return { resuming, releasePreparation };
+  }
+
   it('keeps ordinary start and resume snapshots lifecycle-free', async () => {
     const storage = new InMemoryStore();
     const { runtime } = buildRuntime(storage);
@@ -5672,28 +5698,11 @@ describe('RunnerRuntime run lifecycle', () => {
       inputData: {},
       deadlineMs: 100,
     });
-    let preparationEntered!: () => void;
-    let releasePreparation!: () => void;
-    const entered = new Promise<void>((resolve) => {
-      preparationEntered = resolve;
-    });
-    const preparation = new Promise<void>((resolve) => {
-      releasePreparation = resolve;
-    });
-
-    const resuming = runtime.resume(
-      'held-workflow',
+    const { resuming, releasePreparation } = await resumeHeldInPreparation(
+      runtime,
       'resume-preparation-terminate',
-      {
-        resumeData: { approved: true },
-        deadlineMs: 1_000,
-        prepareExecution: async () => {
-          preparationEntered();
-          await preparation;
-        },
-      },
+      { resumeData: { approved: true }, deadlineMs: 1_000 },
     );
-    await entered;
 
     await expect(
       runtime.cancelActiveExecution(
@@ -5722,6 +5731,41 @@ describe('RunnerRuntime run lifecycle', () => {
       },
     });
     expect(completed()).toBe(false);
+  });
+
+  it.each([
+    ['cancelled', 'RunCancelledError'],
+    ['timed_out', 'RunTimedOutError'],
+  ] as const)("names the recorded %s on the leg's abort when it refuses a resume that is still preparing", async (status, name) => {
+    // #given a run suspended at its step, and a resume whose preparation is
+    // held
+    const { runtime } = heldRuntime({ suspendFirst: true });
+    const runId = `resume-preparation-abort-${status}`;
+    await runtime.start('held-workflow', { runId, inputData: {} });
+    const legAbort = new AbortController();
+    const { resuming, releasePreparation } = await resumeHeldInPreparation(
+      runtime,
+      runId,
+      { resumeData: { approved: true }, legAbort },
+    );
+
+    // #when the transition is recorded while the resume prepares, and the
+    // resume then finds it
+    await expect(
+      runtime.cancelActiveExecution('held-workflow', runId, status, [
+        principal,
+      ]),
+    ).resolves.toBe(false);
+    releasePreparation();
+
+    // #then the resume is refused and its leg's abort names the transition
+    await expect(resuming).rejects.toMatchObject({
+      name: 'RunTerminalConflictError',
+    });
+    expect(legAbort.signal.reason).toMatchObject({
+      name: 'AbortError',
+      cause: { name },
+    });
   });
 
   it('re-drives a persisted core-canceled precursor after runtime eviction', async () => {
