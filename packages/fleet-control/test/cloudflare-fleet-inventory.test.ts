@@ -960,14 +960,19 @@ describe('advanceCloudflareFleetInventoryStage', () => {
     expect(calls).not.toContain('r2:default:');
   });
 
-  it('advances through a host routing KV namespace that is empty', async () => {
+  it.each([
+    false,
+    undefined,
+  ])('inventories an empty untrusted namespace with trusted_workers=%s', async (trustedWorkers) => {
     const { deps } = harness({
       dispatchNamespace: 'anchorage-ns',
       kvPages: [[]],
       dispatchPages: [[]],
       namespaceInventory: {
         namespace_name: 'anchorage-ns',
-        trusted_workers: false,
+        ...(trustedWorkers === undefined
+          ? {}
+          : { trusted_workers: trustedWorkers }),
         script_count: 0,
       },
       domainPages: [[]],
@@ -976,7 +981,8 @@ describe('advanceCloudflareFleetInventoryStage', () => {
       databasePages: [[]],
       namespacePages: [[]],
     });
-    const run = await drive(deps, { ...RICH_OPTIONS, includeR2Buckets: false });
+    const options = { ...RICH_OPTIONS, includeR2Buckets: false };
+    const run = await drive(deps, options);
     expect(run.steps).toEqual([
       'host-kv-keys',
       'dispatch-pages',
@@ -993,6 +999,32 @@ describe('advanceCloudflareFleetInventoryStage', () => {
       'finalize',
     ]);
     expect(details(run.rows)).toEqual([]);
+    const inventory = materializeFleetInventoryGeneration({ ...run, options });
+    expect(inventory.dispatchNamespace).toEqual({
+      name: 'anchorage-ns',
+      trustedWorkers: false,
+      scriptCount: 0,
+    });
+  });
+
+  it.each([
+    true,
+    null,
+    'false',
+    0,
+  ])('reports invalid namespace trust %j', async (trustedWorkers) => {
+    const { deps } = harness({
+      dispatchNamespace: 'anchorage-ns',
+      namespaceInventory: {
+        namespace_name: 'anchorage-ns',
+        trusted_workers: trustedWorkers as boolean,
+        script_count: 0,
+      },
+    });
+    const run = await drive(deps, RICH_OPTIONS);
+    expect(findings(run.rows)).toEqual([
+      expect.objectContaining({ kind: 'trusted-dispatch-namespace' }),
+    ]);
   });
 
   it('advances the offset when a resumed chunk re-reads the same page', async () => {

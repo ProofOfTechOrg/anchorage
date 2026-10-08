@@ -1089,7 +1089,8 @@ export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
       );
     if (
       namespace.namespace_name !== dispatchNamespace ||
-      namespace.trusted_workers !== false
+      (namespace.trusted_workers !== undefined &&
+        namespace.trusted_workers !== false)
     ) {
       throw new Error(
         `dispatch namespace '${dispatchNamespace}' must attest trusted_workers=false`,

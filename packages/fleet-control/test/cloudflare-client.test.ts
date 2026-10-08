@@ -472,7 +472,10 @@ describe('CloudflareProvisioningClient', () => {
     ).toBeUndefined();
   });
 
-  it('creates or reuses only a dispatch namespace that attests trusted_workers=false', async () => {
+  it.each([
+    false,
+    undefined,
+  ])('creates or reuses an untrusted dispatch namespace with trusted_workers=%s', async (trustedWorkers) => {
     const calls: string[] = [];
     const request = vi.fn(
       async (input: string | URL | Request, init?: RequestInit) => {
@@ -490,7 +493,9 @@ describe('CloudflareProvisioningClient', () => {
             namespace_name: 'fleet',
             namespace_id: 'namespace-id',
             script_count: 0,
-            trusted_workers: false,
+            ...(trustedWorkers === undefined
+              ? {}
+              : { trusted_workers: trustedWorkers }),
           });
         }
         if (url.pathname.endsWith('/workers/dispatch/namespaces')) {
@@ -517,7 +522,12 @@ describe('CloudflareProvisioningClient', () => {
     ]);
   });
 
-  it('blocks a dispatch upload when namespace trust is true', async () => {
+  it.each([
+    true,
+    null,
+    'false',
+    0,
+  ])('blocks a dispatch upload when namespace trust is %j', async (trustedWorkers) => {
     let uploaded = false;
     const client = new CloudflareProvisioningClient({
       accountId: 'account',
@@ -537,7 +547,7 @@ describe('CloudflareProvisioningClient', () => {
           return envelope({
             namespace_name: 'fleet',
             script_count: 0,
-            trusted_workers: true,
+            trusted_workers: trustedWorkers,
           });
         }
         throw new Error(`unexpected request ${url.pathname}`);

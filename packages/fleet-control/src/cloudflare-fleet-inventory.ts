@@ -1530,12 +1530,16 @@ async function advanceRegistrationPostprocess(
       ...(inventory.namespace_id
         ? { namespaceId: inventory.namespace_id }
         : {}),
-      trustedWorkers: inventory.trusted_workers,
+      trustedWorkers:
+        inventory.trusted_workers === undefined
+          ? false
+          : inventory.trusted_workers,
       scriptCount: dispatchScriptCount,
     });
     if (
       inventory.namespace_name !== namespace ||
-      inventory.trusted_workers !== false
+      (inventory.trusted_workers !== undefined &&
+        inventory.trusted_workers !== false)
     ) {
       context.sink.finding(
         'trusted-dispatch-namespace',
