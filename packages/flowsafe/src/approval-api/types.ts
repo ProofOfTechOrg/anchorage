@@ -290,7 +290,8 @@ export interface CreateApprovalInput {
    * from RunSummary.suspendedAt by the creating bridge (core clock, so grant
    * minting is clock-free: mint requires record.suspendedAt to EXACTLY match
    * the resumed leg's suspension). A capability-bearing record without it is
-   * inert.
+   * inert. A step record without it resumes the step's current suspension
+   * unchecked.
    */
   suspendedAt?: number;
   /**

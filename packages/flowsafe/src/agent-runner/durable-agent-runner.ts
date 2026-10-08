@@ -2011,7 +2011,10 @@ export class FlowsafeDurableAgent<
    * registration completes on the run's terminal outcome or a resume failure
    * after rehydration, when the wrapper publishes a terminal error. Another
    * suspension keeps blocking the thread until the next resume, as a first leg does.
-   * Hosts expose this only from their trusted approval-decision topology.
+   * Hosts expose this only from their trusted approval-decision topology, and
+   * spread a decided approval's `expectedSuspensionFor(record)` into the
+   * options, so a decision for an earlier suspension of the step is refused
+   * with SuspensionChangedError; without it the resume is unchecked.
    */
   async resumeViaRuntime(options: {
     runId: string;
