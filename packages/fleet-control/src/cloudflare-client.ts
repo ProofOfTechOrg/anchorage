@@ -408,6 +408,7 @@ function d1RestParameters(
 function queueConsumerMatches(
   consumer: Readonly<{
     type?: string;
+    script?: unknown;
     script_name?: string;
     dead_letter_queue?: string;
     settings?: Readonly<{
@@ -421,7 +422,11 @@ function queueConsumerMatches(
 ): boolean {
   return (
     consumer.type === 'worker' &&
-    consumer.script_name === options.scriptName &&
+    (consumer.script === options.scriptName ||
+      consumer.script_name === options.scriptName) &&
+    (!('script' in consumer) || consumer.script === options.scriptName) &&
+    (!('script_name' in consumer) ||
+      consumer.script_name === options.scriptName) &&
     (consumer.dead_letter_queue ?? '') === (options.deadLetterQueue ?? '') &&
     consumer.settings?.batch_size === AUDIT_CONSUMER_SETTINGS.batch_size &&
     consumer.settings.max_concurrency ===

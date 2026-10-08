@@ -10,3 +10,5 @@ Inventory continuations bind the configured namespace and routing KV, and deploy
 Expose FlowSafe's existing maintenance capability and receipt implementation through `@proofoftech/flowsafe/host-kit/maintenance-capability`, allowing control-plane bundles to import it without the host composition graph.
 
 Accept Cloudflare’s omitted namespace trust flag as its default untrusted mode during provisioning and inventory. Trusted and malformed trust values remain refused.
+
+Handle Cloudflare’s `script` response field when verifying audit queue consumers, avoiding false convergence failures.

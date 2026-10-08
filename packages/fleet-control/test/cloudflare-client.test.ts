@@ -2418,6 +2418,163 @@ describe('CloudflareProvisioningClient', () => {
     ]);
   });
 
+  it.each([
+    false,
+    true,
+  ])('accepts the live audit consumer script response (existing: %s)', async (existing) => {
+    const consumer = {
+      consumer_id: 'consumer-id',
+      type: 'worker',
+      script: 'fleet-audit',
+      settings: {
+        batch_size: 100,
+        max_concurrency: 4,
+        max_retries: 5,
+        max_wait_time_ms: 5_000,
+        retry_delay: 0,
+      },
+    };
+    let created = existing;
+    const request = vi.fn(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        const url = new URL(
+          typeof input === 'string'
+            ? input
+            : input instanceof URL
+              ? input.href
+              : input.url,
+        );
+        const method = init?.method ?? 'GET';
+        if (url.pathname.endsWith('/accounts/account/queues')) {
+          return envelope([
+            { queue_id: 'queue-id', queue_name: 'fleet-audit' },
+          ]);
+        }
+        if (
+          url.pathname.endsWith('/accounts/account/queues/queue-id/consumers')
+        ) {
+          if (method === 'POST') {
+            created = true;
+            return envelope(consumer);
+          }
+          return envelope(created ? [consumer] : []);
+        }
+        if (
+          url.pathname.endsWith(
+            '/accounts/account/queues/queue-id/consumers/consumer-id',
+          )
+        ) {
+          return envelope(consumer);
+        }
+        throw new Error(`unexpected Cloudflare request: ${url.href}`);
+      },
+    );
+    const client = new CloudflareProvisioningClient({
+      accountId: 'account',
+      apiToken: 'token',
+      rateCoordinator: testRateCoordinator(),
+      dispatchNamespace: 'fleet',
+      fetch: request,
+    });
+
+    await expect(
+      fenced(client, () =>
+        client.ensureQueueConsumer({
+          queueName: 'fleet-audit',
+          scriptName: 'fleet-audit',
+        }),
+      ),
+    ).resolves.toBeUndefined();
+    expect(request.mock.calls.some(([, init]) => init?.method === 'PUT')).toBe(
+      false,
+    );
+  });
+
+  it.each(
+    ['get', 'list'].flatMap((stage) =>
+      [
+        {},
+        { script: 'other-audit' },
+        { script: 'fleet-audit', script_name: 'other-audit' },
+        { script: 'other-audit', script_name: 'fleet-audit' },
+        { script: 42, script_name: 'fleet-audit' },
+        { script: 'fleet-audit', script_name: null },
+      ].map((aliases) => ({ stage, aliases })),
+    ),
+  )('refuses invalid audit consumer aliases at $stage: $aliases', async ({
+    stage,
+    aliases,
+  }) => {
+    const consumer = {
+      consumer_id: 'consumer-id',
+      type: 'worker',
+      settings: {
+        batch_size: 100,
+        max_concurrency: 4,
+        max_retries: 5,
+        max_wait_time_ms: 5_000,
+      },
+    };
+    let listCount = 0;
+    const client = new CloudflareProvisioningClient({
+      accountId: 'account',
+      apiToken: 'token',
+      rateCoordinator: testRateCoordinator(),
+      dispatchNamespace: 'fleet',
+      fetch: async (input) => {
+        const url = new URL(
+          typeof input === 'string'
+            ? input
+            : input instanceof URL
+              ? input.href
+              : input.url,
+        );
+        if (url.pathname.endsWith('/accounts/account/queues')) {
+          return envelope([
+            { queue_id: 'queue-id', queue_name: 'fleet-audit' },
+          ]);
+        }
+        if (
+          url.pathname.endsWith('/accounts/account/queues/queue-id/consumers')
+        ) {
+          listCount += 1;
+          return envelope([
+            {
+              ...consumer,
+              ...(stage === 'list' && listCount === 2
+                ? aliases
+                : { script: 'fleet-audit' }),
+            },
+          ]);
+        }
+        if (
+          url.pathname.endsWith(
+            '/accounts/account/queues/queue-id/consumers/consumer-id',
+          )
+        ) {
+          return envelope({
+            ...consumer,
+            ...(stage === 'get' ? aliases : { script: 'fleet-audit' }),
+          });
+        }
+        throw new Error(`unexpected Cloudflare request: ${url.href}`);
+      },
+    });
+
+    await expect(
+      fenced(client, () =>
+        client.ensureQueueConsumer({
+          queueName: 'fleet-audit',
+          scriptName: 'fleet-audit',
+        }),
+      ),
+    ).rejects.toThrow(
+      stage === 'get'
+        ? 'does not match the requested configuration'
+        : 'does not have exactly one attested consumer',
+    );
+  });
+
   it('updates the sole audit consumer by ID for every configuration difference and re-attests it', async () => {
     const desired = {
       consumer_id: 'consumer-id',
