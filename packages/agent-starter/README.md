@@ -384,9 +384,9 @@ pnpm --filter anchorage-agent-starter conformance:verify
 pnpm test:conformance-config
 ```
 
-`build:conformance` emits `dist/conformance/{candidate,trusted-state-v1,trusted-state-v2}.mjs` and refuses a bundle that is not one self-contained module, whose exported class set differs from its migrations, or that stops parsing when the gate appends its release-two comment. `conformance:verify` runs it first, so both are one command in CI.
+`build:conformance` emits the modules and their referenced Wasm files under `dist/conformance/`, with upload descriptors and Wasm digests in `dist/conformance/anchorage-starter.conformance.json`. `conformance:verify` runs the build first.
 
-`conformance:verify` runs all three under real workerd and drives the contract in the gate's order, including the release update with one approval suspended across it. Four things it cannot prove — platform CPU termination, platform-layer egress denial, namespace and secret retention across a same-name upload, and decommission refusal on a non-empty bucket — are printed at the end of every run.
+`conformance:verify` copies the upload modules declared by the generated configuration into private directories and runs those bytes under workerd without rebundling. It drives the contract in the gate’s order, including the release update with one approval suspended across it, and reports the checks that still require the paid gate.
 
 `test:conformance-config` validates `conformance/anchorage-starter.conformance.json` with fleet control's own validators — both the structural pass and the production deployment-spec pass — and checks the harness wrangler configurations against the same contract. All three commands run in CI.
 
@@ -395,7 +395,7 @@ pnpm test:conformance-config
 Not yet run: it needs a scratch Cloudflare account with a Workers for Platforms subscription. When one exists:
 
 1. `pnpm --filter anchorage-agent-starter build:conformance`.
-2. Copy `conformance/anchorage-starter.conformance.json` and replace the account-specific values, all of which ship as placeholders:
+2. Copy `dist/conformance/anchorage-starter.conformance.json` and replace the account-specific placeholders:
    - `hostRoutingKvId`
    - `routeHostnames.tenanta` and `routeHostnames.tenantb`
    - `maintenanceBaseUrls.tenanta` and `maintenanceBaseUrls.tenantb`
@@ -404,7 +404,7 @@ Not yet run: it needs a scratch Cloudflare account with a Workers for Platforms 
 4. Export `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN`, `FLEET_CONFORMANCE_CONFIG`, `FLEET_MAINTENANCE_CAPABILITY_PRIVATE_JWK`, `FLEET_STATE_EGRESS_ROOT_SECRET`, and `FLEET_CONFORMANCE_APPLICATION_SECRET`. Bundle paths in the configuration resolve from `packages/fleet-control`, which is the runner's working directory.
 5. `pnpm fleet-control:credentialed > proof.json`. The proof goes to standard output; retain it with the release evidence.
 
-Regenerate the configuration with `pnpm --filter anchorage-agent-starter conformance:config` after any change to `src/conformance/contract.json`; that file is the only place binding names, paths, and class names are written.
+After changing `src/conformance/contract.json`, run `pnpm --filter anchorage-agent-starter conformance:config` to update the committed template, then rebuild to generate the upload configuration with the current Wasm descriptors. Use the generated configuration for the paid gate.
 
 ### Delete it
 

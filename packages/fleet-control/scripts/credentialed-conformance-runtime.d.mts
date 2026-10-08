@@ -5,6 +5,7 @@ import type {
   DeploymentSpec,
   DurableObjectMigration,
   ExternalPlatformProfile,
+  WorkerModule,
 } from '../src/types.js';
 
 interface CredentialedDurableObjectBinding {
@@ -51,18 +52,31 @@ export function preflightMaintenanceCapabilityKeyPair(options: {
   readonly canonicalizePublicKey: (value: string) => string;
 }): Readonly<Record<string, unknown>>;
 
+interface CredentialedAuxiliaryWasm {
+  readonly name: string;
+  readonly file: string;
+  readonly sha256: string;
+}
+
 export function loadCredentialedConformanceArtifacts<T>(options: {
   readonly privateJwk: string;
   readonly publicJwk: string;
   readonly canonicalizePublicKey: (value: string) => string;
   readonly workerBundle: string;
   readonly stateWorkerBundles: readonly string[];
+  readonly auxiliaryWasm?: readonly CredentialedAuxiliaryWasm[];
+  readonly stateWorkerAuxiliaryWasm?: readonly (
+    | readonly CredentialedAuxiliaryWasm[]
+    | undefined
+  )[];
   readonly readArtifact: (path: string) => T | Promise<T>;
 }): Promise<
   Readonly<{
     maintenanceCapabilityPrivateKey: Readonly<Record<string, unknown>>;
     workerContent: T;
     stateWorkerContents: readonly T[];
+    workerAdditionalModules: readonly WorkerModule[];
+    stateWorkerAdditionalModules: readonly (readonly WorkerModule[])[];
   }>
 >;
 

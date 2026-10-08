@@ -56,17 +56,26 @@ validateConformanceConfig(config);
 const { canonicalMaintenanceCapabilityPublicKey } = await import(
   '../dist/platform-resources.js'
 );
-const { maintenanceCapabilityPrivateKey, workerContent, stateWorkerContents } =
-  await loadCredentialedConformanceArtifacts({
-    privateJwk: maintenanceCapabilityPrivateJwk,
-    publicJwk: config.platformProfile.maintenanceCapabilityPublicKey,
-    canonicalizePublicKey: canonicalMaintenanceCapabilityPublicKey,
-    workerBundle: config.workerBundle,
-    stateWorkerBundles: config.platformProfile.stateProfiles.map(
-      (profile) => profile.stateWorker.bundle,
-    ),
-    readArtifact: (path) => readFile(resolve(path)),
-  });
+const {
+  maintenanceCapabilityPrivateKey,
+  workerContent,
+  stateWorkerContents,
+  workerAdditionalModules,
+  stateWorkerAdditionalModules,
+} = await loadCredentialedConformanceArtifacts({
+  privateJwk: maintenanceCapabilityPrivateJwk,
+  publicJwk: config.platformProfile.maintenanceCapabilityPublicKey,
+  canonicalizePublicKey: canonicalMaintenanceCapabilityPublicKey,
+  workerBundle: config.workerBundle,
+  stateWorkerBundles: config.platformProfile.stateProfiles.map(
+    (profile) => profile.stateWorker.bundle,
+  ),
+  auxiliaryWasm: config.auxiliaryWasm,
+  stateWorkerAuxiliaryWasm: config.platformProfile.stateProfiles.map(
+    (profile) => profile.stateWorker.auxiliaryWasm,
+  ),
+  readArtifact: (path) => readFile(resolve(path)),
+});
 if (stateEgressRootSecret.length < 32) {
   throw new Error('FLEET_STATE_EGRESS_ROOT_SECRET must contain 32 characters');
 }
@@ -76,7 +85,7 @@ const applicationSecretDescriptor = Object.freeze({
   valueSha256: createHash('sha256').update(applicationSecret).digest('hex'),
 });
 
-function trustedArtifact(configuration, content) {
+function trustedArtifact(configuration, content, additionalModules) {
   return {
     mainModule: configuration.mainModule,
     modules: [
@@ -85,6 +94,7 @@ function trustedArtifact(configuration, content) {
         content,
         contentType: 'application/javascript+module',
       },
+      ...additionalModules,
     ],
     compatibilityDate: configuration.compatibilityDate,
     compatibilityFlags: configuration.compatibilityFlags,
@@ -101,6 +111,7 @@ const stateProfiles = config.platformProfile.stateProfiles.map(
     stateWorker: trustedArtifact(
       profile.stateWorker,
       stateWorkerContents[index],
+      stateWorkerAdditionalModules[index],
     ),
     stateDurableObjectMigrations: profile.stateDurableObjectMigrations,
     organizationEgressHosts: config.platformProfile.organizationEgressHosts,
@@ -218,6 +229,7 @@ function deploymentSpec(tenantTag, release) {
               ]),
         contentType: 'application/javascript+module',
       },
+      ...workerAdditionalModules,
     ],
     authoredBy: 'external',
     schemaVersion: config.schemaVersion,

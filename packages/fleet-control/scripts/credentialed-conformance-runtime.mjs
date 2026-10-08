@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import {
+  createHash,
   createPrivateKey,
   createPublicKey,
   randomBytes,
@@ -204,6 +205,38 @@ export function preflightMaintenanceCapabilityKeyPair(options) {
   return Object.freeze({ ...privateKey });
 }
 
+async function loadAuxiliaryWasm(descriptors, readArtifact) {
+  const modules = [];
+  for (const descriptor of descriptors ?? []) {
+    const content = await readArtifact(descriptor.file);
+    if (!(content instanceof Uint8Array)) {
+      throw new Error(
+        `conformance artifact ${descriptor.name} has invalid Wasm bytes`,
+      );
+    }
+    if (
+      createHash('sha256').update(content).digest('hex') !== descriptor.sha256
+    ) {
+      throw new Error(
+        `conformance artifact ${descriptor.name} has invalid Wasm digest`,
+      );
+    }
+    if (!WebAssembly.validate(content)) {
+      throw new Error(
+        `conformance artifact ${descriptor.name} has invalid Wasm format`,
+      );
+    }
+    modules.push(
+      Object.freeze({
+        name: descriptor.name,
+        content,
+        contentType: 'application/wasm',
+      }),
+    );
+  }
+  return Object.freeze(modules);
+}
+
 export async function loadCredentialedConformanceArtifacts(options) {
   const maintenanceCapabilityPrivateKey = preflightMaintenanceCapabilityKeyPair(
     {
@@ -216,10 +249,24 @@ export async function loadCredentialedConformanceArtifacts(options) {
   const stateWorkerContents = await Promise.all(
     options.stateWorkerBundles.map((bundle) => options.readArtifact(bundle)),
   );
+  const workerAdditionalModules = await loadAuxiliaryWasm(
+    options.auxiliaryWasm,
+    options.readArtifact,
+  );
+  const stateWorkerAdditionalModules = await Promise.all(
+    options.stateWorkerBundles.map((_bundle, index) =>
+      loadAuxiliaryWasm(
+        options.stateWorkerAuxiliaryWasm?.[index],
+        options.readArtifact,
+      ),
+    ),
+  );
   return Object.freeze({
     maintenanceCapabilityPrivateKey,
     workerContent,
     stateWorkerContents: Object.freeze(stateWorkerContents),
+    workerAdditionalModules,
+    stateWorkerAdditionalModules: Object.freeze(stateWorkerAdditionalModules),
   });
 }
 

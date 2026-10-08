@@ -29,16 +29,24 @@
  */
 
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve as resolvePath } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
   DEPLOYMENT_SENTINEL_DDL,
   DEPLOYMENT_SENTINEL_TABLE,
 } from '@proofoftech/flowsafe/deployment-identity-protocol';
+import ts from 'typescript';
 
 import {
   createWorkerdServerLifecycle,
@@ -93,7 +101,97 @@ const APPLICATION_SECRET = 'conformance-local-application-secret';
 let currentStep = 'startup';
 let upstream;
 let temporaryDirectory;
+let artifactConfigurations;
 const lifecycle = createWorkerdServerLifecycle({ port: PORT });
+
+function prepareArtifactConfigurations() {
+  const operatorConfig = JSON.parse(
+    readFileSync(
+      join(packageRoot, 'dist/conformance/anchorage-starter.conformance.json'),
+      'utf8',
+    ),
+  );
+  const candidate = {
+    bundle: operatorConfig.workerBundle,
+    mainModule: operatorConfig.mainModule,
+    auxiliaryWasm: operatorConfig.auxiliaryWasm,
+  };
+  const artifacts = [
+    ['candidate', candidate, false],
+    ['candidate-v2', candidate, true],
+    ...operatorConfig.platformProfile.stateProfiles.map((profile) => [
+      `state-${profile.name}`,
+      profile.stateWorker,
+      false,
+    ]),
+  ];
+  const configurations = new Map();
+  for (const [name, artifact, releaseTwo] of artifacts) {
+    const directory = join(temporaryDirectory, name);
+    mkdirSync(directory, { mode: 0o700 });
+    assert(
+      /^[A-Za-z0-9][A-Za-z0-9._-]*\.(?:mjs|js)$/u.test(artifact.mainModule),
+      `${name} has an invalid main module name`,
+    );
+    const mainPath = join(directory, artifact.mainModule);
+    const bundle = readFileSync(
+      resolvePath(packageRoot, '../fleet-control', artifact.bundle),
+    );
+    writeFileSync(
+      mainPath,
+      releaseTwo
+        ? Buffer.concat([bundle, Buffer.from('\n// conformance-release:2\n')])
+        : bundle,
+      { flag: 'wx', mode: 0o600 },
+    );
+    for (const wasm of artifact.auxiliaryWasm ?? []) {
+      assert(
+        /^[A-Za-z0-9][A-Za-z0-9._-]*\.wasm$/u.test(wasm.name),
+        `${name} has an invalid Wasm module name`,
+      );
+      const bytes = readFileSync(
+        resolvePath(packageRoot, '../fleet-control', wasm.file),
+      );
+      assert(
+        createHash('sha256').update(bytes).digest('hex') === wasm.sha256 &&
+          WebAssembly.validate(bytes),
+        `${name} has an invalid Wasm module: ${wasm.name}`,
+      );
+      writeFileSync(join(directory, wasm.name), bytes, {
+        flag: 'wx',
+        mode: 0o600,
+      });
+    }
+    const configName = `wrangler.${name}.jsonc`;
+    const originalPath = join(CONFIG_DIR, configName);
+    const parsed = ts.parseConfigFileTextToJson(
+      originalPath,
+      readFileSync(originalPath, 'utf8'),
+    );
+    if (parsed.error) {
+      throw new Error(
+        ts.flattenDiagnosticMessageText(parsed.error.messageText, '\n'),
+      );
+    }
+    const configPath = join(temporaryDirectory, configName);
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        ...parsed.config,
+        main: mainPath,
+        base_dir: directory,
+        no_bundle: true,
+        find_additional_modules: true,
+        rules: [
+          { type: 'CompiledWasm', globs: ['**/*.wasm'], fallthrough: false },
+        ],
+      }),
+      { flag: 'wx', mode: 0o600 },
+    );
+    configurations.set(configName, configPath);
+  }
+  return configurations;
+}
 
 function assert(condition, label, detail) {
   if (condition) return;
@@ -247,7 +345,7 @@ function seedDeploymentSentinel() {
       '--persist-to',
       temporaryDirectory,
       '--config',
-      join(CONFIG_DIR, 'wrangler.state-v1.jsonc'),
+      artifactConfigurations.get('wrangler.state-v1.jsonc'),
       '--file',
       sql,
       '--yes',
@@ -274,9 +372,9 @@ function launchWrangler(candidateConfig, stateConfig) {
         '--persist-to',
         temporaryDirectory,
         '--config',
-        join(CONFIG_DIR, candidateConfig),
+        artifactConfigurations.get(candidateConfig),
         '--config',
-        join(CONFIG_DIR, stateConfig),
+        artifactConfigurations.get(stateConfig),
         '--config',
         join(CONFIG_DIR, 'wrangler.harness-outbound.jsonc'),
       ],
@@ -445,6 +543,7 @@ async function probeAudit() {
 
 async function main() {
   temporaryDirectory = mkdtempSync(join(tmpdir(), 'anchorage-conformance-'));
+  artifactConfigurations = prepareArtifactConfigurations();
   await step('preflight and deployment sentinel', async () => {
     await lifecycle.preflight();
     seedDeploymentSentinel();

@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import { isPortablePathSegment } from '../src/export-file-name.ts';
+
 export const CONFORMANCE_CONTRACT_VERSION = 1;
 
 function requireString(value, label) {
@@ -57,6 +59,51 @@ function validateArtifact(artifact, label) {
   requireString(value.bundle, `${label}.bundle`);
   requireString(value.mainModule, `${label}.mainModule`);
   requireString(value.compatibilityDate, `${label}.compatibilityDate`);
+  validateAuxiliaryWasm(
+    value.auxiliaryWasm,
+    value.mainModule,
+    `${label}.auxiliaryWasm`,
+  );
+}
+
+function validateAuxiliaryWasm(artifacts, mainModule, label) {
+  if (artifacts === undefined) return;
+  const names = new Set([mainModule]);
+  for (const [index, artifact] of requireArray(artifacts, label).entries()) {
+    const descriptorLabel = `${label}[${index}]`;
+    const descriptor = requireObject(artifact, descriptorLabel);
+    if (
+      Object.keys(descriptor).length !== 3 ||
+      !Object.keys(descriptor).every((key) =>
+        ['name', 'file', 'sha256'].includes(key),
+      )
+    ) {
+      throw new Error(
+        `conformance config requires ${descriptorLabel} with name, file, and sha256`,
+      );
+    }
+    requireString(descriptor.file, `${descriptorLabel}.file`);
+    const name = requireString(descriptor.name, `${descriptorLabel}.name`);
+    if (
+      name.length > 255 ||
+      !isPortablePathSegment(name) ||
+      !name.endsWith('.wasm') ||
+      names.has(name)
+    ) {
+      throw new Error(
+        `conformance config requires distinct portable ${descriptorLabel}.name`,
+      );
+    }
+    if (
+      typeof descriptor.sha256 !== 'string' ||
+      !/^[a-f0-9]{64}$/u.test(descriptor.sha256)
+    ) {
+      throw new Error(
+        `conformance config requires SHA-256 ${descriptorLabel}.sha256`,
+      );
+    }
+    names.add(name);
+  }
 }
 
 function validateStateProfiles(profile, conformance) {
@@ -142,6 +189,7 @@ export function validateConformanceConfig(value) {
   requireString(value.auditQueueName, 'auditQueueName');
   requireString(value.workerBundle, 'workerBundle');
   requireString(value.mainModule, 'mainModule');
+  validateAuxiliaryWasm(value.auxiliaryWasm, value.mainModule, 'auxiliaryWasm');
   requireString(value.exportDirectory, 'exportDirectory');
   requireString(value.compatibilityDate, 'compatibilityDate');
   if (!Number.isSafeInteger(value.schemaVersion) || value.schemaVersion < 0) {

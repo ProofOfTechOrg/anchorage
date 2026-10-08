@@ -80,6 +80,12 @@ const maintenancePublicKey = canonicalMaintenanceCapabilityPublicKey(
     x: maintenancePrivateKey.x,
   }),
 );
+const wasmBytes = Uint8Array.from([0, 97, 115, 109, 1, 0, 0, 0]);
+const wasmDescriptor = {
+  name: 'hash.wasm',
+  file: './artifacts/hash.wasm',
+  sha256: '93a44bbb96c751218e4c00d479e4c14358122a389acca16205b1e4d0dc5f9476',
+};
 
 function operationalFixture(): {
   plans: Array<{
@@ -292,6 +298,136 @@ describe('credentialed conformance command', () => {
     expect(() => validateConformanceConfig(replaced)).toThrow(/append/u);
   });
 
+  it.each([
+    'tenant',
+    'state',
+  ] as const)('rejects unsafe or ambiguous %s Wasm descriptors', (role) => {
+    const configuration = structuredClone(validConfig);
+    const artifact =
+      role === 'tenant'
+        ? configuration
+        : (
+            configuration.platformProfile as {
+              stateProfiles: Array<{ stateWorker: Record<string, unknown> }>;
+            }
+          ).stateProfiles[0]?.stateWorker;
+    if (!artifact) throw new Error('example has no state artifact');
+    artifact.auxiliaryWasm = [wasmDescriptor];
+    expect(() => validateConformanceConfig(configuration)).not.toThrow();
+    for (const invalid of [
+      null,
+      {},
+      [{ ...wasmDescriptor, name: '../hash.wasm' }],
+      [{ ...wasmDescriptor, name: 'hash.js' }],
+      [{ ...wasmDescriptor, name: 'CON.wasm' }],
+      [{ ...wasmDescriptor, file: '' }],
+      [{ ...wasmDescriptor, sha256: 'invalid' }],
+      [wasmDescriptor, wasmDescriptor],
+    ]) {
+      artifact.auxiliaryWasm = invalid;
+      expect(() => validateConformanceConfig(configuration)).toThrow(
+        /auxiliaryWasm/u,
+      );
+    }
+    artifact.auxiliaryWasm = [wasmDescriptor];
+    artifact.mainModule = wasmDescriptor.name;
+    expect(() => validateConformanceConfig(configuration)).toThrow(
+      /auxiliaryWasm/u,
+    );
+  });
+
+  it('loads tenant and state Wasm modules with their upload names and unchanged bytes', async () => {
+    const stateWasm = Uint8Array.from([
+      0, 97, 115, 109, 1, 0, 0, 0, 0, 2, 1, 120,
+    ]);
+    const artifactPaths: string[] = [];
+    const loaded = await loadCredentialedConformanceArtifacts({
+      privateJwk: JSON.stringify(maintenancePrivateKey),
+      publicJwk: maintenancePublicKey,
+      canonicalizePublicKey: canonicalMaintenanceCapabilityPublicKey,
+      workerBundle: './tenant.mjs',
+      stateWorkerBundles: ['./state-v1.mjs', './state-v2.mjs'],
+      auxiliaryWasm: [wasmDescriptor],
+      stateWorkerAuxiliaryWasm: [
+        undefined,
+        [
+          {
+            name: 'state.wasm',
+            file: './artifacts/state.wasm',
+            sha256:
+              'c50e86a2eac362a08107aabb3dfcba703070886e64810653a07b57c6da6a1307',
+          },
+        ],
+      ],
+      readArtifact: (path) => {
+        artifactPaths.push(path);
+        if (path === './artifacts/hash.wasm') return wasmBytes;
+        if (path === './artifacts/state.wasm') return stateWasm;
+        return new TextEncoder().encode(`export default '${path}'`);
+      },
+    });
+    expect(loaded.workerAdditionalModules).toEqual([
+      {
+        name: 'hash.wasm',
+        content: wasmBytes,
+        contentType: 'application/wasm',
+      },
+    ]);
+    expect(loaded.stateWorkerAdditionalModules).toEqual([
+      [],
+      [
+        {
+          name: 'state.wasm',
+          content: stateWasm,
+          contentType: 'application/wasm',
+        },
+      ],
+    ]);
+    expect(new TextDecoder().decode(loaded.workerContent)).toBe(
+      "export default './tenant.mjs'",
+    );
+    expect(
+      loaded.stateWorkerContents.map((bytes) =>
+        new TextDecoder().decode(bytes),
+      ),
+    ).toEqual([
+      "export default './state-v1.mjs'",
+      "export default './state-v2.mjs'",
+    ]);
+    expect(artifactPaths).toEqual(
+      expect.arrayContaining([
+        './artifacts/hash.wasm',
+        './artifacts/state.wasm',
+      ]),
+    );
+  });
+
+  it.each([
+    ['digest mismatch', wasmBytes, '0'.repeat(64), /Wasm digest/u],
+    [
+      'invalid binary',
+      Uint8Array.from([1, 2, 3]),
+      '039058c6f2c0cb492c533b0a4d14ef77cc0f78abccced5287d84a1a2011cfb81',
+      /Wasm format/u,
+    ],
+    ['non-binary content', 'not bytes', wasmDescriptor.sha256, /Wasm bytes/u],
+  ])('rejects Wasm %s before provider construction', async (_case, content, sha256, error) => {
+    let providerConstructions = 0;
+    await expect(async () => {
+      await loadCredentialedConformanceArtifacts({
+        privateJwk: JSON.stringify(maintenancePrivateKey),
+        publicJwk: maintenancePublicKey,
+        canonicalizePublicKey: canonicalMaintenanceCapabilityPublicKey,
+        workerBundle: './tenant.mjs',
+        stateWorkerBundles: [],
+        auxiliaryWasm: [{ ...wasmDescriptor, sha256 }],
+        readArtifact: () => content,
+      });
+      providerConstructions += 1;
+    }).rejects.toThrow(error);
+    expect(providerConstructions).toBe(0);
+  });
+
   it('rejects a malformed signer before nonexistent artifacts are read or a provider is constructed', async () => {
     const configuration = structuredClone(validConfig);
     configuration.workerBundle = '/does/not/exist/worker.mjs';
@@ -313,6 +449,7 @@ describe('credentialed conformance command', () => {
         stateWorkerBundles: platformProfile.stateProfiles.map(
           (profile) => profile.stateWorker.bundle,
         ),
+        auxiliaryWasm: [wasmDescriptor],
         readArtifact: async (path) => {
           artifactReads += 1;
           return readFileSync(path);

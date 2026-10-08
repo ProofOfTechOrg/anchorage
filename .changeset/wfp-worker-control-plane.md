@@ -14,3 +14,5 @@ Accept Cloudflare’s omitted namespace trust flag as its default untrusted mode
 Handle Cloudflare’s `script` response field when verifying audit queue consumers, avoiding false convergence failures.
 
 Allow Cloudflare’s empty prebuilt-pipeline metadata when attesting the shared dispatcher’s outbound binding.
+
+Preserve referenced Wasm sidecars in WFP conformance artifacts, verify their digests before upload, and run the exact upload modules in the local verifier.
