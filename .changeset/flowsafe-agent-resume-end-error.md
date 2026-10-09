@@ -1,5 +1,0 @@
----
-"@proofoftech/flowsafe": patch
----
-
-A durable-agent run cancelled or timed out while an approval resume prepares its leg now ends its run stream with `RunCancelledError` (`RunTimedOutError` for a timeout), whether the thread object or another instance recorded the transition; before this change the stream ended with `RunTerminalConflictError`, whose message named the run's stored status: `suspended` while only the transition's intent was recorded, or the settled status for another instance's terminal record. A resumed leg that a cancellation or timeout cut in this isolate and that then throws now ends its stream the same way, instead of with the thrown error. A resumed leg that another instance's settlement aborts, such as a terminate the new instance handles during a deploy, now ends its run stream with the error of the run's stored outcome, `RunCancelledError` for a terminate, instead of `RunSettledConflictError`; when the run's row is gone or its status cannot be read, the stream ends with the leg's own error. The approval resume's response is unchanged.
