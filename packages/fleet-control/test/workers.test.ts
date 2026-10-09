@@ -355,22 +355,21 @@ describe('platform Workers', () => {
       [STATE_EGRESS_HEADERS.routeHostname]: 'dispatch.example.test',
       [STATE_EGRESS_HEADERS.policyId]: 'policy-acme-production',
     });
-    const entrypoint = new StateEgress(
-      {},
-      {
-        HOSTS: { get: vi.fn(async () => JSON.stringify(target)) },
-        scriptName: '',
-        tenantTag: '',
-        environment: '',
-        policyId: '',
-      },
-    );
+    const env = {
+      HOSTS: { get: vi.fn(async () => JSON.stringify(target)) },
+      scriptName: '',
+      tenantTag: '',
+      environment: '',
+      policyId: '',
+    };
 
-    const allowed = await entrypoint.fetch(
+    const allowed = await StateEgress.fetch(
       new Request('https://api.example.com/data', { headers }),
+      env,
     );
-    const denied = await entrypoint.fetch(
+    const denied = await StateEgress.fetch(
       new Request('https://evil.example.net/data', { headers }),
+      env,
     );
 
     expect(await allowed.text()).toBe('upstream');
@@ -388,17 +387,7 @@ describe('platform Workers', () => {
         credentialDigest: createHash('sha256').update(credential).digest('hex'),
       },
     };
-    const entrypoint = new StateEgress(
-      {},
-      {
-        HOSTS: { get: vi.fn(async () => JSON.stringify(target)) },
-        scriptName: '',
-        tenantTag: '',
-        environment: '',
-        policyId: '',
-      },
-    );
-    const response = await entrypoint.fetch(
+    const response = await StateEgress.fetch(
       new Request('https://api.example.com/data', {
         headers: {
           [STATE_EGRESS_HEADERS.credential]: credential,
@@ -410,6 +399,13 @@ describe('platform Workers', () => {
           [STATE_EGRESS_HEADERS.policyId]: 'policy-acme-production',
         },
       }),
+      {
+        HOSTS: { get: vi.fn(async () => JSON.stringify(target)) },
+        scriptName: '',
+        tenantTag: '',
+        environment: '',
+        policyId: '',
+      },
     );
 
     expect(response.status).toBe(403);

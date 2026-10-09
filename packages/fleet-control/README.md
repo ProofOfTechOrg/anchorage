@@ -44,6 +44,8 @@ Fleet Control does not install a runtime Wrangler dependency. Keep the selected 
 
 The `workers/*` entries are deployment artifacts for the platform's own Workers.
 
+`StateEgress` is an HTTP handler object. For direct JavaScript invocation, replace `new StateEgress(context, env).fetch(request)` with `StateEgress.fetch(request, env)`. Service bindings continue to use `entrypoint: 'StateEgress'`.
+
 The root entry exposes `plainWorkerIngressModule(spec)` for upload-budget checks and ordinary Worker ingress tests. Keep its returned module separate from the input specification; the backend appends it during upload.
 
 Import `createCloudflareControlPlane` from `cloudflare-control-plane` in a [dedicated trusted control-plane Worker](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/fleet-control.md#run-the-trusted-control-plane-in-a-worker). Supply direct Fleet and quota D1 bindings, a private export R2 binding, and a host-owned Cloudflare token. Authorize incoming operations before calling the factory's methods. Never expose the token, bindings, or factory to a tenant-serving Worker. Queue delivery tokens identify requested work; durable Fleet state determines whether it can advance.

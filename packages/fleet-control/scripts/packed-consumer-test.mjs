@@ -436,6 +436,7 @@ import {
   type FleetOutboundEnv,
 } from '@proofoftech/fleet-control/workers/outbound';
 import type { FleetAuditConsumerEnv } from '@proofoftech/fleet-control/workers/audit-consumer';
+import type { Request as WorkerRequest, Response as WorkerResponse } from '@cloudflare/workers-types';
 
 declare const dispatchEnv: FleetDispatchEnv;
 declare const outboundEnv: FleetOutboundEnv;
@@ -858,7 +859,11 @@ void ProvisioningError;
 void WorkersForPlatformsBackend;
 void WorkersForPlatformsBackendSwitchProvider;
 void WranglerLoopBackend;
-void StateEgress;
+const stateEgressFetch: (
+  request: WorkerRequest,
+  env: FleetOutboundEnv,
+) => Promise<WorkerResponse> = StateEgress.fetch;
+void stateEgressFetch;
 void attestConvergedActiveRoute;
 void attestFleetRecordActiveRoute;
 void auditFleetDrift;
@@ -940,7 +945,7 @@ const [dispatch, outbound, auditConsumer] = await Promise.all([
 assert.equal(typeof dispatch.default.fetch, 'function');
 assert.equal(typeof outbound.default.fetch, 'function');
 assert.equal(typeof outbound.createEgressProxyFetch, 'function');
-assert.equal(typeof outbound.StateEgress, 'function');
+assert.equal(typeof outbound.StateEgress.fetch, 'function');
 assert.equal(typeof auditConsumer.default.queue, 'function');
 
 assert.equal(typeof deploymentSpecDigest, 'function');

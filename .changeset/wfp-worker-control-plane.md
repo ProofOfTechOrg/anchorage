@@ -26,3 +26,5 @@ Relay conformance candidate maintenance requests to trusted state and verify sig
 Project trusted state ownership into dispatch inventory. Remove WFP traffic using complete persisted policy and state-egress authority, retaining migration evidence through bounded teardown and using durable bridge identity during switch rollback.
 
 Preserve published deployments when the final ready-state write fails or its response is lost, keeping retry and export-backed decommission available without destructive provisioning rollback.
+
+Export `StateEgress` as a named HTTP handler so trusted-state service bindings resolve it in the Workers runtime. Direct JavaScript callers must replace `new StateEgress(context, env).fetch(request)` with `StateEgress.fetch(request, env)`. The service-binding entrypoint name and HTTP contract remain unchanged.

@@ -242,18 +242,12 @@ export default {
   },
 };
 
-export class StateEgress {
-  readonly #env: FleetOutboundEnv;
-
-  constructor(_context: unknown, env: FleetOutboundEnv) {
-    this.#env = env;
-  }
-
-  async fetch(request: Request): Promise<Response> {
+export const StateEgress = {
+  async fetch(request: Request, env: FleetOutboundEnv): Promise<Response> {
     const url = new URL(request.url);
     let policy: ResolvedPolicy;
     try {
-      policy = await resolveStatePolicy(request, this.#env);
+      policy = await resolveStatePolicy(request, env);
     } catch (error) {
       console.warn(
         JSON.stringify({
@@ -277,5 +271,5 @@ export class StateEgress {
       return new Response('egress redirect denied', { status: 502 });
     }
     return response;
-  }
-}
+  },
+};
