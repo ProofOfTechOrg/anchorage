@@ -27,9 +27,9 @@ import type { StepResult, WorkflowRunState } from '@mastra/core/workflows';
 import {
   captureD1DomainConfig,
   FencedWorkflowsStorageD1,
-  serializedByKey,
 } from '../do-runner/fenced-workflows-d1.js';
 import type { D1DatabaseBinding } from '../do-runner/index.js';
+import { serializedByKey } from '../do-runner/serialized-by-key.js';
 import { validateTablePrefix } from '../do-runner/table-prefix.js';
 
 export type {
