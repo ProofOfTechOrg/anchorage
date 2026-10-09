@@ -347,8 +347,16 @@ function platformTargetFromUnknown(
     (target.stateEgressCredentialDigest !== undefined &&
       (typeof target.stateEgressCredentialDigest !== 'string' ||
         !isSha256(target.stateEgressCredentialDigest))) ||
-    typeof target.egressArtifactDigest !== 'string' ||
-    !isSha256(target.egressArtifactDigest) ||
+    (target.sharedOutboundWorkerName !== undefined &&
+      (typeof target.sharedOutboundWorkerName !== 'string' ||
+        !isDeploymentScriptName(target.sharedOutboundWorkerName))) ||
+    (target.egressArtifactDigest !== undefined &&
+      (typeof target.egressArtifactDigest !== 'string' ||
+        !isSha256(target.egressArtifactDigest))) ||
+    (target.sharedOutboundWorkerName === undefined) ===
+      (target.egressArtifactDigest === undefined) ||
+    (target.sharedOutboundWorkerName !== undefined &&
+      typeof target.stateEgressCredentialDigest !== 'string') ||
     typeof target.d1SchemaVersion !== 'number' ||
     !Number.isSafeInteger(target.d1SchemaVersion) ||
     target.d1SchemaVersion < 0 ||
@@ -387,7 +395,12 @@ function platformTargetFromUnknown(
           stateEgressCredentialDigest: target.stateEgressCredentialDigest,
         }
       : {}),
-    egressArtifactDigest: target.egressArtifactDigest,
+    ...(typeof target.sharedOutboundWorkerName === 'string'
+      ? { sharedOutboundWorkerName: target.sharedOutboundWorkerName }
+      : {}),
+    ...(typeof target.egressArtifactDigest === 'string'
+      ? { egressArtifactDigest: target.egressArtifactDigest }
+      : {}),
     d1SchemaVersion: target.d1SchemaVersion,
     d1SchemaHistoryDigest: target.d1SchemaHistoryDigest,
     outboundPolicy,
