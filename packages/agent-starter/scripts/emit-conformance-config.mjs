@@ -109,7 +109,7 @@ export function buildConformanceConfig() {
       allowedUpstreamUrl: ALLOWED_UPSTREAM_URL,
       deniedUpstreamUrl: DENIED_UPSTREAM_URL,
       deniedUpstreamStatus: 403,
-      cpuOverLimitStatus: 500,
+      cpuOverLimitStatus: 503,
       applicationVariableName: contract.applicationVariableName,
       applicationVariableValue: contract.applicationVariableValue,
       newDurableObjectBinding: contract.newDurableObjectBinding,

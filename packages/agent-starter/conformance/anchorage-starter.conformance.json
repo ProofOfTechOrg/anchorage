@@ -58,7 +58,7 @@
     "allowedUpstreamUrl": "https://allowed-upstream.replace-me.example/probe",
     "deniedUpstreamUrl": "https://denied-upstream.replace-me.example/probe",
     "deniedUpstreamStatus": 403,
-    "cpuOverLimitStatus": 500,
+    "cpuOverLimitStatus": 503,
     "applicationVariableName": "APPLICATION_MODE",
     "applicationVariableValue": "conformance",
     "newDurableObjectBinding": {
