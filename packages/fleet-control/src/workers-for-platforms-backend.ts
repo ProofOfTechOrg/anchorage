@@ -34,11 +34,11 @@ import {
   canonicalDeploymentEgressPolicy,
   canonicalMaintenanceCapabilityPublicKey,
   durableObjectMigrationHistoryDigest,
+  externalDurableObjectBindings,
   externalEgressProxyScriptName,
   externalPlatformResourceGroupId,
   externalStateDeploymentSpec,
   externalStateScriptName,
-  FLEET_AUDIT_PROXY_BINDING,
   FLEET_AUDIT_PROXY_CLASS_NAME,
   FLEET_AUDIT_PROXY_STATE_BINDING,
   trustedArtifactDigest,
@@ -46,6 +46,7 @@ import {
   validateMaintenanceSigningProfile,
 } from './platform-resources.js';
 import { assertProviderBindingIdentitiesMatchInspection } from './provider-binding-inventory.js';
+import { durableObjectBindingsMatch } from './release-topology.js';
 import { deploymentSpecDigest } from './spec-digest.js';
 import type {
   ActiveRouteAttestation,
@@ -1518,8 +1519,13 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
           'external candidate requires persisted platform resources',
         );
       }
-      const expectedBindings = [
-        ...spec.durableObjectBindings.map((binding) => ({
+      const expectedExternalBindings =
+        spec.authoredBy === 'external'
+          ? externalDurableObjectBindings(spec, platformResources)
+          : undefined;
+      const expectedBindings =
+        expectedExternalBindings ??
+        spec.durableObjectBindings.map((binding) => ({
           ...binding,
           ...(platformResources
             ? {
@@ -1532,23 +1538,7 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
                   : {}),
               }
             : {}),
-        })),
-        ...(spec.authoredBy === 'external' && spec.queueProducer
-          ? [
-              {
-                name: FLEET_AUDIT_PROXY_BINDING,
-                className: FLEET_AUDIT_PROXY_CLASS_NAME,
-                scriptName: platformResources?.stateWorker.scriptName,
-                ...(platformResources?.stateWorker.dispatchNamespace
-                  ? {
-                      dispatchNamespace:
-                        platformResources.stateWorker.dispatchNamespace,
-                    }
-                  : {}),
-              },
-            ]
-          : []),
-      ];
+        }));
       const expectedServiceBindings =
         spec.authoredBy === 'external'
           ? []
@@ -1587,11 +1577,13 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
           existing.tenantTag !== spec.tenantTag ||
           existing.environment !== spec.environment ||
           !isSha256(existing.desiredSpecDigest) ||
-          (spec.authoredBy === 'external' &&
+          (expectedExternalBindings !== undefined &&
             (existing.desiredSpecDigest !== targetDigest ||
               existing.schemaVersion !== spec.schemaVersion ||
-              bindingKeys(existing.durableObjectBindings) !==
-                bindingKeys(expectedBindings) ||
+              !durableObjectBindingsMatch(
+                existing.durableObjectBindings,
+                expectedExternalBindings,
+              ) ||
               JSON.stringify(existing.serviceBindings ?? []) !==
                 JSON.stringify(expectedServiceBindings) ||
               JSON.stringify(existing.queueProducerBindings ?? []) !==
@@ -1675,8 +1667,13 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
           attested.schemaVersion !== spec.schemaVersion ||
           attested.databaseIds.length !== 1 ||
           attested.databaseIds[0] !== database.id ||
-          bindingKeys(attested.durableObjectBindings) !==
-            bindingKeys(expectedBindings) ||
+          (expectedExternalBindings
+            ? !durableObjectBindingsMatch(
+                attested.durableObjectBindings,
+                expectedExternalBindings,
+              )
+            : bindingKeys(attested.durableObjectBindings) !==
+              bindingKeys(expectedBindings)) ||
           JSON.stringify(attested.serviceBindings ?? []) !==
             JSON.stringify(expectedServiceBindings) ||
           JSON.stringify(attested.queueProducerBindings ?? []) !==

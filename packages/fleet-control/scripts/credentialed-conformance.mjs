@@ -488,26 +488,46 @@ async function assertPlatformGroup(deployment, record) {
       candidate.databaseIds[0] === record.databaseId,
     `${spec.tenantTag} candidate and state Worker do not share the exact D1 database`,
   );
+  const expectedCandidateBindings = [
+    ...spec.durableObjectBindings.map(({ name, className }) => ({
+      name,
+      className,
+      stateBindingName: name,
+    })),
+    ...(spec.queueProducer
+      ? [
+          {
+            name: 'AUDIT_PROXY',
+            className: 'FlowsafeFleetAuditProxy',
+            stateBindingName: 'FLEET_AUDIT_PROXY_OBJECT',
+          },
+        ]
+      : []),
+  ];
   assert(
-    candidate.durableObjectBindings.every(
-      (binding) =>
-        binding.scriptName === stateName &&
-        binding.dispatchNamespace === config.dispatchNamespace,
-    ),
-    `${spec.tenantTag} candidate has a Durable Object outside its state Worker`,
-  );
-  if (spec.queueProducer) {
-    assert(
-      candidate.durableObjectBindings.some(
-        (binding) =>
-          binding.name === 'AUDIT_PROXY' &&
-          binding.className === 'FlowsafeFleetAuditProxy' &&
+    candidate.durableObjectBindings.length ===
+      expectedCandidateBindings.length &&
+      expectedCandidateBindings.every((expected) => {
+        const binding = candidate.durableObjectBindings.find(
+          (entry) => entry.name === expected.name,
+        );
+        const stateBinding = state.durableObjectBindings.find(
+          (entry) =>
+            entry.name === expected.stateBindingName &&
+            entry.className === expected.className,
+        );
+        return (
+          binding !== undefined &&
+          stateBinding !== undefined &&
+          binding.className === expected.className &&
           binding.scriptName === stateName &&
-          binding.dispatchNamespace === config.dispatchNamespace,
-      ),
-      `${spec.tenantTag} candidate has no exact remote audit Durable Object`,
-    );
-  }
+          binding.namespaceId === stateBinding.namespaceId &&
+          (binding.dispatchNamespace === undefined ||
+            binding.dispatchNamespace === config.dispatchNamespace)
+        );
+      }),
+    `${spec.tenantTag} candidate does not match its owned state namespaces`,
+  );
   assert(
     (candidate.serviceBindings ?? []).length === 0 &&
       (candidate.queueProducerBindings ?? []).length === 0 &&

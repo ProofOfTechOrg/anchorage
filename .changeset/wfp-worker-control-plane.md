@@ -18,3 +18,5 @@ Allow Cloudflare’s empty prebuilt-pipeline metadata when attesting the shared 
 Preserve referenced Wasm sidecars in WFP conformance artifacts, verify their digests before upload, and run the exact upload modules in the local verifier.
 
 Select trusted-state Durable Object migrations from the owned live Worker, preserving initial class creation and retries after provider commits.
+
+Match remote Durable Object bindings to owned namespace IDs when Cloudflare omits dispatch-namespace metadata, while rejecting conflicting targets. Allow external deployments with reserved application R2 buckets to converge.

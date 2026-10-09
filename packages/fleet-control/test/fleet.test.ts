@@ -1374,9 +1374,13 @@ describe('fleet operations', () => {
       });
 
     await expect(audit([auditBinding])).resolves.toEqual([]);
+    const { dispatchNamespace: _namespace, ...omittedNamespaceBinding } =
+      auditBinding;
+    await expect(audit([omittedNamespaceBinding])).resolves.toEqual([]);
     for (const drifted of [
       [],
       [{ ...auditBinding, dispatchNamespace: 'foreign-namespace' }],
+      [{ ...omittedNamespaceBinding, namespaceId: 'foreign-namespace-id' }],
     ]) {
       await expect(audit(drifted)).resolves.toEqual(
         expect.arrayContaining([
@@ -3017,6 +3021,104 @@ describe('fleet operations', () => {
         }),
       }),
     ).rejects.toThrow(/migration base mismatch/);
+  });
+
+  it('retains the owned dispatch namespace after migrating an omitted provider binding', async () => {
+    class OmittedNamespaceBackend extends ImmutableFleetBackend {
+      override async ensurePlatformResources(deployment: DeploymentSpec) {
+        const result = await super.ensurePlatformResources(deployment);
+        return {
+          ...result,
+          resources: {
+            ...result.resources,
+            stateWorker: {
+              ...result.resources.stateWorker,
+              dispatchNamespace: 'fleet-conformance',
+            },
+          },
+        };
+      }
+
+      override async deployWorker(
+        ...input: Parameters<ImmutableFleetBackend['deployWorker']>
+      ) {
+        const result = await super.deployWorker(...input);
+        const live = this.releases.get(result.physicalScriptName);
+        if (!live) throw new Error('missing migration candidate');
+        const topology = externalReleaseTopology(
+          input[0],
+          input[3] as FleetRecord['platformResources'],
+        );
+        this.releases.set(result.physicalScriptName, {
+          ...live,
+          durableObjectBindings: topology.durableObjectBindings.map(
+            ({ dispatchNamespace: _namespace, ...binding }) => binding,
+          ),
+        });
+        return result;
+      }
+    }
+    const acme = record('acme');
+    const initialSpec: DeploymentSpec = {
+      ...spec(acme, 1),
+      durableObjectBindings: [{ name: 'RUNNER', className: 'Runner' }],
+    };
+    const backend = new OmittedNamespaceBackend();
+    const { resources } = await backend.ensurePlatformResources(initialSpec);
+    const topology = externalReleaseTopology(initialSpec, resources);
+    const physicalScriptName = externalReleaseScriptName(initialSpec);
+    const platformTarget = backend.describeExternalPlatformTarget(initialSpec);
+    const current: FleetRecord = {
+      ...acme,
+      desiredSpecDigest: deploymentSpecDigest(initialSpec),
+      durableObjectBindings: topology.durableObjectBindings,
+      platformResources: resources,
+      platformTarget,
+      outboundPolicy: platformTarget.outboundPolicy,
+      activeRelease: {
+        physicalScriptName,
+        specDigest: deploymentSpecDigest(initialSpec),
+        artifactVersion: acme.artifactVersion,
+        releaseSchemaVersion: initialSpec.schemaVersion,
+        topology,
+      },
+    };
+    backend.routedScriptName = physicalScriptName;
+    backend.releases.set(
+      physicalScriptName,
+      liveFor(current, { scriptName: physicalScriptName }),
+    );
+    const target: DeploymentSpec = {
+      ...spec(current, 2),
+      durableObjectBindings: initialSpec.durableObjectBindings,
+    };
+    const store = storeFor([current]);
+
+    const [migrated] = await migrateFleet({
+      store,
+      records: [current],
+      canaryTenantTags: [],
+      backendFor: () => backend,
+      specFor: () => target,
+      secretsFor: () => ({
+        deploymentIdentity: 'deployment-identity-secret-value-0001',
+        maintenanceAdmin: 'maintenance-admin-secret-value-00001',
+      }),
+    });
+
+    expect(migrated?.phase).toBe('ready');
+    expect(migrated?.activeRelease?.topology?.durableObjectBindings).toEqual([
+      {
+        name: 'RUNNER',
+        className: 'Runner',
+        namespaceId: 'state-worker-acme-RUNNER',
+        scriptName: externalStateScriptName(initialSpec),
+        dispatchNamespace: 'fleet-conformance',
+      },
+    ]);
+    expect(
+      (await store.get('acme', 'production'))?.activeRelease?.topology,
+    ).toEqual(migrated?.activeRelease?.topology);
   });
 
   it('keeps the old route live when an immutable candidate fails exact validation', async () => {

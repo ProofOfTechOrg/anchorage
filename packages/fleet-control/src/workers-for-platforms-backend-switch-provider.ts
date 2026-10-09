@@ -46,6 +46,7 @@ import {
   assertProviderBindingIdentitiesMatchInspection,
   assertSupportedPlainWorkerBindings,
 } from './provider-binding-inventory.js';
+import { durableObjectBindingsMatch } from './release-topology.js';
 import { deploymentSpecDigest } from './spec-digest.js';
 import type {
   ApplicationBindingTopology,
@@ -2609,8 +2610,10 @@ export class WorkersForPlatformsBackendSwitchProvider
           live.artifactVersion !== release.artifactVersion) ||
         live.databaseIds.length !== 1 ||
         live.databaseIds[0] !== input.prior.databaseId ||
-        JSON.stringify(sortedBindingKeys(live.durableObjectBindings)) !==
-          JSON.stringify(sortedBindingKeys(topology.durableObjectBindings)) ||
+        !durableObjectBindingsMatch(
+          live.durableObjectBindings,
+          topology.durableObjectBindings,
+        ) ||
         JSON.stringify(live.serviceBindings ?? []) !==
           JSON.stringify(topology.serviceBindings) ||
         JSON.stringify(live.queueProducerBindings ?? []) !==

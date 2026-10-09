@@ -41,6 +41,7 @@ import {
   assertPlatformDurableObjectHistory,
   reconcilePersistedDatabase,
 } from './provision.js';
+import { durableObjectBindingsMatch } from './release-topology.js';
 import { settlePromotedRoute } from './settlement.js';
 import { deploymentSpecDigest } from './spec-digest.js';
 import type {
@@ -490,22 +491,6 @@ function bindingKey(binding: {
   return `${binding.name}:${binding.className}:${binding.namespaceId}`;
 }
 
-function fullBindingKey(binding: {
-  readonly name: string;
-  readonly className: string;
-  readonly namespaceId: string;
-  readonly scriptName?: string;
-  readonly dispatchNamespace?: string;
-}): string {
-  return [
-    binding.name,
-    binding.className,
-    binding.namespaceId,
-    binding.scriptName ?? '',
-    binding.dispatchNamespace ?? '',
-  ].join(':');
-}
-
 function namedTargetKeys(
   bindings: readonly Readonly<{
     name: string;
@@ -525,8 +510,16 @@ function externalReleaseTopologyFromLive(
   live: LiveDeployment,
   intended: ExternalReleaseTopology,
 ): ExternalReleaseTopology {
+  if (
+    !durableObjectBindingsMatch(
+      live.durableObjectBindings,
+      intended.durableObjectBindings,
+    )
+  ) {
+    throw new Error('migration candidate has drifted Durable Object bindings');
+  }
   return {
-    durableObjectBindings: live.durableObjectBindings,
+    durableObjectBindings: intended.durableObjectBindings,
     serviceBindings: live.serviceBindings ?? [],
     queueProducerBindings: live.queueProducerBindings ?? [],
     secretNames: intended.secretNames,
@@ -1313,12 +1306,10 @@ export async function auditRecordStep(
         detail: `lifecycle release '${release.physicalScriptName}' has no durable binding topology`,
       });
     } else if (
-      JSON.stringify(
-        liveRelease.durableObjectBindings.map(fullBindingKey).sort(),
-      ) !==
-        JSON.stringify(
-          release.topology.durableObjectBindings.map(fullBindingKey).sort(),
-        ) ||
+      !durableObjectBindingsMatch(
+        liveRelease.durableObjectBindings,
+        release.topology.durableObjectBindings,
+      ) ||
       JSON.stringify(namedTargetKeys(liveRelease.serviceBindings ?? [])) !==
         JSON.stringify(namedTargetKeys(release.topology.serviceBindings)) ||
       JSON.stringify(

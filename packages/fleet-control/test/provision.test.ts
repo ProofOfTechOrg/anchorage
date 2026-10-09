@@ -6,6 +6,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { ActiveRouteAttestationError } from '../src/active-route.js';
+import {
+  applicationBindingTopology,
+  reserveApplicationR2Resources,
+} from '../src/application-bindings.js';
 import type {
   BackendSwitchProvider,
   BridgeMutationPlan,
@@ -1445,6 +1449,114 @@ function legacyOnlyBackend(backend: FakeBackend): ProvisioningBackend {
 }
 
 describe('fleet provisioning', () => {
+  it.each([
+    ['omitted namespace', false],
+    ['explicit namespace and reserved R2', true],
+  ] as const)('attests owned external bindings with %s', async (_label, withR2) => {
+    const deployment = spec({
+      authoredBy: 'external',
+      ...(withR2
+        ? {
+            application: {
+              vars: [],
+              secrets: [],
+              r2Buckets: [{ name: 'APPLICATION_FILES' }],
+            },
+          }
+        : {}),
+    });
+    const backend = new FakeBackend('workers-for-platforms');
+    const { resources } = await backend.ensurePlatformResources(deployment);
+    const platformResources = {
+      ...resources,
+      stateWorker: {
+        ...resources.stateWorker,
+        dispatchNamespace: 'fleet-conformance',
+      },
+    };
+    const applicationResources = reserveApplicationR2Resources(deployment);
+    const applicationBindings = applicationBindingTopology(
+      deployment,
+      applicationResources,
+    );
+    const topology = externalReleaseTopology(
+      deployment,
+      platformResources,
+      applicationResources,
+    );
+    const digest = deploymentSpecDigest(deployment);
+    const record = {
+      tenantTag: deployment.tenantTag,
+      environment: deployment.environment,
+      databaseId: DATABASE_ID,
+      backend: backend.kind,
+      platformResources,
+      applicationBindings,
+    };
+    const live = completeLiveDeployment({
+      tenantTag: deployment.tenantTag,
+      environment: deployment.environment,
+      scriptName: deployment.scriptName,
+      databaseId: DATABASE_ID,
+      durableObjectBindings: topology.durableObjectBindings.map(
+        ({ dispatchNamespace, ...binding }) => ({
+          ...binding,
+          ...(withR2 ? { dispatchNamespace } : {}),
+        }),
+      ),
+      serviceBindings: [],
+      queueProducerBindings: [],
+      r2BucketBindings: applicationBindings.r2Buckets,
+      plainTextBindings: {},
+      secretNames: ['DEPLOYMENT_IDENTITY_SECRET'],
+      artifactVersion: 'artifact-v3',
+      desiredSpecDigest: digest,
+      schemaVersion: deployment.schemaVersion,
+      maintenance,
+    });
+
+    expect(() =>
+      assertLiveDeploymentMatches(live, record, deployment, digest),
+    ).not.toThrow();
+    for (const mismatch of [
+      { namespaceId: 'foreign-namespace-id' },
+      { dispatchNamespace: 'foreign-dispatch-namespace' },
+    ]) {
+      expect(() =>
+        assertLiveDeploymentMatches(
+          completeLiveDeployment({
+            ...live,
+            durableObjectBindings: live.durableObjectBindings.map(
+              (binding) => ({ ...binding, ...mismatch }),
+            ),
+          }),
+          record,
+          deployment,
+          digest,
+        ),
+      ).toThrow(/does not exactly match/u);
+    }
+    if (withR2) {
+      expect(() =>
+        assertLiveDeploymentMatches(
+          completeLiveDeployment({
+            ...live,
+            r2BucketBindings: [
+              {
+                name: 'APPLICATION_FILES',
+                bucketName: 'foreign-bucket',
+                jurisdiction: 'default',
+              },
+            ],
+          }),
+          record,
+          deployment,
+          digest,
+        ),
+      ).toThrow(/does not exactly match/u);
+    }
+  });
+
   it('attests empty application bindings exactly while allowing only system-owned variables', () => {
     const deployment = spec();
     const digest = deploymentSpecDigest(deployment);

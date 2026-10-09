@@ -44,6 +44,7 @@ import type {
   DecommissionAttachmentScanResult,
   DeploymentSecrets,
   DeploymentSpec,
+  DurableObjectBindingInventory,
   ExternalMutationFence,
   ExternalPlatformProfile,
   ExternalPlatformResources,
@@ -4141,6 +4142,196 @@ describe('WorkersForPlatformsBackend', () => {
         MAINTENANCE_CAPABILITY_PUBLIC_KEY,
       FLEET_DEPLOYMENT_SCRIPT: platform.scriptName,
       FLEET_RESOURCE_ROLE: 'platform-catalog',
+    });
+  });
+
+  describe.each([
+    'fresh',
+    'retry',
+  ] as const)('%s owned candidate topology', (stage) => {
+    const spec: DeploymentSpec = {
+      ...deployment,
+      durableObjectBindings: [
+        { name: 'MAINTENANCE', className: 'Maintenance' },
+      ],
+      queueProducer: { binding: 'AUDIT_QUEUE', queueName: 'fleet-audit' },
+    };
+    const resources: ExternalPlatformResources = {
+      ...platformResources,
+      stateWorker: {
+        ...platformResources.stateWorker,
+        dispatchNamespace: NAMESPACED_STATE.dispatchNamespace,
+        durableObjectBindings: [
+          {
+            name: 'MAINTENANCE',
+            className: 'Maintenance',
+            namespaceId: 'namespace:Maintenance',
+          },
+          {
+            name: 'FLEET_AUDIT_PROXY_OBJECT',
+            className: 'FlowsafeFleetAuditProxy',
+            namespaceId: 'namespace:FlowsafeFleetAuditProxy',
+          },
+        ],
+        namespaceIds: [
+          'namespace:Maintenance',
+          'namespace:FlowsafeFleetAuditProxy',
+        ],
+      },
+      auditQueueName: 'fleet-audit',
+    };
+    const cases: readonly {
+      label: string;
+      accepted?: boolean;
+      observe: (
+        bindings: readonly DurableObjectBindingInventory[],
+      ) => readonly DurableObjectBindingInventory[];
+    }[] = [
+      {
+        label: 'accepts omitted dispatch namespace with exact owned UUIDs',
+        accepted: true,
+        observe: (bindings) =>
+          bindings
+            .map(({ dispatchNamespace: _, ...binding }) => binding)
+            .reverse(),
+      },
+      {
+        label: 'rejects a foreign namespace UUID',
+        observe: (bindings) =>
+          bindings.map((binding) => ({
+            ...binding,
+            namespaceId: 'namespace:foreign',
+          })),
+      },
+      {
+        label: 'rejects an empty namespace UUID',
+        observe: (bindings) =>
+          bindings.map((binding) => ({ ...binding, namespaceId: '' })),
+      },
+      {
+        label: 'rejects namespace UUIDs assigned to the wrong class',
+        observe: (bindings) =>
+          bindings.map((binding) => ({
+            ...binding,
+            namespaceId:
+              binding.name === 'MAINTENANCE'
+                ? 'namespace:FlowsafeFleetAuditProxy'
+                : 'namespace:Maintenance',
+          })),
+      },
+      {
+        label: 'rejects omitted dispatch namespace with a foreign UUID',
+        observe: (bindings) =>
+          bindings.map(({ dispatchNamespace: _, ...binding }) => ({
+            ...binding,
+            namespaceId: 'namespace:foreign',
+          })),
+      },
+      {
+        label: 'rejects omitted dispatch namespace with a different class',
+        observe: (bindings) =>
+          bindings.map(({ dispatchNamespace: _, ...binding }) => ({
+            ...binding,
+            className: 'Foreign',
+          })),
+      },
+      {
+        label:
+          'rejects omitted dispatch namespace with a different remote script',
+        observe: (bindings) =>
+          bindings.map(({ dispatchNamespace: _, ...binding }) => ({
+            ...binding,
+            scriptName: 'foreign-state',
+          })),
+      },
+      {
+        label: 'rejects an explicit different dispatch namespace',
+        observe: (bindings) =>
+          bindings.map((binding) => ({
+            ...binding,
+            dispatchNamespace: 'foreign',
+          })),
+      },
+      {
+        label: 'rejects a missing binding',
+        observe: (bindings) => bindings.slice(1),
+      },
+      {
+        label: 'rejects a duplicate binding replacing another binding',
+        observe: (bindings) =>
+          bindings.slice(0, 1).flatMap((binding) => [binding, binding]),
+      },
+    ];
+
+    it.each(cases)('$label', async ({ observe, accepted }) => {
+      const client = new FakeApi();
+      client.exists = false;
+      const backend = new WorkersForPlatformsBackend({
+        namespacedState: NAMESPACED_STATE,
+        client,
+        hostRoutingKvId: 'host-routes',
+        auditQueueName: 'fleet-audit',
+      });
+      const database = {
+        id: 'db-acme',
+        name: deployment.databaseName,
+        created: true,
+      };
+      const scriptName = externalReleaseScriptName(spec);
+      if (stage === 'retry') {
+        await backend.deployWorker(
+          spec,
+          database,
+          secrets,
+          resources,
+          fence,
+          'pending',
+        );
+      }
+      const changeBindings = () => {
+        const live = client.dispatchWorkers.get(scriptName);
+        if (!live) throw new Error('missing candidate Worker');
+        client.dispatchWorkers.set(scriptName, {
+          ...live,
+          durableObjectBindings: observe(live.durableObjectBindings),
+        });
+      };
+      if (stage === 'retry') {
+        changeBindings();
+      } else {
+        const upload = client.uploadDispatchWorker.bind(client);
+        vi.spyOn(client, 'uploadDispatchWorker').mockImplementation(
+          async (...args) => {
+            const uploaded = await upload(...args);
+            changeBindings();
+            return uploaded;
+          },
+        );
+      }
+      client.calls.length = 0;
+      const deployed = backend.deployWorker(
+        spec,
+        database,
+        secrets,
+        resources,
+        fence,
+        stage === 'retry' ? 'etag-v1' : 'pending',
+      );
+      if (accepted) {
+        await expect(deployed).resolves.toEqual({
+          artifactVersion: 'etag-v1',
+          created: stage === 'fresh',
+          physicalScriptName: scriptName,
+        });
+        expect(client.uploadedScriptNames).toEqual([scriptName]);
+      } else {
+        await expect(deployed).rejects.toThrow();
+        if (stage === 'retry') {
+          expect(client.calls).toEqual([]);
+        } else {
+          expect(client.deletedScriptNames).toEqual([scriptName]);
+        }
+      }
     });
   });
 

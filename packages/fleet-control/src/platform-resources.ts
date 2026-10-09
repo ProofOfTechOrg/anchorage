@@ -10,6 +10,7 @@ import type { HostRoutingTarget } from './host-routing.js';
 import type {
   DeploymentEgressPolicy,
   DeploymentSpec,
+  DurableObjectBindingInventory,
   DurableObjectMigration,
   ExternalPlatformProfile,
   ExternalPlatformResources,
@@ -205,11 +206,10 @@ export function externalStateDeploymentSpec(
   };
 }
 
-export function externalReleaseTopology(
+export function externalDurableObjectBindings(
   spec: DeploymentSpec,
   resources: ExternalPlatformResources | undefined,
-  applicationResources: readonly import('./types.js').ApplicationR2Resource[] = [],
-): ExternalReleaseTopology {
+): readonly DurableObjectBindingInventory[] {
   if (!resources) {
     throw new Error('external release topology requires platform resources');
   }
@@ -255,8 +255,16 @@ export function externalReleaseTopology(
         : {}),
     });
   }
+  return durableObjectBindings;
+}
+
+export function externalReleaseTopology(
+  spec: DeploymentSpec,
+  resources: ExternalPlatformResources | undefined,
+  applicationResources: readonly import('./types.js').ApplicationR2Resource[] = [],
+): ExternalReleaseTopology {
   return {
-    durableObjectBindings,
+    durableObjectBindings: externalDurableObjectBindings(spec, resources),
     serviceBindings: [],
     queueProducerBindings: [],
     secretNames: [

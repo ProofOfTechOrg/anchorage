@@ -1312,6 +1312,24 @@ describe('backend switch provider teardown authority', () => {
   });
 
   it('deletes a commit-unknown release only from its exact topology and adopts response-loss absence', async () => {
+    const ownedBinding = {
+      name: 'RUNNER',
+      className: 'Runner',
+      namespaceId: 'namespace-runner',
+      scriptName: 'owned-state-worker',
+      dispatchNamespace: 'fleet-conformance',
+    };
+    const ownedRelease: ExternalReleaseSnapshot = {
+      ...release,
+      topology: {
+        durableObjectBindings: [ownedBinding],
+        serviceBindings: [],
+        queueProducerBindings: [],
+        secretNames: ['DEPLOYMENT_IDENTITY_SECRET'],
+        application: release.application,
+      },
+    };
+    const { dispatchNamespace: _namespace, ...observedBinding } = ownedBinding;
     let live:
       | Awaited<ReturnType<BackendSwitchApi['inspectDispatchWorker']>>
       | undefined = completeProviderBindingInspection({
@@ -1321,7 +1339,7 @@ describe('backend switch provider teardown authority', () => {
       desiredSpecDigest: release.specDigest,
       schemaVersion: release.releaseSchemaVersion,
       databaseIds: [prior.databaseId],
-      durableObjectBindings: [],
+      durableObjectBindings: [observedBinding],
       serviceBindings: [],
       queueProducerBindings: [],
       r2BucketBindings: [],
@@ -1369,7 +1387,7 @@ describe('backend switch provider teardown authority', () => {
       tenantTag: targetSpec.tenantTag,
       environment: targetSpec.environment,
       routeHostname: targetSpec.routeHostname,
-      release,
+      release: ownedRelease,
       fence,
     };
 
@@ -1382,7 +1400,31 @@ describe('backend switch provider teardown authority', () => {
     expect(inventory).toBeUndefined();
   });
 
-  it('rejects a commit-unknown release when any live topology edge differs', async () => {
+  it.each([
+    { name: 'FOREIGN' },
+    { className: 'Foreign' },
+    { scriptName: 'foreign-state-worker' },
+    { namespaceId: 'foreign-namespace-id' },
+    { dispatchNamespace: 'foreign-dispatch-namespace' },
+  ])('rejects a commit-unknown release when a remote binding differs: %j', async (mismatch) => {
+    const ownedBinding = {
+      name: 'RUNNER',
+      className: 'Runner',
+      namespaceId: 'namespace-runner',
+      scriptName: 'owned-state-worker',
+      dispatchNamespace: 'fleet-conformance',
+    };
+    const ownedRelease: ExternalReleaseSnapshot = {
+      ...release,
+      topology: {
+        durableObjectBindings: [ownedBinding],
+        serviceBindings: [],
+        queueProducerBindings: [],
+        secretNames: ['DEPLOYMENT_IDENTITY_SECRET'],
+        application: release.application,
+      },
+    };
+    const { dispatchNamespace: _namespace, ...observedBinding } = ownedBinding;
     let revoked = false;
     const subject = provider({
       inspectDispatchWorker: async () =>
@@ -1395,9 +1437,8 @@ describe('backend switch provider teardown authority', () => {
           databaseIds: [prior.databaseId],
           durableObjectBindings: [
             {
-              name: 'FOREIGN',
-              className: 'Foreign',
-              namespaceId: 'namespace-foreign',
+              ...observedBinding,
+              ...mismatch,
             },
           ],
           serviceBindings: [],
@@ -1432,7 +1473,7 @@ describe('backend switch provider teardown authority', () => {
         tenantTag: targetSpec.tenantTag,
         environment: targetSpec.environment,
         routeHostname: targetSpec.routeHostname,
-        release,
+        release: ownedRelease,
         fence,
       }),
     ).rejects.toThrow(/foreign backend-switch release/);

@@ -62,10 +62,12 @@ import {
   describeExternalPlatformTarget,
   durableObjectMigrationHistoryDigest,
   effectiveAppliedPlatformTarget,
+  externalDurableObjectBindings,
   externalReleaseTopology,
 } from './platform-resources.js';
 import { buildPromotionGuard } from './promotion-guard.js';
 import { assertProviderBindingIdentitiesMatchInspection } from './provider-binding-inventory.js';
+import { durableObjectBindingsMatch } from './release-topology.js';
 import { deploymentSpecDigest } from './spec-digest.js';
 import type {
   CleanupAdvanceToken,
@@ -225,16 +227,14 @@ function expectedBindingKeys(
   bindings: readonly Readonly<{
     name: string;
     className: string;
-    namespaceId?: string;
     scriptName?: string;
     dispatchNamespace?: string;
   }>[],
-  includeNamespaceId = false,
 ): readonly string[] {
   return bindings
     .map(
-      ({ name, className, namespaceId, scriptName, dispatchNamespace }) =>
-        `${name}:${className}:${includeNamespaceId ? (namespaceId ?? '') : ''}:${scriptName ?? ''}:${dispatchNamespace ?? ''}`,
+      ({ name, className, scriptName, dispatchNamespace }) =>
+        `${name}:${className}:${scriptName ?? ''}:${dispatchNamespace ?? ''}`,
     )
     .sort();
 }
@@ -269,12 +269,12 @@ export function assertLiveDeploymentMatches(
     },
     `deployment '${record.tenantTag}:${record.environment}'`,
   );
-  const externalTopology =
+  const externalBindings =
     spec.authoredBy === 'external' && record.platformResources
-      ? externalReleaseTopology(spec, record.platformResources)
+      ? externalDurableObjectBindings(spec, record.platformResources)
       : undefined;
   const expectedDurableObjectBindings =
-    externalTopology?.durableObjectBindings ??
+    externalBindings ??
     spec.durableObjectBindings.map((binding) => ({
       ...binding,
       ...(record.platformResources
@@ -282,15 +282,13 @@ export function assertLiveDeploymentMatches(
         : {}),
     }));
   const expectedServiceBindings =
-    externalTopology?.serviceBindings ??
-    (spec.authoredBy === 'external'
+    spec.authoredBy === 'external'
       ? []
       : spec.egressProxyService
         ? [{ name: 'EGRESS_PROXY', service: spec.egressProxyService }]
-        : []);
+        : [];
   const expectedQueueProducerBindings =
-    externalTopology?.queueProducerBindings ??
-    (spec.authoredBy === 'external'
+    spec.authoredBy === 'external'
       ? []
       : spec.queueProducer
         ? [
@@ -299,7 +297,7 @@ export function assertLiveDeploymentMatches(
               queueName: spec.queueProducer.queueName,
             },
           ]
-        : []);
+        : [];
   const application = expectedApplication;
   const expectedApplicationSecrets =
     application?.secrets.map(({ name }) => name) ?? [];
@@ -314,18 +312,13 @@ export function assertLiveDeploymentMatches(
     live.databaseId !== record.databaseId ||
     live.schemaVersion !== spec.schemaVersion ||
     live.desiredSpecDigest !== expectedDigest ||
-    JSON.stringify(
-      expectedBindingKeys(
-        live.durableObjectBindings,
-        externalTopology !== undefined,
-      ),
-    ) !==
-      JSON.stringify(
-        expectedBindingKeys(
-          expectedDurableObjectBindings,
-          externalTopology !== undefined,
-        ),
-      ) ||
+    (externalBindings
+      ? !durableObjectBindingsMatch(
+          live.durableObjectBindings,
+          externalBindings,
+        )
+      : JSON.stringify(expectedBindingKeys(live.durableObjectBindings)) !==
+        JSON.stringify(expectedBindingKeys(expectedDurableObjectBindings))) ||
     JSON.stringify(live.serviceBindings ?? []) !==
       JSON.stringify(expectedServiceBindings) ||
     JSON.stringify(live.queueProducerBindings ?? []) !==
