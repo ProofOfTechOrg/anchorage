@@ -98,6 +98,8 @@ export interface FencedWorkflowAdmissionCapability {
    * `settled`, so report it only when the same storage refuses that leg's later
    * writes over the row, as the settled-row guard does; a capability without
    * such a guard resolves nothing, which is no evidence and aborts nothing.
+   * With `withStoredRun`, the runtime also aborts a leg on `absent` once that
+   * leg stored its row, so report `absent` only for a row that is gone.
    * Without `touchRun` a run whose leg stops is never settled automatically.
    */
   touchRun?(
@@ -125,19 +127,50 @@ export interface FencedWorkflowAdmissionCapability {
    * Write the run's lifecycle, `timestamp` and `updatedAt` and no other part of
    * its snapshot, but only while the stored status is `expected.status`, the
    * stored lifecycle's revision is `expected.lifecycleRevision` (or it has no
-   * lifecycle, when that is omitted), the row is not settled and its lifecycle
-   * records no disputed economic operation; otherwise
-   * resolve `false`, writing nothing. A write that leaves the status and
-   * lifecycle alone, such as a leg's step progress, does not make it miss. It
-   * rejects, writing nothing, a malformed address, expectation or patch.
+   * lifecycle, when that is omitted), the stored lifecycle is exactly
+   * `expected.lifecycle` when that is given, the row is not settled and its
+   * lifecycle records no disputed economic operation; otherwise
+   * resolve `false`, writing nothing. Pass `expected.lifecycle` as read from the
+   * row, with the `lifecycleRevision` it carries: another writer can reach the
+   * same revision with a different lifecycle, and `lifecycle` without the
+   * matching `lifecycleRevision` misses on every attempt.
+   * `FencedWorkflowsStorageD1` compares the stored JSON text, so there a
+   * lifecycle rebuilt from parsed fields, whose keys can come out in another
+   * order, misses as well. A write that leaves the status and lifecycle alone,
+   * such as a leg's step progress, does not make it miss. It rejects, writing
+   * nothing, a malformed address, expectation or patch.
    */
   patchRunLifecycle?(
     address: { workflowId: string; runId: string },
-    expected: { status: string; lifecycleRevision?: number },
+    expected: {
+      status: string;
+      lifecycleRevision?: number;
+      lifecycle?: object;
+    },
     patch: {
       lifecycle: object;
       timestamp: number;
       updatedAt: string;
     },
   ): Promise<boolean>;
+  /**
+   * Run `operation`, a whole leg of the run `scope` names, inside `scope`.
+   * When a write inside it stores the run's row, the storage sets
+   * `scope.rowStored` on the `scope` object it is passed. The runtime also
+   * sets it after a fenced admission and when a resume begins, and reads it in
+   * the liveness touch and in the end-of-leg reconcile. Once it is `true`, a
+   * write of that run that finds no row is refused, writing nothing, with
+   * `RunSettledConflictError`, or with `RunStateNotStorableError` for a
+   * snapshot SQLite cannot parse. Writes of any other run address are not
+   * guarded. A capability that copies `scope` instead of using the object it
+   * is passed loses the insert guard until its own first write.
+   */
+  withStoredRun?<T>(
+    scope: {
+      readonly workflowId: string;
+      readonly runId: string;
+      rowStored: boolean;
+    },
+    operation: () => Promise<T>,
+  ): Promise<T>;
 }

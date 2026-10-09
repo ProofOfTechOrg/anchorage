@@ -128,6 +128,7 @@ import {
   terminalStateFields,
   terminalStateUpdate,
 } from './run-terminal-state.js';
+import { serializedByKey } from './serialized-by-key.js';
 import {
   captureReservation,
   type StartReservationReading,
@@ -162,10 +163,17 @@ export class UnknownRunError extends Error {
   }
 }
 
-export class RunNotSuspendedError extends Error {
-  constructor(workflowId: string, runId: string, status: WorkflowRunStatus) {
+/**
+ * A resume of a run that is not suspended, such as one that has ended: 409 with
+ * `reason.code` `RUN_NOT_SUSPENDED`.
+ */
+export class RunNotSuspendedError extends DoStatusError {
+  readonly status = 409;
+  readonly reason = { code: 'RUN_NOT_SUSPENDED' } as const;
+
+  constructor(workflowId: string, runId: string, runStatus: WorkflowRunStatus) {
     super(
-      `run '${runId}' of workflow '${workflowId}' is '${status}', not 'suspended'`,
+      `run '${runId}' of workflow '${workflowId}' is '${runStatus}', not 'suspended'`,
     );
     this.name = 'RunNotSuspendedError';
   }
@@ -858,12 +866,10 @@ export type StartRunOptions = {
     readonly reservationToken: string;
   };
   /**
-   * @internal An abort controller the runtime aborts wherever it aborts the
-   * leg: when the liveness touch finds the run settled by another instance,
-   * which can happen before the leg's engine run exists, and when a terminate
-   * or a deadline handled in this isolate cancels the leg, after the engine
-   * run's own abort, with a {@link terminalLegAbortReason}. Never
-   * request-context data.
+   * @internal An abort controller the runtime aborts when it stops the leg, or
+   * when a recorded cancellation or timeout refuses the leg before its engine
+   * run starts. The reason's `cause` names why; a cancellation's or timeout's
+   * reason is a {@link terminalLegAbortReason}. Never request-context data.
    */
   readonly legAbort?: AbortController;
 } & OptionalRunRequester;
@@ -940,8 +946,9 @@ class RowChangedError extends Error {
 /**
  * Compare-and-set passes a lifecycle transition makes before it answers that
  * the run's row keeps changing. A touch moves the row at most once per
- * RUN_LEG_TOUCH_MS, so a miss it causes clears on the next pass; only a leg on
- * another instance writing snapshots back to back misses every time.
+ * RUN_LEG_TOUCH_MS, so a miss it causes clears on the next pass; a leg writing
+ * snapshots back to back misses every time when it runs on another instance,
+ * or, over a row SQLite cannot parse, in this object too.
  */
 const LIFECYCLE_WRITE_ATTEMPTS = 5;
 
@@ -1232,17 +1239,24 @@ function effectiveLifecycle(
 ): RunLifecycleState | undefined {
   if (!persisted) return active;
   if (!active) return persisted;
+  // As lifecycleMergeSql decides: a stored intent never joins a lifecycle it
+  // was not checked against.
+  if (persisted.transitionIntent && hasDisputedSettlement(active))
+    return active;
   if (persisted.revision > active.revision) return persisted;
   if (active.revision > persisted.revision) return active;
+  const { transitionIntent: storedIntent, ...persistedWithoutIntent } =
+    persisted;
+  const transitionIntent =
+    storedIntent &&
+    (storedIntent.expectedDeadlineAt === undefined ||
+      storedIntent.expectedDeadlineAt === active.deadlineAt)
+      ? storedIntent
+      : active.transitionIntent;
   return {
-    ...persisted,
+    ...persistedWithoutIntent,
     ...active,
-    ...((persisted.transitionIntent ?? active.transitionIntent)
-      ? {
-          transitionIntent:
-            persisted.transitionIntent ?? active.transitionIntent,
-        }
-      : {}),
+    ...(transitionIntent ? { transitionIntent } : {}),
     ...((persisted.terminal ?? active.terminal)
       ? { terminal: persisted.terminal ?? active.terminal }
       : {}),
@@ -1287,6 +1301,10 @@ function failedByMarker(marker: keyof typeof RUN_FAILURE_MARKERS, now: number) {
   };
 }
 
+type StoredRunScope = Parameters<
+  NonNullable<FencedWorkflowAdmissionCapability['withStoredRun']>
+>[0];
+
 type CapturedWorkflowStorage = {
   readonly workflows: WorkflowsStorage;
   readonly read: WorkflowsStorage['getWorkflowRunById'];
@@ -1305,6 +1323,7 @@ type CapturedWorkflowStorage = {
       readonly touch?: FencedWorkflowAdmissionCapability['touchRun'];
       readonly replace?: FencedWorkflowAdmissionCapability['replaceSnapshot'];
       readonly patch?: FencedWorkflowAdmissionCapability['patchRunLifecycle'];
+      readonly enterStoredRun?: FencedWorkflowAdmissionCapability['withStoredRun'];
     }
 );
 
@@ -1314,6 +1333,7 @@ type ActiveRun = {
   lifecycle?: RunLifecycleState;
   requestContext?: RequestContext;
   source?: CapturedWorkflowStorage;
+  storedRunScope?: StoredRunScope;
 };
 
 type TerminalTransitionOptions = {
@@ -1737,6 +1757,8 @@ export class RunnerRuntime {
             );
           const source = await this.#captureWorkflowStorage(workflowId);
           active.source = source;
+          if (this.#withStoredRunOf(source))
+            active.storedRunScope = { workflowId, runId, rowStored: false };
           provenance = {
             version: 2,
             startToken: crypto.randomUUID(),
@@ -1776,91 +1798,96 @@ export class RunnerRuntime {
             ]);
           const capturedExecution = execution;
           const capturedProvenance = provenance;
-          const { executionPromise } = await this.#withLifecycleLock(
-            workflowId,
-            runId,
-            async () => {
-              let run: Awaited<ReturnType<AnyWorkflow['createRun']>>;
-              if (this.#executionFence) {
-                if (source.storage !== 'd1')
-                  throw new Error(
-                    'fenced workflow storage capability is unavailable',
-                  );
-                const d1Execution =
-                  normalizeD1RunExecutionIdentity(capturedExecution);
-                admissionEntered = true;
-                const admitted = await source.admit.call(
-                  source.capability,
-                  {
-                    execution: d1Execution,
-                    attemptToken: capturedProvenance.attemptToken,
-                    mutationEpoch: options.mutationEpoch,
-                    startIdentity,
-                    requestContext: Object.fromEntries(
-                      requestContext.entries(),
-                    ),
-                    fence: this.#executionFence,
-                    reservationStore: claim
-                      ? this.#startIdempotency
-                      : undefined,
-                    reservation: claim,
-                    proof,
-                    runOwnerGuard: options.runOwnerGuard,
-                    onInitialWriteAttempt: () => {
-                      candidate = workflow.runs.get(runId);
+          await this.#inStoredRunScope(active, async () => {
+            const { executionPromise } = await this.#withLifecycleLock(
+              workflowId,
+              runId,
+              async () => {
+                let run: Awaited<ReturnType<AnyWorkflow['createRun']>>;
+                if (this.#executionFence) {
+                  if (source.storage !== 'd1')
+                    throw new Error(
+                      'fenced workflow storage capability is unavailable',
+                    );
+                  const d1Execution =
+                    normalizeD1RunExecutionIdentity(capturedExecution);
+                  admissionEntered = true;
+                  const admitted = await source.admit.call(
+                    source.capability,
+                    {
+                      execution: d1Execution,
+                      attemptToken: capturedProvenance.attemptToken,
+                      mutationEpoch: options.mutationEpoch,
+                      startIdentity,
+                      requestContext: Object.fromEntries(
+                        requestContext.entries(),
+                      ),
+                      fence: this.#executionFence,
+                      reservationStore: claim
+                        ? this.#startIdempotency
+                        : undefined,
+                      reservation: claim,
+                      proof,
+                      runOwnerGuard: options.runOwnerGuard,
+                      onInitialWriteAttempt: () => {
+                        candidate = workflow.runs.get(runId);
+                      },
                     },
-                  },
-                  () => this.#createRun(workflowId, runId),
-                );
-                if (
-                  !admitted?.witness ||
-                  !sameExecution(admitted.witness.execution, d1Execution)
-                )
-                  throw new RunStateUnreadableError(workflowId, runId);
-                const witnessed = this.#projectD1StartState(
-                  source,
-                  workflowId,
-                  runId,
-                  admitted.witness.row,
-                );
-                if (
-                  witnessed.kind !== 'initial' ||
-                  !sameExecution(witnessed.execution, d1Execution) ||
-                  witnessed.provenance.initialAdmission !== true ||
-                  witnessed.provenance.attemptToken !==
-                    capturedProvenance.attemptToken
-                )
-                  throw new RunStateUnreadableError(workflowId, runId);
-                run = admitted.value as Awaited<
-                  ReturnType<AnyWorkflow['createRun']>
-                >;
-              } else {
-                if (claim && startIdentity && this.#startIdempotency)
-                  await this.#startIdempotency.bindPreparedStart(claim, {
-                    ...capturedExecution,
-                    ...startIdentity,
-                  });
-                run = await this.#createRun(workflowId, runId);
-              }
-              active.run = run;
-              engineEntered = true;
-              return {
-                executionPromise: run.start({
-                  inputData: options.inputData,
-                  initialState: options.initialState,
-                  requestContext,
-                }),
-              };
-            },
-          );
-          const result = await executionPromise;
-          await this.#reconcileTerminalState(
-            workflowId,
-            runId,
-            result,
-            requestContext,
-            source,
-          );
+                    () => this.#createRun(workflowId, runId),
+                  );
+                  if (
+                    !admitted?.witness ||
+                    !sameExecution(admitted.witness.execution, d1Execution)
+                  )
+                    throw new RunStateUnreadableError(workflowId, runId);
+                  const witnessed = this.#projectD1StartState(
+                    source,
+                    workflowId,
+                    runId,
+                    admitted.witness.row,
+                  );
+                  if (
+                    witnessed.kind !== 'initial' ||
+                    !sameExecution(witnessed.execution, d1Execution) ||
+                    witnessed.provenance.initialAdmission !== true ||
+                    witnessed.provenance.attemptToken !==
+                      capturedProvenance.attemptToken
+                  )
+                    throw new RunStateUnreadableError(workflowId, runId);
+                  if (active.storedRunScope)
+                    active.storedRunScope.rowStored = true;
+                  run = admitted.value as Awaited<
+                    ReturnType<AnyWorkflow['createRun']>
+                  >;
+                } else {
+                  if (claim && startIdentity && this.#startIdempotency)
+                    await this.#startIdempotency.bindPreparedStart(claim, {
+                      ...capturedExecution,
+                      ...startIdentity,
+                    });
+                  run = await this.#createRun(workflowId, runId);
+                }
+                active.run = run;
+                engineEntered = true;
+                return {
+                  executionPromise: run.start({
+                    inputData: options.inputData,
+                    initialState: options.initialState,
+                    requestContext,
+                  }),
+                };
+              },
+            );
+            const result = await executionPromise;
+            await this.#reconcileTerminalState(
+              workflowId,
+              runId,
+              result,
+              requestContext,
+              source,
+              active.storedRunScope?.rowStored === true,
+            );
+          });
           outcomeReadStarted = true;
           const selected = await this.#completedStartState(
             source,
@@ -1948,6 +1975,8 @@ export class RunnerRuntime {
         if (!state) throw new UnknownRunError(workflowId, runId);
         if (state.isFromInMemory)
           throw new RunStateUnreadableError(workflowId, runId);
+        if (this.#withStoredRunOf(source))
+          active.storedRunScope = { workflowId, runId, rowStored: true };
         const prior = runProvenance(state);
         if (
           proof &&
@@ -1979,16 +2008,20 @@ export class RunnerRuntime {
           const currentLifecycle = lifecycleFromRequestContext(
             current.requestContext,
           );
-          if (
-            currentLifecycle?.terminal ||
-            currentLifecycle?.transitionIntent ||
-            this.#activeRuns.get(activeKey) !== active
-          )
+          const ending =
+            currentLifecycle?.terminal?.status ??
+            currentLifecycle?.transitionIntent?.status;
+          if (ending || this.#activeRuns.get(activeKey) !== active) {
+            // A leg refused before its engine run exists has nothing for a
+            // cancel to cut, so its abort names the run's end the way a cut
+            // leg's does.
+            if (ending) legAbort?.abort(terminalLegAbortReason(ending));
             throw new RunTerminalConflictError(
               workflowId,
               runId,
               current.status as RunStatus,
             );
+          }
           active.lifecycle = effectiveLifecycle(
             currentLifecycle,
             active.lifecycle,
@@ -2005,32 +2038,36 @@ export class RunnerRuntime {
           );
           await this.#withLifecycleLock(workflowId, runId, check);
         }
-        const run = await this.#createRun(workflowId, runId);
-        const { executionPromise } = await this.#withLifecycleLock(
-          workflowId,
-          runId,
-          async () => {
-            await check();
-            active.run = run;
-            engineEntered = true;
-            return {
-              executionPromise: run.resume({
-                step: options.step,
-                resumeData: options.resumeData,
-                requestContext,
-              }),
-            };
-          },
-        );
-        const result = await executionPromise;
-        await this.#reconcileTerminalState(
-          workflowId,
-          runId,
-          result,
-          requestContext,
-          source,
-          proof,
-        );
+        const result = await this.#inStoredRunScope(active, async () => {
+          const run = await this.#createRun(workflowId, runId);
+          const { executionPromise } = await this.#withLifecycleLock(
+            workflowId,
+            runId,
+            async () => {
+              await check();
+              active.run = run;
+              engineEntered = true;
+              return {
+                executionPromise: run.resume({
+                  step: options.step,
+                  resumeData: options.resumeData,
+                  requestContext,
+                }),
+              };
+            },
+          );
+          const resumed = await executionPromise;
+          await this.#reconcileTerminalState(
+            workflowId,
+            runId,
+            resumed,
+            requestContext,
+            source,
+            active.storedRunScope?.rowStored === true,
+            proof,
+          );
+          return resumed;
+        });
         if (provenance.version === 2) {
           const execution = runExecutionIdentityFor(
             { tablePrefix: source.tablePrefix, workflowId, runId },
@@ -2564,6 +2601,7 @@ export class RunnerRuntime {
       touchRun: touch,
       replaceSnapshot: replace,
       patchRunLifecycle: patch,
+      withStoredRun: enterStoredRun,
     } = capability;
     if (
       typeof prefix !== 'string' ||
@@ -2573,6 +2611,7 @@ export class RunnerRuntime {
       (touch !== undefined && typeof touch !== 'function') ||
       (replace !== undefined && typeof replace !== 'function') ||
       (patch !== undefined && typeof patch !== 'function') ||
+      (enterStoredRun !== undefined && typeof enterStoredRun !== 'function') ||
       !database ||
       typeof database.prepare !== 'function' ||
       typeof database.batch !== 'function'
@@ -2596,6 +2635,7 @@ export class RunnerRuntime {
       ...(touch === undefined ? {} : { touch }),
       ...(replace === undefined ? {} : { replace }),
       ...(patch === undefined ? {} : { patch }),
+      ...(enterStoredRun === undefined ? {} : { enterStoredRun }),
     };
   }
 
@@ -3023,10 +3063,11 @@ export class RunnerRuntime {
   /**
    * @internal Mark this run's row live for an executing leg, from whichever
    * instance runs it; the evidence #silentRow reads. When the row reads
-   * settled, the leg this runtime drives for the run is aborted: its engine
-   * starts no further step, and its step in flight sees its `abortSignal`
-   * aborted. A storage source without the touch leaves nothing to read, so its
-   * runs are never settled here.
+   * settled, or, on storage with `withStoredRun`, absent after the leg stored
+   * it, the leg this runtime drives for the run is aborted: its engine starts
+   * no further step, and its step in flight sees its `abortSignal` aborted. A
+   * storage source without the touch leaves nothing to read, so its runs are
+   * never settled here.
    */
   async touchRun(
     workflowId: string,
@@ -3040,9 +3081,13 @@ export class RunnerRuntime {
       { workflowId, runId },
       now,
     );
-    if (touched === 'settled')
+    const active = this.#activeRuns.get(this.#runKey(workflowId, runId));
+    if (
+      touched === 'settled' ||
+      (touched === 'absent' && active?.storedRunScope?.rowStored === true)
+    )
       this.#abortLeg(
-        this.#activeRuns.get(this.#runKey(workflowId, runId)),
+        active,
         new RunSettledConflictError(workflowId, runId),
         'run-leg-settled-abort',
         workflowId,
@@ -3102,6 +3147,26 @@ export class RunnerRuntime {
     console.error(JSON.stringify({ type: logType, workflowId, runId }));
     const reason = legAbortReason(cause);
     for (const controller of unaborted) controller.abort(reason);
+  }
+
+  #withStoredRunOf(
+    source: CapturedWorkflowStorage | undefined,
+  ): FencedWorkflowAdmissionCapability['withStoredRun'] {
+    return source?.storage === 'd1'
+      ? source.enterStoredRun?.bind(source.capability)
+      : undefined;
+  }
+
+  /** Run a leg's writes of its own run inside the storage's stored-run scope. */
+  #inStoredRunScope<T>(
+    active: ActiveRun,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const withStoredRun = this.#withStoredRunOf(active.source);
+    const { storedRunScope } = active;
+    return withStoredRun && storedRunScope
+      ? withStoredRun(storedRunScope, operation)
+      : operation();
   }
 
   /**
@@ -3578,6 +3643,9 @@ export class RunnerRuntime {
           status: state.status,
           lifecycleRevision: lifecycleFromRequestContext(state.requestContext)
             ?.revision,
+          // As read from the row: the patch compares stored JSON text, and the
+          // parsed lifecycle orders its keys differently.
+          lifecycle: state.requestContext?.[RUN_LIFECYCLE_CONTEXT_KEY],
         },
         {
           lifecycle: intent,
@@ -3771,6 +3839,7 @@ export class RunnerRuntime {
     result: CoreRunResult,
     requestContext: RequestContext,
     source: CapturedWorkflowStorage,
+    rowStored: boolean,
     proof?: D1RunExecutionIdentity,
   ): Promise<void> {
     const opts = terminalStateUpdate(result);
@@ -3782,6 +3851,10 @@ export class RunnerRuntime {
         runId,
       });
       if (!snapshot) {
+        // A row gone after this leg stored it was removed by retention, either
+        // after another instance settled the run or after this leg's own
+        // terminal write (`success` or `failed`).
+        if (rowStored) throw new RunSettledConflictError(workflowId, runId);
         throw new Error(
           `RunnerRuntime: run '${runId}' of workflow '${workflowId}' completed without a durable snapshot`,
         );
@@ -3915,7 +3988,7 @@ export class RunnerRuntime {
     runId: string,
     fn: () => Promise<T>,
   ): Promise<T> {
-    return this.#withLock(
+    return serializedByKey(
       this.#lifecycleLocks,
       this.#runKey(workflowId, runId),
       fn,
@@ -3932,24 +4005,6 @@ export class RunnerRuntime {
     runId: string,
     fn: () => Promise<T>,
   ): Promise<T> {
-    return this.#withLock(this.#runLocks, this.#runKey(workflowId, runId), fn);
-  }
-
-  async #withLock<T>(
-    locks: Map<string, Promise<unknown>>,
-    key: string,
-    fn: () => Promise<T>,
-  ): Promise<T> {
-    const previous = locks.get(key) ?? Promise.resolve();
-    const task = previous.then(fn);
-    const tail = task.then(
-      () => undefined,
-      () => undefined,
-    );
-    locks.set(key, tail);
-    void tail.then(() => {
-      if (locks.get(key) === tail) locks.delete(key);
-    });
-    return task;
+    return serializedByKey(this.#runLocks, this.#runKey(workflowId, runId), fn);
   }
 }

@@ -66,6 +66,7 @@ import {
   terminalStateFields,
   terminalStateUpdate,
 } from './run-terminal-state.js';
+import { serializedByKey } from './serialized-by-key.js';
 import {
   decodeStartReservationAdmissionResult,
   START_IDEMPOTENCY_TABLE,
@@ -100,30 +101,6 @@ interface AdmissionScope {
   witness?: InitialAdmissionWitness;
   failure?: unknown;
   failed: boolean;
-}
-
-/**
- * @internal Runs `work` once every earlier call with the same `key` on `tails`
- * has settled, in call order; a failed call does not block the next. An entry
- * leaves `tails` when its last call settles. Each owner keeps its own `tails`:
- * a caller that holds its queue across a call into another owner's would
- * deadlock on a shared one.
- */
-export function serializedByKey<T>(
-  tails: Map<string, Promise<unknown>>,
-  key: string,
-  work: () => Promise<T>,
-): Promise<T> {
-  const previous = tails.get(key) ?? Promise.resolve();
-  const current = previous.then(work, work);
-  const settled = current.then(
-    () => undefined,
-    () => undefined,
-  );
-  tails.set(key, settled);
-  return current.finally(() => {
-    if (tails.get(key) === settled) tails.delete(key);
-  });
 }
 
 /** @internal Match the pinned standalone resolver's property-presence precedence. */
@@ -543,23 +520,47 @@ async function replaceSnapshotRow(
   return false;
 }
 
+type StoredRunScope = Parameters<
+  NonNullable<FencedWorkflowAdmissionCapability['withStoredRun']>
+>[0];
+
+function assertStoredRunScope(
+  scope: StoredRunScope,
+  operation: () => Promise<unknown>,
+): void {
+  if (
+    scope === null ||
+    typeof scope !== 'object' ||
+    !isPathSafeId(scope.workflowId) ||
+    !isPathSafeId(scope.runId) ||
+    typeof scope.rowStored !== 'boolean' ||
+    typeof operation !== 'function'
+  )
+    throw new Error('stored run scope is malformed');
+}
+
+type PatchRunLifecycleArgs = Parameters<
+  NonNullable<FencedWorkflowAdmissionCapability['patchRunLifecycle']>
+>;
+
 /**
  * The timestamp is bound as JSON text because a bound JS number would be
  * stored as a REAL (`456.0`). A request context that is not an object makes
  * json_set write nothing yet still count a row, so the predicate refuses it.
- * The patch replaces the whole lifecycle, and a revision does not identify one
- * across instances (a resume elsewhere reaches the same revision), so a stored
- * dispute refuses it as it refuses recording an intent.
+ * The patch replaces the whole lifecycle, so, when the caller passes
+ * `expected.lifecycle`, it matches that lifecycle and not only its revision,
+ * which a resume on another instance reaches as well; a stored dispute refuses
+ * it as it refuses recording an intent.
  */
 async function patchLifecycleRow(
   database: InitialAdmissionDatabase,
   tablePrefix: string,
-  address: { workflowId: string; runId: string },
-  expected: { status: string; lifecycleRevision?: number },
-  patch: { lifecycle: object; timestamp: number; updatedAt: string },
+  address: PatchRunLifecycleArgs[0],
+  expected: PatchRunLifecycleArgs[1],
+  patch: PatchRunLifecycleArgs[2],
 ): Promise<boolean> {
   const { workflowId, runId } = address;
-  const { status, lifecycleRevision } = expected;
+  const { status, lifecycleRevision, lifecycle: expectedLifecycle } = expected;
   const { lifecycle, timestamp, updatedAt } = patch;
   if (
     !isPathSafeId(workflowId) ||
@@ -567,6 +568,10 @@ async function patchLifecycleRow(
     typeof status !== 'string' ||
     (lifecycleRevision !== undefined &&
       !Number.isSafeInteger(lifecycleRevision)) ||
+    (expectedLifecycle !== undefined &&
+      (expectedLifecycle === null ||
+        typeof expectedLifecycle !== 'object' ||
+        Array.isArray(expectedLifecycle))) ||
     lifecycle === null ||
     typeof lifecycle !== 'object' ||
     Array.isArray(lifecycle) ||
@@ -590,6 +595,7 @@ async function patchLifecycleRow(
           AND ${lifecycleSql('snapshot', 'revision')} IS ?7
           AND ${STORED_UNSETTLED_SQL}
           AND NOT ${disputedSql('snapshot')}
+          AND (?8 IS NULL OR (snapshot -> ${lifecyclePath()}) IS json(?8))
         END
     RETURNING workflow_name`)
     .bind(
@@ -600,6 +606,9 @@ async function patchLifecycleRow(
       runId,
       status,
       lifecycleRevision ?? null,
+      expectedLifecycle === undefined
+        ? null
+        : JSON.stringify(expectedLifecycle),
     )
     .all();
   return writtenRowCount(captureStatementResult(result)) === 1;
@@ -1253,6 +1262,7 @@ export class FencedWorkflowsStorageD1 extends WorkflowsStorageD1 {
   readonly [FENCED_WORKFLOW_STORAGE]?: FencedWorkflowAdmissionCapability;
   readonly #admission?: FencedWorkflowAdmissionCapability;
   readonly #scopes = new AsyncLocalStorage<AdmissionScope>();
+  readonly #storedRuns = new AsyncLocalStorage<StoredRunScope>();
   readonly #unreadableRowTails = new Map<string, Promise<unknown>>();
 
   constructor(config: D1DomainConfig) {
@@ -1288,15 +1298,12 @@ export class FencedWorkflowsStorageD1 extends WorkflowsStorageD1 {
           expected: RawWorkflowSnapshot,
           replacement: { snapshot: string; updatedAt: string },
         ) => replaceSnapshotRow(database, tablePrefix, expected, replacement),
-        patchRunLifecycle: (
-          address: { workflowId: string; runId: string },
-          expected: { status: string; lifecycleRevision?: number },
-          patch: {
-            lifecycle: object;
-            timestamp: number;
-            updatedAt: string;
-          },
-        ) => patchLifecycleRow(database, tablePrefix, address, expected, patch),
+        patchRunLifecycle: (...args: PatchRunLifecycleArgs) =>
+          patchLifecycleRow(database, tablePrefix, ...args),
+        withStoredRun: <T>(
+          scope: StoredRunScope,
+          operation: () => Promise<T>,
+        ) => this.#withStoredRun(scope, operation),
       });
       this[FENCED_WORKFLOW_STORAGE] = this.#admission;
     }
@@ -1420,6 +1427,14 @@ export class FencedWorkflowsStorageD1 extends WorkflowsStorageD1 {
     }
   }
 
+  async #withStoredRun<T>(
+    scope: StoredRunScope,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    assertStoredRunScope(scope, operation);
+    return this.#storedRuns.run(scope, operation);
+  }
+
   override async persistWorkflowSnapshot(args: PersistInput): Promise<void> {
     const scope = this.#scopes.getStore();
     if (!scope) {
@@ -1460,11 +1475,23 @@ export class FencedWorkflowsStorageD1 extends WorkflowsStorageD1 {
   ): Promise<void> {
     const row = mastraSnapshotRow(args, new Date().toISOString());
     const { database, tablePrefix } = capability;
+    const leg = this.#storedRuns.getStore();
+    const ownRun =
+      leg?.workflowId === row.workflowName && leg.runId === row.runId
+        ? leg
+        : undefined;
+    // The leg stored this run's row and the row is gone: another instance
+    // settled the run and retention removed it, so inserting the row would
+    // store the run again as unsettled.
+    const insertGuard = ownRun?.rowStored
+      ? `AND EXISTS (SELECT 1 FROM "${tablePrefix}mastra_workflow_snapshot"
+          WHERE workflow_name = ?1 AND run_id = ?2)`
+      : '';
     const result = await database
       .prepare(`INSERT INTO "${tablePrefix}mastra_workflow_snapshot"
       (workflow_name, run_id, resourceId, snapshot, createdAt, updatedAt)
       SELECT ?1, ?2, ?3, ?4, ?5, ?6
-      WHERE json_valid(?4)
+      WHERE json_valid(?4) ${insertGuard}
       ON CONFLICT (workflow_name, run_id) DO UPDATE
         SET snapshot = ${UPSERT_SNAPSHOT_SQL}, updatedAt = excluded.updatedAt
         WHERE ${SETTLED_ROW_GUARD_SQL}
@@ -1478,7 +1505,10 @@ export class FencedWorkflowsStorageD1 extends WorkflowsStorageD1 {
         row.updatedAt,
       )
       .all();
-    if (writtenRowCount(captureStatementResult(result)) === 1) return;
+    if (writtenRowCount(captureStatementResult(result)) === 1) {
+      if (ownRun) ownRun.rowStored = true;
+      return;
+    }
     // The guard refused a readable row, or the write is not storable; a row
     // gone since the upsert met it is refused too, so a purged settlement is
     // not written over.
@@ -1500,6 +1530,7 @@ export class FencedWorkflowsStorageD1 extends WorkflowsStorageD1 {
       `${row.workflowName}\0${row.runId}`,
       () => writeOverUnreadableRow(database, tablePrefix, row),
     );
+    if (ownRun) ownRun.rowStored = true;
   }
 
   #initialRow(

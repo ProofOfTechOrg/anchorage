@@ -100,6 +100,7 @@ import {
 } from '../do-runner/index.js';
 import { resourceIdFromKey } from '../do-runner/memory-id.js';
 import {
+  isSettledLegAbort,
   type RunTerminalStatus,
   runTerminalError,
   terminalStatusOfLegAbort,
@@ -927,6 +928,8 @@ function composeTotalBudget(
   };
 }
 
+const RESUME_FAILED_MESSAGE = 'Durable agent workflow resume failed';
+
 /**
  * The terminal ERROR a leg's run stream ends with when its run ended other
  * than successfully. An engine cancel publishes no terminal event of its own,
@@ -1073,8 +1076,9 @@ export class FlowsafeDurableAgent<
   readonly #guardedCallOptionMapper?: DurableCallOptionMapper;
   readonly #threadRuntime?: Mastra['agentThreadStreamRuntime'];
   readonly #resumedThreadLegs = new Map<string, Set<ResumedThreadLeg>>();
-  // Registry entries whose run's terminal ERROR this isolate published or is
-  // publishing, so a later release cleans them without publishing a second one.
+  // Registry entries whose run's terminal ERROR this isolate published, is
+  // publishing, or left to Mastra's publication of what a start leg threw, so a
+  // later release cleans them without publishing a second one.
   readonly #endedEntries = new WeakSet<object>();
   readonly #pendingStarts = new Map<string, PendingStart>();
   // The host's exact options object receives one private, single-use re-entry ticket.
@@ -2007,7 +2011,10 @@ export class FlowsafeDurableAgent<
    * registration completes on the run's terminal outcome or a resume failure
    * after rehydration, when the wrapper publishes a terminal error. Another
    * suspension keeps blocking the thread until the next resume, as a first leg does.
-   * Hosts expose this only from their trusted approval-decision topology.
+   * Hosts expose this only from their trusted approval-decision topology, and
+   * spread a decided approval's `expectedSuspensionFor(record)` into the
+   * options, so a decision for an earlier suspension of the step is refused
+   * with SuspensionChangedError; without it the resume is unchecked.
    */
   async resumeViaRuntime(options: {
     runId: string;
@@ -2077,7 +2084,7 @@ export class FlowsafeDurableAgent<
       );
       const terminalError = legTerminalError(
         summary,
-        'Durable agent workflow resume failed',
+        RESUME_FAILED_MESSAGE,
         legAbort.signal,
       );
       if (terminalError)
@@ -2094,7 +2101,14 @@ export class FlowsafeDurableAgent<
       else if (leg) leg.outcome = 'suspended';
       return summary;
     } catch (error) {
-      if (rehydrated) await this.#endRunLocally(options.runId, error, 'failed');
+      if (rehydrated) {
+        const end = await this.#failedResumeEnd(
+          options.runId,
+          legAbort.signal.reason,
+          error,
+        );
+        await this.#endRunLocally(options.runId, end.error, end.outcome);
+      }
       throw error;
     }
   }
@@ -2127,6 +2141,40 @@ export class FlowsafeDurableAgent<
       endedRunError(summary.status, summary.error),
       threadLegOutcome(summary.status),
     );
+  }
+
+  /**
+   * The terminal ERROR and thread outcome of a resumed leg that threw after
+   * rehydration. The leg's abort reason names a cancellation or timeout that
+   * refused or cut it; for a settlement by another instance it names only the
+   * conflict, so the run's stored outcome is read.
+   */
+  async #failedResumeEnd(
+    runId: string,
+    abortReason: unknown,
+    error: unknown,
+  ): Promise<{ error: unknown; outcome: ThreadLegTerminalOutcome }> {
+    const ending = terminalStatusOfLegAbort(abortReason);
+    if (ending)
+      return {
+        error: endedRunError(ending, undefined),
+        outcome: threadLegOutcome(ending),
+      };
+    if (isSettledLegAbort(abortReason)) {
+      // An unreadable or removed row leaves the thrown error to end the stream.
+      const settled = await this.#runtime
+        .authoritativeStatus(this.getWorkflow().id, runId)
+        .catch(() => null);
+      if (settled) {
+        const settledError = legTerminalError(settled, RESUME_FAILED_MESSAGE);
+        if (settledError)
+          return {
+            error: settledError,
+            outcome: threadLegOutcome(settled.status),
+          };
+      }
+    }
+    return { error, outcome: 'failed' };
   }
 
   #trackResumedLeg(runId: string): ResumedThreadLeg {
@@ -2595,6 +2643,8 @@ export class FlowsafeDurableAgent<
       });
       start.persisted.resolve();
     } catch (error) {
+      // Mastra publishes what this method throws as the run's terminal ERROR.
+      if (entry) this.#endedEntries.add(entry);
       start?.persisted.reject(error);
       throw error;
     }
@@ -2607,14 +2657,12 @@ export class FlowsafeDurableAgent<
     );
     if (terminalError && !(entry && this.#endedEntries.has(entry))) {
       // The host's waiter already resolved, so a release can race this
-      // publication; the entry is claimed before it is awaited.
+      // publication; the entry is claimed before it is awaited. A failed
+      // publication keeps the claim and throws the terminal error for Mastra
+      // to publish.
       if (entry) this.#endedEntries.add(entry);
-      try {
-        await this.emitError(runId, terminalError);
-      } catch (error) {
-        if (entry) this.#endedEntries.delete(entry);
-        throw error;
-      }
+      if (!(await this.#publishTerminalError(runId, terminalError)))
+        throw terminalError;
     }
   }
 }

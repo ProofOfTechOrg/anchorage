@@ -76,6 +76,7 @@ import {
   isExecutionFenceRefusal,
   readExecutionFence,
 } from '../do-runner/index.js';
+import { runInputDepthMessage } from '../do-runner/run-input-depth.js';
 import { hostErrorText } from '../host-kit/host-approval-service.js';
 import {
   type BoundThreadTargetValidator,
@@ -102,7 +103,10 @@ import {
   scheduleCreatorRole,
   scheduleWithCreatorRole,
 } from './target-policy.js';
-import { isReservedScheduleContextKey } from './tick.js';
+import {
+  deepScheduleTargetField,
+  isReservedScheduleContextKey,
+} from './tick.js';
 
 /** The storage subset the facade reads/writes (a subset of D1SchedulesStorage). */
 export interface ScheduleFacadeStore {
@@ -274,6 +278,14 @@ type Validated<T> = { ok: true; value: T } | { ok: false; error: Rejection };
 
 function reject(reason: string, message: string, status = 400): Rejection {
   return { reason, message, status };
+}
+
+/** The refusal of a target with a value nested past the run-input bound. */
+function targetDepthRejection(target: ScheduleTarget): Rejection | undefined {
+  const field = deepScheduleTargetField(target);
+  return field === undefined
+    ? undefined
+    : reject('input-too-deep', runInputDepthMessage(field));
 }
 
 /**
@@ -649,6 +661,8 @@ function buildCreateRow(
         ? { requestContext: body.requestContext as Record<string, unknown> }
         : {}),
     };
+    const deep = targetDepthRejection(target);
+    if (deep) return { ok: false, error: deep };
     return {
       ok: true,
       value: {
@@ -694,6 +708,8 @@ function buildCreateRow(
   if (reserved) return { ok: false, error: reserved };
   const agentTarget = normalizeAgentTarget('pending', body);
   if (!agentTarget.ok) return agentTarget;
+  const deep = targetDepthRejection(agentTarget.value);
+  if (deep) return { ok: false, error: deep };
   return {
     ok: true,
     value: {
@@ -1312,7 +1328,11 @@ function buildUpdatePatch(
   // stays a workflow schedule). Only the settable target fields are merged.
   const nextTarget = patchTarget(existing, body);
   if (!nextTarget.ok) return nextTarget;
-  if (nextTarget.value !== undefined) patch.target = nextTarget.value;
+  if (nextTarget.value !== undefined) {
+    const deep = targetDepthRejection(nextTarget.value);
+    if (deep) return { ok: false, error: deep };
+    patch.target = nextTarget.value;
+  }
 
   if (body.metadata !== undefined) {
     const clientMeta = metadataOrReject(body.metadata);

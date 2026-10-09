@@ -1,5 +1,26 @@
 # showcase
 
+## 0.0.30
+
+### Patch Changes
+
+- 2b5b89c: The decide toast no longer says re-driving is safe when the inline resume is refused because the step moved on to another suspension or the run was not suspended; it says what to do instead.
+- Updated dependencies [65f58d8]
+- Updated dependencies [65f58d8]
+- Updated dependencies [31faca1]
+- Updated dependencies [31faca1]
+- Updated dependencies [e3935f9]
+- Updated dependencies [2b5b89c]
+- Updated dependencies [6fa6d8c]
+  - @proofoftech/flowsafe@0.26.2
+
+## 0.0.29
+
+### Patch Changes
+
+- Updated dependencies [5a7afd1]
+  - @proofoftech/flowsafe@0.26.1
+
 ## 0.0.28
 
 ### Patch Changes

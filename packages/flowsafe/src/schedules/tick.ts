@@ -42,12 +42,19 @@ import {
   resolveScheduleStartOwner,
   stripReservedExecutionContext,
 } from '../do-runner/index.js';
+import {
+  exceedsDepth,
+  exceedsRunInputDepth,
+  MAX_RUN_INPUT_DEPTH,
+  runInputDepthMessage,
+} from '../do-runner/run-input-depth.js';
 import { nonnegativeSafeInteger } from '../numeric-config.js';
-import type {
-  Schedule,
-  ScheduleAgentDispatchReceipt,
-  ScheduleFireClaim,
-  ScheduleTrigger,
+import {
+  parseScheduleAgentDispatchReceipt,
+  type Schedule,
+  type ScheduleAgentDispatchReceipt,
+  type ScheduleFireClaim,
+  type ScheduleTrigger,
 } from './schedules-d1.js';
 import {
   type ScheduleTargetPolicy,
@@ -176,7 +183,8 @@ export interface ScheduleTickStartAgentInput {
  * firing, once {@link ScheduleTickStatus} states that the run does not exist,
  * at that fire or on a later pass. A lookup that returns `undefined` fails the
  * fire after any other failure too, and one that returns a run resolves the
- * fire from it; any other answer leaves the fire deferred for later
+ * fire from it; one that throws with `status` 404 fails it once the fire is an
+ * hour old, and any other answer leaves the fire deferred for later
  * reconciliation.
  */
 export type ScheduleTickStartAgent = (
@@ -194,8 +202,9 @@ export interface ScheduleTickSignalAgentInput
  * the thread Durable Object's signal route as a numeric `status` property.
  * An adapter that reaches the route through another hop must not forward that
  * hop's own status as a refusal. Statuses 400, 403, 404 and 422, which includes
- * a signal content denial, fail this fire, and the schedule keeps firing. Any
- * other failure is retried on a later pass. The 404
+ * a signal content denial, fail this fire, and the schedule keeps firing,
+ * unless the target already stored a receipt for the fire, which then decides
+ * it. Any other failure is retried on a later pass. The 404
  * classification assumes D1 reads see the tick's own writes, using the default
  * primary-consistent D1 access without read-replication sessions.
  */
@@ -281,14 +290,18 @@ export interface ScheduleTickStatusResult {
  * The target's answer for the run a fire dispatched, read after the dispatch
  * failed and on each reconcile pass. `undefined` states that the target holds
  * no such run, and the tick records the fire `failed`. A throw with a numeric
- * `status` of 404 states the same only for a threadless agent start the
- * target refused with 400, 403, 404 or 422, and the tick then records the
- * fire `failed`. A threaded signal the target refused with one of those
- * statuses is recorded `failed` whatever the lookup throws. Any other throw, a
- * 404 for any other dispatch included, leaves the dispatch indeterminate: the
- * fire stays deferred, and a reconcile pass sends a threaded signal again
- * unless the throw carries `status` 503 with `reason.code`
- * `RUN_START_PENDING`.
+ * `status` of 404 states the same for a threadless agent start. The tick
+ * records such a fire `failed` on that answer when the target refused the start
+ * with 400, 403, 404 or 422, and otherwise on the first such answer once the
+ * fire is an hour old. A threaded signal the target refused with one of those
+ * statuses is recorded `failed` whatever the lookup throws, unless the target
+ * already stored a receipt for the fire, which then decides it. Any other
+ * throw, including a 404 for a workflow or threaded dispatch, leaves the
+ * dispatch indeterminate: the fire stays deferred, and a reconcile pass sends a
+ * threaded signal again unless the throw carries `status` 503 with
+ * `reason.code` `RUN_START_PENDING`. An adapter that reaches the thread Durable
+ * Object through another hop must answer with the thread object's own status,
+ * never that hop's: a relayed 404 fails a threadless start that is an hour old.
  */
 export type ScheduleTickStatus = (
   input: ScheduleTickDispatchRef,
@@ -407,6 +420,37 @@ function contextObject(
     return null;
   }
   return value as Record<string, unknown>;
+}
+
+/**
+ * The first part of a stored schedule target nested past MAX_RUN_INPUT_DEPTH,
+ * named as a refusal names it. A fire's dispatch record embeds the target in
+ * trigger metadata that SQLite's JSON functions read. The whole-target bound
+ * sits four levels above the run-input bound, the depth of the deepest field
+ * named here, so a field a later Core version adds cannot pass unbounded.
+ */
+export function deepScheduleTargetField(target: unknown): string | undefined {
+  const stored = contextObject(target) ?? {};
+  const values = (field: string, value: unknown): Array<[string, unknown]> =>
+    Object.values(contextObject(value) ?? {}).map((item) => [field, item]);
+  const streamOptions = contextObject(
+    contextObject(stored.ifIdle)?.streamOptions,
+  );
+  const fields: Array<[string, unknown]> = [
+    ['inputData', stored.inputData],
+    ['initialState', stored.initialState],
+    ...values('a requestContext value', stored.requestContext),
+    ...values('a providerOptions value', stored.providerOptions),
+    ...values(
+      'an ifIdle.streamOptions.requestContext value',
+      streamOptions?.requestContext,
+    ),
+  ];
+  const deep = fields.find(([, value]) => exceedsRunInputDepth(value));
+  if (deep) return deep[0];
+  return exceedsDepth(target, MAX_RUN_INPUT_DEPTH + 4)
+    ? 'the schedule target'
+    : undefined;
 }
 
 function normalizeAndSanitizeWorkflowTarget(
@@ -566,7 +610,8 @@ function scheduleTickDispatchRef(
       stored === null ||
       typeof stored !== 'object' ||
       Array.isArray(stored) ||
-      (stored as { type?: unknown }).type !== 'workflow'
+      (stored as { type?: unknown }).type !== 'workflow' ||
+      deepScheduleTargetField(stored) !== undefined
     ) {
       return undefined;
     }
@@ -598,7 +643,8 @@ function scheduleTickDispatchRef(
     stored === null ||
     typeof stored !== 'object' ||
     Array.isArray(stored) ||
-    (stored as { type?: unknown }).type !== 'agent'
+    (stored as { type?: unknown }).type !== 'agent' ||
+    deepScheduleTargetField(stored) !== undefined
   ) {
     return undefined;
   }
@@ -713,6 +759,15 @@ function isPermanentDispatchError(error: unknown): boolean {
 }
 
 /**
+ * Age at which a lookup's 404 decides a threadless agent start the target did
+ * not refuse. The tick sends a start only at its fire, and the target commits
+ * an admitted start's run ownership, or its start recovery resolves the start,
+ * well within this age. Settling the fire also ends the target's admission of a
+ * late start.
+ */
+const UNRESOLVED_START_SETTLE_MS = 60 * 60_000;
+
+/**
  * Build the schedule tick: a `() => Promise<ScheduleTickResult>` a host slots
  * into its alarm dispatch as its OWN failure-isolated duty (own try/catch, own
  * log line — the purge-availability lesson). Each due schedule is processed
@@ -813,10 +868,12 @@ export function createScheduleTick(
     }
   };
 
-  const recordRefusedDispatch = async (
+  /** Resolves to whether the write changed the deferred row. */
+  const recordFailedDispatch = async (
     ref: ScheduleTickDispatchRef,
     trigger: ScheduleTrigger,
     error: unknown,
+    reason: 'dispatch-refused' | 'dispatch-unresolved',
     result: ScheduleTickResult,
   ): Promise<boolean> => {
     let changed: boolean;
@@ -825,7 +882,7 @@ export function createScheduleTick(
         trigger.id ?? '',
         trigger.scheduleId,
         error instanceof Error ? error.message : String(error),
-        triggerMetadata({ dispatchRef: ref, reason: 'dispatch-refused' }),
+        triggerMetadata({ dispatchRef: ref, reason }),
       );
     } catch (bookkeepingError) {
       result.deferred += 1;
@@ -839,7 +896,7 @@ export function createScheduleTick(
         scheduleId: ref.scheduleId,
         target: ref.target,
         outcome: 'failed',
-        reason: 'dispatch-refused',
+        reason,
         runId: ref.runId,
       });
     } catch (bookkeepingError) {
@@ -855,14 +912,23 @@ export function createScheduleTick(
     for (const trigger of pending) {
       const ref = scheduleTickDispatchRef(trigger.metadata?.dispatchRef);
       if (!ref) {
-        result.failed += 1;
-        result.reconciled += 1;
-        await store.recordTrigger({
-          ...trigger,
-          outcome: 'failed',
-          error: 'stored deferred dispatch is malformed',
-          metadata: triggerMetadata({ reason: 'invalid-deferred-dispatch' }),
-        });
+        try {
+          await store.recordTrigger({
+            ...trigger,
+            outcome: 'failed',
+            error: 'stored deferred dispatch is malformed',
+            metadata: triggerMetadata({ reason: 'invalid-deferred-dispatch' }),
+          });
+          result.failed += 1;
+          result.reconciled += 1;
+        } catch (bookkeepingError) {
+          result.deferred += 1;
+          logBookkeepingError(
+            trigger.scheduleId,
+            trigger.runId ?? undefined,
+            bookkeepingError,
+          );
+        }
         continue;
       }
       try {
@@ -870,27 +936,33 @@ export function createScheduleTick(
         result.reconciled += 1;
         await recordResolvedDispatch(ref, trigger, summary, result);
       } catch (error) {
-        // A start the target refused before it reserved a run leaves none in
-        // flight, so a lookup that states the run does not exist decides it.
         if (
           ref.target === 'agent' &&
           ref.mode === 'start' &&
-          isPermanentDispatchError({
-            status: trigger.metadata?.refusedStatus,
-          }) &&
           statusOf(error) === 404
         ) {
+          // A start the target refused before it reserved a run leaves none in
+          // flight, so a lookup that states the run does not exist decides it.
+          const refused = isPermanentDispatchError({
+            status: trigger.metadata?.refusedStatus,
+          });
           if (
-            await recordRefusedDispatch(
-              ref,
-              trigger,
-              trigger.error ?? 'agent start refused',
-              result,
-            )
+            refused ||
+            now() - trigger.actualFireAt >= UNRESOLVED_START_SETTLE_MS
           ) {
-            result.reconciled += 1;
+            if (
+              await recordFailedDispatch(
+                ref,
+                trigger,
+                trigger.error ?? 'agent start outcome unresolved',
+                refused ? 'dispatch-refused' : 'dispatch-unresolved',
+                result,
+              )
+            ) {
+              result.reconciled += 1;
+            }
+            continue;
           }
-          continue;
         }
         let pendingError = error;
         if (
@@ -934,8 +1006,27 @@ export function createScheduleTick(
             continue;
           } catch (retryError) {
             if (isPermanentDispatchError(retryError)) {
-              if (
-                await recordRefusedDispatch(ref, trigger, retryError, result)
+              // A receipt the target stored decided the fire; refusing a later
+              // redelivery does not change that decision.
+              const stored = parseScheduleAgentDispatchReceipt(
+                trigger.metadata?.dispatchReceipt,
+              );
+              if (stored) {
+                result.reconciled += 1;
+                await recordResolvedDispatch(
+                  ref,
+                  trigger,
+                  { dispatchReceipt: stored },
+                  result,
+                );
+              } else if (
+                await recordFailedDispatch(
+                  ref,
+                  trigger,
+                  retryError,
+                  'dispatch-refused',
+                  result,
+                )
               ) {
                 result.reconciled += 1;
               }
@@ -995,7 +1086,13 @@ export function createScheduleTick(
         isPermanentDispatchError(error) &&
         (ref.mode === 'signal' || statusOf(statusError) === 404)
       ) {
-        await recordRefusedDispatch(ref, trigger, error, result);
+        await recordFailedDispatch(
+          ref,
+          trigger,
+          error,
+          'dispatch-refused',
+          result,
+        );
         return;
       }
       result.deferred += 1;
@@ -1169,6 +1266,25 @@ export function createScheduleTick(
         target: targetType,
         outcome: 'failed',
         reason,
+      });
+      return;
+    }
+
+    const deepField = deepScheduleTargetField(schedule.target);
+    if (deepField !== undefined) {
+      result.failed += 1;
+      await store.recordTrigger({
+        ...claimTrigger,
+        runId: null,
+        outcome: 'failed',
+        error: runInputDepthMessage(deepField),
+        metadata: triggerMetadata({ reason: 'input-too-deep' }),
+      });
+      await audit({
+        scheduleId: schedule.id,
+        target: targetType,
+        outcome: 'failed',
+        reason: 'input-too-deep',
       });
       return;
     }
@@ -1589,7 +1705,15 @@ export function createScheduleTick(
       reconciled: 0,
       lost: 0,
     };
-    await reconcileDeferred(result);
+    // Reconciliation and the due fires are independent: a failed deferred
+    // listing still lets every due schedule fire, and then fails the pass so
+    // the maintenance duty reports it.
+    let reconcileFailure: { error: unknown } | undefined;
+    try {
+      await reconcileDeferred(result);
+    } catch (error) {
+      reconcileFailure = { error };
+    }
     for (const schedule of due) {
       // Per-schedule isolation: one wedged row (an unexpected store/audit throw)
       // must not abort the pass and strand every due schedule behind it.
@@ -1606,6 +1730,7 @@ export function createScheduleTick(
         );
       }
     }
+    if (reconcileFailure) throw reconcileFailure.error;
     return result;
   };
 }

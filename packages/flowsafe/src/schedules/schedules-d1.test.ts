@@ -5,6 +5,10 @@
 import type { Schedule } from '@mastra/core/storage';
 import { describe, expect, it, vi } from 'vitest';
 
+import {
+  nestedArray,
+  PAST_SQLITE_JSON_DEPTH,
+} from '../../test-support/deep-json.js';
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import {
   D1ResourceOwnershipStore,
@@ -946,6 +950,53 @@ describe('D1SchedulesStorage', () => {
     });
 
     expect((await store.listDeferredTriggers(1))[0]?.id).toBe('newer-ready');
+  });
+
+  it('lists a deferred dispatch whose metadata SQLite cannot parse, by its fire time', async () => {
+    // #given two deferred dispatches with reconciliation cursors, and an
+    // earlier one whose metadata nests past the depth SQLite parses
+    const { store } = storeOver();
+    await store.createSchedule(workflowSchedule());
+    await store.recordTrigger({
+      id: 'deep',
+      scheduleId: 'schedule_a',
+      runId: 'run_deep',
+      scheduledFireAt: NOW - 10,
+      actualFireAt: NOW - 10,
+      outcome: 'deferred',
+      metadata: { dispatchRef: { deep: nestedArray(PAST_SQLITE_JSON_DEPTH) } },
+    });
+    await store.recordTrigger({
+      id: 'retry-later',
+      scheduleId: 'schedule_a',
+      runId: 'run_later',
+      scheduledFireAt: NOW - 1,
+      actualFireAt: NOW - 1,
+      outcome: 'deferred',
+      metadata: { reconcileAfter: NOW + 100 },
+    });
+    await store.recordTrigger({
+      id: 'ready',
+      scheduleId: 'schedule_a',
+      runId: 'run_ready',
+      scheduledFireAt: NOW,
+      actualFireAt: NOW,
+      outcome: 'deferred',
+      metadata: { reconcileAfter: NOW },
+    });
+
+    // #when the deferred dispatches are listed
+    const all = await store.listDeferredTriggers();
+    const first = await store.listDeferredTriggers(1);
+
+    // #then every one is listed, the unparseable one at its fire time and the
+    // others by their cursors
+    expect(all.map((trigger) => trigger.id)).toEqual([
+      'deep',
+      'ready',
+      'retry-later',
+    ]);
+    expect(first.map((trigger) => trigger.id)).toEqual(['deep']);
   });
 
   it('deleteSchedule removes the schedule AND its trigger history', async () => {

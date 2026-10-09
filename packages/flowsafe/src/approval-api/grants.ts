@@ -256,8 +256,9 @@ export function defaultResumeData(
  * The suspension a decided record resumes, as
  * `ResumeRunOptions.expectedSuspension`, for a resumer that builds its own
  * resume call or request body. Spread it into the resume options or body: a
- * record without a step or without a captured `suspendedAt` (run-scoped, or
- * from an earlier version) names none and resumes unfenced.
+ * record without a step or without a captured `suspendedAt` (run-scoped, from
+ * an earlier version, or a step record trusted code filed without one) names
+ * none and resumes unchecked.
  */
 export function expectedSuspensionFor(record: ApprovalRecord): {
   expectedSuspension?: NonNullable<ResumeRunOptions['expectedSuspension']>;
@@ -276,8 +277,12 @@ export function expectedSuspensionFor(record: ApprovalRecord): {
 /**
  * ApprovalServiceOptions.resumeRun for same-process deployments: resumes the
  * decided run on a RunnerRuntime (rejects are resumed too — the workflow
- * learns the outcome from resumeData.approved). Cross-Worker deployments
- * implement resumeRun against the run's DO stub instead.
+ * learns the outcome from resumeData.approved) with the record's
+ * `expectedSuspensionFor(record)`, so a decision for an earlier suspension of
+ * the step is refused. Cross-Worker deployments resume through the run's DO
+ * stub instead, with createDoRunTopology(...).resumeRecord or with a request
+ * body that spreads `expectedSuspensionFor(record)`; a resume without it is
+ * unchecked.
  */
 export function resumeViaRuntime(
   runtime: RunnerRuntime,

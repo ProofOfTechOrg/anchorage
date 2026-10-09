@@ -981,8 +981,9 @@ export class ApprovalService {
       );
       return { attempted: true, ok: true, summary };
     } catch (error) {
-      // The decision is already durable; the run stays suspended and a later
-      // resume derives the same grants from the store. Report, don't unwind.
+      // The decision is already durable, so report the failure rather than
+      // unwind it; while the run stays at this suspension, a later resume
+      // derives the same grants from the store.
       const message = errorMessage(error);
       this.#record(actor, 'approval.resume', `approval:${record.id}`, 'error', {
         reason: message,

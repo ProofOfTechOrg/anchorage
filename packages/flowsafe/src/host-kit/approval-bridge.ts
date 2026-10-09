@@ -33,9 +33,10 @@ function errorMessage(error: unknown): string {
 }
 
 /**
- * Resumes a run after a decision. The showcase Worker fetches the run's DO stub;
- * an in-process host uses resumeViaRuntime(runtime). Either way it returns the
- * post-resume RunSummary so the re-queue wrapper can inspect status.
+ * Resumes a run after a decision and returns the post-resume RunSummary so the
+ * re-queue wrapper can inspect status. An implementation sends
+ * `expectedSuspensionFor(record)` with the resume, so a decision for an earlier
+ * suspension of the step is refused; without it the resume is unchecked.
  */
 export type ResumeRunFn = (
   record: ApprovalRecord,
@@ -224,8 +225,8 @@ export async function queueApprovalForSuspension(
  * Wrap a base resume fn so a run that re-suspends at a LATER gate auto-queues
  * its next approval(s) — the multi-gate flow (product-launch's two gates); every
  * suspended path re-queues, not just the first. The base
- * resume (resumeViaRuntime or a DO-stub fetch) deliberately omits re-queue; this
- * adds it without coupling to the host's resume topology.
+ * resume (see ResumeRunFn) omits re-queue; this adds it without coupling to the
+ * host's resume topology.
  *
  * The reviewer whose decision advanced the run becomes the next gate's
  * `requestedBy`, so they cannot also decide it (SoD across gates). Guard

@@ -2429,7 +2429,6 @@ export function createThreadAgentHost(
       };
     },
     route: async (request, scope) => {
-      let preflightedTermination = false;
       const preflightUrl = new URL(request.url);
       if (!preflightUrl.pathname.startsWith(AGENT_HOST_ROUTE_PREFIX))
         return null;
@@ -2509,6 +2508,9 @@ export function createThreadAgentHost(
             : await publicAgentState(scope, ref),
         );
         const owner = await options.resourceAccess().owner('run', ref.runId);
+        // Cancels outside the dispatch lock, which a running start or resume
+        // leg holds; the intent it records refuses a resume queued behind the
+        // lock.
         if (preflightUrl.searchParams.get('replay') !== '1') {
           await scope.init.runtime.cancelActiveExecution(
             await workflowIdFor(scope, ref.agentId),
@@ -2516,7 +2518,6 @@ export function createThreadAgentHost(
             'cancelled',
             [scope.principal, owner ?? scope.principal],
           );
-          preflightedTermination = true;
         }
       }
       // A queued start or resume keeps its parsed body if the sender disconnects.
@@ -2787,17 +2788,6 @@ export function createThreadAgentHost(
             ref,
             replayOnly ? undefined : await publicAgentState(scope, ref),
           );
-          const preflightOwner = await options
-            .resourceAccess()
-            .owner('run', ref.runId);
-          if (!replayOnly && !preflightedTermination) {
-            await scopedRuntime.cancelActiveExecution(
-              await workflowIdFor(scope, ref.agentId),
-              ref.runId,
-              'cancelled',
-              [scope.principal, preflightOwner ?? scope.principal],
-            );
-          }
           const owner = await options.resourceAccess().owner('run', ref.runId);
           if (replayOnly) {
             const existing = await scopedRuntime.status(

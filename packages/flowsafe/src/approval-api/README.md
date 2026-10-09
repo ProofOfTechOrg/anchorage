@@ -105,7 +105,9 @@ never resumes a run.
   or Durable Object path; do not submit the decision again. The stored decision
   still derives the grant for that suspension. A resume whose `code` is
   `SUSPENSION_CHANGED` is refused on every retry: the step has moved on to
-  another suspension, so decide that suspension's approval instead.
+  another suspension, so decide that suspension's approval instead. A resume
+  whose `code` is `RUN_NOT_SUSPENDED` found the run not suspended; read the
+  run's status to learn whether it has ended, which refuses every retry.
 - **Enforce separation of duties by default**: `decide()` rejects the
   requester and a reviewer who approved an earlier sequential gate in the same
   run. Parallel gates filed before either decision do not trigger the

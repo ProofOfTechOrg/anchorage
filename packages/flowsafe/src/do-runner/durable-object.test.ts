@@ -2406,6 +2406,9 @@ describe('DurableObjectRunner.fetch', () => {
 
     // #then
     expect(again.status).toBe(409);
+    expect(await again.json()).toMatchObject({
+      reason: { code: 'RUN_NOT_SUSPENDED' },
+    });
   });
 
   it('returns 409 when starting a run with an already-used runId', async () => {

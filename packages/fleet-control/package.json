@@ -1,6 +1,6 @@
 {
   "name": "@proofoftech/fleet-control",
-  "version": "0.5.5",
+  "version": "0.5.7",
   "publishConfig": {
     "access": "public"
   },

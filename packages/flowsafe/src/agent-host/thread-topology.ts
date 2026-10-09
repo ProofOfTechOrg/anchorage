@@ -144,6 +144,12 @@ export interface AgentThreadTopology {
     input: AgentThreadRunRef,
     replayOnly?: boolean,
   ): Promise<AgentRunEnvelope>;
+  /**
+   * Resumes a decided agent approval's run through its thread object. An
+   * implementation sends `expectedSuspensionFor(record)` with the resume, so a
+   * decision for an earlier suspension of the step is refused; without it the
+   * resume is unchecked.
+   */
   resume(
     context: ActorContext,
     record: ApprovalRecord,

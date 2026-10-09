@@ -845,6 +845,11 @@ test('the ci.yml canary reds the job from a final outcome step that reads the id
       'breakwater suite',
     ],
     ['Test flowsafe against newest core', 'tests_flowsafe', 'flowsafe suite'],
+    [
+      'Test flowsafe workers project against newest core',
+      'tests_flowsafe_workers',
+      'flowsafe workers suite',
+    ],
   ];
   for (const [name, id] of probes) {
     const step = steps.find((candidate) => candidate.name === name);
