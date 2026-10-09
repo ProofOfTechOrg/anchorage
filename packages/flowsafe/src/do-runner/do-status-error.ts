@@ -18,9 +18,9 @@ export interface DoRefusalReason {
 }
 
 /**
- * The base for a DO's OWN refusal — the taxonomy's extension point, for the
- * statuses the runtime errors do not cover. A shell declares one
- * (ThreadIdentityError's 403) and so does a host route:
+ * The base for a refusal that carries its own HTTP status and an optional
+ * `reason` — the taxonomy's extension point. A shell or a host route declares
+ * one:
  *
  * ```ts
  * class UnknownSignalError extends DoStatusError {

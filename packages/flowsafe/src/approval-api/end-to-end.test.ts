@@ -1211,6 +1211,51 @@ describe('approval queue end to end', () => {
     expect(resumeCountFor(current, ['gate2x'])).toBe(1);
   });
 
+  it('reports the refused resume of an approval whose run has ended', async () => {
+    // #given an approval filed for the launch run's suspension, and the run
+    // resumed to its end without that approval's decision
+    const harness = buildHarness();
+    const started = await harness.runtime.start('launch', {
+      runId: `acme_${crypto.randomUUID()}`,
+      inputData: { topic: 'ended' },
+    });
+    const { record } = await harness.service.create(
+      {
+        workflowId: 'launch',
+        runId: started.runId,
+        stepPath: ['approval'],
+        suspendedAt: suspendedAtFor(started, ['approval']),
+        title: 'Publish launch post',
+        connectors: ['blog-publisher'],
+      },
+      OPERATOR,
+    );
+    await harness.runtime.resume('launch', started.runId, {
+      step: 'approval',
+      resumeData: { approved: false },
+    });
+
+    // #when the approval is decided
+    const decided = await harness.service.decide(
+      record.id,
+      { decision: 'approve' },
+      REVIEWER,
+    );
+
+    // #then the decision stands, its resume is reported refused because the
+    // run is not suspended, and nothing is published
+    expect(decided.record.status).toBe('approved');
+    expect(decided.resume).toMatchObject({
+      attempted: true,
+      ok: false,
+      code: 'RUN_NOT_SUSPENDED',
+    });
+    expect(await harness.runtime.status('launch', started.runId)).toMatchObject(
+      { status: 'success' },
+    );
+    expect(harness.publishes()).toBe(0);
+  });
+
   it('a spent approval does not mint into a NO-PAYLOAD re-suspension (falsy-resume regression)', async () => {
     // The reported leak: Mastra stamps resumedAt only on a payload-bearing
     // resume, so a re-suspension reached via a falsy resume left the old

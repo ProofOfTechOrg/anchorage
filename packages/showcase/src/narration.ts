@@ -18,6 +18,10 @@ import type {
   BatchDecideResult,
   DecideResult,
 } from '@flowsafe/approval-api/types';
+import type {
+  RunNotSuspendedError,
+  SuspensionChangedError,
+} from '@flowsafe/do-runner/runtime';
 import {
   RunApiError,
   type RunSummary,
@@ -771,11 +775,6 @@ export function startErrorEvent(
 }
 
 /**
- * Narrate the decider's own decide result. Pre-records the resumed/grant keys
- * the poll will re-derive, so the decider never gets a second toast for the
- * resume their decision caused.
- */
-/**
  * One-shot summary of a batch decision. ONE event per batch (keyed by the
  * action instant, the resetEvent precedent for one-shot actions): the
  * per-record status changes arrive through the poll diffs under their own
@@ -812,6 +811,24 @@ export function batchDecideEvent(
   };
 }
 
+const SUSPENSION_CHANGED: SuspensionChangedError['reason']['code'] =
+  'SUSPENSION_CHANGED';
+const RUN_NOT_SUSPENDED: RunNotSuspendedError['reason']['code'] =
+  'RUN_NOT_SUSPENDED';
+
+function resumeFailedDetail(code: string | undefined): string {
+  if (code === SUSPENSION_CHANGED)
+    return "The decision is durable, but the step has moved on to another suspension, so re-driving it is refused every time. Decide the approval for the step's current suspension instead.";
+  if (code === RUN_NOT_SUSPENDED)
+    return "The decision is durable, but the run was not suspended when the resume reached it, so re-driving resumes nothing while that holds. Check the run's status.";
+  return 'The decision is durable and the grant re-derives from the store, so re-driving this run is safe.';
+}
+
+/**
+ * Narrate the decider's own decide result. Pre-records the resumed/grant keys
+ * the poll will re-derive, so the decider never gets a second toast for the
+ * resume their decision caused.
+ */
 export function decideEvents(result: DecideResult): NarrationEvent[] {
   const at = Date.now();
   const { record, resume } = result;
@@ -849,8 +866,7 @@ export function decideEvents(result: DecideResult): NarrationEvent[] {
       zone: 'worker',
       kind: 'run.resume-failed',
       title: "Decision saved; resume didn't complete",
-      detail:
-        'The decision is durable and the grant re-derives from the store, so re-driving this run is safe.',
+      detail: resumeFailedDetail(resume.code),
       tone: 'danger',
       runId: record.runId,
       approvalId: record.id,

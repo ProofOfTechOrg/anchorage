@@ -255,6 +255,40 @@ describe('FencedWorkflowsStorageD1 on workerd D1', () => {
     expect(await storedLifecycle()).toEqual(disputed);
   });
 
+  it('lands a lifecycle patch whose expected lifecycle is the stored one as the runtime reads it', async () => {
+    // #given a running row whose lifecycle holds non-ASCII text, read back as
+    // the runtime reads it
+    const { domain, capability } = await fencedDomain();
+    await persist(
+      domain,
+      snapshot('running', {
+        version: 1,
+        revision: 1,
+        economicOperations: [
+          { id: 'charge-1', settlementState: 'settled-λ😀' },
+        ],
+      }),
+    );
+    const row = await capability.readSnapshot(ADDRESS);
+    const readLifecycle = JSON.parse(String(row?.snapshot)).requestContext[
+      RUN_LIFECYCLE_CONTEXT_KEY
+    ];
+
+    // #when the patch expects that lifecycle
+    const patched = await capability.patchRunLifecycle?.(
+      ADDRESS,
+      { status: 'running', lifecycleRevision: 1, lifecycle: readLifecycle },
+      {
+        lifecycle: { version: 1, revision: 2 },
+        timestamp: 456,
+        updatedAt: '2026-10-04T00:00:00.000Z',
+      },
+    );
+
+    // #then it lands
+    expect(patched).toBe(true);
+  });
+
   it('refuses a snapshot nested past the depth SQLite parses, over a readable row and for a run with no row', async () => {
     // #given a run with no row, and a write nested past the depth SQLite parses
     const { domain } = await fencedDomain();
@@ -284,6 +318,29 @@ describe('FencedWorkflowsStorageD1 on workerd D1', () => {
       status: 422,
     });
     expect(await rows()).toEqual(stored);
+  });
+
+  it('refuses, inside a stored-run scope, to insert a run row deleted since the leg stored it', async () => {
+    // #given a leg that stored its run row inside its scope, and the row
+    // deleted since
+    const { domain, capability } = await fencedDomain();
+    const scope = { ...ADDRESS, rowStored: false };
+    await capability.withStoredRun?.(scope, () =>
+      persist(domain, snapshot('running')),
+    );
+    expect(scope.rowStored).toBe(true);
+    await db().prepare('DELETE FROM mastra_workflow_snapshot').run();
+
+    // #when the leg writes its run again inside the same scope
+    const again = capability.withStoredRun?.(scope, () =>
+      persist(domain, snapshot('running')),
+    );
+
+    // #then it is refused and no row is stored
+    await expect(again).rejects.toMatchObject({
+      name: 'RunSettledConflictError',
+    });
+    expect(await rows()).toEqual([]);
   });
 
   it('admits a successor nested past the depth over a row already stored too deep to parse', async () => {

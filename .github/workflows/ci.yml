@@ -394,6 +394,15 @@ jobs:
         continue-on-error: true
         run: pnpm --filter @proofoftech/flowsafe test
 
+      # The workerd tests load the newest core inside workerd, where a Node
+      # module that neither the test Worker's compatibility date nor its flags
+      # provide stops the test module from loading (maintainer guide, "Core
+      # bump maintenance contract").
+      - name: Test flowsafe workers project against newest core
+        id: tests_flowsafe_workers
+        continue-on-error: true
+        run: pnpm exec vitest run --config vitest.flowsafe-workers.config.ts
+
       # The probe steps swallow their own status, so this step is what carries
       # a red probe to the job status. The summary lines report a flip
       # (upstream fix, or a new regression) without opening the log, and the
@@ -423,4 +432,5 @@ jobs:
           report "spike bundle" "${{ steps.bundle.outcome }}"
           report "breakwater suite" "${{ steps.tests_breakwater.outcome }}"
           report "flowsafe suite" "${{ steps.tests_flowsafe.outcome }}"
+          report "flowsafe workers suite" "${{ steps.tests_flowsafe_workers.outcome }}"
           exit "$red"

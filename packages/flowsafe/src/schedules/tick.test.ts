@@ -20,6 +20,7 @@ import {
   runInputDepthMessage,
 } from '../do-runner/run-input-depth.js';
 import {
+  createScheduleAgentDispatchReceipt,
   D1SchedulesStorage,
   type ScheduleDatabase,
   type ScheduleFireClaim,
@@ -243,6 +244,15 @@ function threadedSchedule(overrides: Partial<Schedule> = {}): Schedule {
       threadId: 'acme_thread',
       resourceId: 'acme_resource',
     },
+    ...overrides,
+  });
+}
+
+function threadlessSchedule(overrides: Partial<Schedule> = {}): Schedule {
+  return workflowSchedule({
+    target: { type: 'agent', agentId: 'a1', prompt: 'go' },
+    ownerType: 'agent',
+    ownerId: 'a1',
     ...overrides,
   });
 }
@@ -862,7 +872,7 @@ describe('createScheduleTick', () => {
 
   it.each([
     409, 502, 503,
-  ])('keeps an unthreaded agent start refusal with status %s deferred across reconcile passes', async (statusCode) => {
+  ])('keeps an unthreaded agent start refusal with status %s deferred across reconcile passes within an hour of its fire', async (statusCode) => {
     // #given an unthreaded agent schedule whose start fails in a way a retry can
     // clear, and a host that answers 404 for the run's status
     const store = new FakeStore();
@@ -894,6 +904,105 @@ describe('createScheduleTick', () => {
     expect(fired).toMatchObject({ deferred: 1, failed: 0 });
     expect(later).toMatchObject({ deferred: 1, failed: 0 });
     expect(store.triggers[0]).toMatchObject({ outcome: 'deferred' });
+  });
+
+  async function fireAgentStartWithLostResponse(
+    status: ScheduleTickOptions['status'],
+  ) {
+    const store = new FakeStore();
+    store.seed(
+      threadlessSchedule({ id: 'agent_unresolved', cron: '0 0 1 1 *' }),
+    );
+    const events: ScheduleTickAuditEvent[] = [];
+    let clock = NOW;
+    const tick = createScheduleTick({
+      store,
+      start: vi.fn(),
+      startAgent: async () => {
+        throw new Error('start response lost');
+      },
+      status,
+      now: () => clock,
+      audit: (event) => {
+        events.push(event);
+      },
+    });
+    expect(await tick()).toMatchObject({ deferred: 1, failed: 0 });
+    return {
+      store,
+      events,
+      tickAfter: (elapsedMs: number) => {
+        clock = NOW + elapsedMs;
+        return tick();
+      },
+    };
+  }
+
+  it('records a threadless agent start whose outcome stays unknown as failed once its fire is an hour old', async () => {
+    // #given a threadless agent start whose response was lost and whose fire
+    // the host holds no run for
+    const { store, events, tickAfter } =
+      await fireAgentStartWithLostResponse(absentRunLookup);
+
+    // #when a tick runs an hour after the fire
+    const later = await tickAfter(60 * 60_000);
+
+    // #then the fire is recorded as unresolved and nothing is left deferred
+    expect(later).toMatchObject({
+      due: 0,
+      failed: 1,
+      reconciled: 1,
+      deferred: 0,
+    });
+    expect(store.triggers).toEqual([
+      expect.objectContaining({
+        outcome: 'failed',
+        error: 'start response lost',
+        metadata: expect.objectContaining({ reason: 'dispatch-unresolved' }),
+      }),
+    ]);
+    expect(events).toEqual([
+      expect.objectContaining({
+        outcome: 'deferred',
+        reason: 'dispatch-indeterminate',
+      }),
+      expect.objectContaining({
+        outcome: 'failed',
+        reason: 'dispatch-unresolved',
+      }),
+    ]);
+  });
+
+  it.each([
+    [
+      'a millisecond short of an hour after its fire',
+      60 * 60_000 - 1,
+      absentRunLookup,
+    ],
+    [
+      'an hour after its fire while the lookup fails without a status',
+      60 * 60_000,
+      pendingTargetReceipt,
+    ],
+    [
+      'an hour after its fire while the lookup answers 403',
+      60 * 60_000,
+      async (): Promise<never> => {
+        throw Object.assign(new Error('forbidden'), { status: 403 });
+      },
+    ],
+  ] as const)('keeps a threadless agent start whose outcome is unknown deferred %s', async (_, elapsedMs, lookup) => {
+    // #given a threadless agent start whose response was lost
+    const { store, events, tickAfter } =
+      await fireAgentStartWithLostResponse(lookup);
+
+    // #when a tick runs without both an hour-old fire and a 404 lookup
+    const later = await tickAfter(elapsedMs);
+
+    // #then the fire stays deferred
+    expect(later).toMatchObject({ deferred: 1, failed: 0 });
+    expect(store.triggers[0]).toMatchObject({ outcome: 'deferred' });
+    expect(events.filter((event) => event.outcome === 'failed')).toEqual([]);
   });
 
   it.each([
@@ -1668,6 +1777,63 @@ describe('createScheduleTick', () => {
       fired: 0,
     });
     expect(events.filter((event) => event.outcome === 'failed')).toEqual([]);
+  });
+
+  it('records a deferred threaded fire from the receipt its target stored when a redelivery is refused', async () => {
+    // #given a threaded fire whose first signal response was lost, and whose
+    // target then stored a receipt for it
+    const store = new FakeStore();
+    store.seed(threadedSchedule());
+    const signalAgent = vi
+      .fn(async () => {
+        throw Object.assign(new Error('gone'), { status: 404 });
+      })
+      .mockRejectedValueOnce(new Error('response lost'));
+    const events: ScheduleTickAuditEvent[] = [];
+    const tick = createScheduleTick({
+      store,
+      start: vi.fn(),
+      signalAgent,
+      status: pendingTargetReceipt,
+      now: () => NOW,
+      audit: (event) => {
+        events.push(event);
+      },
+    });
+    expect(await tick()).toMatchObject({ deferred: 1 });
+    const deferred = store.triggers[0];
+    if (!deferred?.id) throw new Error('expected a deferred trigger');
+    store.triggers[0] = {
+      ...deferred,
+      metadata: {
+        ...deferred.metadata,
+        dispatchState: 'settled',
+        dispatchReceipt: createScheduleAgentDispatchReceipt('deliver', {
+          runId: 'active_run',
+          signalId: deferred.id,
+        }),
+      },
+    };
+
+    // #when a later pass sends the signal again and the target refuses it
+    const result = await tick();
+
+    // #then the fire is recorded from the stored receipt
+    expect(result).toMatchObject({
+      fired: 1,
+      reconciled: 1,
+      failed: 0,
+      deferred: 0,
+    });
+    expect(store.triggers[0]).toMatchObject({
+      outcome: 'delivered',
+      runId: 'active_run',
+    });
+    expect(signalAgent).toHaveBeenCalledTimes(2);
+    expect(events).toEqual([
+      expect.objectContaining({ outcome: 'deferred' }),
+      expect.objectContaining({ outcome: 'delivered', runId: 'active_run' }),
+    ]);
   });
 
   it('keeps a refused threaded fire deferred when failure bookkeeping rejects', async () => {

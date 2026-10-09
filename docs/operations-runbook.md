@@ -108,7 +108,7 @@ wrangler d1 execute <database> --remote --config wrangler.jsonc \
   --command "SELECT workflow_name, run_id FROM <prefix>mastra_workflow_snapshot WHERE NOT json_valid(snapshot)"
 ```
 
-Terminate each listed run that is not terminal. Retention never removes these rows: remove a terminal one by hand from the tables `RUN_TTL_PURGE_TABLES` and `RUN_TTL_FLOWSAFE_PURGE_TABLES` name, after deleting its artifacts. During a gradual deployment from a version earlier than 0.26.0, a Worker still on the earlier version answers a keyed start replay of a run that failed with `RUN_STATE_NOT_STORABLE` with `503 persisted start is not readable`; retry it once every Worker runs 0.26.0 or later.
+Terminate each listed run that is not terminal. A terminate of such a run whose leg writes continuously answers `503` and records nothing; retry it once the leg stops writing. Retention never removes these rows: remove a terminal one by hand from the tables `RUN_TTL_PURGE_TABLES` and `RUN_TTL_FLOWSAFE_PURGE_TABLES` name, after deleting its artifacts. During a gradual deployment from a version earlier than 0.26.0, a Worker still on the earlier version answers a keyed start replay of a run that failed with `RUN_STATE_NOT_STORABLE` with `503 persisted start is not readable`; retry it once every Worker runs 0.26.0 or later.
 
 Before 0.26.1, a schedule target value nested about 1,000 levels deep could leave a deferred fire whose metadata SQLite cannot parse; every later tick then logged `schedule-tick-error` with `malformed JSON`, and no schedule in the deployment fired. The upgraded tick settles such a fire as `failed` with reason `invalid-deferred-dispatch` without a status lookup, and fails each later fire of a target nested more than 256 levels deep with reason `input-too-deep`. A settled agent fire may still have started its run: check the agent's external effects before running its work again. During a gradual deployment, a Worker on an earlier version still accepts such a target and still stops on its fires, so finish the rollout first. Before a rollback to an earlier version, update or delete each schedule whose target an earlier tick would copy into a fire record SQLite cannot parse, whether or not it has fired since the upgrade. The query nests each stored target four levels deeper, as a fire record does with a margin, and lists those SQLite cannot parse:
 
@@ -208,6 +208,17 @@ The purge invocation contains independent failure boundaries for each configured
 
 Provider polling runs through the singleton provider-host Durable Object's alarms. Subscription mutations should call the provider-host topology's `reconcilePolling()` after committing D1. A reconciliation failure means the mutation is already durable; retry reconciliation rather than trying to undo the row.
 
+### Deferred schedule fires
+
+A schedule fire stays `deferred` while the tick cannot learn its outcome. Each reconcile pass asks its target again, the drain inventory counts it under `schedule-deferred-dispatches`, and deleting its schedule answers `202` with `pending: true` until the tick settles the schedule's last deferred fire. [Add schedules](durable-agents.md#add-schedules) describes when the tick settles a threadless agent start. A fire recorded `failed` with reason `dispatch-unresolved`, including one an earlier version left deferred, may have started its run, which was then cancelled, timed out or purged before a pass saw it, or may still be running with its ownership commit stuck behind a start recovery fault, so check the agent's external effects before running its work again. List the fires still deferred, with the deployment's `tablePrefix` in front of the table name:
+
+```bash
+wrangler d1 execute <database> --remote --config wrangler.jsonc \
+  --command "SELECT id, scheduleId, runId, datetime(actualFireAt / 1000, 'unixepoch') AS firedAt, error, CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.dispatchRef.target') END AS target, CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.dispatchRef.mode') END AS mode, CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.statusError') END AS statusError FROM <prefix>mastra_schedule_triggers WHERE outcome = 'deferred' ORDER BY actualFireAt"
+```
+
+`statusError` names why the last pass could not decide the fire. Fix what it names, and the next pass settles the fire and completes a pending deletion. Do not settle a fire through direct SQL: the store completes a pending deletion only when the tick settles the fire.
+
 ## Retention policy
 
 | Data | Eligible |
@@ -303,6 +314,7 @@ Audit records are security evidence. Queue depth and SIEM ingestion status must 
 | Live updates stop but HTTP works | Hub binding, ticket secret/expiry, socket liveness | Let client poll; repair stream configuration without disabling authorization |
 | Subscription changed but polling did not | Reconcile response/audit and provider alarm | Retry `reconcilePolling()` against committed subscriptions |
 | Schedule did not fire | Maintenance alarm status, active status, CAS winner, run cap, stored metadata, and `schedule-tick-error` lines | Re-arm maintenance or correct the stored row; do not bypass the tick guard. A fire recorded `failed` with reason `input-too-deep` has a stored target value nested more than 256 levels deep: update the schedule with a shallower value or delete it |
+| Deleting a schedule answers `202` with `pending: true` and the schedule stays, or the drain inventory's `schedule-deferred-dispatches` category does not empty | The fires still deferred and each one's `statusError`: see [Deferred schedule fires](#deferred-schedule-fires) | Act as that section says |
 | Purge removed a snapshot but left R2 | Artifact store omitted or delete failed | Restore row/key evidence if available, repair paired purge, scan known prefix |
 | Audit is absent while requests succeed | Sink, Queue, consumer, SIEM | Restore export, preserve local ring/Logs, assess evidence gap |
 | Agent CLI error lacks output | Expected safe diagnostics | Inspect the isolated workspace/vendor logs under appropriate access; do not weaken public error safety |

@@ -23,7 +23,6 @@ import {
   type PersistedStartResult,
   RunAlreadyExistsError,
   RunLifecycleBlockedError,
-  RunNotSuspendedError,
   RunSettledConflictError,
   type RunSummary,
   RunTerminalConflictError,
@@ -271,7 +270,6 @@ function errorResponse(error: unknown): Response {
     return json({ error: error.message }, 404);
   }
   if (
-    error instanceof RunNotSuspendedError ||
     error instanceof RunAlreadyExistsError ||
     error instanceof RunTerminalConflictError ||
     error instanceof RunSettledConflictError

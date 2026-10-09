@@ -19,7 +19,6 @@ import {
   InvalidRunRequestError,
   RunAlreadyExistsError,
   RunLifecycleBlockedError,
-  RunNotSuspendedError,
   RunSettledConflictError,
   RunStateUnreadableError,
   RunTerminalConflictError,
@@ -52,7 +51,6 @@ function statusOf(error: unknown): number | undefined {
     return 404;
   }
   if (
-    error instanceof RunNotSuspendedError ||
     error instanceof RunAlreadyExistsError ||
     error instanceof RunTerminalConflictError ||
     error instanceof RunSettledConflictError ||
@@ -79,11 +77,10 @@ function statusOf(error: unknown): number | undefined {
 
 /**
  * The structured reason a refusal publishes, or undefined. Two channels, one
- * renderer: RunLifecycleBlockedError predates DoStatusError and is a plain
- * Error, while every refusal authored since carries its reason on the
- * taxonomy's own base (ExecutionFencedError's EXECUTION_FENCED among them).
- * Anything else has no reason to publish — an unclassified fault must not
- * grow a machine-readable code it never defined.
+ * renderer: RunLifecycleBlockedError is a plain Error with its own `reason`; a
+ * DoStatusError subclass carries its reason on the base. Anything else has no
+ * reason to publish — an unclassified fault must not grow a machine-readable
+ * code it never defined.
  */
 function reasonOf(error: unknown): unknown {
   if (error instanceof RunLifecycleBlockedError) return error.reason;

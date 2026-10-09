@@ -532,9 +532,10 @@ function buildConfiguredApprovalService<Env extends FlowsafeWorkerEnv>(
 
 /**
  * Builds the Runner DO's lifecycle hooks (terminal cleanup, and the approvals
- * the object files from its alarm) from the same approval-service
- * configuration as createFlowsafeWorker. Hosts supply only the optional DO
- * keepalive and their receipt-protocol-specific dispatch settler.
+ * the object files on its own through `reconcileApprovals`) from the same
+ * approval-service configuration as createFlowsafeWorker. Hosts supply only
+ * the optional DO keepalive and their receipt-protocol-specific dispatch
+ * settler.
  */
 export function createFlowsafeRunnerLifecycle<Env extends FlowsafeWorkerEnv>(
   config: FlowsafeRunnerLifecycleConfig<Env>,
