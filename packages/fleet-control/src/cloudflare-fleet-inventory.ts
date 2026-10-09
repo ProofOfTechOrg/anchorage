@@ -1424,12 +1424,17 @@ async function advanceRegistrationChecks(
       registrationOrdinal += 1;
       continue;
     }
+    const resourceRole = live.plainTextBindings.FLEET_RESOURCE_ROLE;
+    const resourceGroupId = live.plainTextBindings.FLEET_RESOURCE_GROUP;
+    const trusted =
+      resourceRole === 'platform-state' || resourceRole === 'deployment-egress';
     const deploymentOrdinal = context.sink.add('deployment', {
       record: 'deployment',
       backend: 'workers-for-platforms',
       scriptName: registration.scriptName,
       tenantTag: live.tenantTag,
       environment: live.environment,
+      ...(trusted ? { resourceRole, resourceGroupId } : {}),
       artifactVersion: live.artifactVersion,
       desiredSpecDigest: live.desiredSpecDigest,
       schemaVersion: live.schemaVersion,

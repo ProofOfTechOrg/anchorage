@@ -22,3 +22,7 @@ Select trusted-state Durable Object migrations from the owned live Worker, prese
 Match remote Durable Object bindings to owned namespace IDs when Cloudflare omits dispatch-namespace metadata, while rejecting conflicting targets. Allow external deployments with reserved application R2 buckets to converge.
 
 Relay conformance candidate maintenance requests to trusted state and verify signed requests, receipts, and replay refusal against the built artifacts locally.
+
+Project trusted state ownership into dispatch inventory. Remove WFP traffic using complete persisted policy and state-egress authority, retaining migration evidence through bounded teardown and using durable bridge identity during switch rollback.
+
+Preserve published deployments when the final ready-state write fails or its response is lost, keeping retry and export-backed decommission available without destructive provisioning rollback.

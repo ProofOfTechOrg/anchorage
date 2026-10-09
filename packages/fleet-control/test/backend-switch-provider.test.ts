@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import type {
   BridgeMutationPlan,
   BridgeSnapshot,
   PlainBackendSnapshot,
 } from '../src/backend-switch.js';
+import { CloudflareProvisioningClient } from '../src/cloudflare-client.js';
 import {
   canonicalDeploymentEgressPolicy,
   durableObjectMigrationHistoryDigest,
@@ -23,8 +25,10 @@ import type {
   PlainWorkerVersionDetail,
 } from '../src/types.js';
 import type { WorkersForPlatformsBackend } from '../src/workers-for-platforms-backend.js';
+import { deriveStateEgressCredential } from '../src/workers-for-platforms-backend.js';
 import type { BackendSwitchApi } from '../src/workers-for-platforms-backend-switch-provider.js';
 import { WorkersForPlatformsBackendSwitchProvider } from '../src/workers-for-platforms-backend-switch-provider.js';
+import { testRateCoordinator } from './fixtures/cloudflare-fetch-fixture.js';
 
 const fence: ExternalMutationFence = {
   mutationLeaseTtlMs: 60_000,
@@ -564,6 +568,94 @@ async function removePlanOnlyBridge(
 }
 
 describe('backend switch provider teardown authority', () => {
+  it('removes candidate rollback traffic with persisted policy and bridge authority', async () => {
+    let stored: string | undefined;
+    let deletes = 0;
+    let loseResponse = true;
+    const client = new CloudflareProvisioningClient({
+      accountId: 'account',
+      apiToken: 'token',
+      dispatchNamespace: 'fleet',
+      requestTimeoutMs: 1_000,
+      rateCoordinator: testRateCoordinator(),
+      fetch: async (_input, init) => {
+        if (init?.method === 'DELETE') {
+          deletes += 1;
+          stored = undefined;
+          return new Response(null, { status: 200 });
+        }
+        return stored === undefined
+          ? new Response(null, { status: 404 })
+          : new Response(stored);
+      },
+    });
+    const durableTarget = {
+      ...target,
+      stateEgressCredentialDigest: createHash('sha256')
+        .update(
+          deriveStateEgressCredential(
+            'root-secret-012345678901234567890123456789',
+            targetSpec,
+            prior.scriptName,
+          ),
+        )
+        .digest('hex'),
+    };
+    const bridge: BridgeSnapshot = {
+      ...prior,
+      artifactDigest: 'e'.repeat(64),
+      publicRouteAttached: true,
+      stateOnly: false,
+    };
+    const subject = provider({
+      withMutationFence: async (_fence, operation) =>
+        client.withMutationFence(fence, operation),
+      getHostRouting: async () => stored,
+      putHostRouting: async (_namespace, _hostname, publishedTarget) => {
+        stored = JSON.stringify(publishedTarget);
+      },
+      deleteHostRouting: async (namespace, hostname, targets) => {
+        await client.deleteHostRouting(namespace, hostname, targets);
+        if (loseResponse) {
+          loseResponse = false;
+          throw new Error('route deletion response lost');
+        }
+      },
+    });
+    const input = {
+      targetSpec,
+      candidate: release,
+      target: durableTarget,
+      bridge,
+      fence,
+    };
+    await subject.publishCandidateHost(input);
+    const published = stored;
+    await expect(subject.removeCandidateHostAndDrain(input)).rejects.toThrow(
+      /response lost/,
+    );
+    expect(stored).toBeUndefined();
+    await expect(
+      subject.removeCandidateHostAndDrain(input),
+    ).resolves.toBeUndefined();
+    expect(deletes).toBe(1);
+    const route = JSON.parse(published as string);
+    for (const drift of [
+      { ...route, policyHosts: ['foreign.example.com'] },
+      {
+        ...route,
+        stateEgress: { ...route.stateEgress, stateScriptName: 'foreign-state' },
+      },
+    ]) {
+      stored = JSON.stringify(drift);
+      await expect(subject.removeCandidateHostAndDrain(input)).rejects.toThrow(
+        /owned by another deployment/,
+      );
+      expect(stored).toBe(JSON.stringify(drift));
+      expect(deletes).toBe(1);
+    }
+  });
+
   it.each([
     'traffic',
     'bridge',

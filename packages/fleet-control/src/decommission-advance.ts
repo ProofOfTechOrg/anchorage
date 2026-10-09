@@ -29,6 +29,7 @@ import {
   normalizeDecommissionAdvanceIntent,
   parseDecommissionAdvanceToken,
 } from './decommission-intent.js';
+import { hostRoutingTargetsForRecord } from './platform-resources.js';
 import { deploymentSpecDigest } from './spec-digest.js';
 import { cloneBoundedPlainData } from './strict-plain-data.js';
 import type {
@@ -913,6 +914,9 @@ export function consumeMigrationCarrier(
   return {
     ...remaining,
     desiredSpecDigest: requestedSpecDigest,
+    ...(record.migrationIntent
+      ? { migrationIntent: record.migrationIntent }
+      : {}),
     ...(priorActive ? { activeRelease: priorActive } : {}),
     ...(pendingRelease ? { pendingRelease } : {}),
   };
@@ -924,6 +928,7 @@ function clearRetainedReleases(record: FleetRecord): FleetRecord {
     migrationPriorRelease: _migrationPriorRelease,
     rollbackRelease: _rollbackRelease,
     retiringRelease: _retiringRelease,
+    migrationIntent: _migrationIntent,
     ...remaining
   } = record;
   return remaining;
@@ -1006,6 +1011,7 @@ async function advanceLifecycle(
       activeExternalRelease(record),
       database as DatabaseReference,
       lease,
+      hostRoutingTargetsForRecord(record),
     );
     await backend.assertTrafficRemoved(spec);
     return commitRecord(

@@ -1613,6 +1613,30 @@ describe('D1FleetStateStore release state', () => {
       decommissioningMigration,
     );
 
+    for (const lifecyclePhase of [
+      'decommissioning',
+      'traffic-removed',
+      'credentials-revoked',
+      'worker-deleted',
+      'platform-credentials-revoked',
+    ] as const) {
+      const retained: FleetRecord = {
+        ...decommissioningMigration,
+        desiredSpecDigest: record.migrationIntent.targetSpecDigest,
+        decommissionIntent: {
+          ...normalDecommissionIntentFixture(record, lifecyclePhase, {
+            requestedSpecDigest: record.migrationIntent.targetSpecDigest,
+            entryLifecyclePhase: 'migrating',
+          }),
+          state: 'transitioning',
+        },
+      };
+      await store.withDeploymentLease('acme', 'production', (lease) =>
+        lease.put(retained),
+      );
+      await expect(store.get('acme', 'production')).resolves.toEqual(retained);
+    }
+
     const { migrationIntent: _withoutIntent, ...withoutIntent } =
       decommissioningMigration;
     await expectInvalidDecommission(

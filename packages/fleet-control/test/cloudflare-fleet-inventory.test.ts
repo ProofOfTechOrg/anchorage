@@ -1027,6 +1027,65 @@ describe('advanceCloudflareFleetInventoryStage', () => {
     ]);
   });
 
+  it.each([
+    ['platform-state', 'platform-state', 'group-1'],
+    ['deployment-egress', 'deployment-egress', 'group-1'],
+    ['unknown-role', undefined, undefined],
+    [undefined, undefined, undefined],
+  ] as const)('projects dispatch resource metadata for role %s', async (role, expectedRole, expectedGroup) => {
+    const { deps } = harness({
+      dispatchNamespace: 'anchorage-ns',
+      kvPages: [[{ name: '__anchorage_script__:anchorage-state' }]],
+      kvValues: {
+        '__anchorage_script__:anchorage-state':
+          registrationValue('anchorage-state'),
+      },
+      dispatchPages: [
+        [
+          {
+            id: 'anchorage-state',
+            tags: ['fleet:anchorage', `tenant:${TENANT}`, 'environment:prod'],
+          },
+        ],
+      ],
+      namespaceInventory: {
+        namespace_name: 'anchorage-ns',
+        trusted_workers: false,
+        script_count: 1,
+      },
+      dispatchWorkers: {
+        'anchorage-state': dispatchWorker({
+          plainTextBindings: {
+            DEPLOYMENT_TENANT: TENANT,
+            FLEET_RESOURCE_GROUP: 'group-1',
+            ...(role === undefined ? {} : { FLEET_RESOURCE_ROLE: role }),
+          },
+        }),
+      },
+    });
+    const options = { ...RICH_OPTIONS, includeR2Buckets: false };
+    const run = await drive(deps, options);
+    expect(findings(run.rows)).toEqual([]);
+    const inventory = materializeFleetInventoryGeneration({ ...run, options });
+    expect(inventory.deployments).toHaveLength(1);
+    const deployment = inventory.deployments[0];
+    expect(deployment).toMatchObject({
+      backend: 'workers-for-platforms',
+      scriptName: 'anchorage-state',
+      tenantTag: TENANT,
+      environment: ENVIRONMENT,
+      databaseIds: ['db-1'],
+      plainTextBindings: { FLEET_RESOURCE_GROUP: 'group-1' },
+    });
+    expect({
+      resourceRole: deployment?.resourceRole,
+      resourceGroupId: deployment?.resourceGroupId,
+    }).toEqual({
+      resourceRole: expectedRole,
+      resourceGroupId: expectedGroup,
+    });
+  });
+
   it('advances the offset when a resumed chunk re-reads the same page', async () => {
     const world: World = {
       kvPages: [

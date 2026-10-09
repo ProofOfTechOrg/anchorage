@@ -248,6 +248,9 @@ class FakeSwitchProvider implements BackendSwitchProvider {
   readonly removedRouteTargets: Array<
     readonly import('../src/host-routing.js').HostRoutingTarget[]
   > = [];
+  rollbackRouteAuthority:
+    | Parameters<BackendSwitchProvider['removeCandidateHostAndDrain']>[0]
+    | undefined;
   failBridgeResponseOnce = false;
   failR2DeleteResponseOnce = false;
   switchTrafficRemoved = false;
@@ -443,7 +446,10 @@ class FakeSwitchProvider implements BackendSwitchProvider {
   async assertPlainBridgeServing() {
     this.calls.push('rollback-route-assert');
   }
-  async removeCandidateHostAndDrain() {
+  async removeCandidateHostAndDrain(
+    input: Parameters<BackendSwitchProvider['removeCandidateHostAndDrain']>[0],
+  ) {
+    this.rollbackRouteAuthority = input;
     this.calls.push('rollback-drain');
   }
   async restorePlainDeployment() {
@@ -975,6 +981,15 @@ describe('backend switch state machine', () => {
       backendSwitchIntent: { subphase: 'rolled-back' },
     });
     expect(store.record.platformResources).toBeUndefined();
+    expect(provider.rollbackRouteAuthority).toMatchObject({
+      target,
+      bridge: {
+        scriptName: 'acme-production',
+        artifactVersion: 'bridge-v1',
+        artifactDigest: 'e'.repeat(64),
+      },
+      candidate: { physicalScriptName: 'acme-candidate' },
+    });
     expect(provider.calls).toEqual([
       'rollback-route',
       'rollback-route-assert',

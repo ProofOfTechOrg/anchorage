@@ -15,10 +15,12 @@ import {
 } from '@proofoftech/flowsafe/host-kit';
 import { describe, expect, it, vi } from 'vitest';
 import { ActiveRouteAttestationError } from '../src/active-route.js';
+import { CloudflareProvisioningClient } from '../src/cloudflare-client.js';
 import { D1FleetStateDatabase } from '../src/d1-fleet-state-database.js';
 import { advanceDecommissionDeployment } from '../src/decommission-advance.js';
 import { WorkerDeploymentError } from '../src/deployment-error.js';
 import { migrateFleet } from '../src/fleet.js';
+import type { HostRoutingTarget } from '../src/host-routing.js';
 import {
   canonicalDeploymentEgressPolicy,
   durableObjectMigrationHistoryDigest,
@@ -60,6 +62,7 @@ import {
   type WorkersForPlatformsApi,
   WorkersForPlatformsBackend,
 } from '../src/workers-for-platforms-backend.js';
+import { testRateCoordinator } from './fixtures/cloudflare-fetch-fixture.js';
 import { decommissionAdvancingRecordFixture } from './fixtures/decommission-intent-fixture.js';
 import { D1State } from './fixtures/provider-world.js';
 import { createWfpMaintenanceHarness } from './fixtures/wfp-maintenance-harness.js';
@@ -354,16 +357,7 @@ class FakeApi implements WorkersForPlatformsApi {
         policyHosts?: readonly string[];
       }
     | undefined;
-  lastPromotedRoute:
-    | {
-        scriptName: string;
-        tenantTag: string;
-        environment: string;
-        policyId: string;
-        policyDigest: string;
-        policyHosts: readonly string[];
-      }
-    | undefined;
+  lastPromotedRoute: HostRoutingTarget | undefined;
 
   async listWorkerDatabaseAttachments(): Promise<
     readonly Readonly<{
@@ -924,14 +918,7 @@ class FakeApi implements WorkersForPlatformsApi {
   async putHostRouting(
     _namespaceId: string,
     _hostname: string,
-    target: {
-      scriptName: string;
-      tenantTag: string;
-      environment: string;
-      policyId: string;
-      policyDigest: string;
-      policyHosts: readonly string[];
-    },
+    target: HostRoutingTarget,
     guard: PromotionGuard,
   ): Promise<void> {
     this.calls.push('route');
@@ -950,20 +937,13 @@ class FakeApi implements WorkersForPlatformsApi {
   async deleteHostRouting(
     _namespaceId: string,
     _hostname: string,
-    allowedTargets: readonly Readonly<{
-      scriptName: string;
-      tenantTag: string;
-      environment: string;
-    }>[],
+    allowedTargets: readonly HostRoutingTarget[],
   ): Promise<void> {
     this.calls.push('delete-route');
     if (!this.routeOwner) return;
     if (
       !allowedTargets.some(
-        (target) =>
-          target.scriptName === this.routeOwner?.scriptName &&
-          target.tenantTag === this.routeOwner.tenantTag &&
-          target.environment === this.routeOwner.environment,
+        (target) => JSON.stringify(target) === JSON.stringify(this.routeOwner),
       )
     ) {
       throw new Error('route is owned by another deployment or release');
@@ -1086,6 +1066,91 @@ async function attestedHealthResponse(
 }
 
 describe('WorkersForPlatformsBackend', () => {
+  it('removes a persisted route through the concrete byte-exact client', async () => {
+    const api = new FakeApi();
+    const policy = canonicalDeploymentEgressPolicy({
+      policyId: externalPlatformResourceGroupId(deployment),
+      tenantTag: deployment.tenantTag,
+      environment: deployment.environment,
+      allowedHosts: ['prior.example.com'],
+    });
+    const target = {
+      scriptName: externalReleaseScriptName(deployment),
+      tenantTag: deployment.tenantTag,
+      environment: deployment.environment,
+      policyId: policy.policyId,
+      policyDigest: policy.policyDigest,
+      policyHosts: policy.policyHosts,
+      stateEgress: {
+        resourceGroupId: policy.policyId,
+        stateScriptName: externalStateScriptName(deployment),
+        credentialDigest: 'a'.repeat(64),
+      },
+    };
+    let stored: string | undefined = JSON.stringify(target);
+    let deletes = 0;
+    const client = new CloudflareProvisioningClient({
+      accountId: 'account',
+      apiToken: 'token',
+      dispatchNamespace: 'fleet',
+      requestTimeoutMs: 1_000,
+      rateCoordinator: testRateCoordinator(),
+      fetch: async (_input, init) => {
+        if (init?.method === 'DELETE') {
+          deletes += 1;
+          stored = undefined;
+          return new Response(null, { status: 200 });
+        }
+        return stored === undefined
+          ? new Response(null, { status: 404 })
+          : new Response(stored);
+      },
+    });
+    api.deleteHostRouting = (namespace, hostname, targets) =>
+      client.withMutationFence(fence, () =>
+        client.deleteHostRouting(namespace, hostname, targets),
+      );
+    const backend = new WorkersForPlatformsBackend({
+      namespacedState: NAMESPACED_STATE,
+      client: api,
+      hostRoutingKvId: 'host-routes',
+    });
+    const database = {
+      id: 'db-acme',
+      name: deployment.databaseName,
+      created: false,
+    };
+    await backend.removeTraffic(deployment, [], undefined, database, fence, [
+      target,
+    ]);
+    expect(stored).toBeUndefined();
+    expect(deletes).toBe(1);
+    for (const drift of [
+      { ...target, policyHosts: ['foreign.example.com'] },
+      {
+        ...target,
+        stateEgress: {
+          ...target.stateEgress,
+          credentialDigest: 'b'.repeat(64),
+        },
+      },
+    ]) {
+      stored = JSON.stringify(drift);
+      await expect(
+        backend.removeTraffic(deployment, [], undefined, database, fence, [
+          target,
+        ]),
+      ).rejects.toThrow(/owned by another deployment/);
+      expect(stored).toBe(JSON.stringify(drift));
+      expect(deletes).toBe(1);
+    }
+    stored = JSON.stringify(target);
+    await expect(
+      backend.removeTraffic(deployment, [], undefined, database, fence),
+    ).rejects.toThrow(/owned by another deployment/);
+    expect(deletes).toBe(1);
+  });
+
   it.each([
     'alias',
     'class',
@@ -4559,6 +4624,8 @@ describe('WorkersForPlatformsBackend', () => {
       policyHosts: ['api.example.com'],
     });
     expect(api.lastPromotedRoute?.policyDigest).toMatch(/^[a-f0-9]{64}$/u);
+    const promotedRoute = api.lastPromotedRoute;
+    if (!promotedRoute) throw new Error('promoted route is missing');
 
     api.routeOwner = undefined;
     const retained = {
@@ -4584,17 +4651,18 @@ describe('WorkersForPlatformsBackend', () => {
       database,
       fence,
     );
-    api.routeOwner = {
+    const retainedRoute = {
+      ...promotedRoute,
       scriptName: retained.physicalScriptName,
-      tenantTag: deployment.tenantTag,
-      environment: deployment.environment,
     };
+    api.routeOwner = retainedRoute;
     await backend.removeTraffic(
       deployment,
       [retained],
       undefined,
       database,
       fence,
+      [retainedRoute],
     );
     await backend.deleteWorker(
       deployment,
@@ -4662,11 +4730,21 @@ describe('WorkersForPlatformsBackend', () => {
     ).rejects.toThrow(/another deployment or release/);
     expect(api.deletedScriptNames).toEqual([]);
 
-    api.routeOwner = {
+    const policy = canonicalDeploymentEgressPolicy({
+      policyId: externalPlatformResourceGroupId(deployment),
+      tenantTag: deployment.tenantTag,
+      environment: deployment.environment,
+      allowedHosts: [],
+    });
+    const pendingRoute = {
       scriptName: pending.physicalScriptName,
       tenantTag: deployment.tenantTag,
       environment: deployment.environment,
+      policyId: policy.policyId,
+      policyDigest: policy.policyDigest,
+      policyHosts: policy.policyHosts,
     };
+    api.routeOwner = pendingRoute;
     api.failDelete = true;
     await backend.removeTraffic(
       deployment,
@@ -4674,6 +4752,7 @@ describe('WorkersForPlatformsBackend', () => {
       active,
       { id: 'db-acme', name: deployment.databaseName, created: false },
       fence,
+      [pendingRoute],
     );
     await expect(
       backend.deleteWorker(

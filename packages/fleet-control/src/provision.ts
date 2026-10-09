@@ -64,6 +64,7 @@ import {
   effectiveAppliedPlatformTarget,
   externalDurableObjectBindings,
   externalReleaseTopology,
+  hostRoutingTargetsForRecord,
 } from './platform-resources.js';
 import { buildPromotionGuard } from './promotion-guard.js';
 import { assertProviderBindingIdentitiesMatchInspection } from './provider-binding-inventory.js';
@@ -430,6 +431,7 @@ async function rollbackProvisioning(
         rollbackActiveRelease,
         database,
         lease,
+        hostRoutingTargetsForRecord(record),
       );
       await backend.assertTrafficRemoved(spec);
       await assertApplicationR2EmptyBeforeDecommission({
@@ -1581,7 +1583,7 @@ async function provisionDeploymentUnderLease(
       workerCreated ||= cause.createdByAttempt;
       workerResourceState = cause.resourceState;
     }
-    if (record?.phase === 'publishing') {
+    if (record?.phase === 'publishing' || record?.phase === 'ready') {
       throw new ProvisioningError(
         `failed to provision '${spec.tenantTag}:${spec.environment}'; publishing state is preserved for retry or export-backed decommissioning`,
         cause,
@@ -2217,6 +2219,7 @@ async function decommissionDeploymentUnderLease(
       activeExternalRelease(record),
       database,
       lease,
+      hostRoutingTargetsForRecord(record),
     );
     await backend.assertTrafficRemoved(spec);
     record = {

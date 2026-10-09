@@ -22,7 +22,7 @@ import type {
   ProvisioningBackend,
   TrustedWorkerArtifact,
 } from './types.js';
-import { effectiveLifecyclePhase } from './types.js';
+import { effectiveLifecyclePhase, isPlatformCatalogRecord } from './types.js';
 
 export const FLEET_AUDIT_PROXY_BINDING = 'AUDIT_PROXY';
 export const FLEET_AUDIT_PROXY_STATE_BINDING = 'FLEET_AUDIT_PROXY_OBJECT';
@@ -186,6 +186,41 @@ export function externalHostRoutingTarget(
     );
   }
   return expectation.routeTarget ?? target;
+}
+
+export function hostRoutingTargetsForRecord(
+  record: FleetRecord | undefined,
+): readonly HostRoutingTarget[] {
+  if (record?.backend !== 'workers-for-platforms') return [];
+  if (!isPlatformCatalogRecord(record)) {
+    return externalRouteExpectations(record).map((expectation) =>
+      externalHostRoutingTarget(record, expectation),
+    );
+  }
+  if (
+    ![
+      'publishing',
+      'ready',
+      'migrating',
+      'rolling-back',
+      'decommissioning',
+      'credentials-revoked',
+    ].includes(effectiveLifecyclePhase(record))
+  )
+    return [];
+  const policy = record.outboundPolicy;
+  if (!policy)
+    throw new Error('catalog route authority has no persisted outbound policy');
+  return [
+    {
+      scriptName: record.scriptName,
+      tenantTag: record.tenantTag,
+      environment: record.environment,
+      policyId: policy.policyId,
+      policyDigest: policy.policyDigest,
+      policyHosts: policy.policyHosts,
+    },
+  ];
 }
 
 export function externalStateDeploymentSpec(

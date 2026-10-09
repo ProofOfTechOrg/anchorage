@@ -749,11 +749,12 @@ function validateRecordCrossFields(record: FleetRecord): void {
     schemaVersion,
   } = record;
   // The retained target authorizes recovery of a state upload whose response is lost.
-  const legacyMigrationTeardown =
+  const migrationTeardown =
     backend === 'workers-for-platforms' &&
     record.wfpMode === undefined &&
     record.cleanupIntent === undefined &&
-    record.decommissionIntent === undefined &&
+    (record.decommissionIntent === undefined ||
+      record.decommissionIntent.identity.mode.kind === 'normal') &&
     record.backendSwitchIntent === undefined &&
     record.desiredSpecDigest === migrationIntent?.targetSpecDigest &&
     [
@@ -762,7 +763,7 @@ function validateRecordCrossFields(record: FleetRecord): void {
       'credentials-revoked',
       'worker-deleted',
       'platform-credentials-revoked',
-    ].includes(record.phase);
+    ].includes(phase);
   if (
     (backend === 'workers-for-platforms' && !outboundPolicy) ||
     (backend === 'plain-worker' && outboundPolicy) ||
@@ -784,7 +785,7 @@ function validateRecordCrossFields(record: FleetRecord): void {
     (platformTarget &&
       JSON.stringify(platformTarget.outboundPolicy) !==
         JSON.stringify(outboundPolicy)) ||
-    (migrationIntent && phase !== 'migrating' && !legacyMigrationTeardown) ||
+    (migrationIntent && phase !== 'migrating' && !migrationTeardown) ||
     (migrationIntent &&
       migrationIntent.targetSpecDigest !==
         migrationIntent.targetRelease.specDigest) ||

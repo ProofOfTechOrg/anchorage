@@ -23,7 +23,10 @@ import {
 } from './database-export-store.js';
 import { isSha256 } from './deployment-context.js';
 import { WorkerDeploymentError } from './deployment-error.js';
-import { parseHostRoutingTarget } from './host-routing.js';
+import {
+  type HostRoutingTarget,
+  parseHostRoutingTarget,
+} from './host-routing.js';
 import { readMaintenanceHealth } from './maintenance-health.js';
 import {
   applyMigrationsWithLedger,
@@ -386,11 +389,7 @@ export interface WorkersForPlatformsApi {
   deleteHostRouting(
     namespaceId: string,
     hostname: string,
-    allowedTargets: readonly Readonly<{
-      readonly scriptName: string;
-      readonly tenantTag: string;
-      readonly environment: string;
-    }>[],
+    allowedTargets: readonly HostRoutingTarget[],
   ): Promise<void>;
   getHostRouting(
     namespaceId: string,
@@ -1721,13 +1720,7 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
           await this.#client.deleteHostRouting(
             this.#hostRoutingKvId,
             spec.routeHostname,
-            [
-              {
-                scriptName: physicalScriptName,
-                tenantTag: spec.tenantTag,
-                environment: spec.environment,
-              },
-            ],
+            [],
           );
           if (
             (await this.#client.getHostRouting(
@@ -2159,6 +2152,7 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
     activeRelease: ExternalReleaseSnapshot | undefined,
     database: DatabaseReference,
     fence: ExternalMutationFence,
+    routeTargets: readonly HostRoutingTarget[] = [],
   ): Promise<void> {
     await this.#withMutationFence(fence, async () => {
       const releases = this.#releaseTargets(
@@ -2174,14 +2168,23 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
           retainedReleases ?? [],
         );
       }
+      for (const target of routeTargets) {
+        if (
+          target.tenantTag !== spec.tenantTag ||
+          target.environment !== spec.environment ||
+          !releases.some(
+            (release) => release.physicalScriptName === target.scriptName,
+          )
+        ) {
+          throw new Error(
+            'host route authority belongs to another deployment or release',
+          );
+        }
+      }
       await this.#client.deleteHostRouting(
         this.#hostRoutingKvId,
         spec.routeHostname,
-        releases.map((release) => ({
-          scriptName: release.physicalScriptName,
-          tenantTag: spec.tenantTag,
-          environment: spec.environment,
-        })),
+        routeTargets,
       );
     });
   }

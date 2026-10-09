@@ -33,6 +33,7 @@ import {
   canonicalDeploymentEgressPolicy,
   canonicalDurableObjectMigrationHistory,
   durableObjectMigrationHistoryDigest,
+  externalHostRoutingTarget,
   externalPlatformResourceGroupId,
   externalReleaseTopology,
   externalStateDeploymentSpec,
@@ -2173,19 +2174,28 @@ export class WorkersForPlatformsBackendSwitchProvider
   async removeCandidateHostAndDrain(input: {
     readonly targetSpec: DeploymentSpec;
     readonly candidate: ExternalReleaseSnapshot;
+    readonly target: ExternalPlatformTargetDescription;
+    readonly bridge: BridgeSnapshot;
     readonly fence: BackendSwitchMutationFence;
   }): Promise<void> {
+    if (!input.target.stateEgressCredentialDigest) {
+      throw new Error(
+        'candidate rollback has no persisted state-egress credential digest',
+      );
+    }
+    const routeTarget = externalHostRoutingTarget(
+      {
+        tenantTag: input.targetSpec.tenantTag,
+        environment: input.targetSpec.environment,
+      },
+      { release: input.candidate, target: input.target },
+      input.bridge.scriptName,
+    );
     await this.#client.withMutationFence(input.fence, () =>
       this.#client.deleteHostRouting(
         this.#hostRoutingKvId,
         input.targetSpec.routeHostname,
-        [
-          {
-            scriptName: input.candidate.physicalScriptName,
-            tenantTag: input.targetSpec.tenantTag,
-            environment: input.targetSpec.environment,
-          },
-        ],
+        [routeTarget],
       ),
     );
     if (
