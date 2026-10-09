@@ -23,9 +23,10 @@ import type { Agent, ToolsInput } from '@mastra/core/agent';
 import type { IMastraLogger } from '@mastra/core/logger';
 import { Mastra } from '@mastra/core/mastra';
 import { RequestContext } from '@mastra/core/request-context';
-import type {
-  MastraCompositeStore,
-  WorkflowsStorage,
+import {
+  createEmptyWorkflowSnapshot,
+  type MastraCompositeStore,
+  type WorkflowsStorage,
 } from '@mastra/core/storage';
 import {
   type AnyWorkflow,
@@ -91,6 +92,7 @@ import {
   canonicalScheduleDispatch,
   failureEnvelope,
   hasDisputedSettlement,
+  isSettledLegAbort,
   legAbortReason,
   lifecycleFromRequestContext,
   projectTerminalLifecycle,
@@ -1879,13 +1881,15 @@ export class RunnerRuntime {
               },
             );
             const result = await executionPromise;
+            this.#throwIfSettledLeg(active, workflowId, runId);
             await this.#reconcileTerminalState(
               workflowId,
               runId,
               result,
               requestContext,
               source,
-              active.storedRunScope?.rowStored === true,
+              // A fenced start's admission witnessed the row it stored.
+              admissionEntered || active.storedRunScope?.rowStored === true,
             );
           });
           outcomeReadStarted = true;
@@ -2057,13 +2061,15 @@ export class RunnerRuntime {
             },
           );
           const resumed = await executionPromise;
+          this.#throwIfSettledLeg(active, workflowId, runId);
           await this.#reconcileTerminalState(
             workflowId,
             runId,
             resumed,
             requestContext,
             source,
-            active.storedRunScope?.rowStored === true,
+            // A resume begins from the row it read.
+            true,
             proof,
           );
           return resumed;
@@ -3149,6 +3155,21 @@ export class RunnerRuntime {
     for (const controller of unaborted) controller.abort(reason);
   }
 
+  /**
+   * End a leg the liveness touch aborted for a settlement as that settlement's
+   * conflict. Core releases report such an abort differently (`canceled` or
+   * `waiting`), and a workflow whose `shouldPersistSnapshot` skips that status
+   * stores nothing for it, so only the abort reason tells.
+   */
+  #throwIfSettledLeg(
+    active: ActiveRun,
+    workflowId: string,
+    runId: string,
+  ): void {
+    if (isSettledLegAbort(active.run?.abortController.signal.reason))
+      throw new RunSettledConflictError(workflowId, runId);
+  }
+
   #withStoredRunOf(
     source: CapturedWorkflowStorage | undefined,
   ): FencedWorkflowAdmissionCapability['withStoredRun'] {
@@ -3846,19 +3867,21 @@ export class RunnerRuntime {
     if (!opts) return;
     await this.#withLifecycleLock(workflowId, runId, async () => {
       const workflows = source.workflows;
-      const snapshot = await source.load.call(workflows, {
+      const stored = await source.load.call(workflows, {
         workflowName: workflowId,
         runId,
       });
-      if (!snapshot) {
-        // A row gone after this leg stored it was removed by retention, either
-        // after another instance settled the run or after this leg's own
-        // terminal write (`success` or `failed`).
-        if (rowStored) throw new RunSettledConflictError(workflowId, runId);
-        throw new Error(
-          `RunnerRuntime: run '${runId}' of workflow '${workflowId}' completed without a durable snapshot`,
-        );
-      }
+      // A row gone after this leg read or stored it was removed after the run
+      // settled, by retention or by the host, so the leg must not store the
+      // run again.
+      if (!stored && rowStored)
+        throw new RunSettledConflictError(workflowId, runId);
+      // A start whose workflow stores none of the statuses it passed through
+      // has no row, so its terminal record is the run's first.
+      const snapshot = stored ?? {
+        ...createEmptyWorkflowSnapshot(runId),
+        serializedStepGraph: this.#getWorkflow(workflowId).serializedStepGraph,
+      };
       if (snapshot.runId !== runId)
         throw new RunStateUnreadableError(workflowId, runId);
       const expected = runProvenance({
