@@ -88,6 +88,17 @@ interface CredentialedCleanupSpec {
 interface CredentialedCleanupRecord {
   readonly phase: string;
   readonly desiredSpecDigest: string;
+  readonly migrationIntent?: { readonly targetSpecDigest: string };
+  readonly pendingRelease?: { readonly specDigest: string };
+  readonly pendingSpecDigest?: string;
+  readonly decommissionIntent?: {
+    readonly identity: {
+      readonly mode: {
+        readonly kind: string;
+        readonly requestedSpecDigest?: string;
+      };
+    };
+  };
 }
 
 interface CredentialedCleanupDeployment<TSpec extends CredentialedCleanupSpec> {

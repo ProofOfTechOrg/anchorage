@@ -3023,7 +3023,7 @@ describe('fleet operations', () => {
     ).rejects.toThrow(/migration base mismatch/);
   });
 
-  it('retains the owned dispatch namespace after migrating an omitted provider binding', async () => {
+  it('retains owned dispatch namespaces when migration adds an omitted provider binding', async () => {
     class OmittedNamespaceBackend extends ImmutableFleetBackend {
       override async ensurePlatformResources(deployment: DeploymentSpec) {
         const result = await super.ensurePlatformResources(deployment);
@@ -3090,7 +3090,10 @@ describe('fleet operations', () => {
     );
     const target: DeploymentSpec = {
       ...spec(current, 2),
-      durableObjectBindings: initialSpec.durableObjectBindings,
+      durableObjectBindings: [
+        ...initialSpec.durableObjectBindings,
+        { name: 'RUNNER_V2', className: 'RunnerV2' },
+      ],
     };
     const store = storeFor([current]);
 
@@ -3115,7 +3118,16 @@ describe('fleet operations', () => {
         scriptName: externalStateScriptName(initialSpec),
         dispatchNamespace: 'fleet-conformance',
       },
+      {
+        name: 'RUNNER_V2',
+        className: 'RunnerV2',
+        namespaceId: 'state-worker-acme-RUNNER_V2',
+        scriptName: externalStateScriptName(initialSpec),
+        dispatchNamespace: 'fleet-conformance',
+      },
     ]);
+    expect(migrated?.rollbackRelease).toEqual(current.activeRelease);
+    expect(backend.routedScriptName).toBe(externalReleaseScriptName(target));
     expect(
       (await store.get('acme', 'production'))?.activeRelease?.topology,
     ).toEqual(migrated?.activeRelease?.topology);

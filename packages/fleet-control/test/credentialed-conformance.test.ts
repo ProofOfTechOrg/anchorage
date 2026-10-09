@@ -494,18 +494,80 @@ describe('credentialed conformance command', () => {
   });
 
   it.each([
-    ['migration failure before intent', 'ready'],
-    ['mid-migration failure', 'migrating'],
-    ['rollback settlement response loss', 'ready'],
-  ])('selects the durable initial spec and removes resources after %s', async (_failure, phase) => {
+    {
+      failure: 'migration failure before intent',
+      record: { phase: 'ready', desiredSpecDigest: 'initial' },
+      expectedSpec: 'initial',
+    },
+    {
+      failure: 'external migration failure',
+      record: {
+        phase: 'migrating',
+        desiredSpecDigest: 'initial',
+        migrationIntent: { targetSpecDigest: 'next' },
+        pendingRelease: { specDigest: 'next' },
+        pendingSpecDigest: 'next',
+      },
+      expectedSpec: 'next',
+    },
+    {
+      failure: 'migration with a retained pending release',
+      record: {
+        phase: 'migrating',
+        desiredSpecDigest: 'initial',
+        pendingRelease: { specDigest: 'next' },
+      },
+      expectedSpec: 'next',
+    },
+    {
+      failure: 'mutable migration failure',
+      record: {
+        phase: 'migrating',
+        desiredSpecDigest: 'initial',
+        pendingSpecDigest: 'next',
+      },
+      expectedSpec: 'next',
+    },
+    {
+      failure: 'bounded decommission admission response loss',
+      record: {
+        phase: 'decommission-advancing',
+        desiredSpecDigest: 'initial',
+        migrationIntent: { targetSpecDigest: 'next' },
+        decommissionIntent: {
+          lifecyclePhase: 'migrating',
+          identity: {
+            mode: { kind: 'normal', requestedSpecDigest: 'next' },
+          },
+        },
+      },
+      expectedSpec: 'next',
+    },
+    {
+      failure: 'bounded decommission transition response loss',
+      record: {
+        phase: 'decommission-advancing',
+        desiredSpecDigest: 'next',
+        decommissionIntent: {
+          lifecyclePhase: 'traffic-removed',
+          identity: {
+            mode: { kind: 'normal', requestedSpecDigest: 'next' },
+          },
+        },
+      },
+      expectedSpec: 'next',
+    },
+  ])('dispatches cleanup with durable authority after $failure', async ({
+    record,
+    expectedSpec,
+  }) => {
     const initialSpec = {
       tenantTag: 'tenant-a',
       environment: 'conformance',
       digest: 'initial',
     };
     const nextSpec = { ...initialSpec, digest: 'next' };
-    const record = { phase, desiredSpecDigest: initialSpec.digest };
-    const removed: string[] = [];
+    const dispatched: string[] = [];
     await cleanupCredentialedDeployment(
       {
         initialSpec,
@@ -518,14 +580,108 @@ describe('credentialed conformance command', () => {
         backend: {},
         deploymentSpecDigest: (spec) => spec.digest,
         decommissionDeployment: async ({ spec }) => {
-          removed.push(spec.digest);
+          dispatched.push(`decommission:${spec.digest}`);
         },
         cleanupDeploymentArtifacts: async ({ spec }) => {
-          removed.push(spec.digest);
+          dispatched.push(`artifacts:${spec.digest}`);
         },
       },
     );
-    expect(removed).toEqual(['initial']);
+    expect(dispatched).toEqual([`decommission:${expectedSpec}`]);
+  });
+
+  it.each([
+    {
+      failure: 'missing migration target',
+      record: { phase: 'migrating', desiredSpecDigest: 'initial' },
+    },
+    {
+      failure: 'foreign migration target with a known pending release',
+      record: {
+        phase: 'migrating',
+        desiredSpecDigest: 'initial',
+        migrationIntent: { targetSpecDigest: 'foreign' },
+        pendingRelease: { specDigest: 'next' },
+      },
+    },
+    {
+      failure: 'invalid migration target with a known fallback',
+      record: {
+        phase: 'migrating',
+        desiredSpecDigest: 'initial',
+        migrationIntent: { targetSpecDigest: '' },
+        pendingSpecDigest: 'next',
+      },
+    },
+    {
+      failure: 'missing bounded decommission authority',
+      record: { phase: 'decommission-advancing', desiredSpecDigest: 'next' },
+    },
+    {
+      failure: 'foreign bounded decommission authority',
+      record: {
+        phase: 'decommission-advancing',
+        desiredSpecDigest: 'next',
+        decommissionIntent: {
+          identity: {
+            mode: { kind: 'normal', requestedSpecDigest: 'foreign' },
+          },
+        },
+      },
+    },
+    {
+      failure: 'invalid bounded decommission authority',
+      record: {
+        phase: 'decommission-advancing',
+        desiredSpecDigest: 'next',
+        decommissionIntent: { identity: { mode: { kind: 'normal' } } },
+      },
+    },
+    {
+      failure: 'backend-switch decommission authority',
+      record: {
+        phase: 'decommission-advancing',
+        desiredSpecDigest: 'next',
+        decommissionIntent: {
+          identity: {
+            mode: { kind: 'backend-switch', requestedSpecDigest: 'next' },
+          },
+        },
+      },
+    },
+  ])('refuses cleanup before callbacks for $failure', async ({ record }) => {
+    const initialSpec = {
+      tenantTag: 'tenant-a',
+      environment: 'conformance',
+      digest: 'initial',
+    };
+    const nextSpec = { ...initialSpec, digest: 'next' };
+    const callbacks: string[] = [];
+    await expect(
+      cleanupCredentialedDeployment(
+        {
+          initialSpec,
+          nextSpec,
+          currentSpec: nextSpec,
+          secrets: {},
+          store: { get: async () => record },
+        },
+        {
+          backend: {},
+          deploymentSpecDigest: (spec) => spec.digest,
+          beforeCleanup: async () => {
+            callbacks.push('before');
+          },
+          decommissionDeployment: async () => {
+            callbacks.push('decommission');
+          },
+          cleanupDeploymentArtifacts: async () => {
+            callbacks.push('artifacts');
+          },
+        },
+      ),
+    ).rejects.toThrow(/credentialed cleanup refuses/u);
+    expect(callbacks).toEqual([]);
   });
 
   it('selects a durably settled next spec and fails closed on an unknown digest', async () => {

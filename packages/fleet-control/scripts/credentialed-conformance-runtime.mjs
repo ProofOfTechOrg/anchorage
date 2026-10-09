@@ -39,6 +39,7 @@ const DECOMMISSIONABLE_PHASES = new Set([
   'ready',
   'migrating',
   'rolling-back',
+  'decommission-advancing',
   'decommissioning',
   'traffic-removed',
   'credentials-revoked',
@@ -272,16 +273,37 @@ export async function loadCredentialedConformanceArtifacts(options) {
 
 export function selectCredentialedCleanupSpec(options) {
   if (!options.record) return undefined;
+  const record = options.record;
+  let requestedDigest;
+  if (
+    record.decommissionIntent !== undefined ||
+    record.phase === 'decommission-advancing'
+  ) {
+    const mode = record.decommissionIntent?.identity?.mode;
+    if (mode?.kind !== 'normal') {
+      throw new Error(
+        'credentialed cleanup refuses invalid normal decommission authority',
+      );
+    }
+    requestedDigest = mode.requestedSpecDigest;
+  } else if (record.phase === 'migrating') {
+    requestedDigest =
+      record.migrationIntent?.targetSpecDigest ??
+      record.pendingRelease?.specDigest ??
+      record.pendingSpecDigest;
+  } else {
+    requestedDigest = record.desiredSpecDigest;
+  }
   const initialDigest = options.deploymentSpecDigest(options.initialSpec);
   const nextDigest = options.deploymentSpecDigest(options.nextSpec);
-  if (options.record.desiredSpecDigest === initialDigest) {
+  if (requestedDigest === initialDigest) {
     return options.initialSpec;
   }
-  if (options.record.desiredSpecDigest === nextDigest) {
+  if (requestedDigest === nextDigest) {
     return options.nextSpec;
   }
   throw new Error(
-    `credentialed cleanup refuses unknown desired specification digest '${options.record.desiredSpecDigest}'`,
+    `credentialed cleanup refuses unknown desired specification digest '${requestedDigest}'`,
   );
 }
 

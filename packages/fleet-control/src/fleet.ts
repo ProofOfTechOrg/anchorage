@@ -2966,7 +2966,6 @@ async function migrationPlatformOnlyResources(
 async function migrationPlatformOnlyMaintenance(
   admitted: AdmittedFleetMigrationContext,
   current: FleetRecord,
-  entry: FleetRecord,
 ): Promise<FleetRecord> {
   const { lease, backend, spec, secrets, targetDigest } = admitted;
   const platformMigrationRelease = (
@@ -2982,7 +2981,7 @@ async function migrationPlatformOnlyMaintenance(
   }
   assertLiveDeploymentMatches(
     maintenancePreflight,
-    entry,
+    current,
     spec,
     targetDigest,
     platformMigrationRelease.application,
@@ -3011,7 +3010,6 @@ async function migrationPlatformOnlyMaintenance(
 async function migrationPlatformOnlyPromote(
   admitted: AdmittedFleetMigrationContext,
   current: FleetRecord,
-  entry: FleetRecord,
 ): Promise<FleetRecord> {
   const {
     lease,
@@ -3038,7 +3036,7 @@ async function migrationPlatformOnlyPromote(
     }
     assertLiveDeploymentMatches(
       publicationPreflight,
-      entry,
+      current,
       spec,
       targetDigest,
       platformMigrationRelease.application,
@@ -3073,7 +3071,6 @@ async function migrationPlatformOnlyPromote(
 async function migrationPlatformOnlyReady(
   admitted: AdmittedFleetMigrationContext,
   current: FleetRecord,
-  entry: FleetRecord,
 ): Promise<FleetRecord> {
   const {
     lease,
@@ -3100,7 +3097,7 @@ async function migrationPlatformOnlyReady(
   if (!live) throw new Error('platform-only migration release is missing');
   assertLiveDeploymentMatches(
     live,
-    entry,
+    current,
     spec,
     targetDigest,
     platformMigrationRelease.application,
@@ -3295,7 +3292,6 @@ async function migrationPendingTopology(
 async function migrationDeployCandidate(
   admitted: AdmittedFleetMigrationContext,
   current: FleetRecord,
-  entry: FleetRecord,
 ): Promise<FleetRecord> {
   const {
     lease,
@@ -3360,7 +3356,7 @@ async function migrationDeployCandidate(
   if (!live) throw new Error('migration candidate is missing');
   assertLiveDeploymentMatches(
     live,
-    entry,
+    current,
     spec,
     targetDigest,
     current.migrationIntent?.targetRelease.application ??
@@ -3449,7 +3445,6 @@ async function migrationArmMaintenance(
 async function migrationPromote(
   admitted: AdmittedFleetMigrationContext,
   current: FleetRecord,
-  entry: FleetRecord,
 ): Promise<FleetRecord> {
   const {
     lease,
@@ -3469,7 +3464,7 @@ async function migrationPromote(
   }
   assertLiveDeploymentMatches(
     publicationPreflight,
-    entry,
+    current,
     spec,
     targetDigest,
     current.migrationIntent?.targetRelease.application ??
@@ -3536,7 +3531,7 @@ async function migrationSettleReady(
   }
   assertLiveDeploymentMatches(
     live,
-    entry,
+    current,
     spec,
     targetDigest,
     current.migrationIntent?.targetRelease.application ??
@@ -3704,17 +3699,13 @@ export async function executeNextMigrationStep(
       current = await migrationPlatformOnlyResources(admitted, current);
       break;
     case 'platform-only-maintenance':
-      current = await migrationPlatformOnlyMaintenance(
-        admitted,
-        current,
-        entry,
-      );
+      current = await migrationPlatformOnlyMaintenance(admitted, current);
       break;
     case 'platform-only-promote':
-      current = await migrationPlatformOnlyPromote(admitted, current, entry);
+      current = await migrationPlatformOnlyPromote(admitted, current);
       break;
     case 'platform-only-ready':
-      current = await migrationPlatformOnlyReady(admitted, current, entry);
+      current = await migrationPlatformOnlyReady(admitted, current);
       break;
     case 'seed-identity':
       current = await migrationSeedIdentity(admitted, current, entry);
@@ -3740,13 +3731,13 @@ export async function executeNextMigrationStep(
       current = await migrationPendingTopology(admitted, current);
       break;
     case 'deploy-candidate':
-      current = await migrationDeployCandidate(admitted, current, entry);
+      current = await migrationDeployCandidate(admitted, current);
       break;
     case 'arm-maintenance':
       current = await migrationArmMaintenance(admitted, current);
       break;
     case 'promote':
-      current = await migrationPromote(admitted, current, entry);
+      current = await migrationPromote(admitted, current);
       break;
     case 'settle-ready':
       current = await migrationSettleReady(admitted, current, entry);
@@ -4104,7 +4095,7 @@ export async function rollbackExternalRelease(options: {
       if (!live) throw new Error('retained rollback release is missing');
       assertLiveDeploymentMatches(
         live,
-        stored,
+        intent,
         rollbackSpec,
         rollbackDigest,
         target.application,
@@ -4129,7 +4120,7 @@ export async function rollbackExternalRelease(options: {
       if (!live) throw new Error('retained rollback release is missing');
       assertLiveDeploymentMatches(
         live,
-        stored,
+        intent,
         rollbackSpec,
         rollbackDigest,
         target.application,
@@ -4152,7 +4143,7 @@ export async function rollbackExternalRelease(options: {
         throw new Error('rollback release disappeared after promotion');
       assertLiveDeploymentMatches(
         live,
-        stored,
+        intent,
         rollbackSpec,
         rollbackDigest,
         target.application,

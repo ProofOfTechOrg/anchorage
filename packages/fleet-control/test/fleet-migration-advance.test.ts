@@ -3886,7 +3886,7 @@ describe('bounded fleet migration', () => {
     }
   });
 
-  it('all ten bounded entry bindings observe the leased retry snapshot rather than the admission snapshot', async () => {
+  it('validates reconciled migration topology while preserving entry identity', async () => {
     for (const step of [
       'platform-only-maintenance',
       'platform-only-promote',
@@ -3921,14 +3921,14 @@ describe('bounded fleet migration', () => {
       const plan = item.plan;
       const planCursor = item.planCursor;
       await withAdmitted(world, async ({ admitted, reread }) => {
-        const staleEntry = {
+        const staleCurrent = {
           ...reread,
           platformResources: world.initial.platformResources,
         };
         await expect(
           executeNextMigrationStep(admitted, plan, planCursor, {
-            entry: staleEntry,
-            current: reread,
+            entry: reread,
+            current: staleCurrent,
           }),
         ).rejects.toThrow(
           "deployment 'cedar:production' live state does not exactly match the desired specification",
