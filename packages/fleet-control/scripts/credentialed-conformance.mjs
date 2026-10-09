@@ -105,7 +105,10 @@ function trustedArtifact(configuration, content, additionalModules) {
     modules: [
       {
         name: configuration.mainModule,
-        content,
+        content: new TextDecoder('utf-8', {
+          fatal: true,
+          ignoreBOM: true,
+        }).decode(content),
         contentType: 'application/javascript+module',
       },
       ...additionalModules,
