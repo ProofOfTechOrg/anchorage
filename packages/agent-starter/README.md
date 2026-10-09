@@ -392,14 +392,10 @@ pnpm test:conformance-config
 
 ### Run the paid gate
 
-Not yet run: it needs a scratch Cloudflare account with a Workers for Platforms subscription. When one exists:
+Use a scratch Cloudflare account with a Workers for Platforms subscription. See [paid namespace conformance](../../docs/fleet-control.md#run-paid-namespace-conformance) for the current proof record and operator requirements.
 
 1. `pnpm --filter anchorage-agent-starter build:conformance`.
-2. Copy `dist/conformance/anchorage-starter.conformance.json` and replace the account-specific placeholders:
-   - `hostRoutingKvId`
-   - `routeHostnames.tenanta` and `routeHostnames.tenantb`
-   - `maintenanceBaseUrls.tenanta` and `maintenanceBaseUrls.tenantb`
-   - `platformProfile.maintenanceCapabilityPublicKey`
+2. Copy `dist/conformance/anchorage-starter.conformance.json` and replace the account-specific placeholders using the [operator configuration requirements](../../docs/fleet-control.md#run-paid-namespace-conformance).
 3. Point `conformance.allowedUpstreamUrl` at an origin that really answers 2xx, set `platformProfile.organizationEgressHosts` to exactly that hostname, and point `deniedUpstreamUrl` at a hostname absent from that list. The placeholder `.example` hosts do not resolve, the gate requires an actual upstream status from both, and stage-one validation rejects a configuration whose allowed hostname is not in `organizationEgressHosts`.
 4. Export `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN`, `FLEET_CONFORMANCE_CONFIG`, `FLEET_MAINTENANCE_CAPABILITY_PRIVATE_JWK`, `FLEET_STATE_EGRESS_ROOT_SECRET`, and `FLEET_CONFORMANCE_APPLICATION_SECRET`. Bundle paths in the configuration resolve from `packages/fleet-control`, which is the runner's working directory.
 5. `pnpm fleet-control:credentialed > proof.json`. The proof goes to standard output; retain it with the release evidence.

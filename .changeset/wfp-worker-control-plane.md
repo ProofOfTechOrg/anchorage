@@ -30,3 +30,7 @@ Preserve published deployments when the final ready-state write fails or its res
 Reject unusable credentialed-run export directories before provisioning paid resources.
 
 Export `StateEgress` as a named HTTP handler so trusted-state service bindings resolve it in the Workers runtime. Direct JavaScript callers must replace `new StateEgress(context, env).fetch(request)` with `StateEgress.fetch(request, env)`. The service-binding entrypoint name and HTTP contract remain unchanged.
+
+Persist platform targets for the shared outbound Worker and omit absent Durable Object tags from migration and switch records so lifecycle state survives reload. Validate candidates against reconciled trusted state resources during migration and rollback.
+
+Select paid-run cleanup from the current lifecycle record and preserve the applied migration cursor during same-name trusted-state uploads. Align its CPU failure expectation with the dispatcher’s 503 response, and load trusted JavaScript entry modules as UTF-8 text for the ordinary Worker probe. Operator configurations must set `plainWorkerRouteHostname` to a separate unused hostname.
