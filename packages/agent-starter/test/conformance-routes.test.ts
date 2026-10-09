@@ -2,6 +2,7 @@
 
 import { describe, expect, it } from 'vitest';
 
+import candidate from '../src/conformance/candidate.js';
 import { CONFORMANCE_CONTRACT } from '../src/conformance/contract.js';
 import type { ConformanceCandidateEnv } from '../src/conformance/env.js';
 import { mountConformanceRoutes } from '../src/conformance/routes.js';
@@ -35,6 +36,87 @@ function post(body: unknown): Request {
 }
 
 describe('conformance candidate routes', () => {
+  it.each([
+    ['POST', '/admin/ensure-maintenance', '/ensure', 'ensure-body', 202],
+    ['GET', '/admin/maintenance-status', '/status', undefined, 401],
+  ])('relays %s %s to the maintenance singleton without interpreting credentials', async (method, path, target, body, status) => {
+    const namespaceCalls: unknown[] = [];
+    const response = await candidate.fetch(
+      new Request(`https://tenanta.example${path}?instance=other`, {
+        method,
+        headers: { authorization: 'opaque maintenance credential' },
+        body,
+      }),
+      env({
+        MAINTENANCE: {
+          idFromName(name) {
+            namespaceCalls.push(['idFromName', name]);
+            return 'maintenance-object-id';
+          },
+          get(id) {
+            namespaceCalls.push(['get', id]);
+            return {
+              async fetch(request) {
+                return Response.json(
+                  {
+                    method: request.method,
+                    url: request.url,
+                    authorization: request.headers.get('authorization'),
+                    body: await request.text(),
+                  },
+                  {
+                    status,
+                    headers: {
+                      'x-flowsafe-maintenance-receipt': 'opaque-receipt',
+                    },
+                  },
+                );
+              },
+            };
+          },
+        },
+      }),
+    );
+
+    expect(response.status).toBe(status);
+    expect(namespaceCalls).toEqual([
+      ['idFromName', 'deployment-maintenance'],
+      ['get', 'maintenance-object-id'],
+    ]);
+    expect(response.headers.get('x-flowsafe-maintenance-receipt')).toBe(
+      'opaque-receipt',
+    );
+    await expect(response.json()).resolves.toEqual({
+      method,
+      url: `http://maintenance${target}`,
+      authorization: 'opaque maintenance credential',
+      body: body ?? '',
+    });
+  });
+
+  it.each([
+    ['GET', '/admin/ensure-maintenance'],
+    ['POST', '/admin/maintenance-status'],
+    ['POST', '/admin/ensure-maintenance/'],
+    ['GET', '/admin/maintenance-status/'],
+  ])('does not relay %s %s', async (method, path) => {
+    const response = await candidate.fetch(
+      new Request(`https://tenanta.example${path}`, { method }),
+      env({
+        MAINTENANCE: {
+          idFromName() {
+            throw new Error('unmatched route reached maintenance');
+          },
+          get() {
+            throw new Error('unmatched route reached maintenance');
+          },
+        },
+      }),
+    );
+    expect(response.status).toBe(404);
+    await expect(response.text()).resolves.toBe('not found');
+  });
+
   it('ignores every path outside the contract', async () => {
     const response = await mountConformanceRoutes(
       new Request('https://tenanta.example/api/anything'),

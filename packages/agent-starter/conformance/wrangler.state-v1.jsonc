@@ -69,6 +69,8 @@
     "FLEET_ENVIRONMENT": "conformance",
     "FLEET_DEPLOYMENT_SCRIPT": "conformance-tenanta-local",
     "FLEET_RESOURCE_ROLE": "platform-state",
+    "FLEET_RESOURCE_GROUP": "0123456789abcdef0123",
+    "FLEET_AUDIT_PROXY_INGRESS": "required",
     "OUTBOUND_TENANT_ID": "tenanta",
     "OUTBOUND_ENVIRONMENT": "conformance",
     "OUTBOUND_RESOURCE_GROUP_ID": "0123456789abcdef0123",

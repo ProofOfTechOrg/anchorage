@@ -26,6 +26,11 @@
         "name": "AUDIT_PROXY",
         "class_name": "FlowsafeFleetAuditProxy",
         "script_name": "anchorage-conformance-state"
+      },
+      {
+        "name": "MAINTENANCE",
+        "class_name": "Maintenance",
+        "script_name": "anchorage-conformance-state"
       }
     ]
   },

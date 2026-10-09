@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import { MAINTENANCE_INSTANCE_NAME } from '@proofoftech/flowsafe/host-kit';
+
 import type { ConformanceCandidateEnv } from './env.js';
 import { mountConformanceRoutes } from './routes.js';
 
@@ -20,6 +22,19 @@ export default {
     request: Request,
     env: ConformanceCandidateEnv,
   ): Promise<Response> {
+    const path = new URL(request.url).pathname;
+    const operation =
+      request.method === 'POST' && path === '/admin/ensure-maintenance'
+        ? 'ensure'
+        : request.method === 'GET' && path === '/admin/maintenance-status'
+          ? 'status'
+          : undefined;
+    if (operation) {
+      const id = env.MAINTENANCE.idFromName(MAINTENANCE_INSTANCE_NAME);
+      return env.MAINTENANCE.get(id).fetch(
+        new Request(`http://maintenance/${operation}`, request),
+      );
+    }
     const conformance = await mountConformanceRoutes(request, env);
     if (conformance) return conformance;
     return new Response('not found', { status: 404 });

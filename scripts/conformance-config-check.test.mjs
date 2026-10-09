@@ -249,6 +249,7 @@ test('the harness wrangler configurations match the contract', () => {
     'AUDIT_PROXY',
     'CONFORMANCE_STATE',
     'CONFORMANCE_V2',
+    'MAINTENANCE',
   ];
   assert.deepEqual(
     [...declaredCandidateBindings].sort(),

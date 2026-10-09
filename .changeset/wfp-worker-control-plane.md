@@ -20,3 +20,5 @@ Preserve referenced Wasm sidecars in WFP conformance artifacts, verify their dig
 Select trusted-state Durable Object migrations from the owned live Worker, preserving initial class creation and retries after provider commits.
 
 Match remote Durable Object bindings to owned namespace IDs when Cloudflare omits dispatch-namespace metadata, while rejecting conflicting targets. Allow external deployments with reserved application R2 buckets to converge.
+
+Relay conformance candidate maintenance requests to trusted state and verify signed requests, receipts, and replay refusal against the built artifacts locally.

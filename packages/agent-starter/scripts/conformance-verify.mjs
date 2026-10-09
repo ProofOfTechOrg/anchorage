@@ -29,7 +29,7 @@
  */
 
 import { spawn, spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, generateKeyPairSync } from 'node:crypto';
 import {
   mkdirSync,
   mkdtempSync,
@@ -41,11 +41,18 @@ import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve as resolvePath } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isDeepStrictEqual } from 'node:util';
 
 import {
   DEPLOYMENT_SENTINEL_DDL,
   DEPLOYMENT_SENTINEL_TABLE,
+  deploymentIdentityHeaders,
 } from '@proofoftech/flowsafe/deployment-identity-protocol';
+import {
+  MAINTENANCE_RECEIPT_HEADER,
+  mintAsymmetricMaintenanceCapability,
+  verifyMaintenanceReceipt,
+} from '@proofoftech/flowsafe/host-kit/maintenance-capability';
 import ts from 'typescript';
 
 import {
@@ -104,7 +111,7 @@ let temporaryDirectory;
 let artifactConfigurations;
 const lifecycle = createWorkerdServerLifecycle({ port: PORT });
 
-function prepareArtifactConfigurations() {
+function prepareArtifactConfigurations(publicKey) {
   const operatorConfig = JSON.parse(
     readFileSync(
       join(packageRoot, 'dist/conformance/anchorage-starter.conformance.json'),
@@ -126,6 +133,7 @@ function prepareArtifactConfigurations() {
     ]),
   ];
   const configurations = new Map();
+  let maintenanceFixture;
   for (const [name, artifact, releaseTwo] of artifacts) {
     const directory = join(temporaryDirectory, name);
     mkdirSync(directory, { mode: 0o700 });
@@ -173,11 +181,23 @@ function prepareArtifactConfigurations() {
         ts.flattenDiagnosticMessageText(parsed.error.messageText, '\n'),
       );
     }
+    const trustedState = name === 'state-v1' || name === 'state-v2';
+    if (name === 'state-v1') maintenanceFixture = parsed.config.vars;
     const configPath = join(temporaryDirectory, configName);
     writeFileSync(
       configPath,
       JSON.stringify({
         ...parsed.config,
+        ...(trustedState
+          ? {
+              vars: {
+                ...parsed.config.vars,
+                FLEET_MAINTENANCE_CAPABILITIES: 'required',
+                FLEET_MAINTENANCE_CAPABILITY_PUBLIC_KEY:
+                  JSON.stringify(publicKey),
+              },
+            }
+          : {}),
         main: mainPath,
         base_dir: directory,
         no_bundle: true,
@@ -190,7 +210,7 @@ function prepareArtifactConfigurations() {
     );
     configurations.set(configName, configPath);
   }
-  return configurations;
+  return { configurations, maintenanceFixture };
 }
 
 function assert(condition, label, detail) {
@@ -541,9 +561,92 @@ async function probeAudit() {
   );
 }
 
+function maintenanceCapability(operation, fixture, privateKey) {
+  return mintAsymmetricMaintenanceCapability({
+    privateKey,
+    operation,
+    tenantTag: fixture.DEPLOYMENT_TENANT,
+    environment: fixture.FLEET_ENVIRONMENT,
+    scriptName: 'anchorage-conformance-candidate',
+    specDigest: 'a'.repeat(64),
+    ttlSeconds: 60,
+  });
+}
+
+async function signedMaintenanceRequest(capability, fixture) {
+  const operation = capability.claims.operation;
+  const response = await fetch(`${BASE}/admin/${operation}`, {
+    method: operation === 'ensure-maintenance' ? 'POST' : 'GET',
+    headers: { authorization: `Bearer ${capability.token}` },
+    signal: AbortSignal.timeout(15_000),
+    redirect: 'manual',
+  });
+  assert(
+    response.status === 200,
+    `${operation} returned ${response.status}, expected 200`,
+  );
+  const receipt = response.headers.get(MAINTENANCE_RECEIPT_HEADER);
+  assert(receipt !== null, `${operation} returned no maintenance receipt`);
+  const result = await verifyMaintenanceReceipt({
+    secret: fixture.MAINTENANCE_ADMIN_SECRET,
+    token: receipt,
+    capability: capability.claims,
+  });
+  assert(result !== undefined, `${operation} receipt verification failed`);
+  const body = await response.json();
+  assert(
+    isDeepStrictEqual(result, body),
+    `${operation} response differs from its signed receipt`,
+  );
+  return result;
+}
+
+async function refuseMaintenanceRequest(headers, label) {
+  const response = await fetch(`${BASE}/admin/ensure-maintenance`, {
+    method: 'POST',
+    headers,
+    signal: AbortSignal.timeout(15_000),
+    redirect: 'manual',
+  });
+  assert(
+    response.status === 401,
+    `${label} returned ${response.status}, expected 401`,
+  );
+  assert(
+    !response.headers.has(MAINTENANCE_RECEIPT_HEADER),
+    `${label} returned a maintenance receipt`,
+  );
+  await response.body?.cancel();
+}
+
+async function probeMaintenanceStatus(fixture, privateKey, armed) {
+  const capability = await maintenanceCapability(
+    'maintenance-status',
+    fixture,
+    privateKey,
+  );
+  const result = await signedMaintenanceRequest(capability, fixture);
+  assert(
+    armed ? Number.isFinite(result.alarmAt) : result.alarmAt === null,
+    armed ? 'maintenance alarm is not armed' : 'maintenance alarm is not fresh',
+  );
+}
+
 async function main() {
   temporaryDirectory = mkdtempSync(join(tmpdir(), 'anchorage-conformance-'));
-  artifactConfigurations = prepareArtifactConfigurations();
+  const signingKey = generateKeyPairSync('ed25519');
+  const keyId = crypto.randomUUID();
+  const privateKey = {
+    ...signingKey.privateKey.export({ format: 'jwk' }),
+    alg: 'EdDSA',
+    kid: keyId,
+  };
+  const { configurations, maintenanceFixture } = prepareArtifactConfigurations({
+    ...signingKey.publicKey.export({ format: 'jwk' }),
+    alg: 'EdDSA',
+    kid: keyId,
+  });
+  artifactConfigurations = configurations;
   await step('preflight and deployment sentinel', async () => {
     await lifecycle.preflight();
     seedDeploymentSentinel();
@@ -560,6 +663,64 @@ async function main() {
         'wrangler.state-v1.jsonc',
       )(),
     })),
+  );
+
+  await step('signed maintenance status starts unarmed', () =>
+    probeMaintenanceStatus(maintenanceFixture, privateKey, false),
+  );
+
+  await step(
+    'maintenance refuses a wrong signer and deployment credential',
+    async () => {
+      const wrongSigner = generateKeyPairSync('ed25519');
+      const capability = await maintenanceCapability(
+        'ensure-maintenance',
+        maintenanceFixture,
+        {
+          ...wrongSigner.privateKey.export({ format: 'jwk' }),
+          alg: 'EdDSA',
+          kid: keyId,
+        },
+      );
+      await refuseMaintenanceRequest(
+        { authorization: `Bearer ${capability.token}` },
+        'wrong maintenance signer',
+      );
+      await refuseMaintenanceRequest(
+        deploymentIdentityHeaders(
+          maintenanceFixture.DEPLOYMENT_IDENTITY_SECRET,
+        ),
+        'raw deployment credential',
+      );
+    },
+  );
+
+  await step(
+    'signed maintenance ensure arms an alarm and rejects replay',
+    async () => {
+      const capability = await maintenanceCapability(
+        'ensure-maintenance',
+        maintenanceFixture,
+        privateKey,
+      );
+      const result = await signedMaintenanceRequest(
+        capability,
+        maintenanceFixture,
+      );
+      assert(
+        Number.isFinite(result.alarmAt),
+        'maintenance ensure did not arm an alarm',
+      );
+      await refuseMaintenanceRequest(
+        { authorization: `Bearer ${capability.token}` },
+        'replayed maintenance ensure',
+      );
+      assert(
+        Date.now() < capability.claims.expiresAt * 1_000,
+        'maintenance capability expired before its replay refusal was verified',
+      );
+      await probeMaintenanceStatus(maintenanceFixture, privateKey, true);
+    },
   );
 
   await step('state marker put and get', async () => {
@@ -668,6 +829,11 @@ async function main() {
       )(),
     }));
   });
+
+  await step(
+    'signed maintenance status retains an alarm after the release update',
+    () => probeMaintenanceStatus(maintenanceFixture, privateKey, true),
+  );
 
   await step('the v1 state marker survived the release update', async () => {
     const result = await action('state-marker-get', { marker });

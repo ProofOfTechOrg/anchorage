@@ -645,6 +645,8 @@ The v1 state profile must export the original FlowSafe Durable Object classes. T
 
 ### Implement the artifact contract
 
+Candidates must relay `POST /admin/ensure-maintenance` and `GET /admin/maintenance-status` to `/ensure` and `/status` on the `MAINTENANCE` namespace’s fixed object. Use `MAINTENANCE_INSTANCE_NAME` from `@proofoftech/flowsafe/host-kit`. Preserve the Authorization header and the trusted response, including `x-flowsafe-maintenance-receipt`. The FlowSafe Maintenance object verifies the capability and signs the receipt; the candidate must not receive the maintenance admin secret.
+
 Each candidate must serve a JSON action endpoint at `conformance.httpPath`. Requests contain `contractVersion: 1`, `action`, and the action fields below. Every response must contain only the documented fields and must repeat `contractVersion: 1` and the exact action.
 
 | Action | Request fields | Required response evidence |
