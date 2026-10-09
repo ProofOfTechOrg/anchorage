@@ -27,4 +27,6 @@ Project trusted state ownership into dispatch inventory. Remove WFP traffic usin
 
 Preserve published deployments when the final ready-state write fails or its response is lost, keeping retry and export-backed decommission available without destructive provisioning rollback.
 
+Reject unusable credentialed-run export directories before provisioning paid resources.
+
 Export `StateEgress` as a named HTTP handler so trusted-state service bindings resolve it in the Workers runtime. Direct JavaScript callers must replace `new StateEgress(context, env).fetch(request)` with `StateEgress.fetch(request, env)`. The service-binding entrypoint name and HTTP contract remain unchanged.

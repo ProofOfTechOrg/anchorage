@@ -2,6 +2,18 @@
 
 import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
+import {
+  lstat,
+  mkdir,
+  mkdtemp,
+  readlink,
+  realpath,
+  rm,
+  symlink,
+  writeFile,
+} from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import {
@@ -835,6 +847,107 @@ describe('credentialed conformance command', () => {
       ),
     ).rejects.toThrow(new RegExp(`requires ${missingOperation}`, 'u'));
     expect(calls).toEqual([]);
+  });
+
+  it.each([
+    'missing',
+    'file',
+    'symlink',
+    'relative',
+  ] as const)('checks the %s export root before provider access', async (kind) => {
+    const root = await realpath(
+      await mkdtemp(join(tmpdir(), 'fleet-conformance-export-root-')),
+    );
+    try {
+      const directory = join(root, 'exports');
+      const target = join(root, 'retained-exports');
+      if (kind === 'file') await writeFile(directory, 'retained file');
+      if (kind === 'symlink') {
+        await mkdir(target, { mode: 0o700 });
+        await symlink(target, directory);
+      }
+      if (kind === 'relative') await mkdir(directory, { mode: 0o700 });
+
+      const plan = operationalFixture().plans[0];
+      const candidate = plan?.initialSpec.modules[0];
+      const state = plan?.initialProfile.stateWorker.modules[0];
+      if (!candidate || !state) throw new Error('missing artifact fixture');
+      const candidatePath = join(root, 'candidate.mjs');
+      const statePath = join(root, 'state.mjs');
+      await writeFile(candidatePath, candidate.content);
+      await writeFile(statePath, state.content);
+      const configuration = structuredClone(validConfig);
+      configuration.workerBundle = candidatePath;
+      configuration.exportDirectory =
+        kind === 'relative' ? 'exports' : directory;
+      const profile = configuration.platformProfile as {
+        maintenanceCapabilityPublicKey: string;
+        stateProfiles: Array<{ stateWorker: { bundle: string } }>;
+      };
+      profile.maintenanceCapabilityPublicKey = maintenancePublicKey;
+      for (const entry of profile.stateProfiles) {
+        entry.stateWorker.bundle = statePath;
+      }
+      const configPath = join(root, 'operator.json');
+      await writeFile(configPath, JSON.stringify(configuration));
+
+      const providerStarted = 'CONFORMANCE_PROVIDER_STARTED';
+      const preload = `import { writeSync } from 'node:fs';
+globalThis.fetch = () => {
+  writeSync(2, ${JSON.stringify(providerStarted)});
+  process.exit(86);
+};`;
+      const result = spawnSync(
+        process.execPath,
+        [
+          '--import',
+          `data:text/javascript,${encodeURIComponent(preload)}`,
+          scriptPath,
+        ],
+        {
+          cwd: root,
+          encoding: 'utf8',
+          timeout: 15_000,
+          maxBuffer: 64 * 1024,
+          env: {
+            FLEET_CONFORMANCE_CONFIG: configPath,
+            CLOUDFLARE_API_TOKEN: 'conformance-test-token',
+            CLOUDFLARE_ACCOUNT_ID: 'conformance-test-account',
+            FLEET_MAINTENANCE_CAPABILITY_PRIVATE_JWK: JSON.stringify(
+              maintenancePrivateKey,
+            ),
+            FLEET_STATE_EGRESS_ROOT_SECRET: 'conformance-test-root-secret-0001',
+            FLEET_CONFORMANCE_APPLICATION_SECRET:
+              'conformance-test-application-secret',
+          },
+        },
+      );
+      expect(result.error).toBeUndefined();
+      if (kind === 'relative') {
+        expect(result.status, result.stderr).toBe(86);
+        expect(result.stderr).toContain(providerStarted);
+        expect((await lstat(directory)).isDirectory()).toBe(true);
+      } else {
+        expect(result.status, result.stderr).toBe(1);
+        expect(result.stderr).toContain(
+          'conformance exportDirectory must be an existing canonical directory',
+        );
+        expect(result.stderr).not.toContain(providerStarted);
+        if (kind === 'missing') {
+          await expect(lstat(directory)).rejects.toMatchObject({
+            code: 'ENOENT',
+          });
+        } else if (kind === 'file') {
+          expect((await lstat(directory)).isFile()).toBe(true);
+          expect(readFileSync(directory, 'utf8')).toBe('retained file');
+        } else {
+          expect((await lstat(directory)).isSymbolicLink()).toBe(true);
+          expect(await readlink(directory)).toBe(target);
+        }
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it('fails before loading the client or making a request without credentials', () => {

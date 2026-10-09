@@ -7,7 +7,7 @@ import {
   randomUUID,
   timingSafeEqual,
 } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { readFile, realpath, stat } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -53,6 +53,20 @@ const applicationSecret =
 
 const config = JSON.parse(await readFile(resolve(configPath), 'utf8'));
 validateConformanceConfig(config);
+const exportDirectory = resolve(config.exportDirectory);
+const exportDirectoryReady = await Promise.all([
+  realpath(exportDirectory),
+  stat(exportDirectory),
+]).then(
+  ([canonical, metadata]) =>
+    canonical === exportDirectory && metadata.isDirectory(),
+  () => false,
+);
+if (!exportDirectoryReady) {
+  throw new Error(
+    'conformance exportDirectory must be an existing canonical directory',
+  );
+}
 const { canonicalMaintenanceCapabilityPublicKey } = await import(
   '../dist/platform-resources.js'
 );
@@ -291,7 +305,7 @@ validateOperationalConformance({
 });
 
 const rateCoordinator = new ProcessLocalCloudflareApiRateCoordinator();
-const exportStore = new FileSystemDatabaseExportStore(config.exportDirectory);
+const exportStore = new FileSystemDatabaseExportStore(exportDirectory);
 const client = new CloudflareProvisioningClient({
   accountId,
   apiToken,

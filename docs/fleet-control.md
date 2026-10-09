@@ -683,6 +683,8 @@ Set these environment variables:
 
 Keep only the canonical public JWK in `platformProfile.maintenanceCapabilityPublicKey` inside the JSON configuration. Keep the private JWK, state-egress root secret, and application-secret plaintext out of that file and logs. The runner computes the application secret descriptor at runtime and persists only its SHA-256 digest and binding name.
 
+Create a private directory for retained SQL exports and set `exportDirectory` to its canonical path. Preserve the directory after the run. The command refuses missing paths, paths that resolve through symlinks, and nondirectories before provider access.
+
 Run the credentialed gate:
 
 ```bash
