@@ -1157,6 +1157,8 @@ async function assertSecretPreservingStateUpload(deployment, record) {
       client.withMutationFence(fence, async () => {
         await client.uploadNamespacedStateWorker({
           spec: externalStateDeploymentSpec(deployment.currentSpec, profile),
+          appliedDurableObjectTag:
+            record.platformResources.stateWorker.durableObjectTag ?? null,
           database,
           artifact: profile.stateWorker,
           artifactDigest: target.stateArtifactDigest,
