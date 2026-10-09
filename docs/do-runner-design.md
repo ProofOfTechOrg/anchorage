@@ -82,7 +82,7 @@ Start:
 3. The object authenticates the caller credential, validates its target sentinel, and checks that no snapshot already exists.
 4. It obtains the trusted per-leg request context.
 5. It calls Mastra `createRun({ runId, pubsub })` and starts with input.
-6. Mastra persists its workflow snapshot after the engine boundaries that the workflow's `shouldPersistSnapshot` admits. When it skips the run's terminal status, the runtime writes the terminal record itself, as the run's first row when the workflow stored none. A workflow that can suspend must store `suspended`: the runtime cannot rebuild a suspension the engine did not store, so such a run cannot be resumed.
+6. Mastra persists its workflow snapshot after the engine boundaries that the workflow's `shouldPersistSnapshot` admits. When it skips the run's terminal status, the runtime writes the terminal record itself, as the run's first row when the workflow stored none on storage whose capability has `withStoredRun`; other storage cannot show that the leg stored no row, so such a start fails there instead of possibly storing a settled run again. A workflow that can suspend must store `suspended`: the runtime cannot rebuild a suspension the engine did not store, so such a run cannot be resumed.
 7. The runtime projects the outcome to a JSON-safe `RunSummary`.
 8. The object broadcasts the summary to connected run sockets.
 

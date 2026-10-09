@@ -3871,11 +3871,20 @@ export class RunnerRuntime {
         workflowName: workflowId,
         runId,
       });
-      // A row gone after this leg read or stored it was removed after the run
-      // settled, by retention or by the host, so the leg must not store the
-      // run again.
-      if (!stored && rowStored)
-        throw new RunSettledConflictError(workflowId, runId);
+      if (!stored) {
+        // A row gone after this leg read or stored it was removed after the
+        // run settled, by retention or by the host, so the leg must not store
+        // the run again.
+        if (rowStored) throw new RunSettledConflictError(workflowId, runId);
+        // Storage without `withStoredRun` does not track the leg's writes, so
+        // it cannot tell a row this leg never stored from one removed after
+        // the run settled, and writing the latter again would revive a
+        // settled run.
+        if (!this.#withStoredRunOf(source))
+          throw new Error(
+            `RunnerRuntime: run '${runId}' of workflow '${workflowId}' completed without a durable snapshot`,
+          );
+      }
       // A start whose workflow stores none of the statuses it passed through
       // has no row, so its terminal record is the run's first.
       const snapshot = stored ?? {

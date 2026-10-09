@@ -12614,6 +12614,57 @@ describe('RunnerRuntime leg liveness touch', () => {
     });
   });
 
+  it.each([
+    {
+      storage: "Mastra's in-memory store",
+      create: async (): Promise<MastraCompositeStore> => new InMemoryStore(),
+    },
+    {
+      storage: 'a D1 capability without withStoredRun',
+      create: async (): Promise<MastraCompositeStore> => {
+        const { storage } = await d1Storage();
+        await stripStoredRunMember(storage);
+        return storage;
+      },
+    },
+  ])("does not store a start's run again when its row is gone at the leg's end on $storage, which does not track the leg's writes", async ({
+    create,
+  }) => {
+    // #given a leg held in its first step, on a workflow that stores only its
+    // pending snapshot, whose run another instance terminated and whose row
+    // was then removed
+    const storage = await create();
+    const leg = startHeldLeg(storage, {
+      persistence: { statuses: ['pending'] },
+    });
+    await leg.entered.promise;
+    await abortableApp(storage).app.runtime.terminate(WORKFLOW_ID, RUN_ID);
+    const workflows = await storage.getStore('workflows');
+    assert(workflows);
+    await workflows.deleteWorkflowRunById({
+      workflowName: WORKFLOW_ID,
+      runId: RUN_ID,
+    });
+
+    // #when the step returns
+    leg.release.resolve();
+
+    // #then the start fails without claiming a settlement, and the terminated
+    // run is not stored again
+    const failure = await leg.started.then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    expect(failure).toBeInstanceOf(Error);
+    expect(failure).not.toBeInstanceOf(RunSettledConflictError);
+    expect(
+      await workflows.loadWorkflowSnapshot({
+        workflowName: WORKFLOW_ID,
+        runId: RUN_ID,
+      }),
+    ).toBeNull();
+  });
+
   /** Hides `withStoredRun` from the storage's fenced workflow capability. */
   async function stripStoredRunMember(storage: MastraCompositeStore) {
     const workflows = (await storage.getStore(
