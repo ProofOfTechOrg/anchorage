@@ -2008,9 +2008,12 @@ export class FlowsafeDurableAgent<
    * active thread registration, then resume through RunnerRuntime so approval
    * grant derivation and snapshot provenance remain authoritative.
    * A resumed leg observes from the current run stream position. Its thread
-   * registration completes on the run's terminal outcome or a resume failure
-   * after rehydration, when the wrapper publishes a terminal error. Another
-   * suspension keeps blocking the thread until the next resume, as a first leg does.
+   * registration completes on the run's terminal outcome, or on a resume
+   * failure after rehydration when the wrapper publishes a terminal error:
+   * the run is no longer suspended, a cancellation or timeout refused or cut
+   * the leg, or the run's status cannot be read. A failure that leaves the
+   * run stored suspended with nothing recorded to end it keeps blocking the
+   * thread until the next resume, as another suspension does.
    * Hosts expose this only from their trusted approval-decision topology, and
    * spread a decided approval's `expectedSuspensionFor(record)` into the
    * options, so a decision for an earlier suspension of the step is refused
@@ -2107,7 +2110,10 @@ export class FlowsafeDurableAgent<
           legAbort.signal.reason,
           error,
         );
-        await this.#endRunLocally(options.runId, end.error, end.outcome);
+        // A run the failed leg left suspended continues as at a re-suspension.
+        if (end === 'suspended') {
+          if (leg) leg.outcome = 'suspended';
+        } else await this.#endRunLocally(options.runId, end.error, end.outcome);
       }
       throw error;
     }
@@ -2125,6 +2131,8 @@ export class FlowsafeDurableAgent<
     const holdsRun = () =>
       !this.#pendingStarts.has(runId) && this.isRunLive(runId);
     if (!holdsRun()) return;
+    // Not `#storedStatus`: a failed read propagates, so the host logs the
+    // failed release instead of the run silently keeping its stream and thread.
     const summary = await this.#runtime.authoritativeStatus(
       this.getWorkflow().id,
       runId,
@@ -2145,36 +2153,55 @@ export class FlowsafeDurableAgent<
 
   /**
    * The terminal ERROR and thread outcome of a resumed leg that threw after
-   * rehydration. The leg's abort reason names a cancellation or timeout that
-   * refused or cut it; for a settlement by another instance it names only the
-   * conflict, so the run's stored outcome is read.
+   * rehydration, or `'suspended'` when the run stays stored suspended with
+   * nothing recorded to end it. A leg that fails while its run stays suspended
+   * ends nothing: a terminal ERROR arms Mastra's delayed, run-id-keyed cleanup,
+   * which would remove the registry entries and stream history of a later
+   * resume of the run. The leg's abort reason names a cancellation or timeout
+   * that refused or cut it; for a settlement by another instance it names only
+   * the conflict, so the run's stored outcome is read.
    */
   async #failedResumeEnd(
     runId: string,
     abortReason: unknown,
     error: unknown,
-  ): Promise<{ error: unknown; outcome: ThreadLegTerminalOutcome }> {
+  ): Promise<
+    { error: unknown; outcome: ThreadLegTerminalOutcome } | 'suspended'
+  > {
     const ending = terminalStatusOfLegAbort(abortReason);
     if (ending)
       return {
         error: endedRunError(ending, undefined),
         outcome: threadLegOutcome(ending),
       };
+    const stored = await this.#storedStatus(runId);
     if (isSettledLegAbort(abortReason)) {
       // An unreadable or removed row leaves the thrown error to end the stream.
-      const settled = await this.#runtime
-        .authoritativeStatus(this.getWorkflow().id, runId)
-        .catch(() => null);
-      if (settled) {
-        const settledError = legTerminalError(settled, RESUME_FAILED_MESSAGE);
+      if (stored) {
+        const settledError = legTerminalError(stored, RESUME_FAILED_MESSAGE);
         if (settledError)
           return {
             error: settledError,
-            outcome: threadLegOutcome(settled.status),
+            outcome: threadLegOutcome(stored.status),
           };
       }
-    }
+    } else if (stored?.status === 'suspended') return 'suspended';
     return { error, outcome: 'failed' };
+  }
+
+  /**
+   * The run's stored status, or `null` when the run has no row or its status
+   * cannot be read; either leaves a failed leg to publish its error.
+   */
+  async #storedStatus(runId: string): Promise<RunSummary | null> {
+    try {
+      return await this.#runtime.authoritativeStatus(
+        this.getWorkflow().id,
+        runId,
+      );
+    } catch {
+      return null;
+    }
   }
 
   #trackResumedLeg(runId: string): ResumedThreadLeg {
@@ -2556,6 +2583,9 @@ export class FlowsafeDurableAgent<
     const entry = this.runRegistryInternal.get(runId);
     const legAbort = entry?.abortController;
     let summary: RunSummary;
+    // The runtime prepares a start's identity only after refusing a run id
+    // another start already stored, so a row a prepared start finds is its own.
+    let startPrepared = false;
     try {
       if (start === undefined) {
         // No pending start means the host start seam never registered this
@@ -2636,13 +2666,28 @@ export class FlowsafeDurableAgent<
         mutationEpoch: authority.mutationEpoch,
         startIdentity: authority.startIdentity,
         agentStart: authority.agentStart,
-        onPreparedStartIdentity: authority.onPreparedStartIdentity,
+        onPreparedStartIdentity: async (execution) => {
+          startPrepared = true;
+          await authority.onPreparedStartIdentity?.call(undefined, execution);
+        },
         runOwnerGuard: authority.runOwnerGuard,
         startReservation: authority.startReservation,
         ...(legAbort === undefined ? {} : { legAbort }),
       });
       start.persisted.resolve();
     } catch (error) {
+      // A run this start stored that is still stored suspended ends this leg
+      // without a terminal ERROR, as a failed resume does (see
+      // `#failedResumeEnd`). The read precedes the reject because the reject
+      // lets the host release the run.
+      if (
+        start &&
+        startPrepared &&
+        (await this.#storedStatus(runId))?.status === 'suspended'
+      ) {
+        start.persisted.reject(error);
+        return;
+      }
       // Mastra publishes what this method throws as the run's terminal ERROR.
       if (entry) this.#endedEntries.add(entry);
       start?.persisted.reject(error);
