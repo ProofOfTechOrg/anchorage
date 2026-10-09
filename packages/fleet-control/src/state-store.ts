@@ -1155,7 +1155,8 @@ function toRecord(row: Readonly<Record<string, unknown>>): FleetRecord {
               durableObjectMigrationHistory,
             ),
           ) ||
-        durableObjectMigrationHistory.at(-1)?.tag !== durableObjectTag))
+        durableObjectMigrationHistory.at(-1)?.tag !==
+          (durableObjectTag ?? undefined)))
   ) {
     throw new Error(
       'fleet state row has inconsistent Durable Object migration history',

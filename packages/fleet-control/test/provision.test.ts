@@ -1464,6 +1464,81 @@ function legacyOnlyBackend(backend: FakeBackend): ProvisioningBackend {
 
 describe('fleet provisioning', () => {
   it.each([
+    'plain-worker',
+    'workers-for-platforms',
+  ] as const)('persists a tagless %s migration through D1', async (kind) => {
+    const backend = new FakeBackend(kind);
+    const ensurePlatformResources =
+      backend.ensurePlatformResources.bind(backend);
+    vi.spyOn(backend, 'ensurePlatformResources').mockImplementation(
+      async (targetSpec) => {
+        const result = await ensurePlatformResources(targetSpec);
+        return {
+          ...result,
+          resources: {
+            ...result.resources,
+            stateWorker: {
+              ...result.resources.stateWorker,
+              plane: 'dispatch',
+              dispatchNamespace: 'fleet-tenants',
+            },
+          },
+        };
+      },
+    );
+    const fixture = sqliteFleetStore();
+    const deployment = spec({
+      authoredBy: kind === 'workers-for-platforms' ? 'external' : 'platform',
+      durableObjectMigrations: [],
+      durableObjectBindings: [],
+      egressProxyService: undefined,
+    });
+    const target = {
+      ...deployment,
+      modules: [
+        { name: 'worker.js', content: 'export default { migrated: true }' },
+      ],
+    };
+    try {
+      const initial = await provisionDeployment({
+        initialExecutionFenceState: 'open',
+        backend,
+        store: fixture.store,
+        spec: deployment,
+        secrets,
+      });
+      const migrated = await migrateFleet({
+        store: fixture.store,
+        records: [initial.record],
+        canaryTenantTags: [],
+        backendFor: () => backend,
+        specFor: () => target,
+        secretsFor: () => secrets,
+      });
+      expect(migrated).toHaveLength(1);
+      const current = await fixture.store.get('acme', 'production');
+      expect(current).toEqual(migrated[0]);
+      expect(current).toMatchObject({
+        phase: 'ready',
+        databaseId: DATABASE_ID,
+        schemaVersion: 3,
+        desiredSpecDigest: deploymentSpecDigest(target),
+      });
+      expect(current).not.toHaveProperty('durableObjectTag');
+      if (kind === 'workers-for-platforms') {
+        expect(current?.activeRelease).toMatchObject({
+          physicalScriptName: externalReleaseScriptName(target),
+          specDigest: deploymentSpecDigest(target),
+          artifactVersion: 'artifact-v3',
+        });
+        expect(current?.rollbackRelease).toEqual(initial.record.activeRelease);
+      }
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it.each([
     ['omitted namespace', false],
     ['explicit namespace and reserved R2', true],
   ] as const)('attests owned external bindings with %s', async (_label, withR2) => {

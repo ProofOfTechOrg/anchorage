@@ -3582,6 +3582,10 @@ async function migrationSettleReady(
     attestation: attestationOptions,
   });
   const settled = { ...current };
+  const durableObjectTag = finalizedStateProvider
+    ? current.durableObjectTag
+    : targetDurableObjectTag(spec);
+  delete settled.durableObjectTag;
   delete settled.pendingRelease;
   delete settled.migrationPriorRelease;
   delete settled.pendingSpecDigest;
@@ -3607,15 +3611,7 @@ async function migrationSettleReady(
           outboundPolicy: targetPlatform.outboundPolicy,
         }
       : {}),
-    // Written unconditionally, unlike the conditional spreads around it: the
-    // key belongs to a migrated record whatever its value, and carries
-    // `undefined` when a finalized state provider supplies no tag. The frozen
-    // migration baseline records it that way and the golden suite compares
-    // with `toStrictEqual`, which reads a present `undefined` key differently
-    // from an absent one, so a conditional spread here changes what it pins.
-    durableObjectTag: finalizedStateProvider
-      ? current.durableObjectTag
-      : targetDurableObjectTag(spec),
+    ...(durableObjectTag !== undefined ? { durableObjectTag } : {}),
     ...(spec.authoredBy === 'platform'
       ? {
           durableObjectMigrationHistory: canonicalDurableObjectMigrationHistory(

@@ -2094,6 +2094,7 @@ export class WorkersForPlatformsBackendSwitchProvider
       pendingArtifactVersion: _pendingArtifactVersion,
       pendingRelease: _pendingRelease,
       migrationIntent: _migrationIntent,
+      durableObjectTag: _durableObjectTag,
       ...currentRecord
     } = input.currentRecord;
     return {
@@ -2104,7 +2105,9 @@ export class WorkersForPlatformsBackendSwitchProvider
       artifactVersion: input.candidate.artifactVersion,
       desiredSpecDigest: input.candidate.specDigest,
       schemaVersion: input.target.d1SchemaVersion,
-      durableObjectTag: input.target.stateDurableObjectTag,
+      ...(input.target.stateDurableObjectTag !== undefined
+        ? { durableObjectTag: input.target.stateDurableObjectTag }
+        : {}),
       durableObjectMigrationHistory: bridgeHistory,
       durableObjectMigrationHistoryDigest:
         input.target.stateDurableObjectHistoryDigest,

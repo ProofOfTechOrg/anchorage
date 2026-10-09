@@ -7,10 +7,6 @@
 import type { FleetRecord } from '../../src/types.js';
 import type { MigrationOpLogEntry } from './fleet-migration-worlds.js';
 
-/**
- * An absent `durableObjectTag` key differs from a present key whose value
- * is `undefined`.
- */
 export const MIGRATION_SUCCESS_BASELINE_RESULT = [
   {
     tenantTag: 'extfull',
@@ -108,7 +104,6 @@ export const MIGRATION_SUCCESS_BASELINE_RESULT = [
       version: 1,
       authorizedAt: '2026-06-01T00:00:00.000Z',
     },
-    durableObjectTag: undefined,
     settledSettlementKey:
       '0b32b3081b897947a1db852b033a86fad2e38700dc2824e91cc292904e642b6c',
   },
@@ -131,7 +126,6 @@ export const MIGRATION_SUCCESS_BASELINE_RESULT = [
       version: 1,
       authorizedAt: '2026-06-01T00:00:00.000Z',
     },
-    durableObjectTag: undefined,
     durableObjectMigrationHistory: [],
     durableObjectMigrationHistoryDigest:
       '4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945',

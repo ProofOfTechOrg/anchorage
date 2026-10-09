@@ -7,6 +7,7 @@ import type {
   BridgeSnapshot,
   PlainBackendSnapshot,
 } from '../src/backend-switch.js';
+import { structuralBackendSwitchFleetRecordFromUnknown } from '../src/backend-switch.js';
 import { CloudflareProvisioningClient } from '../src/cloudflare-client.js';
 import {
   canonicalDeploymentEgressPolicy,
@@ -1570,6 +1571,87 @@ describe('backend switch provider teardown authority', () => {
       }),
     ).rejects.toThrow(/foreign backend-switch release/);
     expect(revoked).toBe(false);
+  });
+
+  it.each([
+    'tagless',
+    'tagged',
+  ] as const)('produces persistable ownership for a %s bridge', async (mode) => {
+    const tagless = mode === 'tagless';
+    const deployment = tagless
+      ? {
+          ...targetSpec,
+          durableObjectMigrations: [],
+          durableObjectBindings: [],
+        }
+      : targetSpec;
+    const subject = provider({}, {}, () =>
+      tagless ? { ...profile, stateDurableObjectMigrations: [] } : profile,
+    );
+    const { stateDurableObjectTag: _tag, ...withoutTag } = target;
+    const desiredTarget = tagless
+      ? {
+          ...withoutTag,
+          stateDurableObjectHistoryDigest: durableObjectMigrationHistoryDigest(
+            [],
+          ),
+        }
+      : target;
+    const bridge: BridgeSnapshot = {
+      scriptName: prior.scriptName,
+      artifactVersion: 'bridge-v2',
+      artifactDigest: desiredTarget.stateArtifactDigest,
+      databaseId: prior.databaseId,
+      durableObjectBindings: tagless ? [] : prior.durableObjectBindings,
+      namespaceIds: tagless ? [] : prior.namespaceIds,
+      secretNames: prior.secretNames,
+      publicRouteAttached: false,
+      stateOnly: false,
+    };
+    const currentRecord: FleetRecord = {
+      tenantTag: deployment.tenantTag,
+      environment: deployment.environment,
+      backend: 'plain-worker',
+      scriptName: prior.scriptName,
+      databaseId: prior.databaseId,
+      databaseName: prior.databaseName,
+      schemaVersion: deployment.schemaVersion,
+      artifactVersion: prior.artifactVersion,
+      desiredSpecDigest: prior.specDigest,
+      durableObjectBindings: bridge.durableObjectBindings,
+      ...(tagless ? {} : { durableObjectTag: 'v1' }),
+      routeHostname: deployment.routeHostname,
+      phase: 'ready',
+      updatedAt: '2026-08-11T00:00:00.000Z',
+    };
+    const committed = await subject.commitWorkersForPlatformsOwnership({
+      prior,
+      bridge,
+      candidate: release,
+      target: desiredTarget,
+      targetSpec: deployment,
+      currentRecord,
+    });
+    const persisted =
+      structuralBackendSwitchFleetRecordFromUnknown(committed).record;
+    expect(persisted).toMatchObject({
+      backend: 'workers-for-platforms',
+      phase: 'ready',
+      databaseId: prior.databaseId,
+      activeRelease: release,
+      platformTarget: desiredTarget,
+    });
+    if (tagless) {
+      expect(persisted).not.toHaveProperty('durableObjectTag');
+      expect(persisted.platformResources?.stateWorker).not.toHaveProperty(
+        'durableObjectTag',
+      );
+    } else {
+      expect(persisted.durableObjectTag).toBe('v2');
+      expect(persisted.platformResources?.stateWorker.durableObjectTag).toBe(
+        'v2',
+      );
+    }
   });
 
   it('rebuilds finalized ownership from the exact target and bridge', async () => {
