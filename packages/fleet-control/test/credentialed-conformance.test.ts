@@ -250,6 +250,7 @@ describe('credentialed conformance command', () => {
     'maintenanceBaseUrls.tenantb',
     'routeHostnames.tenanta',
     'routeHostnames.tenantb',
+    'plainWorkerRouteHostname',
     'durableObjectBindings',
     'durableObjectBindings.0.name',
     'durableObjectBindings.0.className',
@@ -295,6 +296,44 @@ describe('credentialed conformance command', () => {
     expect(() =>
       validateConformanceConfig(withoutPath(validConfig, path)),
     ).toThrow();
+  });
+
+  it.each([
+    null,
+    42,
+    '',
+    'localhost',
+    'https://plain.example.test',
+    'PLAIN.example.test',
+    'plain.example.test.',
+    'plain.example.test:443',
+    'plain.example.test:invalid',
+    'plain.example.test/path',
+    'operator@plain.example.test',
+    'plain.example.test?probe=1',
+    'plain.example.test#probe',
+    ' plain.example.test',
+  ])('rejects noncanonical ordinary probe hostname %j', (plainWorkerRouteHostname) => {
+    expect(() =>
+      validateConformanceConfig({ ...validConfig, plainWorkerRouteHostname }),
+    ).toThrow(/plainWorkerRouteHostname/u);
+  });
+
+  it.each([
+    'tenanta',
+    'tenantb',
+  ])('rejects an ordinary probe hostname that aliases %s', (tenantTag) => {
+    const routeHostnames = validConfig.routeHostnames as Record<string, string>;
+    const hostname = routeHostnames[tenantTag] as string;
+    for (const alias of [hostname, hostname.toUpperCase(), `${hostname}.`]) {
+      expect(() =>
+        validateConformanceConfig({
+          ...validConfig,
+          plainWorkerRouteHostname: hostname,
+          routeHostnames: { ...routeHostnames, [tenantTag]: alias },
+        }),
+      ).toThrow(/plainWorkerRouteHostname.*distinct/u);
+    }
   });
 
   it('requires an append-only second state profile with the new class', () => {

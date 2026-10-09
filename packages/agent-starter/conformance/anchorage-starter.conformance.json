@@ -14,6 +14,7 @@
     "tenanta": "tenanta.replace-me.example",
     "tenantb": "tenantb.replace-me.example"
   },
+  "plainWorkerRouteHostname": "plain.replace-me.example",
   "workerBundle": "../agent-starter/dist/conformance/candidate.mjs",
   "mainModule": "worker.js",
   "compatibilityDate": "2026-07-08",

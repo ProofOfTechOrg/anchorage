@@ -204,12 +204,51 @@ export function validateConformanceConfig(value) {
     'maintenanceBaseUrls',
   );
   const routeHostnames = requireObject(value.routeHostnames, 'routeHostnames');
+  const plainWorkerRouteHostname = requireString(
+    value.plainWorkerRouteHostname,
+    'plainWorkerRouteHostname',
+  );
+  let plainWorkerRouteUrl;
+  try {
+    plainWorkerRouteUrl = new URL(`https://${plainWorkerRouteHostname}`);
+  } catch {
+    throw new Error(
+      'conformance config requires valid plainWorkerRouteHostname',
+    );
+  }
+  if (
+    plainWorkerRouteUrl.hostname !== plainWorkerRouteHostname ||
+    plainWorkerRouteUrl.pathname !== '/' ||
+    plainWorkerRouteUrl.port !== '' ||
+    !plainWorkerRouteHostname.includes('.') ||
+    plainWorkerRouteHostname.endsWith('.')
+  ) {
+    throw new Error(
+      'conformance config plainWorkerRouteHostname must be a canonical lowercase hostname without a port or trailing dot',
+    );
+  }
   for (const tenantTag of tenantTags) {
     requireUrl(
       maintenanceBaseUrls[tenantTag],
       `maintenanceBaseUrls['${tenantTag}']`,
     );
-    requireString(routeHostnames[tenantTag], `routeHostnames['${tenantTag}']`);
+    const routeHostname = requireString(
+      routeHostnames[tenantTag],
+      `routeHostnames['${tenantTag}']`,
+    );
+    let routeUrl;
+    try {
+      routeUrl = new URL(`https://${routeHostname}`);
+    } catch {
+      throw new Error(
+        `conformance config requires valid routeHostnames['${tenantTag}']`,
+      );
+    }
+    if (routeUrl.hostname.replace(/\.$/u, '') === plainWorkerRouteHostname) {
+      throw new Error(
+        'conformance config plainWorkerRouteHostname must be distinct from routeHostnames',
+      );
+    }
   }
 
   const durableObjectBindings = requireArray(

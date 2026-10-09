@@ -79,6 +79,7 @@ export function buildConformanceConfig() {
         `${tenantTag}.replace-me.example`,
       ]),
     ),
+    plainWorkerRouteHostname: 'plain.replace-me.example',
     workerBundle: `${ARTIFACT_DIRECTORY}/candidate.mjs`,
     mainModule: contract.candidateMainModule,
     compatibilityDate: contract.compatibilityDate,

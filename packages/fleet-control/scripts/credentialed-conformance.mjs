@@ -1252,7 +1252,7 @@ function plainWorkerDeploymentSpec(workersDevSubdomain) {
       },
     ),
     maintenanceBaseUrl: `https://${scriptName}.${workersDevSubdomain}.workers.dev`,
-    routeHostname: config.routeHostnames[tenantTag],
+    routeHostname: config.plainWorkerRouteHostname,
     cpuLimitMs: config.cpuLimitMs,
     subrequestLimit: config.subrequestLimit,
   };
