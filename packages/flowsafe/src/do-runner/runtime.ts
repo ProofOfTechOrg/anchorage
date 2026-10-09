@@ -162,10 +162,17 @@ export class UnknownRunError extends Error {
   }
 }
 
-export class RunNotSuspendedError extends Error {
-  constructor(workflowId: string, runId: string, status: WorkflowRunStatus) {
+/**
+ * A resume of a run that is not suspended, such as one that has ended: 409 with
+ * `reason.code` `RUN_NOT_SUSPENDED`.
+ */
+export class RunNotSuspendedError extends DoStatusError {
+  readonly status = 409;
+  readonly reason = { code: 'RUN_NOT_SUSPENDED' } as const;
+
+  constructor(workflowId: string, runId: string, runStatus: WorkflowRunStatus) {
     super(
-      `run '${runId}' of workflow '${workflowId}' is '${status}', not 'suspended'`,
+      `run '${runId}' of workflow '${workflowId}' is '${runStatus}', not 'suspended'`,
     );
     this.name = 'RunNotSuspendedError';
   }

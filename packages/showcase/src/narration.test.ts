@@ -510,6 +510,29 @@ describe('decideEvents', () => {
     expect(failed?.tone).toBe('danger');
   });
 
+  it('narrates each refused-resume code differently from an uncoded failure', () => {
+    // #given the same failed inline resume, with and without a refusal code
+    const codes = [undefined, 'SUSPENSION_CHANGED', 'RUN_NOT_SUSPENDED'];
+
+    // #when
+    const failed = codes.map((code) =>
+      decideEvents(
+        decideResult({
+          decision: 'approve',
+          resume: { attempted: true, ok: false, error: 'x', code },
+        }),
+      ).filter((e) => e.kind === 'run.resume-failed'),
+    );
+
+    // #then each yields one resume-failed event, and no two share a detail
+    expect(failed.map((events) => events.map((e) => e.key))).toEqual([
+      ['resume-failed:appr-1'],
+      ['resume-failed:appr-1'],
+      ['resume-failed:appr-1'],
+    ]);
+    expect(new Set(failed.flat().map((e) => e.detail)).size).toBe(3);
+  });
+
   it('emits no resume events when no resume was attempted', () => {
     const events = decideEvents(
       decideResult({ decision: 'approve', resume: { attempted: false } }),

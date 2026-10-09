@@ -550,7 +550,7 @@ The public Worker normally exposes its own authenticated route facade and forwar
 
 The raw resume surface carries no approval grant. A protected connector still requires a matching stored decision.
 
-Start and resume bodies accept an optional nonnegative `deadlineMs`. Resume replaces the previous deadline relative to the accepted leg. A resume body also accepts `expectedSuspension`, the `{ suspendedAt, resumeCount? }` that `expectedSuspensionFor(record)` returns for a decided approval: the object refuses a resume whose step is no longer at that suspension with `409` and `reason.code` `SUSPENSION_CHANGED`, and a body without it resumes unchecked. The maintenance scanner reads expired candidates in bounded passes, then sends each revision-and-deadline compare-and-swap to the run's owner object. It never writes snapshots directly from maintenance. A run whose snapshot an earlier version stored nested past SQLite's JSON depth limit is not selected; the operations runbook gives the query that lists such rows.
+Start and resume bodies accept an optional nonnegative `deadlineMs`. Resume replaces the previous deadline relative to the accepted leg. A resume body also accepts `expectedSuspension`, the `{ suspendedAt, resumeCount? }` that `expectedSuspensionFor(record)` returns for a decided approval: the object refuses a resume of a suspended run whose step is no longer at that suspension with `409` and `reason.code` `SUSPENSION_CHANGED`, a run that is not suspended answers `RUN_NOT_SUSPENDED` first, and a body without it resumes unchecked. The maintenance scanner reads expired candidates in bounded passes, then sends each revision-and-deadline compare-and-swap to the run's owner object. It never writes snapshots directly from maintenance. A run whose snapshot an earlier version stored nested past SQLite's JSON depth limit is not selected; the operations runbook gives the query that lists such rows.
 
 The maintenance Durable Object persists a rotating tuple cursor after every selected row, including failures, so a permanently failing earliest row cannot starve later deadlines. Rows in `timed_out` with incomplete cleanup and any matching timeout intent remain eligible after an interrupted pass.
 
@@ -597,9 +597,10 @@ The runner preserves stable statuses and structured refusal reasons across Durab
 | `InvalidStartIdempotencyRequestError` | `400` | `INVALID_START_IDEMPOTENCY_REQUEST` | The key or reservation request is malformed |
 | `InvalidInventoryRequestError` | `400` | `INVALID_INVENTORY_REQUEST` | The category, cursor, or limit is invalid |
 | `RunStateNotStorableError` | `422` | `RUN_STATE_NOT_STORABLE` | The run state SQLite cannot parse as JSON; it was not stored |
+| `RunNotSuspendedError` | `409` | `RUN_NOT_SUSPENDED` | A resume found the run not suspended, for example ended |
 | `SuspensionChangedError` | `409` | `SUSPENSION_CHANGED` | A resume named a suspension its step has since left |
 
-The runtime also distinguishes unknown workflows, unknown runs, duplicate runs, runs that are not suspended, client-fixable input or resume-data errors, and internal execution or storage failures.
+The runtime also distinguishes unknown workflows, unknown runs, duplicate runs, client-fixable input or resume-data errors, and internal execution or storage failures.
 
 The Durable Object maps known errors to stable HTTP status codes through `doErrorResponse()`. Unknown failures return an internal error without copying arbitrary thrown data to an audit sink.
 

@@ -1847,18 +1847,25 @@ describe('createRunRouter — error mapping', () => {
   });
 
   it.each([
-    ['UnknownRunError -> 404', new UnknownRunError('open-flow', 'r1'), 404],
+    [
+      'UnknownRunError -> 404',
+      new UnknownRunError('open-flow', 'r1'),
+      404,
+      undefined,
+    ],
     [
       'RunNotSuspendedError -> 409',
       new RunNotSuspendedError('open-flow', 'r1', 'success'),
       409,
+      { code: 'RUN_NOT_SUSPENDED' },
     ],
     [
       'InvalidRunRequestError -> 400',
       new InvalidRunRequestError('bad step'),
       400,
+      undefined,
     ],
-  ])('maps %s', async (_label, error, status) => {
+  ])('maps %s', async (_label, error, status, reason) => {
     // #given — an in-process host throws the do-runner's typed errors
     const { handle } = makeHarness({
       resume: async () => {
@@ -1866,11 +1873,15 @@ describe('createRunRouter — error mapping', () => {
       },
     });
 
-    // #when / #then
-    expect(
-      (await handle(req('/runs/open-flow/acme_r1/resume', { body: {} })))
-        ?.status,
-    ).toBe(status);
+    // #when
+    const response = await handle(
+      req('/runs/open-flow/acme_r1/resume', { body: {} }),
+    );
+
+    // #then
+    expect(response?.status).toBe(status);
+    const body = (await response?.json()) as { reason?: unknown } | undefined;
+    expect(body?.reason).toEqual(reason);
   });
 
   it.each([
