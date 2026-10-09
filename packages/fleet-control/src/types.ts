@@ -2189,6 +2189,8 @@ export interface ProvisioningBackend {
     activeRelease: ExternalReleaseSnapshot | undefined,
     database: DatabaseReference,
     fence: ExternalMutationFence,
+    /** Persisted complete WFP routes; omission authorizes absence only. */
+    routeTargets?: readonly HostRoutingTarget[],
   ): Promise<void>;
   assertTrafficRemoved(spec: DeploymentSpec): Promise<void>;
   revokeCredentials(

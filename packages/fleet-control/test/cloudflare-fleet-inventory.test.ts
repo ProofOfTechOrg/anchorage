@@ -518,6 +518,54 @@ const EMPTY_OPTIONS: FleetInventoryRunOptions = {
 
 describe('advanceCloudflareFleetInventoryStage', () => {
   it.each([
+    'other-dispatch',
+    undefined,
+  ])('refuses a bound namespace before provider work with client namespace %s', async (dispatchNamespace) => {
+    const { deps, calls, dispatchRequests } = harness({ dispatchNamespace });
+    const options = {
+      ...EMPTY_OPTIONS,
+      dispatchNamespace: 'anchorage-dispatch',
+      hostRoutingKvId: 'hosts',
+      includeDispatchNamespace: true,
+    };
+    const progress = initialProgress(options);
+    await expect(
+      advanceCloudflareFleetInventoryStage(deps, {
+        stage: progress.stage,
+        options,
+        progress,
+        maxProviderRequests: 1_000,
+      }),
+    ).rejects.toThrow(/dispatch namespace/);
+    expect(calls).toEqual([]);
+    expect(dispatchRequests).toEqual([]);
+  });
+
+  it('advances an inventory bound to the client namespace', async () => {
+    const { deps, calls } = harness({
+      dispatchNamespace: 'anchorage-dispatch',
+    });
+    const options = {
+      ...EMPTY_OPTIONS,
+      dispatchNamespace: 'anchorage-dispatch',
+      hostRoutingKvId: 'hosts',
+      includeDispatchNamespace: true,
+    };
+    const progress = initialProgress(options);
+    const result = await advanceCloudflareFleetInventoryStage(deps, {
+      stage: progress.stage,
+      options,
+      progress,
+      maxProviderRequests: 1_000,
+    });
+    expect(calls).toEqual(['kv-keys:']);
+    expect(result.nextStage).toEqual({
+      step: 'dispatch-pages',
+      pageOrdinal: 0,
+    });
+  });
+
+  it.each([
     'bücher.example',
     '例子.example',
     'ｘ',
@@ -912,14 +960,19 @@ describe('advanceCloudflareFleetInventoryStage', () => {
     expect(calls).not.toContain('r2:default:');
   });
 
-  it('advances through a host routing KV namespace that is empty', async () => {
+  it.each([
+    false,
+    undefined,
+  ])('inventories an empty untrusted namespace with trusted_workers=%s', async (trustedWorkers) => {
     const { deps } = harness({
       dispatchNamespace: 'anchorage-ns',
       kvPages: [[]],
       dispatchPages: [[]],
       namespaceInventory: {
         namespace_name: 'anchorage-ns',
-        trusted_workers: false,
+        ...(trustedWorkers === undefined
+          ? {}
+          : { trusted_workers: trustedWorkers }),
         script_count: 0,
       },
       domainPages: [[]],
@@ -928,7 +981,8 @@ describe('advanceCloudflareFleetInventoryStage', () => {
       databasePages: [[]],
       namespacePages: [[]],
     });
-    const run = await drive(deps, { ...RICH_OPTIONS, includeR2Buckets: false });
+    const options = { ...RICH_OPTIONS, includeR2Buckets: false };
+    const run = await drive(deps, options);
     expect(run.steps).toEqual([
       'host-kv-keys',
       'dispatch-pages',
@@ -945,6 +999,91 @@ describe('advanceCloudflareFleetInventoryStage', () => {
       'finalize',
     ]);
     expect(details(run.rows)).toEqual([]);
+    const inventory = materializeFleetInventoryGeneration({ ...run, options });
+    expect(inventory.dispatchNamespace).toEqual({
+      name: 'anchorage-ns',
+      trustedWorkers: false,
+      scriptCount: 0,
+    });
+  });
+
+  it.each([
+    true,
+    null,
+    'false',
+    0,
+  ])('reports invalid namespace trust %j', async (trustedWorkers) => {
+    const { deps } = harness({
+      dispatchNamespace: 'anchorage-ns',
+      namespaceInventory: {
+        namespace_name: 'anchorage-ns',
+        trusted_workers: trustedWorkers as boolean,
+        script_count: 0,
+      },
+    });
+    const run = await drive(deps, RICH_OPTIONS);
+    expect(findings(run.rows)).toEqual([
+      expect.objectContaining({ kind: 'trusted-dispatch-namespace' }),
+    ]);
+  });
+
+  it.each([
+    ['platform-state', 'platform-state', 'group-1'],
+    ['deployment-egress', 'deployment-egress', 'group-1'],
+    ['unknown-role', undefined, undefined],
+    [undefined, undefined, undefined],
+  ] as const)('projects dispatch resource metadata for role %s', async (role, expectedRole, expectedGroup) => {
+    const { deps } = harness({
+      dispatchNamespace: 'anchorage-ns',
+      kvPages: [[{ name: '__anchorage_script__:anchorage-state' }]],
+      kvValues: {
+        '__anchorage_script__:anchorage-state':
+          registrationValue('anchorage-state'),
+      },
+      dispatchPages: [
+        [
+          {
+            id: 'anchorage-state',
+            tags: ['fleet:anchorage', `tenant:${TENANT}`, 'environment:prod'],
+          },
+        ],
+      ],
+      namespaceInventory: {
+        namespace_name: 'anchorage-ns',
+        trusted_workers: false,
+        script_count: 1,
+      },
+      dispatchWorkers: {
+        'anchorage-state': dispatchWorker({
+          plainTextBindings: {
+            DEPLOYMENT_TENANT: TENANT,
+            FLEET_RESOURCE_GROUP: 'group-1',
+            ...(role === undefined ? {} : { FLEET_RESOURCE_ROLE: role }),
+          },
+        }),
+      },
+    });
+    const options = { ...RICH_OPTIONS, includeR2Buckets: false };
+    const run = await drive(deps, options);
+    expect(findings(run.rows)).toEqual([]);
+    const inventory = materializeFleetInventoryGeneration({ ...run, options });
+    expect(inventory.deployments).toHaveLength(1);
+    const deployment = inventory.deployments[0];
+    expect(deployment).toMatchObject({
+      backend: 'workers-for-platforms',
+      scriptName: 'anchorage-state',
+      tenantTag: TENANT,
+      environment: ENVIRONMENT,
+      databaseIds: ['db-1'],
+      plainTextBindings: { FLEET_RESOURCE_GROUP: 'group-1' },
+    });
+    expect({
+      resourceRole: deployment?.resourceRole,
+      resourceGroupId: deployment?.resourceGroupId,
+    }).toEqual({
+      resourceRole: expectedRole,
+      resourceGroupId: expectedGroup,
+    });
   });
 
   it('advances the offset when a resumed chunk re-reads the same page', async () => {

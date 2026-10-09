@@ -37,16 +37,20 @@ Fleet Control does not install a runtime Wrangler dependency. Keep the selected 
 | Export | Contents |
 | --- | --- |
 | `@proofoftech/fleet-control` | Provisioning, migration, promotion, rollback, decommission, inventory, fleet state, and the Cloudflare client and rate coordinator. |
-| `@proofoftech/fleet-control/cloudflare-control-plane` | Trusted ordinary-Worker control-plane factory, bounded lifecycle operations, D1 adapter and shared quota coordinator, R2 export store, and their data and error types. |
+| `@proofoftech/fleet-control/cloudflare-control-plane` | Trusted ordinary-Worker and external Workers for Platforms control-plane factories, bounded lifecycle operations, D1 adapter and shared quota coordinator, R2 export store, and their data and error types. |
 | `@proofoftech/fleet-control/workers/dispatch` | Platform dispatch Worker that routes to a deployment's user script under a verified maintenance capability. |
 | `@proofoftech/fleet-control/workers/outbound` | Shared outbound Worker: the declared-egress proxy and the named `StateEgress` entrypoint. |
 | `@proofoftech/fleet-control/workers/audit-consumer` | Control-plane queue consumer for backend-owned deployment audit events. |
 
 The `workers/*` entries are deployment artifacts for the platform's own Workers.
 
+`StateEgress` is an HTTP handler object. For direct JavaScript invocation, replace `new StateEgress(context, env).fetch(request)` with `StateEgress.fetch(request, env)`. Service bindings continue to use `entrypoint: 'StateEgress'`.
+
 The root entry exposes `plainWorkerIngressModule(spec)` for upload-budget checks and ordinary Worker ingress tests. Keep its returned module separate from the input specification; the backend appends it during upload.
 
 Import `createCloudflareControlPlane` from `cloudflare-control-plane` in a [dedicated trusted control-plane Worker](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/fleet-control.md#run-the-trusted-control-plane-in-a-worker). Supply direct Fleet and quota D1 bindings, a private export R2 binding, and a host-owned Cloudflare token. Authorize incoming operations before calling the factory's methods. Never expose the token, bindings, or factory to a tenant-serving Worker. Queue delivery tokens identify requested work; durable Fleet state determines whether it can advance.
+
+For external artifacts with dispatch-native trusted state, use `createCloudflareWorkersForPlatformsControlPlane` from that entry. Its [WFP host configuration](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/fleet-control.md#host-the-workers-for-platforms-control-plane) fixes namespace, routing, trusted artifacts and signing authority. It supports lifecycle continuations and exact-spec rollback; provisioning and rollback remain single-deployment calls.
 
 Size inventory and audit workloads for the [documented memory and read-cost envelope](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/fleet-control.md#audit-an-account-under-a-request-budget). A provider-request budget does not establish a memory or CPU bound.
 
@@ -106,7 +110,7 @@ The first trusted state profile owns the original FlowSafe Durable Object classe
 
 The gate provisions two scratch deployments and validates the complete external resource group. It performs application variable and secret HMAC challenges, R2 write/read/delete/absence checks, audit ingress, HTTP and state-egress allow/deny probes, a WebSocket nonce echo, CPU limit and recovery checks, and a FlowSafe approval suspended across the v1 to v2 release update. It also proves that a nonempty R2 bucket blocks decommission before traffic or credentials change. Only the candidate can delete that fixture before the successful retry.
 
-After both namespace deployments reach terminal decommission, the gate reuses the first released route for one platform-authored plain Worker driven by `WranglerCommandRunner` and `WranglerLoopBackend`. The host must provide Wrangler `>=4.118 <5`. The gate requires valid, nonempty version-ID observations before credential revocation, after revocation, and before deletion, while allowing provider-created versions and Wrangler's rolling list window. It then requires the terminal `decommissioned` phase and confirms that Cloudflare no longer resolves the exported database's immutable ID. Fleet Control checks exact persisted artifact membership before traffic removal, then uses a version-churn-tolerant live identity check before secret mutation and Worker deletion. If the assertion fails after the owned Worker's control-secret mutation begins, failure cleanup uses that same live teardown identity before deleting the exact uniquely named Worker and resuming normal artifact cleanup, so the regression cannot wedge the scratch account.
+After both namespace deployments reach terminal decommission, the gate runs the ordinary Worker probe described in [paid namespace conformance](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/fleet-control.md#run-paid-namespace-conformance). The host must provide Wrangler `>=4.118 <5`. The gate requires valid, nonempty version-ID observations before credential revocation, after revocation, and before deletion, while allowing provider-created versions and Wrangler's rolling list window. It then requires the terminal `decommissioned` phase and confirms that Cloudflare no longer resolves the exported database's immutable ID. Fleet Control checks exact persisted artifact membership before traffic removal, then uses a version-churn-tolerant live identity check before secret mutation and Worker deletion. If the assertion fails after the owned Worker's control-secret mutation begins, failure cleanup uses that same live teardown identity before deleting the exact uniquely named Worker and resuming normal artifact cleanup, so the regression cannot wedge the scratch account.
 
 Set `FLEET_CONFORMANCE_CONFIG`, `CLOUDFLARE_API_TOKEN`,
 `CLOUDFLARE_ACCOUNT_ID`, and the fleet-private Ed25519 signing JWK in

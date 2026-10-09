@@ -21,6 +21,7 @@ import {
   type DecommissionAdvanceAction,
   type DecommissionAdvanceResult,
 } from './decommission-advance.js';
+import { rollbackExternalRelease } from './fleet.js';
 import {
   abandonFleetAuditOperation,
   advanceFleetAudit,
@@ -55,12 +56,16 @@ import type {
   CleanupTerminalReceipt,
   DeploymentSecrets,
   DeploymentSpec,
+  ExternalPlatformProfile,
   FleetRecord,
   FleetResourceInventory,
   FleetSettlementHost,
+  FleetStateStore,
   InitialExecutionFenceState,
+  ProvisioningBackend,
   ProvisioningResult,
 } from './types.js';
+import { WorkersForPlatformsBackend } from './workers-for-platforms-backend.js';
 
 export { ActiveRouteAttestationError } from './active-route.js';
 export {
@@ -185,6 +190,7 @@ export type {
   DurableObjectMigration,
   ExternalMigrationIntent,
   ExternalMigrationSubphase,
+  ExternalPlatformProfile,
   ExternalPlatformResources,
   ExternalPlatformTargetDescription,
   ExternalReleaseSnapshot,
@@ -203,6 +209,7 @@ export type {
   ProvisioningBackendKind,
   ProvisioningPhase,
   R2Jurisdiction,
+  TrustedWorkerArtifact,
   WorkerModule,
   WorkerZoneRoute,
 } from './types.js';
@@ -262,24 +269,30 @@ export type CloudflareDeploymentSpec = Omit<
   }>[];
 };
 
-export interface CloudflareProvisionDeploymentOptions {
-  readonly spec: CloudflareDeploymentSpec;
+export interface CloudflareProvisionDeploymentOptions<
+  Spec extends DeploymentSpec = CloudflareDeploymentSpec,
+> {
+  readonly spec: Spec;
   readonly secrets: DeploymentSecrets;
   readonly initialExecutionFenceState: InitialExecutionFenceState;
   readonly routeAttestation?: AttestConvergedActiveRouteOptions;
   readonly clock?: () => number;
 }
 
-export interface CloudflareAdvanceCleanupDeploymentOptions {
-  readonly spec: CloudflareDeploymentSpec;
+export interface CloudflareAdvanceCleanupDeploymentOptions<
+  Spec extends DeploymentSpec = CloudflareDeploymentSpec,
+> {
+  readonly spec: Spec;
   readonly action: CleanupAdvanceAction;
   readonly maxProviderRequests: number;
   readonly signal?: AbortSignal;
   readonly clock?: () => number;
 }
 
-export interface CloudflareAdvanceDecommissionDeploymentOptions {
-  readonly spec: CloudflareDeploymentSpec;
+export interface CloudflareAdvanceDecommissionDeploymentOptions<
+  Spec extends DeploymentSpec = CloudflareDeploymentSpec,
+> {
+  readonly spec: Spec;
   readonly action: DecommissionAdvanceAction;
   readonly maxProviderRequests: number;
   readonly signal?: AbortSignal;
@@ -307,9 +320,11 @@ export interface CloudflareAdvanceFleetInventoryOptions {
   readonly signal?: AbortSignal;
 }
 
-export interface CloudflareAdvanceFleetAuditOptions {
+export interface CloudflareAdvanceFleetAuditOptions<
+  Spec extends DeploymentSpec = CloudflareDeploymentSpec,
+> {
   readonly action: FleetAuditAdvanceAction;
-  readonly specFor: (record: FleetRecord) => CloudflareDeploymentSpec;
+  readonly specFor: (record: FleetRecord) => Spec;
   readonly maintenanceSecretFor: (record: FleetRecord) => string;
   readonly maxItemsPerCall?: number;
   readonly auditClock?: () => number;
@@ -317,9 +332,11 @@ export interface CloudflareAdvanceFleetAuditOptions {
   readonly signal?: AbortSignal;
 }
 
-export interface CloudflareAdvanceFleetMigrationOptions {
+export interface CloudflareAdvanceFleetMigrationOptions<
+  Spec extends DeploymentSpec = CloudflareDeploymentSpec,
+> {
   readonly action: FleetMigrationAdvanceAction;
-  readonly specFor: (record: FleetRecord) => CloudflareDeploymentSpec;
+  readonly specFor: (record: FleetRecord) => Spec;
   readonly secretsFor: (record: FleetRecord) => DeploymentSecrets;
   readonly settlementFor?: (
     record: FleetRecord,
@@ -348,15 +365,17 @@ export interface CloudflareFleetMigrationItemsPage {
   readonly done: boolean;
 }
 
-export interface CloudflareControlPlane {
+export interface CloudflareControlPlane<
+  Spec extends DeploymentSpec = CloudflareDeploymentSpec,
+> {
   provisionDeployment(
-    options: CloudflareProvisionDeploymentOptions,
+    options: CloudflareProvisionDeploymentOptions<Spec>,
   ): Promise<ProvisioningResult>;
   advanceCleanupDeployment(
-    options: CloudflareAdvanceCleanupDeploymentOptions,
+    options: CloudflareAdvanceCleanupDeploymentOptions<Spec>,
   ): Promise<CleanupAdvanceResult>;
   advanceDecommissionDeployment(
-    options: CloudflareAdvanceDecommissionDeploymentOptions,
+    options: CloudflareAdvanceDecommissionDeploymentOptions<Spec>,
   ): Promise<DecommissionAdvanceResult>;
   advanceFleetInventory(
     options: CloudflareAdvanceFleetInventoryOptions,
@@ -368,14 +387,14 @@ export interface CloudflareControlPlane {
     FleetInventoryGenerationRef | undefined
   >;
   advanceFleetAudit(
-    options: CloudflareAdvanceFleetAuditOptions,
+    options: CloudflareAdvanceFleetAuditOptions<Spec>,
   ): Promise<FleetAuditAdvanceResult>;
   readFleetAuditFindingsPage(
     options: CloudflareFleetOperationPageOptions,
   ): Promise<FleetAuditFindingsPage>;
   abandonFleetAuditOperation(operationId: string): Promise<void>;
   advanceFleetMigration(
-    options: CloudflareAdvanceFleetMigrationOptions,
+    options: CloudflareAdvanceFleetMigrationOptions<Spec>,
   ): Promise<FleetMigrationAdvanceResult>;
   readFleetMigrationItemsPage(
     options: CloudflareFleetOperationPageOptions,
@@ -399,6 +418,48 @@ export interface CloudflareControlPlane {
   ): Promise<Readonly<{ deleted: number; releasedPins: number }>>;
 }
 
+export type CloudflareWorkersForPlatformsDeploymentSpec = Omit<
+  DeploymentSpec,
+  'authoredBy' | 'durableObjectBindings'
+> & {
+  readonly authoredBy: 'external';
+  readonly durableObjectBindings: readonly Readonly<{
+    name: string;
+    className: string;
+  }>[];
+};
+
+export interface CloudflareWorkersForPlatformsControlPlaneOptions
+  extends CloudflareControlPlaneOptions {
+  readonly dispatchNamespace: string;
+  readonly hostRoutingKvId: string;
+  readonly auditQueueName: string;
+  readonly sharedOutboundWorkerName: string;
+  readonly stateEgressRootSecret: string;
+  readonly platformProfileFor: (
+    spec: CloudflareWorkersForPlatformsDeploymentSpec,
+  ) => ExternalPlatformProfile;
+}
+
+export interface CloudflareRollbackExternalReleaseOptions {
+  readonly currentSpec: CloudflareWorkersForPlatformsDeploymentSpec;
+  readonly rollbackSpec: CloudflareWorkersForPlatformsDeploymentSpec;
+  readonly secrets: DeploymentSecrets;
+  readonly settlement?: FleetSettlementHost;
+  readonly routeAttestation?: AttestConvergedActiveRouteOptions;
+  readonly clock?: () => number;
+}
+
+export interface CloudflareWorkersForPlatformsControlPlane
+  extends Omit<
+    CloudflareControlPlane<CloudflareWorkersForPlatformsDeploymentSpec>,
+    'advanceCleanupDeployment'
+  > {
+  rollbackExternalRelease(
+    options: CloudflareRollbackExternalReleaseOptions,
+  ): Promise<FleetRecord>;
+}
+
 function ordinarySpec(spec: DeploymentSpec): CloudflareDeploymentSpec {
   if (spec.authoredBy !== 'platform') {
     throw new TypeError(
@@ -418,6 +479,156 @@ function ordinarySpec(spec: DeploymentSpec): CloudflareDeploymentSpec {
 export function createCloudflareControlPlane(
   options: CloudflareControlPlaneOptions,
 ): CloudflareControlPlane {
+  const { maintenanceFetch, maintenanceRequestTimeoutMs } = options;
+  return createControlPlane(options, {
+    clientPlane: { plane: 'plain-worker' },
+    spec: ordinarySpec,
+    inventoryScope: { includeDispatchNamespace: false },
+    backend: (client, clock) =>
+      new CloudflareApiPlainWorkerBackend({
+        client,
+        fetch: maintenanceFetch,
+        maintenanceRequestTimeoutMs,
+        clock,
+      }),
+    record(record) {
+      if (record.backend !== 'plain-worker') {
+        throw new TypeError(
+          'Cloudflare control plane requires plain-worker records',
+        );
+      }
+    },
+  }).controlPlane;
+}
+
+function externalSpec(
+  spec: DeploymentSpec,
+): CloudflareWorkersForPlatformsDeploymentSpec {
+  if (spec.authoredBy !== 'external') {
+    throw new TypeError(
+      'Workers for Platforms control plane requires external specifications',
+    );
+  }
+  for (const binding of spec.durableObjectBindings) {
+    if (
+      binding.scriptName !== undefined ||
+      binding.dispatchNamespace !== undefined
+    ) {
+      throw new TypeError(
+        'Workers for Platforms control plane owns Durable Object binding targets',
+      );
+    }
+  }
+  return spec as CloudflareWorkersForPlatformsDeploymentSpec;
+}
+
+export function createCloudflareWorkersForPlatformsControlPlane(
+  options: CloudflareWorkersForPlatformsControlPlaneOptions,
+): CloudflareWorkersForPlatformsControlPlane {
+  const {
+    dispatchNamespace,
+    hostRoutingKvId,
+    auditQueueName,
+    sharedOutboundWorkerName,
+    stateEgressRootSecret,
+    maintenanceFetch,
+    maintenanceRequestTimeoutMs,
+  } = options;
+  if (!auditQueueName) throw new TypeError('auditQueueName is required');
+  const platformProfileFor = options.platformProfileFor.bind(options);
+  const { controlPlane, fleetStore, backend } = createControlPlane(options, {
+    clientPlane: { dispatchNamespace },
+    spec: externalSpec,
+    inventoryScope: {
+      includeDispatchNamespace: true,
+      dispatchNamespace,
+      hostRoutingKvId,
+    },
+    backend: (client, clock) =>
+      new WorkersForPlatformsBackend({
+        client,
+        fetch: maintenanceFetch,
+        maintenanceRequestTimeoutMs,
+        clock,
+        hostRoutingKvId,
+        auditQueueName,
+        platformProfileFor: (spec) => platformProfileFor(externalSpec(spec)),
+        namespacedState: {
+          dispatchNamespace,
+          sharedOutboundWorkerName,
+          stateEgressRootSecret,
+        },
+      }),
+    guardLeases: true,
+    record(record) {
+      if (
+        record.backend !== 'workers-for-platforms' ||
+        record.wfpMode === 'platform-catalog' ||
+        record.backendSwitchIntent !== undefined
+      ) {
+        throw new TypeError(
+          'Workers for Platforms control plane requires dispatch-native external records',
+        );
+      }
+      const resources = record.platformResources;
+      if (
+        resources &&
+        (resources.stateWorker.plane !== 'dispatch' ||
+          resources.stateWorker.dispatchNamespace !== dispatchNamespace ||
+          resources.sharedOutboundWorkerName !== sharedOutboundWorkerName ||
+          (resources.auditQueueName !== undefined &&
+            resources.auditQueueName !== auditQueueName))
+      ) {
+        throw new TypeError(
+          'Workers for Platforms record does not match the configured platform',
+        );
+      }
+    },
+  });
+  const { advanceCleanupDeployment: _cleanup, ...supported } = controlPlane;
+  return Object.freeze({
+    ...supported,
+    async rollbackExternalRelease(
+      input: CloudflareRollbackExternalReleaseOptions,
+    ) {
+      return rollbackExternalRelease({
+        store: fleetStore,
+        backend,
+        currentSpec: externalSpec(input.currentSpec),
+        rollbackSpec: externalSpec(input.rollbackSpec),
+        secrets: input.secrets,
+        settlement: input.settlement,
+        routeAttestation: input.routeAttestation,
+        clock: input.clock?.bind(input),
+      });
+    },
+  });
+}
+
+function createControlPlane<Spec extends DeploymentSpec>(
+  options: CloudflareControlPlaneOptions,
+  configuration: Readonly<{
+    clientPlane:
+      | Readonly<{ plane: 'plain-worker' }>
+      | Readonly<{ dispatchNamespace: string }>;
+    spec: (spec: DeploymentSpec) => Spec;
+    backend: (
+      client: CloudflareProvisioningClient,
+      clock: (() => number) | undefined,
+    ) => ProvisioningBackend;
+    record: (record: FleetRecord) => void;
+    guardLeases?: boolean;
+    inventoryScope: Readonly<{
+      includeDispatchNamespace: boolean;
+      dispatchNamespace?: string;
+      hostRoutingKvId?: string;
+    }>;
+  }>,
+): Readonly<{
+  controlPlane: CloudflareControlPlane<Spec>;
+  fleetStore: FleetStateStore;
+  backend: ProvisioningBackend;
+}> {
   const {
     accountId,
     apiToken,
@@ -430,15 +641,45 @@ export function createCloudflareControlPlane(
     concurrency,
     requestTimeoutMs,
     fetch: providerFetch,
-    maintenanceFetch,
-    maintenanceRequestTimeoutMs,
   } = options;
   const clock = options.clock?.bind(options);
   const randomUUID =
     options.randomUUID?.bind(options) ?? (() => crypto.randomUUID());
   const database = new D1FleetStateDatabase(fleetDatabase);
   const storeOptions = { accountId, leaseTtlMs, leaseRenewalIntervalMs };
-  const fleetStore = new D1FleetStateStore(database, storeOptions);
+  const durableFleetStore = new D1FleetStateStore(database, storeOptions);
+  const fleetStore: FleetStateStore = configuration.guardLeases
+    ? {
+        async withDeploymentLease(tenantTag, environment, operation) {
+          return durableFleetStore.withDeploymentLease(
+            tenantTag,
+            environment,
+            async (lease) => {
+              const record = await durableFleetStore.get(
+                tenantTag,
+                environment,
+              );
+              if (record) configuration.record(record);
+              return operation(lease);
+            },
+          );
+        },
+        async get(tenantTag, environment) {
+          const record = await durableFleetStore.get(tenantTag, environment);
+          if (record) configuration.record(record);
+          return record;
+        },
+        async list() {
+          const records = await durableFleetStore.list();
+          for (const record of records) configuration.record(record);
+          return records;
+        },
+        readCleanupReceipt: (operationId) =>
+          durableFleetStore.readCleanupReceipt(operationId),
+        pruneCleanupReceipts: (input) =>
+          durableFleetStore.pruneCleanupReceipts(input),
+      }
+    : durableFleetStore;
   const inventoryStore = new D1FleetInventoryRunStore(database, storeOptions);
   const operationStore = new D1FleetOperationStore(database, {
     accountId,
@@ -453,34 +694,27 @@ export function createCloudflareControlPlane(
   const client = new CloudflareProvisioningClient({
     accountId,
     apiToken,
-    plane: 'plain-worker',
+    ...configuration.clientPlane,
     rateCoordinator,
     exportStore,
     concurrency,
     requestTimeoutMs,
     fetch: providerFetch,
   });
-  const backend = new CloudflareApiPlainWorkerBackend({
-    client,
-    fetch: maintenanceFetch,
-    maintenanceRequestTimeoutMs,
-    clock,
-  });
-  const backendFor = (record: FleetRecord): CloudflareApiPlainWorkerBackend => {
-    if (record.backend !== 'plain-worker') {
-      throw new TypeError(
-        'Cloudflare control plane requires plain-worker records',
-      );
-    }
+  const backend = configuration.backend(client, clock);
+  const backendFor = (record: FleetRecord): ProvisioningBackend => {
+    configuration.record(record);
     return backend;
   };
 
-  return Object.freeze({
-    async provisionDeployment(input: CloudflareProvisionDeploymentOptions) {
+  const controlPlane: CloudflareControlPlane<Spec> = Object.freeze({
+    async provisionDeployment(
+      input: CloudflareProvisionDeploymentOptions<Spec>,
+    ) {
       return provisionDeployment({
         backend,
         store: fleetStore,
-        spec: ordinarySpec(input.spec),
+        spec: configuration.spec(input.spec),
         secrets: input.secrets,
         initialExecutionFenceState: input.initialExecutionFenceState,
         routeAttestation: input.routeAttestation,
@@ -489,12 +723,12 @@ export function createCloudflareControlPlane(
       });
     },
     async advanceCleanupDeployment(
-      input: CloudflareAdvanceCleanupDeploymentOptions,
+      input: CloudflareAdvanceCleanupDeploymentOptions<Spec>,
     ) {
       return advanceCleanupDeployment({
         backend,
         store: fleetStore,
-        spec: ordinarySpec(input.spec),
+        spec: configuration.spec(input.spec),
         action: input.action,
         maxProviderRequests: input.maxProviderRequests,
         signal: input.signal,
@@ -503,12 +737,12 @@ export function createCloudflareControlPlane(
       });
     },
     async advanceDecommissionDeployment(
-      input: CloudflareAdvanceDecommissionDeploymentOptions,
+      input: CloudflareAdvanceDecommissionDeploymentOptions<Spec>,
     ) {
       return advanceDecommissionDeployment({
         backend,
         store: fleetStore,
-        spec: ordinarySpec(input.spec),
+        spec: configuration.spec(input.spec),
         action: input.action,
         maxProviderRequests: input.maxProviderRequests,
         signal: input.signal,
@@ -520,20 +754,9 @@ export function createCloudflareControlPlane(
       const context = cloudflareFleetInventoryContext(client);
       const action = input.action;
       return advanceFleetInventory({
-        context: {
-          async advanceStage(stageInput) {
-            if (
-              stageInput.options.includeDispatchNamespace ||
-              stageInput.options.hostRoutingKvId !== undefined
-            ) {
-              throw new TypeError(
-                'Cloudflare control plane cannot advance dispatch or host-routing inventory',
-              );
-            }
-            return context.advanceStage(stageInput);
-          },
-        },
+        context,
         store: inventoryStore,
+        expectedScope: configuration.inventoryScope,
         action:
           action.kind === 'start'
             ? {
@@ -543,7 +766,7 @@ export function createCloudflareControlPlane(
                   databaseNamePrefix: action.options.databaseNamePrefix,
                   scriptNamePrefix: action.options.scriptNamePrefix,
                   includeR2Buckets: action.options.includeR2Buckets,
-                  includeDispatchNamespace: false,
+                  ...configuration.inventoryScope,
                 },
               }
             : { kind: action.kind, token: action.token },
@@ -556,14 +779,14 @@ export function createCloudflareControlPlane(
       readFleetInventoryGeneration(inventoryStore, generation),
     latestFinalizedInventoryGeneration: () =>
       inventoryStore.latestFinalizedGeneration(),
-    async advanceFleetAudit(input: CloudflareAdvanceFleetAuditOptions) {
+    async advanceFleetAudit(input: CloudflareAdvanceFleetAuditOptions<Spec>) {
       const specFor = input.specFor.bind(input);
       return advanceFleetAudit({
         operationStore,
         inventoryStore,
         fleetStore,
         backendFor,
-        specFor: (record) => ordinarySpec(specFor(record)),
+        specFor: (record) => configuration.spec(specFor(record)),
         maintenanceSecretFor: input.maintenanceSecretFor.bind(input),
         action: input.action,
         maxItemsPerCall: input.maxItemsPerCall,
@@ -584,13 +807,15 @@ export function createCloudflareControlPlane(
         inventoryStore,
         operationId,
       }),
-    async advanceFleetMigration(input: CloudflareAdvanceFleetMigrationOptions) {
+    async advanceFleetMigration(
+      input: CloudflareAdvanceFleetMigrationOptions<Spec>,
+    ) {
       const specFor = input.specFor.bind(input);
       return advanceFleetMigration({
         operationStore,
         fleetStore,
         backendFor,
-        specFor: (record) => ordinarySpec(specFor(record)),
+        specFor: (record) => configuration.spec(specFor(record)),
         secretsFor: input.secretsFor.bind(input),
         settlementFor: input.settlementFor?.bind(input),
         action: input.action,
@@ -611,11 +836,11 @@ export function createCloudflareControlPlane(
     getDeployment: (tenantTag: string, environment: string) =>
       fleetStore.get(tenantTag, environment),
     readCleanupReceipt: (operationId: string) =>
-      fleetStore.readCleanupReceipt(operationId),
+      durableFleetStore.readCleanupReceipt(operationId),
     pruneCleanupReceipts: (
       input: Readonly<{ completedBeforeMs: number; limit: number }>,
     ) =>
-      fleetStore.pruneCleanupReceipts({
+      durableFleetStore.pruneCleanupReceipts({
         completedBeforeMs: input.completedBeforeMs,
         limit: input.limit,
       }),
@@ -629,4 +854,5 @@ export function createCloudflareControlPlane(
         limit: input.limit,
       }),
   });
+  return { controlPlane, fleetStore, backend };
 }

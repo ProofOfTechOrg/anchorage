@@ -10,6 +10,7 @@ import type {
 import {
   type CloudflareDeploymentSpec,
   createCloudflareControlPlane,
+  createCloudflareWorkersForPlatformsControlPlane,
   D1CloudflareApiRateCoordinator,
   D1FleetStateDatabase,
   ProvisioningError,
@@ -236,6 +237,24 @@ async function provider(env: Env, invocationId: string) {
     }
     if (method === 'GET' && path === '/client/v4/zones') return page([]);
     const account = '/client/v4/accounts/account';
+    if (
+      method === 'GET' &&
+      [
+        `${account}/storage/kv/namespaces/packed-hosts/keys`,
+        `${account}/workers/dispatch/namespaces/packed-namespace/scripts`,
+      ].includes(path)
+    )
+      return page([]);
+    if (
+      method === 'GET' &&
+      path === `${account}/workers/dispatch/namespaces/packed-namespace`
+    ) {
+      return single({
+        namespace_name: 'packed-namespace',
+        trusted_workers: false,
+        script_count: 0,
+      });
+    }
     if (path === `${account}/d1/database`) {
       if (method === 'GET') {
         if (url.searchParams.has('page')) return page([]);
@@ -332,6 +351,70 @@ function transport(
     const requestBody = typeof raw === 'string' ? JSON.parse(raw) : {};
     return respond({ method, url, body: requestBody });
   };
+}
+
+async function wfpInventory(
+  env: Env,
+  invocationId: string,
+  action: string,
+  token: unknown,
+) {
+  const inert = await provider(env, invocationId);
+  const providerFetch = transport(inert.respond);
+  const control =
+    action === 'wfp-ordinary'
+      ? plane(env, providerFetch)
+      : createCloudflareWorkersForPlatformsControlPlane({
+          accountId: 'account',
+          apiToken: 'packed-inert-provider-token',
+          fleetDatabase: env.FLEET_DB,
+          quotaDatabase: env.QUOTA_DB,
+          quotaScope: 'packed-factory-provider',
+          databaseExports: exportOptions(env),
+          dispatchNamespace:
+            action === 'wfp-namespace' ? 'other-namespace' : 'packed-namespace',
+          hostRoutingKvId:
+            action === 'wfp-hosts' ? 'other-hosts' : 'packed-hosts',
+          auditQueueName: 'packed-audit',
+          sharedOutboundWorkerName: 'packed-outbound',
+          stateEgressRootSecret: 'packed-state-egress-secret-0000000001',
+          platformProfileFor: () => {
+            throw new Error('inventory cannot resolve an artifact profile');
+          },
+          fetch: providerFetch,
+          maintenanceFetch: async () => {
+            throw new Error('inventory cannot invoke maintenance');
+          },
+        });
+  try {
+    const outcome = await control.advanceFleetInventory({
+      action:
+        action === 'wfp-start'
+          ? {
+              kind: 'start',
+              operationId: '33333333-3333-4333-8333-333333333333',
+              options: {
+                databaseNamePrefix: 'packed-wfp-',
+                scriptNamePrefix: 'packed-wfp-',
+              },
+            }
+          : { kind: 'continue', token },
+      maxProviderRequests: 9,
+    });
+    return {
+      outcome,
+      requests: inert.count(),
+      ...(outcome.status === 'complete'
+        ? {
+            inventory: await control.readFleetInventoryGeneration(
+              outcome.generation.generation,
+            ),
+          }
+        : {}),
+    };
+  } catch (error) {
+    return { error: errorInfo(error), requests: inert.count() };
+  }
 }
 
 async function provisionFailure(
@@ -657,6 +740,13 @@ export default {
     try {
       let result: unknown;
       if (input.action === 'quota') result = await quota(env);
+      else if (input.action.startsWith('wfp-'))
+        result = await wfpInventory(
+          env,
+          invocationId,
+          input.action,
+          input.token,
+        );
       else if (input.action === 'queue-live' || input.action === 'queue-stale')
         result = await queuedAuthority(env, input.action === 'queue-stale');
       else if (input.action === 'lease-winner')

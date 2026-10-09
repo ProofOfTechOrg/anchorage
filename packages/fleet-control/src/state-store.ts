@@ -347,8 +347,16 @@ function platformTargetFromUnknown(
     (target.stateEgressCredentialDigest !== undefined &&
       (typeof target.stateEgressCredentialDigest !== 'string' ||
         !isSha256(target.stateEgressCredentialDigest))) ||
-    typeof target.egressArtifactDigest !== 'string' ||
-    !isSha256(target.egressArtifactDigest) ||
+    (target.sharedOutboundWorkerName !== undefined &&
+      (typeof target.sharedOutboundWorkerName !== 'string' ||
+        !isDeploymentScriptName(target.sharedOutboundWorkerName))) ||
+    (target.egressArtifactDigest !== undefined &&
+      (typeof target.egressArtifactDigest !== 'string' ||
+        !isSha256(target.egressArtifactDigest))) ||
+    (target.sharedOutboundWorkerName === undefined) ===
+      (target.egressArtifactDigest === undefined) ||
+    (target.sharedOutboundWorkerName !== undefined &&
+      typeof target.stateEgressCredentialDigest !== 'string') ||
     typeof target.d1SchemaVersion !== 'number' ||
     !Number.isSafeInteger(target.d1SchemaVersion) ||
     target.d1SchemaVersion < 0 ||
@@ -387,7 +395,12 @@ function platformTargetFromUnknown(
           stateEgressCredentialDigest: target.stateEgressCredentialDigest,
         }
       : {}),
-    egressArtifactDigest: target.egressArtifactDigest,
+    ...(typeof target.sharedOutboundWorkerName === 'string'
+      ? { sharedOutboundWorkerName: target.sharedOutboundWorkerName }
+      : {}),
+    ...(typeof target.egressArtifactDigest === 'string'
+      ? { egressArtifactDigest: target.egressArtifactDigest }
+      : {}),
     d1SchemaVersion: target.d1SchemaVersion,
     d1SchemaHistoryDigest: target.d1SchemaHistoryDigest,
     outboundPolicy,
@@ -749,11 +762,12 @@ function validateRecordCrossFields(record: FleetRecord): void {
     schemaVersion,
   } = record;
   // The retained target authorizes recovery of a state upload whose response is lost.
-  const legacyMigrationTeardown =
+  const migrationTeardown =
     backend === 'workers-for-platforms' &&
     record.wfpMode === undefined &&
     record.cleanupIntent === undefined &&
-    record.decommissionIntent === undefined &&
+    (record.decommissionIntent === undefined ||
+      record.decommissionIntent.identity.mode.kind === 'normal') &&
     record.backendSwitchIntent === undefined &&
     record.desiredSpecDigest === migrationIntent?.targetSpecDigest &&
     [
@@ -762,7 +776,7 @@ function validateRecordCrossFields(record: FleetRecord): void {
       'credentials-revoked',
       'worker-deleted',
       'platform-credentials-revoked',
-    ].includes(record.phase);
+    ].includes(phase);
   if (
     (backend === 'workers-for-platforms' && !outboundPolicy) ||
     (backend === 'plain-worker' && outboundPolicy) ||
@@ -784,7 +798,7 @@ function validateRecordCrossFields(record: FleetRecord): void {
     (platformTarget &&
       JSON.stringify(platformTarget.outboundPolicy) !==
         JSON.stringify(outboundPolicy)) ||
-    (migrationIntent && phase !== 'migrating' && !legacyMigrationTeardown) ||
+    (migrationIntent && phase !== 'migrating' && !migrationTeardown) ||
     (migrationIntent &&
       migrationIntent.targetSpecDigest !==
         migrationIntent.targetRelease.specDigest) ||
@@ -1141,7 +1155,8 @@ function toRecord(row: Readonly<Record<string, unknown>>): FleetRecord {
               durableObjectMigrationHistory,
             ),
           ) ||
-        durableObjectMigrationHistory.at(-1)?.tag !== durableObjectTag))
+        durableObjectMigrationHistory.at(-1)?.tag !==
+          (durableObjectTag ?? undefined)))
   ) {
     throw new Error(
       'fleet state row has inconsistent Durable Object migration history',

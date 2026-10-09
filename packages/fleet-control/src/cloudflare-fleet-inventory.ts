@@ -1424,12 +1424,17 @@ async function advanceRegistrationChecks(
       registrationOrdinal += 1;
       continue;
     }
+    const resourceRole = live.plainTextBindings.FLEET_RESOURCE_ROLE;
+    const resourceGroupId = live.plainTextBindings.FLEET_RESOURCE_GROUP;
+    const trusted =
+      resourceRole === 'platform-state' || resourceRole === 'deployment-egress';
     const deploymentOrdinal = context.sink.add('deployment', {
       record: 'deployment',
       backend: 'workers-for-platforms',
       scriptName: registration.scriptName,
       tenantTag: live.tenantTag,
       environment: live.environment,
+      ...(trusted ? { resourceRole, resourceGroupId } : {}),
       artifactVersion: live.artifactVersion,
       desiredSpecDigest: live.desiredSpecDigest,
       schemaVersion: live.schemaVersion,
@@ -1530,12 +1535,16 @@ async function advanceRegistrationPostprocess(
       ...(inventory.namespace_id
         ? { namespaceId: inventory.namespace_id }
         : {}),
-      trustedWorkers: inventory.trusted_workers,
+      trustedWorkers:
+        inventory.trusted_workers === undefined
+          ? false
+          : inventory.trusted_workers,
       scriptCount: dispatchScriptCount,
     });
     if (
       inventory.namespace_name !== namespace ||
-      inventory.trusted_workers !== false
+      (inventory.trusted_workers !== undefined &&
+        inventory.trusted_workers !== false)
     ) {
       context.sink.finding(
         'trusted-dispatch-namespace',
@@ -2043,6 +2052,14 @@ export async function advanceCloudflareFleetInventoryStage(
   input: FleetInventoryStageInput,
 ): Promise<FleetInventoryStageResult> {
   assertWorkerAttachmentProviderRequestBudget(input.maxProviderRequests);
+  if (
+    input.options.dispatchNamespace !== undefined &&
+    input.options.dispatchNamespace !== deps.dispatchNamespace()
+  ) {
+    throw new TypeError(
+      'fleet inventory dispatch namespace does not match the client',
+    );
+  }
   const stage = fleetInventoryStageFromUnknown(input.stage);
   const budget = new RequestBudget(input.maxProviderRequests, stage.step);
   const resumed =

@@ -2,6 +2,18 @@
 
 import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
+import {
+  lstat,
+  mkdir,
+  mkdtemp,
+  readlink,
+  realpath,
+  rm,
+  symlink,
+  writeFile,
+} from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import {
@@ -80,6 +92,12 @@ const maintenancePublicKey = canonicalMaintenanceCapabilityPublicKey(
     x: maintenancePrivateKey.x,
   }),
 );
+const wasmBytes = Uint8Array.from([0, 97, 115, 109, 1, 0, 0, 0]);
+const wasmDescriptor = {
+  name: 'hash.wasm',
+  file: './artifacts/hash.wasm',
+  sha256: '93a44bbb96c751218e4c00d479e4c14358122a389acca16205b1e4d0dc5f9476',
+};
 
 function operationalFixture(): {
   plans: Array<{
@@ -232,6 +250,7 @@ describe('credentialed conformance command', () => {
     'maintenanceBaseUrls.tenantb',
     'routeHostnames.tenanta',
     'routeHostnames.tenantb',
+    'plainWorkerRouteHostname',
     'durableObjectBindings',
     'durableObjectBindings.0.name',
     'durableObjectBindings.0.className',
@@ -279,6 +298,44 @@ describe('credentialed conformance command', () => {
     ).toThrow();
   });
 
+  it.each([
+    null,
+    42,
+    '',
+    'localhost',
+    'https://plain.example.test',
+    'PLAIN.example.test',
+    'plain.example.test.',
+    'plain.example.test:443',
+    'plain.example.test:invalid',
+    'plain.example.test/path',
+    'operator@plain.example.test',
+    'plain.example.test?probe=1',
+    'plain.example.test#probe',
+    ' plain.example.test',
+  ])('rejects noncanonical ordinary probe hostname %j', (plainWorkerRouteHostname) => {
+    expect(() =>
+      validateConformanceConfig({ ...validConfig, plainWorkerRouteHostname }),
+    ).toThrow(/plainWorkerRouteHostname/u);
+  });
+
+  it.each([
+    'tenanta',
+    'tenantb',
+  ])('rejects an ordinary probe hostname that aliases %s', (tenantTag) => {
+    const routeHostnames = validConfig.routeHostnames as Record<string, string>;
+    const hostname = routeHostnames[tenantTag] as string;
+    for (const alias of [hostname, hostname.toUpperCase(), `${hostname}.`]) {
+      expect(() =>
+        validateConformanceConfig({
+          ...validConfig,
+          plainWorkerRouteHostname: hostname,
+          routeHostnames: { ...routeHostnames, [tenantTag]: alias },
+        }),
+      ).toThrow(/plainWorkerRouteHostname.*distinct/u);
+    }
+  });
+
   it('requires an append-only second state profile with the new class', () => {
     const replaced = structuredClone(validConfig);
     const profile = replaced.platformProfile as {
@@ -290,6 +347,136 @@ describe('credentialed conformance command', () => {
       { tag: 'v2', newSqliteClasses: ['ConformanceV2'] },
     ];
     expect(() => validateConformanceConfig(replaced)).toThrow(/append/u);
+  });
+
+  it.each([
+    'tenant',
+    'state',
+  ] as const)('rejects unsafe or ambiguous %s Wasm descriptors', (role) => {
+    const configuration = structuredClone(validConfig);
+    const artifact =
+      role === 'tenant'
+        ? configuration
+        : (
+            configuration.platformProfile as {
+              stateProfiles: Array<{ stateWorker: Record<string, unknown> }>;
+            }
+          ).stateProfiles[0]?.stateWorker;
+    if (!artifact) throw new Error('example has no state artifact');
+    artifact.auxiliaryWasm = [wasmDescriptor];
+    expect(() => validateConformanceConfig(configuration)).not.toThrow();
+    for (const invalid of [
+      null,
+      {},
+      [{ ...wasmDescriptor, name: '../hash.wasm' }],
+      [{ ...wasmDescriptor, name: 'hash.js' }],
+      [{ ...wasmDescriptor, name: 'CON.wasm' }],
+      [{ ...wasmDescriptor, file: '' }],
+      [{ ...wasmDescriptor, sha256: 'invalid' }],
+      [wasmDescriptor, wasmDescriptor],
+    ]) {
+      artifact.auxiliaryWasm = invalid;
+      expect(() => validateConformanceConfig(configuration)).toThrow(
+        /auxiliaryWasm/u,
+      );
+    }
+    artifact.auxiliaryWasm = [wasmDescriptor];
+    artifact.mainModule = wasmDescriptor.name;
+    expect(() => validateConformanceConfig(configuration)).toThrow(
+      /auxiliaryWasm/u,
+    );
+  });
+
+  it('loads tenant and state Wasm modules with their upload names and unchanged bytes', async () => {
+    const stateWasm = Uint8Array.from([
+      0, 97, 115, 109, 1, 0, 0, 0, 0, 2, 1, 120,
+    ]);
+    const artifactPaths: string[] = [];
+    const loaded = await loadCredentialedConformanceArtifacts({
+      privateJwk: JSON.stringify(maintenancePrivateKey),
+      publicJwk: maintenancePublicKey,
+      canonicalizePublicKey: canonicalMaintenanceCapabilityPublicKey,
+      workerBundle: './tenant.mjs',
+      stateWorkerBundles: ['./state-v1.mjs', './state-v2.mjs'],
+      auxiliaryWasm: [wasmDescriptor],
+      stateWorkerAuxiliaryWasm: [
+        undefined,
+        [
+          {
+            name: 'state.wasm',
+            file: './artifacts/state.wasm',
+            sha256:
+              'c50e86a2eac362a08107aabb3dfcba703070886e64810653a07b57c6da6a1307',
+          },
+        ],
+      ],
+      readArtifact: (path) => {
+        artifactPaths.push(path);
+        if (path === './artifacts/hash.wasm') return wasmBytes;
+        if (path === './artifacts/state.wasm') return stateWasm;
+        return new TextEncoder().encode(`export default '${path}'`);
+      },
+    });
+    expect(loaded.workerAdditionalModules).toEqual([
+      {
+        name: 'hash.wasm',
+        content: wasmBytes,
+        contentType: 'application/wasm',
+      },
+    ]);
+    expect(loaded.stateWorkerAdditionalModules).toEqual([
+      [],
+      [
+        {
+          name: 'state.wasm',
+          content: stateWasm,
+          contentType: 'application/wasm',
+        },
+      ],
+    ]);
+    expect(new TextDecoder().decode(loaded.workerContent)).toBe(
+      "export default './tenant.mjs'",
+    );
+    expect(
+      loaded.stateWorkerContents.map((bytes) =>
+        new TextDecoder().decode(bytes),
+      ),
+    ).toEqual([
+      "export default './state-v1.mjs'",
+      "export default './state-v2.mjs'",
+    ]);
+    expect(artifactPaths).toEqual(
+      expect.arrayContaining([
+        './artifacts/hash.wasm',
+        './artifacts/state.wasm',
+      ]),
+    );
+  });
+
+  it.each([
+    ['digest mismatch', wasmBytes, '0'.repeat(64), /Wasm digest/u],
+    [
+      'invalid binary',
+      Uint8Array.from([1, 2, 3]),
+      '039058c6f2c0cb492c533b0a4d14ef77cc0f78abccced5287d84a1a2011cfb81',
+      /Wasm format/u,
+    ],
+    ['non-binary content', 'not bytes', wasmDescriptor.sha256, /Wasm bytes/u],
+  ])('rejects Wasm %s before provider construction', async (_case, content, sha256, error) => {
+    let providerConstructions = 0;
+    await expect(async () => {
+      await loadCredentialedConformanceArtifacts({
+        privateJwk: JSON.stringify(maintenancePrivateKey),
+        publicJwk: maintenancePublicKey,
+        canonicalizePublicKey: canonicalMaintenanceCapabilityPublicKey,
+        workerBundle: './tenant.mjs',
+        stateWorkerBundles: [],
+        auxiliaryWasm: [{ ...wasmDescriptor, sha256 }],
+        readArtifact: () => content,
+      });
+      providerConstructions += 1;
+    }).rejects.toThrow(error);
+    expect(providerConstructions).toBe(0);
   });
 
   it('rejects a malformed signer before nonexistent artifacts are read or a provider is constructed', async () => {
@@ -313,6 +500,7 @@ describe('credentialed conformance command', () => {
         stateWorkerBundles: platformProfile.stateProfiles.map(
           (profile) => profile.stateWorker.bundle,
         ),
+        auxiliaryWasm: [wasmDescriptor],
         readArtifact: async (path) => {
           artifactReads += 1;
           return readFileSync(path);
@@ -345,18 +533,80 @@ describe('credentialed conformance command', () => {
   });
 
   it.each([
-    ['migration failure before intent', 'ready'],
-    ['mid-migration failure', 'migrating'],
-    ['rollback settlement response loss', 'ready'],
-  ])('selects the durable initial spec and removes resources after %s', async (_failure, phase) => {
+    {
+      failure: 'migration failure before intent',
+      record: { phase: 'ready', desiredSpecDigest: 'initial' },
+      expectedSpec: 'initial',
+    },
+    {
+      failure: 'external migration failure',
+      record: {
+        phase: 'migrating',
+        desiredSpecDigest: 'initial',
+        migrationIntent: { targetSpecDigest: 'next' },
+        pendingRelease: { specDigest: 'next' },
+        pendingSpecDigest: 'next',
+      },
+      expectedSpec: 'next',
+    },
+    {
+      failure: 'migration with a retained pending release',
+      record: {
+        phase: 'migrating',
+        desiredSpecDigest: 'initial',
+        pendingRelease: { specDigest: 'next' },
+      },
+      expectedSpec: 'next',
+    },
+    {
+      failure: 'mutable migration failure',
+      record: {
+        phase: 'migrating',
+        desiredSpecDigest: 'initial',
+        pendingSpecDigest: 'next',
+      },
+      expectedSpec: 'next',
+    },
+    {
+      failure: 'bounded decommission admission response loss',
+      record: {
+        phase: 'decommission-advancing',
+        desiredSpecDigest: 'initial',
+        migrationIntent: { targetSpecDigest: 'next' },
+        decommissionIntent: {
+          lifecyclePhase: 'migrating',
+          identity: {
+            mode: { kind: 'normal', requestedSpecDigest: 'next' },
+          },
+        },
+      },
+      expectedSpec: 'next',
+    },
+    {
+      failure: 'bounded decommission transition response loss',
+      record: {
+        phase: 'decommission-advancing',
+        desiredSpecDigest: 'next',
+        decommissionIntent: {
+          lifecyclePhase: 'traffic-removed',
+          identity: {
+            mode: { kind: 'normal', requestedSpecDigest: 'next' },
+          },
+        },
+      },
+      expectedSpec: 'next',
+    },
+  ])('dispatches cleanup with durable authority after $failure', async ({
+    record,
+    expectedSpec,
+  }) => {
     const initialSpec = {
       tenantTag: 'tenant-a',
       environment: 'conformance',
       digest: 'initial',
     };
     const nextSpec = { ...initialSpec, digest: 'next' };
-    const record = { phase, desiredSpecDigest: initialSpec.digest };
-    const removed: string[] = [];
+    const dispatched: string[] = [];
     await cleanupCredentialedDeployment(
       {
         initialSpec,
@@ -369,14 +619,108 @@ describe('credentialed conformance command', () => {
         backend: {},
         deploymentSpecDigest: (spec) => spec.digest,
         decommissionDeployment: async ({ spec }) => {
-          removed.push(spec.digest);
+          dispatched.push(`decommission:${spec.digest}`);
         },
         cleanupDeploymentArtifacts: async ({ spec }) => {
-          removed.push(spec.digest);
+          dispatched.push(`artifacts:${spec.digest}`);
         },
       },
     );
-    expect(removed).toEqual(['initial']);
+    expect(dispatched).toEqual([`decommission:${expectedSpec}`]);
+  });
+
+  it.each([
+    {
+      failure: 'missing migration target',
+      record: { phase: 'migrating', desiredSpecDigest: 'initial' },
+    },
+    {
+      failure: 'foreign migration target with a known pending release',
+      record: {
+        phase: 'migrating',
+        desiredSpecDigest: 'initial',
+        migrationIntent: { targetSpecDigest: 'foreign' },
+        pendingRelease: { specDigest: 'next' },
+      },
+    },
+    {
+      failure: 'invalid migration target with a known fallback',
+      record: {
+        phase: 'migrating',
+        desiredSpecDigest: 'initial',
+        migrationIntent: { targetSpecDigest: '' },
+        pendingSpecDigest: 'next',
+      },
+    },
+    {
+      failure: 'missing bounded decommission authority',
+      record: { phase: 'decommission-advancing', desiredSpecDigest: 'next' },
+    },
+    {
+      failure: 'foreign bounded decommission authority',
+      record: {
+        phase: 'decommission-advancing',
+        desiredSpecDigest: 'next',
+        decommissionIntent: {
+          identity: {
+            mode: { kind: 'normal', requestedSpecDigest: 'foreign' },
+          },
+        },
+      },
+    },
+    {
+      failure: 'invalid bounded decommission authority',
+      record: {
+        phase: 'decommission-advancing',
+        desiredSpecDigest: 'next',
+        decommissionIntent: { identity: { mode: { kind: 'normal' } } },
+      },
+    },
+    {
+      failure: 'backend-switch decommission authority',
+      record: {
+        phase: 'decommission-advancing',
+        desiredSpecDigest: 'next',
+        decommissionIntent: {
+          identity: {
+            mode: { kind: 'backend-switch', requestedSpecDigest: 'next' },
+          },
+        },
+      },
+    },
+  ])('refuses cleanup before callbacks for $failure', async ({ record }) => {
+    const initialSpec = {
+      tenantTag: 'tenant-a',
+      environment: 'conformance',
+      digest: 'initial',
+    };
+    const nextSpec = { ...initialSpec, digest: 'next' };
+    const callbacks: string[] = [];
+    await expect(
+      cleanupCredentialedDeployment(
+        {
+          initialSpec,
+          nextSpec,
+          currentSpec: nextSpec,
+          secrets: {},
+          store: { get: async () => record },
+        },
+        {
+          backend: {},
+          deploymentSpecDigest: (spec) => spec.digest,
+          beforeCleanup: async () => {
+            callbacks.push('before');
+          },
+          decommissionDeployment: async () => {
+            callbacks.push('decommission');
+          },
+          cleanupDeploymentArtifacts: async () => {
+            callbacks.push('artifacts');
+          },
+        },
+      ),
+    ).rejects.toThrow(/credentialed cleanup refuses/u);
+    expect(callbacks).toEqual([]);
   });
 
   it('selects a durably settled next spec and fails closed on an unknown digest', async () => {
@@ -698,6 +1042,107 @@ describe('credentialed conformance command', () => {
       ),
     ).rejects.toThrow(new RegExp(`requires ${missingOperation}`, 'u'));
     expect(calls).toEqual([]);
+  });
+
+  it.each([
+    'missing',
+    'file',
+    'symlink',
+    'relative',
+  ] as const)('checks the %s export root before provider access', async (kind) => {
+    const root = await realpath(
+      await mkdtemp(join(tmpdir(), 'fleet-conformance-export-root-')),
+    );
+    try {
+      const directory = join(root, 'exports');
+      const target = join(root, 'retained-exports');
+      if (kind === 'file') await writeFile(directory, 'retained file');
+      if (kind === 'symlink') {
+        await mkdir(target, { mode: 0o700 });
+        await symlink(target, directory);
+      }
+      if (kind === 'relative') await mkdir(directory, { mode: 0o700 });
+
+      const plan = operationalFixture().plans[0];
+      const candidate = plan?.initialSpec.modules[0];
+      const state = plan?.initialProfile.stateWorker.modules[0];
+      if (!candidate || !state) throw new Error('missing artifact fixture');
+      const candidatePath = join(root, 'candidate.mjs');
+      const statePath = join(root, 'state.mjs');
+      await writeFile(candidatePath, candidate.content);
+      await writeFile(statePath, state.content);
+      const configuration = structuredClone(validConfig);
+      configuration.workerBundle = candidatePath;
+      configuration.exportDirectory =
+        kind === 'relative' ? 'exports' : directory;
+      const profile = configuration.platformProfile as {
+        maintenanceCapabilityPublicKey: string;
+        stateProfiles: Array<{ stateWorker: { bundle: string } }>;
+      };
+      profile.maintenanceCapabilityPublicKey = maintenancePublicKey;
+      for (const entry of profile.stateProfiles) {
+        entry.stateWorker.bundle = statePath;
+      }
+      const configPath = join(root, 'operator.json');
+      await writeFile(configPath, JSON.stringify(configuration));
+
+      const providerStarted = 'CONFORMANCE_PROVIDER_STARTED';
+      const preload = `import { writeSync } from 'node:fs';
+globalThis.fetch = () => {
+  writeSync(2, ${JSON.stringify(providerStarted)});
+  process.exit(86);
+};`;
+      const result = spawnSync(
+        process.execPath,
+        [
+          '--import',
+          `data:text/javascript,${encodeURIComponent(preload)}`,
+          scriptPath,
+        ],
+        {
+          cwd: root,
+          encoding: 'utf8',
+          timeout: 15_000,
+          maxBuffer: 64 * 1024,
+          env: {
+            FLEET_CONFORMANCE_CONFIG: configPath,
+            CLOUDFLARE_API_TOKEN: 'conformance-test-token',
+            CLOUDFLARE_ACCOUNT_ID: 'conformance-test-account',
+            FLEET_MAINTENANCE_CAPABILITY_PRIVATE_JWK: JSON.stringify(
+              maintenancePrivateKey,
+            ),
+            FLEET_STATE_EGRESS_ROOT_SECRET: 'conformance-test-root-secret-0001',
+            FLEET_CONFORMANCE_APPLICATION_SECRET:
+              'conformance-test-application-secret',
+          },
+        },
+      );
+      expect(result.error).toBeUndefined();
+      if (kind === 'relative') {
+        expect(result.status, result.stderr).toBe(86);
+        expect(result.stderr).toContain(providerStarted);
+        expect((await lstat(directory)).isDirectory()).toBe(true);
+      } else {
+        expect(result.status, result.stderr).toBe(1);
+        expect(result.stderr).toContain(
+          'conformance exportDirectory must be an existing canonical directory',
+        );
+        expect(result.stderr).not.toContain(providerStarted);
+        if (kind === 'missing') {
+          await expect(lstat(directory)).rejects.toMatchObject({
+            code: 'ENOENT',
+          });
+        } else if (kind === 'file') {
+          expect((await lstat(directory)).isFile()).toBe(true);
+          expect(readFileSync(directory, 'utf8')).toBe('retained file');
+        } else {
+          expect((await lstat(directory)).isSymbolicLink()).toBe(true);
+          expect(await readlink(directory)).toBe(target);
+        }
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it('fails before loading the client or making a request without credentials', () => {

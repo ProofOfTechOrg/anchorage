@@ -6,6 +6,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { ActiveRouteAttestationError } from '../src/active-route.js';
+import {
+  applicationBindingTopology,
+  reserveApplicationR2Resources,
+} from '../src/application-bindings.js';
 import type {
   BackendSwitchProvider,
   BridgeMutationPlan,
@@ -22,6 +26,7 @@ import {
 } from '../src/decommission-advance.js';
 import { normalizeDecommissionAdvanceIntent } from '../src/decommission-intent.js';
 import { migrateFleet, rollbackExternalRelease } from '../src/fleet.js';
+import type { HostRoutingTarget } from '../src/host-routing.js';
 import {
   canonicalDeploymentEgressPolicy,
   externalEgressProxyScriptName,
@@ -387,6 +392,7 @@ class FakeBackend implements ProvisioningBackend {
   deletedPlatformNamespaceIds: readonly string[] = [];
   platformBootstrapPresent = false;
   trafficRemoved = false;
+  hostRoute: string | undefined;
   trafficDrift = false;
   removeTrafficCalls = 0;
   assertTrafficRemovedCalls = 0;
@@ -705,7 +711,17 @@ class FakeBackend implements ProvisioningBackend {
     _deployment?: DeploymentSpec,
     retainedReleases: readonly ExternalReleaseSnapshot[] = [],
     activeRelease?: ExternalReleaseSnapshot,
+    _database?: DatabaseReference,
+    _fence?: ExternalMutationFence,
+    routeTargets: readonly HostRoutingTarget[] = [],
   ): Promise<void> {
+    if (
+      this.hostRoute !== undefined &&
+      !routeTargets.some((target) => JSON.stringify(target) === this.hostRoute)
+    ) {
+      throw new Error('host route is outside persisted authority');
+    }
+    this.hostRoute = undefined;
     this.retainedReleases = retainedReleases;
     this.activeRelease = activeRelease;
     this.removeTrafficCalls += 1;
@@ -843,8 +859,10 @@ class R2RollbackBackend extends FakeBackend {
   deleteFailureBeforeCommit: unknown;
   deleteFailureAfterCommit: unknown;
 
-  override async removeTraffic(): Promise<void> {
-    await super.removeTraffic();
+  override async removeTraffic(
+    ...args: Parameters<FakeBackend['removeTraffic']>
+  ): Promise<void> {
+    await super.removeTraffic(...args);
     if (this.writeAfterTrafficRemovalOnce) {
       this.writeAfterTrafficRemovalOnce = false;
       this.nonempty = true;
@@ -1445,6 +1463,189 @@ function legacyOnlyBackend(backend: FakeBackend): ProvisioningBackend {
 }
 
 describe('fleet provisioning', () => {
+  it.each([
+    'plain-worker',
+    'workers-for-platforms',
+  ] as const)('persists a tagless %s migration through D1', async (kind) => {
+    const backend = new FakeBackend(kind);
+    const ensurePlatformResources =
+      backend.ensurePlatformResources.bind(backend);
+    vi.spyOn(backend, 'ensurePlatformResources').mockImplementation(
+      async (targetSpec) => {
+        const result = await ensurePlatformResources(targetSpec);
+        return {
+          ...result,
+          resources: {
+            ...result.resources,
+            stateWorker: {
+              ...result.resources.stateWorker,
+              plane: 'dispatch',
+              dispatchNamespace: 'fleet-tenants',
+            },
+          },
+        };
+      },
+    );
+    const fixture = sqliteFleetStore();
+    const deployment = spec({
+      authoredBy: kind === 'workers-for-platforms' ? 'external' : 'platform',
+      durableObjectMigrations: [],
+      durableObjectBindings: [],
+      egressProxyService: undefined,
+    });
+    const target = {
+      ...deployment,
+      modules: [
+        { name: 'worker.js', content: 'export default { migrated: true }' },
+      ],
+    };
+    try {
+      const initial = await provisionDeployment({
+        initialExecutionFenceState: 'open',
+        backend,
+        store: fixture.store,
+        spec: deployment,
+        secrets,
+      });
+      const migrated = await migrateFleet({
+        store: fixture.store,
+        records: [initial.record],
+        canaryTenantTags: [],
+        backendFor: () => backend,
+        specFor: () => target,
+        secretsFor: () => secrets,
+      });
+      expect(migrated).toHaveLength(1);
+      const current = await fixture.store.get('acme', 'production');
+      expect(current).toEqual(migrated[0]);
+      expect(current).toMatchObject({
+        phase: 'ready',
+        databaseId: DATABASE_ID,
+        schemaVersion: 3,
+        desiredSpecDigest: deploymentSpecDigest(target),
+      });
+      expect(current).not.toHaveProperty('durableObjectTag');
+      if (kind === 'workers-for-platforms') {
+        expect(current?.activeRelease).toMatchObject({
+          physicalScriptName: externalReleaseScriptName(target),
+          specDigest: deploymentSpecDigest(target),
+          artifactVersion: 'artifact-v3',
+        });
+        expect(current?.rollbackRelease).toEqual(initial.record.activeRelease);
+      }
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it.each([
+    ['omitted namespace', false],
+    ['explicit namespace and reserved R2', true],
+  ] as const)('attests owned external bindings with %s', async (_label, withR2) => {
+    const deployment = spec({
+      authoredBy: 'external',
+      ...(withR2
+        ? {
+            application: {
+              vars: [],
+              secrets: [],
+              r2Buckets: [{ name: 'APPLICATION_FILES' }],
+            },
+          }
+        : {}),
+    });
+    const backend = new FakeBackend('workers-for-platforms');
+    const { resources } = await backend.ensurePlatformResources(deployment);
+    const platformResources = {
+      ...resources,
+      stateWorker: {
+        ...resources.stateWorker,
+        dispatchNamespace: 'fleet-conformance',
+      },
+    };
+    const applicationResources = reserveApplicationR2Resources(deployment);
+    const applicationBindings = applicationBindingTopology(
+      deployment,
+      applicationResources,
+    );
+    const topology = externalReleaseTopology(
+      deployment,
+      platformResources,
+      applicationResources,
+    );
+    const digest = deploymentSpecDigest(deployment);
+    const record = {
+      tenantTag: deployment.tenantTag,
+      environment: deployment.environment,
+      databaseId: DATABASE_ID,
+      backend: backend.kind,
+      platformResources,
+      applicationBindings,
+    };
+    const live = completeLiveDeployment({
+      tenantTag: deployment.tenantTag,
+      environment: deployment.environment,
+      scriptName: deployment.scriptName,
+      databaseId: DATABASE_ID,
+      durableObjectBindings: topology.durableObjectBindings.map(
+        ({ dispatchNamespace, ...binding }) => ({
+          ...binding,
+          ...(withR2 ? { dispatchNamespace } : {}),
+        }),
+      ),
+      serviceBindings: [],
+      queueProducerBindings: [],
+      r2BucketBindings: applicationBindings.r2Buckets,
+      plainTextBindings: {},
+      secretNames: ['DEPLOYMENT_IDENTITY_SECRET'],
+      artifactVersion: 'artifact-v3',
+      desiredSpecDigest: digest,
+      schemaVersion: deployment.schemaVersion,
+      maintenance,
+    });
+
+    expect(() =>
+      assertLiveDeploymentMatches(live, record, deployment, digest),
+    ).not.toThrow();
+    for (const mismatch of [
+      { namespaceId: 'foreign-namespace-id' },
+      { dispatchNamespace: 'foreign-dispatch-namespace' },
+    ]) {
+      expect(() =>
+        assertLiveDeploymentMatches(
+          completeLiveDeployment({
+            ...live,
+            durableObjectBindings: live.durableObjectBindings.map(
+              (binding) => ({ ...binding, ...mismatch }),
+            ),
+          }),
+          record,
+          deployment,
+          digest,
+        ),
+      ).toThrow(/does not exactly match/u);
+    }
+    if (withR2) {
+      expect(() =>
+        assertLiveDeploymentMatches(
+          completeLiveDeployment({
+            ...live,
+            r2BucketBindings: [
+              {
+                name: 'APPLICATION_FILES',
+                bucketName: 'foreign-bucket',
+                jurisdiction: 'default',
+              },
+            ],
+          }),
+          record,
+          deployment,
+          digest,
+        ),
+      ).toThrow(/does not exactly match/u);
+    }
+  });
+
   it('attests empty application bindings exactly while allowing only system-owned variables', () => {
     const deployment = spec();
     const digest = deploymentSpecDigest(deployment);
@@ -3024,49 +3225,148 @@ describe('fleet provisioning', () => {
     expect(backend.emptyChecks).toBeGreaterThanOrEqual(2);
   });
 
-  it('preserves publishing resources after a promote response loss and routes cleanup through export-backed decommission', async () => {
-    const backend = new R2RollbackBackend('plain-worker');
-    const store = new MemoryStore();
+  it.each([
+    ['plain-worker', 'promote-response-loss'],
+    ['external', 'promote-response-loss'],
+    ['external', 'ready-write-failure'],
+    ['external', 'ready-response-loss'],
+  ] as const)('preserves publication resources after %s %s and exports before decommission', async (mode, boundary) => {
+    const external = mode === 'external';
+    const backend = new R2RollbackBackend(
+      external ? 'workers-for-platforms' : 'plain-worker',
+    );
+    const store =
+      boundary === 'ready-response-loss'
+        ? new CommitThenThrowStore()
+        : new MemoryStore();
+    const withLease = store.withDeploymentLease.bind(store);
+    store.withDeploymentLease = (tenantTag, environment, operation) =>
+      withLease(
+        tenantTag,
+        environment,
+        ({ completeCleanup: _completeCleanup, ...lease }) => operation(lease),
+      );
     const deployment = spec({
+      ...(external
+        ? {
+            authoredBy: 'external',
+            durableObjectMigrations: [],
+            egressProxyService: undefined,
+          }
+        : {}),
       application: {
         vars: [],
         secrets: [],
-        r2Buckets: [{ name: 'FILES' }],
+        r2Buckets: external ? [] : [{ name: 'FILES' }],
       },
     });
-    backend.failAt = 'promote';
+    let publishedRoute: string | undefined;
+    const promote = backend.promoteWorker.bind(backend);
+    vi.spyOn(backend, 'promoteWorker').mockImplementation(async () => {
+      await promote();
+      if (external) {
+        const record = store.record;
+        if (!record?.pendingRelease || !record.outboundPolicy)
+          throw new Error('publication fixture has no pending route authority');
+        publishedRoute = JSON.stringify({
+          scriptName: record.pendingRelease.physicalScriptName,
+          tenantTag: record.tenantTag,
+          environment: record.environment,
+          policyId: record.outboundPolicy.policyId,
+          policyDigest: record.outboundPolicy.policyDigest,
+          policyHosts: record.outboundPolicy.policyHosts,
+        });
+        backend.hostRoute = publishedRoute;
+      }
+      if (boundary === 'promote-response-loss')
+        throw new Error('promotion response lost');
+    });
+    if (boundary === 'ready-write-failure') store.failPutPhase = 'ready';
+    if (store instanceof CommitThenThrowStore)
+      store.failAfterCommittedPhase = 'ready';
+    const failure = await provisionDeployment({
+      initialExecutionFenceState: 'open',
+      backend,
+      store,
+      spec: deployment,
+      secrets,
+    }).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(ProvisioningError);
+    expect((failure as ProvisioningError).cause).toMatchObject({
+      message:
+        boundary === 'promote-response-loss'
+          ? 'promotion response lost'
+          : boundary === 'ready-write-failure'
+            ? 'failed state write at ready'
+            : 'state write response was lost after committing ready',
+    });
+    const preservedPhase =
+      boundary === 'ready-response-loss' ? 'ready' : 'publishing';
+    expect({
+      phase: store.record?.phase,
+      route: backend.hostRoute,
+      workerPresent: backend.live !== undefined,
+      databasePresent: backend.databaseExists,
+      trafficRemovals: backend.removeTrafficCalls,
+      databaseDeleted: backend.events.includes('delete-database'),
+    }).toEqual({
+      phase: preservedPhase,
+      route: publishedRoute,
+      workerPresent: true,
+      databasePresent: true,
+      trafficRemovals: 0,
+      databaseDeleted: false,
+    });
+    expect((failure as ProvisioningError).cleanupErrors).toEqual([]);
+    expect(backend.events).not.toContain('revoke');
+    expect(backend.events).not.toContain('delete-worker');
+    expect(backend.buckets.size).toBe(external ? 0 : 1);
 
-    await expect(
-      provisionDeployment({
-        initialExecutionFenceState: 'open',
-        backend,
-        store,
-        spec: deployment,
-        secrets,
-      }),
-    ).rejects.toThrow(/publishing state is preserved/u);
-    expect(effectiveLifecyclePhase(store.record as FleetRecord)).toBe(
-      'publishing',
-    );
-    expect(backend.live).toBeDefined();
-    expect(backend.databaseExists).toBe(true);
-    expect(backend.buckets.size).toBe(1);
-
-    backend.failAt = undefined;
+    const hidden = new Set<PropertyKey>([
+      'advanceDecommissionAttachmentScan',
+      'databaseExportReceiptAuthority',
+      'exportDatabaseReceipt',
+    ]);
+    const legacyBackend = new Proxy(backend, {
+      has(target, property) {
+        return !hidden.has(property) && Reflect.has(target, property);
+      },
+      get(target, property) {
+        if (hidden.has(property)) return undefined;
+        const value = Reflect.get(target, property, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
     backend.events.length = 0;
-    backend.nonempty = true;
-    await expect(
-      decommissionDeployment({ backend, store, spec: deployment }),
-    ).rejects.toThrow(/not empty/u);
-    expect(effectiveLifecyclePhase(store.record as FleetRecord)).toBe(
-      'publishing',
-    );
-    expect(backend.events).toEqual([]);
+    if (!external) {
+      backend.nonempty = true;
+      await expect(
+        decommissionDeployment({
+          backend: legacyBackend,
+          store,
+          spec: deployment,
+        }),
+      ).rejects.toThrow(/not empty/u);
+      expect(effectiveLifecyclePhase(store.record as FleetRecord)).toBe(
+        preservedPhase,
+      );
+      expect(backend.events).toEqual([]);
+    }
 
     backend.nonempty = false;
     await expect(
-      decommissionDeployment({ backend, store, spec: deployment }),
+      decommissionDeployment({
+        backend: legacyBackend,
+        store,
+        spec: deployment,
+      }),
     ).resolves.toMatchObject({ record: { phase: 'decommissioned' } });
+    expect(backend.hostRoute).toBeUndefined();
+    expect(backend.databaseExists).toBe(false);
+    expect(backend.events).toContain('export');
+    expect(backend.events.indexOf('export')).toBeLessThan(
+      backend.events.indexOf('delete-database'),
+    );
   });
 
   it('refuses manual prepublication cleanup when unexpected ingress remains', async () => {
@@ -9046,7 +9346,157 @@ describe('fleet provisioning', () => {
     ).resolves.toMatchObject({ record: { phase: 'decommissioned' } });
   });
 
-  it('atomically consumes plain and WFP migration carriers while preserving snapshots', async () => {
+  it.each([
+    ['schema-applied', 'prior', true],
+    ['schema-applied', 'target', false],
+    ['candidate-armed', 'prior', true],
+    ['candidate-armed', 'target', true],
+    ['route-published', 'prior', false],
+    ['route-published', 'target', true],
+  ] as const)('removes persisted route after native restart at %s (%s, allowed=%s)', async (subphase, routed, allowed) => {
+    const harness = await boundedDecommissionHarness({
+      kind: 'workers-for-platforms',
+      external: true,
+    });
+    const original = harness.store.record;
+    if (
+      !original?.activeRelease ||
+      !original.platformTarget ||
+      !original.platformResources?.egressProxy
+    )
+      throw new Error('missing migration fixture');
+    const target = original.platformTarget;
+    const priorPolicy = canonicalDeploymentEgressPolicy({
+      policyId: target.outboundPolicy.policyId,
+      tenantTag: original.tenantTag,
+      environment: original.environment,
+      allowedHosts: ['prior.example.com'],
+    });
+    const priorTarget = { ...target, outboundPolicy: priorPolicy };
+    const priorRelease = {
+      ...original.activeRelease,
+      physicalScriptName: 'acme-prior-release',
+      artifactVersion: 'prior-version',
+      specDigest: 'f'.repeat(64),
+    };
+    const targetRelease = original.activeRelease;
+    const currentTarget = subphase === 'schema-applied' ? priorTarget : target;
+    const source: FleetRecord = {
+      ...original,
+      phase: 'migrating',
+      desiredSpecDigest: priorRelease.specDigest,
+      activeRelease: priorRelease,
+      pendingRelease: targetRelease,
+      pendingSpecDigest: targetRelease.specDigest,
+      migrationPriorRelease: priorRelease,
+      platformTarget: currentTarget,
+      outboundPolicy: currentTarget.outboundPolicy,
+      platformResources: {
+        ...original.platformResources,
+        stateWorker: {
+          ...original.platformResources.stateWorker,
+          plane: 'dispatch',
+          dispatchNamespace: 'compatibility',
+        },
+        egressProxy: {
+          ...original.platformResources.egressProxy,
+          ...currentTarget.outboundPolicy,
+        },
+      },
+      migrationIntent: {
+        priorRelease,
+        priorTarget,
+        priorOutboundPolicy: priorPolicy,
+        targetRelease,
+        target,
+        targetSpecDigest: targetRelease.specDigest,
+        subphase,
+      },
+    };
+    const selectedPolicy =
+      routed === 'prior' ? priorPolicy : target.outboundPolicy;
+    const route = JSON.stringify({
+      scriptName:
+        routed === 'prior'
+          ? priorRelease.physicalScriptName
+          : targetRelease.physicalScriptName,
+      tenantTag: source.tenantTag,
+      environment: source.environment,
+      policyId: selectedPolicy.policyId,
+      policyDigest: selectedPolicy.policyDigest,
+      policyHosts: selectedPolicy.policyHosts,
+    });
+    harness.backend.hostRoute = route;
+    harness.backend.platformPolicyHosts = ['current-profile.example.com'];
+    const fixture = sqliteFleetStore();
+    try {
+      await fixture.store.withDeploymentLease(
+        source.tenantTag,
+        source.environment,
+        (lease) => lease.put(source),
+      );
+      const options = (
+        action: AdvanceDecommissionDeploymentOptions['action'],
+      ) => boundedAdvanceOptions(harness, action, { store: fixture.store });
+      const started = await advanceDecommissionDeployment(
+        options({ kind: 'start' }),
+      );
+      const entering = await advanceDecommissionDeployment(
+        options({ kind: 'continue', token: started.token }),
+      );
+      const restored = await fixture.store.get(
+        source.tenantTag,
+        source.environment,
+      );
+      expect(restored?.migrationIntent).toEqual(source.migrationIntent);
+      const continuation = advanceDecommissionDeployment(
+        options({ kind: 'continue', token: entering.token }),
+      );
+      if (allowed) {
+        await expect(continuation).resolves.toMatchObject({
+          status: 'pending',
+        });
+        await expect(
+          fixture.store.get(source.tenantTag, source.environment),
+        ).resolves.toMatchObject({
+          decommissionIntent: { lifecyclePhase: 'traffic-removed' },
+        });
+        expect(harness.backend.hostRoute).toBeUndefined();
+      } else {
+        await expect(continuation).rejects.toThrow(
+          /outside persisted authority/,
+        );
+        expect(harness.backend.hostRoute).toBe(route);
+      }
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it('removes persisted route for a catalog without external platform authority', async () => {
+    const harness = await boundedDecommissionHarness({
+      kind: 'workers-for-platforms',
+    });
+    const record = harness.store.record;
+    if (!record?.outboundPolicy) throw new Error('missing catalog policy');
+    expect(record.wfpMode).toBe('platform-catalog');
+    expect(record.platformTarget).toBeUndefined();
+    harness.backend.hostRoute = JSON.stringify({
+      scriptName: record.scriptName,
+      tenantTag: record.tenantTag,
+      environment: record.environment,
+      policyId: record.outboundPolicy.policyId,
+      policyDigest: record.outboundPolicy.policyDigest,
+      policyHosts: record.outboundPolicy.policyHosts,
+    });
+    await driveBoundedUntil(
+      harness,
+      (current) => effectiveLifecyclePhase(current) === 'traffic-removed',
+    );
+    expect(harness.backend.hostRoute).toBeUndefined();
+  });
+
+  it('preserves retained migration authority while consuming mutable carriers', async () => {
     for (const mode of ['plain', 'catalog', 'external'] as const) {
       const mutable = mode !== 'external';
       const harness = await boundedDecommissionHarness({
@@ -9110,7 +9560,15 @@ describe('fleet provisioning', () => {
       });
       expect(harness.store.record).not.toHaveProperty('pendingSpecDigest');
       expect(harness.store.record).not.toHaveProperty('pendingArtifactVersion');
-      expect(harness.store.record).not.toHaveProperty('migrationIntent');
+      if (mutable) {
+        expect(harness.store.record).not.toHaveProperty('migrationIntent');
+      } else {
+        expect(harness.store.record?.migrationIntent).toMatchObject({
+          targetSpecDigest: targetDigest,
+          priorRelease: activeRelease,
+          targetRelease: pendingRelease,
+        });
+      }
     }
 
     const withoutArtifact = await boundedDecommissionHarness({

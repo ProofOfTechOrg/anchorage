@@ -10,7 +10,10 @@ import {
   type CloudflareAdvanceFleetMigrationOptions,
   type CloudflareControlPlaneOptions,
   type CloudflareDeploymentSpec,
+  type CloudflareWorkersForPlatformsControlPlaneOptions,
+  type CloudflareWorkersForPlatformsDeploymentSpec,
   createCloudflareControlPlane,
+  createCloudflareWorkersForPlatformsControlPlane,
   D1CloudflareApiRateCoordinator,
   D1FleetStateDatabase,
   ProvisioningError,
@@ -19,6 +22,7 @@ import {
 import { D1FleetInventoryRunStore } from '../src/d1-fleet-inventory-run-store.js';
 import { D1FleetOperationStore } from '../src/d1-fleet-operation-store.js';
 import { advanceDecommissionDeployment } from '../src/decommission-advance.js';
+import { rollbackExternalRelease } from '../src/fleet.js';
 import {
   abandonFleetAuditOperation,
   advanceFleetAudit,
@@ -41,7 +45,8 @@ import {
 } from '../src/fleet-migration-advance.js';
 import { provisionDeployment } from '../src/provision.js';
 import { D1FleetStateStore } from '../src/state-store.js';
-import type { FleetRecord } from '../src/types.js';
+import type { FleetRecord, FleetStateLease } from '../src/types.js';
+import { WorkersForPlatformsBackend } from '../src/workers-for-platforms-backend.js';
 import {
   initialSpec,
   routeAttestation,
@@ -57,6 +62,7 @@ const constructed = vi.hoisted(() => ({
   quota: vi.fn(),
   client: vi.fn(),
   backend: vi.fn(),
+  wfpBackend: vi.fn(),
 }));
 
 vi.mock('../src/d1-fleet-state-database.js', async (importOriginal) => {
@@ -183,6 +189,27 @@ vi.mock('../src/provision.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../src/provision.js')>()),
   provisionDeployment: vi.fn(),
 }));
+vi.mock('../src/workers-for-platforms-backend.js', async (importOriginal) => {
+  const actual =
+    await importOriginal<
+      typeof import('../src/workers-for-platforms-backend.js')
+    >();
+  return {
+    ...actual,
+    WorkersForPlatformsBackend: class extends actual.WorkersForPlatformsBackend {
+      constructor(
+        ...args: ConstructorParameters<typeof actual.WorkersForPlatformsBackend>
+      ) {
+        super(...args);
+        constructed.wfpBackend(this, ...args);
+      }
+    },
+  };
+});
+vi.mock('../src/fleet.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../src/fleet.js')>()),
+  rollbackExternalRelease: vi.fn(),
+}));
 vi.mock('../src/cleanup-advance.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../src/cleanup-advance.js')>()),
   advanceCleanupDeployment: vi.fn(),
@@ -240,6 +267,30 @@ const TOKEN = {
   operationId: OPERATION_ID,
   revision: 1,
 };
+const WFP_SPEC: CloudflareWorkersForPlatformsDeploymentSpec = {
+  ...SPEC,
+  authoredBy: 'external',
+  durableObjectBindings: [{ name: 'RUNNER', className: 'Runner' }],
+};
+const WFP_RESOURCES = {
+  maintenanceCapabilityPublicKey: 'test-verifier',
+  sharedOutboundWorkerName: 'fleet-outbound',
+  auditQueueName: 'fleet-audit',
+  stateWorker: {
+    scriptName: 'fleet-state',
+    artifactVersion: 'state-v1',
+    artifactDigest: 'b'.repeat(64),
+    plane: 'dispatch' as const,
+    dispatchNamespace: 'fleet-dispatch',
+    durableObjectBindings: [],
+    namespaceIds: [],
+  },
+};
+const WFP_RECORD: FleetRecord = {
+  ...RECORD,
+  backend: 'workers-for-platforms',
+  platformResources: WFP_RESOURCES,
+};
 
 function required<T>(value: T | undefined): T {
   expect(value).toBeDefined();
@@ -269,6 +320,20 @@ function hostOptions(): CloudflareControlPlaneOptions {
       randomUUID: () => OPERATION_ID,
     },
     randomUUID: () => OPERATION_ID,
+  };
+}
+
+function wfpHostOptions(): CloudflareWorkersForPlatformsControlPlaneOptions {
+  return {
+    ...hostOptions(),
+    dispatchNamespace: 'fleet-dispatch',
+    hostRoutingKvId: 'fleet-hosts',
+    auditQueueName: 'fleet-audit',
+    sharedOutboundWorkerName: 'fleet-outbound',
+    stateEgressRootSecret: 'test-state-egress-root-secret-00000001',
+    platformProfileFor() {
+      throw new Error('platform profile was not configured by this test');
+    },
   };
 }
 
@@ -617,6 +682,7 @@ describe('Cloudflare control-plane composition with real constructors and mocked
     expect(first).toEqual({
       context: { advanceStage: expect.any(Function) },
       store: required(constructed.inventoryStore.mock.calls[0])[0],
+      expectedScope: { includeDispatchNamespace: false },
       action: {
         kind: 'start',
         operationId: OPERATION_ID,
@@ -649,27 +715,6 @@ describe('Cloudflare control-plane composition with real constructors and mocked
       2,
       required(constructed.client.mock.calls[0])[0],
     );
-  });
-
-  it.each([
-    { includeDispatchNamespace: true },
-    { hostRoutingKvId: 'root-hosts' },
-  ])('rejects canonical persisted foreign-plane options at the stage boundary', async (options) => {
-    const control = createCloudflareControlPlane(hostOptions());
-    await control.advanceFleetInventory({
-      action: { kind: 'continue', token: { opaque: true } },
-      maxProviderRequests: 9,
-    });
-    const forwarded = required(
-      vi.mocked(advanceFleetInventory).mock.calls[0],
-    )[0];
-    await expect(
-      forwarded.context.advanceStage(stageInput(options)),
-    ).rejects.toThrow('cannot advance dispatch or host-routing inventory');
-    const providerContext = required(
-      vi.mocked(cloudflareFleetInventoryContext).mock.results[0],
-    ).value as FleetInventoryProviderContext;
-    expect(providerContext.advanceStage).not.toHaveBeenCalled();
   });
 
   it('preserves the private provider context receiver for ordinary stage advancement', async () => {
@@ -997,5 +1042,614 @@ describe('Cloudflare control-plane composition with real constructors and mocked
       kind: 'audit',
       limit: 7,
     });
+  });
+});
+
+describe('Workers for Platforms control-plane composition', () => {
+  it('captures the trusted platform configuration and constructs native stores and a dispatch backend', () => {
+    const profileFailure = new Error('profile resolution');
+    const options = {
+      ...wfpHostOptions(),
+      fetch: vi.fn<typeof fetch>(),
+      maintenanceFetch: vi.fn<typeof fetch>(),
+      maintenanceRequestTimeoutMs: 3_000,
+      clock() {
+        expect(this).toBe(options);
+        return 91;
+      },
+      platformProfileFor(spec: CloudflareWorkersForPlatformsDeploymentSpec) {
+        expect(this).toBe(options);
+        expect(spec).toBe(WFP_SPEC);
+        throw profileFailure;
+      },
+      plane: 'plain-worker',
+      rateCoordinator: {},
+      exportStore: {},
+      client: {},
+      backend: {},
+      store: {},
+      inventoryStore: {},
+      operationStore: {},
+    };
+    const control = createCloudflareWorkersForPlatformsControlPlane(options);
+    const [database, databaseBinding] = required(
+      constructed.database.mock.calls[0],
+    );
+    const [fleetStore, fleetAdapter] = required(
+      constructed.fleetStore.mock.calls[0],
+    );
+    const [inventoryStore, inventoryAdapter] = required(
+      constructed.inventoryStore.mock.calls[0],
+    );
+    const [operationStore, operationAdapter, operationOptions] = required(
+      constructed.operationStore.mock.calls[0],
+    );
+    const [quota, quotaBinding, quotaOptions] = required(
+      constructed.quota.mock.calls[0],
+    );
+    const [client, clientOptions] = required(constructed.client.mock.calls[0]);
+    const [backend, backendOptions] = required(
+      constructed.wfpBackend.mock.calls[0],
+    );
+    expect(database).toBeInstanceOf(D1FleetStateDatabase);
+    expect(databaseBinding).toBe(options.fleetDatabase);
+    expect([fleetAdapter, inventoryAdapter, operationAdapter]).toEqual([
+      database,
+      database,
+      database,
+    ]);
+    expect(fleetStore).toBeInstanceOf(D1FleetStateStore);
+    expect(inventoryStore).toBeInstanceOf(D1FleetInventoryRunStore);
+    expect(operationStore).toBeInstanceOf(D1FleetOperationStore);
+    expect(operationOptions.inventoryStore).toBe(inventoryStore);
+    expect(quota).toBeInstanceOf(D1CloudflareApiRateCoordinator);
+    expect(quotaBinding).toBe(options.quotaDatabase);
+    expect(quotaOptions).toEqual({ quotaScope: 'account-token-quota' });
+    expect(clientOptions).toEqual({
+      accountId: 'account-1',
+      apiToken: 'provider-token',
+      dispatchNamespace: 'fleet-dispatch',
+      rateCoordinator: quota,
+      exportStore: expect.any(R2DatabaseExportStore),
+      concurrency: undefined,
+      requestTimeoutMs: undefined,
+      fetch: options.fetch,
+    });
+    expect(backend).toBeInstanceOf(WorkersForPlatformsBackend);
+    expect(backendOptions).toEqual({
+      client,
+      fetch: options.maintenanceFetch,
+      maintenanceRequestTimeoutMs: 3_000,
+      clock: expect.any(Function),
+      hostRoutingKvId: 'fleet-hosts',
+      auditQueueName: 'fleet-audit',
+      platformProfileFor: expect.any(Function),
+      namespacedState: {
+        dispatchNamespace: 'fleet-dispatch',
+        sharedOutboundWorkerName: 'fleet-outbound',
+        stateEgressRootSecret: 'test-state-egress-root-secret-00000001',
+      },
+    });
+    options.clock = () => 999;
+    options.platformProfileFor = () => {
+      throw new Error('mutated profile resolver');
+    };
+    expect(backendOptions.clock()).toBe(91);
+    expect(() => backendOptions.platformProfileFor(WFP_SPEC)).toThrow(
+      profileFailure,
+    );
+    expect(Object.isFrozen(control)).toBe(true);
+    expect(control).not.toHaveProperty('advanceCleanupDeployment');
+    expect(control).not.toHaveProperty('backend');
+    expect(control).not.toHaveProperty('store');
+    expect(control).not.toHaveProperty('client');
+    expect(constructed.backend).not.toHaveBeenCalled();
+    expect(options.fleetDatabase.prepare).not.toHaveBeenCalled();
+    expect(options.quotaDatabase.prepare).not.toHaveBeenCalled();
+    expect(options.fetch).not.toHaveBeenCalled();
+    expect(options.maintenanceFetch).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { ...WFP_SPEC, authoredBy: 'platform' },
+    {
+      ...WFP_SPEC,
+      durableObjectBindings: [
+        { name: 'RUNNER', className: 'Runner', scriptName: 'foreign-state' },
+      ],
+    },
+    {
+      ...WFP_SPEC,
+      durableObjectBindings: [
+        {
+          name: 'RUNNER',
+          className: 'Runner',
+          dispatchNamespace: 'foreign-dispatch',
+        },
+      ],
+    },
+  ])('refuses runtime specs outside external, locally bound deployments before lifecycle forwarding', async (invalid) => {
+    const control = createCloudflareWorkersForPlatformsControlPlane(
+      wfpHostOptions(),
+    );
+    const spec = invalid as CloudflareWorkersForPlatformsDeploymentSpec;
+    await expect(
+      control.provisionDeployment({
+        spec,
+        secrets: sharedSecrets,
+        initialExecutionFenceState: 'open',
+      }),
+    ).rejects.toThrow(TypeError);
+    await expect(
+      control.advanceDecommissionDeployment({
+        spec,
+        action: { kind: 'start' },
+        maxProviderRequests: 9,
+      }),
+    ).rejects.toThrow(TypeError);
+    await expect(
+      control.rollbackExternalRelease({
+        currentSpec: spec,
+        rollbackSpec: WFP_SPEC,
+        secrets: sharedSecrets,
+      }),
+    ).rejects.toThrow(TypeError);
+    await expect(
+      control.rollbackExternalRelease({
+        currentSpec: WFP_SPEC,
+        rollbackSpec: spec,
+        secrets: sharedSecrets,
+      }),
+    ).rejects.toThrow(TypeError);
+    expect(provisionDeployment).not.toHaveBeenCalled();
+    expect(advanceDecommissionDeployment).not.toHaveBeenCalled();
+    expect(rollbackExternalRelease).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { ...WFP_RECORD, backend: 'plain-worker' },
+    { ...WFP_RECORD, wfpMode: 'platform-catalog' },
+    {
+      ...WFP_RECORD,
+      platformResources: {
+        ...WFP_RESOURCES,
+        sharedOutboundWorkerName: 'foreign-outbound',
+      },
+    },
+    {
+      ...WFP_RECORD,
+      platformResources: { ...WFP_RESOURCES, auditQueueName: 'foreign-audit' },
+    },
+    {
+      ...WFP_RECORD,
+      platformResources: {
+        ...WFP_RESOURCES,
+        stateWorker: { ...WFP_RESOURCES.stateWorker, plane: 'ordinary' },
+      },
+    },
+    {
+      ...WFP_RECORD,
+      platformResources: {
+        ...WFP_RESOURCES,
+        stateWorker: {
+          ...WFP_RESOURCES.stateWorker,
+          dispatchNamespace: 'foreign-dispatch',
+        },
+      },
+    },
+    {
+      ...WFP_RECORD,
+      backendSwitchIntent: {
+        kind: 'backend-switch',
+        tenantTag: WFP_RECORD.tenantTag,
+        environment: WFP_RECORD.environment,
+        prior: {
+          scriptName: SPEC.scriptName,
+          artifactVersion: 'artifact-1',
+          specDigest: 'a'.repeat(64),
+          databaseId: 'database-1',
+          databaseName: SPEC.databaseName,
+          durableObjectBindings: [],
+          namespaceIds: [],
+          secretNames: [],
+          applicationResources: [],
+          customDomain: { id: 'domain-1', hostname: SPEC.routeHostname },
+        },
+        targetSpecDigest: 'b'.repeat(64),
+        targetApplication: { vars: [], secrets: [], r2Buckets: [] },
+        target: {
+          maintenanceCapabilityPublicKey: 'test-verifier',
+          stateArtifactDigest: 'c'.repeat(64),
+          stateDurableObjectHistoryDigest: 'd'.repeat(64),
+          d1SchemaVersion: 1,
+          d1SchemaHistoryDigest: 'e'.repeat(64),
+          outboundPolicy: {
+            policyId: 'policy-1',
+            policyHosts: [],
+            policyDigest: 'f'.repeat(64),
+          },
+        },
+        rollbackUntil: '2026-09-10T00:00:00.000Z',
+        subphase: 'finalized',
+      },
+    },
+  ] satisfies FleetRecord[])('refuses a foreign or adopted record while holding the deployment lease and on reads', async (record) => {
+    const control = createCloudflareWorkersForPlatformsControlPlane(
+      wfpHostOptions(),
+    );
+    const durableStore = required(
+      constructed.fleetStore.mock.calls[0],
+    )[0] as D1FleetStateStore;
+    const lease: FleetStateLease = {
+      tenantTag: WFP_SPEC.tenantTag,
+      environment: WFP_SPEC.environment,
+      mutationLeaseTtlMs: 10_000,
+      assertOwned: vi.fn(async () => {}),
+      renew: vi.fn(async () => {}),
+      put: vi.fn(async () => {}),
+      delete: vi.fn(async () => {}),
+    };
+    let held = false;
+    const acquired = vi
+      .spyOn(durableStore, 'withDeploymentLease')
+      .mockImplementation(async (tenantTag, environment, operation) => {
+        expect([tenantTag, environment]).toEqual([
+          WFP_SPEC.tenantTag,
+          WFP_SPEC.environment,
+        ]);
+        held = true;
+        try {
+          return await operation(lease);
+        } finally {
+          held = false;
+        }
+      });
+    const read = vi.spyOn(durableStore, 'get').mockImplementation(async () => {
+      expect(held).toBe(true);
+      return record;
+    });
+    const mutation = vi.fn(async () => {
+      throw new Error('foreign record reached mutation');
+    });
+    vi.mocked(provisionDeployment).mockImplementation(async (operation) =>
+      operation.store.withDeploymentLease(
+        operation.spec.tenantTag,
+        operation.spec.environment,
+        mutation,
+      ),
+    );
+    await expect(
+      control.provisionDeployment({
+        spec: WFP_SPEC,
+        secrets: sharedSecrets,
+        initialExecutionFenceState: 'open',
+      }),
+    ).rejects.toThrow(TypeError);
+    expect(acquired).toHaveBeenCalledOnce();
+    expect(read).toHaveBeenCalledExactlyOnceWith(
+      WFP_SPEC.tenantTag,
+      WFP_SPEC.environment,
+    );
+    expect(mutation).not.toHaveBeenCalled();
+    read.mockResolvedValue(record);
+    await expect(
+      control.getDeployment(WFP_SPEC.tenantTag, WFP_SPEC.environment),
+    ).rejects.toThrow(TypeError);
+  });
+
+  it('passes the acquired lease through for new and matching deployments with bounded failure cleanup', async () => {
+    const control = createCloudflareWorkersForPlatformsControlPlane(
+      wfpHostOptions(),
+    );
+    const durableStore = required(
+      constructed.fleetStore.mock.calls[0],
+    )[0] as D1FleetStateStore;
+    const lease: FleetStateLease = {
+      tenantTag: WFP_SPEC.tenantTag,
+      environment: WFP_SPEC.environment,
+      mutationLeaseTtlMs: 10_000,
+      assertOwned: vi.fn(async () => {}),
+      renew: vi.fn(async () => {}),
+      put: vi.fn(async () => {}),
+      delete: vi.fn(async () => {}),
+    };
+    vi.spyOn(durableStore, 'withDeploymentLease').mockImplementation(
+      async (_tenantTag, _environment, operation) => operation(lease),
+    );
+    vi.spyOn(durableStore, 'get')
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce(WFP_RECORD);
+    const mutation = vi.fn(async (owned: FleetStateLease) => {
+      expect(owned).toBe(lease);
+      await owned.put(WFP_RECORD);
+      return {
+        record: WFP_RECORD,
+        maintenance: {
+          armed: true,
+          nextAlarmAt: null,
+          lastSweepAt: null,
+          lastPurgeAt: null,
+        },
+      };
+    });
+    vi.mocked(provisionDeployment).mockImplementation(async (operation) =>
+      operation.store.withDeploymentLease(
+        operation.spec.tenantTag,
+        operation.spec.environment,
+        mutation,
+      ),
+    );
+    const input = {
+      spec: WFP_SPEC,
+      secrets: sharedSecrets,
+      initialExecutionFenceState: 'open' as const,
+      routeAttestation,
+      clock() {
+        expect(this).toBe(input);
+        return 105;
+      },
+      failureCleanup: 'drain',
+      backend: {},
+      store: {},
+    };
+    await control.provisionDeployment(input);
+    await control.provisionDeployment(input);
+    const forwarded = required(vi.mocked(provisionDeployment).mock.calls[0])[0];
+    expect(forwarded).toEqual({
+      backend: required(constructed.wfpBackend.mock.calls[0])[0],
+      store: expect.objectContaining({
+        withDeploymentLease: expect.any(Function),
+      }),
+      spec: WFP_SPEC,
+      secrets: sharedSecrets,
+      initialExecutionFenceState: 'open',
+      routeAttestation,
+      failureCleanup: 'bounded',
+      clock: expect.any(Function),
+    });
+    expect(forwarded.store).not.toBe(input.store);
+    expect(forwarded.clock?.()).toBe(105);
+    expect(mutation).toHaveBeenCalledTimes(2);
+    expect(lease.put).toHaveBeenCalledTimes(2);
+  });
+
+  it('pins start and continuation inventory to the configured namespace and HOSTS store', async () => {
+    const options = wfpHostOptions();
+    const control = createCloudflareWorkersForPlatformsControlPlane(options);
+    Reflect.set(options, 'dispatchNamespace', 'mutated-dispatch');
+    Reflect.set(options, 'hostRoutingKvId', 'mutated-hosts');
+    const action = {
+      kind: 'start' as const,
+      operationId: OPERATION_ID,
+      options: {
+        databaseNamePrefix: 'fleet-',
+        scriptNamePrefix: 'fleet-',
+        includeR2Buckets: true,
+        includeDispatchNamespace: false,
+        dispatchNamespace: 'forged-dispatch',
+        hostRoutingKvId: 'forged-hosts',
+      },
+    };
+    await control.advanceFleetInventory({ action, maxProviderRequests: 9 });
+    await control.advanceFleetInventory({
+      action: { kind: 'continue', token: TOKEN },
+      maxProviderRequests: 9,
+    });
+    const first = required(vi.mocked(advanceFleetInventory).mock.calls[0])[0];
+    const continued = required(
+      vi.mocked(advanceFleetInventory).mock.calls[1],
+    )[0];
+    const scope = {
+      includeDispatchNamespace: true,
+      dispatchNamespace: 'fleet-dispatch',
+      hostRoutingKvId: 'fleet-hosts',
+    };
+    expect(first.action).toEqual({
+      kind: 'start',
+      operationId: OPERATION_ID,
+      options: {
+        databaseNamePrefix: 'fleet-',
+        scriptNamePrefix: 'fleet-',
+        includeR2Buckets: true,
+        ...scope,
+      },
+    });
+    expect(first.expectedScope).toEqual(scope);
+    expect(continued.expectedScope).toEqual(scope);
+    expect(continued.action).toEqual({ kind: 'continue', token: TOKEN });
+  });
+
+  it('binds audit and migration callbacks while refusing specs and records outside the WFP contract', async () => {
+    const control = createCloudflareWorkersForPlatformsControlPlane(
+      wfpHostOptions(),
+    );
+    let spec = WFP_SPEC;
+    const audit: CloudflareAdvanceFleetAuditOptions<CloudflareWorkersForPlatformsDeploymentSpec> =
+      {
+        action: {
+          kind: 'start',
+          operationId: OPERATION_ID,
+          records: [WFP_RECORD],
+          staleAfterMs: 100,
+        },
+        specFor(record) {
+          expect(this).toBe(audit);
+          expect(record).toBe(WFP_RECORD);
+          return spec;
+        },
+        maintenanceSecretFor(record) {
+          expect(this).toBe(audit);
+          expect(record).toBe(WFP_RECORD);
+          return sharedSecrets.maintenanceAdmin;
+        },
+        auditClock() {
+          expect(this).toBe(audit);
+          return 210;
+        },
+        authorityClock() {
+          expect(this).toBe(audit);
+          return 211;
+        },
+      };
+    const settlement = { settle: vi.fn(async () => {}) };
+    const completions: unknown[] = [];
+    const migration: CloudflareAdvanceFleetMigrationOptions<CloudflareWorkersForPlatformsDeploymentSpec> =
+      {
+        action: {
+          kind: 'start',
+          operationId: OPERATION_ID,
+          records: [WFP_RECORD],
+          canaryTenantTags: [],
+        },
+        specFor(record) {
+          expect(this).toBe(migration);
+          expect(record).toBe(WFP_RECORD);
+          return spec;
+        },
+        secretsFor(record) {
+          expect(this).toBe(migration);
+          expect(record).toBe(WFP_RECORD);
+          return sharedSecrets;
+        },
+        settlementFor(record) {
+          expect(this).toBe(migration);
+          expect(record).toBe(WFP_RECORD);
+          return settlement;
+        },
+        clock() {
+          expect(this).toBe(migration);
+          return 310;
+        },
+        onComplete(result) {
+          expect(this).toBe(migration);
+          completions.push(result);
+        },
+      };
+    await control.advanceFleetAudit(audit);
+    await control.advanceFleetMigration(migration);
+    const auditInput = required(vi.mocked(advanceFleetAudit).mock.calls[0])[0];
+    const migrationInput = required(
+      vi.mocked(advanceFleetMigration).mock.calls[0],
+    )[0];
+    const backend = required(constructed.wfpBackend.mock.calls[0])[0];
+    for (const forwarded of [auditInput, migrationInput]) {
+      expect(forwarded.backendFor(WFP_RECORD)).toBe(backend);
+      expect(() => forwarded.backendFor(RECORD)).toThrow(TypeError);
+      expect(forwarded.specFor(WFP_RECORD)).toBe(WFP_SPEC);
+    }
+    expect(auditInput.maintenanceSecretFor(WFP_RECORD)).toBe(
+      sharedSecrets.maintenanceAdmin,
+    );
+    expect(auditInput.auditClock?.()).toBe(210);
+    expect(auditInput.authorityClock?.()).toBe(211);
+    expect(migrationInput.secretsFor(WFP_RECORD)).toBe(sharedSecrets);
+    expect(migrationInput.settlementFor?.(WFP_RECORD)).toBe(settlement);
+    expect(migrationInput.clock?.()).toBe(310);
+    const completion = {
+      operationId: OPERATION_ID,
+      itemCount: 1,
+      completedItemCount: 1,
+      finalizedAtMs: 900,
+    };
+    await migrationInput.onComplete?.(completion);
+    expect(completions).toEqual([completion]);
+    spec = SPEC as unknown as CloudflareWorkersForPlatformsDeploymentSpec;
+    expect(() => auditInput.specFor(WFP_RECORD)).toThrow(TypeError);
+    expect(() => migrationInput.specFor(WFP_RECORD)).toThrow(TypeError);
+  });
+
+  it('forwards exact rollback and decommission inputs through the same guarded store and captured UUID source', async () => {
+    const host = {
+      ...wfpHostOptions(),
+      randomUUID() {
+        expect(this).toBe(host);
+        return OPERATION_ID;
+      },
+    };
+    const control = createCloudflareWorkersForPlatformsControlPlane(host);
+    const rollbackSpec = { ...WFP_SPEC, schemaVersion: 2 };
+    const settlement = { settle: vi.fn(async () => {}) };
+    const rollback = {
+      currentSpec: WFP_SPEC,
+      rollbackSpec,
+      secrets: sharedSecrets,
+      settlement,
+      routeAttestation,
+      clock() {
+        expect(this).toBe(rollback);
+        return 410;
+      },
+      store: {},
+      backend: {},
+    };
+    const decommission = {
+      spec: WFP_SPEC,
+      action: { kind: 'continue' as const, token: TOKEN },
+      maxProviderRequests: 9,
+      signal: new AbortController().signal,
+      clock() {
+        expect(this).toBe(decommission);
+        return 411;
+      },
+      randomUUID: () => 'forged-uuid',
+      store: {},
+      backend: {},
+    };
+    host.randomUUID = () => 'mutated-uuid';
+    const invokeRollback = control.rollbackExternalRelease;
+    const invokeDecommission = control.advanceDecommissionDeployment;
+    await invokeRollback(rollback);
+    await invokeDecommission(decommission);
+    const rolledBack = required(
+      vi.mocked(rollbackExternalRelease).mock.calls[0],
+    )[0];
+    const teardown = required(
+      vi.mocked(advanceDecommissionDeployment).mock.calls[0],
+    )[0];
+    const backend = required(constructed.wfpBackend.mock.calls[0])[0];
+    expect(rolledBack).toEqual({
+      backend,
+      store: expect.objectContaining({
+        withDeploymentLease: expect.any(Function),
+      }),
+      currentSpec: WFP_SPEC,
+      rollbackSpec,
+      secrets: sharedSecrets,
+      settlement,
+      routeAttestation,
+      clock: expect.any(Function),
+    });
+    expect(teardown).toEqual({
+      backend,
+      store: rolledBack.store,
+      spec: WFP_SPEC,
+      action: decommission.action,
+      maxProviderRequests: 9,
+      signal: decommission.signal,
+      clock: expect.any(Function),
+      randomUUID: expect.any(Function),
+    });
+    expect(rolledBack.store).not.toBe(rollback.store);
+    expect(rolledBack.currentSpec).toBe(WFP_SPEC);
+    expect(rolledBack.rollbackSpec).toBe(rollbackSpec);
+    expect(rolledBack.clock?.()).toBe(410);
+    expect(teardown.clock?.()).toBe(411);
+    expect(teardown.randomUUID()).toBe(OPERATION_ID);
+    expect(rollbackExternalRelease).toHaveBeenCalledOnce();
+    expect(advanceDecommissionDeployment).toHaveBeenCalledOnce();
+  });
+  it('keeps external deployments without optional audit enrollment readable', async () => {
+    const control = createCloudflareWorkersForPlatformsControlPlane(
+      wfpHostOptions(),
+    );
+    const store = required(constructed.fleetStore.mock.calls[0])[0];
+    const { auditQueueName: _queue, ...platformResources } = required(
+      WFP_RECORD.platformResources,
+    );
+    const record = { ...WFP_RECORD, platformResources };
+    vi.spyOn(store, 'get').mockResolvedValue(record);
+    await expect(
+      control.getDeployment(record.tenantTag, record.environment),
+    ).resolves.toBe(record);
   });
 });

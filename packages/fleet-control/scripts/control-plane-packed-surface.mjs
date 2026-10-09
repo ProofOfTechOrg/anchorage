@@ -44,6 +44,7 @@ const VALUE_NAMES = [
   'R2DatabaseExportStore',
   'WorkerDeploymentError',
   'createCloudflareControlPlane',
+  'createCloudflareWorkersForPlatformsControlPlane',
   'deploymentSpecDigest',
   'generateDeploymentSecrets',
 ];
@@ -89,6 +90,10 @@ const TYPE_NAMES = [
   'CloudflareFleetMigrationItemsPage',
   'CloudflareFleetOperationPageOptions',
   'CloudflareProvisionDeploymentOptions',
+  'CloudflareRollbackExternalReleaseOptions',
+  'CloudflareWorkersForPlatformsControlPlane',
+  'CloudflareWorkersForPlatformsControlPlaneOptions',
+  'CloudflareWorkersForPlatformsDeploymentSpec',
   'D1CloudflareApiRateCoordinatorOptions',
   'D1Migration',
   'DatabaseExport',
@@ -120,6 +125,7 @@ const TYPE_NAMES = [
   'ExternalMigrationIntent',
   'ExternalMigrationSubphase',
   'ExternalPlatformResources',
+  'ExternalPlatformProfile',
   'ExternalPlatformTargetDescription',
   'ExternalReleaseSnapshot',
   'ExternalReleaseTopology',
@@ -167,6 +173,7 @@ const TYPE_NAMES = [
   'R2DatabaseExportStoreOptions',
   'R2DatabaseExportStoreStreamPrimitives',
   'R2Jurisdiction',
+  'TrustedWorkerArtifact',
   'WorkerModule',
   'WorkerZoneRoute',
 ];
@@ -189,6 +196,11 @@ const METHOD_NAMES = [
   'readFleetAuditFindingsPage',
   'readFleetInventoryGeneration',
   'readFleetMigrationItemsPage',
+];
+
+const WFP_METHOD_NAMES = [
+  ...METHOD_NAMES.filter((name) => name !== 'advanceCleanupDeployment'),
+  'rollbackExternalRelease',
 ];
 
 const FORBIDDEN_TYPES = new Set([
@@ -452,6 +464,34 @@ type ExpectedMethods = ${METHOD_NAMES.map((name) => `'${name}'`).join(' | ')};
 const noMissingMethods: Exclude<ExpectedMethods, keyof CloudflareControlPlane> extends never ? true : false = true;
 const noExtraMethods: Exclude<keyof CloudflareControlPlane, ExpectedMethods> extends never ? true : false = true;
 void [plane, noMissingMethods, noExtraMethods];
+declare const profile: ExternalPlatformProfile;
+declare const spec: CloudflareWorkersForPlatformsDeploymentSpec;
+declare const ordinarySpec: CloudflareDeploymentSpec;
+declare const secrets: DeploymentSecrets;
+const wfpOptions: CloudflareWorkersForPlatformsControlPlaneOptions = {
+  ...options, dispatchNamespace: 'packed-namespace', hostRoutingKvId: 'packed-hosts',
+  auditQueueName: 'packed-audit', sharedOutboundWorkerName: 'packed-outbound',
+  stateEgressRootSecret: 'packed-state-egress-secret-0000000001',
+  platformProfileFor: () => profile,
+};
+const wfp: CloudflareWorkersForPlatformsControlPlane = createCloudflareWorkersForPlatformsControlPlane(wfpOptions);
+void wfp.provisionDeployment({ spec, secrets, initialExecutionFenceState: 'open' });
+void wfp.advanceDecommissionDeployment({ spec, action: { kind: 'start' }, maxProviderRequests: 9 });
+void wfp.advanceFleetAudit({ action: { kind: 'continue', token: {} }, specFor: () => spec, maintenanceSecretFor: () => secrets.maintenanceAdmin });
+void wfp.advanceFleetMigration({ action: { kind: 'continue', token: {} }, specFor: () => spec, secretsFor: () => secrets });
+const rollback: CloudflareRollbackExternalReleaseOptions = { currentSpec: spec, rollbackSpec: spec, secrets };
+void wfp.rollbackExternalRelease(rollback);
+// @ts-expect-error The ordinary factory accepts platform specifications.
+void plane.provisionDeployment({ spec, secrets, initialExecutionFenceState: 'open' });
+// @ts-expect-error The WFP factory accepts external specifications.
+void wfp.provisionDeployment({ spec: ordinarySpec, secrets, initialExecutionFenceState: 'open' });
+// @ts-expect-error External state targets belong to the trusted factory.
+const targeted: CloudflareWorkersForPlatformsDeploymentSpec = { ...spec, durableObjectBindings: [{ name: 'STATE', className: 'State', scriptName: 'other' }] };
+// @ts-expect-error External state namespaces belong to the trusted factory.
+const namespaced: CloudflareWorkersForPlatformsDeploymentSpec = { ...spec, durableObjectBindings: [{ name: 'STATE', className: 'State', dispatchNamespace: 'other' }] };
+// @ts-expect-error WFP teardown requires export-backed decommission.
+void wfp.advanceCleanupDeployment;
+void [targeted, namespaced];
 `;
 }
 
@@ -474,7 +514,7 @@ for (const [name, methods] of Object.entries({
 })) assert.deepEqual(Reflect.ownKeys(surface[name].prototype).sort(), methods, name);
 const unexpected = () => { throw new Error('packed surface shape probe performed I/O'); };
 const database = { prepare: unexpected, batch: unexpected };
-const plane = surface.createCloudflareControlPlane({
+const options = {
   accountId: 'packed-account', apiToken: 'inert-token',
   fleetDatabase: database, quotaDatabase: database, quotaScope: 'packed-quota',
   fetch: unexpected, maintenanceFetch: unexpected,
@@ -484,15 +524,24 @@ const plane = surface.createCloudflareControlPlane({
     streams: { DigestStream: class {}, FixedLengthStream: class {} },
     randomUUID: () => crypto.randomUUID(),
   },
+};
+const plane = surface.createCloudflareControlPlane(options);
+const wfp = surface.createCloudflareWorkersForPlatformsControlPlane({
+  ...options, dispatchNamespace: 'packed-namespace', hostRoutingKvId: 'packed-hosts',
+  auditQueueName: 'packed-audit', sharedOutboundWorkerName: 'packed-outbound',
+  stateEgressRootSecret: 'packed-state-egress-secret-0000000001',
+  platformProfileFor: unexpected,
 });
-assert.equal(Object.getPrototypeOf(plane), Object.prototype);
-assert.equal(Object.isFrozen(plane), true);
-assert.deepEqual(Reflect.ownKeys(plane).sort(), ${JSON.stringify(METHOD_NAMES)});
-for (const method of ${JSON.stringify(METHOD_NAMES)}) {
-  const descriptor = Object.getOwnPropertyDescriptor(plane, method);
-  assert.equal(typeof descriptor.value, 'function', method);
-  assert.equal(descriptor.writable, false, method);
-  assert.equal(descriptor.configurable, false, method);
+for (const [control, methods] of [[plane, ${JSON.stringify(METHOD_NAMES)}], [wfp, ${JSON.stringify(WFP_METHOD_NAMES)}]]) {
+  assert.equal(Object.getPrototypeOf(control), Object.prototype);
+  assert.equal(Object.isFrozen(control), true);
+  assert.deepEqual(Reflect.ownKeys(control).sort(), methods);
+  for (const method of methods) {
+    const descriptor = Object.getOwnPropertyDescriptor(control, method);
+    assert.equal(typeof descriptor.value, 'function', method);
+    assert.equal(descriptor.writable, false, method);
+    assert.equal(descriptor.configurable, false, method);
+  }
 }
 `;
 }

@@ -33,6 +33,7 @@ import {
   canonicalDeploymentEgressPolicy,
   canonicalDurableObjectMigrationHistory,
   durableObjectMigrationHistoryDigest,
+  externalHostRoutingTarget,
   externalPlatformResourceGroupId,
   externalReleaseTopology,
   externalStateDeploymentSpec,
@@ -46,6 +47,7 @@ import {
   assertProviderBindingIdentitiesMatchInspection,
   assertSupportedPlainWorkerBindings,
 } from './provider-binding-inventory.js';
+import { durableObjectBindingsMatch } from './release-topology.js';
 import { deploymentSpecDigest } from './spec-digest.js';
 import type {
   ApplicationBindingTopology,
@@ -2092,6 +2094,7 @@ export class WorkersForPlatformsBackendSwitchProvider
       pendingArtifactVersion: _pendingArtifactVersion,
       pendingRelease: _pendingRelease,
       migrationIntent: _migrationIntent,
+      durableObjectTag: _durableObjectTag,
       ...currentRecord
     } = input.currentRecord;
     return {
@@ -2102,7 +2105,9 @@ export class WorkersForPlatformsBackendSwitchProvider
       artifactVersion: input.candidate.artifactVersion,
       desiredSpecDigest: input.candidate.specDigest,
       schemaVersion: input.target.d1SchemaVersion,
-      durableObjectTag: input.target.stateDurableObjectTag,
+      ...(input.target.stateDurableObjectTag !== undefined
+        ? { durableObjectTag: input.target.stateDurableObjectTag }
+        : {}),
       durableObjectMigrationHistory: bridgeHistory,
       durableObjectMigrationHistoryDigest:
         input.target.stateDurableObjectHistoryDigest,
@@ -2172,19 +2177,28 @@ export class WorkersForPlatformsBackendSwitchProvider
   async removeCandidateHostAndDrain(input: {
     readonly targetSpec: DeploymentSpec;
     readonly candidate: ExternalReleaseSnapshot;
+    readonly target: ExternalPlatformTargetDescription;
+    readonly bridge: BridgeSnapshot;
     readonly fence: BackendSwitchMutationFence;
   }): Promise<void> {
+    if (!input.target.stateEgressCredentialDigest) {
+      throw new Error(
+        'candidate rollback has no persisted state-egress credential digest',
+      );
+    }
+    const routeTarget = externalHostRoutingTarget(
+      {
+        tenantTag: input.targetSpec.tenantTag,
+        environment: input.targetSpec.environment,
+      },
+      { release: input.candidate, target: input.target },
+      input.bridge.scriptName,
+    );
     await this.#client.withMutationFence(input.fence, () =>
       this.#client.deleteHostRouting(
         this.#hostRoutingKvId,
         input.targetSpec.routeHostname,
-        [
-          {
-            scriptName: input.candidate.physicalScriptName,
-            tenantTag: input.targetSpec.tenantTag,
-            environment: input.targetSpec.environment,
-          },
-        ],
+        [routeTarget],
       ),
     );
     if (
@@ -2609,8 +2623,10 @@ export class WorkersForPlatformsBackendSwitchProvider
           live.artifactVersion !== release.artifactVersion) ||
         live.databaseIds.length !== 1 ||
         live.databaseIds[0] !== input.prior.databaseId ||
-        JSON.stringify(sortedBindingKeys(live.durableObjectBindings)) !==
-          JSON.stringify(sortedBindingKeys(topology.durableObjectBindings)) ||
+        !durableObjectBindingsMatch(
+          live.durableObjectBindings,
+          topology.durableObjectBindings,
+        ) ||
         JSON.stringify(live.serviceBindings ?? []) !==
           JSON.stringify(topology.serviceBindings) ||
         JSON.stringify(live.queueProducerBindings ?? []) !==

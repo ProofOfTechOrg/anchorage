@@ -9,7 +9,7 @@ import {
   MAINTENANCE_RECEIPT_HEADER,
   mintAsymmetricMaintenanceCapability,
   verifyMaintenanceReceipt,
-} from '@proofoftech/flowsafe/host-kit';
+} from '@proofoftech/flowsafe/host-kit/maintenance-capability';
 import { ActiveRouteAttestationError } from './active-route.js';
 import {
   applicationSecretNames,
@@ -23,7 +23,10 @@ import {
 } from './database-export-store.js';
 import { isSha256 } from './deployment-context.js';
 import { WorkerDeploymentError } from './deployment-error.js';
-import { parseHostRoutingTarget } from './host-routing.js';
+import {
+  type HostRoutingTarget,
+  parseHostRoutingTarget,
+} from './host-routing.js';
 import { readMaintenanceHealth } from './maintenance-health.js';
 import {
   applyMigrationsWithLedger,
@@ -34,11 +37,11 @@ import {
   canonicalDeploymentEgressPolicy,
   canonicalMaintenanceCapabilityPublicKey,
   durableObjectMigrationHistoryDigest,
+  externalDurableObjectBindings,
   externalEgressProxyScriptName,
   externalPlatformResourceGroupId,
   externalStateDeploymentSpec,
   externalStateScriptName,
-  FLEET_AUDIT_PROXY_BINDING,
   FLEET_AUDIT_PROXY_CLASS_NAME,
   FLEET_AUDIT_PROXY_STATE_BINDING,
   trustedArtifactDigest,
@@ -46,6 +49,7 @@ import {
   validateMaintenanceSigningProfile,
 } from './platform-resources.js';
 import { assertProviderBindingIdentitiesMatchInspection } from './provider-binding-inventory.js';
+import { durableObjectBindingsMatch } from './release-topology.js';
 import { deploymentSpecDigest } from './spec-digest.js';
 import type {
   ActiveRouteAttestation,
@@ -252,6 +256,7 @@ export interface WorkersForPlatformsApi {
   ): Promise<{ artifactVersion: string }>;
   uploadNamespacedStateWorker?(options: {
     readonly spec: DeploymentSpec;
+    readonly appliedDurableObjectTag?: string | null;
     readonly database: DatabaseReference;
     readonly artifact: import('./types.js').TrustedWorkerArtifact;
     readonly artifactDigest: string;
@@ -384,11 +389,7 @@ export interface WorkersForPlatformsApi {
   deleteHostRouting(
     namespaceId: string,
     hostname: string,
-    allowedTargets: readonly Readonly<{
-      readonly scriptName: string;
-      readonly tenantTag: string;
-      readonly environment: string;
-    }>[],
+    allowedTargets: readonly HostRoutingTarget[],
   ): Promise<void>;
   getHostRouting(
     namespaceId: string,
@@ -1085,6 +1086,7 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
       }
       await upload.call(this.#client, {
         spec: externalStateDeploymentSpec(spec, profile),
+        appliedDurableObjectTag: existing.durableObjectTag ?? null,
         database,
         artifact: profile.stateWorker,
         artifactDigest: target.stateArtifactDigest,
@@ -1129,6 +1131,7 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
     try {
       await upload.call(this.#client, {
         spec: externalStateDeploymentSpec(spec, profile),
+        appliedDurableObjectTag: null,
         database,
         artifact: profile.stateWorker,
         artifactDigest: target.stateArtifactDigest,
@@ -1515,8 +1518,13 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
           'external candidate requires persisted platform resources',
         );
       }
-      const expectedBindings = [
-        ...spec.durableObjectBindings.map((binding) => ({
+      const expectedExternalBindings =
+        spec.authoredBy === 'external'
+          ? externalDurableObjectBindings(spec, platformResources)
+          : undefined;
+      const expectedBindings =
+        expectedExternalBindings ??
+        spec.durableObjectBindings.map((binding) => ({
           ...binding,
           ...(platformResources
             ? {
@@ -1529,23 +1537,7 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
                   : {}),
               }
             : {}),
-        })),
-        ...(spec.authoredBy === 'external' && spec.queueProducer
-          ? [
-              {
-                name: FLEET_AUDIT_PROXY_BINDING,
-                className: FLEET_AUDIT_PROXY_CLASS_NAME,
-                scriptName: platformResources?.stateWorker.scriptName,
-                ...(platformResources?.stateWorker.dispatchNamespace
-                  ? {
-                      dispatchNamespace:
-                        platformResources.stateWorker.dispatchNamespace,
-                    }
-                  : {}),
-              },
-            ]
-          : []),
-      ];
+        }));
       const expectedServiceBindings =
         spec.authoredBy === 'external'
           ? []
@@ -1584,11 +1576,13 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
           existing.tenantTag !== spec.tenantTag ||
           existing.environment !== spec.environment ||
           !isSha256(existing.desiredSpecDigest) ||
-          (spec.authoredBy === 'external' &&
+          (expectedExternalBindings !== undefined &&
             (existing.desiredSpecDigest !== targetDigest ||
               existing.schemaVersion !== spec.schemaVersion ||
-              bindingKeys(existing.durableObjectBindings) !==
-                bindingKeys(expectedBindings) ||
+              !durableObjectBindingsMatch(
+                existing.durableObjectBindings,
+                expectedExternalBindings,
+              ) ||
               JSON.stringify(existing.serviceBindings ?? []) !==
                 JSON.stringify(expectedServiceBindings) ||
               JSON.stringify(existing.queueProducerBindings ?? []) !==
@@ -1672,8 +1666,13 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
           attested.schemaVersion !== spec.schemaVersion ||
           attested.databaseIds.length !== 1 ||
           attested.databaseIds[0] !== database.id ||
-          bindingKeys(attested.durableObjectBindings) !==
-            bindingKeys(expectedBindings) ||
+          (expectedExternalBindings
+            ? !durableObjectBindingsMatch(
+                attested.durableObjectBindings,
+                expectedExternalBindings,
+              )
+            : bindingKeys(attested.durableObjectBindings) !==
+              bindingKeys(expectedBindings)) ||
           JSON.stringify(attested.serviceBindings ?? []) !==
             JSON.stringify(expectedServiceBindings) ||
           JSON.stringify(attested.queueProducerBindings ?? []) !==
@@ -1721,13 +1720,7 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
           await this.#client.deleteHostRouting(
             this.#hostRoutingKvId,
             spec.routeHostname,
-            [
-              {
-                scriptName: physicalScriptName,
-                tenantTag: spec.tenantTag,
-                environment: spec.environment,
-              },
-            ],
+            [],
           );
           if (
             (await this.#client.getHostRouting(
@@ -2159,6 +2152,7 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
     activeRelease: ExternalReleaseSnapshot | undefined,
     database: DatabaseReference,
     fence: ExternalMutationFence,
+    routeTargets: readonly HostRoutingTarget[] = [],
   ): Promise<void> {
     await this.#withMutationFence(fence, async () => {
       const releases = this.#releaseTargets(
@@ -2174,14 +2168,23 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
           retainedReleases ?? [],
         );
       }
+      for (const target of routeTargets) {
+        if (
+          target.tenantTag !== spec.tenantTag ||
+          target.environment !== spec.environment ||
+          !releases.some(
+            (release) => release.physicalScriptName === target.scriptName,
+          )
+        ) {
+          throw new Error(
+            'host route authority belongs to another deployment or release',
+          );
+        }
+      }
       await this.#client.deleteHostRouting(
         this.#hostRoutingKvId,
         spec.routeHostname,
-        releases.map((release) => ({
-          scriptName: release.physicalScriptName,
-          tenantTag: spec.tenantTag,
-          environment: spec.environment,
-        })),
+        routeTargets,
       );
     });
   }

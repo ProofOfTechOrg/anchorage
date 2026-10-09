@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import {
+  createHash,
   createPrivateKey,
   createPublicKey,
   randomBytes,
@@ -38,6 +39,7 @@ const DECOMMISSIONABLE_PHASES = new Set([
   'ready',
   'migrating',
   'rolling-back',
+  'decommission-advancing',
   'decommissioning',
   'traffic-removed',
   'credentials-revoked',
@@ -204,6 +206,38 @@ export function preflightMaintenanceCapabilityKeyPair(options) {
   return Object.freeze({ ...privateKey });
 }
 
+async function loadAuxiliaryWasm(descriptors, readArtifact) {
+  const modules = [];
+  for (const descriptor of descriptors ?? []) {
+    const content = await readArtifact(descriptor.file);
+    if (!(content instanceof Uint8Array)) {
+      throw new Error(
+        `conformance artifact ${descriptor.name} has invalid Wasm bytes`,
+      );
+    }
+    if (
+      createHash('sha256').update(content).digest('hex') !== descriptor.sha256
+    ) {
+      throw new Error(
+        `conformance artifact ${descriptor.name} has invalid Wasm digest`,
+      );
+    }
+    if (!WebAssembly.validate(content)) {
+      throw new Error(
+        `conformance artifact ${descriptor.name} has invalid Wasm format`,
+      );
+    }
+    modules.push(
+      Object.freeze({
+        name: descriptor.name,
+        content,
+        contentType: 'application/wasm',
+      }),
+    );
+  }
+  return Object.freeze(modules);
+}
+
 export async function loadCredentialedConformanceArtifacts(options) {
   const maintenanceCapabilityPrivateKey = preflightMaintenanceCapabilityKeyPair(
     {
@@ -216,25 +250,60 @@ export async function loadCredentialedConformanceArtifacts(options) {
   const stateWorkerContents = await Promise.all(
     options.stateWorkerBundles.map((bundle) => options.readArtifact(bundle)),
   );
+  const workerAdditionalModules = await loadAuxiliaryWasm(
+    options.auxiliaryWasm,
+    options.readArtifact,
+  );
+  const stateWorkerAdditionalModules = await Promise.all(
+    options.stateWorkerBundles.map((_bundle, index) =>
+      loadAuxiliaryWasm(
+        options.stateWorkerAuxiliaryWasm?.[index],
+        options.readArtifact,
+      ),
+    ),
+  );
   return Object.freeze({
     maintenanceCapabilityPrivateKey,
     workerContent,
     stateWorkerContents: Object.freeze(stateWorkerContents),
+    workerAdditionalModules,
+    stateWorkerAdditionalModules: Object.freeze(stateWorkerAdditionalModules),
   });
 }
 
 export function selectCredentialedCleanupSpec(options) {
   if (!options.record) return undefined;
+  const record = options.record;
+  let requestedDigest;
+  if (
+    record.decommissionIntent !== undefined ||
+    record.phase === 'decommission-advancing'
+  ) {
+    const mode = record.decommissionIntent?.identity?.mode;
+    if (mode?.kind !== 'normal') {
+      throw new Error(
+        'credentialed cleanup refuses invalid normal decommission authority',
+      );
+    }
+    requestedDigest = mode.requestedSpecDigest;
+  } else if (record.phase === 'migrating') {
+    requestedDigest =
+      record.migrationIntent?.targetSpecDigest ??
+      record.pendingRelease?.specDigest ??
+      record.pendingSpecDigest;
+  } else {
+    requestedDigest = record.desiredSpecDigest;
+  }
   const initialDigest = options.deploymentSpecDigest(options.initialSpec);
   const nextDigest = options.deploymentSpecDigest(options.nextSpec);
-  if (options.record.desiredSpecDigest === initialDigest) {
+  if (requestedDigest === initialDigest) {
     return options.initialSpec;
   }
-  if (options.record.desiredSpecDigest === nextDigest) {
+  if (requestedDigest === nextDigest) {
     return options.nextSpec;
   }
   throw new Error(
-    `credentialed cleanup refuses unknown desired specification digest '${options.record.desiredSpecDigest}'`,
+    `credentialed cleanup refuses unknown desired specification digest '${requestedDigest}'`,
   );
 }
 

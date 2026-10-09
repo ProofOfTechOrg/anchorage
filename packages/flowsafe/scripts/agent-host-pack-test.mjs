@@ -114,6 +114,7 @@ try {
       './do-runner/testing',
       './goals',
       './host-kit',
+      './host-kit/maintenance-capability',
       './host-kit/module',
       './package.json',
       './schedules',

@@ -1,11 +1,174 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import { createHash } from 'node:crypto';
+import { once } from 'node:events';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { createServer, type IncomingHttpHeaders, type Server } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import type { KVNamespace } from '@cloudflare/workers-types';
+import { STATE_EGRESS_HEADERS } from '@proofoftech/flowsafe/host-kit';
+import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { createTestHarness, type TestHarness } from 'wrangler';
+import { canonicalDeploymentEgressPolicy } from '../src/platform-resources.js';
+
+describe('production state egress', { timeout: 30_000 }, () => {
+  let directory: string;
+  let server: TestHarness;
+  let upstream: Server;
+  let upstreamUrl: URL;
+  const received: IncomingHttpHeaders[] = [];
+  const stateContext = {
+    OUTBOUND_PROXY_CREDENTIAL: 'state-egress-native-credential-0001',
+    OUTBOUND_TENANT_ID: 'acme',
+    OUTBOUND_ENVIRONMENT: 'production',
+    OUTBOUND_RESOURCE_GROUP_ID: '0123456789abcdefabcd',
+    OUTBOUND_STATE_SCRIPT_NAME: 'acme-production-state',
+    OUTBOUND_ROUTE_HOSTNAME: 'acme.example.test',
+    OUTBOUND_POLICY_ID: 'policy-acme-production',
+    DEPLOYMENT_IDENTITY_SECRET: 'state-egress-deployment-identity-0001',
+  };
+
+  beforeAll(async () => {
+    directory = await mkdtemp(join(tmpdir(), 'fleet-state-egress-'));
+    upstream = createServer((request, response) => {
+      received.push(request.headers);
+      response.end('state-egress-upstream');
+    });
+    upstream.listen(0, '127.0.0.1');
+    await once(upstream, 'listening');
+    const address = upstream.address();
+    if (!address || typeof address === 'string') {
+      throw new Error('state-egress upstream has no TCP address');
+    }
+    upstreamUrl = new URL(`http://127.0.0.1:${address.port}/probe`);
+    const main = join(directory, 'caller.ts');
+    const adapter = fileURLToPath(
+      new URL('../../flowsafe/src/host-kit/state-egress.ts', import.meta.url),
+    );
+    await writeFile(
+      main,
+      `import {createStateEgressFetch} from ${JSON.stringify(adapter)};
+export default {fetch(request, env) {
+  if (new URL(request.url).pathname === '/raw') {
+    return env.OUTBOUND_PROXY.fetch(request);
+  }
+  return createStateEgressFetch(env)(request);
+}};`,
+    );
+    server = createTestHarness({
+      root: directory,
+      workers: [
+        {
+          config: {
+            name: 'state-egress-caller',
+            main,
+            compatibility_date: '2026-08-06',
+            compatibility_flags: ['nodejs_compat'],
+            vars: stateContext,
+            services: [
+              {
+                binding: 'OUTBOUND_PROXY',
+                service: 'state-egress-outbound',
+                entrypoint: 'StateEgress',
+              },
+            ],
+          },
+        },
+        {
+          config: {
+            name: 'state-egress-outbound',
+            main: fileURLToPath(
+              new URL('../src/workers/outbound.ts', import.meta.url),
+            ),
+            compatibility_date: '2026-08-06',
+            compatibility_flags: ['nodejs_compat'],
+            kv_namespaces: [{ binding: 'HOSTS', id: 'state-egress-hosts' }],
+          },
+        },
+      ],
+    });
+    await server.listen();
+    const env = await server
+      .getWorker<{ HOSTS: KVNamespace }>('state-egress-outbound')
+      .getEnv();
+    await env.HOSTS.put(
+      stateContext.OUTBOUND_ROUTE_HOSTNAME,
+      JSON.stringify({
+        scriptName: 'acme-production-candidate',
+        tenantTag: stateContext.OUTBOUND_TENANT_ID,
+        environment: stateContext.OUTBOUND_ENVIRONMENT,
+        ...canonicalDeploymentEgressPolicy({
+          policyId: stateContext.OUTBOUND_POLICY_ID,
+          tenantTag: stateContext.OUTBOUND_TENANT_ID,
+          environment: stateContext.OUTBOUND_ENVIRONMENT,
+          allowedHosts: [upstreamUrl.hostname],
+        }),
+        stateEgress: {
+          resourceGroupId: stateContext.OUTBOUND_RESOURCE_GROUP_ID,
+          stateScriptName: stateContext.OUTBOUND_STATE_SCRIPT_NAME,
+          credentialDigest: createHash('sha256')
+            .update(stateContext.OUTBOUND_PROXY_CREDENTIAL)
+            .digest('hex'),
+        },
+      }),
+    );
+  }, 30_000);
+
+  afterEach(({ task }) => {
+    if (task.result?.state === 'fail') server?.debug();
+  });
+
+  afterAll(async () => {
+    try {
+      await server?.close();
+    } finally {
+      try {
+        if (upstream?.listening) {
+          await new Promise<void>((resolve, reject) => {
+            upstream.close((error) => (error ? reject(error) : resolve()));
+          });
+        }
+      } finally {
+        if (directory) await rm(directory, { recursive: true, force: true });
+      }
+    }
+  }, 30_000);
+
+  it('resolves the named HTTP entrypoint and refuses missing state credentials', async () => {
+    const response = await server.getWorker().fetch('https://fixture.test/raw');
+    expect(response.status).toBe(403);
+    expect(await response.text()).toBe('egress denied');
+  });
+
+  it('authenticates the native adapter and strips state headers before origin fetch', async () => {
+    const response = await server.getWorker().fetch(upstreamUrl.href, {
+      headers: {
+        ...Object.fromEntries(
+          Object.values(STATE_EGRESS_HEADERS).map((name) => [name, 'spoofed']),
+        ),
+        'x-application-header': 'preserved',
+      },
+    });
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe('state-egress-upstream');
+    expect(received.at(-1)?.['x-application-header']).toBe('preserved');
+    for (const name of Object.values(STATE_EGRESS_HEADERS)) {
+      expect(received.at(-1)).not.toHaveProperty(name);
+    }
+  });
+
+  it('refuses a host absent from the canonical route without fetching it', async () => {
+    const deniedUrl = new URL(upstreamUrl);
+    deniedUrl.hostname = 'localhost';
+    const requestsBefore = received.length;
+    const response = await server.getWorker().fetch(deniedUrl.href);
+    expect(response.status).toBe(403);
+    expect(await response.text()).toBe('egress denied');
+    expect(received).toHaveLength(requestsBefore);
+  });
+});
 
 describe('native Worker fetch receivers', { timeout: 30_000 }, () => {
   let directory: string;

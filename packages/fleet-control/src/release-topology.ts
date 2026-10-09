@@ -21,6 +21,48 @@ const RESERVED_BINDINGS = new Set([
 ]);
 const JURISDICTIONS = new Set<R2Jurisdiction>(['default', 'eu', 'fedramp']);
 
+export function durableObjectBindingsMatch(
+  actual: readonly DurableObjectBindingInventory[],
+  expected: readonly DurableObjectBindingInventory[],
+): boolean {
+  if (actual.length !== expected.length) return false;
+  const unmatched = [...actual];
+  for (const target of expected) {
+    if (
+      typeof target.namespaceId !== 'string' ||
+      target.namespaceId.length === 0
+    ) {
+      return false;
+    }
+    const sameTarget = (binding: DurableObjectBindingInventory) =>
+      binding.name === target.name &&
+      binding.className === target.className &&
+      binding.scriptName === target.scriptName &&
+      binding.namespaceId === target.namespaceId;
+    let index = unmatched.findIndex(
+      (binding) =>
+        sameTarget(binding) &&
+        binding.dispatchNamespace === target.dispatchNamespace,
+    );
+    // Cloudflare can omit the dispatch namespace for same-namespace remote bindings.
+    if (
+      index === -1 &&
+      typeof target.dispatchNamespace === 'string' &&
+      target.dispatchNamespace.length > 0 &&
+      typeof target.scriptName === 'string' &&
+      target.scriptName.length > 0
+    ) {
+      index = unmatched.findIndex(
+        (binding) =>
+          sameTarget(binding) && binding.dispatchNamespace === undefined,
+      );
+    }
+    if (index === -1) return false;
+    unmatched.splice(index, 1);
+  }
+  return true;
+}
+
 function object(value: unknown, label: string): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     throw new Error(`${label} must be an object`);

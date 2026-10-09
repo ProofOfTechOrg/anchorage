@@ -12,6 +12,7 @@ import {
   type FleetInventoryGenerationRef,
   type FleetInventoryLease,
   type FleetInventoryProviderContext,
+  type FleetInventoryRunOptions,
   type FleetInventoryRunRecord,
   type FleetInventoryRunStore,
   type FleetInventoryRunToken,
@@ -41,6 +42,12 @@ export interface AdvanceFleetInventoryOptions {
   readonly context: FleetInventoryProviderContext;
   readonly store: FleetInventoryRunStore;
   readonly action: FleetInventoryAdvanceAction;
+  readonly expectedScope?: Readonly<
+    Pick<
+      FleetInventoryRunOptions,
+      'dispatchNamespace' | 'hostRoutingKvId' | 'includeDispatchNamespace'
+    >
+  >;
   readonly maxProviderRequests: number;
   readonly maxStagedRowsPerChunk?: number;
   /**
@@ -137,6 +144,22 @@ function runToken(run: FleetInventoryRunRecord): FleetInventoryRunToken {
     operationId: run.operationId,
     revision: run.progress.revision,
   };
+}
+
+function assertExpectedScope(
+  options: FleetInventoryRunOptions,
+  expected: AdvanceFleetInventoryOptions['expectedScope'],
+): void {
+  if (
+    expected !== undefined &&
+    (options.dispatchNamespace !== expected.dispatchNamespace ||
+      options.hostRoutingKvId !== expected.hostRoutingKvId ||
+      options.includeDispatchNamespace !== expected.includeDispatchNamespace)
+  ) {
+    throw new TypeError(
+      'fleet inventory scope does not match the control plane',
+    );
+  }
 }
 
 async function completeFromRun(
@@ -240,11 +263,13 @@ export async function advanceFleetInventory(
     const canonical = canonicalFleetInventoryRunOptions(action.options);
     const optionsDigest = fleetInventoryOptionsDigest(canonical);
     return options.store.withAccountInventoryLease(async (lease) => {
+      assertExpectedScope(canonical, options.expectedScope);
       const run = await lease.startRun({
         operationId: action.operationId,
         options: canonical,
         optionsDigest,
       });
+      assertExpectedScope(run.options, options.expectedScope);
       return advanceChunk(options, lease, run, maxStagedRowsPerChunk);
     });
   }
@@ -255,12 +280,16 @@ export async function advanceFleetInventory(
       const persisted = await options.store.readRunByOperation(
         token.operationId,
       );
+      if (persisted) {
+        assertExpectedScope(persisted.options, options.expectedScope);
+      }
       if (persisted?.state === 'finalized') {
         classifyFleetInventoryRunToken(token, persisted);
         return completeFromRun(options.store, lease, persisted);
       }
       throw new FleetInventoryRunTokenOperationError(token.operationId);
     }
+    assertExpectedScope(run.options, options.expectedScope);
     if (classifyFleetInventoryRunToken(token, run) === 'stale') {
       return run.state === 'finalized'
         ? completeFromRun(options.store, lease, run)

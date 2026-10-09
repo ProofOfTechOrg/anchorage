@@ -51,6 +51,69 @@ test('fleet control accepts the shipped operator config', () => {
   assert.deepEqual(validateConformanceConfig(structuredClone(config)), config);
 });
 
+test('shipped CPU failure defaults match the dispatcher child-failure response', async (t) => {
+  const { default: dispatchWorker } = await import(
+    '../packages/fleet-control/dist/workers/dispatch.js'
+  );
+  const { canonicalDeploymentEgressPolicy } = await import(
+    '../packages/fleet-control/dist/platform-resources.js'
+  );
+  const target = {
+    scriptName: 'tenanta-conformance',
+    tenantTag: 'tenanta',
+    environment: 'conformance',
+    ...canonicalDeploymentEgressPolicy({
+      policyId: 'conformance-policy',
+      tenantTag: 'tenanta',
+      environment: 'conformance',
+      allowedHosts: [],
+    }),
+  };
+  const childFetch = t.mock.fn(async () => {
+    throw new Error('child invocation failed');
+  });
+  const get = t.mock.fn(() => ({ fetch: childFetch }));
+  t.mock.method(console, 'error', () => {});
+  const request = new Request('https://tenanta.example.test/conformance');
+  const response = await dispatchWorker.fetch(request, {
+    HOSTS: { get: async () => JSON.stringify(target) },
+    DISPATCH: { get },
+    TENANT_CPU_LIMIT_MS: String(config.cpuLimitMs),
+    TENANT_SUBREQUEST_LIMIT: String(config.subrequestLimit),
+  });
+
+  assert.equal(get.mock.callCount(), 1);
+  assert.equal(get.mock.calls[0].arguments[0], target.scriptName);
+  assert.deepEqual(get.mock.calls[0].arguments[2].limits, {
+    cpuMs: config.cpuLimitMs,
+    subRequests: config.subrequestLimit,
+  });
+  assert.equal(childFetch.mock.callCount(), 1);
+  assert.equal(childFetch.mock.calls[0].arguments[0], request);
+  assert.equal(response.status, 503);
+  assert.equal(config.conformance.cpuOverLimitStatus, response.status);
+
+  const example = JSON.parse(
+    readFileSync(
+      new URL(
+        '../packages/fleet-control/scripts/credentialed-conformance.example.json',
+        import.meta.url,
+      ),
+      'utf8',
+    ),
+  );
+  assert.equal(example.conformance.cpuOverLimitStatus, response.status);
+});
+
+test('operators can configure a different CPU failure response status', () => {
+  const customConfig = structuredClone(config);
+  customConfig.conformance.cpuOverLimitStatus = 500;
+  assert.equal(
+    validateConformanceConfig(customConfig).conformance.cpuOverLimitStatus,
+    500,
+  );
+});
+
 test('the artifacts and the config name the same bindings', () => {
   assert.equal(config.mainModule, contract.candidateMainModule);
   assert.equal(
@@ -249,6 +312,7 @@ test('the harness wrangler configurations match the contract', () => {
     'AUDIT_PROXY',
     'CONFORMANCE_STATE',
     'CONFORMANCE_V2',
+    'MAINTENANCE',
   ];
   assert.deepEqual(
     [...declaredCandidateBindings].sort(),

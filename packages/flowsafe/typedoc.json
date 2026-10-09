@@ -14,6 +14,7 @@
     "src/deployment-identity-protocol.ts",
     "src/goals/index.ts",
     "src/host-kit/index.ts",
+    "src/host-kit/maintenance-capability.ts",
     "src/host-kit/module.ts",
     "src/schedules/index.ts",
     "src/signal-providers/index.ts",

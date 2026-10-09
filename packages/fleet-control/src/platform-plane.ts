@@ -495,6 +495,22 @@ function assertWorkerAttestation(options: {
   const actualR2Bindings = options.inspection.r2BucketBindings.map(
     ({ name, bucketName }) => ({ name, bucketName: bucketName ?? '' }),
   );
+  const actualDispatchBindings =
+    options.inspection.dispatchNamespaceBindings.map((binding) => {
+      const outbound = binding.outbound;
+      if (
+        !outbound ||
+        typeof outbound !== 'object' ||
+        Array.isArray(outbound) ||
+        !('prebuilt_pipeline_id' in outbound) ||
+        outbound.prebuilt_pipeline_id !== null
+      ) {
+        return binding;
+      }
+      const actualOutbound: Record<string, unknown> = { ...outbound };
+      delete actualOutbound.prebuilt_pipeline_id;
+      return { ...binding, outbound: actualOutbound };
+    });
   if (
     options.inspection.databaseIds.length !== 0 ||
     options.inspection.durableObjectBindings.length !== 0 ||
@@ -506,7 +522,7 @@ function assertWorkerAttestation(options: {
       canonicalBindingSet(expectedQueueBindings) ||
     canonicalBindingSet(options.inspection.kvNamespaceBindings) !==
       canonicalBindingSet(expectedKvBindings) ||
-    canonicalBindingSet(options.inspection.dispatchNamespaceBindings) !==
+    canonicalBindingSet(actualDispatchBindings) !==
       canonicalBindingSet(expectedDispatchBindings) ||
     canonicalBindingSet(actualR2Bindings) !==
       canonicalBindingSet(expectedR2Bindings) ||

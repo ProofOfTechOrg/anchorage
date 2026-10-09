@@ -1,19 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-/**
- * Build the three artifacts `pnpm fleet-control:credentialed` uploads: one
- * external candidate and two trusted state versions.
- *
- * Each must be ONE self-contained ES module. The gate reads the file as raw
- * bytes and uploads it as a single module named by the operator config, and it
- * manufactures release two of the candidate by appending
- * `\n// conformance-release:2\n` to those exact bytes
- * (packages/fleet-control/scripts/credentialed-conformance.mjs). This script
- * therefore verifies, not just builds: one emitted file, and still parseable
- * with that comment appended.
- */
-
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import {
   mkdirSync,
   readdirSync,
@@ -21,11 +9,25 @@ import {
   rmSync,
   writeFileSync,
 } from 'node:fs';
-import { join } from 'node:path';
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  join,
+  relative,
+  resolve,
+} from 'node:path';
 import { fileURLToPath } from 'node:url';
+
+import { buildConformanceConfig } from './emit-conformance-config.mjs';
 
 const packageRoot = fileURLToPath(new URL('..', import.meta.url));
 const outputDirectory = join(packageRoot, 'dist', 'conformance');
+const generatedConfigPath = join(
+  outputDirectory,
+  'anchorage-starter.conformance.json',
+);
+const wasmModules = new Map();
 
 const contract = JSON.parse(
   readFileSync(
@@ -69,35 +71,90 @@ const RELEASE_SUFFIX = '\n// conformance-release:2\n';
 
 function buildOne({ config, output }) {
   const stagingDirectory = join(outputDirectory, `.staging-${output}`);
+  const configPath = join(packageRoot, 'conformance', config);
+  const metafilePath = join(stagingDirectory, 'metafile.json');
   rmSync(stagingDirectory, { recursive: true, force: true });
-  execFileSync(
-    'pnpm',
-    [
-      'exec',
-      'wrangler',
-      'deploy',
-      '--dry-run',
-      '--outdir',
-      stagingDirectory,
-      '--config',
-      join(packageRoot, 'conformance', config),
-    ],
-    { cwd: packageRoot, stdio: 'inherit' },
-  );
-
-  const emitted = readdirSync(stagingDirectory).filter((name) =>
-    name.endsWith('.js'),
-  );
-  if (emitted.length !== 1) {
-    throw new Error(
-      `${config} emitted ${emitted.length} JavaScript modules (${emitted.join(', ')}); the gate uploads exactly one`,
+  try {
+    execFileSync(
+      'pnpm',
+      [
+        'exec',
+        'wrangler',
+        'deploy',
+        '--dry-run',
+        '--outdir',
+        stagingDirectory,
+        '--metafile',
+        metafilePath,
+        '--config',
+        configPath,
+      ],
+      { cwd: packageRoot, stdio: 'inherit' },
     );
+
+    const emitted = readdirSync(stagingDirectory).filter((name) =>
+      name.endsWith('.js'),
+    );
+    if (emitted.length !== 1) {
+      throw new Error(
+        `${config} emitted ${emitted.length} JavaScript modules (${emitted.join(', ')}); the gate uploads one main module`,
+      );
+    }
+    const mainPath = join(stagingDirectory, emitted[0]);
+    const metadata = JSON.parse(readFileSync(metafilePath, 'utf8'));
+    const entries = Object.entries(metadata.outputs ?? {}).filter(
+      ([path, candidate]) =>
+        resolve(dirname(configPath), path) === mainPath &&
+        typeof candidate.entryPoint === 'string',
+    );
+    const bundle = readFileSync(mainPath);
+    const entry = entries[0]?.[1];
+    if (
+      entries.length !== 1 ||
+      entry.bytes !== bundle.length ||
+      !Array.isArray(entry.imports)
+    ) {
+      throw new Error(`${config} has invalid Wrangler main output metadata`);
+    }
+    const wasmNames = new Set();
+    for (const imported of entry.imports) {
+      if (!imported || typeof imported.path !== 'string') {
+        throw new Error(`${config} has invalid Wrangler import metadata`);
+      }
+      const path = imported.path;
+      if (!path.startsWith('.') && !isAbsolute(path)) continue;
+      if (
+        !/^\.\/[A-Za-z0-9][A-Za-z0-9._-]*\.wasm$/u.test(path) ||
+        imported.kind !== 'import-statement' ||
+        imported.external !== true
+      ) {
+        throw new Error(`${config} has an unsupported output import: ${path}`);
+      }
+      wasmNames.add(path.slice(2));
+    }
+    const auxiliaryWasm = [...wasmNames].sort().map((name) => {
+      const bytes = readFileSync(join(stagingDirectory, name));
+      if (!WebAssembly.validate(bytes)) {
+        throw new Error(`${config} emitted invalid Wasm: ${name}`);
+      }
+      const previous = wasmModules.get(name);
+      if (previous && !previous.equals(bytes)) {
+        throw new Error(`${config} emitted conflicting Wasm bytes: ${name}`);
+      }
+      wasmModules.set(name, bytes);
+      const file = join(outputDirectory, name);
+      writeFileSync(file, bytes);
+      return {
+        name,
+        file: relative(join(packageRoot, '../fleet-control'), file),
+        sha256: createHash('sha256').update(bytes).digest('hex'),
+      };
+    });
+    writeFileSync(join(outputDirectory, output), bundle);
+    return { output, bytes: bundle.length, auxiliaryWasm };
+  } finally {
+    rmSync(stagingDirectory, { recursive: true, force: true });
   }
-  const [only] = emitted;
-  const bundle = readFileSync(join(stagingDirectory, only), 'utf8');
-  writeFileSync(join(outputDirectory, output), bundle);
-  rmSync(stagingDirectory, { recursive: true, force: true });
-  return { output, bytes: Buffer.byteLength(bundle) };
 }
 
 function assertSurvivesReleaseSuffix(path) {
@@ -153,6 +210,7 @@ function assertExportedClasses(path, expected) {
 }
 
 mkdirSync(outputDirectory, { recursive: true });
+rmSync(generatedConfigPath, { force: true });
 const built = ARTIFACTS.map(buildOne);
 for (const artifact of ARTIFACTS) {
   assertExportedClasses(
@@ -161,6 +219,20 @@ for (const artifact of ARTIFACTS) {
   );
 }
 assertSurvivesReleaseSuffix(join(outputDirectory, 'candidate.mjs'));
+const operatorConfig = buildConformanceConfig();
+function wasmFor(bundle) {
+  const artifact = built.find((item) => item.output === basename(bundle));
+  if (!artifact) throw new Error(`No built conformance artifact for ${bundle}`);
+  return artifact.auxiliaryWasm;
+}
+operatorConfig.auxiliaryWasm = wasmFor(operatorConfig.workerBundle);
+for (const profile of operatorConfig.platformProfile.stateProfiles) {
+  profile.stateWorker.auxiliaryWasm = wasmFor(profile.stateWorker.bundle);
+}
+writeFileSync(
+  generatedConfigPath,
+  `${JSON.stringify(operatorConfig, null, 2)}\n`,
+);
 for (const artifact of built) {
   console.log(`${artifact.output}: ${artifact.bytes} bytes`);
 }

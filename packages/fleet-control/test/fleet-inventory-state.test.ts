@@ -8,6 +8,7 @@ import {
   classifyFleetInventoryRunToken,
   emptyFleetInventoryRowCounts,
   FLEET_INVENTORY_STAGE_ORDER,
+  FLEET_INVENTORY_STRING_BYTE_BOUND,
   FleetInventoryFindingValueError,
   type FleetInventoryRunOptions,
   type FleetInventoryRunRecord,
@@ -334,6 +335,70 @@ describe('fleet inventory state', () => {
     expect(initialFleetInventoryStage(canonical)).toEqual({
       step: 'custom-domains',
     });
+  });
+
+  it('retains the dispatch namespace in persisted options and their digest', () => {
+    const canonical = canonicalFleetInventoryRunOptions({
+      ...CALLER_OPTIONS,
+      dispatchNamespace: 'anchorage-dispatch',
+    });
+    expect(canonical).toEqual({
+      dispatchNamespace: 'anchorage-dispatch',
+      hostRoutingKvId: 'kv-host-routing',
+      databaseNamePrefix: 'anchorage-db',
+      scriptNamePrefix: 'anchorage',
+      includeDispatchNamespace: true,
+      includeR2Buckets: false,
+    });
+    expect(
+      fleetInventoryRunRecordFromUnknown(runRecord({ options: canonical }))
+        .options,
+    ).toEqual(canonical);
+    expect(fleetInventoryOptionsDigest(canonical)).not.toBe(
+      fleetInventoryOptionsDigest(options()),
+    );
+    expect(fleetInventoryOptionsDigest(canonical)).not.toBe(
+      fleetInventoryOptionsDigest({
+        ...canonical,
+        dispatchNamespace: 'other-dispatch',
+      }),
+    );
+  });
+
+  it.each([
+    { name: 'empty', dispatchNamespace: '' },
+    {
+      name: 'over-bound',
+      dispatchNamespace: 'x'.repeat(FLEET_INVENTORY_STRING_BYTE_BOUND + 1),
+    },
+    { name: 'non-string', dispatchNamespace: 1 },
+  ])('refuses a $name dispatch namespace', ({ dispatchNamespace }) => {
+    const invalid = { ...CALLER_OPTIONS, dispatchNamespace };
+    expect(() =>
+      canonicalFleetInventoryRunOptions(
+        invalid as Parameters<typeof canonicalFleetInventoryRunOptions>[0],
+      ),
+    ).toThrow(FleetInventoryStateError);
+    expect(() =>
+      fleetInventoryOptionsDigest({
+        ...options(),
+        dispatchNamespace,
+      } as FleetInventoryRunOptions),
+    ).toThrow(FleetInventoryStateError);
+  });
+
+  it('refuses a namespace when dispatch inventory is disabled', () => {
+    const invalid = {
+      ...CALLER_OPTIONS,
+      dispatchNamespace: 'anchorage-dispatch',
+      includeDispatchNamespace: false,
+    };
+    expect(() => canonicalFleetInventoryRunOptions(invalid)).toThrow(
+      FleetInventoryStateError,
+    );
+    expect(() =>
+      fleetInventoryOptionsDigest({ ...options(), ...invalid }),
+    ).toThrow(FleetInventoryStateError);
   });
 
   it('keeps the options digest stable under caller key reorder', () => {

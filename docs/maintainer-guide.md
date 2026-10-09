@@ -107,11 +107,12 @@ The changesets base is `dev`. `onlyUpdatePeerDependentsWhenOutOfRange` prevents 
 2. The version workflow maintains a `Version Packages` pull request against `dev`.
 3. Review generated versions and changelogs, then merge that pull request into `dev`.
 4. Run the full gate on the versioned `dev` commit.
-5. Open the promotion pull request from `dev` to `main`.
-6. Confirm the promotion contains no pending changeset files.
-7. Merge to `main`.
-8. The release workflow publishes unpublished package versions to npm with provenance, creates tags, and creates GitHub releases. It publishes the `PUBLISH_PREREQUISITES` packages in `scripts/publish-ordered.mjs` before the rest, so each exact or minimum package dependency is available first.
-9. Confirm npm tarballs, export smoke tests, release notes, Pages API docs, and the production showcase.
+5. For changes affecting Workers for Platforms behavior covered by the [paid namespace gate](fleet-control.md#run-paid-namespace-conformance), run `pnpm fleet-control:credentialed` against a disposable paid account using the exact versioned release candidate. Retain the successful proof and final scratch inventory before promotion. Ordinary Worker releases that do not change WFP behavior do not require this step.
+6. Open the promotion pull request from `dev` to `main`.
+7. Confirm the promotion contains no pending changeset files.
+8. Merge to `main`.
+9. The release workflow publishes unpublished package versions to npm with provenance, creates tags, and creates GitHub releases. It publishes the `PUBLISH_PREREQUISITES` packages in `scripts/publish-ordered.mjs` before the rest, so each exact or minimum package dependency is available first.
+10. Confirm npm tarballs, export smoke tests, release notes, Pages API docs, and the production showcase.
 
 The release workflow never opens version pull requests or commits to `main`. A pending changeset on `main` is a freeze-window failure.
 

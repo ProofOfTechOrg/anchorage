@@ -1394,7 +1394,10 @@ describe('D1FleetStateStore release state', () => {
     }
   });
 
-  it('round-trips active, pending, and retained immutable release metadata', async () => {
+  it.each([
+    'legacy-proxy',
+    'shared-outbound',
+  ] as const)('round-trips active, pending, and retained immutable release metadata (%s)', async (egressMode) => {
     const db = new MemoryD1();
     const store = new D1FleetStateStore(db, { accountId: 'account' });
     const policy = canonicalDeploymentEgressPolicy({
@@ -1483,19 +1486,31 @@ describe('D1FleetStateStore release state', () => {
           durableObjectBindings: [],
           namespaceIds: [],
         },
-        egressProxy: {
-          scriptName: 'acme-production-egress-a1b2c3d4',
-          artifactVersion: 'egress-version',
-          artifactDigest: 'f'.repeat(64),
-          ...policy,
-        },
+        ...(egressMode === 'shared-outbound'
+          ? {
+              sharedOutboundWorkerName: 'fleet-outbound',
+              outboundPolicy: policy,
+            }
+          : {
+              egressProxy: {
+                scriptName: 'acme-production-egress-a1b2c3d4',
+                artifactVersion: 'egress-version',
+                artifactDigest: 'f'.repeat(64),
+                ...policy,
+              },
+            }),
       },
       platformTarget: {
         maintenanceCapabilityPublicKey: MAINTENANCE_PUBLIC_KEY,
         stateArtifactDigest: 'e'.repeat(64),
         stateDurableObjectHistoryDigest: '1'.repeat(64),
         stateDurableObjectTag: 'state-v1',
-        egressArtifactDigest: 'f'.repeat(64),
+        ...(egressMode === 'shared-outbound'
+          ? {
+              stateEgressCredentialDigest: '7'.repeat(64),
+              sharedOutboundWorkerName: 'fleet-outbound',
+            }
+          : { egressArtifactDigest: 'f'.repeat(64) }),
         d1SchemaVersion: 2,
         d1SchemaHistoryDigest: '2'.repeat(64),
         outboundPolicy: policy,
@@ -1515,7 +1530,12 @@ describe('D1FleetStateStore release state', () => {
           stateArtifactDigest: 'e'.repeat(64),
           stateDurableObjectHistoryDigest: '1'.repeat(64),
           stateDurableObjectTag: 'state-v1',
-          egressArtifactDigest: 'f'.repeat(64),
+          ...(egressMode === 'shared-outbound'
+            ? {
+                stateEgressCredentialDigest: '7'.repeat(64),
+                sharedOutboundWorkerName: 'fleet-outbound',
+              }
+            : { egressArtifactDigest: 'f'.repeat(64) }),
           d1SchemaVersion: 2,
           d1SchemaHistoryDigest: '2'.repeat(64),
           outboundPolicy: policy,
@@ -1534,7 +1554,12 @@ describe('D1FleetStateStore release state', () => {
           stateArtifactDigest: '3'.repeat(64),
           stateDurableObjectHistoryDigest: '4'.repeat(64),
           stateDurableObjectTag: 'state-v2',
-          egressArtifactDigest: '5'.repeat(64),
+          ...(egressMode === 'shared-outbound'
+            ? {
+                stateEgressCredentialDigest: '8'.repeat(64),
+                sharedOutboundWorkerName: 'fleet-outbound',
+              }
+            : { egressArtifactDigest: '5'.repeat(64) }),
           d1SchemaVersion: 2,
           d1SchemaHistoryDigest: '6'.repeat(64),
           outboundPolicy: policy,
@@ -1557,8 +1582,51 @@ describe('D1FleetStateStore release state', () => {
     await store.withDeploymentLease('acme', 'production', (lease) =>
       lease.put(record),
     );
-    await expect(store.get('acme', 'production')).resolves.toEqual(record);
+    const restarted = new D1FleetStateStore(db, { accountId: 'account' });
+    await expect(restarted.get('acme', 'production')).resolves.toEqual(record);
     if (!record.migrationIntent) throw new Error('missing migration intent');
+
+    if (egressMode === 'shared-outbound') {
+      const persisted = { ...db.row };
+      for (const corruption of [
+        { sharedOutboundWorkerName: undefined },
+        { sharedOutboundWorkerName: '../foreign' },
+        { sharedOutboundWorkerName: 42 },
+        { stateEgressCredentialDigest: undefined },
+        { stateEgressCredentialDigest: 'invalid' },
+        { egressArtifactDigest: 'f'.repeat(64) },
+      ]) {
+        for (const field of ['platform_target', 'priorTarget', 'target']) {
+          db.row =
+            field === 'platform_target'
+              ? {
+                  ...persisted,
+                  platform_target: JSON.stringify({
+                    ...record.platformTarget,
+                    ...corruption,
+                  }),
+                }
+              : {
+                  ...persisted,
+                  migration_intent: JSON.stringify({
+                    ...record.migrationIntent,
+                    [field]: {
+                      ...(field === 'priorTarget'
+                        ? record.migrationIntent.priorTarget
+                        : record.migrationIntent.target),
+                      ...corruption,
+                    },
+                  }),
+                };
+          const corrupted = { ...db.row };
+          await expect(restarted.get('acme', 'production')).rejects.toThrow(
+            /invalid (platform_target|migration_intent)/,
+          );
+          expect(db.row).toEqual(corrupted);
+        }
+      }
+      db.row = persisted;
+    }
 
     const legacyTeardown: FleetRecord = {
       ...record,
@@ -1612,6 +1680,30 @@ describe('D1FleetStateStore release state', () => {
     await expect(store.get('acme', 'production')).resolves.toEqual(
       decommissioningMigration,
     );
+
+    for (const lifecyclePhase of [
+      'decommissioning',
+      'traffic-removed',
+      'credentials-revoked',
+      'worker-deleted',
+      'platform-credentials-revoked',
+    ] as const) {
+      const retained: FleetRecord = {
+        ...decommissioningMigration,
+        desiredSpecDigest: record.migrationIntent.targetSpecDigest,
+        decommissionIntent: {
+          ...normalDecommissionIntentFixture(record, lifecyclePhase, {
+            requestedSpecDigest: record.migrationIntent.targetSpecDigest,
+            entryLifecyclePhase: 'migrating',
+          }),
+          state: 'transitioning',
+        },
+      };
+      await store.withDeploymentLease('acme', 'production', (lease) =>
+        lease.put(retained),
+      );
+      await expect(store.get('acme', 'production')).resolves.toEqual(retained);
+    }
 
     const { migrationIntent: _withoutIntent, ...withoutIntent } =
       decommissioningMigration;
@@ -1696,7 +1788,12 @@ describe('D1FleetStateStore release state', () => {
           stateArtifactDigest: '7'.repeat(64),
           stateDurableObjectHistoryDigest: '8'.repeat(64),
           stateDurableObjectTag: 'state-v2',
-          egressArtifactDigest: '9'.repeat(64),
+          ...(egressMode === 'shared-outbound'
+            ? {
+                stateEgressCredentialDigest: '9'.repeat(64),
+                sharedOutboundWorkerName: 'fleet-outbound',
+              }
+            : { egressArtifactDigest: '9'.repeat(64) }),
           d1SchemaVersion: stable.schemaVersion,
           d1SchemaHistoryDigest: 'a'.repeat(64),
           outboundPolicy: policy,
