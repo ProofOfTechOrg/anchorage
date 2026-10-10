@@ -810,6 +810,45 @@ describe('D1SchedulesStorage', () => {
     ).resolves.toBeNull();
   });
 
+  it('answers no claimed dispatch for a fire record SQLite cannot parse', async () => {
+    // #given a deferred fire whose metadata nests past the depth SQLite parses
+    const { store } = storeOver();
+    await store.createSchedule(workflowSchedule());
+    await store.recordTrigger({
+      id: 'dispatch-deep',
+      scheduleId: 'schedule_a',
+      runId: 'run-deep',
+      scheduledFireAt: NOW,
+      actualFireAt: NOW,
+      outcome: 'deferred',
+      metadata: {
+        dispatchState: 'prepared',
+        dispatchRef: {
+          scheduleId: 'schedule_a',
+          dispatchId: 'dispatch-deep',
+          runId: 'run-deep',
+          target: 'workflow',
+          workflowId: 'wf',
+          workflowTarget: {
+            type: 'workflow',
+            workflowId: 'wf',
+            inputData: { topic: nestedArray(PAST_SQLITE_JSON_DEPTH) },
+          },
+        },
+      },
+    });
+
+    // #when a target reads the claimed dispatch
+    const claimed = store.getClaimedScheduleDispatch(
+      'schedule_a',
+      'dispatch-deep',
+      'run-deep',
+    );
+
+    // #then it finds no claimed dispatch instead of failing on the record
+    await expect(claimed).resolves.toBeNull();
+  });
+
   it('force-discards a same-run wake receipt and refuses unrelated receipts', async () => {
     const { store } = storeOver();
     await store.createSchedule(workflowSchedule());

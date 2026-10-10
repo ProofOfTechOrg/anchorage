@@ -405,7 +405,7 @@ The tick:
 - starts workflow targets through `RunnerRuntime`;
 - starts agent targets through the injected thread topology callback;
 - records a fire whose stored target holds a value nested more than 256 levels deep as `failed` (`input-too-deep`) without dispatching it, whichever writer stored the target;
-- settles a deferred fire whose stored dispatch holds such a value as `failed` (`invalid-deferred-dispatch`) without a status lookup;
+- resolves a deferred fire whose stored dispatch holds such a value from the `status` lookup without sending it again, and settles it as `failed` (`invalid-deferred-dispatch`) when the lookup throws;
 - fires the due schedules when reconciling deferred fires fails, then fails the pass with that error;
 - isolates each schedule's failure and records the actual joined run id.
 
