@@ -385,6 +385,12 @@ export interface PurgeExpiredRunsOptions {
   tablePrefix?: string;
   /** Artifact deletion precedes the guarded snapshot transaction. */
   artifactStore?: RunArtifactPurger;
+  /**
+   * Resource ownership registry. A terminal snapshot whose run's `run` claim
+   * is still reserved stays for a later pass, and a committed claim is
+   * removed with its run. A registry whose table does not exist holds no
+   * claim, and each pass then logs one `retention-config` line.
+   */
   resourceOwnerTable?: string;
   startIdempotencyTable?: string;
   /** Defaults to ttlMs and cannot shorten the snapshot retention horizon. */
@@ -442,6 +448,8 @@ interface RetentionSchema {
   names: string[];
   table?: string;
   stage?: StartReservationSchemaStage;
+  /** The ownership registry, when its table exists. */
+  owner?: string;
   bindings: [string, string | null, string | null];
 }
 interface RetentionStatement {
@@ -569,6 +577,7 @@ function prepareRetentionStatement(
 async function observeRunRetentionSchema(
   db: SnapshotDatabase,
   table: string | undefined,
+  owner: string | undefined,
 ): Promise<RetentionSchema> {
   const names = snapshotResultRows(
     await db
@@ -629,10 +638,22 @@ async function observeRunRetentionSchema(
       ]);
     }
   }
+  const ownerPresent =
+    owner !== undefined &&
+    snapshotResultRows(
+      await prepareRetentionStatement(
+        db,
+        retentionStatement(
+          `SELECT 1 AS present FROM sqlite_schema WHERE lower(name)=?1 AND type='table' LIMIT 1`,
+          [owner],
+        ),
+      ).all(),
+    ).length === 1;
   return {
     names: canonical,
     table,
     stage,
+    ...(ownerPresent ? { owner } : {}),
     bindings: [
       JSON.stringify(canonical),
       table ?? null,
@@ -667,6 +688,20 @@ function retentionPathGuard(): string {
     AND (SELECT count(*) FROM json_each(s.snapshot,'$.requestContext') WHERE key COLLATE BINARY='flowsafe.runProvenance') <= 1
     AND NOT EXISTS (SELECT key FROM json_each(s.snapshot,'${RETENTION_PATH}')
       WHERE key COLLATE BINARY IN ('version','startToken','startIdentity','agentStart') GROUP BY key COLLATE BINARY HAVING count(*) > 1)`;
+}
+
+/**
+ * Whether the start that wrote the run's snapshot has read its outcome. A run
+ * object or agent thread object reserves its run's `run` claim before the
+ * start is admitted and commits it once it has read the start's outcome, so a
+ * terminal snapshot whose claim is still reserved is one a start has yet to
+ * read. A registry whose table does not exist holds no claim.
+ */
+function retentionStartReadSql(owner: string | undefined): string {
+  return owner === undefined
+    ? '1'
+    : `NOT EXISTS (SELECT 1 FROM "${owner}" AS o WHERE o.resource_kind COLLATE BINARY='run'
+      AND o.resource_id COLLATE BINARY=s.run_id COLLATE BINARY AND o.reservation_token IS NOT NULL)`;
 }
 
 function retentionOwnedExpressions(): string[] {
@@ -905,7 +940,6 @@ function retentionMembership(
 function retentionSnapshotGroup(
   schema: RetentionSchema,
   table: string,
-  owner: string | undefined,
   selectors: readonly RetentionSelector[],
   raw: RawWorkflowSnapshot | undefined,
   cutoff: string,
@@ -926,7 +960,7 @@ function retentionSnapshotGroup(
             `${RETENTION_SCHEMA_SQL} DELETE FROM "${table}" AS s WHERE (SELECT ok FROM schema_ok)=1
       AND s.workflow_name COLLATE BINARY=?4 AND s.run_id COLLATE BINARY=?5 AND s.snapshot COLLATE BINARY=?6
       AND s.createdAt COLLATE BINARY IS ?7 AND s.updatedAt COLLATE BINARY IS ?8 AND s.resourceId COLLATE BINARY IS ?9
-      AND s.updatedAt COLLATE BINARY < ?10 AND CASE WHEN json_valid(s.snapshot) THEN (${retentionTerminalSql(11)}) AND ${retentionPathGuard()} ELSE 0 END`,
+      AND s.updatedAt COLLATE BINARY < ?10 AND ${retentionStartReadSql(schema.owner)} AND CASE WHEN json_valid(s.snapshot) THEN (${retentionTerminalSql(11)}) AND ${retentionPathGuard()} ELSE 0 END`,
             [
               ...schema.bindings,
               raw.workflowId,
@@ -941,19 +975,19 @@ function retentionSnapshotGroup(
           )
         : retentionStatement(
             `${RETENTION_SCHEMA_SQL} DELETE FROM "${table}" AS s WHERE (SELECT ok FROM schema_ok)=1
-      AND s.updatedAt COLLATE BINARY < ?5 AND CASE WHEN json_valid(s.snapshot) THEN (${retentionTerminalSql(6)}) ELSE 0 END
+      AND s.updatedAt COLLATE BINARY < ?5 AND ${retentionStartReadSql(schema.owner)} AND CASE WHEN json_valid(s.snapshot) THEN (${retentionTerminalSql(6)}) ELSE 0 END
       AND EXISTS (SELECT 1 FROM json_each(?4) c WHERE s.workflow_name COLLATE BINARY=json_extract(c.value,'$[0]')
       AND s.run_id COLLATE BINARY=json_extract(c.value,'$[1]') AND ${retentionOwnedEquality('$[2]')})`,
             [...schema.bindings, json, cutoff, ...RUN_TERMINAL_STATUSES],
           ),
     );
   }
-  if (owner !== undefined) {
+  if (schema.owner !== undefined) {
     const candidates = "SELECT json_extract(value,'$[1]') FROM json_each(?4)";
     result.push(
       retentionStatement(
         `${RETENTION_SCHEMA_SQL}, present(run_id) AS (${retentionMembership(schema.names, candidates)})
-      DELETE FROM "${owner}" WHERE (SELECT ok FROM schema_ok)=1 AND resource_kind COLLATE BINARY='run' AND reservation_token IS NULL
+      DELETE FROM "${schema.owner}" WHERE (SELECT ok FROM schema_ok)=1 AND resource_kind COLLATE BINARY='run' AND reservation_token IS NULL
       AND resource_id COLLATE BINARY IN (${candidates}) AND NOT EXISTS (SELECT 1 FROM present WHERE present.run_id COLLATE BINARY=resource_id COLLATE BINARY)`,
         [...schema.bindings, json],
       ),
@@ -1250,7 +1284,15 @@ export async function purgeExpiredWorkflowRuns(
   if (!/^\d{4}-/.test(cutoff))
     throw new Error('run retention cutoff must have a four-digit ISO year');
   const table = `${prefix}${RETENTION_SUFFIX}`;
-  let schema = await observeRunRetentionSchema(captured, registry);
+  let schema = await observeRunRetentionSchema(captured, registry, owner);
+  if (owner !== undefined && schema.owner === undefined)
+    console.error(
+      JSON.stringify({
+        type: 'retention-config',
+        resourceOwnerTable: owner,
+        problem: 'table does not exist, so retention treats it as no claim',
+      }),
+    );
   let schemaRetryUsed = false;
   let deleted = 0;
   const failures: string[] = [];
@@ -1276,7 +1318,7 @@ export async function purgeExpiredWorkflowRuns(
     if (schemaRetryUsed)
       throw new Error('run retention schema changed repeatedly');
     schemaRetryUsed = true;
-    schema = await observeRunRetentionSchema(captured, registry);
+    schema = await observeRunRetentionSchema(captured, registry, owner);
   };
   const execute = async (
     build: () => RetentionStatement[],
@@ -1332,7 +1374,6 @@ export async function purgeExpiredWorkflowRuns(
     retentionSnapshotGroup(
       schema,
       table,
-      owner,
       selectors,
       raw,
       cutoff,
@@ -1358,7 +1399,7 @@ export async function purgeExpiredWorkflowRuns(
           limit,
           `CASE WHEN length(s.workflow_name)<=200 THEN s.workflow_name END AS workflow_name,
        CASE WHEN length(s.run_id)<=200 THEN s.run_id END AS run_id,
-       s.updatedAt COLLATE BINARY < ?4 AND CASE WHEN json_valid(s.snapshot) THEN (${retentionTerminalSql(5)}) ELSE 0 END AS eligible,
+       s.updatedAt COLLATE BINARY < ?4 AND ${retentionStartReadSql(schema.owner)} AND CASE WHEN json_valid(s.snapshot) THEN (${retentionTerminalSql(5)}) ELSE 0 END AS eligible,
        ${retentionOwnedProjection()}`,
           [cutoff, ...RUN_TERMINAL_STATUSES],
         ),

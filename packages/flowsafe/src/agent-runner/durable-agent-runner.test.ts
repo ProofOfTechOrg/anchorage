@@ -5850,7 +5850,16 @@ describe('agent observation', () => {
           const row = await read(address);
           f.snapshot.requestContext['flowsafe.runProvenance'].startToken = 'S2';
           Object.assign(f.snapshot, { result: { generation: 'S2' } });
-          await f.seed();
+          // Raw: the settled-row guard refuses a write that names another start.
+          f.sql
+            .prepare(
+              'UPDATE mastra_workflow_snapshot SET snapshot = ? WHERE workflow_name = ? AND run_id = ?',
+            )
+            .run(
+              JSON.stringify(f.snapshot),
+              f.workflow.id,
+              'observed-agent-run',
+            );
           return row;
         });
       const state = await f.agent.authoritativeAgentStartState(

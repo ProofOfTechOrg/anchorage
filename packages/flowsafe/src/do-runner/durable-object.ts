@@ -253,6 +253,8 @@ type RunOwnerRecovery = {
   token: string;
   owner: DurableObjectRunOwner;
   startReservation?: StartReservationReading;
+  /** Set once the host has read the start's outcome from the run's row. */
+  outcomeRead?: true;
 } & (
   | { phase: 'preparing'; execution?: never }
   | { phase: 'prepared'; execution: D1RunExecutionIdentity }
@@ -918,15 +920,35 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
     await storage.put(RUN_OWNER_RECOVERY_KEY, recovery);
   }
 
+  /** The stored journal, after checking that it is still `recovery`. */
   async #assertRunOwnerRecoveryCurrent(
     recovery: RunOwnerRecovery,
-  ): Promise<void> {
+  ): Promise<unknown> {
     const current = await this.state?.storage?.get(RUN_OWNER_RECOVERY_KEY);
     if (
       current === undefined ||
       !sameRunRecovery(this.#runOwnerRecovery(current), recovery)
     )
       throw new Error('run owner recovery changed');
+    return current;
+  }
+
+  /**
+   * Commit the start's run claim once its outcome was read from the run's row,
+   * recording that read in the journal first: retention may remove a terminal
+   * row once its claim commits, and a row missing after the read is then a run
+   * that ended, never a start whose admission may yet land.
+   */
+  async #commitRunOwner(recovery: RunOwnerRecovery): Promise<void> {
+    const storage = this.state?.storage;
+    if (!storage)
+      throw new Error('run owner recovery requires durable storage');
+    if (recovery.outcomeRead !== true)
+      await storage.put(RUN_OWNER_RECOVERY_KEY, {
+        ...recoveryObject(await this.#assertRunOwnerRecoveryCurrent(recovery)),
+        outcomeRead: true,
+      });
+    await this.runOwnership(this.env).settleReservation(recovery.token, []);
   }
 
   /**
@@ -1041,7 +1063,7 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
     await this.#assertRunOwnerRecoveryCurrent(recovery);
     if (isTerminalRunStatus(state.summary.status))
       await runtime.settleStartExecution(state, recovery.startReservation);
-    await this.runOwnership(this.env).settleReservation(recovery.token, []);
+    await this.#commitRunOwner(recovery);
     const cleanup = terminalCleanupFor(
       lifecycleFromRequestContext(state.snapshot.requestContext),
     );
@@ -1933,50 +1955,41 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
         startLeg: ownFrame?.unwound === true ? 'unwound' : 'touched',
       });
     } else if (recovery.phase === 'prepared-unfenced') {
-      const state = this.#matchingRunState(
-        recovery,
-        await runtime.authoritativeStartState(
-          recovery.workflowId,
-          recovery.runId,
-        ),
+      const read = await runtime.authoritativeStartState(
+        recovery.workflowId,
+        recovery.runId,
       );
-      if (state.kind === 'initial') throw new RunStartPendingError();
-      return this.#finishRunOwner(recovery, state.summary, state);
+      // A row missing after the outcome was read is handled below as a run
+      // that ended.
+      if (read !== null || recovery.outcomeRead !== true) {
+        const state = this.#matchingRunState(recovery, read);
+        if (state.kind === 'initial') throw new RunStartPendingError();
+        return this.#finishRunOwner(recovery, state.summary, state);
+      }
     }
     await this.#assertRunOwnerRecoveryCurrent(recovery);
     if (recovered) {
-      const summary =
+      // Runtime already strictly settled the single selected recovery observation.
+      await this.#commitRunOwner(recovery);
+      const completed =
         recovered.kind === 'ordinary'
           ? recovered.summary
-          : recovered.transition.summary;
-      if (recovered.kind === 'lifecycle') {
-        // Runtime already strictly settled the single selected recovery observation.
-        await this.runOwnership(this.env).settleReservation(recovery.token, []);
-        const completed = recovered.transition.cleanup.cleanupCompleted
-          ? summary
-          : await this.#completeTerminalEffects(
-              runtime,
-              recovery.workflowId,
-              recovery.runId,
-              recovery.owner,
-              recovered.transition,
-            );
-        const reconciled = await this.#reconcileSuspensionDeadlinesBestEffort(
-          recovery.workflowId,
-          recovery.runId,
-          completed,
-        );
-        await this.#clearRunOwnerRecovery(recovery, !reconciled);
-        return completed;
-      }
-      await this.runOwnership(this.env).settleReservation(recovery.token, []);
+          : recovered.transition.cleanup.cleanupCompleted
+            ? recovered.transition.summary
+            : await this.#completeTerminalEffects(
+                runtime,
+                recovery.workflowId,
+                recovery.runId,
+                recovery.owner,
+                recovered.transition,
+              );
       const reconciled = await this.#reconcileSuspensionDeadlinesBestEffort(
         recovery.workflowId,
         recovery.runId,
-        summary,
+        completed,
       );
       await this.#clearRunOwnerRecovery(recovery, !reconciled);
-      return summary;
+      return completed;
     }
     const localZero = (): boolean =>
       recovery.phase === 'prepared' &&
@@ -1988,7 +2001,13 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
     await this.runOwnership(this.env).settleReservation(recovery.token, [
       { kind: 'run', resourceId: recovery.runId },
     ]);
-    if (recovery.phase === 'prepared' && !localZero()) {
+    // A row gone after the start read it is a run that ended and that
+    // retention removed, not a start whose admission may yet land.
+    if (
+      recovery.phase === 'prepared' &&
+      recovery.outcomeRead !== true &&
+      !localZero()
+    ) {
       await this.#rearmRunOwnerRecovery();
       throw new ExecutionFenceUnreadableError(
         'run start recovery is unresolved',
@@ -2008,7 +2027,8 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
       !isPathSafeId(stored.runId) ||
       !isPathSafeId(stored.token) ||
       !isExecutionPrincipalKind(owner.kind) ||
-      !isExecutionPrincipalId(owner.id)
+      !isExecutionPrincipalId(owner.id) ||
+      (stored.outcomeRead !== undefined && stored.outcomeRead !== true)
     )
       throw new Error('stored run owner recovery is malformed');
     const rawClaim =
@@ -2041,6 +2061,7 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
       token: stored.token,
       owner: { kind: owner.kind, id: owner.id },
       ...(claim ? { startReservation: claim } : {}),
+      ...(stored.outcomeRead === true ? { outcomeRead: true as const } : {}),
     };
     if (stored.phase === 'preparing' && !Object.hasOwn(stored, 'execution'))
       return { ...base, phase: 'preparing' };

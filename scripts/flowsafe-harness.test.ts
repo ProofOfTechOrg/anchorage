@@ -1992,7 +1992,7 @@ describe.sequential('FlowSafe Wrangler test harness', () => {
       snapshots: Array<Record<string, unknown>>;
       sibling: Array<Record<string, unknown>>;
     }>(probe, '/retention-e/siblings');
-    expect(outcome.purged).toBe(4);
+    expect(outcome.purged).toBe(3);
     expect(outcome.owners).toEqual([
       {
         resource_id: 'e-retention-cross-workflow',
@@ -2012,6 +2012,7 @@ describe.sequential('FlowSafe Wrangler test harness', () => {
     ]);
     expect(outcome.snapshots).toEqual([
       { workflow_name: 'other-workflow', run_id: 'e-retention-cross-workflow' },
+      { workflow_name: 'physical-workflow', run_id: 'e-retention-reserved' },
     ]);
     expect(outcome.sibling).toEqual([
       { run_id: 'e-retention-malformed-sibling', snapshot: '{not-json' },

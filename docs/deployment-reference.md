@@ -100,7 +100,7 @@ Host routing belongs to the provisioning control plane. It must resolve a hostna
 | `APPROVAL_ACTOR_TOKENS` | Empty | Static verifier map. Empty means every authenticated route returns 401 |
 | `APPROVAL_SLA_SECONDS` | `14400` | SLA assigned to new approval records |
 | `APPROVAL_ALLOW_SELF_DECISION` | Unset | Separation of duties enabled. Accepts `true` or a comma-separated role list |
-| `RUN_RETENTION_DAYS` | `30` | Age for terminal workflow snapshot purge; `0` means immediate eligibility |
+| `RUN_RETENTION_DAYS` | `30` | Age for terminal workflow snapshot purge; `0` makes a terminal run eligible once the object that started it has read the start's outcome |
 | `START_IDEMPOTENCY_RETENTION_DAYS` | `RUN_RETENTION_DAYS` | Age for terminal start-reservation purge; keep it at least as long as callers may retry a key |
 | `APPROVAL_RETENTION_DAYS` | `30` | Age for approved/rejected approval purge |
 | `THREAD_RETENTION_DAYS` | Unset | Idle thread and message purge. Unset keeps conversations |

@@ -1740,9 +1740,9 @@ const FENCE_ERROR_AUTHORS: ReadonlyArray<{
   {
     file: 'do-runner/durable-object.ts',
     error: 'ExecutionFenceUnreadableError',
-    anchor: "if (recovery.phase === 'prepared' && !localZero()) {",
+    anchor: 'recovery.outcomeRead !== true &&',
     effectBoundary:
-      'Prepared absence retains the workflow journal after exact H rollback unless the current own catch proves a matching zero insert; unknown earlier effects never permit a retry.',
+      'Prepared absence retains the workflow journal after exact H rollback unless the journal records that the host read the start outcome, or the current own catch proves a matching zero insert; unknown earlier effects never permit a retry.',
   },
   {
     file: 'approval-api/service.ts',

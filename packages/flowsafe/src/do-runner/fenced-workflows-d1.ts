@@ -657,6 +657,21 @@ function lifecycleSql(column: string, path: string): string {
   return `json_extract(${column}, ${lifecyclePath(path)})`;
 }
 
+const START_TOKEN_PATH = `'$.requestContext."${PROVENANCE}".startToken'`;
+
+/**
+ * Whether a write names the start the stored row records, by its run
+ * provenance's start token. A side that carries no start token does not
+ * decide: the row of an earlier provenance version, or a write made outside a
+ * leg's request context.
+ */
+function sameStartSql(stored: string, incoming: string): string {
+  const token = (column: string) =>
+    `json_extract(${column}, ${START_TOKEN_PATH})`;
+  return `(${token(stored)} IS NULL OR ${token(incoming)} IS NULL
+    OR ${token(incoming)} = ${token(stored)})`;
+}
+
 function unsettledSql(stored: string): string {
   return RUN_SETTLING_MARKERS.map(
     (marker) => `${lifecycleSql(stored, marker)} IS NULL`,
@@ -679,23 +694,27 @@ function decisionSql(rule: string): string {
 }
 
 /**
- * Upsert condition over a stored row: unsettled, or the incoming write
- * advances the revision and keeps the settlement. A stored row SQLite cannot
- * read (malformed, or nested past its depth limit) fails it, and
- * #persistUnlessSettled then evaluates it on that row's lifecycle. CASE,
- * unlike OR, never evaluates json_extract on JSON its guard found unreadable.
+ * Upsert condition over a stored row: the write names the row's start (or one
+ * side names none), and the row is unsettled or the incoming write advances
+ * the revision and keeps the settlement. A stored row SQLite cannot read
+ * (malformed, or nested past its depth limit) fails it, and
+ * #persistUnlessSettled then evaluates it on that row's lifecycle, whose
+ * projection carries no provenance, so a write over such a row compares no
+ * start token. CASE, unlike OR, never evaluates json_extract on JSON its guard
+ * found unreadable.
  */
 function settledRowGuardSql(stored: string, incoming: string): string {
   return `CASE
     WHEN NOT json_valid(${stored}) THEN 0
     WHEN NOT json_valid(${incoming}) THEN ${unsettledSql(stored)}
-    ELSE (${unsettledSql(stored)})
+    ELSE ${sameStartSql(stored, incoming)}
+      AND ((${unsettledSql(stored)})
       OR (json_type(${incoming}, ${lifecyclePath('revision')}) = 'integer'
         AND ${lifecycleSql(incoming, 'revision')} > ${lifecycleSql(stored, 'revision')}
         AND ${RUN_SETTLED_IDENTITY_PATHS.map(
           (path) =>
             `${lifecycleSql(incoming, path)} IS ${lifecycleSql(stored, path)}`,
-        ).join(' AND ')})
+        ).join(' AND ')}))
     END`;
 }
 

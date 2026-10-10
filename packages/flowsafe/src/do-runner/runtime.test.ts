@@ -227,8 +227,13 @@ describe('authoritative start state', () => {
     'background',
   ] as const)('selects one raw %s snapshot for physical identity and S1 payload', async (kind) => {
     const f = await d1Fixture(kind);
+    const table =
+      kind === 'prefixed'
+        ? 'D1_mastra_workflow_snapshot'
+        : 'mastra_workflow_snapshot';
     try {
       for (const status of ['success', 'failed', 'suspended'] as const) {
+        f.sql.prepare(`DELETE FROM "${table}"`).run();
         const snapshot = d1Snapshot(status);
         await f.seed(snapshot);
         const capability = f.capability;
@@ -244,7 +249,10 @@ describe('authoritative start state', () => {
             replacement.error = { name: 'Error', message: 'S2 failure' };
             assert(replacement.context.gate);
             replacement.context.gate.suspendPayload = { source: 'S2' };
-            await f.seed(replacement);
+            // Raw: the settled-row guard refuses a write that names another start.
+            f.sql
+              .prepare(`UPDATE "${table}" SET snapshot = ?`)
+              .run(JSON.stringify(replacement));
             return row;
           });
         const publicRead = vi.spyOn(f.workflow, 'getWorkflowRunById');
@@ -2775,6 +2783,53 @@ describe('RunnerRuntime run state SQLite cannot store', () => {
         h.stored().requestContext?.['flowsafe.runLifecycle']
           ?.stateNotStorableAt,
       ).toBeUndefined();
+    });
+
+    /** A later start of `held-deep` under the held leg's run id, suspended in its step. */
+    function startLater(storage: MastraCompositeStore) {
+      const later = init(
+        { storage },
+        { executionFence: 'none', startIdempotency: 'none' },
+      );
+      later
+        .createWorkflow({
+          id: 'held-deep',
+          inputSchema: schema,
+          outputSchema: schema,
+        })
+        .then(
+          later.createStep({
+            id: 'hold',
+            inputSchema: schema,
+            outputSchema: schema,
+            suspendSchema: schema,
+            resumeSchema: schema,
+            execute: async ({ suspend }) => suspend({}),
+          }),
+        )
+        .commit();
+      return later.runtime.start('held-deep', {
+        runId: 'held-run',
+        inputData: {},
+      });
+    }
+
+    it("keeps the row of a later run that started under the leg's run id after retention removed the leg's run", async () => {
+      // #given a held leg whose run row retention removed, and a later start
+      // under the same run id that suspended
+      const h = await heldDeepLeg();
+      h.sql.prepare('DELETE FROM mastra_workflow_snapshot').run();
+      await expect(startLater(h.storage)).resolves.toMatchObject({
+        status: 'suspended',
+      });
+      const laterRow = h.stored();
+
+      // #when the leg's step returns state nested past the depth SQLite parses
+      h.release.resolve();
+      await h.outcome;
+
+      // #then the later run is not recorded as failed
+      expect(h.stored()).toEqual(laterRow);
     });
   });
 });
@@ -8242,6 +8297,13 @@ async function runtimeActivationFixture(
   };
   const row = (runId = 'activation-run') =>
     workflows.loadWorkflowSnapshot({ workflowName: workflow.id, runId });
+  /** Write over the run's row in SQL, past the settled-row guard, as an earlier version's leg can. */
+  const plant = (snapshot: unknown, runId = 'activation-run') =>
+    sql
+      .prepare(
+        'UPDATE activation_mastra_workflow_snapshot SET snapshot = ? WHERE workflow_name = ? AND run_id = ?',
+      )
+      .run(JSON.stringify(snapshot), workflow.id, runId);
   return {
     ...app,
     sql,
@@ -8255,6 +8317,7 @@ async function runtimeActivationFixture(
     options,
     claim,
     row,
+    plant,
     close: () => sql.close(),
   };
 }
@@ -8765,11 +8828,7 @@ describe('Runtime activation', () => {
           if (replacement === 'tokenless')
             delete snapshot.requestContext?.['flowsafe.runProvenance'];
           if (replacement === 'pending') snapshot.status = 'pending';
-          await f.workflows.persistWorkflowSnapshot({
-            workflowName: f.workflow.id,
-            runId: 'activation-run',
-            snapshot,
-          });
+          f.plant(snapshot);
           throw fault;
         });
         return run;
@@ -9039,11 +9098,7 @@ describe('Runtime activation', () => {
           const later = JSON.parse(outcome.row.snapshot);
           later.requestContext['flowsafe.runProvenance'].startToken = 'S2';
           later.result = { foreign: true };
-          await f.workflows.persistWorkflowSnapshot({
-            workflowName: f.workflow.id,
-            runId: 'activation-run',
-            snapshot: later,
-          });
+          f.plant(later);
         }
         return outcome;
       };
@@ -9431,11 +9486,7 @@ describe('Runtime activation', () => {
       await entered.promise;
       assert(before.requestContext);
       before.requestContext['flowsafe.runProvenance'].startToken = 'S2';
-      await f.workflows.persistWorkflowSnapshot({
-        workflowName: f.workflow.id,
-        runId: 'activation-run',
-        snapshot: before,
-      });
+      f.plant(before);
       release.resolve();
       const result = await pending.catch((error) => error);
       expect(
@@ -9795,11 +9846,7 @@ describe('Runtime activation', () => {
           const snapshot = await f.row();
           assert(snapshot?.requestContext);
           snapshot.requestContext['flowsafe.runProvenance'].startToken = 'S2';
-          await f.workflows.persistWorkflowSnapshot({
-            workflowName: f.workflow.id,
-            runId: 'activation-run',
-            snapshot,
-          });
+          f.plant(snapshot);
           return original;
         },
       );
@@ -12761,6 +12808,31 @@ describe('RunnerRuntime leg liveness touch', () => {
 
     // #then the resume answers a settled conflict
     await expect(resumed).rejects.toBeInstanceOf(RunSettledConflictError);
+  });
+
+  it("refuses the next write of a leg whose run id a later start used after retention removed the run, and keeps the later run's row", async () => {
+    // #given a leg held in its first step, on a run another instance
+    // terminated and retention removed, and a later start under the same run
+    // id that ran to its success
+    const { sql, storage } = await d1Storage();
+    const leg = startHeldLeg(storage);
+    await leg.entered.promise;
+    await terminatedAndPurged(sql, storage);
+    const later = abortableApp(storage);
+    later.release.resolve();
+    await expect(
+      later.app.runtime.start(WORKFLOW_ID, { runId: RUN_ID, inputData: {} }),
+    ).resolves.toMatchObject({ status: 'success' });
+    const laterRows = storedRows(sql);
+
+    // #when the held leg's step returns
+    leg.release.resolve();
+
+    // #then the leg's next write is refused, its second step never ran, and
+    // the later run's row stays as that run wrote it
+    await expect(leg.started).rejects.toBeInstanceOf(RunSettledConflictError);
+    expect(leg.observed.afterRuns).toBe(0);
+    expect(storedRows(sql)).toEqual(laterRows);
   });
 
   it("answers a settled conflict for a legacy run's resumed leg that the touch aborted after another instance terminated the run", async () => {

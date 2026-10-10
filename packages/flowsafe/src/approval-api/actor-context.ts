@@ -54,9 +54,15 @@ export interface ActorContext {
   readonly resourceOwner: ResourceOwner;
   /** The approval service over this deployment's store. */
   service(): ApprovalService;
-  /** Mint a server-owned path-safe run id. */
+  /**
+   * Mint a server-owned path-safe run id that no start in this deployment has
+   * used, because a run id is single-use.
+   */
   newRunId(): string;
-  /** Mint a server-owned path-safe memory thread id. */
+  /**
+   * Mint a server-owned path-safe memory thread id that names one thread for
+   * the deployment's lifetime.
+   */
   newThreadId(): string;
   /** Validate a host-owned business key as a memory resource id. */
   resourceIdFromKey(resourceKey: string): string;
@@ -102,7 +108,12 @@ export interface CreateActorResolverOptions {
   mutationEpoch?: unknown;
   /** Host-specific service assembly, called lazily at most once per request. */
   buildService: (store: ApprovalStore, actor: ApprovalActor) => ApprovalService;
-  /** Run-id generator. Default: crypto.randomUUID. */
+  /**
+   * Run-id generator, which also mints thread ids. Every call must return a
+   * value it never returned before in this deployment, because a run id is
+   * single-use and a thread id names one thread for the deployment's
+   * lifetime. Default: crypto.randomUUID.
+   */
   newRunId?: () => string;
   /** The same self-decision policy supplied to ApprovalService. */
   allowSelfDecision?: SelfDecisionPolicy;
@@ -115,6 +126,10 @@ export interface CreatePrincipalActorContextOptions {
   deploymentTag?: string;
   mutationEpoch?: unknown;
   buildService: (store: ApprovalStore, actor: ApprovalActor) => ApprovalService;
+  /**
+   * Run-id generator, which also mints thread ids; every value must be unique
+   * for the deployment's lifetime, as for `CreateActorResolverOptions.newRunId`.
+   */
   newRunId?: () => string;
   canSelfDecide?: (role: ApprovalRole) => boolean;
 }

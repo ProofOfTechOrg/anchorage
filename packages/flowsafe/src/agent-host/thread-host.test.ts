@@ -18,6 +18,7 @@ import {
   D1ResourceOwnershipStore,
   type ExecutionPrincipal,
   InMemoryResourceOwnershipStore,
+  RESOURCE_OWNERSHIP_TABLE,
   type RecoverableResourceOwnershipStore,
   type ResourceOwnershipDatabase,
 } from '../approval-api/index.js';
@@ -41,6 +42,7 @@ import {
   ExecutionFenceStore,
   ExecutionFenceUnreadableError,
   init,
+  purgeExpiredWorkflowRuns,
   RunSettledConflictError,
   RunStartPendingError,
   RunStateUnreadableError,
@@ -1178,18 +1180,23 @@ describe('direct thread host capture', () => {
       const journals = writes.filter(([key]) =>
         key.startsWith('flowsafe:agent-owner-recovery'),
       );
-      expect(journals).toHaveLength(phase === 'failure' ? 1 : 2);
+      expect(journals).toHaveLength(phase === 'failure' ? 1 : 3);
       expect(journals[0]?.[1]).toMatchObject({
         version: 2,
         phase: 'preparing',
         token: args?.[4],
         runRecord: { version: 2, principal: fixture.scope.principal },
       });
-      if (phase !== 'failure')
+      if (phase !== 'failure') {
         expect(journals[1]?.[1]).toMatchObject({
           phase: 'prepared',
           execution: { startToken: expect.any(String) },
         });
+        expect(journals[2]?.[1]).toMatchObject({
+          phase: 'prepared',
+          outcomeRead: true,
+        });
+      }
       const snapshot = await workflows.loadWorkflowSnapshot({
         workflowName: 'durable-agentic-loop',
         runId: 'acme_run',
@@ -1430,7 +1437,7 @@ describe('direct thread host capture', () => {
     const journals = writes.filter(([key]) =>
       key.startsWith(OWNER_RECOVERY_PREFIX),
     );
-    expect(journals).toHaveLength(2);
+    expect(journals).toHaveLength(3);
     expect(journals[0]?.[1]).toMatchObject({
       version: 2,
       phase: 'preparing',
@@ -1452,6 +1459,10 @@ describe('direct thread host capture', () => {
     expect(journals[1]?.[1]).toMatchObject({
       phase: 'prepared-unfenced',
       execution: { tablePrefix: null, startToken: 'test-generation' },
+    });
+    expect(journals[2]?.[1]).toMatchObject({
+      phase: 'prepared-unfenced',
+      outcomeRead: true,
     });
     expect(writes).toContainEqual([
       TEST_RUN_RECORD_KEY,
@@ -7862,9 +7873,10 @@ describe('host agent recovery barriers', () => {
         : 'rejected',
     );
     expect(events, String(outcome)).toEqual(order.slice(0, reached + 1));
-    expect(fixture.state.get(TEST_OWNER_RECOVERY_KEY)).toEqual(
-      fixture.recovery,
-    );
+    expect(fixture.state.get(TEST_OWNER_RECOVERY_KEY)).toEqual({
+      ...fixture.recovery,
+      outcomeRead: true,
+    });
     expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(
       boundary !== 'completion',
     );
@@ -7898,6 +7910,100 @@ describe('host agent recovery barriers', () => {
       },
     });
     expect(mocked.stream).not.toHaveBeenCalled();
+  });
+
+  /** Retention with a zero horizon over the lifecycle fixture's tables. */
+  function purgeLifecycleAtZero(fixture: {
+    sql: ReturnType<typeof openSqlite>;
+  }) {
+    return purgeExpiredWorkflowRuns(
+      sqliteUnitDatabase(fixture.sql) as Parameters<
+        typeof purgeExpiredWorkflowRuns
+      >[0],
+      {
+        ttlMs: 0,
+        now: () => Date.now() + 1_000,
+        tablePrefix: 'host_lifecycle_',
+        resourceOwnerTable: RESOURCE_OWNERSHIP_TABLE,
+        advanceCursor: async () => {},
+      },
+    );
+  }
+
+  it.each([
+    'fenced',
+    'actual-prefix',
+  ] as const)("clears an unthreaded agent run's start journal and claims once retention removed the run after it ended (%s)", async (mode) => {
+    // #given an unthreaded start that left its journal armed on a suspended
+    // run, and the run then ended and retention removed it
+    const fixture = await hostAgentLifecycleFixture({
+      mode,
+      provenance: 'modern',
+      status: 'suspended',
+      threaded: false,
+      journal: true,
+    });
+    await fixture.host.recoverOwnership(fixture.scope);
+    expect(fixture.state.has(TEST_OWNER_RECOVERY_KEY)).toBe(true);
+    expect(await fixture.resources.owner('run', 'acme_run')).toEqual(
+      HUMAN_OWNER,
+    );
+    await fixture.persist({ ...fixture.snapshot, status: 'success' });
+    expect(await purgeLifecycleAtZero(fixture)).toBe(1);
+
+    // #when the host recovers its ownership again
+    const recovered = fixture.host.recoverOwnership(fixture.scope);
+
+    // #then the journal, the run record and the claims are gone
+    await expect(recovered).resolves.toBeUndefined();
+    expect(fixture.state.has(TEST_OWNER_RECOVERY_KEY)).toBe(false);
+    expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(false);
+    expect(fixture.owners()).toEqual([]);
+  });
+
+  it("clears a threaded agent run's start journal an instance left after committing its claims, once retention removed the ended run", async () => {
+    // #given a threaded start whose instance stopped right after it committed
+    // the run's claims, and retention that then removed the ended run
+    const fixture = await hostAgentLifecycleFixture({
+      mode: 'fenced',
+      provenance: 'modern',
+      status: 'success',
+      journal: true,
+    });
+    const settle = fixture.resources.settleReservation.bind(fixture.resources);
+    const stopped = vi
+      .spyOn(fixture.resources, 'settleReservation')
+      .mockImplementation(async (...args) => {
+        await settle(...args);
+        throw new Error('instance stopped');
+      });
+    await fixture.host.recoverOwnership(fixture.scope).catch(() => undefined);
+    stopped.mockRestore();
+    expect(fixture.state.has(TEST_OWNER_RECOVERY_KEY)).toBe(true);
+    expect(await fixture.resources.owner('run', 'acme_run')).toEqual(
+      HUMAN_OWNER,
+    );
+    expect(await purgeLifecycleAtZero(fixture)).toBe(1);
+
+    // #when the host recovers its ownership again
+    const recovered = fixture.host.recoverOwnership(fixture.scope);
+
+    // #then the journal and the run record are gone, and the thread keeps its
+    // binding and committed claims
+    await expect(recovered).resolves.toBeUndefined();
+    expect(fixture.state.has(TEST_OWNER_RECOVERY_KEY)).toBe(false);
+    expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(false);
+    expect(fixture.state.has(THREAD_BINDING_KEY)).toBe(true);
+    expect(fixture.owners()).toEqual([
+      expect.objectContaining({
+        resource_kind: 'resource',
+        reservation_token: null,
+      }),
+      expect.objectContaining({
+        resource_kind: 'thread',
+        reservation_token: null,
+      }),
+    ]);
   });
 });
 

@@ -821,6 +821,11 @@ export type StartRunOptions = {
    * (createRunRouter) so a client can never choose the identity a run is
    * keyed by everywhere it lands. A generation fallback here would let any caller
    * that forgets to mint create a run under an id the host never issued.
+   *
+   * A run id is single-use: never start one again, even after retention
+   * removed its run. `start` refuses an id only while its run's row exists,
+   * and a leg of the earlier run still running on another instance keeps
+   * running against the later run until its next write is refused.
    */
   runId: string;
   inputData?: unknown;
@@ -3806,6 +3811,11 @@ export class RunnerRuntime {
               workflowId,
               runId,
             );
+            const stored = runProvenance(state);
+            const own = runProvenance({ requestContext: live });
+            // A row that records another start is a later run under the same
+            // id, which this leg must not fail.
+            if (stored && own && stored.startToken !== own.startToken) return;
             const { context, lifecycle } = overlayLegContext(
               state.requestContext,
               overlay,

@@ -356,6 +356,8 @@ type AgentOwnerRecovery = {
   bindingPreexisting: boolean;
   runRecord: AgentRunRecord;
   startReservation?: StartReservationReading;
+  /** Set once the host has read the start's outcome from the run's row. */
+  outcomeRead?: true;
 } & (
   | { phase: 'preparing'; execution?: never }
   | { phase: 'prepared'; execution: D1RunExecutionIdentity }
@@ -1051,7 +1053,8 @@ export function createThreadAgentHost(
         !isPathSafeId(stored.token) ||
         ownerRecoveryKey(stored.runId) !== key ||
         typeof stored.threaded !== 'boolean' ||
-        typeof stored.bindingPreexisting !== 'boolean'
+        typeof stored.bindingPreexisting !== 'boolean' ||
+        (stored.outcomeRead !== undefined && stored.outcomeRead !== true)
       )
         throw new Error('invalid journal');
       const owner = resourceOwner(persistedStartRecord(stored.owner));
@@ -1104,6 +1107,7 @@ export function createThreadAgentHost(
         bindingPreexisting: stored.bindingPreexisting,
         runRecord,
         ...(claim ? { startReservation: claim } : {}),
+        ...(stored.outcomeRead === true ? { outcomeRead: true as const } : {}),
       };
       if (stored.phase === 'preparing' && !Object.hasOwn(stored, 'execution'))
         return { ...base, phase: 'preparing' };
@@ -1263,9 +1267,10 @@ export function createThreadAgentHost(
     return state;
   };
 
+  /** The stored journal, after checking that it is still `recovery`. */
   const assertRecoveryCurrent = async (
     recovery: AgentOwnerRecovery,
-  ): Promise<void> => {
+  ): Promise<unknown> => {
     const key = ownerRecoveryKey(recovery.runId),
       current = await options.stateStorage().get(key);
     if (
@@ -1276,6 +1281,25 @@ export function createThreadAgentHost(
       )
     )
       throw new Error('agent owner recovery changed');
+    return current;
+  };
+
+  /**
+   * Commit the start's claims once its outcome was read from the run's row,
+   * recording that read in the journal first: retention may remove a terminal
+   * row once the run claim commits, and a row missing after the read is then a
+   * run that ended, never a start whose admission may yet land. Callers hold
+   * the recovery lock.
+   */
+  const commitOwnerClaims = async (
+    recovery: AgentOwnerRecovery,
+  ): Promise<void> => {
+    if (recovery.outcomeRead !== true)
+      await options.stateStorage().put(ownerRecoveryKey(recovery.runId), {
+        ...persistedStartRecord(await assertRecoveryCurrent(recovery)),
+        outcomeRead: true,
+      });
+    await options.resourceAccess().settleReservation(recovery.token, []);
   };
 
   const assertLegacyTerminalCurrent = async (
@@ -1370,15 +1394,15 @@ export function createThreadAgentHost(
 
   const finalizeJournalBookkeeping = async (
     recovery: AgentOwnerRecovery,
-    summary: RunSummary,
+    ended: boolean,
   ): Promise<boolean> => {
     await assertRecoveryCurrent(recovery);
-    if (!recovery.threaded && !isTerminalRunStatus(summary.status)) {
+    if (!recovery.threaded && !ended) {
       await ensureOwnerRecoveryAlarm(options.stateStorage());
       return false;
     }
     if (!recovery.threaded) await releaseEphemeralOwnerClaims(recovery);
-    if (isTerminalRunStatus(summary.status)) {
+    if (ended) {
       const current = await readRun(recovery.runId);
       if (current !== undefined && !sameRunRecord(current, recovery.runRecord))
         throw new Error('agent run record changed');
@@ -1396,7 +1420,7 @@ export function createThreadAgentHost(
     await assertRecoveryCurrent(recovery);
     const workflowId = recovery.execution?.workflowId;
     if (!workflowId) throw new Error('agent recovery has no execution');
-    await options.resourceAccess().settleReservation(recovery.token, []);
+    await commitOwnerClaims(recovery);
     await assertRecoveryCurrent(recovery);
     if (!transition.cleanup.cleanupCompleted) {
       await abandonApprovalsForRun(
@@ -1425,7 +1449,10 @@ export function createThreadAgentHost(
       )
         throw new Error('run ownership could not be released');
     }
-    await finalizeJournalBookkeeping(recovery, transition.summary);
+    await finalizeJournalBookkeeping(
+      recovery,
+      isTerminalRunStatus(transition.summary.status),
+    );
     return transition.cleanup.cleanupCompleted
       ? transition.summary
       : scope.init.runtime.completeTerminalCleanup(
@@ -1479,8 +1506,11 @@ export function createThreadAgentHost(
           });
           return true;
         }
-        await options.resourceAccess().settleReservation(recovery.token, []);
-        return finalizeJournalBookkeeping(recovery, summary);
+        await commitOwnerClaims(recovery);
+        return finalizeJournalBookkeeping(
+          recovery,
+          isTerminalRunStatus(summary.status),
+        );
       });
       if (clear) await clearOwnerRecovery(recovery);
       return summary;
@@ -1795,30 +1825,32 @@ export function createThreadAgentHost(
               },
             );
           } else {
-            const selected = matchRecoveryState(
-              stored,
-              await selectedAgentState(scope, stored),
-            );
-            if (selected.kind === 'initial') throw new RunStartPendingError();
-            if (isTerminalRunStatus(selected.summary.status))
-              await scope.init.runtime.settleStartExecution(
-                selected,
-                stored.startReservation,
+            const read = await selectedAgentState(scope, stored);
+            // A row missing after the outcome was read is handled below as a
+            // run that ended.
+            if (read !== null || stored.outcomeRead !== true) {
+              const selected = matchRecoveryState(stored, read);
+              if (selected.kind === 'initial') throw new RunStartPendingError();
+              if (isTerminalRunStatus(selected.summary.status))
+                await scope.init.runtime.settleStartExecution(
+                  selected,
+                  stored.startReservation,
+                );
+              const cleanup = terminalCleanupFor(
+                lifecycleFromRequestContext(selected.snapshot.requestContext),
               );
-            const cleanup = terminalCleanupFor(
-              lifecycleFromRequestContext(selected.snapshot.requestContext),
-            );
-            recovered = cleanup
-              ? {
-                  kind: 'lifecycle',
-                  transition: {
-                    summary: selected.summary,
-                    transitioned: false,
-                    casMatched: true,
-                    cleanup,
-                  },
-                }
-              : { kind: 'ordinary', summary: selected.summary };
+              recovered = cleanup
+                ? {
+                    kind: 'lifecycle',
+                    transition: {
+                      summary: selected.summary,
+                      transitioned: false,
+                      casMatched: true,
+                      cleanup,
+                    },
+                  }
+                : { kind: 'ordinary', summary: selected.summary };
+            }
           }
         }
         if (recovered) {
@@ -1836,8 +1868,11 @@ export function createThreadAgentHost(
             clear = true;
           } else {
             await assertRecoveryCurrent(stored);
-            await options.resourceAccess().settleReservation(stored.token, []);
-            clear = await finalizeJournalBookkeeping(stored, summary);
+            await commitOwnerClaims(stored);
+            clear = await finalizeJournalBookkeeping(
+              stored,
+              isTerminalRunStatus(summary.status),
+            );
           }
           if (clear) {
             await assertRecoveryCurrent(stored);
@@ -1846,6 +1881,20 @@ export function createThreadAgentHost(
           return summary;
         }
         await assertRecoveryCurrent(stored);
+        // A row gone after the start read it is a run that ended and that
+        // retention removed: finish its bookkeeping as for an ended run and
+        // clear the journal.
+        if (stored.outcomeRead === true) {
+          await options
+            .resourceAccess()
+            .settleReservation(stored.token, [
+              { kind: 'run', resourceId: stored.runId },
+            ]);
+          await finalizeJournalBookkeeping(stored, true);
+          await assertRecoveryCurrent(stored);
+          await options.stateStorage().delete(key);
+          return null;
+        }
         const localZero = (): boolean =>
           stored.phase === 'prepared' &&
           ownFrame !== undefined &&

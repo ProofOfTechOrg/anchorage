@@ -3,7 +3,7 @@
 // ISO-cutoff comparisons execute in SQLite, while the Wrangler harness owns
 // D1 concurrency, transaction, and runtime fidelity.
 
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, onTestFinished, vi } from 'vitest';
 
 import {
   openSqlite,
@@ -3371,7 +3371,6 @@ describe('generation-safe run retention', () => {
   it.each([
     'sibling-prefix',
     'sibling-workflow',
-    'reserved-owner',
   ])('protects %s ownership while removing an expired snapshot', async (kind) => {
     const { sqlite, db, cycle } = retentionWorld();
     await createResourceOwnershipSchema(db as never);
@@ -3381,20 +3380,14 @@ describe('generation-safe run retention', () => {
       id: 'resource-owner',
     });
     retentionSnapshot(sqlite, 'run');
-    if (kind === 'reserved-owner')
-      sqlite.exec(
-        `UPDATE ${RESOURCE_OWNERSHIP_TABLE} SET reservation_token='claim-token'`,
-      );
-    else {
-      if (kind === 'sibling-prefix') createSnapshotTable(sqlite, 'sibling_');
-      retentionSnapshot(sqlite, 'run', {
-        prefix: kind === 'sibling-prefix' ? 'sibling_' : '',
-        workflowId: 'other',
-      });
-      sqlite.exec(
-        `UPDATE ${kind === 'sibling-prefix' ? 'sibling_' : ''}mastra_workflow_snapshot SET snapshot='corrupt' WHERE workflow_name='other'`,
-      );
-    }
+    if (kind === 'sibling-prefix') createSnapshotTable(sqlite, 'sibling_');
+    retentionSnapshot(sqlite, 'run', {
+      prefix: kind === 'sibling-prefix' ? 'sibling_' : '',
+      workflowId: 'other',
+    });
+    sqlite.exec(
+      `UPDATE ${kind === 'sibling-prefix' ? 'sibling_' : ''}mastra_workflow_snapshot SET snapshot='corrupt' WHERE workflow_name='other'`,
+    );
     expect(
       await purgeExpiredWorkflowRuns(db, {
         ...cycle.options(),
@@ -3410,7 +3403,7 @@ describe('generation-safe run retention', () => {
     ).toEqual({
       owner_kind: 'human',
       owner_id: 'resource-owner',
-      reservation_token: kind === 'reserved-owner' ? 'claim-token' : null,
+      reservation_token: null,
     });
   });
 
@@ -3429,6 +3422,85 @@ describe('generation-safe run retention', () => {
       }),
     ).toBe(1);
     expect(await resources.owner('run', 'run')).toBeUndefined();
+  });
+
+  it('keeps an expired terminal snapshot and its artifacts while its run claim is reserved, and removes them once the claim commits', async () => {
+    // #given an expired terminal snapshot whose run's claim a start still holds
+    const { sqlite, db, cycle } = retentionWorld();
+    const resources = new D1ResourceOwnershipStore(db as never);
+    await resources.reserveAll(
+      [{ kind: 'run', resourceId: 'run' }],
+      { kind: 'human', id: 'resource-owner' },
+      'claim-token',
+    );
+    retentionSnapshot(sqlite, 'run');
+    const deleteRun = vi.fn(async () => 0);
+    const options = () => ({
+      ...cycle.options(),
+      resourceOwnerTable: RESOURCE_OWNERSHIP_TABLE,
+      artifactStore: { deleteRun },
+    });
+    const logged = vi
+      .spyOn(console, 'error')
+      .mockImplementation(() => undefined);
+    onTestFinished(() => {
+      logged.mockRestore();
+    });
+
+    // #when a pass runs
+    const kept = await purgeExpiredWorkflowRuns(db, options());
+
+    // #then it keeps the snapshot and its artifacts, and the claim
+    expect(kept).toBe(0);
+    expect(remainingRunIds(sqlite)).toEqual(['run']);
+    expect(deleteRun).not.toHaveBeenCalled();
+    expect(
+      sqlite
+        .prepare(
+          `SELECT reservation_token FROM ${RESOURCE_OWNERSHIP_TABLE} WHERE resource_kind='run' AND resource_id='run'`,
+        )
+        .get(),
+    ).toEqual({ reservation_token: 'claim-token' });
+
+    // #when the start commits its claim and a later pass runs
+    await resources.settleReservation('claim-token', []);
+    const removed = await purgeExpiredWorkflowRuns(db, options());
+
+    // #then the snapshot, its artifacts and its claim are removed, and neither
+    // pass logged a configuration problem
+    expect(removed).toBe(1);
+    expect(remainingRunIds(sqlite)).toEqual([]);
+    expect(deleteRun).toHaveBeenCalledTimes(1);
+    expect(await resources.owner('run', 'run')).toBeUndefined();
+    expect(logged).not.toHaveBeenCalled();
+  });
+
+  it('purges an expired terminal snapshot and logs the missing registry when the configured ownership registry does not exist', async () => {
+    // #given an expired terminal snapshot, and a configured ownership table no
+    // start has created
+    const { sqlite, db, cycle } = retentionWorld();
+    retentionSnapshot(sqlite, 'run');
+    const logged = vi
+      .spyOn(console, 'error')
+      .mockImplementation(() => undefined);
+    onTestFinished(() => {
+      logged.mockRestore();
+    });
+
+    // #when a pass runs
+    const removed = await purgeExpiredWorkflowRuns(db, {
+      ...cycle.options(),
+      resourceOwnerTable: RESOURCE_OWNERSHIP_TABLE,
+    });
+
+    // #then the snapshot is removed, and one structured line names the table
+    expect(removed).toBe(1);
+    expect(remainingRunIds(sqlite)).toEqual([]);
+    expect(logged).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(String(logged.mock.calls[0]?.[0]))).toMatchObject({
+      type: 'retention-config',
+      resourceOwnerTable: RESOURCE_OWNERSHIP_TABLE,
+    });
   });
 
   it.each([
@@ -4204,13 +4276,16 @@ describe('run retention SQL boundaries', () => {
       }),
     ).toBe(1);
     retentionSnapshot(sqlite, 'second');
+    const owners = 'x'.repeat(89_000);
+    await createResourceOwnershipSchema(db as never);
+    sqlite.exec(`ALTER TABLE ${RESOURCE_OWNERSHIP_TABLE} RENAME TO ${owners}`);
     const deleteRun = vi.fn(async () => 0);
     await expect(
       purgeExpiredWorkflowRuns(db, {
         ...cycle.options(),
         startIdempotencyTable: undefined,
         cursor: undefined,
-        resourceOwnerTable: 'x'.repeat(89_000),
+        resourceOwnerTable: owners,
         artifactStore: { deleteRun },
       }),
     ).rejects.toThrow(/budget/);
@@ -4275,7 +4350,7 @@ describe('run retention SQL boundaries', () => {
     expect(metrics.maxSelectorBytes).toBeGreaterThan(500_000);
     expect(metrics.maxSelectorBytes).toBeLessThanOrEqual(1_000_000);
     expect(metrics.maxBindings).toBe(13);
-    expect(metrics.statements).toBe(9);
+    expect(metrics.statements).toBe(10);
     console.info('RETENTION_MODERN_MAX', JSON.stringify(metrics));
   });
 
@@ -4337,7 +4412,7 @@ describe('run retention SQL boundaries', () => {
     expect(reservationRows(sqlite)).toEqual([]);
     expect(metrics.legacyReads).toBe(90);
     expect(metrics.maxBindings).toBe(18);
-    expect(metrics.statements).toBe(608);
+    expect(metrics.statements).toBe(609);
     console.info('RETENTION_LEGACY_ORPHAN_MAX', JSON.stringify(metrics));
   });
 });
