@@ -332,8 +332,8 @@ jobs:
 
       # Each probe step runs under its own continue-on-error, so one probe's
       # red, or an expected upstream red, skips no probe after it. A typecheck
-      # probe runs one script that a package's `typecheck` chains, so a red tsc
-      # program hides none after it.
+      # probe runs one script that a package's or the root `typecheck` chains,
+      # so a red tsc program hides none after it.
       - name: Typecheck breakwater src against newest core
         id: typecheck_breakwater_src
         continue-on-error: true
@@ -377,8 +377,16 @@ jobs:
         continue-on-error: true
         run: pnpm --filter @proofoftech/breakwater build
 
+      # The packages' typecheck programs map Breakwater's package subpaths to
+      # source; the harness program resolves them to dist/.
+      - name: Typecheck the Workers test harness against newest core
+        id: typecheck_harness
+        continue-on-error: true
+        run: pnpm run typecheck:harness
+
       # Bundles the flowsafe spike Worker so this job can see a published-dist
-      # bundling regression that typecheck and test structurally cannot.
+      # bundling regression that typecheck and the package suites structurally
+      # cannot.
       - name: Bundle the flowsafe spike Worker against newest core
         id: bundle
         continue-on-error: true
@@ -402,6 +410,32 @@ jobs:
         id: tests_flowsafe_workers
         continue-on-error: true
         run: pnpm exec vitest run --config vitest.flowsafe-workers.config.ts
+
+      # Breakwater's connector SDK imports @mastra/core, and its Workers-pool
+      # suite loads it inside workerd the same way.
+      - name: Test breakwater workers project against newest core
+        id: tests_breakwater_workers
+        continue-on-error: true
+        run: pnpm exec vitest run --config vitest.breakwater-workers.config.mts
+
+      # The harness bundles the deploy Worker, whose FlowSafe package subpaths
+      # resolve only to dist/. The prebuild hook would rebuild Breakwater and
+      # stop at its red before FlowSafe's tsc runs; the Breakwater build above
+      # already wrote the dist/ this build reads.
+      - name: Build flowsafe against newest core
+        id: build_flowsafe
+        continue-on-error: true
+        run: pnpm --config.enable-pre-post-scripts=false --filter @proofoftech/flowsafe build
+
+      # Wrangler bundles and starts each Worker scripts/flowsafe-harness.test.ts
+      # declares on the newest core, which shows a Worker startup failure the
+      # bundle probe cannot. The step timeout leaves the job time to report
+      # every probe when the harness hangs.
+      - name: Test the flowsafe Wrangler harness against newest core
+        id: tests_flowsafe_harness
+        continue-on-error: true
+        timeout-minutes: 10
+        run: pnpm exec vitest run --config vitest.flowsafe-harness.config.ts
 
       # The probe steps swallow their own status, so this step is what carries
       # a red probe to the job status. The summary lines report a flip
@@ -429,8 +463,12 @@ jobs:
           report "flowsafe typecheck:spike" "${{ steps.typecheck_flowsafe_spike.outcome }}"
           report "flowsafe typecheck:deploy" "${{ steps.typecheck_flowsafe_deploy.outcome }}"
           report "breakwater build" "${{ steps.build_breakwater.outcome }}"
+          report "root typecheck:harness" "${{ steps.typecheck_harness.outcome }}"
           report "spike bundle" "${{ steps.bundle.outcome }}"
           report "breakwater suite" "${{ steps.tests_breakwater.outcome }}"
           report "flowsafe suite" "${{ steps.tests_flowsafe.outcome }}"
           report "flowsafe workers suite" "${{ steps.tests_flowsafe_workers.outcome }}"
+          report "breakwater workers suite" "${{ steps.tests_breakwater_workers.outcome }}"
+          report "flowsafe build" "${{ steps.build_flowsafe.outcome }}"
+          report "flowsafe harness suite" "${{ steps.tests_flowsafe_harness.outcome }}"
           exit "$red"
