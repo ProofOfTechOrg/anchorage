@@ -45,6 +45,7 @@ const BASE64_SHAPE_MIN_LENGTH = 32;
 
 /** Options accepted by `collectFleetInventory`, named for the bounded API. */
 export interface CollectFleetInventoryOptions {
+  readonly dispatchNamespace?: string;
   readonly hostRoutingKvId?: string;
   readonly databaseNamePrefix: string;
   readonly scriptNamePrefix: string;
@@ -54,6 +55,7 @@ export interface CollectFleetInventoryOptions {
 
 /** Canonical inventory options after defaults resolve at run start. */
 export interface FleetInventoryRunOptions {
+  readonly dispatchNamespace?: string;
   readonly hostRoutingKvId?: string;
   readonly databaseNamePrefix: string;
   readonly scriptNamePrefix: string;
@@ -567,7 +569,12 @@ export function canonicalFleetInventoryRunOptions(
   exactKeys(
     candidate,
     ['databaseNamePrefix', 'scriptNamePrefix'],
-    ['hostRoutingKvId', 'includeDispatchNamespace', 'includeR2Buckets'],
+    [
+      'dispatchNamespace',
+      'hostRoutingKvId',
+      'includeDispatchNamespace',
+      'includeR2Buckets',
+    ],
   );
   if (!candidate.databaseNamePrefix || !candidate.scriptNamePrefix) {
     throw new Error(
@@ -577,6 +584,8 @@ export function canonicalFleetInventoryRunOptions(
   if (
     typeof candidate.databaseNamePrefix !== 'string' ||
     typeof candidate.scriptNamePrefix !== 'string' ||
+    (candidate.dispatchNamespace !== undefined &&
+      !boundedString(candidate.dispatchNamespace)) ||
     (candidate.hostRoutingKvId !== undefined &&
       typeof candidate.hostRoutingKvId !== 'string') ||
     (candidate.includeDispatchNamespace !== undefined &&
@@ -589,6 +598,11 @@ export function canonicalFleetInventoryRunOptions(
   const hostRoutingKvId = candidate.hostRoutingKvId
     ? candidate.hostRoutingKvId
     : undefined;
+  const includeDispatchNamespace =
+    candidate.includeDispatchNamespace ?? hostRoutingKvId !== undefined;
+  if (candidate.dispatchNamespace !== undefined && !includeDispatchNamespace) {
+    return malformed();
+  }
   assertNoCredentialInInventoryText(
     candidate.databaseNamePrefix,
     'databaseNamePrefix',
@@ -600,12 +614,20 @@ export function canonicalFleetInventoryRunOptions(
   if (hostRoutingKvId !== undefined) {
     assertNoCredentialInInventoryText(hostRoutingKvId, 'hostRoutingKvId');
   }
+  if (candidate.dispatchNamespace !== undefined) {
+    assertNoCredentialInInventoryText(
+      candidate.dispatchNamespace,
+      'dispatchNamespace',
+    );
+  }
   return {
+    ...(candidate.dispatchNamespace === undefined
+      ? {}
+      : { dispatchNamespace: candidate.dispatchNamespace }),
     ...(hostRoutingKvId === undefined ? {} : { hostRoutingKvId }),
     databaseNamePrefix: candidate.databaseNamePrefix,
     scriptNamePrefix: candidate.scriptNamePrefix,
-    includeDispatchNamespace:
-      candidate.includeDispatchNamespace ?? hostRoutingKvId !== undefined,
+    includeDispatchNamespace,
     includeR2Buckets: candidate.includeR2Buckets ?? false,
   };
 }
@@ -633,11 +655,14 @@ function fleetInventoryRunOptionsFromUnknown(
       'includeDispatchNamespace',
       'includeR2Buckets',
     ],
-    ['hostRoutingKvId'],
+    ['dispatchNamespace', 'hostRoutingKvId'],
   );
   if (
     !boundedString(candidate.databaseNamePrefix) ||
     !boundedString(candidate.scriptNamePrefix) ||
+    (candidate.dispatchNamespace !== undefined &&
+      (!boundedString(candidate.dispatchNamespace) ||
+        candidate.includeDispatchNamespace !== true)) ||
     (candidate.hostRoutingKvId !== undefined &&
       !boundedString(candidate.hostRoutingKvId)) ||
     typeof candidate.includeDispatchNamespace !== 'boolean' ||
@@ -659,7 +684,16 @@ function fleetInventoryRunOptionsFromUnknown(
       'hostRoutingKvId',
     );
   }
+  if (candidate.dispatchNamespace !== undefined) {
+    assertNoCredentialInInventoryText(
+      candidate.dispatchNamespace,
+      'dispatchNamespace',
+    );
+  }
   return {
+    ...(candidate.dispatchNamespace === undefined
+      ? {}
+      : { dispatchNamespace: candidate.dispatchNamespace }),
     ...(candidate.hostRoutingKvId === undefined
       ? {}
       : { hostRoutingKvId: candidate.hostRoutingKvId }),

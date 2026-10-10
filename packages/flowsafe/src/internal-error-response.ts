@@ -8,12 +8,11 @@ function errorText(error: unknown): string {
   }
 }
 
-/** Package-internal catch-all for public HTTP routes. */
-export function internalErrorResponse(
-  route: string,
-  error: unknown,
-  status: 500 | 502 = 500,
-): Response {
+/**
+ * Package-internal: log a failure that an HTTP answer omits, and return the
+ * message the answer carries in its place.
+ */
+export function internalErrorMessage(route: string, error: unknown): string {
   try {
     console.error(
       JSON.stringify({
@@ -26,11 +25,23 @@ export function internalErrorResponse(
   } catch {
     // Diagnostic failure cannot prevent the HTTP response.
   }
-  return new Response(JSON.stringify({ error: 'internal error' }), {
-    status,
-    headers: {
-      'content-type': 'application/json',
-      'cache-control': 'no-store',
+  return 'internal error';
+}
+
+/** Package-internal catch-all for public HTTP routes; `status` is a 5xx. */
+export function internalErrorResponse(
+  route: string,
+  error: unknown,
+  status = 500,
+): Response {
+  return new Response(
+    JSON.stringify({ error: internalErrorMessage(route, error) }),
+    {
+      status,
+      headers: {
+        'content-type': 'application/json',
+        'cache-control': 'no-store',
+      },
     },
-  });
+  );
 }

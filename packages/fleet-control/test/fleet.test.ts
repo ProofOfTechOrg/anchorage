@@ -1045,7 +1045,7 @@ describe('fleet operations', () => {
     );
   });
 
-  it('checks each configured duty so a fresh sweep cannot mask stale purge or failed tick', async () => {
+  it('checks each configured duty so a fresh sweep cannot mask stale purge or a failed deadline, tick or notification duty', async () => {
     const acme = record('acme');
     const backend = new FleetBackend();
     backend.live.set(
@@ -1056,9 +1056,15 @@ describe('fleet operations', () => {
           nextAlarmAt: 10_100,
           lastSweepAt: 9_900,
           lastPurgeAt: 7_000,
+          lastDeadlineAt: 9_900,
+          lastDeadlineAttemptAt: 9_940,
+          lastDeadlineError: 'deadline database unavailable',
           lastTickAt: 9_900,
           lastTickAttemptAt: 9_950,
           lastTickError: 'tick database unavailable',
+          lastNotificationAt: 9_900,
+          lastNotificationAttemptAt: 9_960,
+          lastNotificationError: 'inbox database unavailable',
         },
       }),
     );
@@ -1077,7 +1083,7 @@ describe('fleet operations', () => {
       expect.objectContaining({
         kind: 'maintenance-stale',
         detail: expect.stringMatching(
-          /purge last succeeded 3000ms ago; tick last attempt failed at 9950: tick database unavailable/,
+          /purge last succeeded 3000ms ago; deadline last attempt failed at 9940: deadline database unavailable; tick last attempt failed at 9950: tick database unavailable; notification last attempt failed at 9960: inbox database unavailable/,
         ),
       }),
     ]);
@@ -1085,6 +1091,49 @@ describe('fleet operations', () => {
     expect(backend.calls.filter((call) => call === 'maintenance:acme')).toEqual(
       ['maintenance:acme'],
     );
+  });
+
+  it.each([
+    [
+      'has never succeeded',
+      null,
+      'deadline has not succeeded within the deployment grace period',
+    ],
+    [
+      'last succeeded too long ago',
+      7_000,
+      'deadline last succeeded 3000ms ago',
+    ],
+  ])('flags a deadline duty that %s as it flags a sweep', async (_when, lastDeadlineAt, detail) => {
+    const acme = record('acme');
+    const backend = new FleetBackend();
+    backend.live.set(
+      acme.tenantTag,
+      liveFor(acme, {
+        maintenance: {
+          armed: true,
+          nextAlarmAt: 10_100,
+          lastSweepAt: 9_900,
+          lastPurgeAt: 9_900,
+          lastDeadlineAt,
+        },
+      }),
+    );
+
+    const findings = await auditFleetDrift({
+      store: storeFor([acme]),
+      records: [acme],
+      inventory: inventoryFor([acme]),
+      backendFor: () => backend,
+      specFor: (item) => spec(item),
+      maintenanceSecretFor: () => 'maintenance-admin-secret-value-00001',
+      staleAfterMs: 1_000,
+      now: 10_000,
+    });
+
+    expect(findings).toEqual([
+      expect.objectContaining({ kind: 'maintenance-stale', detail }),
+    ]);
   });
 
   it('audits recorded and live resources in both directions', async () => {
@@ -1374,9 +1423,13 @@ describe('fleet operations', () => {
       });
 
     await expect(audit([auditBinding])).resolves.toEqual([]);
+    const { dispatchNamespace: _namespace, ...omittedNamespaceBinding } =
+      auditBinding;
+    await expect(audit([omittedNamespaceBinding])).resolves.toEqual([]);
     for (const drifted of [
       [],
       [{ ...auditBinding, dispatchNamespace: 'foreign-namespace' }],
+      [{ ...omittedNamespaceBinding, namespaceId: 'foreign-namespace-id' }],
     ]) {
       await expect(audit(drifted)).resolves.toEqual(
         expect.arrayContaining([
@@ -3017,6 +3070,116 @@ describe('fleet operations', () => {
         }),
       }),
     ).rejects.toThrow(/migration base mismatch/);
+  });
+
+  it('retains owned dispatch namespaces when migration adds an omitted provider binding', async () => {
+    class OmittedNamespaceBackend extends ImmutableFleetBackend {
+      override async ensurePlatformResources(deployment: DeploymentSpec) {
+        const result = await super.ensurePlatformResources(deployment);
+        return {
+          ...result,
+          resources: {
+            ...result.resources,
+            stateWorker: {
+              ...result.resources.stateWorker,
+              dispatchNamespace: 'fleet-conformance',
+            },
+          },
+        };
+      }
+
+      override async deployWorker(
+        ...input: Parameters<ImmutableFleetBackend['deployWorker']>
+      ) {
+        const result = await super.deployWorker(...input);
+        const live = this.releases.get(result.physicalScriptName);
+        if (!live) throw new Error('missing migration candidate');
+        const topology = externalReleaseTopology(
+          input[0],
+          input[3] as FleetRecord['platformResources'],
+        );
+        this.releases.set(result.physicalScriptName, {
+          ...live,
+          durableObjectBindings: topology.durableObjectBindings.map(
+            ({ dispatchNamespace: _namespace, ...binding }) => binding,
+          ),
+        });
+        return result;
+      }
+    }
+    const acme = record('acme');
+    const initialSpec: DeploymentSpec = {
+      ...spec(acme, 1),
+      durableObjectBindings: [{ name: 'RUNNER', className: 'Runner' }],
+    };
+    const backend = new OmittedNamespaceBackend();
+    const { resources } = await backend.ensurePlatformResources(initialSpec);
+    const topology = externalReleaseTopology(initialSpec, resources);
+    const physicalScriptName = externalReleaseScriptName(initialSpec);
+    const platformTarget = backend.describeExternalPlatformTarget(initialSpec);
+    const current: FleetRecord = {
+      ...acme,
+      desiredSpecDigest: deploymentSpecDigest(initialSpec),
+      durableObjectBindings: topology.durableObjectBindings,
+      platformResources: resources,
+      platformTarget,
+      outboundPolicy: platformTarget.outboundPolicy,
+      activeRelease: {
+        physicalScriptName,
+        specDigest: deploymentSpecDigest(initialSpec),
+        artifactVersion: acme.artifactVersion,
+        releaseSchemaVersion: initialSpec.schemaVersion,
+        topology,
+      },
+    };
+    backend.routedScriptName = physicalScriptName;
+    backend.releases.set(
+      physicalScriptName,
+      liveFor(current, { scriptName: physicalScriptName }),
+    );
+    const target: DeploymentSpec = {
+      ...spec(current, 2),
+      durableObjectBindings: [
+        ...initialSpec.durableObjectBindings,
+        { name: 'RUNNER_V2', className: 'RunnerV2' },
+      ],
+    };
+    const store = storeFor([current]);
+
+    const [migrated] = await migrateFleet({
+      store,
+      records: [current],
+      canaryTenantTags: [],
+      backendFor: () => backend,
+      specFor: () => target,
+      secretsFor: () => ({
+        deploymentIdentity: 'deployment-identity-secret-value-0001',
+        maintenanceAdmin: 'maintenance-admin-secret-value-00001',
+      }),
+    });
+
+    expect(migrated?.phase).toBe('ready');
+    expect(migrated?.activeRelease?.topology?.durableObjectBindings).toEqual([
+      {
+        name: 'RUNNER',
+        className: 'Runner',
+        namespaceId: 'state-worker-acme-RUNNER',
+        scriptName: externalStateScriptName(initialSpec),
+        dispatchNamespace: 'fleet-conformance',
+      },
+      {
+        name: 'RUNNER_V2',
+        className: 'RunnerV2',
+        namespaceId: 'state-worker-acme-RUNNER_V2',
+        scriptName: externalStateScriptName(initialSpec),
+        dispatchNamespace: 'fleet-conformance',
+      },
+    ]);
+    expect(migrated?.rollbackRelease).toEqual(current.activeRelease);
+    expect(backend.routedScriptName).toBe(externalReleaseScriptName(target));
+    expect(
+      (await store.get('acme', 'production'))?.activeRelease?.topology,
+    ).toEqual(migrated?.activeRelease?.topology);
   });
 
   it('keeps the old route live when an immutable candidate fails exact validation', async () => {

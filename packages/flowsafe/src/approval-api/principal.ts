@@ -382,6 +382,18 @@ export function samePrincipal(
 }
 
 /**
+ * @internal Whether a recorded execution owner is `principal`: the same kind
+ * and id. An owner names no role or purpose, so this is the comparison that
+ * holds for it; samePrincipal compares two principals.
+ */
+export function isOwnedBy(
+  owner: { readonly kind: string; readonly id: string },
+  principal: { readonly kind: string; readonly id: string },
+): boolean {
+  return owner.kind === principal.kind && owner.id === principal.id;
+}
+
+/**
  * The role an automated principal projects into breakwater's `Actor`.
  *
  * `Actor.role` is required, so an automated principal must carry SOME label.

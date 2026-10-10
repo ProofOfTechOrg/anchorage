@@ -336,6 +336,133 @@ describe('CloudflareProvisioningClient', () => {
     ]);
   });
 
+  it.each([
+    {
+      kind: 'fresh state despite a desired v1 cursor',
+      appliedTag: null,
+      previousTag: 'state-v1',
+      appendV2: false,
+      migrations: {
+        new_tag: 'state-v1',
+        steps: [{ new_sqlite_classes: ['Maintenance'] }],
+      },
+    },
+    {
+      kind: 'already applied v1',
+      appliedTag: 'state-v1',
+      previousTag: undefined,
+      appendV2: false,
+      migrations: undefined,
+    },
+    {
+      kind: 'applied v1 advancing to desired v2',
+      appliedTag: 'state-v1',
+      previousTag: 'state-v2',
+      appendV2: true,
+      migrations: {
+        old_tag: 'state-v1',
+        new_tag: 'state-v2',
+        steps: [{ new_sqlite_classes: ['MaintenanceV2'] }],
+      },
+    },
+    {
+      kind: 'unknown applied cursor',
+      appliedTag: 'unknown',
+      previousTag: 'state-v1',
+      appendV2: false,
+      migrations: undefined,
+    },
+    {
+      kind: 'legacy previous cursor without an applied override',
+      appliedTag: undefined,
+      previousTag: 'state-v1',
+      appendV2: true,
+      migrations: {
+        old_tag: 'state-v1',
+        new_tag: 'state-v2',
+        steps: [{ new_sqlite_classes: ['MaintenanceV2'] }],
+      },
+    },
+    {
+      kind: 'legacy initial upload without either cursor',
+      appliedTag: undefined,
+      previousTag: undefined,
+      appendV2: false,
+      migrations: {
+        new_tag: 'state-v1',
+        steps: [{ new_sqlite_classes: ['Maintenance'] }],
+      },
+    },
+  ])('selects namespaced state migrations for $kind', async ({
+    appliedTag,
+    previousTag,
+    appendV2,
+    migrations,
+  }) => {
+    const spec = deployment({
+      durableObjectBindings: [
+        { name: 'MAINTENANCE', className: 'Maintenance' },
+      ],
+      durableObjectMigrations: [
+        { tag: 'state-v1', newSqliteClasses: ['Maintenance'] },
+        ...(appendV2
+          ? [{ tag: 'state-v2', newSqliteClasses: ['MaintenanceV2'] }]
+          : []),
+      ],
+      previousDurableObjectTag: previousTag,
+    });
+    const metadata: Array<Record<string, unknown>> = [];
+    const client = new CloudflareProvisioningClient({
+      accountId: 'account',
+      apiToken: 'inert',
+      dispatchNamespace: 'fleet',
+      rateCoordinator: testRateCoordinator(),
+      fetch: async (input, init) => {
+        const request = new Request(input, init);
+        if (request.url === 'data:,') return new Response('');
+        if (request.method === 'GET')
+          return envelope({
+            namespace_name: 'fleet',
+            trusted_workers: false,
+            script_count: 0,
+          });
+        expect(request.method).toBe('PUT');
+        const form = await request.formData();
+        metadata.push(JSON.parse(String(form.get('metadata'))));
+        return envelope({ etag: 'uploaded-version' });
+      },
+    });
+    const options = {
+      spec,
+      database: { id: 'db-acme', name: spec.databaseName, created: false },
+      artifact: {
+        mainModule: spec.mainModule,
+        modules: spec.modules,
+        compatibilityDate: spec.compatibilityDate,
+      },
+      artifactDigest: 'a'.repeat(64),
+      maintenanceCapabilityPublicKey: 'inert-public-key',
+      sharedOutboundWorkerName: 'fixture-outbound',
+      stateEgressCredentialDigest: 'b'.repeat(64),
+      ...(appliedTag !== undefined
+        ? { appliedDurableObjectTag: appliedTag }
+        : {}),
+    };
+    const upload = fenced(client, () =>
+      client.uploadNamespacedStateWorker(options),
+    );
+    if (appliedTag === 'unknown') {
+      await expect(upload).rejects.toThrow(
+        /absent from the ordered migration history/,
+      );
+      expect(metadata).toEqual([]);
+    } else {
+      await upload;
+      expect(metadata).toHaveLength(1);
+      expect(metadata[0]?.migrations).toEqual(migrations);
+    }
+  });
+
   it('fails closed for unfenced writes and request timeouts outside the lease TTL', async () => {
     let providerWrites = 0;
     const client = new CloudflareProvisioningClient({
@@ -472,7 +599,10 @@ describe('CloudflareProvisioningClient', () => {
     ).toBeUndefined();
   });
 
-  it('creates or reuses only a dispatch namespace that attests trusted_workers=false', async () => {
+  it.each([
+    false,
+    undefined,
+  ])('creates or reuses an untrusted dispatch namespace with trusted_workers=%s', async (trustedWorkers) => {
     const calls: string[] = [];
     const request = vi.fn(
       async (input: string | URL | Request, init?: RequestInit) => {
@@ -490,7 +620,9 @@ describe('CloudflareProvisioningClient', () => {
             namespace_name: 'fleet',
             namespace_id: 'namespace-id',
             script_count: 0,
-            trusted_workers: false,
+            ...(trustedWorkers === undefined
+              ? {}
+              : { trusted_workers: trustedWorkers }),
           });
         }
         if (url.pathname.endsWith('/workers/dispatch/namespaces')) {
@@ -517,7 +649,12 @@ describe('CloudflareProvisioningClient', () => {
     ]);
   });
 
-  it('blocks a dispatch upload when namespace trust is true', async () => {
+  it.each([
+    true,
+    null,
+    'false',
+    0,
+  ])('blocks a dispatch upload when namespace trust is %j', async (trustedWorkers) => {
     let uploaded = false;
     const client = new CloudflareProvisioningClient({
       accountId: 'account',
@@ -537,7 +674,7 @@ describe('CloudflareProvisioningClient', () => {
           return envelope({
             namespace_name: 'fleet',
             script_count: 0,
-            trusted_workers: true,
+            trusted_workers: trustedWorkers,
           });
         }
         throw new Error(`unexpected request ${url.pathname}`);
@@ -2406,6 +2543,163 @@ describe('CloudflareProvisioningClient', () => {
       'GET:/client/v4/accounts/account/tokens/verify',
       'GET:/client/v4/accounts/account/tokens/token-id',
     ]);
+  });
+
+  it.each([
+    false,
+    true,
+  ])('accepts the live audit consumer script response (existing: %s)', async (existing) => {
+    const consumer = {
+      consumer_id: 'consumer-id',
+      type: 'worker',
+      script: 'fleet-audit',
+      settings: {
+        batch_size: 100,
+        max_concurrency: 4,
+        max_retries: 5,
+        max_wait_time_ms: 5_000,
+        retry_delay: 0,
+      },
+    };
+    let created = existing;
+    const request = vi.fn(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        const url = new URL(
+          typeof input === 'string'
+            ? input
+            : input instanceof URL
+              ? input.href
+              : input.url,
+        );
+        const method = init?.method ?? 'GET';
+        if (url.pathname.endsWith('/accounts/account/queues')) {
+          return envelope([
+            { queue_id: 'queue-id', queue_name: 'fleet-audit' },
+          ]);
+        }
+        if (
+          url.pathname.endsWith('/accounts/account/queues/queue-id/consumers')
+        ) {
+          if (method === 'POST') {
+            created = true;
+            return envelope(consumer);
+          }
+          return envelope(created ? [consumer] : []);
+        }
+        if (
+          url.pathname.endsWith(
+            '/accounts/account/queues/queue-id/consumers/consumer-id',
+          )
+        ) {
+          return envelope(consumer);
+        }
+        throw new Error(`unexpected Cloudflare request: ${url.href}`);
+      },
+    );
+    const client = new CloudflareProvisioningClient({
+      accountId: 'account',
+      apiToken: 'token',
+      rateCoordinator: testRateCoordinator(),
+      dispatchNamespace: 'fleet',
+      fetch: request,
+    });
+
+    await expect(
+      fenced(client, () =>
+        client.ensureQueueConsumer({
+          queueName: 'fleet-audit',
+          scriptName: 'fleet-audit',
+        }),
+      ),
+    ).resolves.toBeUndefined();
+    expect(request.mock.calls.some(([, init]) => init?.method === 'PUT')).toBe(
+      false,
+    );
+  });
+
+  it.each(
+    ['get', 'list'].flatMap((stage) =>
+      [
+        {},
+        { script: 'other-audit' },
+        { script: 'fleet-audit', script_name: 'other-audit' },
+        { script: 'other-audit', script_name: 'fleet-audit' },
+        { script: 42, script_name: 'fleet-audit' },
+        { script: 'fleet-audit', script_name: null },
+      ].map((aliases) => ({ stage, aliases })),
+    ),
+  )('refuses invalid audit consumer aliases at $stage: $aliases', async ({
+    stage,
+    aliases,
+  }) => {
+    const consumer = {
+      consumer_id: 'consumer-id',
+      type: 'worker',
+      settings: {
+        batch_size: 100,
+        max_concurrency: 4,
+        max_retries: 5,
+        max_wait_time_ms: 5_000,
+      },
+    };
+    let listCount = 0;
+    const client = new CloudflareProvisioningClient({
+      accountId: 'account',
+      apiToken: 'token',
+      rateCoordinator: testRateCoordinator(),
+      dispatchNamespace: 'fleet',
+      fetch: async (input) => {
+        const url = new URL(
+          typeof input === 'string'
+            ? input
+            : input instanceof URL
+              ? input.href
+              : input.url,
+        );
+        if (url.pathname.endsWith('/accounts/account/queues')) {
+          return envelope([
+            { queue_id: 'queue-id', queue_name: 'fleet-audit' },
+          ]);
+        }
+        if (
+          url.pathname.endsWith('/accounts/account/queues/queue-id/consumers')
+        ) {
+          listCount += 1;
+          return envelope([
+            {
+              ...consumer,
+              ...(stage === 'list' && listCount === 2
+                ? aliases
+                : { script: 'fleet-audit' }),
+            },
+          ]);
+        }
+        if (
+          url.pathname.endsWith(
+            '/accounts/account/queues/queue-id/consumers/consumer-id',
+          )
+        ) {
+          return envelope({
+            ...consumer,
+            ...(stage === 'get' ? aliases : { script: 'fleet-audit' }),
+          });
+        }
+        throw new Error(`unexpected Cloudflare request: ${url.href}`);
+      },
+    });
+
+    await expect(
+      fenced(client, () =>
+        client.ensureQueueConsumer({
+          queueName: 'fleet-audit',
+          scriptName: 'fleet-audit',
+        }),
+      ),
+    ).rejects.toThrow(
+      stage === 'get'
+        ? 'does not match the requested configuration'
+        : 'does not have exactly one attested consumer',
+    );
   });
 
   it('updates the sole audit consumer by ID for every configuration difference and re-attests it', async () => {

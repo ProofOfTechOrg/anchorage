@@ -8,6 +8,8 @@ import {
   type ApprovalRole,
   RUN_START_ROLES,
 } from '../approval-api/index.js';
+import { isRefusalStatus } from '../do-runner/do-status-error.js';
+import { objectAnswerResponse } from '../host-kit/do-response.js';
 import { hostErrorText } from '../host-kit/host-approval-service.js';
 import {
   assertNoClientMemoryIds,
@@ -273,11 +275,11 @@ export function createSignalRouter(options: SignalRouterOptions): SignalRouter {
             ? 'invalid-thread'
             : `downstream-${response.status}`,
       );
-      return response.status === 404
-        ? json({ error: 'thread not found' }, 404)
-        : response;
+      if (response.status === 404)
+        return json({ error: 'thread not found' }, 404);
+      return objectAnswerResponse('thread-object', response, 'thread');
     } catch (error) {
-      if (error instanceof RunRouteError) {
+      if (error instanceof RunRouteError && isRefusalStatus(error.status)) {
         await audit(
           'rejected',
           error.status === 404

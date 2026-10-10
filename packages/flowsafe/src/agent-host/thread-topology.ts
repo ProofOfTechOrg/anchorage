@@ -23,6 +23,7 @@ import {
   type ExecutionFenceWiring,
   isPathSafeId,
   type PersistedStartResult,
+  RunNotSuspendedError,
   requireStartIdempotency,
   resourceIdFromKey,
   type StartIdempotencyWiring,
@@ -30,11 +31,16 @@ import {
   type StartReservationReading,
 } from '../do-runner/index.js';
 import {
+  isTerminalRunStatus,
+  type RunStatus,
+} from '../do-runner/run-terminal-state.js';
+import {
   captureReservation,
   type StartReservationOwner,
 } from '../do-runner/start-reservation-contract.js';
 import {
   doStartLiveness,
+  objectAnswerError,
   persistedStartExecution,
   persistedStartRecord,
   publicRunSummary,
@@ -148,7 +154,9 @@ export interface AgentThreadTopology {
    * Resumes a decided agent approval's run through its thread object. An
    * implementation sends `expectedSuspensionFor(record)` with the resume, so a
    * decision for an earlier suspension of the step is refused; without it the
-   * resume is unchecked.
+   * resume is unchecked. A run that has ended rejects with a 409 whose
+   * `reason.code` is `RUN_NOT_SUSPENDED` when the context's principal started
+   * it, and with a 404 `RunRouteError` otherwise.
    */
   resume(
     context: ActorContext,
@@ -175,20 +183,8 @@ export interface AgentThreadDispatchTopology extends AgentThreadBoundTopology {
   ): Promise<AgentRunEnvelope | undefined>;
 }
 
-async function errorFrom(response: Response): Promise<RunRouteError> {
-  let message = `agent request failed with status ${response.status}`;
-  let reason: unknown;
-  try {
-    const payload = (await response.json()) as {
-      error?: unknown;
-      reason?: unknown;
-    };
-    if (typeof payload?.error === 'string') message = payload.error;
-    reason = payload?.reason;
-  } catch {
-    // Keep the status-only fallback.
-  }
-  return new RunRouteError(response.status, message, reason);
+function errorFrom(response: Response): Promise<RunRouteError> {
+  return objectAnswerError('thread-object', response, 'agent');
 }
 
 async function envelope(response: Response): Promise<AgentRunEnvelope> {
@@ -281,17 +277,47 @@ export function createAgentThreadTopology<Id>(
     return fetchStatus(context, input, resourceId, true);
   };
   /**
+   * The owner-checked replay read: the thread object answers it only for the
+   * principal that started the run, and without the claim registry.
+   *
+   * The dispatch variant of the status route, because a run that already
+   * reached a terminal state has had its run record and ownership released, and
+   * the public variant answers 404 for exactly that case — which a replay must
+   * not confuse with "no run".
+   */
+  const replayRead = async (
+    context: ActorContext,
+    agentId: string,
+    threadId: string,
+    runId: string,
+    owner: StartReservationOwner,
+  ): Promise<PersistedStartResult<AgentRunEnvelope> | undefined> => {
+    const resourceId = context.resourceIdFromKey(threadId);
+    const response = await threads.send(
+      context,
+      threadId,
+      `${AGENT_HOST_ROUTE_PREFIX}/runs/${encodeURIComponent(
+        agentId,
+      )}/${encodeURIComponent(runId)}?resourceId=${encodeURIComponent(
+        resourceId,
+      )}&dispatch=1&replay=1`,
+    );
+    if (response.status === 404) return undefined;
+    return persistedEnvelope(response, {
+      agentId,
+      threadId,
+      resourceId,
+      runId,
+      owner,
+    });
+  };
+  /**
    * A reserved agent run's persisted envelope, read from the thread the
    * reservation recorded — which is NOT necessarily the thread this retry would
    * have minted. That indirection is the whole reason the reservation stores a
    * thread at all: an unthreaded retry mints a fresh thread every time, and
    * without the recorded one it would be asking an empty object about a run it
    * never had.
-   *
-   * The dispatch variant of the status route, because a run that already
-   * reached a terminal state has had its run record and ownership released, and
-   * the public variant answers 404 for exactly that case — which a replay must
-   * not confuse with "no run".
    *
    * NO `requireResourceAccess` here, deliberately. Ownership on this path is
    * the RESERVATION's: the reserve call already refused every principal but the
@@ -308,25 +334,13 @@ export function createAgentThreadTopology<Id>(
     const threadId = reservation.threadId;
     if (threadId === undefined || !isPathSafeId(threadId))
       throw new RunRouteError(503, 'persisted start is not readable');
-    const response = await threads.send(
+    return replayRead(
       context,
-      threadId,
-      `${AGENT_HOST_ROUTE_PREFIX}/runs/${encodeURIComponent(
-        agentId,
-      )}/${encodeURIComponent(
-        reservation.runId,
-      )}?resourceId=${encodeURIComponent(
-        context.resourceIdFromKey(threadId),
-      )}&dispatch=1&replay=1`,
-    );
-    if (response.status === 404) return undefined;
-    return persistedEnvelope(response, {
       agentId,
       threadId,
-      resourceId: context.resourceIdFromKey(threadId),
-      runId: reservation.runId,
-      owner: reservation.owner,
-    });
+      reservation.runId,
+      reservation.owner,
+    );
   };
   const reservedRunLive = async (
     context: ActorContext,
@@ -343,6 +357,33 @@ export function createAgentThreadTopology<Id>(
       )}/${encodeURIComponent(reservation.runId)}/start-liveness`,
     );
     return doStartLiveness(response);
+  };
+  /**
+   * The workflow and status of an ended run the context's principal started,
+   * read once the run's claims are released: an unthreaded run releases its
+   * thread and resource when it ends, and cancellation and timeout cleanup
+   * release its run claim. Every other outcome of the read, a failure
+   * included, is undefined, so the caller keeps the 404 it already has.
+   */
+  const endedRun = async (
+    context: ActorContext,
+    agentId: string,
+    threadId: string,
+    runId: string,
+  ): Promise<{ workflowId: string; status: RunStatus } | undefined> => {
+    try {
+      const replayed = await replayRead(context, agentId, threadId, runId, {
+        kind: context.principal.kind,
+        id: context.principal.id,
+      });
+      if (replayed?.kind !== 'result') return undefined;
+      const { status } = replayed.value.summary;
+      return isTerminalRunStatus(status)
+        ? { workflowId: replayed.execution.workflowId, status }
+        : undefined;
+    } catch {
+      return undefined;
+    }
   };
   return {
     requireBoundThread: async (context, target: BoundThreadTarget) => {
@@ -631,21 +672,45 @@ export function createAgentThreadTopology<Id>(
       validThread(target.threadId);
       validRun(record.runId);
       expectedResource(context, target.threadId, target.resourceId);
-      await requireResourceAccess(
-        context,
-        'thread',
-        target.threadId,
-        'write',
-        'run',
-      );
-      await requireResourceAccess(
-        context,
-        'resource',
-        target.resourceId,
-        'write',
-        'run',
-      );
-      await requireResourceAccess(context, 'run', record.runId, 'write', 'run');
+      try {
+        await requireResourceAccess(
+          context,
+          'thread',
+          target.threadId,
+          'write',
+          'run',
+        );
+        await requireResourceAccess(
+          context,
+          'resource',
+          target.resourceId,
+          'write',
+          'run',
+        );
+        await requireResourceAccess(
+          context,
+          'run',
+          record.runId,
+          'write',
+          'run',
+        );
+      } catch (error) {
+        if (error instanceof RunRouteError && error.status === 404) {
+          const ended = await endedRun(
+            context,
+            target.agentId,
+            target.threadId,
+            record.runId,
+          );
+          if (ended)
+            throw new RunNotSuspendedError(
+              ended.workflowId,
+              record.runId,
+              ended.status,
+            );
+        }
+        throw error;
+      }
       if (!record.decidedBy) {
         throw new RunRouteError(409, 'approval has no decision actor');
       }

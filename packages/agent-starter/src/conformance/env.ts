@@ -43,6 +43,7 @@ export interface ConformanceCandidateEnv {
   /** Remote Durable Object bindings into the stable trusted state script. */
   readonly CONFORMANCE_STATE: NamespaceLike;
   readonly AUDIT_PROXY: NamespaceLike;
+  readonly MAINTENANCE: NamespaceLike;
   /** Present only from the release whose migration added the class. */
   readonly CONFORMANCE_V2?: NamespaceLike;
 

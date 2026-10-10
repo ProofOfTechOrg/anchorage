@@ -18,6 +18,7 @@ import {
   D1ResourceOwnershipStore,
   type ExecutionPrincipal,
   InMemoryResourceOwnershipStore,
+  RESOURCE_OWNERSHIP_TABLE,
   type RecoverableResourceOwnershipStore,
   type ResourceOwnershipDatabase,
 } from '../approval-api/index.js';
@@ -41,12 +42,14 @@ import {
   ExecutionFenceStore,
   ExecutionFenceUnreadableError,
   init,
+  purgeExpiredWorkflowRuns,
   RunSettledConflictError,
   RunStartPendingError,
   RunStateUnreadableError,
   resourceIdFromKey,
   SUSPENSION_TIMEOUT_RESUME_KEY,
 } from '../do-runner/index.js';
+import { runInputDepthMessage } from '../do-runner/run-input-depth.js';
 import { lifecycleFromRequestContext } from '../do-runner/run-lifecycle.js';
 import {
   D1SchedulesStorage,
@@ -1178,18 +1181,23 @@ describe('direct thread host capture', () => {
       const journals = writes.filter(([key]) =>
         key.startsWith('flowsafe:agent-owner-recovery'),
       );
-      expect(journals).toHaveLength(phase === 'failure' ? 1 : 2);
+      expect(journals).toHaveLength(phase === 'failure' ? 1 : 3);
       expect(journals[0]?.[1]).toMatchObject({
         version: 2,
         phase: 'preparing',
         token: args?.[4],
         runRecord: { version: 2, principal: fixture.scope.principal },
       });
-      if (phase !== 'failure')
+      if (phase !== 'failure') {
         expect(journals[1]?.[1]).toMatchObject({
           phase: 'prepared',
           execution: { startToken: expect.any(String) },
         });
+        expect(journals[2]?.[1]).toMatchObject({
+          phase: 'prepared',
+          outcomeRead: true,
+        });
+      }
       const snapshot = await workflows.loadWorkflowSnapshot({
         workflowName: 'durable-agentic-loop',
         runId: 'acme_run',
@@ -1430,7 +1438,7 @@ describe('direct thread host capture', () => {
     const journals = writes.filter(([key]) =>
       key.startsWith(OWNER_RECOVERY_PREFIX),
     );
-    expect(journals).toHaveLength(2);
+    expect(journals).toHaveLength(3);
     expect(journals[0]?.[1]).toMatchObject({
       version: 2,
       phase: 'preparing',
@@ -1452,6 +1460,10 @@ describe('direct thread host capture', () => {
     expect(journals[1]?.[1]).toMatchObject({
       phase: 'prepared-unfenced',
       execution: { tablePrefix: null, startToken: 'test-generation' },
+    });
+    expect(journals[2]?.[1]).toMatchObject({
+      phase: 'prepared-unfenced',
+      outcomeRead: true,
     });
     expect(writes).toContainEqual([
       TEST_RUN_RECORD_KEY,
@@ -2153,7 +2165,16 @@ describe('createThreadAgentHost', () => {
   });
 
   it.each([
-    ['safeContext', { safeContext: { note: nestedArray(257) } }],
+    [
+      'safeContext',
+      { safeContext: { note: nestedArray(257) } },
+      'a safeContext value',
+    ],
+    [
+      'providerOptions',
+      { providerOptions: { deepseek: { thinking: nestedArray(256) } } },
+      'a providerOptions value',
+    ],
     [
       'messages',
       {
@@ -2171,8 +2192,9 @@ describe('createThreadAgentHost', () => {
           },
         ],
       },
+      'agent input',
     ],
-  ] as const)('refuses an agent start whose %s nests 257 levels deep before writing its journal', async (_field, deep) => {
+  ] as const)('refuses an agent start whose %s nests 257 levels deep before writing its journal', async (_field, deep, field) => {
     // #given a start whose caller input nests 257 levels
     const fixture = harness();
     const reserve = vi.spyOn(fixture.resourceAccess, 'reserveAll');
@@ -2184,12 +2206,32 @@ describe('createThreadAgentHost', () => {
     } as unknown as ThreadAgentStartInput);
 
     // #then it is refused as a bad request before anything is stored or streamed
-    await expect(started).rejects.toMatchObject({ status: 400 });
+    await expect(started).rejects.toMatchObject({
+      status: 400,
+      message: runInputDepthMessage(field),
+    });
     expect(mocked.stream).not.toHaveBeenCalled();
     expect(reserve).not.toHaveBeenCalled();
     expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(false);
     expect(fixture.state.has(THREAD_BINDING_KEY)).toBe(false);
     expect(fixture.state.has(TEST_OWNER_RECOVERY_KEY)).toBe(false);
+  });
+
+  it('starts an agent run whose providerOptions value nests exactly 256 levels deep', async () => {
+    // #given a start whose providerOptions entry nests 256 levels
+    const fixture = harness();
+    const thinking = nestedArray(255);
+
+    // #when the host starts the run
+    await fixture.host.start(fixture.scope, {
+      ...THREAD_START_INPUT,
+      providerOptions: { deepseek: { thinking } },
+    } as unknown as ThreadAgentStartInput);
+
+    // #then the run streams with that value
+    expect(mocked.stream.mock.calls[0]?.[1]?.providerOptions).toEqual({
+      deepseek: { thinking },
+    });
   });
 
   it('refuses a scheduled agent start whose stored context nests 257 levels deep', async () => {
@@ -3968,6 +4010,68 @@ describe('createThreadAgentHost', () => {
         expectedSuspension: { suspendedAt: 1_000, resumeCount: 2 },
       }),
     );
+  });
+
+  describe('an approval resume of a run that has ended', () => {
+    function endedRunFixture(status: 'success' | 'timed_out') {
+      const fixture = harness();
+      fixture.setSummary({ runId: 'acme_run', status });
+      fixture.state.set(THREAD_BINDING_KEY, {
+        version: 1,
+        agentId: 'writer',
+        resourceId: RESOURCE_ID,
+      });
+      return fixture;
+    }
+
+    function resumeRequest(): Request {
+      return new Request('https://thread/_flowsafe/agent-host/resume', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          agentId: 'writer',
+          threadId: 'acme_thread',
+          resourceId: RESOURCE_ID,
+          runId: 'acme_run',
+          entryPath: 'approval.resume',
+          requestedBy: 'reviewer-1',
+          resumeData: { approved: true },
+        }),
+      });
+    }
+
+    it.each([
+      'success',
+      'timed_out',
+    ] as const)('is refused as not suspended when the run ended %s', async (status) => {
+      // #given — the terminal finalization deleted the run record, so only the
+      // snapshot's execution owner is left to tell the starter why
+      const fixture = endedRunFixture(status);
+
+      // #when / #then
+      await expect(
+        fixture.host.route(resumeRequest(), fixture.scope),
+      ).rejects.toMatchObject({
+        status: 409,
+        reason: { code: 'RUN_NOT_SUSPENDED' },
+      });
+      expect(mocked.resumeViaRuntime).not.toHaveBeenCalled();
+    });
+
+    it('keeps the 404 for a principal that did not start the run', async () => {
+      // #given
+      const fixture = endedRunFixture('success');
+      const scope: ThreadScope = {
+        ...fixture.scope,
+        principal: { kind: 'human', id: 'operator-2', role: 'operator' },
+      };
+
+      // #when / #then
+      await expect(
+        fixture.host.route(resumeRequest(), scope),
+      ).rejects.toMatchObject({ status: 404 });
+      expect(mocked.resumeViaRuntime).not.toHaveBeenCalled();
+    });
   });
 
   it.each([
@@ -7862,9 +7966,10 @@ describe('host agent recovery barriers', () => {
         : 'rejected',
     );
     expect(events, String(outcome)).toEqual(order.slice(0, reached + 1));
-    expect(fixture.state.get(TEST_OWNER_RECOVERY_KEY)).toEqual(
-      fixture.recovery,
-    );
+    expect(fixture.state.get(TEST_OWNER_RECOVERY_KEY)).toEqual({
+      ...fixture.recovery,
+      outcomeRead: true,
+    });
     expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(
       boundary !== 'completion',
     );
@@ -7898,6 +8003,100 @@ describe('host agent recovery barriers', () => {
       },
     });
     expect(mocked.stream).not.toHaveBeenCalled();
+  });
+
+  /** Retention with a zero horizon over the lifecycle fixture's tables. */
+  function purgeLifecycleAtZero(fixture: {
+    sql: ReturnType<typeof openSqlite>;
+  }) {
+    return purgeExpiredWorkflowRuns(
+      sqliteUnitDatabase(fixture.sql) as Parameters<
+        typeof purgeExpiredWorkflowRuns
+      >[0],
+      {
+        ttlMs: 0,
+        now: () => Date.now() + 1_000,
+        tablePrefix: 'host_lifecycle_',
+        resourceOwnerTable: RESOURCE_OWNERSHIP_TABLE,
+        advanceCursor: async () => {},
+      },
+    );
+  }
+
+  it.each([
+    'fenced',
+    'actual-prefix',
+  ] as const)("clears an unthreaded agent run's start journal and claims once retention removed the run after it ended (%s)", async (mode) => {
+    // #given an unthreaded start that left its journal armed on a suspended
+    // run, and the run then ended and retention removed it
+    const fixture = await hostAgentLifecycleFixture({
+      mode,
+      provenance: 'modern',
+      status: 'suspended',
+      threaded: false,
+      journal: true,
+    });
+    await fixture.host.recoverOwnership(fixture.scope);
+    expect(fixture.state.has(TEST_OWNER_RECOVERY_KEY)).toBe(true);
+    expect(await fixture.resources.owner('run', 'acme_run')).toEqual(
+      HUMAN_OWNER,
+    );
+    await fixture.persist({ ...fixture.snapshot, status: 'success' });
+    expect(await purgeLifecycleAtZero(fixture)).toBe(1);
+
+    // #when the host recovers its ownership again
+    const recovered = fixture.host.recoverOwnership(fixture.scope);
+
+    // #then the journal, the run record and the claims are gone
+    await expect(recovered).resolves.toBeUndefined();
+    expect(fixture.state.has(TEST_OWNER_RECOVERY_KEY)).toBe(false);
+    expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(false);
+    expect(fixture.owners()).toEqual([]);
+  });
+
+  it("clears a threaded agent run's start journal an instance left after committing its claims, once retention removed the ended run", async () => {
+    // #given a threaded start whose instance stopped right after it committed
+    // the run's claims, and retention that then removed the ended run
+    const fixture = await hostAgentLifecycleFixture({
+      mode: 'fenced',
+      provenance: 'modern',
+      status: 'success',
+      journal: true,
+    });
+    const settle = fixture.resources.settleReservation.bind(fixture.resources);
+    const stopped = vi
+      .spyOn(fixture.resources, 'settleReservation')
+      .mockImplementation(async (...args) => {
+        await settle(...args);
+        throw new Error('instance stopped');
+      });
+    await fixture.host.recoverOwnership(fixture.scope).catch(() => undefined);
+    stopped.mockRestore();
+    expect(fixture.state.has(TEST_OWNER_RECOVERY_KEY)).toBe(true);
+    expect(await fixture.resources.owner('run', 'acme_run')).toEqual(
+      HUMAN_OWNER,
+    );
+    expect(await purgeLifecycleAtZero(fixture)).toBe(1);
+
+    // #when the host recovers its ownership again
+    const recovered = fixture.host.recoverOwnership(fixture.scope);
+
+    // #then the journal and the run record are gone, and the thread keeps its
+    // binding and committed claims
+    await expect(recovered).resolves.toBeUndefined();
+    expect(fixture.state.has(TEST_OWNER_RECOVERY_KEY)).toBe(false);
+    expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(false);
+    expect(fixture.state.has(THREAD_BINDING_KEY)).toBe(true);
+    expect(fixture.owners()).toEqual([
+      expect.objectContaining({
+        resource_kind: 'resource',
+        reservation_token: null,
+      }),
+      expect.objectContaining({
+        resource_kind: 'thread',
+        reservation_token: null,
+      }),
+    ]);
   });
 });
 

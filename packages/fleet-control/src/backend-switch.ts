@@ -2911,6 +2911,8 @@ export interface BackendSwitchProvider {
   removeCandidateHostAndDrain(input: {
     readonly targetSpec: DeploymentSpec;
     readonly candidate: ExternalReleaseSnapshot;
+    readonly target: ExternalPlatformTargetDescription;
+    readonly bridge: BridgeSnapshot;
     readonly fence: BackendSwitchMutationFence;
   }): Promise<void>;
   restorePlainDeployment(input: {
@@ -3693,6 +3695,8 @@ export async function rollbackBackendSwitch(options: {
           await options.provider.removeCandidateHostAndDrain({
             targetSpec: options.targetSpec,
             candidate: intent.candidate,
+            target: intent.target,
+            bridge: requiredBridge(intent),
             fence: lease,
           });
         }

@@ -64,6 +64,7 @@ import {
   type ResourceOwner,
   RUN_START_ROLES,
 } from '../approval-api/index.js';
+import { isRefusalStatus } from '../do-runner/do-status-error.js';
 import {
   InvalidMutationEpochError,
   type MutationEpochContext,
@@ -76,7 +77,10 @@ import {
   isExecutionFenceRefusal,
   readExecutionFence,
 } from '../do-runner/index.js';
-import { runInputDepthMessage } from '../do-runner/run-input-depth.js';
+import {
+  runInputDepthMessage,
+  someValueExceedsRunInputDepth,
+} from '../do-runner/run-input-depth.js';
 import { hostErrorText } from '../host-kit/host-approval-service.js';
 import {
   type BoundThreadTargetValidator,
@@ -466,6 +470,12 @@ function metadataOrReject(value: unknown): Validated<Record<string, unknown>> {
     return {
       ok: false,
       error: reject('metadata-invalid', 'metadata must be an object'),
+    };
+  }
+  if (someValueExceedsRunInputDepth(value)) {
+    return {
+      ok: false,
+      error: reject('input-too-deep', runInputDepthMessage('a metadata value')),
     };
   }
   return { ok: true, value: value as Record<string, unknown> };
@@ -1198,7 +1208,7 @@ export function createScheduleRouter(
           error.status,
         );
       }
-      if (error instanceof RunRouteError) {
+      if (error instanceof RunRouteError && isRefusalStatus(error.status)) {
         await audit(
           'rejected',
           error.status === 404

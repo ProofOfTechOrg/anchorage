@@ -227,8 +227,13 @@ describe('authoritative start state', () => {
     'background',
   ] as const)('selects one raw %s snapshot for physical identity and S1 payload', async (kind) => {
     const f = await d1Fixture(kind);
+    const table =
+      kind === 'prefixed'
+        ? 'D1_mastra_workflow_snapshot'
+        : 'mastra_workflow_snapshot';
     try {
       for (const status of ['success', 'failed', 'suspended'] as const) {
+        f.sql.prepare(`DELETE FROM "${table}"`).run();
         const snapshot = d1Snapshot(status);
         await f.seed(snapshot);
         const capability = f.capability;
@@ -244,7 +249,10 @@ describe('authoritative start state', () => {
             replacement.error = { name: 'Error', message: 'S2 failure' };
             assert(replacement.context.gate);
             replacement.context.gate.suspendPayload = { source: 'S2' };
-            await f.seed(replacement);
+            // Raw: the settled-row guard refuses a write that names another start.
+            f.sql
+              .prepare(`UPDATE "${table}" SET snapshot = ?`)
+              .run(JSON.stringify(replacement));
             return row;
           });
         const publicRead = vi.spyOn(f.workflow, 'getWorkflowRunById');
@@ -2775,6 +2783,53 @@ describe('RunnerRuntime run state SQLite cannot store', () => {
         h.stored().requestContext?.['flowsafe.runLifecycle']
           ?.stateNotStorableAt,
       ).toBeUndefined();
+    });
+
+    /** A later start of `held-deep` under the held leg's run id, suspended in its step. */
+    function startLater(storage: MastraCompositeStore) {
+      const later = init(
+        { storage },
+        { executionFence: 'none', startIdempotency: 'none' },
+      );
+      later
+        .createWorkflow({
+          id: 'held-deep',
+          inputSchema: schema,
+          outputSchema: schema,
+        })
+        .then(
+          later.createStep({
+            id: 'hold',
+            inputSchema: schema,
+            outputSchema: schema,
+            suspendSchema: schema,
+            resumeSchema: schema,
+            execute: async ({ suspend }) => suspend({}),
+          }),
+        )
+        .commit();
+      return later.runtime.start('held-deep', {
+        runId: 'held-run',
+        inputData: {},
+      });
+    }
+
+    it("keeps the row of a later run that started under the leg's run id after retention removed the leg's run", async () => {
+      // #given a held leg whose run row retention removed, and a later start
+      // under the same run id that suspended
+      const h = await heldDeepLeg();
+      h.sql.prepare('DELETE FROM mastra_workflow_snapshot').run();
+      await expect(startLater(h.storage)).resolves.toMatchObject({
+        status: 'suspended',
+      });
+      const laterRow = h.stored();
+
+      // #when the leg's step returns state nested past the depth SQLite parses
+      h.release.resolve();
+      await h.outcome;
+
+      // #then the later run is not recorded as failed
+      expect(h.stored()).toEqual(laterRow);
     });
   });
 });
@@ -8242,6 +8297,13 @@ async function runtimeActivationFixture(
   };
   const row = (runId = 'activation-run') =>
     workflows.loadWorkflowSnapshot({ workflowName: workflow.id, runId });
+  /** Write over the run's row in SQL, past the settled-row guard, as an earlier version's leg can. */
+  const plant = (snapshot: unknown, runId = 'activation-run') =>
+    sql
+      .prepare(
+        'UPDATE activation_mastra_workflow_snapshot SET snapshot = ? WHERE workflow_name = ? AND run_id = ?',
+      )
+      .run(JSON.stringify(snapshot), workflow.id, runId);
   return {
     ...app,
     sql,
@@ -8255,6 +8317,7 @@ async function runtimeActivationFixture(
     options,
     claim,
     row,
+    plant,
     close: () => sql.close(),
   };
 }
@@ -8765,11 +8828,7 @@ describe('Runtime activation', () => {
           if (replacement === 'tokenless')
             delete snapshot.requestContext?.['flowsafe.runProvenance'];
           if (replacement === 'pending') snapshot.status = 'pending';
-          await f.workflows.persistWorkflowSnapshot({
-            workflowName: f.workflow.id,
-            runId: 'activation-run',
-            snapshot,
-          });
+          f.plant(snapshot);
           throw fault;
         });
         return run;
@@ -9039,11 +9098,7 @@ describe('Runtime activation', () => {
           const later = JSON.parse(outcome.row.snapshot);
           later.requestContext['flowsafe.runProvenance'].startToken = 'S2';
           later.result = { foreign: true };
-          await f.workflows.persistWorkflowSnapshot({
-            workflowName: f.workflow.id,
-            runId: 'activation-run',
-            snapshot: later,
-          });
+          f.plant(later);
         }
         return outcome;
       };
@@ -9431,11 +9486,7 @@ describe('Runtime activation', () => {
       await entered.promise;
       assert(before.requestContext);
       before.requestContext['flowsafe.runProvenance'].startToken = 'S2';
-      await f.workflows.persistWorkflowSnapshot({
-        workflowName: f.workflow.id,
-        runId: 'activation-run',
-        snapshot: before,
-      });
+      f.plant(before);
       release.resolve();
       const result = await pending.catch((error) => error);
       expect(
@@ -9795,11 +9846,7 @@ describe('Runtime activation', () => {
           const snapshot = await f.row();
           assert(snapshot?.requestContext);
           snapshot.requestContext['flowsafe.runProvenance'].startToken = 'S2';
-          await f.workflows.persistWorkflowSnapshot({
-            workflowName: f.workflow.id,
-            runId: 'activation-run',
-            snapshot,
-          });
+          f.plant(snapshot);
           return original;
         },
       );
@@ -12367,6 +12414,32 @@ describe('RunnerRuntime leg liveness touch', () => {
     return { ...leg, started };
   }
 
+  /** A run suspended in `hold`, on a workflow that stores only suspensions. */
+  async function suspendedLeg(storage: MastraCompositeStore) {
+    const leg = abortableApp(storage, {
+      suspends: true,
+      persistence: { statuses: ['suspended'] },
+    });
+    await leg.app.runtime.start(WORKFLOW_ID, { runId: RUN_ID, inputData: {} });
+    return leg;
+  }
+
+  /** Resumes the run into `hold`, where it stays until the test ends or releases it. */
+  function resumeHeldLeg(
+    leg: ReturnType<typeof abortableApp>,
+    options: ResumeRunOptions = {},
+  ) {
+    const resumed = leg.app.runtime.resume(WORKFLOW_ID, RUN_ID, {
+      resumeData: {},
+      ...options,
+    });
+    onTestFinished(async () => {
+      leg.release.resolve();
+      await resumed.catch(() => undefined);
+    });
+    return resumed;
+  }
+
   const SETTLEMENTS = [
     { settled: 'terminated', summary: { status: 'cancelled' } },
     {
@@ -12564,10 +12637,83 @@ describe('RunnerRuntime leg liveness touch', () => {
     expect(leg.observed.afterRuns).toBe(1);
   });
 
-  it('runs a leg to its end on a capability without withStoredRun', async () => {
-    // #given storage whose capability omits withStoredRun, and a leg held in
-    // its first step
-    const { storage } = await d1Storage();
+  it('records the outcome of an unfenced start whose workflow stores only its suspensions and that completes without suspending', async () => {
+    // #given a leg held in its first step, on a workflow that stores only its
+    // suspended snapshots, so the run has no row
+    const { sql, storage } = await d1Storage();
+    const leg = startHeldLeg(storage, {
+      persistence: { statuses: ['suspended'] },
+    });
+    await leg.entered.promise;
+    assert.deepEqual(storedRows(sql), []);
+
+    // #when the step returns
+    leg.release.resolve();
+
+    // #then the start answers the run's success, both steps ran, and the
+    // outcome is the run's only row
+    await expect(leg.started).resolves.toMatchObject({ status: 'success' });
+    expect(leg.observed.afterRuns).toBe(1);
+    const rows = storedRows(sql) as { snapshot: string }[];
+    expect(rows).toHaveLength(1);
+    expect(JSON.parse(rows[0]?.snapshot ?? 'null')).toMatchObject({
+      status: 'success',
+    });
+  });
+
+  it.each([
+    {
+      storage: "Mastra's in-memory store",
+      create: async (): Promise<MastraCompositeStore> => new InMemoryStore(),
+    },
+    {
+      storage: 'a D1 capability without withStoredRun',
+      create: async (): Promise<MastraCompositeStore> => {
+        const { storage } = await d1Storage();
+        await stripStoredRunMember(storage);
+        return storage;
+      },
+    },
+  ])("does not store a start's run again when its row is gone at the leg's end on $storage, which does not track the leg's writes", async ({
+    create,
+  }) => {
+    // #given a leg held in its first step, on a workflow that stores only its
+    // pending snapshot, whose run another instance terminated and whose row
+    // was then removed
+    const storage = await create();
+    const leg = startHeldLeg(storage, {
+      persistence: { statuses: ['pending'] },
+    });
+    await leg.entered.promise;
+    await abortableApp(storage).app.runtime.terminate(WORKFLOW_ID, RUN_ID);
+    const workflows = await storage.getStore('workflows');
+    assert(workflows);
+    await workflows.deleteWorkflowRunById({
+      workflowName: WORKFLOW_ID,
+      runId: RUN_ID,
+    });
+
+    // #when the step returns
+    leg.release.resolve();
+
+    // #then the start fails without claiming a settlement, and the terminated
+    // run is not stored again
+    const failure = await leg.started.then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    expect(failure).toBeInstanceOf(Error);
+    expect(failure).not.toBeInstanceOf(RunSettledConflictError);
+    expect(
+      await workflows.loadWorkflowSnapshot({
+        workflowName: WORKFLOW_ID,
+        runId: RUN_ID,
+      }),
+    ).toBeNull();
+  });
+
+  /** Hides `withStoredRun` from the storage's fenced workflow capability. */
+  async function stripStoredRunMember(storage: MastraCompositeStore) {
     const workflows = (await storage.getStore(
       'workflows',
     )) as FencedWorkflowsStorageD1;
@@ -12579,6 +12725,13 @@ describe('RunnerRuntime leg liveness touch', () => {
       ),
       configurable: true,
     });
+  }
+
+  it('runs a leg to its end on a capability without withStoredRun', async () => {
+    // #given storage whose capability omits withStoredRun, and a leg held in
+    // its first step
+    const { storage } = await d1Storage();
+    await stripStoredRunMember(storage);
     const leg = startHeldLeg(storage);
     await leg.entered.promise;
 
@@ -12594,6 +12747,32 @@ describe('RunnerRuntime leg liveness touch', () => {
     // #then the run completes both steps
     await expect(leg.started).resolves.toMatchObject({ status: 'success' });
     expect(leg.observed.afterRuns).toBe(1);
+  });
+
+  it('answers a settled conflict when a fenced start on a capability without withStoredRun ends after retention removed its run, and does not store the run again', async () => {
+    // #given a fenced start leg held in its first step, on storage whose
+    // capability omits withStoredRun and a workflow that stores only its
+    // admission snapshot, on a run another instance terminated and retention
+    // removed
+    const { sql, binding, storage } = await d1Storage();
+    const executionFence = new ExecutionFenceStore(
+      binding as ExecutionFenceDatabase,
+    );
+    await executionFence.seed('open');
+    await stripStoredRunMember(storage);
+    const leg = startHeldLeg(storage, {
+      executionFence,
+      persistence: { statuses: ['pending'] },
+    });
+    await leg.entered.promise;
+    await terminatedAndPurged(sql, storage, executionFence);
+
+    // #when the step returns
+    leg.release.resolve();
+
+    // #then the start answers a settled conflict and no row was stored
+    await expect(leg.started).rejects.toBeInstanceOf(RunSettledConflictError);
+    expect(storedRows(sql)).toEqual([]);
   });
 
   it('refuses the next write of a leg whose run another instance terminated and retention removed, and does not store the run again', async () => {
@@ -12619,18 +12798,8 @@ describe('RunnerRuntime leg liveness touch', () => {
     // stores only its suspended snapshot, whose run another instance
     // terminated and retention removed
     const { sql, storage } = await d1Storage();
-    const leg = abortableApp(storage, {
-      suspends: true,
-      persistence: { statuses: ['suspended'] },
-    });
-    await leg.app.runtime.start(WORKFLOW_ID, { runId: RUN_ID, inputData: {} });
-    const resumed = leg.app.runtime.resume(WORKFLOW_ID, RUN_ID, {
-      resumeData: {},
-    });
-    onTestFinished(async () => {
-      leg.release.resolve();
-      await resumed.catch(() => undefined);
-    });
+    const leg = await suspendedLeg(storage);
+    const resumed = resumeHeldLeg(leg);
     await leg.entered.promise;
     await terminatedAndPurged(sql, storage);
 
@@ -12639,6 +12808,102 @@ describe('RunnerRuntime leg liveness touch', () => {
 
     // #then the resume answers a settled conflict
     await expect(resumed).rejects.toBeInstanceOf(RunSettledConflictError);
+  });
+
+  it("refuses the next write of a leg whose run id a later start used after retention removed the run, and keeps the later run's row", async () => {
+    // #given a leg held in its first step, on a run another instance
+    // terminated and retention removed, and a later start under the same run
+    // id that ran to its success
+    const { sql, storage } = await d1Storage();
+    const leg = startHeldLeg(storage);
+    await leg.entered.promise;
+    await terminatedAndPurged(sql, storage);
+    const later = abortableApp(storage);
+    later.release.resolve();
+    await expect(
+      later.app.runtime.start(WORKFLOW_ID, { runId: RUN_ID, inputData: {} }),
+    ).resolves.toMatchObject({ status: 'success' });
+    const laterRows = storedRows(sql);
+
+    // #when the held leg's step returns
+    leg.release.resolve();
+
+    // #then the leg's next write is refused, its second step never ran, and
+    // the later run's row stays as that run wrote it
+    await expect(leg.started).rejects.toBeInstanceOf(RunSettledConflictError);
+    expect(leg.observed.afterRuns).toBe(0);
+    expect(storedRows(sql)).toEqual(laterRows);
+  });
+
+  it("answers a settled conflict for a legacy run's resumed leg that the touch aborted after another instance terminated the run", async () => {
+    // #given a run with legacy run provenance, suspended and resumed into a
+    // held step, on a workflow that stores only its suspended snapshot, whose
+    // run another instance terminated
+    const { sql, storage } = await d1Storage();
+    const leg = await suspendedLeg(storage);
+    sql
+      .prepare(
+        `UPDATE mastra_workflow_snapshot
+          SET snapshot = json_set(snapshot,
+            '$.requestContext."flowsafe.runProvenance"', json(?))`,
+      )
+      .run(
+        JSON.stringify({
+          version: 1,
+          attemptToken: 'legacy-attempt',
+          requestedBy: 'owner',
+          requestedByKind: 'human',
+          resumeCounts: [],
+        }),
+      );
+    const resumed = resumeHeldLeg(leg, {
+      requestedBy: 'reviewer',
+      requestedByKind: 'human',
+    });
+    await leg.entered.promise;
+    await abortableApp(storage).app.runtime.terminate(WORKFLOW_ID, RUN_ID);
+
+    // #when the leg's touch runs and the step returns
+    await leg.app.runtime.touchRun(WORKFLOW_ID, RUN_ID);
+    leg.release.resolve();
+
+    // #then the resume answers a settled conflict, the second step never ran,
+    // and the run stays cancelled
+    await expect(resumed).rejects.toBeInstanceOf(RunSettledConflictError);
+    expect(leg.observed.afterRuns).toBe(0);
+    const [stored] = storedRows(sql) as { snapshot: string }[];
+    expect(JSON.parse(stored?.snapshot ?? 'null')).toMatchObject({
+      status: 'cancelled',
+    });
+  });
+
+  it('answers a settled conflict when a resumed leg on storage without withStoredRun ends after its run row was removed', async () => {
+    // #given a run suspended and resumed into a held step on Mastra's
+    // in-memory store, on a workflow that stores only its suspended snapshot,
+    // whose row is removed while the step runs
+    const storage = new InMemoryStore();
+    const leg = await suspendedLeg(storage);
+    const resumed = resumeHeldLeg(leg);
+    await leg.entered.promise;
+    const workflows = await storage.getStore('workflows');
+    assert(workflows);
+    await workflows.deleteWorkflowRunById({
+      workflowName: WORKFLOW_ID,
+      runId: RUN_ID,
+    });
+
+    // #when the step returns
+    leg.release.resolve();
+
+    // #then the resume answers a settled conflict and the run is not stored
+    // again
+    await expect(resumed).rejects.toBeInstanceOf(RunSettledConflictError);
+    expect(
+      await workflows.loadWorkflowSnapshot({
+        workflowName: WORKFLOW_ID,
+        runId: RUN_ID,
+      }),
+    ).toBeNull();
   });
 
   it('logs the abort of a settled leg once however many touches follow', async () => {

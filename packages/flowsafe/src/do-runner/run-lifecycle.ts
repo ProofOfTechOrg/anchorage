@@ -121,8 +121,9 @@ export class RunLifecycleBlockedError extends Error {
 
 /**
  * A snapshot write over a settled run row that does not advance the row's
- * lifecycle: the settlement stands, and the writer (typically an execution leg
- * still running on another instance) is refused.
+ * lifecycle, or one whose run provenance names another start than the stored
+ * row's, settled or not: the stored row stands, and the writer (typically an
+ * execution leg still running on another instance) is refused.
  */
 export class RunSettledConflictError extends Error {
   constructor(workflowId: string, runId: string) {

@@ -6,6 +6,7 @@ import { AgentRunSelectorMismatchError } from '../agent-runner/durable-agent-run
 import type { ActorContext, ApprovalRecord } from '../approval-api/index.js';
 import {
   doErrorResponse,
+  RunNotSuspendedError,
   type StartIdempotencyDatabase,
   StartIdempotencyStore,
 } from '../do-runner/index.js';
@@ -127,6 +128,38 @@ function context() {
 }
 
 describe('createAgentThreadTopology', () => {
+  it("replaces the message of a thread object's 5xx answer that carries no reason code", async () => {
+    // #given
+    const fault = 'D1_ERROR: connect ECONNREFUSED 10.0.7.4:5432 db=acme-prod';
+    const topology = createAgentThreadTopology(
+      {
+        idFromName: (name: string) => name,
+        get: () => ({
+          fetch: (async () =>
+            Response.json({ error: fault }, { status: 500 })) as ReturnType<
+            ThreadNamespaceLike<string>['get']
+          >['fetch'],
+        }),
+      },
+      DEPLOYMENT_IDENTITY_SECRET,
+      { startIdempotency: 'none', executionFence: 'none' },
+    );
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      // #when / #then
+      await expect(
+        topology.status(context().value, {
+          agentId: 'writer',
+          threadId: 'acme_thread',
+          runId: 'acme_run',
+        }),
+      ).rejects.toMatchObject({ status: 500, message: 'internal error' });
+      expect(String(logged.mock.calls[0]?.[0])).toContain(fault);
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
   it('validates a standing target through its owning thread DO binding', async () => {
     const { topology, hits } = harness();
     const scoped = context();
@@ -1565,5 +1598,116 @@ describe('protected replay agent wire', () => {
         error: { status: 503, message: 'persisted start is not readable' },
       });
     }
+  });
+});
+
+describe('createAgentThreadTopology — approval resume of an ended run', () => {
+  const execution = {
+    tablePrefix: 'private_',
+    workflowId: 'durable-agentic-loop',
+    runId: 'acme_run',
+    startToken: 'ended-generation',
+    owner: { kind: 'human', id: 'operator-1' },
+    target: { kind: 'agent', id: 'writer', threadId: 'acme_thread' },
+  };
+
+  function ended(status: string, owner = execution.owner): Response {
+    return Response.json({
+      kind: 'result',
+      execution: { ...execution, owner },
+      value: {
+        agentId: 'writer',
+        threadId: 'acme_thread',
+        resourceId: 'acme_resource_acme_thread',
+        runId: 'acme_run',
+        summary: { runId: 'acme_run', status },
+      },
+    });
+  }
+
+  async function resumeAgainst(
+    replay: () => Response,
+    released: 'thread' | 'run' | 'all',
+  ) {
+    const urls: string[] = [];
+    const topology = createAgentThreadTopology(
+      {
+        idFromName: (name: string) => name,
+        get: () => ({
+          fetch: (async (request: Request | string) => {
+            urls.push(typeof request === 'string' ? request : request.url);
+            return replay();
+          }) as ReturnType<ThreadNamespaceLike<string>['get']>['fetch'],
+        }),
+      },
+      DEPLOYMENT_IDENTITY_SECRET,
+      { startIdempotency: 'none', executionFence: 'none' },
+    );
+    const scoped = context();
+    scoped.value.canAccessResource = async (kind) =>
+      released !== 'all' && kind !== released;
+    const record = {
+      workflowId: 'durable-agentic-loop',
+      runId: 'acme_run',
+      decidedBy: 'reviewer-1',
+      stepPath: ['tool'],
+      resumeTarget: {
+        kind: 'agent-thread',
+        agentId: 'writer',
+        threadId: 'acme_thread',
+        resourceId: 'acme_resource_acme_thread',
+        principal: scoped.value.principal,
+      },
+    } as ApprovalRecord;
+    const outcome = await topology
+      .resume(scoped.value, record, 'approve')
+      .catch((error: unknown) => error);
+    return { outcome, urls };
+  }
+
+  it.each([
+    ['success', 'thread'],
+    ['cancelled', 'run'],
+  ] as const)('refuses an approval resume of a run that ended %s after its %s claim was released, as not suspended', async (status, released) => {
+    // #given / #when
+    const { outcome, urls } = await resumeAgainst(
+      () => ended(status),
+      released,
+    );
+
+    // #then
+    expect(outcome).toBeInstanceOf(RunNotSuspendedError);
+    expect(outcome).toMatchObject({
+      status: 409,
+      reason: { code: 'RUN_NOT_SUSPENDED' },
+    });
+    expect(urls).toEqual([expect.stringContaining('&dispatch=1&replay=1')]);
+  });
+
+  it.each([
+    [
+      'the thread does not know the run',
+      () => Response.json({ error: 'run not found' }, { status: 404 }),
+    ],
+    ['the run is still suspended', () => ended('suspended')],
+    [
+      'the thread object refuses the read',
+      () =>
+        Response.json(
+          { error: 'fenced', reason: { code: 'EXECUTION_FENCED' } },
+          { status: 503 },
+        ),
+    ],
+    [
+      'another principal started the run',
+      () => ended('success', { kind: 'human', id: 'operator-2' }),
+    ],
+  ])('keeps the ownership 404 for an approval resume when %s', async (_label, replay) => {
+    // #given / #when
+    const { outcome } = await resumeAgainst(replay, 'all');
+
+    // #then
+    expect(outcome).toMatchObject({ status: 404 });
+    expect(outcome).not.toBeInstanceOf(RunNotSuspendedError);
   });
 });

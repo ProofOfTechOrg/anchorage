@@ -685,6 +685,21 @@ describe('protected replay workflow transport', () => {
     });
   });
 
+  it('replaces the message of a persisted-start answer at 5xx that carries no reason code', async () => {
+    const fault = 'D1_ERROR: connect ECONNREFUSED 10.0.7.4:5432 db=acme-prod';
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await expect(
+        topologyFor({ error: fault }, 500).topology.persistedStart(
+          'workflow-1',
+          'run-1',
+        ),
+      ).rejects.toMatchObject({ status: 500, message: 'internal error' });
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
   it('captures and sends the original winning claim before fetch waits', async () => {
     const { topology, requests } = harness();
     const claim = {

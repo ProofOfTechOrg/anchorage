@@ -383,15 +383,31 @@ function parseIdentity(
   }
   const entry = parseLifecyclePhase(mode.entryLifecyclePhase);
   const carrier = migrationCarrier(source);
+  const retainedMigration =
+    (entry === 'migrating' || !INITIAL_PHASES.has(entry)) &&
+    source.backend === 'workers-for-platforms' &&
+    !isPlatformCatalogRecord(source) &&
+    source.migrationIntent !== undefined &&
+    source.desiredSpecDigest === source.migrationIntent.targetSpecDigest &&
+    mode.requestedSpecDigest === source.migrationIntent.targetSpecDigest &&
+    [
+      'decommissioning',
+      'traffic-removed',
+      'credentials-revoked',
+      'worker-deleted',
+      'platform-credentials-revoked',
+    ].includes(lifecyclePhase);
   if (
     (lifecyclePhase !== 'decommissioned' &&
       !reachesLifecyclePhase(entry, lifecyclePhase)) ||
     !carrier ||
     (entry === 'migrating' && mode.requestedSpecDigest !== carrier.digest) ||
     (entry === 'migrating' &&
-      ((carrier.present && lifecyclePhase !== 'migrating') ||
+      ((carrier.present &&
+        lifecyclePhase !== 'migrating' &&
+        !retainedMigration) ||
         (!carrier.present && lifecyclePhase === 'migrating'))) ||
-    (entry !== 'migrating' && carrier.present) ||
+    (entry !== 'migrating' && carrier.present && !retainedMigration) ||
     (entry !== 'migrating' &&
       entry !== 'ready' &&
       entry !== 'rolling-back' &&

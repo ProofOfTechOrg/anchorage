@@ -1696,7 +1696,9 @@ async function siblingOwnerRetentionProbe(db: D1Database) {
         .all()
     ).results,
     snapshots: (
-      await db.prepare(`SELECT workflow_name, run_id FROM ${E_TABLE}`).all()
+      await db
+        .prepare(`SELECT workflow_name, run_id FROM ${E_TABLE} ORDER BY run_id`)
+        .all()
     ).results,
   };
 }

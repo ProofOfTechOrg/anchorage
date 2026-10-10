@@ -1,6 +1,6 @@
 {
   "name": "@proofoftech/flowsafe",
-  "version": "0.26.2",
+  "version": "0.27.0",
   "publishConfig": {
     "access": "public"
   },
@@ -54,6 +54,7 @@
     "./do-runner/testing": "./dist/do-runner/testing.js",
     "./goals": "./dist/goals/index.js",
     "./host-kit": "./dist/host-kit/index.js",
+    "./host-kit/maintenance-capability": "./dist/host-kit/maintenance-capability.js",
     "./host-kit/module": "./dist/host-kit/module.js",
     "./schedules": "./dist/schedules/index.js",
     "./signal-providers": "./dist/signal-providers/index.js",

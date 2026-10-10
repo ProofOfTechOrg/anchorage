@@ -476,6 +476,32 @@ describe('createScheduleRouter — create', () => {
     expect(store.owners.size).toBe(0);
   });
 
+  it.each([
+    200, 600,
+  ])('answers a host RunRouteError whose status is %s with a generic 500', async (status) => {
+    const validateThreadTarget = vi.fn(async () => {
+      throw new RunRouteError(status, 'not a refusal');
+    });
+    const { call, store } = harness(ctx('acme', 'operator'), {
+      validateThreadTarget,
+    });
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    const response = await call('POST', '/api/schedules', {
+      agentId: 'a1',
+      prompt: 'go',
+      cron: '*/5 * * * *',
+      threadId: 'acme_thread',
+      resourceId: 'acme_resource',
+    });
+
+    expect(response).toEqual({
+      status: 500,
+      body: { error: 'internal error' },
+    });
+    expect(store.m.size).toBe(0);
+  });
+
   it('normalizes a valid threaded agent target and strips unsupported nested fields', async () => {
     const { call, store } = harness(ctx('acme', 'operator'));
     const res = await call('POST', '/api/schedules', {
@@ -680,7 +706,7 @@ describe('createScheduleRouter — create', () => {
   const AGENT_CREATE = { agentId: 'a1', prompt: 'go', cron: '*/5 * * * *' };
 
   /** Create bodies whose one tenant value nests `levels` levels deep. */
-  const targetValueBodies = (levels: number) => [
+  const tenantValueBodies = (levels: number) => [
     {
       field: 'inputData',
       body: {
@@ -720,10 +746,14 @@ describe('createScheduleRouter — create', () => {
         },
       },
     },
+    {
+      field: 'a metadata value',
+      body: { ...WORKFLOW_CREATE, metadata: { note: nestedArray(levels) } },
+    },
   ];
 
   it.each(
-    targetValueBodies(257),
+    tenantValueBodies(257),
   )('400s + audits a schedule whose $field nests more than 256 levels, storing nothing', async ({
     field,
     body,
@@ -748,7 +778,7 @@ describe('createScheduleRouter — create', () => {
   });
 
   it.each(
-    targetValueBodies(256),
+    tenantValueBodies(256),
   )('creates a schedule whose $field nests exactly 256 levels', async ({
     body,
   }) => {
@@ -900,26 +930,37 @@ describe('createScheduleRouter — mutations', () => {
     );
   });
 
-  it('update 400s an inputData nested more than 256 levels and keeps the stored target', async () => {
+  it.each([
+    [
+      'an inputData',
+      { inputData: { topic: nestedArray(256) } },
+      'inputData',
+      'target',
+    ],
+    [
+      'a metadata value',
+      { metadata: { note: nestedArray(257) } },
+      'a metadata value',
+      'metadata',
+    ],
+  ] as const)('update 400s %s nested more than 256 levels and keeps the stored schedule', async (_label, patch, field, stored) => {
     // #given a stored workflow schedule
     const { call, store, events, id } = await seed();
-    const before = store.m.get(id)?.target;
+    const before = store.m.get(id)?.[stored];
 
-    // #when an update nests its inputData 257 levels deep
-    const res = await call('PATCH', `/api/schedules/${id}`, {
-      inputData: { topic: nestedArray(256) },
-    });
+    // #when an update nests the field 257 levels deep
+    const res = await call('PATCH', `/api/schedules/${id}`, patch);
 
-    // #then it is refused and audited, and the stored target is unchanged
+    // #then it is refused and audited, and the stored field is unchanged
     expect(res.status).toBe(400);
-    expect(res.body.error).toBe(runInputDepthMessage('inputData'));
+    expect(res.body.error).toBe(runInputDepthMessage(field));
     expect(events).toContainEqual(
       expect.objectContaining({
         operation: 'update',
         reason: 'input-too-deep',
       }),
     );
-    expect(store.m.get(id)?.target).toEqual(before);
+    expect(store.m.get(id)?.[stored]).toEqual(before);
   });
 
   it('update rejects a reserved key in the agent ifIdle.streamOptions.requestContext', async () => {

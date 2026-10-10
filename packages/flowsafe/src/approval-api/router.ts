@@ -17,13 +17,17 @@
 
 import { isExecutionFenceRefusal } from '../do-runner/execution-fence.js';
 import { isPathSafeId } from '../do-runner/path-safe-id.js';
+import {
+  exceedsRunInputDepth,
+  runInputDepthMessage,
+} from '../do-runner/run-input-depth.js';
 import { readBoundedBody } from '../http-body.js';
+import { internalErrorResponse } from '../internal-error-response.js';
 import { ActorResolutionError, type ActorResolver } from './actor-context.js';
 import {
-  ApprovalAuthzError,
   ApprovalConflictError,
+  approvalErrorCode,
   InvalidApprovalInputError,
-  UnknownApprovalError,
 } from './service.js';
 import {
   APPROVAL_LIST_ORDERS,
@@ -119,12 +123,24 @@ export type ApprovalRouter = (request: Request) => Promise<Response | null>;
 
 class ApprovalPayloadTooLargeError extends Error {}
 
+// no-store: approval records name the actors and payloads of a decision, and
+// this authenticated API is served from the host's own origin.
 function json(payload: unknown, status = 200): Response {
   return new Response(JSON.stringify(payload), {
     status,
-    headers: { 'content-type': 'application/json' },
+    headers: {
+      'content-type': 'application/json',
+      'cache-control': 'no-store',
+    },
   });
 }
+
+const APPROVAL_ERROR_STATUS = {
+  'not-found': 404,
+  conflict: 409,
+  forbidden: 403,
+  invalid: 400,
+} as const;
 
 function errorResponse(error: unknown): Response {
   // The deployment execution fence refusing, or failing to answer. 503 with
@@ -137,28 +153,23 @@ function errorResponse(error: unknown): Response {
   if (error instanceof ApprovalPayloadTooLargeError) {
     return json({ error: error.message }, 413);
   }
-  if (error instanceof InvalidApprovalInputError) {
-    return json({ error: error.message }, 400);
-  }
   if (error instanceof ActorResolutionError) {
     // Invalid authenticated claims are a verifier bug, not a client 4xx it
     // can fix. Fail closed without echoing claim details.
     return json({ error: 'forbidden' }, 403);
   }
-  if (error instanceof ApprovalAuthzError) {
-    return json({ error: error.message }, 403);
-  }
-  if (error instanceof UnknownApprovalError) {
-    return json({ error: error.message }, 404);
-  }
-  if (error instanceof ApprovalConflictError) {
-    return json(
-      { error: error.message, currentStatus: error.currentStatus },
-      409,
-    );
-  }
-  const message = error instanceof Error ? error.message : String(error);
-  return json({ error: message }, 500);
+  const code = approvalErrorCode(error);
+  if (code === 'error' || code === 'unavailable' || !(error instanceof Error))
+    return internalErrorResponse('approvals', error);
+  return json(
+    {
+      error: error.message,
+      ...(error instanceof ApprovalConflictError
+        ? { currentStatus: error.currentStatus }
+        : {}),
+    },
+    APPROVAL_ERROR_STATUS[code],
+  );
 }
 
 async function readJsonObject(
@@ -331,6 +342,20 @@ export function createApprovalRouter(
           };
           for (const field of CLIENT_CREATE_FIELDS) {
             if (field in body) input[field] = body[field];
+          }
+          if (
+            input.summary !== undefined &&
+            typeof input.summary !== 'string'
+          ) {
+            throw new InvalidApprovalInputError('summary must be a string');
+          }
+          // Here and not in service.create: the in-process bridge files a
+          // run's suspend payload, which a step can nest a few levels below a
+          // 256-level input.
+          if (exceedsRunInputDepth(input.payload)) {
+            throw new InvalidApprovalInputError(
+              runInputDepthMessage('payload'),
+            );
           }
           const runId = input.runId;
           if (typeof runId !== 'string' || runId.length === 0) {

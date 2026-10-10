@@ -22,10 +22,12 @@ import {
   stampDeploymentIdentityRequest,
 } from '../do-runner/index.js';
 import { readBoundedBody } from '../http-body.js';
+import { internalErrorResponse } from '../internal-error-response.js';
+import { objectAnswerResponse } from './do-response.js';
 import type { RunnerNamespaceLike } from './do-run-topology.js';
 import { createHubTopology, type HubNamespaceLike } from './hub-topology.js';
 import { requireResourceAccess } from './resource-access.js';
-import { RunRouteError, runRouteReason } from './run-route-error.js';
+import { RunRouteError, runRouteErrorBody } from './run-route-error.js';
 import { mintStreamTicket, verifyStreamTicket } from './stream-ticket.js';
 
 export interface StreamRouterOptions {
@@ -184,9 +186,11 @@ export function createStreamRouter(options: StreamRouterOptions): StreamRouter {
     forwardUrl.searchParams.set('actorId', claims.actorId);
     forwardUrl.searchParams.set('role', claims.role);
     const forwardRequest = new Request(forwardUrl.toString(), request);
-    return createHubTopology(hub, deploymentIdentitySecret).forwardSubscribe(
-      forwardRequest,
-    );
+    const response = await createHubTopology(
+      hub,
+      deploymentIdentitySecret,
+    ).forwardSubscribe(forwardRequest);
+    return objectAnswerResponse('hub-object', response, 'hub subscribe');
   }
 
   async function runUpgrade(
@@ -224,9 +228,10 @@ export function createStreamRouter(options: StreamRouterOptions): StreamRouter {
     const stub = runner.get(
       runner.idFromName(`${workflowId}:${runId}`),
     ) as unknown as UpgradeForwardStub;
-    return stub.fetch(
+    const response = await stub.fetch(
       stampDeploymentIdentityRequest(forwardRequest, deploymentIdentitySecret),
     );
+    return objectAnswerResponse('run-object', response, 'run stream');
   }
 
   return async (request: Request): Promise<Response | null> => {
@@ -267,25 +272,10 @@ export function createStreamRouter(options: StreamRouterOptions): StreamRouter {
         return json({ error: 'forbidden' }, 403);
       }
       if (error instanceof RunRouteError) {
-        // A structured reason is the DO's own published refusal code, so it
-        // passes through at ANY status — 5xx included, which this branch used
-        // to collapse into the bare 500 below. That collapse turned a 503
-        // EXECUTION_FENCED into "I am broken" for every stream caller.
-        const reason = runRouteReason(error);
-        if (error.status < 500 || reason !== undefined) {
-          return json(
-            {
-              error: error.message,
-              ...(reason === undefined ? {} : { reason }),
-            },
-            error.status,
-          );
-        }
+        const body = runRouteErrorBody(error);
+        if (body) return json(body, error.status);
       }
-      return json(
-        { error: error instanceof Error ? error.message : String(error) },
-        500,
-      );
+      return internalErrorResponse('stream', error);
     }
   };
 }

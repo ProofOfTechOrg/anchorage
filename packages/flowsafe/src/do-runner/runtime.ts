@@ -23,15 +23,15 @@ import type { Agent, ToolsInput } from '@mastra/core/agent';
 import type { IMastraLogger } from '@mastra/core/logger';
 import { Mastra } from '@mastra/core/mastra';
 import { RequestContext } from '@mastra/core/request-context';
-import type {
-  MastraCompositeStore,
-  WorkflowsStorage,
+import {
+  createEmptyWorkflowSnapshot,
+  type MastraCompositeStore,
+  type WorkflowsStorage,
 } from '@mastra/core/storage';
 import {
   type AnyWorkflow,
   cleanStepResult,
   type WorkflowRunState,
-  type WorkflowRunStatus,
   type WorkflowState,
   type WorkflowStateField,
 } from '@mastra/core/workflows';
@@ -91,6 +91,7 @@ import {
   canonicalScheduleDispatch,
   failureEnvelope,
   hasDisputedSettlement,
+  isSettledLegAbort,
   legAbortReason,
   lifecycleFromRequestContext,
   projectTerminalLifecycle,
@@ -171,7 +172,7 @@ export class RunNotSuspendedError extends DoStatusError {
   readonly status = 409;
   readonly reason = { code: 'RUN_NOT_SUSPENDED' } as const;
 
-  constructor(workflowId: string, runId: string, runStatus: WorkflowRunStatus) {
+  constructor(workflowId: string, runId: string, runStatus: RunStatus) {
     super(
       `run '${runId}' of workflow '${workflowId}' is '${runStatus}', not 'suspended'`,
     );
@@ -197,15 +198,23 @@ export class SuspensionChangedError extends DoStatusError {
 
 /**
  * An authoritative run-state read did not succeed, so nothing that read
- * returned is evidence about the run. One cause is Mastra answering from its
- * in-memory fallback instead of from storage — what comes back then describes
- * the Run object this isolate happens to hold rather than what is persisted.
+ * returned is evidence about the run: 503 with `reason.code`
+ * `RUN_STATE_UNREADABLE`. One cause is Mastra answering from its in-memory
+ * fallback instead of from storage — what comes back then describes the Run
+ * object this isolate happens to hold rather than what is persisted.
  * Distinct from UnknownRunError: the run may
  * well exist and be suspended — nothing about it could be READ. The message
  * therefore names no cause: it is minted where the read failed, not where the
  * reason is known.
+ *
+ * Retryable: the caller asked for nothing wrong and the condition clears on its
+ * own, so it is not a 500 that reads as a code fault, and a 404 or a summary
+ * would invite a conclusion from a read that never happened.
  */
-export class RunStateUnreadableError extends Error {
+export class RunStateUnreadableError extends DoStatusError {
+  readonly status = 503;
+  readonly reason = { code: 'RUN_STATE_UNREADABLE' } as const;
+
   constructor(workflowId: string, runId: string, options?: ErrorOptions) {
     super(
       `run '${runId}' of workflow '${workflowId}' state is not readable`,
@@ -819,6 +828,11 @@ export type StartRunOptions = {
    * (createRunRouter) so a client can never choose the identity a run is
    * keyed by everywhere it lands. A generation fallback here would let any caller
    * that forgets to mint create a run under an id the host never issued.
+   *
+   * A run id is single-use: never start one again, even after retention
+   * removed its run. `start` refuses an id only while its run's row exists,
+   * and a leg of the earlier run still running on another instance keeps
+   * running against the later run until its next write is refused.
    */
   runId: string;
   inputData?: unknown;
@@ -994,7 +1008,12 @@ function assertLegAbort(legAbort: unknown): void {
     throw new InvalidRunRequestError('legAbort is malformed');
 }
 
-function assertRunInputDepth(field: string, value: unknown): void {
+/**
+ * @internal Refuse tenant JSON nested past MAX_RUN_INPUT_DEPTH as a request the
+ * caller can fix. Defined here, beside InvalidRunRequestError, because
+ * run-input-depth.ts importing this module would close an import cycle.
+ */
+export function assertRunInputDepth(field: string, value: unknown): void {
   if (exceedsRunInputDepth(value))
     throw new InvalidRunRequestError(runInputDepthMessage(field));
 }
@@ -1879,13 +1898,15 @@ export class RunnerRuntime {
               },
             );
             const result = await executionPromise;
+            this.#throwIfSettledLeg(active, workflowId, runId);
             await this.#reconcileTerminalState(
               workflowId,
               runId,
               result,
               requestContext,
               source,
-              active.storedRunScope?.rowStored === true,
+              // A fenced start's admission witnessed the row it stored.
+              admissionEntered || active.storedRunScope?.rowStored === true,
             );
           });
           outcomeReadStarted = true;
@@ -2057,13 +2078,15 @@ export class RunnerRuntime {
             },
           );
           const resumed = await executionPromise;
+          this.#throwIfSettledLeg(active, workflowId, runId);
           await this.#reconcileTerminalState(
             workflowId,
             runId,
             resumed,
             requestContext,
             source,
-            active.storedRunScope?.rowStored === true,
+            // A resume begins from the row it read.
+            true,
             proof,
           );
           return resumed;
@@ -3149,6 +3172,21 @@ export class RunnerRuntime {
     for (const controller of unaborted) controller.abort(reason);
   }
 
+  /**
+   * End a leg the liveness touch aborted for a settlement as that settlement's
+   * conflict. Core releases report such an abort differently (`canceled` or
+   * `waiting`), and a workflow whose `shouldPersistSnapshot` skips that status
+   * stores nothing for it, so only the abort reason tells.
+   */
+  #throwIfSettledLeg(
+    active: ActiveRun,
+    workflowId: string,
+    runId: string,
+  ): void {
+    if (isSettledLegAbort(active.run?.abortController.signal.reason))
+      throw new RunSettledConflictError(workflowId, runId);
+  }
+
   #withStoredRunOf(
     source: CapturedWorkflowStorage | undefined,
   ): FencedWorkflowAdmissionCapability['withStoredRun'] {
@@ -3785,6 +3823,11 @@ export class RunnerRuntime {
               workflowId,
               runId,
             );
+            const stored = runProvenance(state);
+            const own = runProvenance({ requestContext: live });
+            // A row that records another start is a later run under the same
+            // id, which this leg must not fail.
+            if (stored && own && stored.startToken !== own.startToken) return;
             const { context, lifecycle } = overlayLegContext(
               state.requestContext,
               overlay,
@@ -3846,19 +3889,30 @@ export class RunnerRuntime {
     if (!opts) return;
     await this.#withLifecycleLock(workflowId, runId, async () => {
       const workflows = source.workflows;
-      const snapshot = await source.load.call(workflows, {
+      const stored = await source.load.call(workflows, {
         workflowName: workflowId,
         runId,
       });
-      if (!snapshot) {
-        // A row gone after this leg stored it was removed by retention, either
-        // after another instance settled the run or after this leg's own
-        // terminal write (`success` or `failed`).
+      if (!stored) {
+        // A row gone after this leg read or stored it was removed after the
+        // run settled, by retention or by the host, so the leg must not store
+        // the run again.
         if (rowStored) throw new RunSettledConflictError(workflowId, runId);
-        throw new Error(
-          `RunnerRuntime: run '${runId}' of workflow '${workflowId}' completed without a durable snapshot`,
-        );
+        // Storage without `withStoredRun` does not track the leg's writes, so
+        // it cannot tell a row this leg never stored from one removed after
+        // the run settled, and writing the latter again would revive a
+        // settled run.
+        if (!this.#withStoredRunOf(source))
+          throw new Error(
+            `RunnerRuntime: run '${runId}' of workflow '${workflowId}' completed without a durable snapshot`,
+          );
       }
+      // A start whose workflow stores none of the statuses it passed through
+      // has no row, so its terminal record is the run's first.
+      const snapshot = stored ?? {
+        ...createEmptyWorkflowSnapshot(runId),
+        serializedStepGraph: this.#getWorkflow(workflowId).serializedStepGraph,
+      };
       if (snapshot.runId !== runId)
         throw new RunStateUnreadableError(workflowId, runId);
       const expected = runProvenance({

@@ -29,7 +29,7 @@ Do not perform a physical-isolation cutover as an in-place update of a pooled Wo
 | `DEPLOYMENT_TENANT` | Variable | Stable provisioning tag that must match the singleton D1 sentinel |
 | `DEPLOYMENT_IDENTITY_SECRET` | Secret | Internal Worker-to-Durable-Object caller credential; 32–256 visible ASCII characters |
 | `RUNNER` | Durable Object namespace | One runner object per workflow run |
-| `MAINTENANCE` | Durable Object namespace | Fixed deployment singleton for deadline expiry, SLA sweep, retention purge, and optional schedule tick |
+| `MAINTENANCE` | Durable Object namespace | Fixed deployment singleton that runs the [alarm-driven maintenance](#alarm-driven-maintenance) duties |
 | `MAINTENANCE_ADMIN_SECRET` | Secret | Control-plane credential for maintenance bootstrap and status; distinct from deployment identity |
 
 Provision the sentinel before application migrations or traffic. Install host-provided Wrangler `>=4.118 <5` in the application, then run `npx flowsafe-provision --database <database> --tag <tag> --initial-fence-state <open|migration-locked> --remote --config wrangler.jsonc`. Set distinct `DEPLOYMENT_IDENTITY_SECRET` and `MAINTENANCE_ADMIN_SECRET` values with `wrangler secret put`. Wrangler is not installed as a Flowsafe peer. The CLI is published with Flowsafe. It verifies the exact singleton schema, refuses to re-home an owned database, and refuses to adopt an unowned database that already contains application tables.
@@ -100,7 +100,7 @@ Host routing belongs to the provisioning control plane. It must resolve a hostna
 | `APPROVAL_ACTOR_TOKENS` | Empty | Static verifier map. Empty means every authenticated route returns 401 |
 | `APPROVAL_SLA_SECONDS` | `14400` | SLA assigned to new approval records |
 | `APPROVAL_ALLOW_SELF_DECISION` | Unset | Separation of duties enabled. Accepts `true` or a comma-separated role list |
-| `RUN_RETENTION_DAYS` | `30` | Age for terminal workflow snapshot purge; `0` means immediate eligibility |
+| `RUN_RETENTION_DAYS` | `30` | Age for terminal workflow snapshot purge; `0` makes a terminal run eligible once the object that started it has read the start's outcome |
 | `START_IDEMPOTENCY_RETENTION_DAYS` | `RUN_RETENTION_DAYS` | Age for terminal start-reservation purge; keep it at least as long as callers may retry a key |
 | `APPROVAL_RETENTION_DAYS` | `30` | Age for approved/rejected approval purge |
 | `THREAD_RETENTION_DAYS` | Unset | Idle thread and message purge. Unset keeps conversations |
@@ -243,6 +243,7 @@ Other route factories accept a `basePath` when the exact public prefix is host-s
 - `buildObjectiveRouter`
 - `buildScheduleRouter`
 - `scheduleTick`
+- `notificationTick`
 - `extraPurgeDuties` for deployment-owned domains
 
 Use the exported router and topology factories rather than recreating their gate order.
@@ -258,12 +259,13 @@ Omitted context arrives as `undefined`. Existing hooks with fewer parameters rem
 
 ## Alarm-driven maintenance
 
-The fixed maintenance Durable Object schedules four independent duties:
+The fixed maintenance Durable Object schedules these independent duties:
 
 1. Run deadline expiry
 2. Approval SLA sweep
 3. Retention purge
 4. Schedule fire tick, when enabled
+5. Notification dispatch, when enabled
 
 Each alarm persists its successor before running exactly one due duty. If several duties are due, the object schedules an immediate follow-up alarm. A termination during one duty cannot starve another duty or break the alarm chain.
 
@@ -278,7 +280,7 @@ Within the purge invocation, each domain is failure-isolated:
 - terminal background tasks;
 - host-owned extra duties.
 
-Provisioning must authenticate `POST /admin/ensure-maintenance` after deployment. The drift watchdog reads `GET /admin/maintenance-status` and re-arms a missing or stale alarm. Provider polling, background recovery, and notification dispatch also use Durable Object alarms.
+Provisioning must authenticate `POST /admin/ensure-maintenance` after deployment. The drift watchdog reads `GET /admin/maintenance-status` and re-arms a missing or stale alarm. Provider polling and background recovery also use Durable Object alarms.
 
 ## Storage lifecycle
 

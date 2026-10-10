@@ -32,7 +32,6 @@ import {
 import {
   abandonApprovalsForRun,
   createDoRunTopology,
-  doSummary,
   queueApprovalForSuspension,
 } from '../src/host-kit/index.js';
 
@@ -558,13 +557,10 @@ async function handleFlowsafe(request: Request, env: Env): Promise<Response> {
         },
       },
     );
-    let detail: unknown;
-    try {
-      detail = await doSummary(response);
-    } catch (error) {
-      detail = error instanceof Error ? error.message : String(error);
-    }
-    return json({ status: response.status, detail });
+    // The run object's own answer: a reader would replace the message of an
+    // unclassified failure, and that message is what this probe reports.
+    const payload = (await response.json()) as { error?: unknown };
+    return json({ status: response.status, detail: payload.error });
   }
 
   return json({ error: 'not found' }, 404);

@@ -26,6 +26,7 @@ import {
   InMemoryApprovalStore,
   InMemoryResourceOwnershipStore,
   OPEN_STATUSES,
+  RESOURCE_OWNERSHIP_TABLE,
   type ResourceOwnershipDatabase,
 } from '../approval-api/index.js';
 import {
@@ -39,6 +40,7 @@ import {
 import type { DurableKeyValueStorage } from './cf-types.js';
 import {
   createD1Storage,
+  purgeExpiredWorkflowRuns,
   type SnapshotDatabase,
   sweepExpiredRunDeadlines,
 } from './d1-storage.js';
@@ -893,7 +895,7 @@ describe('workflow ingress capture', () => {
     const journals = writes.filter(([key]) =>
       key.startsWith('flowsafe:run-owner-recovery'),
     );
-    expect(journals).toHaveLength(2);
+    expect(journals).toHaveLength(3);
     expect(journals[0]?.[1]).toMatchObject({
       version: 2,
       phase: 'preparing',
@@ -911,6 +913,10 @@ describe('workflow ingress capture', () => {
         runId: 'c-run',
         startToken: expect.any(String),
       },
+    });
+    expect(journals[2]?.[1]).toMatchObject({
+      phase: 'prepared',
+      outcomeRead: true,
     });
     for (const count of reads.values()) expect(count).toBe(1);
     expect(ownerReads.kind).toHaveBeenCalledTimes(scheduled ? 1 : 0);
@@ -1030,17 +1036,22 @@ describe('workflow ingress capture', () => {
       const journals = writes.filter(([key]) =>
         key.startsWith('flowsafe:run-owner-recovery'),
       );
-      expect(journals).toHaveLength(phase === 'failure' ? 1 : 2);
+      expect(journals).toHaveLength(phase === 'failure' ? 1 : 3);
       expect(journals[0]?.[1]).toMatchObject({
         version: 2,
         phase: 'preparing',
         token: options?.attemptToken,
       });
-      if (phase !== 'failure')
+      if (phase !== 'failure') {
         expect(journals[1]?.[1]).toMatchObject({
           phase: 'prepared',
           execution: { startToken: expect.any(String) },
         });
+        expect(journals[2]?.[1]).toMatchObject({
+          phase: 'prepared',
+          outcomeRead: true,
+        });
+      }
       const snapshot = await workflows.loadWorkflowSnapshot({
         workflowName: 'gated',
         runId: 'c-run',
@@ -4606,6 +4617,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
     expect(response.status).toBe(503);
     await expect(response.json()).resolves.toMatchObject({
       error: expect.stringContaining('state is not readable'),
+      reason: { code: 'RUN_STATE_UNREADABLE' },
     });
     expect(values.has('flowsafe:run-owner-recovery:v1')).toBe(true);
   });
@@ -7263,12 +7275,17 @@ describe('host activation workflow recovery barriers', () => {
       post('/runs', WORKFLOW_START_BODY),
     );
     expect(response.status).toBe(200);
-    const journal = writes.at(-1) as Record<string, unknown>;
+    // The first prepared write is the journal before the host read the start's
+    // outcome.
+    const journal = writes.find(
+      (value) => (value as { phase?: unknown }).phase === 'prepared',
+    ) as Record<string, unknown>;
     expect(journal).toMatchObject({
       version: 2,
       phase: 'prepared',
       owner: { kind: 'human', id: 'owner-1' },
     });
+    expect(journal).not.toHaveProperty('outcomeRead');
     fixture.journal.values.set(
       'flowsafe:run-owner-recovery:v1',
       structuredClone(journal),
@@ -7439,7 +7456,11 @@ describe('host activation workflow recovery barriers', () => {
     });
     expect(
       fixture.journal.values.get('flowsafe:run-owner-recovery:v1'),
-    ).toEqual(fixture.journalValue);
+    ).toEqual(
+      boundary === 'strict settlement'
+        ? fixture.journalValue
+        : { ...fixture.journalValue, outcomeRead: true },
+    );
     expect(fixture.journal.alarms.at(-1)).toBeGreaterThan(Date.now());
     if (boundary === 'strict settlement')
       expect(hooks.abandonApprovals).not.toHaveBeenCalled();
@@ -7576,24 +7597,29 @@ describe('protected replay selected workflow value', () => {
       .spyOn(fixture.runtime, 'authoritativeStartState')
       .mockImplementation(async (...args) => {
         const selected = await originalRead(...args);
-        await workflows.persistWorkflowSnapshot({
-          workflowName: 'gated',
-          runId: 'c-run',
-          snapshot: {
-            ...snapshot,
-            status: 'success',
-            result: 'replacement-value',
-            requestContext: {
-              ...snapshot.requestContext,
-              'flowsafe.runProvenance': {
-                ...(snapshot.requestContext?.[
-                  'flowsafe.runProvenance'
-                ] as object),
-                startToken: 'replacement-generation',
+        // Raw: the settled-row guard refuses a write that names another start.
+        await fixture.env.DB?.prepare(
+          'UPDATE mastra_workflow_snapshot SET snapshot = ? WHERE workflow_name = ? AND run_id = ?',
+        )
+          .bind(
+            JSON.stringify({
+              ...snapshot,
+              status: 'success',
+              result: 'replacement-value',
+              requestContext: {
+                ...snapshot.requestContext,
+                'flowsafe.runProvenance': {
+                  ...(snapshot.requestContext?.[
+                    'flowsafe.runProvenance'
+                  ] as object),
+                  startToken: 'replacement-generation',
+                },
               },
-            },
-          } as unknown as WorkflowRunState,
-        });
+            }),
+            'gated',
+            'c-run',
+          )
+          .run();
         return selected;
       });
     const response = await fixture.runner.fetch(
@@ -7793,6 +7819,7 @@ describe('host activation prepared absence and local zero', () => {
     vi.spyOn(fixture.journal.storage, 'put').mockImplementation(
       async (key, value) => {
         if (
+          journal === undefined &&
           key === 'flowsafe:run-owner-recovery:v1' &&
           (value as { phase?: string }).phase === 'prepared'
         )
@@ -8167,6 +8194,110 @@ describe('host activation prepared absence and local zero', () => {
       execution: { workflowId: 'zero', runId: 'zero-run' },
     });
     expect(response.status).toBe(503);
+  });
+
+  /** Retention with a zero horizon, as `RUN_RETENTION_DAYS=0` runs it. */
+  function purgeAtZero(env: TestEnv) {
+    return purgeExpiredWorkflowRuns(
+      testDatabase(env.storage) as unknown as Parameters<
+        typeof purgeExpiredWorkflowRuns
+      >[0],
+      {
+        ttlMs: 0,
+        now: () => Date.now() + 1_000,
+        resourceOwnerTable: RESOURCE_OWNERSHIP_TABLE,
+        advanceCursor: async () => {},
+      },
+    );
+  }
+
+  it("answers a start with its run's summary when retention runs between the run's completion and the start's read of it", async () => {
+    // #given a zero-horizon purge that runs once the run's terminal row is
+    // stored: at the leg's next read of the row, and again at the run
+    // object's read of the start's outcome, before it commits the run owner
+    const fixture = await zeroFixture();
+    fixture.allowNext();
+    const purged: number[] = [];
+    const purgeOnceEnded = async () => {
+      const row = await fixture.native.readSnapshot({
+        workflowId: 'zero',
+        runId: 'zero-run',
+      });
+      if (row && JSON.parse(row.snapshot).status === 'success')
+        purged.push(await purgeAtZero(fixture.env));
+    };
+    const load = fixture.domain.loadWorkflowSnapshot.bind(fixture.domain);
+    vi.spyOn(fixture.domain, 'loadWorkflowSnapshot').mockImplementation(
+      async (...args) => {
+        if (purged.length === 0) await purgeOnceEnded();
+        return load(...args);
+      },
+    );
+    const read = fixture.app.runtime.authoritativeStartState.bind(
+      fixture.app.runtime,
+    );
+    vi.spyOn(fixture.app.runtime, 'authoritativeStartState').mockImplementation(
+      async (...args) => {
+        await purgeOnceEnded();
+        return read(...args);
+      },
+    );
+
+    // #when the run starts
+    const response = await fixture.runner.fetch(
+      post('/runs', { workflowId: 'zero', runId: 'zero-run', inputData: {} }),
+    );
+
+    // #then retention kept the row at both reads, and the start answers the
+    // run's summary
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ status: 'success' });
+    expect(purged).toEqual([0, 0]);
+    expect(fixture.journal.values.has('flowsafe:run-owner-recovery:v1')).toBe(
+      false,
+    );
+    expect(await fixture.env.owners.owner('run', 'zero-run')).toEqual({
+      kind: 'human',
+      id: OWNER_PRINCIPAL.id,
+    });
+  });
+
+  it('clears the start journal an instance left after committing the run owner, once retention removed the ended run', async () => {
+    // #given a start whose instance stopped right after it committed the run
+    // owner, and retention that then removed the ended run
+    const fixture = await zeroFixture();
+    fixture.allowNext();
+    const settle = fixture.env.owners.settleReservation.bind(
+      fixture.env.owners,
+    );
+    const stopped = vi
+      .spyOn(fixture.env.owners, 'settleReservation')
+      .mockImplementation(async (...args) => {
+        await settle(...args);
+        throw new Error('instance stopped');
+      });
+    await fixture.runner.fetch(
+      post('/runs', { workflowId: 'zero', runId: 'zero-run', inputData: {} }),
+    );
+    stopped.mockRestore();
+    expect(fixture.journal.values.has('flowsafe:run-owner-recovery:v1')).toBe(
+      true,
+    );
+    expect(await fixture.env.owners.owner('run', 'zero-run')).toEqual({
+      kind: 'human',
+      id: OWNER_PRINCIPAL.id,
+    });
+    expect(await purgeAtZero(fixture.env)).toBe(1);
+
+    // #when a new instance wakes on the journal
+    const wake = new TestRunner(fixture.journal.state, fixture.env).alarm();
+
+    // #then it clears the journal and does not run the workflow again
+    await expect(wake).resolves.toBeUndefined();
+    expect(fixture.journal.values.has('flowsafe:run-owner-recovery:v1')).toBe(
+      false,
+    );
+    expect(fixture.effects()).toBe(1);
   });
 });
 

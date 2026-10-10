@@ -157,7 +157,7 @@ The Worker does not mount `POST /api/approvals`. Approval records come from obse
 | `APPROVAL_ACTOR_TOKENS` | secret | none; protected routes return `401` | JSON map of bearer token to `{ id, role }`. Unknown roles and empty actor ids are dropped |
 | `APPROVAL_SLA_SECONDS` | variable | `14400` | SLA applied to new approvals |
 | `APPROVAL_ALLOW_SELF_DECISION` | variable | unset | Separation of duties remains enabled. `true` exempts all deciders; a comma-separated role list exempts only those roles |
-| `RUN_RETENTION_DAYS` | variable | `30` | Terminal snapshot age before alarm-driven purge; `0` makes every terminal run eligible |
+| `RUN_RETENTION_DAYS` | variable | `30` | Terminal snapshot age before alarm-driven purge; `0` makes a terminal run eligible once the object that started it has read the start's outcome |
 | `APPROVAL_RETENTION_DAYS` | variable | `30` | Decided approval age before alarm-driven purge |
 | `THREAD_RETENTION_DAYS` | variable | unset | Optional idle thread and message retention duty |
 | `STREAM_TICKET_SECRET` | secret | unset | Dedicated HMAC key for 60-second WebSocket tickets |

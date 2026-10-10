@@ -3,7 +3,7 @@
 import {
   type MaintenanceCapabilityJwk,
   verifyAsymmetricMaintenanceCapability,
-} from '@proofoftech/flowsafe/host-kit';
+} from '@proofoftech/flowsafe/host-kit/maintenance-capability';
 import {
   isDeploymentEnvironment,
   isDeploymentScriptName,

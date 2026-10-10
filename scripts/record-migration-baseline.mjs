@@ -28,10 +28,6 @@ import type { MigrationOpLogEntry } from './fleet-migration-worlds.js';`,
     {
       name: 'MIGRATION_SUCCESS_BASELINE_RESULT',
       key: 'successResult',
-      jsDoc: `/**
- * An absent \`durableObjectTag\` key differs from a present key whose value
- * is \`undefined\`.
- */`,
       satisfies: 'readonly FleetRecord[]',
     },
     {

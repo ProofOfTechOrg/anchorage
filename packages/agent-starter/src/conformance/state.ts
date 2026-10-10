@@ -22,11 +22,8 @@ export {
  * its profile appends. Neither file edits the other, which is what keeps the
  * Durable Object history append-only.
  *
- * The state script has no public route: fleet control publishes the candidate's
- * hostname, and the dispatcher reaches this Worker only on the maintenance
- * path. `createFlowsafeWorker` is used anyway because it already implements
- * that path — including the fleet Ed25519 capability check and the HMAC
- * receipt, which `FLEET_MAINTENANCE_CAPABILITIES: 'required'` turns on.
+ * The ordinary Worker teardown proof also uploads this entry and uses its
+ * fetch handler for maintenance.
  */
 const stateWorkerConfig = {
   ...conformanceRunnerLifecycleConfig,

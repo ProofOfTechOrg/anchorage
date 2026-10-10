@@ -11,11 +11,8 @@ import {
   MutationEpochMismatchError,
 } from '../do-runner/execution-admission.js';
 import { isPathSafeId } from '../do-runner/index.js';
-import {
-  RunRouteError,
-  requireResourceAccess,
-  runRouteReason,
-} from '../host-kit/index.js';
+import { RunRouteError, requireResourceAccess } from '../host-kit/index.js';
+import { runRouteErrorBody } from '../host-kit/run-route-error.js';
 import { readBoundedBody } from '../http-body.js';
 import { createAgentCatalog } from './catalog.js';
 import type { AgentThreadTopology } from './thread-topology.js';
@@ -199,19 +196,8 @@ function internalError(error: unknown, route: MatchedRoute): Response {
     return json({ error: 'forbidden' }, 403);
   }
   if (error instanceof RunRouteError) {
-    // A structured reason is the DO saying what it refused and why, in a code
-    // it means to publish — so it passes through at ANY status, 5xx included.
-    // Without this a 503 EXECUTION_FENCED became a bare 500 here and the
-    // caller could not tell a fenced deployment from a broken one.
-    if (error.status < 500 || runRouteReason(error) !== undefined) {
-      return json(
-        {
-          error: error.message,
-          ...(error.reason === undefined ? {} : { reason: error.reason }),
-        },
-        error.status,
-      );
-    }
+    const body = runRouteErrorBody(error);
+    if (body) return json(body, error.status);
   }
   console.error(
     JSON.stringify({

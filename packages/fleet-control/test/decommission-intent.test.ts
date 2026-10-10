@@ -927,6 +927,27 @@ describe('decommission advance intent', () => {
       }),
     ).toThrow(DecommissionAdvanceIntentError);
 
+    const retained = { ...wfpValid, lifecyclePhase: 'decommissioning' };
+    const teardown = { ...wfpMigration, desiredSpecDigest: pendingSpecDigest };
+    expect(parse(retained, teardown)).toEqual(retained);
+    for (const entryLifecyclePhase of ['ready', 'publishing', 'rolling-back']) {
+      expect(() =>
+        parse(
+          {
+            ...retained,
+            identity: {
+              ...retained.identity,
+              mode: { ...retained.identity.mode, entryLifecyclePhase },
+            },
+          },
+          teardown,
+        ),
+      ).toThrow(DecommissionAdvanceIntentError);
+    }
+    expect(() =>
+      parse(retained, { ...teardown, desiredSpecDigest: 'e'.repeat(64) }),
+    ).toThrow(DecommissionAdvanceIntentError);
+
     const advanced = {
       ...common('decommissioning'),
       identity: {

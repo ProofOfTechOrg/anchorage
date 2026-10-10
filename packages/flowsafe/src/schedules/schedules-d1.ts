@@ -1775,13 +1775,16 @@ export class D1SchedulesStorage extends SchedulesStorage {
       return null;
     }
     await this.#ensureSchema();
+    // json_extract throws on metadata SQLite cannot parse, and CASE reads it
+    // only once json_valid holds, so such a record is not a claimed dispatch.
     const row = await this.#db
       .prepare(
         `SELECT * FROM ${this.#triggers}
          WHERE id = ? AND scheduleId = ? AND runId = ?
            AND outcome = 'deferred'
            AND COALESCE(triggerKind, 'schedule-fire') = 'schedule-fire'
-           AND json_extract(metadata, '$.dispatchState') IN (
+           AND CASE WHEN json_valid(metadata)
+             THEN json_extract(metadata, '$.dispatchState') END IN (
              'prepared', 'executing', 'settled'
            )
            AND EXISTS (

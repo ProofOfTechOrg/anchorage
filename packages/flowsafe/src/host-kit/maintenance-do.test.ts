@@ -150,6 +150,8 @@ function harness(
     throwPurge?: boolean;
     withTick?: boolean;
     throwTick?: boolean;
+    withNotification?: boolean;
+    throwNotification?: boolean;
     deadlineLimit?: number;
     config?: Partial<FlowsafeWorkerConfig<TestEnv>>;
   } = {},
@@ -167,6 +169,9 @@ function harness(
         ? { deadlineLimit: options.deadlineLimit }
         : {}),
       ...(options.withTick ? { tickIntervalMs: 60 * 1_000 } : {}),
+      ...(options.withNotification
+        ? { notificationIntervalMs: 60 * 1_000 }
+        : {}),
     },
     ...(options.throwSweep
       ? {
@@ -181,6 +186,16 @@ function harness(
             storage.events.push('io');
             if (options.throwTick) throw new Error('simulated tick failure');
             return { fired: 0 };
+          },
+        }
+      : {}),
+    ...(options.withNotification
+      ? {
+          notificationTick: () => async () => {
+            if (options.throwNotification) {
+              throw new Error('simulated notification failure');
+            }
+            return { due: 0, delivered: 0, failed: 0 };
           },
         }
       : {}),
@@ -1056,6 +1071,99 @@ describe('alarm-driven deployment maintenance', () => {
     expect(status.lastTickAt).toBeUndefined();
     expect(status.lastTickAttemptAt).toBe(NOW);
     expect(status.lastTickError).toContain('simulated tick failure');
+  });
+
+  it.each([
+    {
+      failing: 'schedule tick',
+      options: { withTick: true, withNotification: true, throwTick: true },
+      expected: {
+        lastTickAttemptAt: NOW,
+        lastTickError: expect.stringContaining('simulated tick failure'),
+        lastNotificationAt: NOW,
+        lastNotificationAttemptAt: NOW,
+      },
+      absent: ['lastTickAt', 'lastNotificationError'],
+    },
+    {
+      failing: 'notification tick',
+      options: {
+        withTick: true,
+        withNotification: true,
+        throwNotification: true,
+      },
+      expected: {
+        lastTickAt: NOW,
+        lastTickAttemptAt: NOW,
+        lastNotificationAttemptAt: NOW,
+        lastNotificationError: expect.stringContaining(
+          'simulated notification failure',
+        ),
+      },
+      absent: ['lastTickError', 'lastNotificationAt'],
+    },
+  ])('runs the notification duty in its own invocation and records a failing $failing on that duty alone', async ({
+    options,
+    expected,
+    absent,
+  }) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { instance, internalRequest } = harness(options);
+
+    const ensured = await healthOf(
+      instance,
+      internalRequest('/ensure', 'POST'),
+    );
+    expect(ensured).toMatchObject({ nextTickAt: NOW, nextNotificationAt: NOW });
+
+    // deadline, sweep, purge, tick
+    for (let invocation = 0; invocation < 4; invocation += 1) {
+      await instance.alarm();
+    }
+    const afterTick = await healthOf(
+      instance,
+      internalRequest('/status', 'GET'),
+    );
+    expect(afterTick).toMatchObject({ nextNotificationAt: NOW, alarmAt: NOW });
+    expect(afterTick).not.toHaveProperty('lastNotificationAttemptAt');
+
+    // notification
+    await instance.alarm();
+
+    const status = await healthOf(instance, internalRequest('/status', 'GET'));
+    expect(status).toMatchObject({
+      ...expected,
+      nextNotificationAt: NOW + 60_000,
+      alarmAt: NOW + 60_000,
+    });
+    for (const field of absent) expect(status).not.toHaveProperty(field);
+  });
+
+  it.each([
+    [
+      'an interval without a builder',
+      {
+        maintenance: {
+          sweepIntervalMs: 1_000,
+          purgeIntervalMs: 2_000,
+          notificationIntervalMs: 60_000,
+        },
+      },
+    ],
+    [
+      'a builder without an interval',
+      { notificationTick: () => async () => ({}) },
+    ],
+  ] satisfies [
+    string,
+    Partial<FlowsafeWorkerConfig<TestEnv>>,
+  ][])('refuses %s for the notification duty', (_label, config) => {
+    expect(() => harness({ config })).toThrow(
+      /notificationIntervalMs and notificationTick/,
+    );
   });
 
   it('rejects non-singleton instances before touching maintenance state', async () => {

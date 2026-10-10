@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { describe, expect, it, vi } from 'vitest';
+import { nestedArray } from '../../test-support/deep-json.js';
 import { deploymentIdentityHeaders } from '../do-runner/index.js';
+import { runInputDepthMessage } from '../do-runner/run-input-depth.js';
 import {
   AUDIT_PROXY_INSTANCE_NAME,
   createAuditProxyDurableObjectBinding,
@@ -87,6 +89,25 @@ describe('trusted audit proxy', () => {
     expect((await handler(request('x'.repeat(120 * 1_024 + 1)))).status).toBe(
       413,
     );
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it('refuses an event nested more than 256 levels deep before enqueueing it', async () => {
+    // #given a trusted audit proxy
+    const { handler, send } = proxy();
+
+    // #when a candidate posts an event whose detail makes it 257 levels deep
+    const response = await handler(
+      new Request('http://audit-proxy/internal/audit', {
+        method: 'POST',
+        headers: deploymentIdentityHeaders(SECRET),
+        body: JSON.stringify({ ...event(), detail: nestedArray(256) }),
+      }),
+    );
+
+    // #then it is refused as a bad request and never enqueued
+    expect(response.status).toBe(400);
+    expect(await response.text()).toBe(runInputDepthMessage('audit event'));
     expect(send).not.toHaveBeenCalled();
   });
 

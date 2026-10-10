@@ -15,10 +15,12 @@ import {
 } from '@proofoftech/flowsafe/host-kit';
 import { describe, expect, it, vi } from 'vitest';
 import { ActiveRouteAttestationError } from '../src/active-route.js';
+import { CloudflareProvisioningClient } from '../src/cloudflare-client.js';
 import { D1FleetStateDatabase } from '../src/d1-fleet-state-database.js';
 import { advanceDecommissionDeployment } from '../src/decommission-advance.js';
 import { WorkerDeploymentError } from '../src/deployment-error.js';
 import { migrateFleet } from '../src/fleet.js';
+import type { HostRoutingTarget } from '../src/host-routing.js';
 import {
   canonicalDeploymentEgressPolicy,
   durableObjectMigrationHistoryDigest,
@@ -44,6 +46,7 @@ import type {
   DecommissionAttachmentScanResult,
   DeploymentSecrets,
   DeploymentSpec,
+  DurableObjectBindingInventory,
   ExternalMutationFence,
   ExternalPlatformProfile,
   ExternalPlatformResources,
@@ -59,6 +62,7 @@ import {
   type WorkersForPlatformsApi,
   WorkersForPlatformsBackend,
 } from '../src/workers-for-platforms-backend.js';
+import { testRateCoordinator } from './fixtures/cloudflare-fetch-fixture.js';
 import { decommissionAdvancingRecordFixture } from './fixtures/decommission-intent-fixture.js';
 import { D1State } from './fixtures/provider-world.js';
 import { createWfpMaintenanceHarness } from './fixtures/wfp-maintenance-harness.js';
@@ -353,16 +357,7 @@ class FakeApi implements WorkersForPlatformsApi {
         policyHosts?: readonly string[];
       }
     | undefined;
-  lastPromotedRoute:
-    | {
-        scriptName: string;
-        tenantTag: string;
-        environment: string;
-        policyId: string;
-        policyDigest: string;
-        policyHosts: readonly string[];
-      }
-    | undefined;
+  lastPromotedRoute: HostRoutingTarget | undefined;
 
   async listWorkerDatabaseAttachments(): Promise<
     readonly Readonly<{
@@ -923,14 +918,7 @@ class FakeApi implements WorkersForPlatformsApi {
   async putHostRouting(
     _namespaceId: string,
     _hostname: string,
-    target: {
-      scriptName: string;
-      tenantTag: string;
-      environment: string;
-      policyId: string;
-      policyDigest: string;
-      policyHosts: readonly string[];
-    },
+    target: HostRoutingTarget,
     guard: PromotionGuard,
   ): Promise<void> {
     this.calls.push('route');
@@ -949,20 +937,13 @@ class FakeApi implements WorkersForPlatformsApi {
   async deleteHostRouting(
     _namespaceId: string,
     _hostname: string,
-    allowedTargets: readonly Readonly<{
-      scriptName: string;
-      tenantTag: string;
-      environment: string;
-    }>[],
+    allowedTargets: readonly HostRoutingTarget[],
   ): Promise<void> {
     this.calls.push('delete-route');
     if (!this.routeOwner) return;
     if (
       !allowedTargets.some(
-        (target) =>
-          target.scriptName === this.routeOwner?.scriptName &&
-          target.tenantTag === this.routeOwner.tenantTag &&
-          target.environment === this.routeOwner.environment,
+        (target) => JSON.stringify(target) === JSON.stringify(this.routeOwner),
       )
     ) {
       throw new Error('route is owned by another deployment or release');
@@ -1085,6 +1066,91 @@ async function attestedHealthResponse(
 }
 
 describe('WorkersForPlatformsBackend', () => {
+  it('removes a persisted route through the concrete byte-exact client', async () => {
+    const api = new FakeApi();
+    const policy = canonicalDeploymentEgressPolicy({
+      policyId: externalPlatformResourceGroupId(deployment),
+      tenantTag: deployment.tenantTag,
+      environment: deployment.environment,
+      allowedHosts: ['prior.example.com'],
+    });
+    const target = {
+      scriptName: externalReleaseScriptName(deployment),
+      tenantTag: deployment.tenantTag,
+      environment: deployment.environment,
+      policyId: policy.policyId,
+      policyDigest: policy.policyDigest,
+      policyHosts: policy.policyHosts,
+      stateEgress: {
+        resourceGroupId: policy.policyId,
+        stateScriptName: externalStateScriptName(deployment),
+        credentialDigest: 'a'.repeat(64),
+      },
+    };
+    let stored: string | undefined = JSON.stringify(target);
+    let deletes = 0;
+    const client = new CloudflareProvisioningClient({
+      accountId: 'account',
+      apiToken: 'token',
+      dispatchNamespace: 'fleet',
+      requestTimeoutMs: 1_000,
+      rateCoordinator: testRateCoordinator(),
+      fetch: async (_input, init) => {
+        if (init?.method === 'DELETE') {
+          deletes += 1;
+          stored = undefined;
+          return new Response(null, { status: 200 });
+        }
+        return stored === undefined
+          ? new Response(null, { status: 404 })
+          : new Response(stored);
+      },
+    });
+    api.deleteHostRouting = (namespace, hostname, targets) =>
+      client.withMutationFence(fence, () =>
+        client.deleteHostRouting(namespace, hostname, targets),
+      );
+    const backend = new WorkersForPlatformsBackend({
+      namespacedState: NAMESPACED_STATE,
+      client: api,
+      hostRoutingKvId: 'host-routes',
+    });
+    const database = {
+      id: 'db-acme',
+      name: deployment.databaseName,
+      created: false,
+    };
+    await backend.removeTraffic(deployment, [], undefined, database, fence, [
+      target,
+    ]);
+    expect(stored).toBeUndefined();
+    expect(deletes).toBe(1);
+    for (const drift of [
+      { ...target, policyHosts: ['foreign.example.com'] },
+      {
+        ...target,
+        stateEgress: {
+          ...target.stateEgress,
+          credentialDigest: 'b'.repeat(64),
+        },
+      },
+    ]) {
+      stored = JSON.stringify(drift);
+      await expect(
+        backend.removeTraffic(deployment, [], undefined, database, fence, [
+          target,
+        ]),
+      ).rejects.toThrow(/owned by another deployment/);
+      expect(stored).toBe(JSON.stringify(drift));
+      expect(deletes).toBe(1);
+    }
+    stored = JSON.stringify(target);
+    await expect(
+      backend.removeTraffic(deployment, [], undefined, database, fence),
+    ).rejects.toThrow(/owned by another deployment/);
+    expect(deletes).toBe(1);
+  });
+
   it.each([
     'alias',
     'class',
@@ -2209,6 +2275,10 @@ describe('WorkersForPlatformsBackend', () => {
     });
     expect(client.uploadedControlSpecs).toEqual([]);
     expect(client.controlWorkers.size).toBe(0);
+    expect(client.uploadedNamespacedState.at(-1)).toMatchObject({
+      appliedDurableObjectTag: null,
+      spec: { previousDurableObjectTag: 'state-v1' },
+    });
     expect(client.dispatchWorkers.get(stateName)).toMatchObject({
       databaseIds: ['db-acme'],
       durableObjectBindings: [
@@ -2640,12 +2710,13 @@ describe('WorkersForPlatformsBackend', () => {
       name: deployment.databaseName,
       created: false,
     };
-    const initial = await backend.ensurePlatformResources(
+    const record = platformConvergenceRecord(backend, deployment, database);
+    await backend.ensurePlatformResources(
       deployment,
       database,
       secrets,
       undefined,
-      platformConvergenceRecord(backend, deployment, database),
+      record,
       fence,
     );
     client.calls.length = 0;
@@ -2655,12 +2726,7 @@ describe('WorkersForPlatformsBackend', () => {
       database,
       secrets,
       backend.describeExternalPlatformTarget(deployment),
-      recordWithPlatformResources(
-        backend,
-        deployment,
-        initial.resources,
-        database,
-      ),
+      record,
       fence,
     );
 
@@ -2673,6 +2739,10 @@ describe('WorkersForPlatformsBackend', () => {
       'secrets',
     ]);
     expect(client.uploadedControlSpecs).toEqual([]);
+    expect(client.uploadedNamespacedState.at(-1)).toMatchObject({
+      appliedDurableObjectTag: 'state-v1',
+      spec: { previousDurableObjectTag: 'state-v1' },
+    });
   });
 
   it('rejects persisted ordinary platform resources before provider mutation', async () => {
@@ -3322,12 +3392,15 @@ describe('WorkersForPlatformsBackend', () => {
       ],
       namespaceIds: ['namespace:MaintenanceV1', 'namespace:MaintenanceV2'],
     });
-    expect(client.uploadedNamespacedState.at(-1)?.spec).toMatchObject({
-      previousDurableObjectTag: 'state-v1',
-      durableObjectMigrations: [
-        { tag: 'state-v1', newSqliteClasses: ['MaintenanceV1'] },
-        { tag: 'state-v2', newSqliteClasses: ['MaintenanceV2'] },
-      ],
+    expect(client.uploadedNamespacedState.at(-1)).toMatchObject({
+      appliedDurableObjectTag: 'state-v1',
+      spec: {
+        previousDurableObjectTag: 'state-v1',
+        durableObjectMigrations: [
+          { tag: 'state-v1', newSqliteClasses: ['MaintenanceV1'] },
+          { tag: 'state-v2', newSqliteClasses: ['MaintenanceV2'] },
+        ],
+      },
     });
 
     client.calls.length = 0;
@@ -3345,6 +3418,10 @@ describe('WorkersForPlatformsBackend', () => {
     expect(client.calls).toContain(
       `upload-namespaced:${externalStateScriptName(targetSpec)}`,
     );
+    expect(client.uploadedNamespacedState.at(-1)).toMatchObject({
+      appliedDurableObjectTag: 'state-v2',
+      spec: { previousDurableObjectTag: 'state-v1' },
+    });
   });
 
   it('rejects a same-tag rewrite of persisted trusted-state migration history', async () => {
@@ -4133,6 +4210,196 @@ describe('WorkersForPlatformsBackend', () => {
     });
   });
 
+  describe.each([
+    'fresh',
+    'retry',
+  ] as const)('%s owned candidate topology', (stage) => {
+    const spec: DeploymentSpec = {
+      ...deployment,
+      durableObjectBindings: [
+        { name: 'MAINTENANCE', className: 'Maintenance' },
+      ],
+      queueProducer: { binding: 'AUDIT_QUEUE', queueName: 'fleet-audit' },
+    };
+    const resources: ExternalPlatformResources = {
+      ...platformResources,
+      stateWorker: {
+        ...platformResources.stateWorker,
+        dispatchNamespace: NAMESPACED_STATE.dispatchNamespace,
+        durableObjectBindings: [
+          {
+            name: 'MAINTENANCE',
+            className: 'Maintenance',
+            namespaceId: 'namespace:Maintenance',
+          },
+          {
+            name: 'FLEET_AUDIT_PROXY_OBJECT',
+            className: 'FlowsafeFleetAuditProxy',
+            namespaceId: 'namespace:FlowsafeFleetAuditProxy',
+          },
+        ],
+        namespaceIds: [
+          'namespace:Maintenance',
+          'namespace:FlowsafeFleetAuditProxy',
+        ],
+      },
+      auditQueueName: 'fleet-audit',
+    };
+    const cases: readonly {
+      label: string;
+      accepted?: boolean;
+      observe: (
+        bindings: readonly DurableObjectBindingInventory[],
+      ) => readonly DurableObjectBindingInventory[];
+    }[] = [
+      {
+        label: 'accepts omitted dispatch namespace with exact owned UUIDs',
+        accepted: true,
+        observe: (bindings) =>
+          bindings
+            .map(({ dispatchNamespace: _, ...binding }) => binding)
+            .reverse(),
+      },
+      {
+        label: 'rejects a foreign namespace UUID',
+        observe: (bindings) =>
+          bindings.map((binding) => ({
+            ...binding,
+            namespaceId: 'namespace:foreign',
+          })),
+      },
+      {
+        label: 'rejects an empty namespace UUID',
+        observe: (bindings) =>
+          bindings.map((binding) => ({ ...binding, namespaceId: '' })),
+      },
+      {
+        label: 'rejects namespace UUIDs assigned to the wrong class',
+        observe: (bindings) =>
+          bindings.map((binding) => ({
+            ...binding,
+            namespaceId:
+              binding.name === 'MAINTENANCE'
+                ? 'namespace:FlowsafeFleetAuditProxy'
+                : 'namespace:Maintenance',
+          })),
+      },
+      {
+        label: 'rejects omitted dispatch namespace with a foreign UUID',
+        observe: (bindings) =>
+          bindings.map(({ dispatchNamespace: _, ...binding }) => ({
+            ...binding,
+            namespaceId: 'namespace:foreign',
+          })),
+      },
+      {
+        label: 'rejects omitted dispatch namespace with a different class',
+        observe: (bindings) =>
+          bindings.map(({ dispatchNamespace: _, ...binding }) => ({
+            ...binding,
+            className: 'Foreign',
+          })),
+      },
+      {
+        label:
+          'rejects omitted dispatch namespace with a different remote script',
+        observe: (bindings) =>
+          bindings.map(({ dispatchNamespace: _, ...binding }) => ({
+            ...binding,
+            scriptName: 'foreign-state',
+          })),
+      },
+      {
+        label: 'rejects an explicit different dispatch namespace',
+        observe: (bindings) =>
+          bindings.map((binding) => ({
+            ...binding,
+            dispatchNamespace: 'foreign',
+          })),
+      },
+      {
+        label: 'rejects a missing binding',
+        observe: (bindings) => bindings.slice(1),
+      },
+      {
+        label: 'rejects a duplicate binding replacing another binding',
+        observe: (bindings) =>
+          bindings.slice(0, 1).flatMap((binding) => [binding, binding]),
+      },
+    ];
+
+    it.each(cases)('$label', async ({ observe, accepted }) => {
+      const client = new FakeApi();
+      client.exists = false;
+      const backend = new WorkersForPlatformsBackend({
+        namespacedState: NAMESPACED_STATE,
+        client,
+        hostRoutingKvId: 'host-routes',
+        auditQueueName: 'fleet-audit',
+      });
+      const database = {
+        id: 'db-acme',
+        name: deployment.databaseName,
+        created: true,
+      };
+      const scriptName = externalReleaseScriptName(spec);
+      if (stage === 'retry') {
+        await backend.deployWorker(
+          spec,
+          database,
+          secrets,
+          resources,
+          fence,
+          'pending',
+        );
+      }
+      const changeBindings = () => {
+        const live = client.dispatchWorkers.get(scriptName);
+        if (!live) throw new Error('missing candidate Worker');
+        client.dispatchWorkers.set(scriptName, {
+          ...live,
+          durableObjectBindings: observe(live.durableObjectBindings),
+        });
+      };
+      if (stage === 'retry') {
+        changeBindings();
+      } else {
+        const upload = client.uploadDispatchWorker.bind(client);
+        vi.spyOn(client, 'uploadDispatchWorker').mockImplementation(
+          async (...args) => {
+            const uploaded = await upload(...args);
+            changeBindings();
+            return uploaded;
+          },
+        );
+      }
+      client.calls.length = 0;
+      const deployed = backend.deployWorker(
+        spec,
+        database,
+        secrets,
+        resources,
+        fence,
+        stage === 'retry' ? 'etag-v1' : 'pending',
+      );
+      if (accepted) {
+        await expect(deployed).resolves.toEqual({
+          artifactVersion: 'etag-v1',
+          created: stage === 'fresh',
+          physicalScriptName: scriptName,
+        });
+        expect(client.uploadedScriptNames).toEqual([scriptName]);
+      } else {
+        await expect(deployed).rejects.toThrow();
+        if (stage === 'retry') {
+          expect(client.calls).toEqual([]);
+        } else {
+          expect(client.deletedScriptNames).toEqual([scriptName]);
+        }
+      }
+    });
+  });
+
   it('rejects an out-of-band immutable dispatch artifact overwrite before secrets or upload', async () => {
     const api = new FakeApi();
     api.dispatchArtifactVersion = 'out-of-band-overwrite';
@@ -4357,6 +4624,8 @@ describe('WorkersForPlatformsBackend', () => {
       policyHosts: ['api.example.com'],
     });
     expect(api.lastPromotedRoute?.policyDigest).toMatch(/^[a-f0-9]{64}$/u);
+    const promotedRoute = api.lastPromotedRoute;
+    if (!promotedRoute) throw new Error('promoted route is missing');
 
     api.routeOwner = undefined;
     const retained = {
@@ -4382,17 +4651,18 @@ describe('WorkersForPlatformsBackend', () => {
       database,
       fence,
     );
-    api.routeOwner = {
+    const retainedRoute = {
+      ...promotedRoute,
       scriptName: retained.physicalScriptName,
-      tenantTag: deployment.tenantTag,
-      environment: deployment.environment,
     };
+    api.routeOwner = retainedRoute;
     await backend.removeTraffic(
       deployment,
       [retained],
       undefined,
       database,
       fence,
+      [retainedRoute],
     );
     await backend.deleteWorker(
       deployment,
@@ -4460,11 +4730,21 @@ describe('WorkersForPlatformsBackend', () => {
     ).rejects.toThrow(/another deployment or release/);
     expect(api.deletedScriptNames).toEqual([]);
 
-    api.routeOwner = {
+    const policy = canonicalDeploymentEgressPolicy({
+      policyId: externalPlatformResourceGroupId(deployment),
+      tenantTag: deployment.tenantTag,
+      environment: deployment.environment,
+      allowedHosts: [],
+    });
+    const pendingRoute = {
       scriptName: pending.physicalScriptName,
       tenantTag: deployment.tenantTag,
       environment: deployment.environment,
+      policyId: policy.policyId,
+      policyDigest: policy.policyDigest,
+      policyHosts: policy.policyHosts,
     };
+    api.routeOwner = pendingRoute;
     api.failDelete = true;
     await backend.removeTraffic(
       deployment,
@@ -4472,6 +4752,7 @@ describe('WorkersForPlatformsBackend', () => {
       active,
       { id: 'db-acme', name: deployment.databaseName, created: false },
       fence,
+      [pendingRoute],
     );
     await expect(
       backend.deleteWorker(

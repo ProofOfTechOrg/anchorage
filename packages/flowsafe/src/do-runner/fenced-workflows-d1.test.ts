@@ -4066,6 +4066,39 @@ describe('settled-row guard on unscoped persistence', () => {
     expect(h.rows()).toHaveLength(1);
   });
 
+  /** A snapshot whose run provenance names the start `startToken`. */
+  function startedBy(
+    startToken: string,
+    status: WorkflowRunState['status'],
+  ): WorkflowRunState {
+    return {
+      ...pending(),
+      status,
+      requestContext: {
+        [PROVENANCE]: {
+          version: 2,
+          startToken,
+          attemptToken: 'leg',
+          resumeCounts: [],
+        },
+      },
+    };
+  }
+
+  it("refuses a write whose run provenance names another start than the stored row's, and writes nothing", async () => {
+    // #given a row stored by one start
+    const h = await fixture();
+    await persist(h.domain, startedBy('S2', 'running'));
+    const before = h.rows();
+
+    // #when a leg of another start writes its snapshot over it
+    const outcome = persist(h.domain, startedBy('S1', 'success'));
+
+    // #then the write is refused as a settled conflict and the row is unchanged
+    await expect(outcome).rejects.toBeInstanceOf(RunSettledConflictError);
+    expect(h.rows()).toEqual(before);
+  });
+
   describe('decisions over a row SQLite cannot parse match the SQL decisions', () => {
     const KEY = RUN_LIFECYCLE_CONTEXT_KEY;
     const NO_CONTEXT = undefined;

@@ -504,6 +504,22 @@ function capturedLogs(): { lines: () => string[]; errors: () => string[] } {
   };
 }
 
+/** The JSON lines of `type` among captured log output. */
+function linesOfType(
+  lines: readonly string[],
+  type: string,
+): Record<string, unknown>[] {
+  return lines
+    .map((l) => {
+      try {
+        return JSON.parse(l) as Record<string, unknown>;
+      } catch {
+        return undefined;
+      }
+    })
+    .filter((p): p is Record<string, unknown> => p?.type === type);
+}
+
 afterEach(() => {
   vi.restoreAllMocks();
 });
@@ -2464,7 +2480,7 @@ describe('createFlowsafeWorker storage table prefix', () => {
   });
 });
 
-describe('createFlowsafeWorker schedule tick duty', () => {
+describe('createFlowsafeWorker injected tick duties', () => {
   it('the tick duty runs only the schedule tick', async () => {
     // #given a worker with a tick interval + a scheduleTick builder
     const logs = capturedLogs();
@@ -2489,16 +2505,7 @@ describe('createFlowsafeWorker schedule tick duty', () => {
 
     // #then the tick ran once, logged its own line, and NO maintenance ran
     expect(tickFn).toHaveBeenCalledTimes(1);
-    const tickLines = logs
-      .lines()
-      .map((l) => {
-        try {
-          return JSON.parse(l) as Record<string, unknown>;
-        } catch {
-          return undefined;
-        }
-      })
-      .filter((p): p is Record<string, unknown> => p?.type === 'schedule-tick');
+    const tickLines = linesOfType(logs.lines(), 'schedule-tick');
     expect(tickLines).toHaveLength(1);
     expect(tickLines[0]?.result).toMatchObject({ fired: 1 });
     expect(logs.lines().some((l) => l.includes('"type":"maintenance"'))).toBe(
@@ -2578,6 +2585,48 @@ describe('createFlowsafeWorker schedule tick duty', () => {
     expect(logs.lines().some((l) => l.includes('"type":"maintenance"'))).toBe(
       true,
     );
+  });
+
+  it.each([
+    [
+      'succeeds',
+      async () => ({ due: 1, delivered: 1, failed: 0 }),
+      { ok: true, value: undefined },
+      'lines',
+      'notification-dispatch',
+    ],
+    [
+      'throws',
+      async () => {
+        throw new Error('inbox down');
+      },
+      { ok: false, error: expect.stringContaining('inbox down') },
+      'errors',
+      'notification-dispatch-error',
+    ],
+  ] as const)('the notification duty runs only the notification tick and logs its own line when it %s', async (_when, notificationFn, outcome, channel, logType) => {
+    // #given a worker with both a schedule tick and a notification tick
+    const logs = capturedLogs();
+    const scheduleFn = vi.fn();
+    const worker = makeWorker({
+      maintenance: {
+        sweepIntervalMs: 15 * 60 * 1_000,
+        purgeIntervalMs: 60 * 60 * 1_000,
+        tickIntervalMs: 2 * 60 * 1_000,
+        notificationIntervalMs: 60 * 1_000,
+      },
+      scheduleTick: () => scheduleFn,
+      notificationTick: () => notificationFn,
+    });
+    const { env } = makeEnv();
+
+    // #when the notification duty runs
+    const result = await worker.runMaintenanceDuty('notification', env);
+
+    // #then only the notification tick ran, under its own log type
+    expect(result).toEqual(outcome);
+    expect(scheduleFn).not.toHaveBeenCalled();
+    expect(linesOfType(logs[channel](), logType)).toHaveLength(1);
   });
 });
 

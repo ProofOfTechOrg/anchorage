@@ -1,5 +1,27 @@
 # anchorage-agent-starter
 
+## 0.0.25
+
+### Patch Changes
+
+- fe7cdaf: The conformance state accepts only the runner's `RUN_NOT_SUSPENDED` refusal as proof that a replayed raw resume was refused. Before this change any `409` from the run counted as that refusal, including the conflict a resume meets while a leg of the run is still executing, so the gate could attest a defense the replay never reached. Another refusal now fails the replay step.
+- ff90acb: The starter dispatches due notifications as their own one-minute maintenance duty instead of after the schedule pass in the same invocation. Before this change a schedule pass that threw, for example because reconciling deferred fires failed, skipped notification delivery for that pass, and a notification failure hid the schedule pass's result. `starterMaintenanceTick` is replaced by `starterScheduleTick` and `starterNotificationTick`. Upgrade a fleet control plane that audits starter deployments to `@proofoftech/fleet-control` 0.6.0 first, so it watches the notification duty.
+- Updated dependencies [a444885]
+- Updated dependencies [a444885]
+- Updated dependencies [e9f4ada]
+- Updated dependencies [187059b]
+- Updated dependencies [ff90acb]
+- Updated dependencies [d2a76bf]
+- Updated dependencies [d2a76bf]
+- Updated dependencies [a444885]
+- Updated dependencies [9351f21]
+- Updated dependencies [9351f21]
+- Updated dependencies [e9f4ada]
+- Updated dependencies [080d34e]
+- Updated dependencies [a444885]
+- Updated dependencies [95e563c]
+  - @proofoftech/flowsafe@0.27.0
+
 ## 0.0.24
 
 ### Patch Changes

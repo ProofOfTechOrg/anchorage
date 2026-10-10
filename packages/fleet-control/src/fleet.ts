@@ -21,6 +21,10 @@ import type {
 } from './fleet-migration-state.js';
 import { FLEET_MIGRATION_PLAN_BOUND } from './fleet-operation-state.js';
 import {
+  MAINTENANCE_DUTIES,
+  type MaintenanceDutyName,
+} from './maintenance-health.js';
+import {
   assertExternalPlatformTarget,
   assertExternalPlatformTargetCompatibility,
   assertPlatformResourcesMatchTarget,
@@ -41,6 +45,7 @@ import {
   assertPlatformDurableObjectHistory,
   reconcilePersistedDatabase,
 } from './provision.js';
+import { durableObjectBindingsMatch } from './release-topology.js';
 import { settlePromotedRoute } from './settlement.js';
 import { deploymentSpecDigest } from './spec-digest.js';
 import type {
@@ -476,7 +481,7 @@ function allowedRouteScriptNames(record: FleetRecord): readonly string[] {
 }
 
 interface DutyHealth {
-  readonly name: 'sweep' | 'purge' | 'tick';
+  readonly name: MaintenanceDutyName;
   readonly lastSuccessAt: number | null;
   readonly lastAttemptAt: number | null | undefined;
   readonly lastError: string | undefined;
@@ -488,22 +493,6 @@ function bindingKey(binding: {
   readonly namespaceId: string;
 }): string {
   return `${binding.name}:${binding.className}:${binding.namespaceId}`;
-}
-
-function fullBindingKey(binding: {
-  readonly name: string;
-  readonly className: string;
-  readonly namespaceId: string;
-  readonly scriptName?: string;
-  readonly dispatchNamespace?: string;
-}): string {
-  return [
-    binding.name,
-    binding.className,
-    binding.namespaceId,
-    binding.scriptName ?? '',
-    binding.dispatchNamespace ?? '',
-  ].join(':');
 }
 
 function namedTargetKeys(
@@ -525,8 +514,16 @@ function externalReleaseTopologyFromLive(
   live: LiveDeployment,
   intended: ExternalReleaseTopology,
 ): ExternalReleaseTopology {
+  if (
+    !durableObjectBindingsMatch(
+      live.durableObjectBindings,
+      intended.durableObjectBindings,
+    )
+  ) {
+    throw new Error('migration candidate has drifted Durable Object bindings');
+  }
   return {
-    durableObjectBindings: live.durableObjectBindings,
+    durableObjectBindings: intended.durableObjectBindings,
     serviceBindings: live.serviceBindings ?? [],
     queueProducerBindings: live.queueProducerBindings ?? [],
     secretNames: intended.secretNames,
@@ -535,30 +532,19 @@ function externalReleaseTopologyFromLive(
 }
 
 function configuredDuties(health: MaintenanceHealth): readonly DutyHealth[] {
-  return [
-    {
-      name: 'sweep',
-      lastSuccessAt: health.lastSweepAt,
-      lastAttemptAt: health.lastSweepAttemptAt,
-      lastError: health.lastSweepError,
-    },
-    {
-      name: 'purge',
-      lastSuccessAt: health.lastPurgeAt,
-      lastAttemptAt: health.lastPurgeAttemptAt,
-      lastError: health.lastPurgeError,
-    },
-    ...(health.lastTickAt === undefined
+  return MAINTENANCE_DUTIES.flatMap((duty): readonly DutyHealth[] => {
+    const lastSuccessAt = health[duty.last];
+    return lastSuccessAt === undefined
       ? []
       : [
           {
-            name: 'tick' as const,
-            lastSuccessAt: health.lastTickAt,
-            lastAttemptAt: health.lastTickAttemptAt,
-            lastError: health.lastTickError,
+            name: duty.name,
+            lastSuccessAt,
+            lastAttemptAt: health[duty.attempt],
+            lastError: health[duty.error],
           },
-        ]),
-  ];
+        ];
+  });
 }
 
 interface DutySegment {
@@ -1313,12 +1299,10 @@ export async function auditRecordStep(
         detail: `lifecycle release '${release.physicalScriptName}' has no durable binding topology`,
       });
     } else if (
-      JSON.stringify(
-        liveRelease.durableObjectBindings.map(fullBindingKey).sort(),
-      ) !==
-        JSON.stringify(
-          release.topology.durableObjectBindings.map(fullBindingKey).sort(),
-        ) ||
+      !durableObjectBindingsMatch(
+        liveRelease.durableObjectBindings,
+        release.topology.durableObjectBindings,
+      ) ||
       JSON.stringify(namedTargetKeys(liveRelease.serviceBindings ?? [])) !==
         JSON.stringify(namedTargetKeys(release.topology.serviceBindings)) ||
       JSON.stringify(
@@ -2975,7 +2959,6 @@ async function migrationPlatformOnlyResources(
 async function migrationPlatformOnlyMaintenance(
   admitted: AdmittedFleetMigrationContext,
   current: FleetRecord,
-  entry: FleetRecord,
 ): Promise<FleetRecord> {
   const { lease, backend, spec, secrets, targetDigest } = admitted;
   const platformMigrationRelease = (
@@ -2991,7 +2974,7 @@ async function migrationPlatformOnlyMaintenance(
   }
   assertLiveDeploymentMatches(
     maintenancePreflight,
-    entry,
+    current,
     spec,
     targetDigest,
     platformMigrationRelease.application,
@@ -3020,7 +3003,6 @@ async function migrationPlatformOnlyMaintenance(
 async function migrationPlatformOnlyPromote(
   admitted: AdmittedFleetMigrationContext,
   current: FleetRecord,
-  entry: FleetRecord,
 ): Promise<FleetRecord> {
   const {
     lease,
@@ -3047,7 +3029,7 @@ async function migrationPlatformOnlyPromote(
     }
     assertLiveDeploymentMatches(
       publicationPreflight,
-      entry,
+      current,
       spec,
       targetDigest,
       platformMigrationRelease.application,
@@ -3082,7 +3064,6 @@ async function migrationPlatformOnlyPromote(
 async function migrationPlatformOnlyReady(
   admitted: AdmittedFleetMigrationContext,
   current: FleetRecord,
-  entry: FleetRecord,
 ): Promise<FleetRecord> {
   const {
     lease,
@@ -3109,7 +3090,7 @@ async function migrationPlatformOnlyReady(
   if (!live) throw new Error('platform-only migration release is missing');
   assertLiveDeploymentMatches(
     live,
-    entry,
+    current,
     spec,
     targetDigest,
     platformMigrationRelease.application,
@@ -3304,7 +3285,6 @@ async function migrationPendingTopology(
 async function migrationDeployCandidate(
   admitted: AdmittedFleetMigrationContext,
   current: FleetRecord,
-  entry: FleetRecord,
 ): Promise<FleetRecord> {
   const {
     lease,
@@ -3369,7 +3349,7 @@ async function migrationDeployCandidate(
   if (!live) throw new Error('migration candidate is missing');
   assertLiveDeploymentMatches(
     live,
-    entry,
+    current,
     spec,
     targetDigest,
     current.migrationIntent?.targetRelease.application ??
@@ -3458,7 +3438,6 @@ async function migrationArmMaintenance(
 async function migrationPromote(
   admitted: AdmittedFleetMigrationContext,
   current: FleetRecord,
-  entry: FleetRecord,
 ): Promise<FleetRecord> {
   const {
     lease,
@@ -3478,7 +3457,7 @@ async function migrationPromote(
   }
   assertLiveDeploymentMatches(
     publicationPreflight,
-    entry,
+    current,
     spec,
     targetDigest,
     current.migrationIntent?.targetRelease.application ??
@@ -3545,7 +3524,7 @@ async function migrationSettleReady(
   }
   assertLiveDeploymentMatches(
     live,
-    entry,
+    current,
     spec,
     targetDigest,
     current.migrationIntent?.targetRelease.application ??
@@ -3591,6 +3570,10 @@ async function migrationSettleReady(
     attestation: attestationOptions,
   });
   const settled = { ...current };
+  const durableObjectTag = finalizedStateProvider
+    ? current.durableObjectTag
+    : targetDurableObjectTag(spec);
+  delete settled.durableObjectTag;
   delete settled.pendingRelease;
   delete settled.migrationPriorRelease;
   delete settled.pendingSpecDigest;
@@ -3616,15 +3599,7 @@ async function migrationSettleReady(
           outboundPolicy: targetPlatform.outboundPolicy,
         }
       : {}),
-    // Written unconditionally, unlike the conditional spreads around it: the
-    // key belongs to a migrated record whatever its value, and carries
-    // `undefined` when a finalized state provider supplies no tag. The frozen
-    // migration baseline records it that way and the golden suite compares
-    // with `toStrictEqual`, which reads a present `undefined` key differently
-    // from an absent one, so a conditional spread here changes what it pins.
-    durableObjectTag: finalizedStateProvider
-      ? current.durableObjectTag
-      : targetDurableObjectTag(spec),
+    ...(durableObjectTag !== undefined ? { durableObjectTag } : {}),
     ...(spec.authoredBy === 'platform'
       ? {
           durableObjectMigrationHistory: canonicalDurableObjectMigrationHistory(
@@ -3717,17 +3692,13 @@ export async function executeNextMigrationStep(
       current = await migrationPlatformOnlyResources(admitted, current);
       break;
     case 'platform-only-maintenance':
-      current = await migrationPlatformOnlyMaintenance(
-        admitted,
-        current,
-        entry,
-      );
+      current = await migrationPlatformOnlyMaintenance(admitted, current);
       break;
     case 'platform-only-promote':
-      current = await migrationPlatformOnlyPromote(admitted, current, entry);
+      current = await migrationPlatformOnlyPromote(admitted, current);
       break;
     case 'platform-only-ready':
-      current = await migrationPlatformOnlyReady(admitted, current, entry);
+      current = await migrationPlatformOnlyReady(admitted, current);
       break;
     case 'seed-identity':
       current = await migrationSeedIdentity(admitted, current, entry);
@@ -3753,13 +3724,13 @@ export async function executeNextMigrationStep(
       current = await migrationPendingTopology(admitted, current);
       break;
     case 'deploy-candidate':
-      current = await migrationDeployCandidate(admitted, current, entry);
+      current = await migrationDeployCandidate(admitted, current);
       break;
     case 'arm-maintenance':
       current = await migrationArmMaintenance(admitted, current);
       break;
     case 'promote':
-      current = await migrationPromote(admitted, current, entry);
+      current = await migrationPromote(admitted, current);
       break;
     case 'settle-ready':
       current = await migrationSettleReady(admitted, current, entry);
@@ -4117,7 +4088,7 @@ export async function rollbackExternalRelease(options: {
       if (!live) throw new Error('retained rollback release is missing');
       assertLiveDeploymentMatches(
         live,
-        stored,
+        intent,
         rollbackSpec,
         rollbackDigest,
         target.application,
@@ -4142,7 +4113,7 @@ export async function rollbackExternalRelease(options: {
       if (!live) throw new Error('retained rollback release is missing');
       assertLiveDeploymentMatches(
         live,
-        stored,
+        intent,
         rollbackSpec,
         rollbackDigest,
         target.application,
@@ -4165,7 +4136,7 @@ export async function rollbackExternalRelease(options: {
         throw new Error('rollback release disappeared after promotion');
       assertLiveDeploymentMatches(
         live,
-        stored,
+        intent,
         rollbackSpec,
         rollbackDigest,
         target.application,

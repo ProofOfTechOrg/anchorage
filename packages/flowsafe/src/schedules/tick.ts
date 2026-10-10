@@ -302,6 +302,10 @@ export interface ScheduleTickStatusResult {
  * `reason.code` `RUN_START_PENDING`. An adapter that reaches the thread Durable
  * Object through another hop must answer with the thread object's own status,
  * never that hop's: a relayed 404 fails a threadless start that is an hour old.
+ * A reconcile pass also looks up a dispatch stored with a target nested past
+ * the run-input bound, which only an earlier version stores; it never sends
+ * such a dispatch again, resolves the fire from the answer, and records it
+ * `failed` when the lookup throws.
  */
 export type ScheduleTickStatus = (
   input: ScheduleTickDispatchRef,
@@ -390,15 +394,19 @@ export interface ScheduleTickOptions {
 export interface ScheduleTickResult {
   /** Due schedules the pass considered. */
   due: number;
-  /** Workflow or agent runs dispatched. */
+  /** Workflow or agent runs dispatched, counted once the pass records the fire. */
   fired: number;
   /** Deliberate non-fires (agent start unavailable or run-capped). */
   skipped: number;
-  /** Errors (invalid target + start threw); the schedule was still advanced. */
+  /**
+   * Errors (invalid target + start threw); the schedule was still advanced. A
+   * fire whose run-cap check or claim throws after its claim is stored counts
+   * here, and again in the pass that settles that claim.
+   */
   failed: number;
-  /** Dispatches whose commit state is still unknown and will be reconciled. */
+  /** Fires whose trigger stays deferred after this pass; a later pass reconciles them. */
   deferred: number;
-  /** Earlier deferred triggers resolved during this pass. */
+  /** Earlier deferred triggers this pass settled. */
   reconciled: number;
   /** CAS claims lost because the row advanced, paused, or disappeared. */
   lost: number;
@@ -590,9 +598,13 @@ function agentScheduleProviderOptions(
   };
 }
 
-function scheduleTickDispatchRef(
+/**
+ * Parse a stored dispatch reference and report whether its target nests past
+ * the run-input bound.
+ */
+function storedDispatchRef(
   value: unknown,
-): ScheduleTickDispatchRef | undefined {
+): { ref: ScheduleTickDispatchRef; deep: boolean } | undefined {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
     return undefined;
   }
@@ -610,8 +622,7 @@ function scheduleTickDispatchRef(
       stored === null ||
       typeof stored !== 'object' ||
       Array.isArray(stored) ||
-      (stored as { type?: unknown }).type !== 'workflow' ||
-      deepScheduleTargetField(stored) !== undefined
+      (stored as { type?: unknown }).type !== 'workflow'
     ) {
       return undefined;
     }
@@ -622,12 +633,15 @@ function scheduleTickDispatchRef(
       return undefined;
     }
     return {
-      scheduleId: candidate.scheduleId,
-      dispatchId: candidate.dispatchId,
-      target: 'workflow',
-      workflowId: candidate.workflowId,
-      runId: candidate.runId,
-      workflowTarget,
+      ref: {
+        scheduleId: candidate.scheduleId,
+        dispatchId: candidate.dispatchId,
+        target: 'workflow',
+        workflowId: candidate.workflowId,
+        runId: candidate.runId,
+        workflowTarget,
+      },
+      deep: deepScheduleTargetField(stored) !== undefined,
     };
   }
   if (
@@ -643,8 +657,7 @@ function scheduleTickDispatchRef(
     stored === null ||
     typeof stored !== 'object' ||
     Array.isArray(stored) ||
-    (stored as { type?: unknown }).type !== 'agent' ||
-    deepScheduleTargetField(stored) !== undefined
+    (stored as { type?: unknown }).type !== 'agent'
   ) {
     return undefined;
   }
@@ -661,15 +674,38 @@ function scheduleTickDispatchRef(
     return undefined;
   }
   return {
-    scheduleId: candidate.scheduleId,
-    dispatchId: candidate.dispatchId,
-    target: 'agent',
-    agentId: candidate.agentId,
-    threadId: candidate.threadId,
-    runId: candidate.runId,
-    mode: candidate.mode,
-    agentTarget,
+    ref: {
+      scheduleId: candidate.scheduleId,
+      dispatchId: candidate.dispatchId,
+      target: 'agent',
+      agentId: candidate.agentId,
+      threadId: candidate.threadId,
+      runId: candidate.runId,
+      mode: candidate.mode,
+      agentTarget,
+    },
+    deep: deepScheduleTargetField(stored) !== undefined,
   };
+}
+
+/** A stored dispatch reference a dispatch path may send or execute. */
+function scheduleTickDispatchRef(
+  value: unknown,
+): ScheduleTickDispatchRef | undefined {
+  const stored = storedDispatchRef(value);
+  return stored?.deep ? undefined : stored?.ref;
+}
+
+/** A dispatch reference without its target snapshot. */
+function dispatchIdentifiers(
+  ref: ScheduleTickDispatchRef,
+): Record<string, unknown> {
+  if (ref.target === 'workflow') {
+    const { workflowTarget: _target, ...identifiers } = ref;
+    return identifiers;
+  }
+  const { agentTarget: _target, ...identifiers } = ref;
+  return identifiers;
 }
 
 /** Narrow prepared-trigger read required by target-side schedule dispatch. */
@@ -767,6 +803,15 @@ function isPermanentDispatchError(error: unknown): boolean {
  */
 const UNRESOLVED_START_SETTLE_MS = 60 * 60_000;
 
+/** The tally an outcome counts under: an outcome that ran nothing is skipped. */
+function outcomeCounter(outcome: ScheduleFireOutcome): 'fired' | 'skipped' {
+  return outcome === 'persisted' ||
+    outcome === 'discarded' ||
+    outcome === 'skipped'
+    ? 'skipped'
+    : 'fired';
+}
+
 /**
  * Build the schedule tick: a `() => Promise<ScheduleTickResult>` a host slots
  * into its alarm dispatch as its OWN failure-isolated duty (own try/catch, own
@@ -822,87 +867,137 @@ export function createScheduleTick(
     ...extra,
   });
 
-  const recordResolvedDispatch = async (
+  const auditOrLog = async (
+    event: Omit<ScheduleTickAuditEvent, 'type' | 'timestamp'>,
+    runId: string | undefined,
+  ): Promise<void> => {
+    try {
+      await audit(event);
+    } catch (error) {
+      logBookkeepingError(event.scheduleId, runId, error);
+    }
+  };
+
+  /**
+   * Writes a trigger, then counts the fire under `counter` and audits it. A
+   * failed write counts the fire as deferred, because its trigger stays
+   * deferred for a later pass, and a failed audit changes no count. Resolves
+   * to whether the write changed the trigger; a write that resolves `false`
+   * changed nothing and counts nothing.
+   */
+  const settleTrigger = async (
+    result: ScheduleTickResult,
+    write: () => Promise<unknown>,
+    counter: 'fired' | 'skipped' | 'failed',
+    event: Omit<ScheduleTickAuditEvent, 'type' | 'timestamp'>,
+    logRunId: string | undefined,
+  ): Promise<boolean> => {
+    let changed: unknown;
+    try {
+      changed = await write();
+    } catch (error) {
+      result.deferred += 1;
+      logBookkeepingError(event.scheduleId, logRunId, error);
+      return false;
+    }
+    if (changed === false) return false;
+    result[counter] += 1;
+    await auditOrLog(event, logRunId);
+    return true;
+  };
+
+  const recordResolvedDispatch = (
     ref: ScheduleTickDispatchRef,
     trigger: ScheduleTrigger,
     summary: ScheduleTickStatusResult | undefined,
     result: ScheduleTickResult,
-  ): Promise<void> => {
+    recordedRef: Record<string, unknown> = ref,
+  ): Promise<boolean> => {
     const published = summary !== undefined;
     const receipt = summary?.dispatchReceipt;
     const outcome = receipt?.outcome ?? (published ? 'published' : 'failed');
     const resolvedRunId = receipt?.runId ?? summary?.runId ?? ref.runId;
     const { error: priorError, ...resolvedTrigger } = trigger;
-    if (!published) result.failed += 1;
-    else if (
-      receipt &&
-      (receipt.outcome === 'persisted' ||
-        receipt.outcome === 'discarded' ||
-        receipt.outcome === 'skipped')
-    ) {
-      result.skipped += 1;
-    } else {
-      result.fired += 1;
-    }
-    try {
-      await store.recordTrigger({
-        ...resolvedTrigger,
-        runId: published ? resolvedRunId : ref.runId,
-        outcome,
-        ...(published ? {} : { error: priorError ?? 'start failed' }),
-        metadata: triggerMetadata({
-          ...(trigger.metadata ?? {}),
-          dispatchRef: ref,
-          reason: published ? 'dispatch-reconciled' : 'start-error-confirmed',
+    return settleTrigger(
+      result,
+      () =>
+        store.recordTrigger({
+          ...resolvedTrigger,
+          runId: published ? resolvedRunId : ref.runId,
+          outcome,
+          ...(published ? {} : { error: priorError ?? 'start failed' }),
+          metadata: triggerMetadata({
+            ...(trigger.metadata ?? {}),
+            dispatchRef: recordedRef,
+            reason: published ? 'dispatch-reconciled' : 'start-error-confirmed',
+          }),
         }),
-      });
-      await audit({
+      published ? outcomeCounter(outcome) : 'failed',
+      {
         scheduleId: ref.scheduleId,
         target: ref.target,
         outcome,
         runId: resolvedRunId,
         ...(published ? {} : { reason: 'start-error-confirmed' }),
-      });
-    } catch (error) {
-      logBookkeepingError(ref.scheduleId, ref.runId, error);
-    }
+      },
+      ref.runId,
+    );
   };
 
   /** Resolves to whether the write changed the deferred row. */
-  const recordFailedDispatch = async (
+  const recordFailedDispatch = (
     ref: ScheduleTickDispatchRef,
     trigger: ScheduleTrigger,
     error: unknown,
     reason: 'dispatch-refused' | 'dispatch-unresolved',
     result: ScheduleTickResult,
-  ): Promise<boolean> => {
-    let changed: boolean;
-    try {
-      changed = await store.failDeferredTrigger(
-        trigger.id ?? '',
-        trigger.scheduleId,
-        error instanceof Error ? error.message : String(error),
-        triggerMetadata({ dispatchRef: ref, reason }),
-      );
-    } catch (bookkeepingError) {
-      result.deferred += 1;
-      logBookkeepingError(ref.scheduleId, ref.runId, bookkeepingError);
-      return false;
-    }
-    if (!changed) return false;
-    result.failed += 1;
-    try {
-      await audit({
+  ): Promise<boolean> =>
+    settleTrigger(
+      result,
+      () =>
+        store.failDeferredTrigger(
+          trigger.id ?? '',
+          trigger.scheduleId,
+          error instanceof Error ? error.message : String(error),
+          triggerMetadata({ dispatchRef: ref, reason }),
+        ),
+      'failed',
+      {
         scheduleId: ref.scheduleId,
         target: ref.target,
         outcome: 'failed',
         reason,
         runId: ref.runId,
+      },
+      ref.runId,
+    );
+
+  const settleMalformedDispatch = async (
+    trigger: ScheduleTrigger,
+    result: ScheduleTickResult,
+    error = 'stored deferred dispatch is malformed',
+    recorded: Record<string, unknown> = {},
+  ): Promise<void> => {
+    try {
+      await store.recordTrigger({
+        ...trigger,
+        outcome: 'failed',
+        error,
+        metadata: triggerMetadata({
+          reason: 'invalid-deferred-dispatch',
+          ...recorded,
+        }),
       });
+      result.failed += 1;
+      result.reconciled += 1;
     } catch (bookkeepingError) {
-      logBookkeepingError(ref.scheduleId, ref.runId, bookkeepingError);
+      result.deferred += 1;
+      logBookkeepingError(
+        trigger.scheduleId,
+        trigger.runId ?? undefined,
+        bookkeepingError,
+      );
     }
-    return true;
   };
 
   const reconcileDeferred = async (
@@ -910,31 +1005,54 @@ export function createScheduleTick(
   ): Promise<void> => {
     const pending = await store.listDeferredTriggers(limit);
     for (const trigger of pending) {
-      const ref = scheduleTickDispatchRef(trigger.metadata?.dispatchRef);
+      const storedRef = trigger.metadata?.dispatchRef;
+      const ref = scheduleTickDispatchRef(storedRef);
       if (!ref) {
+        const stored = storedDispatchRef(storedRef);
+        if (!stored?.deep) {
+          await settleMalformedDispatch(trigger, result);
+          continue;
+        }
+        // A target nested past the run-input bound is never dispatched again,
+        // so the target's own state is the evidence of whether this fire ran.
+        let summary: ScheduleTickStatusResult | undefined;
         try {
-          await store.recordTrigger({
-            ...trigger,
-            outcome: 'failed',
-            error: 'stored deferred dispatch is malformed',
-            metadata: triggerMetadata({ reason: 'invalid-deferred-dispatch' }),
-          });
-          result.failed += 1;
-          result.reconciled += 1;
-        } catch (bookkeepingError) {
-          result.deferred += 1;
-          logBookkeepingError(
-            trigger.scheduleId,
-            trigger.runId ?? undefined,
-            bookkeepingError,
+          summary = await options.status(stored.ref);
+        } catch (lookupError) {
+          // With nothing to send again, a lookup that cannot decide the fire
+          // settles it, keeping the lookup's error.
+          await settleMalformedDispatch(
+            trigger,
+            result,
+            runInputDepthMessage('stored deferred dispatch'),
+            {
+              dispatchRef: dispatchIdentifiers(stored.ref),
+              statusError:
+                lookupError instanceof Error
+                  ? lookupError.message
+                  : String(lookupError),
+            },
           );
+          continue;
+        }
+        if (
+          await recordResolvedDispatch(
+            stored.ref,
+            trigger,
+            summary,
+            result,
+            dispatchIdentifiers(stored.ref),
+          )
+        ) {
+          result.reconciled += 1;
         }
         continue;
       }
       try {
         const summary = await options.status(ref);
-        result.reconciled += 1;
-        await recordResolvedDispatch(ref, trigger, summary, result);
+        if (await recordResolvedDispatch(ref, trigger, summary, result)) {
+          result.reconciled += 1;
+        }
       } catch (error) {
         if (
           ref.target === 'agent' &&
@@ -991,18 +1109,21 @@ export function createScheduleTick(
                 ref.agentTarget,
               ),
             });
-            result.reconciled += 1;
-            await recordResolvedDispatch(
-              ref,
-              trigger,
-              {
-                ...(receipt.runId !== undefined
-                  ? { runId: receipt.runId }
-                  : {}),
-                dispatchReceipt: receipt,
-              },
-              result,
-            );
+            if (
+              await recordResolvedDispatch(
+                ref,
+                trigger,
+                {
+                  ...(receipt.runId !== undefined
+                    ? { runId: receipt.runId }
+                    : {}),
+                  dispatchReceipt: receipt,
+                },
+                result,
+              )
+            ) {
+              result.reconciled += 1;
+            }
             continue;
           } catch (retryError) {
             if (isPermanentDispatchError(retryError)) {
@@ -1012,13 +1133,16 @@ export function createScheduleTick(
                 trigger.metadata?.dispatchReceipt,
               );
               if (stored) {
-                result.reconciled += 1;
-                await recordResolvedDispatch(
-                  ref,
-                  trigger,
-                  { dispatchReceipt: stored },
-                  result,
-                );
+                if (
+                  await recordResolvedDispatch(
+                    ref,
+                    trigger,
+                    { dispatchReceipt: stored },
+                    result,
+                  )
+                ) {
+                  result.reconciled += 1;
+                }
               } else if (
                 await recordFailedDispatch(
                   ref,
@@ -1176,12 +1300,15 @@ export function createScheduleTick(
       });
     } catch {
       result.failed += 1;
-      await audit({
-        scheduleId: schedule.id,
-        target: targetType,
-        outcome: 'failed',
-        reason: 'invalid-cron',
-      });
+      await auditOrLog(
+        {
+          scheduleId: schedule.id,
+          target: targetType,
+          outcome: 'failed',
+          reason: 'invalid-cron',
+        },
+        undefined,
+      );
       return;
     }
 
@@ -1222,21 +1349,69 @@ export function createScheduleTick(
     });
     if (!claimed) {
       result.lost += 1;
-      const current = await store.getSchedule(schedule.id);
-      const reason = !current
-        ? 'disappeared'
-        : current.status === 'paused'
-          ? 'paused'
-          : 'concurrent-claim';
-      const lostReason = `lost: ${reason}`;
-      await audit({
-        scheduleId: schedule.id,
-        target: targetType,
-        outcome: 'lost',
-        reason: lostReason,
-      });
+      try {
+        const current = await store.getSchedule(schedule.id);
+        const reason = !current
+          ? 'disappeared'
+          : current.status === 'paused'
+            ? 'paused'
+            : 'concurrent-claim';
+        await audit({
+          scheduleId: schedule.id,
+          target: targetType,
+          outcome: 'lost',
+          reason: `lost: ${reason}`,
+        });
+      } catch (error) {
+        logBookkeepingError(schedule.id, runId, error);
+      }
       return;
     }
+
+    const recordUndispatched = (
+      auditTarget: ScheduleTickAuditEvent['target'],
+      outcome: 'failed' | 'skipped',
+      reason: string,
+      error?: string,
+    ): Promise<boolean> =>
+      settleTrigger(
+        result,
+        () =>
+          store.recordTrigger({
+            ...claimTrigger,
+            runId: null,
+            outcome,
+            error,
+            metadata: triggerMetadata({ reason }),
+          }),
+        outcome,
+        { scheduleId: schedule.id, target: auditTarget, outcome, reason },
+        runId,
+      );
+
+    const recordPublished = (
+      auditTarget: ScheduleTickAuditEvent['target'],
+      dispatchedRunId: string,
+    ): Promise<boolean> =>
+      settleTrigger(
+        result,
+        () =>
+          store.recordTrigger({
+            ...claimTrigger,
+            runId: dispatchedRunId,
+            outcome: 'published',
+            error: undefined,
+            metadata: triggerMetadata(),
+          }),
+        'fired',
+        {
+          scheduleId: schedule.id,
+          target: auditTarget,
+          outcome: 'published',
+          runId: dispatchedRunId,
+        },
+        dispatchedRunId,
+      );
 
     // 4. We own this fire — nextFireAt is already advanced (consumed, never
     // hot-looped), whatever happens below.
@@ -1253,39 +1428,18 @@ export function createScheduleTick(
     }
     if (!targetDecision?.allowed) {
       const reason = targetDecision?.reason ?? 'invalid-creator-role';
-      result.failed += 1;
-      await store.recordTrigger({
-        ...claimTrigger,
-        runId: null,
-        outcome: 'failed',
-        error: reason,
-        metadata: triggerMetadata({ reason }),
-      });
-      await audit({
-        scheduleId: schedule.id,
-        target: targetType,
-        outcome: 'failed',
-        reason,
-      });
+      await recordUndispatched(targetType, 'failed', reason, reason);
       return;
     }
 
     const deepField = deepScheduleTargetField(schedule.target);
     if (deepField !== undefined) {
-      result.failed += 1;
-      await store.recordTrigger({
-        ...claimTrigger,
-        runId: null,
-        outcome: 'failed',
-        error: runInputDepthMessage(deepField),
-        metadata: triggerMetadata({ reason: 'input-too-deep' }),
-      });
-      await audit({
-        scheduleId: schedule.id,
-        target: targetType,
-        outcome: 'failed',
-        reason: 'input-too-deep',
-      });
+      await recordUndispatched(
+        targetType,
+        'failed',
+        'input-too-deep',
+        runInputDepthMessage(deepField),
+      );
       return;
     }
 
@@ -1295,64 +1449,12 @@ export function createScheduleTick(
         schedule.target,
       );
       if (!target) {
-        result.failed += 1;
-        await store.recordTrigger({
-          ...claimTrigger,
-          runId: null,
-          outcome: 'failed',
-          error: 'invalid agent target',
-          metadata: triggerMetadata({ reason: 'invalid-agent-target' }),
-        });
-        await audit({
-          scheduleId: schedule.id,
-          target: 'agent',
-          outcome: 'failed',
-          reason: 'invalid-agent-target',
-        });
-        return;
-      }
-      if (
-        (target.threadId !== undefined && !isPathSafeId(target.threadId)) ||
-        (target.resourceId !== undefined && !isPathSafeId(target.resourceId)) ||
-        (target.threadId !== undefined && target.resourceId === undefined)
-      ) {
-        result.failed += 1;
-        await store.recordTrigger({
-          ...claimTrigger,
-          runId: null,
-          outcome: 'failed',
-          error: 'invalid memory id',
-          metadata: triggerMetadata({ reason: 'invalid-memory-id' }),
-        });
-        await audit({
-          scheduleId: schedule.id,
-          target: 'agent',
-          outcome: 'failed',
-          reason: 'invalid-memory-id',
-        });
-        return;
-      }
-      if (
-        target.threadId === undefined &&
-        (target.resourceId !== undefined ||
-          target.signalType !== undefined ||
-          target.ifActive !== undefined ||
-          target.ifIdle !== undefined)
-      ) {
-        result.failed += 1;
-        await store.recordTrigger({
-          ...claimTrigger,
-          runId: null,
-          outcome: 'failed',
-          error: 'invalid agent target',
-          metadata: triggerMetadata({ reason: 'invalid-agent-target' }),
-        });
-        await audit({
-          scheduleId: schedule.id,
-          target: 'agent',
-          outcome: 'failed',
-          reason: 'invalid-agent-target',
-        });
+        await recordUndispatched(
+          'agent',
+          'failed',
+          'invalid-agent-target',
+          'invalid agent target',
+        );
         return;
       }
 
@@ -1364,20 +1466,11 @@ export function createScheduleTick(
 
       if (threaded) {
         if (!options.signalAgent) {
-          result.skipped += 1;
-          await store.recordTrigger({
-            ...claimTrigger,
-            runId: null,
-            outcome: 'skipped',
-            error: undefined,
-            metadata: triggerMetadata({ reason: 'agent-target-unsupported' }),
-          });
-          await audit({
-            scheduleId: schedule.id,
-            target: 'agent',
-            outcome: 'skipped',
-            reason: 'agent-target-unsupported',
-          });
+          await recordUndispatched(
+            'agent',
+            'skipped',
+            'agent-target-unsupported',
+          );
           return;
         }
         const dispatch: ScheduleTickDispatchRef = {
@@ -1422,73 +1515,44 @@ export function createScheduleTick(
           );
           return;
         }
-        if (
-          receipt.outcome === 'persisted' ||
-          receipt.outcome === 'discarded' ||
-          receipt.outcome === 'skipped'
-        ) {
-          result.skipped += 1;
-        } else {
-          result.fired += 1;
-        }
-        try {
-          await store.recordTrigger({
-            ...claimTrigger,
-            runId: receipt.runId ?? null,
-            outcome: receipt.outcome,
-            error: undefined,
-            metadata: triggerMetadata({
-              action: receipt.action,
-              ...(receipt.signalId !== undefined
-                ? { signalId: receipt.signalId }
-                : {}),
+        await settleTrigger(
+          result,
+          () =>
+            store.recordTrigger({
+              ...claimTrigger,
+              runId: receipt.runId ?? null,
+              outcome: receipt.outcome,
+              error: undefined,
+              metadata: triggerMetadata({
+                action: receipt.action,
+                ...(receipt.signalId !== undefined
+                  ? { signalId: receipt.signalId }
+                  : {}),
+              }),
             }),
-          });
-          await audit({
+          outcomeCounter(receipt.outcome),
+          {
             scheduleId: schedule.id,
             target: 'agent',
             outcome: receipt.outcome,
             ...(receipt.runId !== undefined ? { runId: receipt.runId } : {}),
-          });
-        } catch (error) {
-          logBookkeepingError(schedule.id, receipt.runId ?? firedRunId, error);
-        }
+          },
+          receipt.runId ?? firedRunId,
+        );
         return;
       }
 
       if (!options.startAgent) {
-        result.skipped += 1;
-        await store.recordTrigger({
-          ...claimTrigger,
-          runId: null,
-          outcome: 'skipped',
-          error: undefined,
-          metadata: triggerMetadata({ reason: 'agent-target-unsupported' }),
-        });
-        await audit({
-          scheduleId: schedule.id,
-          target: 'agent',
-          outcome: 'skipped',
-          reason: 'agent-target-unsupported',
-        });
+        await recordUndispatched(
+          'agent',
+          'skipped',
+          'agent-target-unsupported',
+        );
         return;
       }
       const allowed = options.runCap ? await options.runCap() : true;
       if (!allowed) {
-        result.skipped += 1;
-        await store.recordTrigger({
-          ...claimTrigger,
-          runId: null,
-          outcome: 'skipped',
-          error: undefined,
-          metadata: triggerMetadata({ reason: 'run-capped' }),
-        });
-        await audit({
-          scheduleId: schedule.id,
-          target: 'agent',
-          outcome: 'skipped',
-          reason: 'run-capped',
-        });
+        await recordUndispatched('agent', 'skipped', 'run-capped');
         return;
       }
       const dispatch: ScheduleTickDispatchRef = {
@@ -1533,44 +1597,18 @@ export function createScheduleTick(
         );
         return;
       }
-      const dispatchedRunId = summary.runId ?? firedRunId;
-      result.fired += 1;
-      try {
-        await store.recordTrigger({
-          ...claimTrigger,
-          runId: dispatchedRunId,
-          outcome: 'published',
-          error: undefined,
-          metadata: triggerMetadata(),
-        });
-        await audit({
-          scheduleId: schedule.id,
-          target: 'agent',
-          outcome: 'published',
-          runId: dispatchedRunId,
-        });
-      } catch (error) {
-        logBookkeepingError(schedule.id, dispatchedRunId, error);
-      }
+      await recordPublished('agent', summary.runId ?? firedRunId);
       return;
     }
 
     const target = normalizeAndSanitizeWorkflowTarget(schedule.target);
     if (!target) {
-      result.failed += 1;
-      await store.recordTrigger({
-        ...claimTrigger,
-        runId: null,
-        outcome: 'failed',
-        error: 'invalid workflow target',
-        metadata: triggerMetadata({ reason: 'invalid-workflow-target' }),
-      });
-      await audit({
-        scheduleId: schedule.id,
-        target: 'workflow',
-        outcome: 'failed',
-        reason: 'invalid-workflow-target',
-      });
+      await recordUndispatched(
+        'workflow',
+        'failed',
+        'invalid-workflow-target',
+        'invalid workflow target',
+      );
       return;
     }
 
@@ -1578,20 +1616,7 @@ export function createScheduleTick(
     const allowed = options.runCap ? await options.runCap() : true;
     if (!allowed) {
       // Capped: the schedule stays healthy (already advanced) and is audited.
-      result.skipped += 1;
-      await store.recordTrigger({
-        ...claimTrigger,
-        runId: null,
-        outcome: 'skipped',
-        error: undefined,
-        metadata: triggerMetadata({ reason: 'run-capped' }),
-      });
-      await audit({
-        scheduleId: schedule.id,
-        target: 'workflow',
-        outcome: 'skipped',
-        reason: 'run-capped',
-      });
+      await recordUndispatched('workflow', 'skipped', 'run-capped');
       return;
     }
 
@@ -1637,25 +1662,7 @@ export function createScheduleTick(
     // The run WAS dispatched. Record it as `published` (write-once at dispatch,
     // per core's ScheduleTriggerOutcome doc). Bookkeeping failures are logged
     // locally and do not reclassify the successful dispatch as a start failure.
-    const dispatchedRunId = summary.runId ?? firedRunId;
-    result.fired += 1;
-    try {
-      await store.recordTrigger({
-        ...claimTrigger,
-        runId: dispatchedRunId,
-        outcome: 'published',
-        error: undefined,
-        metadata: triggerMetadata(),
-      });
-      await audit({
-        scheduleId: schedule.id,
-        target: 'workflow',
-        outcome: 'published',
-        runId: dispatchedRunId,
-      });
-    } catch (error) {
-      logBookkeepingError(schedule.id, dispatchedRunId, error);
-    }
+    await recordPublished('workflow', summary.runId ?? firedRunId);
   };
 
   const idlePass = (): ScheduleTickResult => ({

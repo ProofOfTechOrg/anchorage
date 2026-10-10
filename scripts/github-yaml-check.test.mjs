@@ -835,6 +835,11 @@ test('the ci.yml canary reds the job from a final outcome step that reads the id
       'breakwater build',
     ],
     [
+      'Typecheck the Workers test harness against newest core',
+      'typecheck_harness',
+      'root typecheck:harness',
+    ],
+    [
       'Bundle the flowsafe spike Worker against newest core',
       'bundle',
       'spike bundle',
@@ -850,6 +855,17 @@ test('the ci.yml canary reds the job from a final outcome step that reads the id
       'tests_flowsafe_workers',
       'flowsafe workers suite',
     ],
+    [
+      'Test breakwater workers project against newest core',
+      'tests_breakwater_workers',
+      'breakwater workers suite',
+    ],
+    ['Build flowsafe against newest core', 'build_flowsafe', 'flowsafe build'],
+    [
+      'Test the flowsafe Wrangler harness against newest core',
+      'tests_flowsafe_harness',
+      'flowsafe harness suite',
+    ],
   ];
   for (const [name, id] of probes) {
     const step = steps.find((candidate) => candidate.name === name);
@@ -864,6 +880,19 @@ test('the ci.yml canary reds the job from a final outcome step that reads the id
       step.id,
       id,
       `the outcome step reads steps.${id}.outcome, so "${name}" carries that id`,
+    );
+  }
+
+  const stepIndex = (id) => steps.findIndex((step) => step.id === id);
+  for (const [build, reader] of [
+    ['build_breakwater', 'typecheck_harness'],
+    ['build_breakwater', 'bundle'],
+    ['build_breakwater', 'build_flowsafe'],
+    ['build_flowsafe', 'tests_flowsafe_harness'],
+  ]) {
+    assert.ok(
+      stepIndex(build) < stepIndex(reader),
+      `${reader} reads the dist/ that ${build} writes, so it runs after it`,
     );
   }
 
@@ -943,33 +972,57 @@ test('the ci.yml canary reds the job from a final outcome step that reads the id
 // A package's `typecheck` stops at its first red tsc program, so the canary
 // runs each chained script as its own probe; a program chained without a probe
 // of its own is hidden again behind an earlier red.
-test('the ci.yml canary probes each tsc program a library typecheck chains', () => {
+test('the ci.yml canary probes each tsc program a library or the root typecheck chains', () => {
   const steps = readCompatCanaryJob().steps ?? [];
 
-  for (const directory of ['packages/breakwater', 'packages/flowsafe']) {
-    const { name, scripts } = JSON.parse(
-      readFileSync(join(repositoryRoot, directory, 'package.json'), 'utf8'),
-    );
-    for (const segment of scripts.typecheck.split('&&')) {
+  const chains = ['packages/breakwater', 'packages/flowsafe'].map(
+    (directory) => {
+      const { name, scripts } = JSON.parse(
+        readFileSync(join(repositoryRoot, directory, 'package.json'), 'utf8'),
+      );
+      return {
+        owner: name,
+        scripts,
+        segments: scripts.typecheck.split('&&'),
+        probe: (script) => `pnpm --filter ${name} ${script}`,
+      };
+    },
+  );
+  const root = JSON.parse(
+    readFileSync(join(repositoryRoot, 'package.json'), 'utf8'),
+  );
+  chains.push({
+    owner: 'the root',
+    scripts: root.scripts,
+    // `pnpm -r typecheck` runs each package's own chain; the library packages'
+    // chains are probed on their own.
+    segments: root.scripts.typecheck
+      .split('&&')
+      .filter((segment) => !/^\s*pnpm -r typecheck\s*$/u.test(segment)),
+    probe: (script) => `pnpm run ${script}`,
+  });
+
+  for (const { owner, scripts, segments, probe } of chains) {
+    for (const segment of segments) {
       const script = /^\s*pnpm run (\S+)\s*$/u.exec(segment)?.[1];
       assert.ok(
         script,
-        `each segment of ${name}'s typecheck is \`pnpm run <script>\`, so a canary probe can run it on its own: ${segment.trim()}`,
+        `each segment of ${owner}'s typecheck is \`pnpm run <script>\`, so a canary probe can run it on its own: ${segment.trim()}`,
       );
       const body = scripts[script];
       assert.equal(
         typeof body,
         'string',
-        `${name}'s typecheck chains ${script}, which the package defines`,
+        `${owner}'s typecheck chains ${script}, which its manifest defines`,
       );
       assert.ok(
         !/&&|;|\|\|/u.test(body) && body.match(/\btsc\b/gu)?.length === 1,
-        `${name}'s ${script} is one tsc invocation, so its probe's red hides no other program: ${body}`,
+        `${owner}'s ${script} is one tsc invocation, so its probe's red hides no other program: ${body}`,
       );
-      const command = `pnpm --filter ${name} ${script}`;
+      const command = probe(script);
       assert.ok(
         steps.some((step) => step.run === command),
-        `each script ${name}'s typecheck chains has its own canary probe: no step runs \`${command}\``,
+        `each script ${owner}'s typecheck chains has its own canary probe: no step runs \`${command}\``,
       );
     }
   }

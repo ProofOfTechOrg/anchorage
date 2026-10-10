@@ -154,6 +154,50 @@ export async function verifyControlPlanePackedRuntime({
       receipt: terminal.receipt,
     };
 
+    let inventory = await probe('wfp-start');
+    assert.equal(inventory.error, undefined, JSON.stringify(inventory));
+    assert.equal(inventory.outcome.status, 'pending');
+    assert.equal(inventory.requests, 1);
+    const wfpStartToken = inventory.outcome.token;
+    for (const action of ['wfp-namespace', 'wfp-hosts', 'wfp-ordinary']) {
+      const refused = await probe(action, wfpStartToken);
+      assert.match(JSON.stringify(refused.error), /scope/);
+      assert.equal(refused.requests, 0);
+    }
+    const wfpFuture = await probe('wfp-continue', {
+      ...wfpStartToken,
+      revision: wfpStartToken.revision + 1,
+    });
+    assert.match(JSON.stringify(wfpFuture.error), /future|ahead/i);
+    assert.equal(wfpFuture.requests, 0);
+    inventory = await probe('wfp-continue', wfpStartToken);
+    assert.equal(inventory.error, undefined, JSON.stringify(inventory));
+    assert.equal(inventory.outcome.status, 'pending');
+    assert.equal(inventory.requests, 1);
+    for (
+      let step = 0;
+      step < 24 && inventory.outcome.status !== 'complete';
+      step += 1
+    ) {
+      inventory = await probe('wfp-continue', inventory.outcome.token);
+      assert.equal(inventory.error, undefined, JSON.stringify(inventory));
+    }
+    assert.equal(inventory.outcome.status, 'complete');
+    assert.equal(inventory.inventory.dispatchScriptCount, 0);
+    assert.deepEqual(inventory.inventory.findings, []);
+    assert.deepEqual(inventory.inventory.databaseIds, []);
+    assert.deepEqual(inventory.inventory.deployments, []);
+    const wfpReplay = await probe('wfp-continue', inventory.outcome.token);
+    assert.equal(wfpReplay.requests, 0);
+    assert.deepEqual(wfpReplay.outcome, inventory.outcome);
+    const finalizedWrongScope = await probe(
+      'wfp-namespace',
+      inventory.outcome.token,
+    );
+    assert.match(JSON.stringify(finalizedWrongScope.error), /scope/);
+    assert.equal(finalizedWrongScope.requests, 0);
+    evidence.workersForPlatformsInventory = inventory.outcome.generation;
+
     const quota = await probe('quota');
     assert.equal(quota.acquired, false);
     assert.equal(quota.error.name, 'AbortError');

@@ -7,7 +7,7 @@ import {
   randomUUID,
   timingSafeEqual,
 } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { readFile, realpath, stat } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -53,20 +53,43 @@ const applicationSecret =
 
 const config = JSON.parse(await readFile(resolve(configPath), 'utf8'));
 validateConformanceConfig(config);
+const exportDirectory = resolve(config.exportDirectory);
+const exportDirectoryReady = await Promise.all([
+  realpath(exportDirectory),
+  stat(exportDirectory),
+]).then(
+  ([canonical, metadata]) =>
+    canonical === exportDirectory && metadata.isDirectory(),
+  () => false,
+);
+if (!exportDirectoryReady) {
+  throw new Error(
+    'conformance exportDirectory must be an existing canonical directory',
+  );
+}
 const { canonicalMaintenanceCapabilityPublicKey } = await import(
   '../dist/platform-resources.js'
 );
-const { maintenanceCapabilityPrivateKey, workerContent, stateWorkerContents } =
-  await loadCredentialedConformanceArtifacts({
-    privateJwk: maintenanceCapabilityPrivateJwk,
-    publicJwk: config.platformProfile.maintenanceCapabilityPublicKey,
-    canonicalizePublicKey: canonicalMaintenanceCapabilityPublicKey,
-    workerBundle: config.workerBundle,
-    stateWorkerBundles: config.platformProfile.stateProfiles.map(
-      (profile) => profile.stateWorker.bundle,
-    ),
-    readArtifact: (path) => readFile(resolve(path)),
-  });
+const {
+  maintenanceCapabilityPrivateKey,
+  workerContent,
+  stateWorkerContents,
+  workerAdditionalModules,
+  stateWorkerAdditionalModules,
+} = await loadCredentialedConformanceArtifacts({
+  privateJwk: maintenanceCapabilityPrivateJwk,
+  publicJwk: config.platformProfile.maintenanceCapabilityPublicKey,
+  canonicalizePublicKey: canonicalMaintenanceCapabilityPublicKey,
+  workerBundle: config.workerBundle,
+  stateWorkerBundles: config.platformProfile.stateProfiles.map(
+    (profile) => profile.stateWorker.bundle,
+  ),
+  auxiliaryWasm: config.auxiliaryWasm,
+  stateWorkerAuxiliaryWasm: config.platformProfile.stateProfiles.map(
+    (profile) => profile.stateWorker.auxiliaryWasm,
+  ),
+  readArtifact: (path) => readFile(resolve(path)),
+});
 if (stateEgressRootSecret.length < 32) {
   throw new Error('FLEET_STATE_EGRESS_ROOT_SECRET must contain 32 characters');
 }
@@ -76,15 +99,19 @@ const applicationSecretDescriptor = Object.freeze({
   valueSha256: createHash('sha256').update(applicationSecret).digest('hex'),
 });
 
-function trustedArtifact(configuration, content) {
+function trustedArtifact(configuration, content, additionalModules) {
   return {
     mainModule: configuration.mainModule,
     modules: [
       {
         name: configuration.mainModule,
-        content,
+        content: new TextDecoder('utf-8', {
+          fatal: true,
+          ignoreBOM: true,
+        }).decode(content),
         contentType: 'application/javascript+module',
       },
+      ...additionalModules,
     ],
     compatibilityDate: configuration.compatibilityDate,
     compatibilityFlags: configuration.compatibilityFlags,
@@ -101,6 +128,7 @@ const stateProfiles = config.platformProfile.stateProfiles.map(
     stateWorker: trustedArtifact(
       profile.stateWorker,
       stateWorkerContents[index],
+      stateWorkerAdditionalModules[index],
     ),
     stateDurableObjectMigrations: profile.stateDurableObjectMigrations,
     organizationEgressHosts: config.platformProfile.organizationEgressHosts,
@@ -218,6 +246,7 @@ function deploymentSpec(tenantTag, release) {
               ]),
         contentType: 'application/javascript+module',
       },
+      ...workerAdditionalModules,
     ],
     authoredBy: 'external',
     schemaVersion: config.schemaVersion,
@@ -279,7 +308,7 @@ validateOperationalConformance({
 });
 
 const rateCoordinator = new ProcessLocalCloudflareApiRateCoordinator();
-const exportStore = new FileSystemDatabaseExportStore(config.exportDirectory);
+const exportStore = new FileSystemDatabaseExportStore(exportDirectory);
 const client = new CloudflareProvisioningClient({
   accountId,
   apiToken,
@@ -476,26 +505,46 @@ async function assertPlatformGroup(deployment, record) {
       candidate.databaseIds[0] === record.databaseId,
     `${spec.tenantTag} candidate and state Worker do not share the exact D1 database`,
   );
+  const expectedCandidateBindings = [
+    ...spec.durableObjectBindings.map(({ name, className }) => ({
+      name,
+      className,
+      stateBindingName: name,
+    })),
+    ...(spec.queueProducer
+      ? [
+          {
+            name: 'AUDIT_PROXY',
+            className: 'FlowsafeFleetAuditProxy',
+            stateBindingName: 'FLEET_AUDIT_PROXY_OBJECT',
+          },
+        ]
+      : []),
+  ];
   assert(
-    candidate.durableObjectBindings.every(
-      (binding) =>
-        binding.scriptName === stateName &&
-        binding.dispatchNamespace === config.dispatchNamespace,
-    ),
-    `${spec.tenantTag} candidate has a Durable Object outside its state Worker`,
-  );
-  if (spec.queueProducer) {
-    assert(
-      candidate.durableObjectBindings.some(
-        (binding) =>
-          binding.name === 'AUDIT_PROXY' &&
-          binding.className === 'FlowsafeFleetAuditProxy' &&
+    candidate.durableObjectBindings.length ===
+      expectedCandidateBindings.length &&
+      expectedCandidateBindings.every((expected) => {
+        const binding = candidate.durableObjectBindings.find(
+          (entry) => entry.name === expected.name,
+        );
+        const stateBinding = state.durableObjectBindings.find(
+          (entry) =>
+            entry.name === expected.stateBindingName &&
+            entry.className === expected.className,
+        );
+        return (
+          binding !== undefined &&
+          stateBinding !== undefined &&
+          binding.className === expected.className &&
           binding.scriptName === stateName &&
-          binding.dispatchNamespace === config.dispatchNamespace,
-      ),
-      `${spec.tenantTag} candidate has no exact remote audit Durable Object`,
-    );
-  }
+          binding.namespaceId === stateBinding.namespaceId &&
+          (binding.dispatchNamespace === undefined ||
+            binding.dispatchNamespace === config.dispatchNamespace)
+        );
+      }),
+    `${spec.tenantTag} candidate does not match its owned state namespaces`,
+  );
   assert(
     (candidate.serviceBindings ?? []).length === 0 &&
       (candidate.queueProducerBindings ?? []).length === 0 &&
@@ -1111,6 +1160,8 @@ async function assertSecretPreservingStateUpload(deployment, record) {
       client.withMutationFence(fence, async () => {
         await client.uploadNamespacedStateWorker({
           spec: externalStateDeploymentSpec(deployment.currentSpec, profile),
+          appliedDurableObjectTag:
+            record.platformResources.stateWorker.durableObjectTag ?? null,
           database,
           artifact: profile.stateWorker,
           artifactDigest: target.stateArtifactDigest,
@@ -1201,7 +1252,7 @@ function plainWorkerDeploymentSpec(workersDevSubdomain) {
       },
     ),
     maintenanceBaseUrl: `https://${scriptName}.${workersDevSubdomain}.workers.dev`,
-    routeHostname: config.routeHostnames[tenantTag],
+    routeHostname: config.plainWorkerRouteHostname,
     cpuLimitMs: config.cpuLimitMs,
     subrequestLimit: config.subrequestLimit,
   };

@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import { execFile } from 'node:child_process';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 import type { D1Database, R2Bucket } from '@cloudflare/workers-types';
 import { seedDeploymentIdentity } from '@proofoftech/flowsafe/do-runner';
 import { createTestHarness, type TestHarness } from 'wrangler';
@@ -19,15 +24,18 @@ export async function createWfpMaintenanceHarness(
     publicKey: string;
   }>,
 ) {
+  const directory = await mkdtemp(join(tmpdir(), 'wfp-maintenance-'));
+  const buildDirectory = join(directory, 'tenant');
+  const buildConfig = join(directory, 'wrangler.json');
   let catalog = input.catalog;
   let catalogEnrolled = true;
   const workerNames = ['wfp-catalog', 'wfp-state', 'wfp-candidate'] as const;
-  const main = fileURLToPath(
+  const source = fileURLToPath(
     new URL('../../scripts/direct-credentialed-tenant.ts', import.meta.url),
   );
   function options() {
     return {
-      root: fileURLToPath(new URL('../..', import.meta.url)),
+      root: directory,
       workers: workerNames.map((name, index) => {
         const spec = name === 'wfp-catalog' ? catalog : input.external;
         const candidate = name === 'wfp-candidate';
@@ -36,7 +44,10 @@ export async function createWfpMaintenanceHarness(
         return {
           config: {
             name,
-            main,
+            main: join(buildDirectory, 'direct-credentialed-tenant.js'),
+            no_bundle: true,
+            find_additional_modules: true,
+            base_dir: buildDirectory,
             compatibility_date: '2026-08-06',
             vars: {
               DEPLOYMENT_TENANT: spec.tenantTag,
@@ -103,6 +114,11 @@ export async function createWfpMaintenanceHarness(
     const errors = results.flatMap((result) =>
       result.status === 'rejected' ? [result.reason] : [],
     );
+    try {
+      await rm(directory, { recursive: true, force: true });
+    } catch (error) {
+      errors.push(error);
+    }
     if (errors.length)
       throw new AggregateError(errors, 'WFP native fixture cleanup failed');
   }
@@ -149,9 +165,33 @@ export async function createWfpMaintenanceHarness(
     return dispatchWorker.fetch(request, dispatcher);
   };
   try {
+    await writeFile(
+      buildConfig,
+      JSON.stringify({
+        name: 'wfp-tenant-bundle',
+        main: source,
+        compatibility_date: '2026-08-06',
+      }),
+    );
+    // Binding reloads use stable bytes because Wrangler removes its previous
+    // temporary bundle before asynchronous config-update builds have stopped.
+    await promisify(execFile)(
+      'pnpm',
+      [
+        'exec',
+        'wrangler',
+        'deploy',
+        '--dry-run',
+        '--config',
+        buildConfig,
+        '--outdir',
+        buildDirectory,
+      ],
+      { cwd: fileURLToPath(new URL('../..', import.meta.url)) },
+    );
     server = createTestHarness(options());
     control = createTestHarness({
-      root: fileURLToPath(new URL('../..', import.meta.url)),
+      root: directory,
       workers: [
         {
           config: {

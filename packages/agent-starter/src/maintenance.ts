@@ -1,19 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
-// The host's unattended maintenance duty, in a module of its own rather than in
-// the Worker entry: workerd rejects a non-handler export from an entry module,
-// so anything a test must reach has to live beside it (the same shape
-// flowsafe's own deploy/crons.ts uses).
+// The host's unattended maintenance duties, in a module of their own rather
+// than in the Worker entry: workerd rejects a non-handler export from an entry
+// module, so anything a test must reach has to live beside it (the same shape
+// flowsafe's own deploy/crons.ts uses). That includes the duty registration,
+// which a test can import from here but not from the entry.
 //
 // What is worth testing here is the WIRING, not the closures: every surface in
 // this host takes its execution fence from `executionFence(env.DB)`, and the
-// one that must not be missed is this tick — an unfenced tick claims a due fire
-// through the schedules CAS (which advances `nextFireAt`) and the fenced
-// runtime then refuses the start, so the fire is consumed and never runs.
+// one that must not be missed is the schedule tick — an unfenced tick claims a
+// due fire through the schedules CAS (which advances `nextFireAt`) and the
+// fenced runtime then refuses the start, so the fire is consumed and never
+// runs.
 
 import { createAgentThreadTopology } from '@proofoftech/flowsafe/agent-host';
 import {
   createDoRunTopology,
   createThreadTopology,
+  type FlowsafeWorkerConfig,
   queueApprovalForSuspension,
   RunRouteError,
 } from '@proofoftech/flowsafe/host-kit';
@@ -21,8 +24,12 @@ import {
   createScheduleTargetPolicy,
   createScheduleTick,
   parseScheduleAgentDispatchReceipt,
+  type ScheduleTickResult,
 } from '@proofoftech/flowsafe/schedules';
-import { createNotificationDispatchTick } from '@proofoftech/flowsafe/signals';
+import {
+  createNotificationDispatchTick,
+  type NotificationDispatchTickResult,
+} from '@proofoftech/flowsafe/signals';
 
 import { STARTER_AGENT_META } from './agent.js';
 import { audit, SYSTEM_PRINCIPAL_ID } from './config.js';
@@ -42,13 +49,14 @@ export const scheduleTargetPolicy = createScheduleTargetPolicy({
 });
 
 /**
- * The deployment's cron duty: claim and fire due schedules, then dispatch due
- * notifications. Both passes read the SAME fence store as the runtime and the
- * routers, so a fenced deployment neither claims a fire nor burns a
- * notification's delivery attempts.
+ * The deployment's schedule duty: claim and fire due schedules and reconcile
+ * deferred fires. It reads the SAME fence store as the runtime and the
+ * routers, so a fenced deployment never claims a fire.
  */
-export function starterMaintenanceTick(env: Env): () => Promise<unknown> {
-  // ONE store, named once: the file header's claim that both passes gate the
+export function starterScheduleTick(
+  env: Env,
+): () => Promise<ScheduleTickResult> {
+  // ONE store, named once: the file header's claim that the tick gates the
   // same fence as the runtime is a claim about identity, and two calls make a
   // reader check the memo to believe it.
   const fence = executionFence(env.DB);
@@ -68,7 +76,7 @@ export function starterMaintenanceTick(env: Env): () => Promise<unknown> {
       executionFence: fence,
     },
   );
-  const schedules = createScheduleTick({
+  return createScheduleTick({
     store: schedulesStore(env.DB),
     targetPolicy: scheduleTargetPolicy,
     executionFence: fence,
@@ -241,15 +249,37 @@ export function starterMaintenanceTick(env: Env): () => Promise<unknown> {
     },
     audit,
   });
-  const notifications = createNotificationDispatchTick({
+}
+
+/**
+ * The deployment's notification duty: dispatch due notifications through the
+ * owning thread Durable Object. The maintenance singleton runs it in its own
+ * invocation, so a schedule pass that throws or is terminated does not hold
+ * delivery back, and it reads the same fence store as the runtime, so a
+ * fenced deployment does not burn a notification's delivery attempts.
+ */
+export function starterNotificationTick(
+  env: Env,
+): () => Promise<NotificationDispatchTickResult> {
+  return createNotificationDispatchTick({
     storage: notificationsStore(env.DB),
-    topology: threadTopology,
+    topology: createThreadTopology(env.THREAD, env.DEPLOYMENT_IDENTITY_SECRET),
     resolveContext: () => systemContext(env, 'notification-dispatch'),
     limit: 100,
-    executionFence: fence,
-  });
-  return async () => ({
-    schedules: await schedules(),
-    notifications: await notifications(),
+    executionFence: executionFence(env.DB),
   });
 }
+
+export const starterMaintenanceConfig = {
+  maintenance: {
+    sweepIntervalMs: 5 * 60 * 1_000,
+    purgeIntervalMs: 60 * 60 * 1_000,
+    tickIntervalMs: 60 * 1_000,
+    notificationIntervalMs: 60 * 1_000,
+  },
+  scheduleTick: starterScheduleTick,
+  notificationTick: starterNotificationTick,
+} satisfies Pick<
+  FlowsafeWorkerConfig<Env>,
+  'maintenance' | 'scheduleTick' | 'notificationTick'
+>;

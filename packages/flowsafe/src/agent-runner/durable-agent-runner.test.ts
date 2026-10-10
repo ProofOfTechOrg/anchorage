@@ -90,6 +90,7 @@ import {
   RunSettledConflictError,
 } from '../do-runner/run-lifecycle.js';
 import {
+  RunAlreadyExistsError,
   RunnerRuntime,
   RunStateUnreadableError,
   UnknownRunError,
@@ -542,6 +543,8 @@ async function realAgentBridgeFixture(
     tools: Record<string, ReturnType<typeof createTool>>;
     totalMs?: number;
     threadRuntime?: Mastra['agentThreadStreamRuntime'];
+    /** Keeps run stream history, as Mastra's default caching pubsub does. */
+    cache?: boolean;
   },
 ) {
   const sql = openSqlite() as ReturnType<typeof openSqlite> & { close(): void };
@@ -632,7 +635,7 @@ async function realAgentBridgeFixture(
           model: toolLoop?.model ?? model,
         }),
     runtime,
-    cache: false,
+    ...(toolLoop?.cache ? {} : { cache: false }),
     maxSteps: 1,
     ...(toolLoop?.threadRuntime
       ? { threadRuntime: toolLoop.threadRuntime }
@@ -1342,9 +1345,6 @@ describe('agent bridge capture', () => {
       ).toBe('success');
       expect(start).toHaveBeenCalledOnce();
       expect(start.mock.calls[0]?.[1].mutationEpoch).toBe(epoch);
-      expect(start.mock.calls[0]?.[1].onPreparedStartIdentity).toBe(
-        authority.onPreparedStartIdentity,
-      );
       const snapshot = await workflows.loadWorkflowSnapshot({
         workflowName: agent.getWorkflow().id,
         runId,
@@ -1489,7 +1489,6 @@ describe('agent bridge capture', () => {
       if (execution) await execution.catch(() => undefined);
       else expect(globalRunRegistry.has(runId)).toBe(false);
       expect(f.start).toHaveBeenCalledOnce();
-      expect(f.start.mock.calls[0]?.[1].onPreparedStartIdentity).toBe(callback);
       expect(f.start.mock.calls[0]?.[1].mutationEpoch).toBe(2);
       const snapshot = await f.workflows.loadWorkflowSnapshot({
         workflowName: workflow.id,
@@ -1588,7 +1587,8 @@ describe('agent bridge capture', () => {
       source.startIdentity.owner.id = 'replacement';
       source.startIdentity.target.threadId = 'replacement-thread';
       source.agentStart.threaded = false;
-      source.onPreparedStartIdentity = vi.fn();
+      const replacement = vi.fn();
+      source.onPreparedStartIdentity = replacement;
       source.runOwnerGuard.owner.id = 'replacement-owner';
       source.runOwnerGuard.reservationToken = 'replacement-token';
       release.resolve();
@@ -1607,7 +1607,6 @@ describe('agent bridge capture', () => {
           reservationToken: 'reservation-original',
         },
       });
-      expect(forwarded.onPreparedStartIdentity).toBe(callback);
       for (const value of [
         forwarded.startIdentity,
         forwarded.startIdentity?.owner,
@@ -1629,6 +1628,12 @@ describe('agent bridge capture', () => {
       ])
         expect(Object.isFrozen(value)).toBe(false);
       expect(callback).not.toHaveBeenCalled();
+      const prepared = { runId: 'run-1' } as Parameters<
+        NonNullable<StartRunOptions['onPreparedStartIdentity']>
+      >[0];
+      await forwarded.onPreparedStartIdentity?.(prepared);
+      expect(callback).toHaveBeenCalledWith(prepared);
+      expect(replacement).not.toHaveBeenCalled();
       expect(f.stream.mock.calls[0]?.[1]).not.toHaveProperty('startIdentity');
       expect(forwarded.inputData).not.toHaveProperty('onPreparedStartIdentity');
     } finally {
@@ -4559,6 +4564,7 @@ describe('FlowsafeDurableAgent abort of the model and tool calls in flight', () 
       toolResult?: unknown;
       threaded?: boolean;
       toolCalls?: number;
+      cache?: boolean;
     } = {},
   ) {
     const entered = bridgeDeferred();
@@ -4602,6 +4608,7 @@ describe('FlowsafeDurableAgent abort of the model and tool calls in flight', () 
             }, options.toolCalls),
         tools: { [HOLD_TOOL]: hold },
         ...(options.totalMs !== undefined ? { totalMs: options.totalMs } : {}),
+        ...(options.cache !== undefined ? { cache: options.cache } : {}),
         ...(options.threaded
           ? {
               threadRuntime: new Mastra({ logger: false })
@@ -4704,6 +4711,20 @@ describe('FlowsafeDurableAgent abort of the model and tool calls in flight', () 
         .map(
           ([, event]) => event.data.error as { name: string; message: string },
         );
+  }
+
+  /** Makes the next resume of the run throw once its own preparation is done. */
+  function failNextResumeAfterPreparation(h: HeldAgent) {
+    vi.spyOn(h.runtime, 'resume').mockImplementationOnce(
+      (workflowId, runId, options = {}) =>
+        RunnerRuntime.prototype.resume.call(h.runtime, workflowId, runId, {
+          ...options,
+          prepareExecution: async (...input) => {
+            await options.prepareExecution?.(...input);
+            throw new Error('D1 unavailable');
+          },
+        }),
+    );
   }
 
   it('aborts the tool call in flight of a start leg whose run another instance settled', async () => {
@@ -5402,18 +5423,28 @@ describe('FlowsafeDurableAgent abort of the model and tool calls in flight', () 
     expect(h.agent.isRunLive(RUN_ID)).toBe(false);
   });
 
-  it('publishes one terminal error for a start leg that failed after its run suspended and that a terminate then ends', async () => {
+  it('publishes no terminal error and keeps the run and its stream history past the cleanup delay for a start leg that failed after its run suspended, then one cancellation error when a terminate ends the run', async () => {
     // #given a start leg whose run suspended at a tool approval and whose
-    // start call then threw, which core published as the run's terminal error
-    const h = await heldToolAgent({ requireApproval: true });
+    // start call then threw
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const h = await heldToolAgent({ requireApproval: true, cache: true });
     const errors = terminalErrorsPublished(h.agent);
     h.start.mockImplementationOnce(async (...args) => {
       await RunnerRuntime.prototype.start.apply(h.runtime, args);
       throw new Error('D1 unavailable');
     });
     await expect(h.startLeg()).rejects.toThrow('D1 unavailable');
-    await vi.waitFor(() => expect(errors()).toHaveLength(1));
+
+    // #when Mastra's cleanup delay passes
+    await vi.advanceTimersByTimeAsync(h.agent.cleanupTimeoutMs);
+
+    // #then no terminal error was published, and the agent still holds the
+    // run and its stream history
+    expect(errors()).toEqual([]);
     expect(h.agent.isRunLive(RUN_ID)).toBe(true);
+    expect(
+      (await h.agent.pubsub.getHistory(AGENT_STREAM_TOPIC(RUN_ID))).length,
+    ).toBeGreaterThan(0);
 
     // #when a terminate ends the run and the agent releases it
     await h.runtime.terminateAsPrincipal(
@@ -5424,9 +5455,82 @@ describe('FlowsafeDurableAgent abort of the model and tool calls in flight', () 
     );
     await h.agent.releaseEndedRun(RUN_ID);
 
-    // #then core's publication stays the run's only terminal error
-    expect(errors()).toEqual([{ name: 'Error', message: 'D1 unavailable' }]);
+    // #then the cancellation is the run's only terminal error, and the agent
+    // no longer holds the run
+    expect(errors().map(({ name }) => name)).toEqual(['RunCancelledError']);
     expect(h.agent.isRunLive(RUN_ID)).toBe(false);
+  });
+
+  it('publishes no terminal error and keeps the run and its stream history past the cleanup delay when a resume fails while the run stays suspended', async () => {
+    // #given a run suspended at a tool approval, whose resume fails after its
+    // preparation while the run stays suspended
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const h = await heldToolAgent({ requireApproval: true, cache: true });
+    await h.startLeg();
+    const errors = terminalErrorsPublished(h.agent);
+    failNextResumeAfterPreparation(h);
+    await expect(h.resumeLeg()).rejects.toThrow('D1 unavailable');
+
+    // #when Mastra's cleanup delay passes
+    await vi.advanceTimersByTimeAsync(h.agent.cleanupTimeoutMs);
+
+    // #then no terminal error was published, and the agent still holds the
+    // run and its stream history
+    expect(errors()).toEqual([]);
+    expect(h.agent.isRunLive(RUN_ID)).toBe(true);
+    expect(
+      (await h.agent.pubsub.getHistory(AGENT_STREAM_TOPIC(RUN_ID))).length,
+    ).toBeGreaterThan(0);
+  });
+
+  it('cleans up after a start refused because another start already stored the run id', async () => {
+    // #given a run suspended at a tool approval, that this isolate no longer
+    // holds
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const h = await heldToolAgent({ requireApproval: true });
+    await h.startLeg();
+    registryFor(h.agent).clear();
+    globalRunRegistry.delete(RUN_ID);
+
+    // #when a start of the same run id is refused and the cleanup delay passes
+    await expect(h.startLeg()).rejects.toBeInstanceOf(RunAlreadyExistsError);
+    await vi.advanceTimersByTimeAsync(h.agent.cleanupTimeoutMs);
+
+    // #then the refused start holds nothing for the run
+    expect(h.agent.isRunLive(RUN_ID)).toBe(false);
+  });
+
+  it('keeps the thread of a threaded run whose resume fails while the run stays suspended, until a terminate ends the run', async () => {
+    // #given a threaded run suspended at a tool approval, which holds its
+    // thread, whose resume fails after its preparation while the run stays
+    // suspended
+    const h = await heldToolAgent({ requireApproval: true, threaded: true });
+    await h.startLeg();
+    expect(h.agent.getActiveThreadRunId(THREAD_KEY)).toBe(RUN_ID);
+    failNextResumeAfterPreparation(h);
+    await expect(h.resumeLeg()).rejects.toThrow('D1 unavailable');
+
+    // #then the thread stays held: a released thread is gone by the time the
+    // resume rejects, and the later event-loop turns leave room for a release
+    // that core's promise callbacks schedule after it
+    for (let turn = 0; turn < 20; turn += 1) {
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(h.agent.getActiveThreadRunId(THREAD_KEY)).toBe(RUN_ID);
+    }
+
+    // #when a terminate ends the run and the agent releases it
+    await h.runtime.terminateAsPrincipal(
+      h.workflowId,
+      RUN_ID,
+      OPERATOR,
+      OPERATOR,
+    );
+    await h.agent.releaseEndedRun(RUN_ID);
+
+    // #then the thread is released
+    await vi.waitFor(() =>
+      expect(h.agent.getActiveThreadRunId(THREAD_KEY)).toBeUndefined(),
+    );
   });
 
   it("publishes the cancellation once when the start leg's own publication of it fails", async () => {
@@ -5746,7 +5850,16 @@ describe('agent observation', () => {
           const row = await read(address);
           f.snapshot.requestContext['flowsafe.runProvenance'].startToken = 'S2';
           Object.assign(f.snapshot, { result: { generation: 'S2' } });
-          await f.seed();
+          // Raw: the settled-row guard refuses a write that names another start.
+          f.sql
+            .prepare(
+              'UPDATE mastra_workflow_snapshot SET snapshot = ? WHERE workflow_name = ? AND run_id = ?',
+            )
+            .run(
+              JSON.stringify(f.snapshot),
+              f.workflow.id,
+              'observed-agent-run',
+            );
           return row;
         });
       const state = await f.agent.authoritativeAgentStartState(

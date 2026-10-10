@@ -47,7 +47,10 @@ import {
   StarterSignalProviderHost,
   StarterThread,
 } from './durable-objects.js';
-import { scheduleTargetPolicy, starterMaintenanceTick } from './maintenance.js';
+import {
+  scheduleTargetPolicy,
+  starterMaintenanceConfig,
+} from './maintenance.js';
 import { starterRunnerLifecycleConfig } from './principal-context.js';
 import {
   executionFence,
@@ -141,11 +144,7 @@ const workerConfig = {
   ...starterRunnerLifecycleConfig,
   workflows: WORKFLOWS,
   buildVerifier,
-  maintenance: {
-    sweepIntervalMs: 5 * 60 * 1_000,
-    purgeIntervalMs: 60 * 60 * 1_000,
-    tickIntervalMs: 60 * 1_000,
-  },
+  ...starterMaintenanceConfig,
   preRoutes: async (request, env, _ctx, kit) => {
     const webhook = await webhookRouter(env)(request);
     if (webhook) return webhook;
@@ -260,7 +259,6 @@ const workerConfig = {
       audit,
       executionFence: executionFence(env.DB),
     }),
-  scheduleTick: starterMaintenanceTick,
   backgroundTasks: {
     completedTtlMs: 60 * 60 * 1_000,
     failedTtlMs: 24 * 60 * 60 * 1_000,

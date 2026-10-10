@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import type {
   BridgeMutationPlan,
   BridgeSnapshot,
   PlainBackendSnapshot,
 } from '../src/backend-switch.js';
+import { structuralBackendSwitchFleetRecordFromUnknown } from '../src/backend-switch.js';
+import { CloudflareProvisioningClient } from '../src/cloudflare-client.js';
 import {
   canonicalDeploymentEgressPolicy,
   durableObjectMigrationHistoryDigest,
@@ -23,8 +26,10 @@ import type {
   PlainWorkerVersionDetail,
 } from '../src/types.js';
 import type { WorkersForPlatformsBackend } from '../src/workers-for-platforms-backend.js';
+import { deriveStateEgressCredential } from '../src/workers-for-platforms-backend.js';
 import type { BackendSwitchApi } from '../src/workers-for-platforms-backend-switch-provider.js';
 import { WorkersForPlatformsBackendSwitchProvider } from '../src/workers-for-platforms-backend-switch-provider.js';
+import { testRateCoordinator } from './fixtures/cloudflare-fetch-fixture.js';
 
 const fence: ExternalMutationFence = {
   mutationLeaseTtlMs: 60_000,
@@ -564,6 +569,94 @@ async function removePlanOnlyBridge(
 }
 
 describe('backend switch provider teardown authority', () => {
+  it('removes candidate rollback traffic with persisted policy and bridge authority', async () => {
+    let stored: string | undefined;
+    let deletes = 0;
+    let loseResponse = true;
+    const client = new CloudflareProvisioningClient({
+      accountId: 'account',
+      apiToken: 'token',
+      dispatchNamespace: 'fleet',
+      requestTimeoutMs: 1_000,
+      rateCoordinator: testRateCoordinator(),
+      fetch: async (_input, init) => {
+        if (init?.method === 'DELETE') {
+          deletes += 1;
+          stored = undefined;
+          return new Response(null, { status: 200 });
+        }
+        return stored === undefined
+          ? new Response(null, { status: 404 })
+          : new Response(stored);
+      },
+    });
+    const durableTarget = {
+      ...target,
+      stateEgressCredentialDigest: createHash('sha256')
+        .update(
+          deriveStateEgressCredential(
+            'root-secret-012345678901234567890123456789',
+            targetSpec,
+            prior.scriptName,
+          ),
+        )
+        .digest('hex'),
+    };
+    const bridge: BridgeSnapshot = {
+      ...prior,
+      artifactDigest: 'e'.repeat(64),
+      publicRouteAttached: true,
+      stateOnly: false,
+    };
+    const subject = provider({
+      withMutationFence: async (_fence, operation) =>
+        client.withMutationFence(fence, operation),
+      getHostRouting: async () => stored,
+      putHostRouting: async (_namespace, _hostname, publishedTarget) => {
+        stored = JSON.stringify(publishedTarget);
+      },
+      deleteHostRouting: async (namespace, hostname, targets) => {
+        await client.deleteHostRouting(namespace, hostname, targets);
+        if (loseResponse) {
+          loseResponse = false;
+          throw new Error('route deletion response lost');
+        }
+      },
+    });
+    const input = {
+      targetSpec,
+      candidate: release,
+      target: durableTarget,
+      bridge,
+      fence,
+    };
+    await subject.publishCandidateHost(input);
+    const published = stored;
+    await expect(subject.removeCandidateHostAndDrain(input)).rejects.toThrow(
+      /response lost/,
+    );
+    expect(stored).toBeUndefined();
+    await expect(
+      subject.removeCandidateHostAndDrain(input),
+    ).resolves.toBeUndefined();
+    expect(deletes).toBe(1);
+    const route = JSON.parse(published as string);
+    for (const drift of [
+      { ...route, policyHosts: ['foreign.example.com'] },
+      {
+        ...route,
+        stateEgress: { ...route.stateEgress, stateScriptName: 'foreign-state' },
+      },
+    ]) {
+      stored = JSON.stringify(drift);
+      await expect(subject.removeCandidateHostAndDrain(input)).rejects.toThrow(
+        /owned by another deployment/,
+      );
+      expect(stored).toBe(JSON.stringify(drift));
+      expect(deletes).toBe(1);
+    }
+  });
+
   it.each([
     'traffic',
     'bridge',
@@ -1312,6 +1405,24 @@ describe('backend switch provider teardown authority', () => {
   });
 
   it('deletes a commit-unknown release only from its exact topology and adopts response-loss absence', async () => {
+    const ownedBinding = {
+      name: 'RUNNER',
+      className: 'Runner',
+      namespaceId: 'namespace-runner',
+      scriptName: 'owned-state-worker',
+      dispatchNamespace: 'fleet-conformance',
+    };
+    const ownedRelease: ExternalReleaseSnapshot = {
+      ...release,
+      topology: {
+        durableObjectBindings: [ownedBinding],
+        serviceBindings: [],
+        queueProducerBindings: [],
+        secretNames: ['DEPLOYMENT_IDENTITY_SECRET'],
+        application: release.application,
+      },
+    };
+    const { dispatchNamespace: _namespace, ...observedBinding } = ownedBinding;
     let live:
       | Awaited<ReturnType<BackendSwitchApi['inspectDispatchWorker']>>
       | undefined = completeProviderBindingInspection({
@@ -1321,7 +1432,7 @@ describe('backend switch provider teardown authority', () => {
       desiredSpecDigest: release.specDigest,
       schemaVersion: release.releaseSchemaVersion,
       databaseIds: [prior.databaseId],
-      durableObjectBindings: [],
+      durableObjectBindings: [observedBinding],
       serviceBindings: [],
       queueProducerBindings: [],
       r2BucketBindings: [],
@@ -1369,7 +1480,7 @@ describe('backend switch provider teardown authority', () => {
       tenantTag: targetSpec.tenantTag,
       environment: targetSpec.environment,
       routeHostname: targetSpec.routeHostname,
-      release,
+      release: ownedRelease,
       fence,
     };
 
@@ -1382,7 +1493,31 @@ describe('backend switch provider teardown authority', () => {
     expect(inventory).toBeUndefined();
   });
 
-  it('rejects a commit-unknown release when any live topology edge differs', async () => {
+  it.each([
+    { name: 'FOREIGN' },
+    { className: 'Foreign' },
+    { scriptName: 'foreign-state-worker' },
+    { namespaceId: 'foreign-namespace-id' },
+    { dispatchNamespace: 'foreign-dispatch-namespace' },
+  ])('rejects a commit-unknown release when a remote binding differs: %j', async (mismatch) => {
+    const ownedBinding = {
+      name: 'RUNNER',
+      className: 'Runner',
+      namespaceId: 'namespace-runner',
+      scriptName: 'owned-state-worker',
+      dispatchNamespace: 'fleet-conformance',
+    };
+    const ownedRelease: ExternalReleaseSnapshot = {
+      ...release,
+      topology: {
+        durableObjectBindings: [ownedBinding],
+        serviceBindings: [],
+        queueProducerBindings: [],
+        secretNames: ['DEPLOYMENT_IDENTITY_SECRET'],
+        application: release.application,
+      },
+    };
+    const { dispatchNamespace: _namespace, ...observedBinding } = ownedBinding;
     let revoked = false;
     const subject = provider({
       inspectDispatchWorker: async () =>
@@ -1395,9 +1530,8 @@ describe('backend switch provider teardown authority', () => {
           databaseIds: [prior.databaseId],
           durableObjectBindings: [
             {
-              name: 'FOREIGN',
-              className: 'Foreign',
-              namespaceId: 'namespace-foreign',
+              ...observedBinding,
+              ...mismatch,
             },
           ],
           serviceBindings: [],
@@ -1432,11 +1566,92 @@ describe('backend switch provider teardown authority', () => {
         tenantTag: targetSpec.tenantTag,
         environment: targetSpec.environment,
         routeHostname: targetSpec.routeHostname,
-        release,
+        release: ownedRelease,
         fence,
       }),
     ).rejects.toThrow(/foreign backend-switch release/);
     expect(revoked).toBe(false);
+  });
+
+  it.each([
+    'tagless',
+    'tagged',
+  ] as const)('produces persistable ownership for a %s bridge', async (mode) => {
+    const tagless = mode === 'tagless';
+    const deployment = tagless
+      ? {
+          ...targetSpec,
+          durableObjectMigrations: [],
+          durableObjectBindings: [],
+        }
+      : targetSpec;
+    const subject = provider({}, {}, () =>
+      tagless ? { ...profile, stateDurableObjectMigrations: [] } : profile,
+    );
+    const { stateDurableObjectTag: _tag, ...withoutTag } = target;
+    const desiredTarget = tagless
+      ? {
+          ...withoutTag,
+          stateDurableObjectHistoryDigest: durableObjectMigrationHistoryDigest(
+            [],
+          ),
+        }
+      : target;
+    const bridge: BridgeSnapshot = {
+      scriptName: prior.scriptName,
+      artifactVersion: 'bridge-v2',
+      artifactDigest: desiredTarget.stateArtifactDigest,
+      databaseId: prior.databaseId,
+      durableObjectBindings: tagless ? [] : prior.durableObjectBindings,
+      namespaceIds: tagless ? [] : prior.namespaceIds,
+      secretNames: prior.secretNames,
+      publicRouteAttached: false,
+      stateOnly: false,
+    };
+    const currentRecord: FleetRecord = {
+      tenantTag: deployment.tenantTag,
+      environment: deployment.environment,
+      backend: 'plain-worker',
+      scriptName: prior.scriptName,
+      databaseId: prior.databaseId,
+      databaseName: prior.databaseName,
+      schemaVersion: deployment.schemaVersion,
+      artifactVersion: prior.artifactVersion,
+      desiredSpecDigest: prior.specDigest,
+      durableObjectBindings: bridge.durableObjectBindings,
+      ...(tagless ? {} : { durableObjectTag: 'v1' }),
+      routeHostname: deployment.routeHostname,
+      phase: 'ready',
+      updatedAt: '2026-08-11T00:00:00.000Z',
+    };
+    const committed = await subject.commitWorkersForPlatformsOwnership({
+      prior,
+      bridge,
+      candidate: release,
+      target: desiredTarget,
+      targetSpec: deployment,
+      currentRecord,
+    });
+    const persisted =
+      structuralBackendSwitchFleetRecordFromUnknown(committed).record;
+    expect(persisted).toMatchObject({
+      backend: 'workers-for-platforms',
+      phase: 'ready',
+      databaseId: prior.databaseId,
+      activeRelease: release,
+      platformTarget: desiredTarget,
+    });
+    if (tagless) {
+      expect(persisted).not.toHaveProperty('durableObjectTag');
+      expect(persisted.platformResources?.stateWorker).not.toHaveProperty(
+        'durableObjectTag',
+      );
+    } else {
+      expect(persisted.durableObjectTag).toBe('v2');
+      expect(persisted.platformResources?.stateWorker.durableObjectTag).toBe(
+        'v2',
+      );
+    }
   });
 
   it('rebuilds finalized ownership from the exact target and bridge', async () => {

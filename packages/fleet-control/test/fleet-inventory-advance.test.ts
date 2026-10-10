@@ -868,6 +868,187 @@ describe('bounded fleet inventory advance', () => {
     expect(run?.optionsDigest).toBe(fleetInventoryOptionsDigest(canonical));
   });
 
+  it('refuses a start outside the expected scope without reserving a run', async () => {
+    const store = new FakeInventoryRunStore();
+    const context = stubContext();
+    await expect(
+      advanceFleetInventory({
+        context,
+        store,
+        action: {
+          kind: 'start',
+          operationId: OPERATION_ID,
+          options: { ...STUB_OPTIONS, dispatchNamespace: 'other-dispatch' },
+        },
+        expectedScope: {
+          dispatchNamespace: 'anchorage-dispatch',
+          hostRoutingKvId: 'hosts',
+          includeDispatchNamespace: true,
+        },
+        maxProviderRequests: MAX_PROVIDER_REQUESTS,
+      }),
+    ).rejects.toThrow('fleet inventory scope does not match the control plane');
+    expect(store.runs.size).toBe(0);
+    expect(store.activeOperationId).toBeUndefined();
+    expect(context.inputs).toEqual([]);
+  });
+
+  it('completes an inventory in the expected namespace and KV scope', async () => {
+    const store = new FakeInventoryRunStore();
+    const result = await runToCompletion({
+      context: stubContext(),
+      store,
+      runOptions: { ...STUB_OPTIONS, dispatchNamespace: 'anchorage-dispatch' },
+      expectedScope: {
+        dispatchNamespace: 'anchorage-dispatch',
+        hostRoutingKvId: 'hosts',
+        includeDispatchNamespace: true,
+      },
+      maxProviderRequests: MAX_PROVIDER_REQUESTS,
+    });
+    expect(result.status).toBe('complete');
+    expect(store.runs.get(OPERATION_ID)?.options.dispatchNamespace).toBe(
+      'anchorage-dispatch',
+    );
+  });
+
+  it.each([
+    {
+      name: 'provider stage with another namespace',
+      finalized: false,
+      stage: 'd1-databases',
+      via: 'continue',
+      stale: false,
+      scope: { dispatchNamespace: 'other-dispatch' },
+    },
+    {
+      name: 'finalize stage with another KV namespace',
+      finalized: false,
+      stage: 'finalize',
+      via: 'continue',
+      stale: false,
+      scope: { hostRoutingKvId: 'other-hosts' },
+    },
+    {
+      name: 'stale token with another dispatch selection',
+      finalized: false,
+      stage: 'd1-databases',
+      via: 'continue',
+      stale: true,
+      scope: { includeDispatchNamespace: false },
+    },
+    {
+      name: 'finalized run with another namespace',
+      finalized: true,
+      stage: 'finalize',
+      via: 'continue',
+      stale: false,
+      scope: { dispatchNamespace: 'other-dispatch' },
+    },
+    {
+      name: 'finalized stale token with another KV namespace',
+      finalized: true,
+      stage: 'finalize',
+      via: 'continue',
+      stale: true,
+      scope: { hostRoutingKvId: 'other-hosts' },
+    },
+    {
+      name: 'finalized fallback with another namespace',
+      finalized: true,
+      stage: 'finalize',
+      via: 'fallback',
+      stale: false,
+      scope: { dispatchNamespace: 'other-dispatch' },
+    },
+    {
+      name: 'replayed start with another namespace',
+      finalized: true,
+      stage: 'finalize',
+      via: 'start',
+      stale: false,
+      scope: { dispatchNamespace: 'other-dispatch' },
+    },
+    {
+      name: 'legacy unbound run through a namespace-bound host',
+      finalized: false,
+      stage: 'd1-databases',
+      via: 'continue',
+      stale: false,
+      unbound: true,
+      scope: {},
+    },
+  ] as const)('refuses the $name without advancing durable state', async (scenario) => {
+    const store = new FakeInventoryRunStore();
+    const context = stubContext();
+    const runOptions = {
+      ...STUB_OPTIONS,
+      ...('unbound' in scenario
+        ? {}
+        : { dispatchNamespace: 'anchorage-dispatch' }),
+    };
+    const started = await advanceFleetInventory({
+      context,
+      store,
+      action: { kind: 'start', operationId: OPERATION_ID, options: runOptions },
+      maxProviderRequests: MAX_PROVIDER_REQUESTS,
+    });
+    if (scenario.finalized) {
+      await advanceFleetInventory({
+        context,
+        store,
+        action: { kind: 'continue', token: started.token },
+        maxProviderRequests: MAX_PROVIDER_REQUESTS,
+      });
+      store.activeOperationId = OPERATION_ID;
+      store.latestGeneration = undefined;
+    }
+    const run = store.runs.get(OPERATION_ID);
+    if (!run) throw new Error('inventory fixture run is absent');
+    store.runs.set(OPERATION_ID, {
+      ...run,
+      progress: { ...run.progress, stage: { step: scenario.stage } },
+    });
+    if (scenario.via === 'fallback') store.hiddenFromLease.add(OPERATION_ID);
+    const before = structuredClone({
+      run: store.runs.get(OPERATION_ID),
+      refs: store.refs,
+      activeOperationId: store.activeOperationId,
+      latestGeneration: store.latestGeneration,
+    });
+    const providerCalls = context.inputs.length;
+    await expect(
+      advanceFleetInventory({
+        context,
+        store,
+        action:
+          scenario.via === 'start'
+            ? { kind: 'start', operationId: OPERATION_ID, options: runOptions }
+            : {
+                kind: 'continue',
+                token: {
+                  ...started.token,
+                  revision: scenario.stale ? 0 : started.token.revision,
+                },
+              },
+        expectedScope: {
+          dispatchNamespace: 'anchorage-dispatch',
+          hostRoutingKvId: 'hosts',
+          includeDispatchNamespace: true,
+          ...scenario.scope,
+        },
+        maxProviderRequests: MAX_PROVIDER_REQUESTS,
+      }),
+    ).rejects.toThrow('fleet inventory scope does not match the control plane');
+    expect({
+      run: store.runs.get(OPERATION_ID),
+      refs: store.refs,
+      activeOperationId: store.activeOperationId,
+      latestGeneration: store.latestGeneration,
+    }).toEqual(before);
+    expect(context.inputs).toHaveLength(providerCalls);
+  });
+
   it('replays a start for the same operation without a new generation', async () => {
     const store = new FakeInventoryRunStore();
     const context = stubContext();

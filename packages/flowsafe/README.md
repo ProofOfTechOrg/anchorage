@@ -44,6 +44,7 @@ Compatibility:
 | `@proofoftech/flowsafe/do-runner/testing` | Timeout resume fixtures for workflow tests |
 | `@proofoftech/flowsafe/approval-ui` | Styling-library-agnostic React dashboard, DOM-free API client, headless hook, and live transport |
 | `@proofoftech/flowsafe/host-kit` | Authenticator and verifier seams, topologies, run/stream routers, approval bridges, and composed Worker |
+| `@proofoftech/flowsafe/host-kit/maintenance-capability` | Maintenance capability signing, verification, and result receipts without host composition imports |
 | `@proofoftech/flowsafe/host-kit/module` | Import-safe workflow module contract |
 | `@proofoftech/flowsafe/artifacts` | R2 artifact store and in-memory test bucket |
 | `@proofoftech/flowsafe/audit-export` | Cloudflare Queue producer sink and NDJSON SIEM consumer |
@@ -378,7 +379,7 @@ Use `GET /admin/inventory` while the fence remains `draining`. A drain is proven
 
 ### Runtime ids are opaque
 
-The host mints opaque, path-safe run and thread ids. `RunnerRuntime.start()` requires a host-owned run id and has no generation fallback. The id scopes the snapshot, Durable Object, approval lookup, stream address, and artifact path, but it carries no customer identity.
+The host mints opaque, path-safe run and thread ids. `RunnerRuntime.start()` requires a host-owned run id and has no generation fallback. A run id is single-use: never start one again, even after retention removed its run. The id scopes the snapshot, Durable Object, approval lookup, stream address, and artifact path, but it carries no customer identity.
 
 Callers that need exactly-once start behavior supply an `idempotencyKey`, never a run ID. The key is available on `POST /runs`, trusted agent-host starts, and `streamUntilPersisted()`. A retry returns the same persisted run. `IDEMPOTENT_START_PENDING` includes `pendingSince`; re-probe the point-in-time `IDEMPOTENT_START_UNRESOLVABLE` result before acting. For an agent start, keep re-probing for at least seven minutes after its last activity before choosing a fresh key: until the thread object repairs a start whose leg stopped or runs on another instance, its replay answers `IDEMPOTENT_START_UNRESOLVABLE`. A key remains valid until its reservation-retention horizon expires.
 
@@ -595,7 +596,7 @@ A non-owner's notification, and an unbranded agent's owner notification, are che
 
 Flowsafe providers route polling and webhook deliveries through the thread topology instead of Mastra's in-process registry.
 
-`SignalProviderHost` runs one alarm-driven host per deployment. `D1SubscriptionStoreFactory` persists subscriptions. External resource ids are opaque, but must be non-empty, contain no ASCII control characters, and fit within 1,024 UTF-8 bytes. Human-only subscription routes reconcile provider alarms after each committed mutation. Webhook routes verify raw bytes before parsing, look up the stored subscription, apply a provider rate cap, and bound forgery audit.
+`SignalProviderHost` runs one alarm-driven host per deployment. `D1SubscriptionStoreFactory` persists subscriptions. External resource ids are opaque, but must be non-empty, contain no ASCII control characters, and fit within 1,024 UTF-8 bytes. A subscription `metadata` value nested more than 256 levels deep is refused with `400`. Human-only subscription routes reconcile provider alarms after each committed mutation. Webhook routes verify raw bytes before parsing, look up the stored subscription, apply a provider rate cap, and bound forgery audit.
 
 `githubSignalProvider()` is the reference provider.
 
@@ -603,17 +604,17 @@ Complete wiring is in the [durable-agents guide](https://github.com/ProofOfTechO
 
 ## Deployment and operations
 
-The composed `createFlowsafeWorker()` owns the shared route and maintenance-duty pipeline. Hosts inject workflows, identity verification, topology-backed optional routers, budget wrappers, notification transport, an invocation-scoped artifact-store factory, the storage table prefix, schedule tick, and extra purge duties.
+The composed `createFlowsafeWorker()` owns the shared route and maintenance-duty pipeline. Hosts inject workflows, identity verification, topology-backed optional routers, budget wrappers, notification transport, an invocation-scoped artifact-store factory, the storage table prefix, schedule and notification ticks, and extra purge duties.
 
 Configure `mutationEpoch` with a nonnegative safe integer or a synchronous environment callback. The Worker captures it before deployment verification or authentication, then forwards it through trusted contexts and protected internal headers. Start paths preserve the original actor, principal, epoch and selectors across waits, including class-backed context method receivers. Do not accept the epoch from public headers or start JSON.
 
 The internal durable-agent host start requires an eighth `AgentStartAuthority` argument, with an explicit `onPreparedStartIdentity` property. This transport does not activate final-write epoch checks or managed recovery; the [deployment reference](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/deployment-reference.md#configure-the-trusted-caller-epoch) and [durable-agents guide](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/durable-agents.md) describe the boundary.
 
-Protect `GET` and `POST /admin/execution-fence` plus `GET /admin/inventory` with a distinct `MAINTENANCE_ADMIN_SECRET`. Fence transitions use CAS and return `409` with `FENCE_CAS_CONFLICT` when the expected state is stale. Fenced execution returns `503` with an `EXECUTION_FENCED` reason. The agent-host and stream routers preserve structured `503` and `409` refusals instead of collapsing them to a generic `500`.
+Protect `GET` and `POST /admin/execution-fence` plus `GET /admin/inventory` with a distinct `MAINTENANCE_ADMIN_SECRET`. Fence transitions use CAS and return `409` with `FENCE_CAS_CONFLICT` when the expected state is stale. Fenced execution returns `503` with an `EXECUTION_FENCED` reason. The agent-host and stream routers answer every refusal with its own status, message and reason. The readers of a run or thread object's answer replace the message of a `5xx` that carries no reason code with `internal error` and log the original; a `RunRouteError` a host authors is forwarded as written.
 
 Every leaf option that accepts `ExecutionFenceWiring` requires an explicit store or `'none'`. Run-router, agent-thread-topology, and storage initialization also require explicit start-idempotency wiring. Use `'none'` only when no database exists. `BackgroundTaskHost` no longer exposes its manager; call `enqueue()`, `getTask()`, `listTasks()`, or `stream()` on the host and use `BackgroundTaskReads` for read-only route composition.
 
-`createFlowsafeMaintenanceDurableObject()` runs deadline expiry, approval service-level agreement (SLA) sweep, retention purge, and optional schedule fire as separate alarm invocations. Provider polling and background recovery use their own Durable Object alarms.
+`createFlowsafeMaintenanceDurableObject()` runs deadline expiry, approval service-level agreement (SLA) sweep, retention purge, and optional schedule fire and notification dispatch as separate alarm invocations. Provider polling and background recovery use their own Durable Object alarms.
 
 Read:
 

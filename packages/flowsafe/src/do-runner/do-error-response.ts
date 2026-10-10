@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-// The ONE error->HTTP mapping the DO bases answer with.
+// The ONE error->HTTP classification, shared by the run object and the run
+// router.
 //
 // Its own leaf because both DO shells need it and neither should depend on the
 // other (same reasoning as host-kit's RunRouteError, which is the Worker-side
@@ -14,13 +15,16 @@
 
 import { DeploymentIdentityError } from './deployment-identity.js';
 import type { DoRefusalReason } from './do-status-error.js';
-import { DoStatusError } from './do-status-error.js';
+import {
+  DoStatusError,
+  isRefusalStatus,
+  refusalBody,
+} from './do-status-error.js';
 import {
   InvalidRunRequestError,
   RunAlreadyExistsError,
   RunLifecycleBlockedError,
   RunSettledConflictError,
-  RunStateUnreadableError,
   RunTerminalConflictError,
   UnknownRunError,
   UnknownWorkflowError,
@@ -32,18 +36,16 @@ import {
 export type { DoRefusalReason };
 export { DoStatusError };
 
-function statusOf(error: unknown): number | undefined {
+/**
+ * @internal The status the run taxonomy answers `error` with, or undefined for
+ * a fault it does not classify. One function, so the run router in process and
+ * the run object answer an error with one status.
+ */
+export function refusalStatus(error: unknown): number | undefined {
   // Mis-provisioned deployment (env tag vs D1 sentinel): the operator's
   // problem, not the caller's — 503 so monitors separate a wiring fault from
   // a code fault. Fail closed: nothing below this line runs for one.
   if (error instanceof DeploymentIdentityError) return 503;
-  // An authoritative read that did not reach storage: the same shape of answer
-  // as the misprovisioning above — the caller asked for nothing wrong, the
-  // condition is the operator's, and it clears on its own — so it is retryable
-  // rather than a 500 that reads as a code fault. A 404 or a 200 with a
-  // fabricated summary would be worse than either: both invite the caller to
-  // conclude something from a read that never happened.
-  if (error instanceof RunStateUnreadableError) return 503;
   if (
     error instanceof UnknownWorkflowError ||
     error instanceof UnknownRunError
@@ -59,30 +61,21 @@ function statusOf(error: unknown): number | undefined {
     return 409;
   }
   if (error instanceof InvalidRunRequestError) return 400;
-  if (error instanceof DoStatusError) {
-    // Range-checked even though the base states the contract, because the base
-    // cannot enforce it: `new Response(body, { status })` raises RangeError
-    // outside [200, 599] — from inside the catch block whose entire job is to
-    // never throw, which would lose the 500 and the message with it. The 4xx/5xx
-    // floor also keeps the message body legal (204/205/304 are null-body
-    // statuses, all below 400). A shell that names anything else has a bug, and
-    // falls through to the 500 that is the honest answer for one.
-    const { status } = error;
-    return Number.isInteger(status) && status >= 400 && status <= 599
-      ? status
-      : undefined;
-  }
+  // Range-checked even though the base states the contract, because the base
+  // cannot enforce it: see isRefusalStatus.
+  if (error instanceof DoStatusError && isRefusalStatus(error.status))
+    return error.status;
   return undefined;
 }
 
 /**
- * The structured reason a refusal publishes, or undefined. Two channels, one
- * renderer: RunLifecycleBlockedError is a plain Error with its own `reason`; a
- * DoStatusError subclass carries its reason on the base. Anything else has no
- * reason to publish — an unclassified fault must not grow a machine-readable
- * code it never defined.
+ * @internal The structured reason a refusal publishes, or undefined. Two
+ * channels, one renderer: RunLifecycleBlockedError is a plain Error with its
+ * own `reason`; a DoStatusError subclass carries its reason on the base.
+ * Anything else has no reason to publish — an unclassified fault must not grow
+ * a machine-readable code it never defined.
  */
-function reasonOf(error: unknown): unknown {
+export function refusalReason(error: unknown): unknown {
   if (error instanceof RunLifecycleBlockedError) return error.reason;
   if (error instanceof DoStatusError) return error.reason;
   return undefined;
@@ -94,15 +87,9 @@ function reasonOf(error: unknown): unknown {
  */
 export function doErrorResponse(error: unknown): Response {
   const message = error instanceof Error ? error.message : String(error);
-  const reason = reasonOf(error);
-  return new Response(
-    JSON.stringify({
-      error: message,
-      ...(reason === undefined ? {} : { reason }),
-    }),
-    {
-      status: statusOf(error) ?? 500,
-      headers: { 'content-type': 'application/json' },
-    },
-  );
+  const reason = refusalReason(error);
+  return new Response(JSON.stringify(refusalBody(message, reason)), {
+    status: refusalStatus(error) ?? 500,
+    headers: { 'content-type': 'application/json' },
+  });
 }
