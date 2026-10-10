@@ -9,6 +9,10 @@ import {
   DEPLOYMENT_IDENTITY_HEADER,
   deploymentIdentityHeaders,
 } from '../do-runner/deployment-identity.js';
+import {
+  exceedsRunInputDepth,
+  runInputDepthMessage,
+} from '../do-runner/run-input-depth.js';
 import { readBoundedBody } from '../http-body.js';
 import type { AuditQueue } from './queue-types.js';
 
@@ -226,6 +230,9 @@ export function createAuditProxyHandler(options: {
     }
     if (!validEvent(event)) {
       return new Response('invalid audit event', { status: 400 });
+    }
+    if (exceedsRunInputDepth(event)) {
+      return new Response(runInputDepthMessage('audit event'), { status: 400 });
     }
     const attributed: InfrastructureAuditEnvelope = {
       fleetAttribution: {

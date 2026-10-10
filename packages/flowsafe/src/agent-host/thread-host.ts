@@ -85,6 +85,7 @@ import { mastraRegistryEntries } from '../do-runner/mastra-registry.js';
 import {
   exceedsRunInputDepth,
   runInputDepthMessage,
+  someValueExceedsRunInputDepth,
 } from '../do-runner/run-input-depth.js';
 import {
   lifecycleFromRequestContext,
@@ -430,7 +431,7 @@ function safeContext(value: unknown): Record<string, unknown> {
     const context = sanitizeStoredAgentContext(
       value as Record<string, unknown> | undefined,
     );
-    if (Object.values(context).some((item) => exceedsRunInputDepth(item)))
+    if (someValueExceedsRunInputDepth(context))
       throw new AgentHostRequestError(
         400,
         runInputDepthMessage('a safeContext value'),
@@ -447,6 +448,11 @@ function providerOptions(
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
     throw new AgentHostRequestError(400, 'providerOptions must be an object');
   }
+  if (someValueExceedsRunInputDepth(value))
+    throw new AgentHostRequestError(
+      400,
+      runInputDepthMessage('a providerOptions value'),
+    );
   // The closed provider-options check validates this snapshot's namespaces and keys before use; the model provider validates the values when it parses its options.
   return structuredClone(
     value as NonNullable<DurableAgentStreamOptions['providerOptions']>,

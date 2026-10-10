@@ -15,6 +15,7 @@ import {
   summarizeNotifications,
 } from '@mastra/core/notifications';
 import { describe, expect, it, vi } from 'vitest';
+import { nestedArray } from '../../test-support/deep-json.js';
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import { FLOWSAFE_PERSISTENCE_FORBIDDEN } from '../agent-runner/durable-agent-runner.js';
 import { RUNTIME_DRIVEN_AGENT } from '../agent-runner/index.js';
@@ -26,6 +27,7 @@ import {
   RunStateUnreadableError,
   type ThreadScope,
 } from '../do-runner/index.js';
+import { runInputDepthMessage } from '../do-runner/run-input-depth.js';
 import type { SignalDatabase } from './d1-shared.js';
 import { D1NotificationsStorage } from './notifications-d1.js';
 import {
@@ -1406,6 +1408,80 @@ describe('createThreadSignalRoutes', () => {
     ).toMatchObject([
       { summary: 'z', status: 'delivered', deliveredSignalId: 's' },
     ]);
+  });
+
+  it.each([
+    [
+      'a state value',
+      '/signal/state',
+      { id: 'g', cacheKey: 'k', contents: 'a', value: nestedArray(257) },
+      'value',
+    ],
+    [
+      'a state delta',
+      '/signal/state',
+      {
+        id: 'g',
+        cacheKey: 'k',
+        contents: 'a',
+        mode: 'delta',
+        delta: nestedArray(257),
+      },
+      'delta',
+    ],
+    [
+      'a notification payload',
+      '/signal/notification',
+      { source: 'x', kind: 'y', summary: 'z', payload: nestedArray(257) },
+      'payload',
+    ],
+  ] as const)('refuses %s nested more than 256 levels deep before sending or recording it', async (_label, path, body, field) => {
+    // #given thread routes over a mock agent and an empty inbox
+    const { agent, calls } = mockAgent();
+    const storage = new InMemoryNotificationsStorage();
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+      resolveNotificationsStorage: () => storage,
+    });
+
+    // #when the signal nests its field 257 levels deep
+    const response = await routes(post(path, body), scopeWith(undefined));
+
+    // #then it is refused for that field and nothing is sent or recorded
+    expect(response?.status).toBe(400);
+    expect(await response?.json()).toEqual({
+      error: runInputDepthMessage(field),
+    });
+    expect(calls).toEqual([]);
+    expect(await storage.listNotifications({ threadId: 'acme_t1' })).toEqual(
+      [],
+    );
+  });
+
+  it('sends a state delta whose body also carries a value nested more than 256 levels deep', async () => {
+    // #given thread routes over a mock agent
+    const { agent, calls } = mockAgent();
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+    });
+
+    // #when a delta signal carries a deep value its mode does not send
+    await routes(
+      post('/signal/state', {
+        id: 'g',
+        cacheKey: 'k',
+        contents: 'a',
+        mode: 'delta',
+        delta: { step: 1 },
+        value: nestedArray(257),
+      }),
+      scopeWith(undefined),
+    );
+
+    // #then the delta is sent
+    expect(calls.map((call) => call.method)).toEqual(['sendStateSignal']);
   });
 
   it('applies queue owner gates to state before sending', async () => {

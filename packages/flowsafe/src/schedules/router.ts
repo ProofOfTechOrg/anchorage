@@ -77,7 +77,10 @@ import {
   isExecutionFenceRefusal,
   readExecutionFence,
 } from '../do-runner/index.js';
-import { runInputDepthMessage } from '../do-runner/run-input-depth.js';
+import {
+  runInputDepthMessage,
+  someValueExceedsRunInputDepth,
+} from '../do-runner/run-input-depth.js';
 import { hostErrorText } from '../host-kit/host-approval-service.js';
 import {
   type BoundThreadTargetValidator,
@@ -467,6 +470,12 @@ function metadataOrReject(value: unknown): Validated<Record<string, unknown>> {
     return {
       ok: false,
       error: reject('metadata-invalid', 'metadata must be an object'),
+    };
+  }
+  if (someValueExceedsRunInputDepth(value)) {
+    return {
+      ok: false,
+      error: reject('input-too-deep', runInputDepthMessage('a metadata value')),
     };
   }
   return { ok: true, value: value as Record<string, unknown> };

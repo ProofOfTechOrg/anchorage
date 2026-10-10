@@ -1008,7 +1008,12 @@ function assertLegAbort(legAbort: unknown): void {
     throw new InvalidRunRequestError('legAbort is malformed');
 }
 
-function assertRunInputDepth(field: string, value: unknown): void {
+/**
+ * @internal Refuse tenant JSON nested past MAX_RUN_INPUT_DEPTH as a request the
+ * caller can fix. Defined here, beside InvalidRunRequestError, because
+ * run-input-depth.ts importing this module would close an import cycle.
+ */
+export function assertRunInputDepth(field: string, value: unknown): void {
   if (exceedsRunInputDepth(value))
     throw new InvalidRunRequestError(runInputDepthMessage(field));
 }

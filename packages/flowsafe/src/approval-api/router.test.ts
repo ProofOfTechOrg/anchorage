@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { describe, expect, it, vi } from 'vitest';
+import { nestedArray } from '../../test-support/deep-json.js';
+import { runInputDepthMessage } from '../do-runner/run-input-depth.js';
 import { type ActorContext, createActorResolver } from './actor-context.js';
 import type { ApprovalRole } from './contract.js';
 import {
@@ -253,6 +255,48 @@ describe('createApprovalRouter', () => {
       priority: 'high',
       payload: { context: 42 },
     });
+  });
+
+  it('refuses a create payload nested more than 256 levels deep before reading run ownership, storing nothing', async () => {
+    // #given a create route whose ownership read refuses the unregistered run
+    const { handle, store } = makeHandler({
+      allowCreate: true,
+      enforceOwnership: true,
+    });
+
+    // #when the payload nests 257 levels deep
+    const response = await handle(
+      req('/api/approvals', {
+        body: { ...CREATE_BODY, payload: nestedArray(257) },
+      }),
+    );
+
+    // #then it is refused for that field and no approval is stored
+    expect(response?.status).toBe(400);
+    expect(await response?.json()).toEqual({
+      error: runInputDepthMessage('payload'),
+    });
+    expect(await store.list()).toEqual([]);
+  });
+
+  it.each([
+    ['an object', { note: 'x' }],
+    ['null', null],
+  ])('refuses a create summary that is %s, storing nothing', async (_label, summary) => {
+    // #given a create route
+    const { handle, store } = makeHandler({ allowCreate: true });
+
+    // #when the summary is not a string
+    const response = await handle(
+      req('/api/approvals', { body: { ...CREATE_BODY, summary } }),
+    );
+
+    // #then it is refused for that field and no approval is stored
+    expect(response?.status).toBe(400);
+    expect(await response?.json()).toEqual({
+      error: 'summary must be a string',
+    });
+    expect(await store.list()).toEqual([]);
   });
 
   it('forces requestedBy to the authenticated actor', async () => {

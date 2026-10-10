@@ -26,7 +26,6 @@ import {
 import {
   beginIdempotentStart,
   type ExecutionFenceWiring,
-  InvalidRunRequestError,
   type PersistedStartResult,
   type RunSummary,
   requireStartIdempotency,
@@ -35,10 +34,7 @@ import {
   type StartReservation,
   type StartReservationReading,
 } from '../do-runner/index.js';
-import {
-  exceedsRunInputDepth,
-  runInputDepthMessage,
-} from '../do-runner/run-input-depth.js';
+import { assertRunInputDepth } from '../do-runner/runtime.js';
 import { readBoundedBody } from '../http-body.js';
 import { internalErrorResponse } from '../internal-error-response.js';
 import { queueApprovalForSuspension } from './approval-bridge.js';
@@ -277,16 +273,6 @@ function errorResponse(error: unknown): Response {
 
 const MAX_RUN_BODY_BYTES = 1_048_576;
 
-/**
- * Refuses tenant JSON the run object could not store, before anything claims a
- * reservation or serializes the body to forward it: JSON.stringify throws on
- * nesting a body within MAX_RUN_BODY_BYTES can reach.
- */
-function assertRunInputDepth(field: string, value: unknown): void {
-  if (exceedsRunInputDepth(value))
-    throw new InvalidRunRequestError(runInputDepthMessage(field));
-}
-
 async function readJson(request: Request): Promise<unknown> {
   const raw = await readBoundedBody(
     request,
@@ -514,6 +500,9 @@ export function createRunRouter(options: RunRouterOptions): RunRouter {
           }
           assertNoReservedExecutionContext(requestContext);
         }
+        // Before anything claims a reservation or serializes the body to
+        // forward it: JSON.stringify throws on nesting a body within
+        // MAX_RUN_BODY_BYTES can reach.
         assertRunInputDepth('inputData', inputData);
         for (const value of Object.values(requestContext ?? {}))
           assertRunInputDepth('a requestContext value', value);

@@ -49,6 +49,7 @@ import {
   resourceIdFromKey,
   SUSPENSION_TIMEOUT_RESUME_KEY,
 } from '../do-runner/index.js';
+import { runInputDepthMessage } from '../do-runner/run-input-depth.js';
 import { lifecycleFromRequestContext } from '../do-runner/run-lifecycle.js';
 import {
   D1SchedulesStorage,
@@ -2164,7 +2165,16 @@ describe('createThreadAgentHost', () => {
   });
 
   it.each([
-    ['safeContext', { safeContext: { note: nestedArray(257) } }],
+    [
+      'safeContext',
+      { safeContext: { note: nestedArray(257) } },
+      'a safeContext value',
+    ],
+    [
+      'providerOptions',
+      { providerOptions: { deepseek: { thinking: nestedArray(256) } } },
+      'a providerOptions value',
+    ],
     [
       'messages',
       {
@@ -2182,8 +2192,9 @@ describe('createThreadAgentHost', () => {
           },
         ],
       },
+      'agent input',
     ],
-  ] as const)('refuses an agent start whose %s nests 257 levels deep before writing its journal', async (_field, deep) => {
+  ] as const)('refuses an agent start whose %s nests 257 levels deep before writing its journal', async (_field, deep, field) => {
     // #given a start whose caller input nests 257 levels
     const fixture = harness();
     const reserve = vi.spyOn(fixture.resourceAccess, 'reserveAll');
@@ -2195,12 +2206,32 @@ describe('createThreadAgentHost', () => {
     } as unknown as ThreadAgentStartInput);
 
     // #then it is refused as a bad request before anything is stored or streamed
-    await expect(started).rejects.toMatchObject({ status: 400 });
+    await expect(started).rejects.toMatchObject({
+      status: 400,
+      message: runInputDepthMessage(field),
+    });
     expect(mocked.stream).not.toHaveBeenCalled();
     expect(reserve).not.toHaveBeenCalled();
     expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(false);
     expect(fixture.state.has(THREAD_BINDING_KEY)).toBe(false);
     expect(fixture.state.has(TEST_OWNER_RECOVERY_KEY)).toBe(false);
+  });
+
+  it('starts an agent run whose providerOptions value nests exactly 256 levels deep', async () => {
+    // #given a start whose providerOptions entry nests 256 levels
+    const fixture = harness();
+    const thinking = nestedArray(255);
+
+    // #when the host starts the run
+    await fixture.host.start(fixture.scope, {
+      ...THREAD_START_INPUT,
+      providerOptions: { deepseek: { thinking } },
+    } as unknown as ThreadAgentStartInput);
+
+    // #then the run streams with that value
+    expect(mocked.stream.mock.calls[0]?.[1]?.providerOptions).toEqual({
+      deepseek: { thinking },
+    });
   });
 
   it('refuses a scheduled agent start whose stored context nests 257 levels deep', async () => {

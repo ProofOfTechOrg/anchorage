@@ -139,7 +139,7 @@ Every authenticated role may list agents. Run inspection follows resource owners
 
 The start body accepts only `{"prompt":"..."}`. The router caps the raw UTF-8 body at 16,384 bytes, requires non-whitespace prompt content, preserves that content, and rejects ids, trusted context, overrides, unknown fields, and prototype meta-keys.
 
-An agent start refuses with HTTP 400 a caller message list or client context value nested more than 256 levels deep, scheduled starts included. The message list counts as one level, and each client context value is checked on its own. The bound does not apply to the thread history memory recalls into the run. A run whose state cannot be stored, because a tool result or a recalled message nests past the depth SQLite's JSON functions parse, fails at once with `errorEnvelope.code` `RUN_STATE_NOT_STORABLE`, the runner publishes the run's terminal `error` event, and the thread is released. The refused write can come after the loop has finished, so the run's stream can end with a normal `finish` event: read the run's status, not its stream, for the outcome. While memory recalls such a message, every start on that thread fails the same way: continue on a new thread, or delete the message from the thread's memory.
+An agent start refuses with HTTP 400 a caller message list, client context value or `providerOptions` value nested more than 256 levels deep, scheduled starts included. The message list counts as one level, and each client context value and each `providerOptions` value is checked on its own. The bound does not apply to the thread history memory recalls into the run. A run whose state cannot be stored, because a tool result or a recalled message nests past the depth SQLite's JSON functions parse, fails at once with `errorEnvelope.code` `RUN_STATE_NOT_STORABLE`, the runner publishes the run's terminal `error` event, and the thread is released. The refused write can come after the loop has finished, so the run's stream can end with a normal `finish` event: read the run's status, not its stream, for the outcome. While memory recalls such a message, every start on that thread fails the same way: continue on a new thread, or delete the message from the thread's memory.
 
 Each stream line contains the next reconnect cursor and one event. Replay depends on the configured Mastra cache and is not process-restart durable. When the durable run exists but its replay cache does not, the stream route returns 409 and the client must use the status route. A run that the terminate route cancels ends its stream with an `error` event.
 
@@ -349,6 +349,8 @@ Configure `SignalRouterOptions.validateThreadTarget` with the `BoundThreadTarget
 
 The router records acceptance after the downstream response succeeds and normalizes thread-not-found refusals from registry access, the validator and the receiving Durable Object. Audit-sink and diagnostic failures retain the selected response. The starter's limiter is isolate-local example protection; use shared durable state when the limit is contractual across the deployment.
 
+The thread object refuses with `400` a state signal's `value` or `delta`, or a notification's `payload`, nested more than 256 levels deep, before it writes or delivers anything; a signal-provider delivery refused this way is recorded as failed.
+
 Signals are untrusted model input. Core escapes the XML representation, while the route validates tag and attribute names and caps payload size. A receiving agent's ordinary `processInput` policy is not a complete signal boundary: Mastra can drain queued signals after the initiating input processor has run. Configure `createThreadSignalRoutes({ contentPolicy })` to inspect Mastra's canonical escaped XML inside the Thread Durable Object before delivery, persistence, wake, or run start. The same boundary covers direct routes, providers, schedules, and notification dispatch.
 
 For a threaded schedule's stored provider options, configure `scheduleProviderOptionsPolicy`; `contentPolicy` does not inspect those options.
@@ -390,7 +392,7 @@ The router:
 - lists deployment schedules under role checks;
 - limits schedule count and fire rate;
 - rejects reserved request-context keys on workflow and agent targets;
-- refuses with 400 a target whose `inputData`, `initialState`, request-context value, `providerOptions` value or `ifIdle.streamOptions.requestContext` value nests more than 256 levels deep, on create and update;
+- refuses with 400 a target whose `inputData`, `initialState`, request-context value, `providerOptions` value or `ifIdle.streamOptions.requestContext` value nests more than 256 levels deep, and a `metadata` value nested that deep, on create and update;
 - exposes trigger history as read-only data.
 
 The tick:

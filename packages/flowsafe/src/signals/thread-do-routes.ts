@@ -65,6 +65,10 @@ import {
   readExecutionFence,
   type ThreadScope,
 } from '../do-runner/index.js';
+import {
+  exceedsRunInputDepth,
+  runInputDepthMessage,
+} from '../do-runner/run-input-depth.js';
 import { internalErrorResponse } from '../internal-error-response.js';
 import { positiveSafeInteger } from '../numeric-config.js';
 import {
@@ -2701,12 +2705,15 @@ async function handleState(
     );
   }
   const mode = body.mode === 'delta' ? 'delta' : 'snapshot';
+  const carried = mode === 'snapshot' ? 'value' : 'delta';
+  if (exceedsRunInputDepth(body[carried]))
+    return json({ error: runInputDepthMessage(carried) }, 400);
   const state: AgentStateSignalInput = {
     id: body.id,
     cacheKey: body.cacheKey,
     contents: body.contents,
     mode,
-    ...(mode === 'snapshot' ? { value: body.value } : { delta: body.delta }),
+    ...(carried === 'value' ? { value: body.value } : { delta: body.delta }),
     ...(isAttributes(body.attributes) ? { attributes: body.attributes } : {}),
   };
   const durableBlockingRun = await options.blockingRun?.();
@@ -2823,6 +2830,8 @@ async function handleNotification(
       400,
     );
   }
+  if (exceedsRunInputDepth(body.payload))
+    return json({ error: runInputDepthMessage('payload') }, 400);
   const notification: SendNotificationSignalInput = {
     source: body.source,
     kind: body.kind,

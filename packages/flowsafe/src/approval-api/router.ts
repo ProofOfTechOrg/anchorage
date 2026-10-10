@@ -17,6 +17,10 @@
 
 import { isExecutionFenceRefusal } from '../do-runner/execution-fence.js';
 import { isPathSafeId } from '../do-runner/path-safe-id.js';
+import {
+  exceedsRunInputDepth,
+  runInputDepthMessage,
+} from '../do-runner/run-input-depth.js';
 import { readBoundedBody } from '../http-body.js';
 import { internalErrorResponse } from '../internal-error-response.js';
 import { ActorResolutionError, type ActorResolver } from './actor-context.js';
@@ -338,6 +342,20 @@ export function createApprovalRouter(
           };
           for (const field of CLIENT_CREATE_FIELDS) {
             if (field in body) input[field] = body[field];
+          }
+          if (
+            input.summary !== undefined &&
+            typeof input.summary !== 'string'
+          ) {
+            throw new InvalidApprovalInputError('summary must be a string');
+          }
+          // Here and not in service.create: the in-process bridge files a
+          // run's suspend payload, which a step can nest a few levels below a
+          // 256-level input.
+          if (exceedsRunInputDepth(input.payload)) {
+            throw new InvalidApprovalInputError(
+              runInputDepthMessage('payload'),
+            );
           }
           const runId = input.runId;
           if (typeof runId !== 'string' || runId.length === 0) {

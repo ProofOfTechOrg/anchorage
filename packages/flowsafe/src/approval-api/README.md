@@ -167,15 +167,18 @@ never resumes a run.
   route returns 400 for any body containing a server-only field
   (`connectors`, `grantScope`, `toolCallId`, `stepPath`, `suspendedAt`,
   `resumedAt`, `resumeCount`, `runScoped`, `requestedBy`, `requestedByKind`, or
-  `resumeTarget`), requires write access to the named run, and forces
-  `requestedBy` to the authenticated actor. A record without `stepPath`,
-  explicit `runScoped: true`, or a server-authored `resumeTarget` is
-  decision-only. `service.create()` still honors an explicit `requestedBy` and
-  `requestedByKind`: the in-process bridge attributes the execution principal
-  that advanced the run, while a human approval resume is attributed to its
-  decider. That attribution makes the separation-of-duties check effective.
+  `resumeTarget`), for a `summary` that is not a string, and for a `payload`
+  nested more than 256 levels deep. It requires write access to the named run
+  and forces `requestedBy` to the authenticated actor. A record without
+  `stepPath`, explicit `runScoped: true`, or a server-authored `resumeTarget`
+  is decision-only. `service.create()` still honors an explicit `requestedBy`
+  and `requestedByKind`: the in-process bridge attributes the execution
+  principal that advanced the run, while a human approval resume is attributed
+  to its decider. That attribution makes the separation-of-duties check
+  effective.
 - Records are JSON-safe end to end (validated at create) so the two store
-  implementations cannot diverge on exotic payloads.
+  implementations cannot diverge on exotic payloads. Only the HTTP create route
+  bounds `payload` nesting; a trusted in-process create is not bounded.
 - Current bridges capture `(suspendedAt, resumeCount)`, and grant derivation
   matches both exactly. `resumeCount` is undefined on the first suspension,
   then increases on every resume. It distinguishes repeated suspensions even

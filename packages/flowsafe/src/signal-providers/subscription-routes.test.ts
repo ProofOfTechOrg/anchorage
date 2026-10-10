@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 import { describe, expect, it, vi } from 'vitest';
 
+import { nestedArray } from '../../test-support/deep-json.js';
 import {
   type ActorContext,
   ActorResolutionError,
   type ApprovalRole,
 } from '../approval-api/index.js';
 import { resourceIdFromKey } from '../do-runner/index.js';
+import { runInputDepthMessage } from '../do-runner/run-input-depth.js';
 import { RunRouteError } from '../host-kit/index.js';
 import {
   InMemorySubscriptionStoreFactory,
@@ -52,6 +54,7 @@ function setup(
     reconcilePolling?: () => Promise<void>;
     audit?: SignalProviderAuditSink;
     validateThreadTarget?: SubscriptionRouterOptions['validateThreadTarget'];
+    authorizeMutation?: SubscriptionRouterOptions['authorizeMutation'];
   } = {},
 ) {
   const factory = new InMemorySubscriptionStoreFactory();
@@ -73,6 +76,9 @@ function setup(
       : {}),
     ...(opts.maxBodyBytes !== undefined
       ? { maxBodyBytes: opts.maxBodyBytes }
+      : {}),
+    ...(opts.authorizeMutation
+      ? { authorizeMutation: opts.authorizeMutation }
       : {}),
   });
   return { router, factory, events };
@@ -208,6 +214,50 @@ describe('createSubscriptionRouter', () => {
 
     expect(res?.status).toBe(400);
     expect(await factory.store().listForThread('acme_t1')).toEqual([]);
+  });
+
+  it('refuses a subscription metadata value nested more than 256 levels deep before authorizing or subscribing', async () => {
+    // #given a subscription router with no subscriptions and a mutation policy
+    const authorizeMutation = vi.fn();
+    const { router, factory } = setup({ authorizeMutation });
+
+    // #when a metadata value nests 257 levels deep
+    const res = await router(
+      req('POST', 'acme_t1', {
+        providerId: 'github',
+        externalResourceId: 'github:acme/repo',
+        resourceKey: 'user-42',
+        metadata: { note: nestedArray(257) },
+      }),
+    );
+
+    // #then it is refused for that field before the policy runs, and nothing
+    // is subscribed
+    expect(res?.status).toBe(400);
+    expect(await res?.json()).toEqual({
+      error: runInputDepthMessage('a metadata value'),
+    });
+    expect(authorizeMutation).not.toHaveBeenCalled();
+    expect(await factory.store().listForThread('acme_t1')).toEqual([]);
+  });
+
+  it('subscribes with a metadata value nested exactly 256 levels deep', async () => {
+    // #given a subscription router with no subscriptions
+    const { router, factory } = setup();
+
+    // #when a metadata value nests 256 levels deep, the metadata itself 257
+    const res = await router(
+      req('POST', 'acme_t1', {
+        providerId: 'github',
+        externalResourceId: 'github:acme/repo',
+        resourceKey: 'user-42',
+        metadata: { note: nestedArray(256) },
+      }),
+    );
+
+    // #then the subscription is stored
+    expect(res?.status).toBe(200);
+    expect(await factory.store().listForThread('acme_t1')).toHaveLength(1);
   });
 
   it('subscribes, lists, and unsubscribes with a validated resource key', async () => {

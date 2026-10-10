@@ -596,7 +596,7 @@ A non-owner's notification, and an unbranded agent's owner notification, are che
 
 Flowsafe providers route polling and webhook deliveries through the thread topology instead of Mastra's in-process registry.
 
-`SignalProviderHost` runs one alarm-driven host per deployment. `D1SubscriptionStoreFactory` persists subscriptions. External resource ids are opaque, but must be non-empty, contain no ASCII control characters, and fit within 1,024 UTF-8 bytes. Human-only subscription routes reconcile provider alarms after each committed mutation. Webhook routes verify raw bytes before parsing, look up the stored subscription, apply a provider rate cap, and bound forgery audit.
+`SignalProviderHost` runs one alarm-driven host per deployment. `D1SubscriptionStoreFactory` persists subscriptions. External resource ids are opaque, but must be non-empty, contain no ASCII control characters, and fit within 1,024 UTF-8 bytes. A subscription `metadata` value nested more than 256 levels deep is refused with `400`. Human-only subscription routes reconcile provider alarms after each committed mutation. Webhook routes verify raw bytes before parsing, look up the stored subscription, apply a provider rate cap, and bound forgery audit.
 
 `githubSignalProvider()` is the reference provider.
 

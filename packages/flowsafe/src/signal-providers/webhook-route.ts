@@ -30,6 +30,10 @@ import {
   isExecutionFenceRefusal,
   readExecutionFence,
 } from '../do-runner/index.js';
+import {
+  runInputDepthMessage,
+  someValueExceedsRunInputDepth,
+} from '../do-runner/run-input-depth.js';
 import { hostErrorText } from '../host-kit/host-approval-service.js';
 import {
   assertNoClientMemoryIds,
@@ -810,6 +814,15 @@ export function createSubscriptionRouter(
           400,
         );
       }
+      const metadata =
+        typeof body.metadata === 'object' &&
+        body.metadata !== null &&
+        !Array.isArray(body.metadata)
+          ? (body.metadata as Record<string, unknown>)
+          : undefined;
+      if (metadata !== undefined && someValueExceedsRunInputDepth(metadata)) {
+        return json({ error: runInputDepthMessage('a metadata value') }, 400);
+      }
       await options.authorizeMutation?.({
         context,
         method,
@@ -849,11 +862,7 @@ export function createSubscriptionRouter(
         externalResourceId,
         threadId,
         resourceId,
-        ...(typeof body.metadata === 'object' &&
-        body.metadata !== null &&
-        !Array.isArray(body.metadata)
-          ? { metadata: body.metadata as Record<string, unknown> }
-          : {}),
+        ...(metadata === undefined ? {} : { metadata }),
       });
       await finishCommittedMutation(providerId, externalResourceId);
       return json({ subscription });
