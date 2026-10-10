@@ -2,7 +2,8 @@
 // The host's unattended maintenance duties, in a module of their own rather
 // than in the Worker entry: workerd rejects a non-handler export from an entry
 // module, so anything a test must reach has to live beside it (the same shape
-// flowsafe's own deploy/crons.ts uses).
+// flowsafe's own deploy/crons.ts uses). That includes the duty registration,
+// which a test can import from here but not from the entry.
 //
 // What is worth testing here is the WIRING, not the closures: every surface in
 // this host takes its execution fence from `executionFence(env.DB)`, and the
@@ -15,6 +16,7 @@ import { createAgentThreadTopology } from '@proofoftech/flowsafe/agent-host';
 import {
   createDoRunTopology,
   createThreadTopology,
+  type FlowsafeWorkerConfig,
   queueApprovalForSuspension,
   RunRouteError,
 } from '@proofoftech/flowsafe/host-kit';
@@ -267,3 +269,17 @@ export function starterNotificationTick(
     executionFence: executionFence(env.DB),
   });
 }
+
+export const starterMaintenanceConfig = {
+  maintenance: {
+    sweepIntervalMs: 5 * 60 * 1_000,
+    purgeIntervalMs: 60 * 60 * 1_000,
+    tickIntervalMs: 60 * 1_000,
+    notificationIntervalMs: 60 * 1_000,
+  },
+  scheduleTick: starterScheduleTick,
+  notificationTick: starterNotificationTick,
+} satisfies Pick<
+  FlowsafeWorkerConfig<Env>,
+  'maintenance' | 'scheduleTick' | 'notificationTick'
+>;

@@ -15,6 +15,7 @@ import {
 import { describe, expect, it } from 'vitest';
 
 import {
+  starterMaintenanceConfig,
   starterNotificationTick,
   starterScheduleTick,
 } from '../src/maintenance.js';
@@ -139,6 +140,16 @@ describe('starter schedule tick and the deployment execution fence', () => {
       id: 'due-1',
     });
     expect(row?.deliveryAttempts ?? 0).toBe(0);
+  });
+});
+
+describe('starter maintenance registration', () => {
+  it('registers the schedule tick and notification dispatch duties at a one-minute cadence', () => {
+    expect(starterMaintenanceConfig).toMatchObject({
+      maintenance: { tickIntervalMs: 60_000, notificationIntervalMs: 60_000 },
+      scheduleTick: starterScheduleTick,
+      notificationTick: starterNotificationTick,
+    });
   });
 });
 
