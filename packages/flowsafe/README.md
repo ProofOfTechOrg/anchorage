@@ -604,7 +604,7 @@ Complete wiring is in the [durable-agents guide](https://github.com/ProofOfTechO
 
 ## Deployment and operations
 
-The composed `createFlowsafeWorker()` owns the shared route and maintenance-duty pipeline. Hosts inject workflows, identity verification, topology-backed optional routers, budget wrappers, notification transport, an invocation-scoped artifact-store factory, the storage table prefix, schedule tick, and extra purge duties.
+The composed `createFlowsafeWorker()` owns the shared route and maintenance-duty pipeline. Hosts inject workflows, identity verification, topology-backed optional routers, budget wrappers, notification transport, an invocation-scoped artifact-store factory, the storage table prefix, schedule and notification ticks, and extra purge duties.
 
 Configure `mutationEpoch` with a nonnegative safe integer or a synchronous environment callback. The Worker captures it before deployment verification or authentication, then forwards it through trusted contexts and protected internal headers. Start paths preserve the original actor, principal, epoch and selectors across waits, including class-backed context method receivers. Do not accept the epoch from public headers or start JSON.
 
@@ -614,7 +614,7 @@ Protect `GET` and `POST /admin/execution-fence` plus `GET /admin/inventory` with
 
 Every leaf option that accepts `ExecutionFenceWiring` requires an explicit store or `'none'`. Run-router, agent-thread-topology, and storage initialization also require explicit start-idempotency wiring. Use `'none'` only when no database exists. `BackgroundTaskHost` no longer exposes its manager; call `enqueue()`, `getTask()`, `listTasks()`, or `stream()` on the host and use `BackgroundTaskReads` for read-only route composition.
 
-`createFlowsafeMaintenanceDurableObject()` runs deadline expiry, approval service-level agreement (SLA) sweep, retention purge, and optional schedule fire as separate alarm invocations. Provider polling and background recovery use their own Durable Object alarms.
+`createFlowsafeMaintenanceDurableObject()` runs deadline expiry, approval service-level agreement (SLA) sweep, retention purge, and optional schedule fire and notification dispatch as separate alarm invocations. Provider polling and background recovery use their own Durable Object alarms.
 
 Read:
 

@@ -213,11 +213,11 @@ Idle-thread retention deletes Mastra thread and message rows only. It deliberate
 - agent catalog routing between deployment `preRoutes` and other optional feature routers;
 - actor resolver construction;
 - suspension-to-approval and resume-to-requeue bridges;
-- separate SLA, purge, and optional schedule-tick maintenance duties.
+- separate [alarm-driven maintenance duties](deployment-reference.md#alarm-driven-maintenance).
 
 `createFlowsafeMaintenanceDurableObject()` runs those duties through the fixed maintenance singleton. Tenant Workers can produce audit Queue messages, but the shared control-plane Worker owns Queue consumption.
 
-Hosts inject identity verification, workflow and agent metadata, optional feature routers, approval-resume composition, budget wrappers, notification transport, an invocation-scoped artifact-store factory, the storage table prefix, schedule tick, and deployment-owned purge duties. The artifact factory receives the current Worker environment inside retention isolation, so no R2 binding is captured globally. A configured storage prefix must match runtime D1 construction and reaches every prefix-aware built-in purge; fixed-schema Flowsafe tables remain unprefixed.
+Hosts inject identity verification, workflow and agent metadata, optional feature routers, approval-resume composition, budget wrappers, notification transport, an invocation-scoped artifact-store factory, the storage table prefix, schedule and notification ticks, and deployment-owned purge duties. The artifact factory receives the current Worker environment inside retention isolation, so no R2 binding is captured globally. A configured storage prefix must match runtime D1 construction and reaches every prefix-aware built-in purge; fixed-schema Flowsafe tables remain unprefixed.
 
 The [baseline deployment](https://github.com/ProofOfTechOrg/anchorage/tree/main/packages/flowsafe/deploy) uses only core workflows and approvals. The [advanced starter](https://github.com/ProofOfTechOrg/anchorage/tree/main/packages/agent-starter) composes the long-running agent features.
 

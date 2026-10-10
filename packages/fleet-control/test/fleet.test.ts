@@ -1045,7 +1045,7 @@ describe('fleet operations', () => {
     );
   });
 
-  it('checks each configured duty so a fresh sweep cannot mask stale purge or failed tick', async () => {
+  it('checks each configured duty so a fresh sweep cannot mask stale purge or a failed deadline, tick or notification duty', async () => {
     const acme = record('acme');
     const backend = new FleetBackend();
     backend.live.set(
@@ -1056,9 +1056,15 @@ describe('fleet operations', () => {
           nextAlarmAt: 10_100,
           lastSweepAt: 9_900,
           lastPurgeAt: 7_000,
+          lastDeadlineAt: 9_900,
+          lastDeadlineAttemptAt: 9_940,
+          lastDeadlineError: 'deadline database unavailable',
           lastTickAt: 9_900,
           lastTickAttemptAt: 9_950,
           lastTickError: 'tick database unavailable',
+          lastNotificationAt: 9_900,
+          lastNotificationAttemptAt: 9_960,
+          lastNotificationError: 'inbox database unavailable',
         },
       }),
     );
@@ -1077,7 +1083,7 @@ describe('fleet operations', () => {
       expect.objectContaining({
         kind: 'maintenance-stale',
         detail: expect.stringMatching(
-          /purge last succeeded 3000ms ago; tick last attempt failed at 9950: tick database unavailable/,
+          /purge last succeeded 3000ms ago; deadline last attempt failed at 9940: deadline database unavailable; tick last attempt failed at 9950: tick database unavailable; notification last attempt failed at 9960: inbox database unavailable/,
         ),
       }),
     ]);
@@ -1085,6 +1091,49 @@ describe('fleet operations', () => {
     expect(backend.calls.filter((call) => call === 'maintenance:acme')).toEqual(
       ['maintenance:acme'],
     );
+  });
+
+  it.each([
+    [
+      'has never succeeded',
+      null,
+      'deadline has not succeeded within the deployment grace period',
+    ],
+    [
+      'last succeeded too long ago',
+      7_000,
+      'deadline last succeeded 3000ms ago',
+    ],
+  ])('flags a deadline duty that %s as it flags a sweep', async (_when, lastDeadlineAt, detail) => {
+    const acme = record('acme');
+    const backend = new FleetBackend();
+    backend.live.set(
+      acme.tenantTag,
+      liveFor(acme, {
+        maintenance: {
+          armed: true,
+          nextAlarmAt: 10_100,
+          lastSweepAt: 9_900,
+          lastPurgeAt: 9_900,
+          lastDeadlineAt,
+        },
+      }),
+    );
+
+    const findings = await auditFleetDrift({
+      store: storeFor([acme]),
+      records: [acme],
+      inventory: inventoryFor([acme]),
+      backendFor: () => backend,
+      specFor: (item) => spec(item),
+      maintenanceSecretFor: () => 'maintenance-admin-secret-value-00001',
+      staleAfterMs: 1_000,
+      now: 10_000,
+    });
+
+    expect(findings).toEqual([
+      expect.objectContaining({ kind: 'maintenance-stale', detail }),
+    ]);
   });
 
   it('audits recorded and live resources in both directions', async () => {

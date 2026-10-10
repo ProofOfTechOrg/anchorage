@@ -1154,13 +1154,19 @@ export interface MaintenanceHealth {
   readonly deploymentSpecDigest?: string;
   readonly lastSweepAt: number | null;
   readonly lastPurgeAt: number | null;
+  readonly lastDeadlineAt?: number | null;
   readonly lastTickAt?: number | null;
+  readonly lastNotificationAt?: number | null;
   readonly lastSweepAttemptAt?: number | null;
   readonly lastPurgeAttemptAt?: number | null;
+  readonly lastDeadlineAttemptAt?: number | null;
   readonly lastTickAttemptAt?: number | null;
+  readonly lastNotificationAttemptAt?: number | null;
   readonly lastSweepError?: string;
   readonly lastPurgeError?: string;
+  readonly lastDeadlineError?: string;
   readonly lastTickError?: string;
+  readonly lastNotificationError?: string;
 }
 
 export interface ProviderBindingIdentity {

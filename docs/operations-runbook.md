@@ -189,9 +189,11 @@ Do not commit provider tokens, account-specific resource IDs, captured provider 
 
 The maintenance singleton runs separate alarm invocations for:
 
+- run deadline expiry;
 - approval SLA sweep;
 - retention purge;
-- schedule fire tick, when schedules are enabled.
+- schedule fire tick, when schedules are enabled;
+- notification dispatch, when the host wires it.
 
 A Workers CPU-limit termination kills the isolate and bypasses JavaScript `catch`. The object persists the next alarm before each duty and runs one duty per invocation, so one runaway class cannot permanently starve another.
 
@@ -315,6 +317,8 @@ Audit records are security evidence. Queue depth and SIEM ingestion status must 
 | Live updates stop but HTTP works | Hub binding, ticket secret/expiry, socket liveness | Let client poll; repair stream configuration without disabling authorization |
 | Subscription changed but polling did not | Reconcile response/audit and provider alarm | Retry `reconcilePolling()` against committed subscriptions |
 | Schedule did not fire | Maintenance alarm status, active status, CAS winner, run cap, stored metadata, and `schedule-tick-error` and `schedule-tick-bookkeeping-error` lines | Re-arm maintenance or correct the stored row; do not bypass the tick guard. A fire recorded `failed` with reason `input-too-deep` has a stored target value nested more than 256 levels deep: update the schedule with a shallower value or delete it |
+| A fleet audit reports `maintenance-stale` for the deadline duty | `deadline-sweep-error` lines, the maintenance status's `lastDeadlineError`, and running runs past their deadline | A pass expires every due run it selects and fails when any one of them fails, so one run whose timeout keeps failing fails every pass, and the audit's re-arm does not clear it. Fix what the error names or terminate that run; until the duty succeeds, runs past their deadline keep running |
+| A fleet audit reports `maintenance-stale` for the notification duty, or due notifications are not delivered | `notification-dispatch-error` lines, a `config-error` line naming `maintenance.notification`, and the maintenance status's `lastNotificationError` | Restore the `notificationTick` wiring a `config-error` line names, or fix what the error names, then check that the next `notification-dispatch` line reports the notifications that were due |
 | Deleting a schedule answers `202` with `pending: true` and the schedule stays, or the drain inventory's `schedule-deferred-dispatches` category does not empty | The fires still deferred and each one's `statusError`: see [Deferred schedule fires](#deferred-schedule-fires) | Act as that section says |
 | Purge removed a snapshot but left R2 | Artifact store omitted or delete failed | Restore row/key evidence if available, repair paired purge, scan known prefix |
 | Audit is absent while requests succeed | Sink, Queue, consumer, SIEM | Restore export, preserve local ring/Logs, assess evidence gap |

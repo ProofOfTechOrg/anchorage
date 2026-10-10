@@ -21,6 +21,10 @@ import type {
 } from './fleet-migration-state.js';
 import { FLEET_MIGRATION_PLAN_BOUND } from './fleet-operation-state.js';
 import {
+  MAINTENANCE_DUTIES,
+  type MaintenanceDutyName,
+} from './maintenance-health.js';
+import {
   assertExternalPlatformTarget,
   assertExternalPlatformTargetCompatibility,
   assertPlatformResourcesMatchTarget,
@@ -477,7 +481,7 @@ function allowedRouteScriptNames(record: FleetRecord): readonly string[] {
 }
 
 interface DutyHealth {
-  readonly name: 'sweep' | 'purge' | 'tick';
+  readonly name: MaintenanceDutyName;
   readonly lastSuccessAt: number | null;
   readonly lastAttemptAt: number | null | undefined;
   readonly lastError: string | undefined;
@@ -528,30 +532,19 @@ function externalReleaseTopologyFromLive(
 }
 
 function configuredDuties(health: MaintenanceHealth): readonly DutyHealth[] {
-  return [
-    {
-      name: 'sweep',
-      lastSuccessAt: health.lastSweepAt,
-      lastAttemptAt: health.lastSweepAttemptAt,
-      lastError: health.lastSweepError,
-    },
-    {
-      name: 'purge',
-      lastSuccessAt: health.lastPurgeAt,
-      lastAttemptAt: health.lastPurgeAttemptAt,
-      lastError: health.lastPurgeError,
-    },
-    ...(health.lastTickAt === undefined
+  return MAINTENANCE_DUTIES.flatMap((duty): readonly DutyHealth[] => {
+    const lastSuccessAt = health[duty.last];
+    return lastSuccessAt === undefined
       ? []
       : [
           {
-            name: 'tick' as const,
-            lastSuccessAt: health.lastTickAt,
-            lastAttemptAt: health.lastTickAttemptAt,
-            lastError: health.lastTickError,
+            name: duty.name,
+            lastSuccessAt,
+            lastAttemptAt: health[duty.attempt],
+            lastError: health[duty.error],
           },
-        ]),
-  ];
+        ];
+  });
 }
 
 interface DutySegment {

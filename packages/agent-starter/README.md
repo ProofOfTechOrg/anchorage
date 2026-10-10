@@ -274,7 +274,7 @@ The route verifies `X-Hub-Signature-256` over raw bytes before parsing or subscr
 
 Schedule routes use the composed Worker's captured artifact epoch and the concrete D1 store's `FENCED_SCHEDULE_STORAGE` capability on the same database. After activation, missing, stale and future epochs refuse mutations, including pause/delete and already-matching pause/resume requests. Configure the epoch through the trusted host configuration; request data cannot supply it. Admitted trigger settlement can finish a pending deletion after an epoch change.
 
-The one-minute tick claims due schedules with D1 CAS, starts generic workflows or the same runtime-driven thread agent, and dispatches due notifications through the owning thread Durable Object.
+The one-minute schedule tick claims due schedules with D1 CAS and starts generic workflows or the same runtime-driven thread agent. A separate one-minute notification duty dispatches due notifications through the owning thread Durable Object, so a failed schedule pass does not hold them back.
 
 Agent schedules must name `agentId: "anchorage-agent"`. A threaded schedule uses a `threadId` and `resourceId` returned by the start route. Stored request context cannot contain Breakwater grant keys or runtime-reserved keys. Every fire gets a fresh opaque run id.
 
@@ -288,12 +288,13 @@ Public background routes are read-only. Enqueue, cancel, and resume are server-s
 
 ## Alarm-driven maintenance
 
-The fixed `deployment-maintenance` Durable Object schedules four independent duties:
+The fixed `deployment-maintenance` Durable Object schedules these independent duties:
 
 - run deadline expiry;
 - five-minute approval SLA sweep;
 - hourly approval, terminal run, memory, notification, thread-state, schedule-trigger, and background-task retention;
-- one-minute schedule firing and due-notification dispatch.
+- one-minute schedule firing;
+- one-minute due-notification dispatch.
 
 The object persists the next alarm before each duty and runs one due duty per invocation. Provider and background-task maintenance use separate Durable Object alarms. Provisioning must authenticate `/admin/ensure-maintenance` after deployment and monitor `/admin/maintenance-status`.
 

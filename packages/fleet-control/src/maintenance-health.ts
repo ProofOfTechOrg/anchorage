@@ -29,6 +29,75 @@ function errorMessage(value: unknown, field: string): string | undefined {
   return value;
 }
 
+/**
+ * The duties the fleet audit watches, with the FlowSafe maintenance status
+ * fields of each. An `always` duty is watched from every status. Any other
+ * duty is watched only when the status carries one of its fields: a
+ * deployment that does not run it reports none, and so does FlowSafe before
+ * 0.16.0 for the run-deadline duty, which would otherwise read as a duty that
+ * never succeeded.
+ */
+export const MAINTENANCE_DUTIES = [
+  {
+    name: 'sweep',
+    always: true,
+    next: 'nextSweepAt',
+    last: 'lastSweepAt',
+    attempt: 'lastSweepAttemptAt',
+    error: 'lastSweepError',
+  },
+  {
+    name: 'purge',
+    always: true,
+    next: 'nextPurgeAt',
+    last: 'lastPurgeAt',
+    attempt: 'lastPurgeAttemptAt',
+    error: 'lastPurgeError',
+  },
+  {
+    name: 'deadline',
+    always: false,
+    next: 'nextDeadlineAt',
+    last: 'lastDeadlineAt',
+    attempt: 'lastDeadlineAttemptAt',
+    error: 'lastDeadlineError',
+  },
+  {
+    name: 'tick',
+    always: false,
+    next: 'nextTickAt',
+    last: 'lastTickAt',
+    attempt: 'lastTickAttemptAt',
+    error: 'lastTickError',
+  },
+  {
+    name: 'notification',
+    always: false,
+    next: 'nextNotificationAt',
+    last: 'lastNotificationAt',
+    attempt: 'lastNotificationAttemptAt',
+    error: 'lastNotificationError',
+  },
+] as const satisfies readonly {
+  readonly name: string;
+  readonly always: boolean;
+  readonly next: string;
+  readonly last: keyof MaintenanceHealth;
+  readonly attempt: keyof MaintenanceHealth;
+  readonly error: keyof MaintenanceHealth;
+}[];
+
+export type MaintenanceDutyName = (typeof MAINTENANCE_DUTIES)[number]['name'];
+
+type MaintenanceDutyField = (typeof MAINTENANCE_DUTIES)[number][
+  | 'last'
+  | 'attempt'
+  | 'error'];
+
+type MaintenanceDutyHealth = {
+  -readonly [K in MaintenanceDutyField]?: MaintenanceHealth[K];
+};
+
 function deploymentSpecDigest(value: unknown): string | undefined {
   if (value === undefined) return undefined;
   if (typeof value !== 'string' || !isSha256(value)) {
@@ -55,52 +124,26 @@ export async function readMaintenanceHealth(
   }
   const value = body as Record<string, unknown>;
   const nextAlarmAt = timestamp(value.alarmAt, 'alarmAt');
-  const tickConfigured =
-    value.nextTickAt !== undefined ||
-    value.lastTickAt !== undefined ||
-    value.lastTickAttemptAt !== undefined ||
-    value.lastTickError !== undefined;
-  const lastSweepError = errorMessage(value.lastSweepError, 'lastSweepError');
-  const lastPurgeError = errorMessage(value.lastPurgeError, 'lastPurgeError');
-  const lastTickError = errorMessage(value.lastTickError, 'lastTickError');
+  const duties: MaintenanceDutyHealth = {};
+  for (const duty of MAINTENANCE_DUTIES) {
+    const reported = [duty.next, duty.last, duty.attempt, duty.error].some(
+      (field) => value[field] !== undefined,
+    );
+    if (!duty.always && !reported) continue;
+    duties[duty.last] = timestamp(value[duty.last], duty.last);
+    if (value[duty.attempt] !== undefined) {
+      duties[duty.attempt] = timestamp(value[duty.attempt], duty.attempt);
+    }
+    const error = errorMessage(value[duty.error], duty.error);
+    if (error !== undefined) duties[duty.error] = error;
+  }
   const specDigest = deploymentSpecDigest(value.deploymentSpecDigest);
   return {
     armed: nextAlarmAt !== null,
     nextAlarmAt,
     ...(specDigest === undefined ? {} : { deploymentSpecDigest: specDigest }),
-    lastSweepAt: timestamp(value.lastSweepAt, 'lastSweepAt'),
-    lastPurgeAt: timestamp(value.lastPurgeAt, 'lastPurgeAt'),
-    ...(value.lastSweepAttemptAt === undefined
-      ? {}
-      : {
-          lastSweepAttemptAt: timestamp(
-            value.lastSweepAttemptAt,
-            'lastSweepAttemptAt',
-          ),
-        }),
-    ...(value.lastPurgeAttemptAt === undefined
-      ? {}
-      : {
-          lastPurgeAttemptAt: timestamp(
-            value.lastPurgeAttemptAt,
-            'lastPurgeAttemptAt',
-          ),
-        }),
-    ...(lastSweepError === undefined ? {} : { lastSweepError }),
-    ...(lastPurgeError === undefined ? {} : { lastPurgeError }),
-    ...(tickConfigured
-      ? {
-          lastTickAt: timestamp(value.lastTickAt, 'lastTickAt'),
-          ...(value.lastTickAttemptAt === undefined
-            ? {}
-            : {
-                lastTickAttemptAt: timestamp(
-                  value.lastTickAttemptAt,
-                  'lastTickAttemptAt',
-                ),
-              }),
-          ...(lastTickError === undefined ? {} : { lastTickError }),
-        }
-      : {}),
+    ...duties,
+    lastSweepAt: duties.lastSweepAt ?? null,
+    lastPurgeAt: duties.lastPurgeAt ?? null,
   };
 }

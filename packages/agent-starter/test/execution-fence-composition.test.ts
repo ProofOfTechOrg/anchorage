@@ -14,9 +14,16 @@ import {
 } from '@proofoftech/flowsafe/schedules';
 import { describe, expect, it } from 'vitest';
 
-import { starterMaintenanceTick } from '../src/maintenance.js';
+import {
+  starterNotificationTick,
+  starterScheduleTick,
+} from '../src/maintenance.js';
 import { contextForPrincipal } from '../src/principal-context.js';
-import { createComposedStorage, schedulesStore } from '../src/storage.js';
+import {
+  createComposedStorage,
+  notificationsStore,
+  schedulesStore,
+} from '../src/storage.js';
 import { openSqlite, sqliteUnitDatabase } from './sqlite.js';
 
 const NOW = 1_750_000_000_000;
@@ -49,7 +56,7 @@ function starterEnv(db: Env['DB']): Env {
   } as unknown as Env;
 }
 
-describe('starter maintenance tick and the deployment execution fence', () => {
+describe('starter schedule tick and the deployment execution fence', () => {
   it('uses the original database for direct and composed schedule capabilities', async () => {
     const db = sqliteUnitDatabase(openSqlite()) as Env['DB'];
     const direct = schedulesStore(db);
@@ -92,11 +99,46 @@ describe('starter maintenance tick and the deployment execution fence', () => {
     });
     const before = await store.getSchedule(due.id);
 
-    await starterMaintenanceTick(env)();
+    await starterScheduleTick(env)();
 
     await expect(store.getSchedule(due.id)).resolves.toEqual(before);
     await expect(store.listDueSchedules(NOW, 10)).resolves.toHaveLength(1);
     await expect(store.listTriggers(due.id)).resolves.toEqual([]);
+  });
+
+  it('leaves a due notification undelivered while the deployment is migration-locked', async () => {
+    // #given a due notification on a deployment the fence locked
+    const db = sqliteUnitDatabase(openSqlite()) as Env['DB'];
+    const env = starterEnv(db);
+    const fence = new ExecutionFenceStore(db);
+    await fence.seed('open');
+    const store = notificationsStore(db);
+    await store.createNotification({
+      id: 'due-1',
+      threadId: 'acme_thread',
+      resourceId: 'acme_resource',
+      agentId: 'agent',
+      source: 'test',
+      kind: 'ready',
+      summary: 'due',
+      deliverAt: new Date(NOW - 1_000),
+    });
+    await fence.transition({ expected: 'open', next: 'draining' });
+    await fence.transition({
+      expected: 'draining',
+      next: 'migration-locked',
+    });
+
+    // #when the starter's notification pass runs
+    const result = await starterNotificationTick(env)();
+
+    // #then it addresses no thread object and the row stays undelivered
+    expect(result).toEqual({ due: 0, delivered: 0, failed: 0 });
+    const row = await store.getNotification({
+      threadId: 'acme_thread',
+      id: 'due-1',
+    });
+    expect(row?.deliveryAttempts ?? 0).toBe(0);
   });
 });
 

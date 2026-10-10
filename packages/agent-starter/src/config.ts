@@ -35,7 +35,7 @@ let githubOwnershipMemo:
 
 /**
  * The host's audit sink: one structured line to Workers Logs. Shared by every
- * router and by the maintenance tick so a deployment's audit trail is one
+ * router and by the schedule tick so a deployment's audit trail is one
  * stream, and it lives here rather than in the Worker entry because workerd
  * rejects a non-handler export from an entry module.
  */

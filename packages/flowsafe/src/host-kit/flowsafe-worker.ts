@@ -141,17 +141,21 @@ export interface MaintenanceHealth {
   nextSweepAt: number;
   nextPurgeAt: number;
   nextTickAt?: number;
+  nextNotificationAt?: number;
   lastSweepAt?: number;
   lastPurgeAt?: number;
   lastTickAt?: number;
+  lastNotificationAt?: number;
   lastDeadlineAt?: number;
   lastSweepAttemptAt?: number;
   lastPurgeAttemptAt?: number;
   lastTickAttemptAt?: number;
+  lastNotificationAttemptAt?: number;
   lastDeadlineAttemptAt?: number;
   lastSweepError?: string;
   lastPurgeError?: string;
   lastTickError?: string;
+  lastNotificationError?: string;
   lastDeadlineError?: string;
 }
 
@@ -356,12 +360,14 @@ export interface FlowsafeWorkerConfig<Env extends FlowsafeWorkerEnv>
   /**
    * Recurrence intervals for the singleton maintenance Durable Object. Every
    * duty receives its own alarm invocation; `tickIntervalMs` is required when
-   * `scheduleTick` is configured and omitted otherwise.
+   * `scheduleTick` is configured and omitted otherwise, and
+   * `notificationIntervalMs` likewise with `notificationTick`.
    */
   maintenance: {
     sweepIntervalMs: number;
     purgeIntervalMs: number;
     tickIntervalMs?: number;
+    notificationIntervalMs?: number;
     /** Deadline duty cadence. Defaults to sweepIntervalMs. */
     deadlineIntervalMs?: number;
     /** Maximum runs per deadline pass. Default 100. */
@@ -476,9 +482,25 @@ export interface FlowsafeWorkerConfig<Env extends FlowsafeWorkerEnv>
    * inside the returned closure. INJECTED (not built here, structurally typed as
    * `() => Promise<unknown>`) because createScheduleTick lives in `schedules/`,
    * which transitively imports host-kit — host-kit importing it back would cycle.
-   * Absent (or `tickIntervalMs` unset) ⇒ no tick invocation.
+   * Requires `maintenance.tickIntervalMs`; absent, the deployment runs no tick
+   * duty. A builder that returns `undefined` fails the duty with a
+   * `config-error` line on every pass.
    */
   scheduleTick?: (env: Env) => (() => Promise<unknown>) | undefined;
+  /**
+   * Opt-in notification dispatch tick. The host builds its
+   * `createNotificationDispatchTick` and returns the closure here. The
+   * composer runs it as its OWN failure-isolated alarm duty (own try/catch,
+   * own `notification-dispatch` log line), so a schedule pass that throws or
+   * is terminated costs it nothing. The composer invokes THIS BUILDER outside
+   * that try, so a builder that throws is logged as `maintenance-error` with
+   * `surface: 'notification-duty'`. INJECTED (not built here, structurally
+   * typed as `() => Promise<unknown>`), like `scheduleTick`, because `signals/`
+   * imports host-kit — host-kit importing it back would cycle. Requires
+   * `maintenance.notificationIntervalMs`; absent, the deployment runs no
+   * notification duty.
+   */
+  notificationTick?: (env: Env) => () => Promise<unknown>;
   /**
    * Extra purge duties. The
    * returned fields fold into the ONE combined `{type:'maintenance'}` log
@@ -683,7 +705,12 @@ async function validateFleetChannelTopology<Env extends FlowsafeWorkerEnv>(
   }
 }
 
-export type MaintenanceDuty = 'deadline' | 'sweep' | 'purge' | 'tick';
+export type MaintenanceDuty =
+  | 'deadline'
+  | 'sweep'
+  | 'purge'
+  | 'tick'
+  | 'notification';
 
 /**
  * The cursor seam a duty resumes from and advances. Each field is optional
@@ -722,6 +749,21 @@ function hasRetentionCursorSeam(
 ): context is MaintenancePurgeDutyContext {
   return typeof context?.advanceRetentionCursor === 'function';
 }
+
+const INJECTED_TICK_DUTIES = {
+  tick: {
+    builder: 'scheduleTick',
+    interval: 'tickIntervalMs',
+    logType: 'schedule-tick',
+  },
+  notification: {
+    builder: 'notificationTick',
+    interval: 'notificationIntervalMs',
+    logType: 'notification-dispatch',
+  },
+} as const;
+
+type InjectedTickDuty = keyof typeof INJECTED_TICK_DUTIES;
 
 /** The Worker handler plus the maintenance duty seam consumed by its DO. */
 export interface FlowsafeWorker<Env extends FlowsafeWorkerEnv> {
@@ -1394,40 +1436,39 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
       : { ok: false, error: failures.join('; ') };
   }
 
-  // Schedule tick — its OWN failure-isolated duty (own try/catch, own log
-  // line). A wedged fire pass must cost the other duties nothing, and vice
+  // A host-injected tick is its OWN failure-isolated duty (own try/catch, own
+  // log line). A wedged pass must cost the other duties nothing, and vice
   // versa (the same failure-isolation rationale).
-  async function runScheduleTickDuty(
+  async function runInjectedTickDuty(
+    duty: InjectedTickDuty,
     env: Env,
-    trigger: string,
   ): Promise<MaintenanceOutcome> {
-    const tick = config.scheduleTick?.(env);
+    const { builder, logType } = INJECTED_TICK_DUTIES[duty];
+    const tick = config[builder]?.(env);
     if (!tick) {
-      // The tick duty ran but no scheduleTick builder is wired — a misconfig.
-      // Do not fall through to another duty; this invocation is the tick's.
+      // The duty ran but its builder is not wired — a misconfig. Do not fall
+      // through to another duty; this invocation is this duty's.
+      const reason = `${duty} duty ran but no ${builder} builder is configured`;
       console.error(
         JSON.stringify({
           type: 'config-error',
-          var: 'maintenance.tick',
-          trigger,
-          reason: 'tick duty ran but no scheduleTick builder is configured',
+          var: `maintenance.${duty}`,
+          trigger: duty,
+          reason,
         }),
       );
-      return {
-        ok: false,
-        error: 'tick duty ran but no scheduleTick builder is configured',
-      };
+      return { ok: false, error: reason };
     }
     try {
       const result = await tick();
-      console.log(JSON.stringify({ type: 'schedule-tick', trigger, result }));
+      console.log(JSON.stringify({ type: logType, trigger: duty, result }));
       return { ok: true, value: undefined };
     } catch (error) {
       const failure = hostErrorText(error);
       console.error(
         JSON.stringify({
-          type: 'schedule-tick-error',
-          trigger,
+          type: `${logType}-error`,
+          trigger: duty,
           error: failure,
         }),
       );
@@ -1746,7 +1787,7 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
           }
           return await runPurgeMaintenance(env, duty, context);
         }
-        return await runScheduleTickDuty(env, duty);
+        return await runInjectedTickDuty(duty, env);
       } catch (error) {
         const failure = hostErrorText(error);
         console.error(
@@ -1769,7 +1810,13 @@ const MAINTENANCE_DEADLINE_CURSOR_KEY =
   'flowsafe:maintenance-deadline-cursor:v1';
 const MAINTENANCE_RUN_RETENTION_CURSOR_KEY =
   'flowsafe:maintenance-run-retention-cursor:v1';
-const DUTY_ORDER = ['deadline', 'sweep', 'purge', 'tick'] as const;
+const DUTY_ORDER = [
+  'deadline',
+  'sweep',
+  'purge',
+  'tick',
+  'notification',
+] as const;
 
 export type MaintenanceDurableObjectConstructor<Env extends FlowsafeWorkerEnv> =
   new (
@@ -1791,6 +1838,7 @@ export function createFlowsafeMaintenanceDurableObject<
     sweep: config.maintenance.sweepIntervalMs,
     purge: config.maintenance.purgeIntervalMs,
     tick: config.maintenance.tickIntervalMs,
+    notification: config.maintenance.notificationIntervalMs,
   };
   for (const duty of DUTY_ORDER) {
     const interval = intervals[duty];
@@ -1803,10 +1851,13 @@ export function createFlowsafeMaintenanceDurableObject<
       );
     }
   }
-  if ((intervals.tick === undefined) !== (config.scheduleTick === undefined)) {
-    throw new Error(
-      'tickIntervalMs and scheduleTick must either both be configured or both be absent',
-    );
+  for (const duty of Object.keys(INJECTED_TICK_DUTIES) as InjectedTickDuty[]) {
+    const { builder, interval } = INJECTED_TICK_DUTIES[duty];
+    if ((intervals[duty] === undefined) !== (config[builder] === undefined)) {
+      throw new Error(
+        `${interval} and ${builder} must either both be configured or both be absent`,
+      );
+    }
   }
   const worker = createFlowsafeWorker(config);
 
@@ -1836,11 +1887,13 @@ export function createFlowsafeMaintenanceDurableObject<
         nextSweepAt: validTime(stored?.nextSweepAt) ?? now,
         nextPurgeAt: validTime(stored?.nextPurgeAt) ?? now,
       };
-      if (intervals.tick !== undefined) {
-        health.nextTickAt = validTime(stored?.nextTickAt) ?? now;
-      }
       for (const duty of DUTY_ORDER) {
         if (intervals[duty] === undefined) continue;
+        // The required duties start from the literal above; the optional ones
+        // start here.
+        if (nextAt(health, duty) === undefined) {
+          setNextAt(health, duty, validTime(nextAt(stored, duty)) ?? now);
+        }
         const last = validTime(lastAt(stored, duty));
         if (last !== undefined) setLastAt(health, duty, last);
         const attempted = validTime(lastAttemptAt(stored, duty));
@@ -2137,48 +2190,74 @@ function validTime(value: unknown): number | undefined {
     : undefined;
 }
 
+/** The health fields each duty owns. */
+const DUTY_HEALTH_FIELDS = {
+  deadline: {
+    next: 'nextDeadlineAt',
+    last: 'lastDeadlineAt',
+    attempt: 'lastDeadlineAttemptAt',
+    error: 'lastDeadlineError',
+  },
+  sweep: {
+    next: 'nextSweepAt',
+    last: 'lastSweepAt',
+    attempt: 'lastSweepAttemptAt',
+    error: 'lastSweepError',
+  },
+  purge: {
+    next: 'nextPurgeAt',
+    last: 'lastPurgeAt',
+    attempt: 'lastPurgeAttemptAt',
+    error: 'lastPurgeError',
+  },
+  tick: {
+    next: 'nextTickAt',
+    last: 'lastTickAt',
+    attempt: 'lastTickAttemptAt',
+    error: 'lastTickError',
+  },
+  notification: {
+    next: 'nextNotificationAt',
+    last: 'lastNotificationAt',
+    attempt: 'lastNotificationAttemptAt',
+    error: 'lastNotificationError',
+  },
+} as const satisfies Record<
+  MaintenanceDuty,
+  {
+    readonly next: keyof MaintenanceHealth;
+    readonly last: keyof MaintenanceHealth;
+    readonly attempt: keyof MaintenanceHealth;
+    readonly error: keyof MaintenanceHealth;
+  }
+>;
+
 function nextAt(
   health: MaintenanceHealth | undefined,
   duty: MaintenanceDuty,
 ): number | undefined {
-  if (duty === 'deadline') return health?.nextDeadlineAt;
-  if (duty === 'sweep') return health?.nextSweepAt;
-  if (duty === 'purge') return health?.nextPurgeAt;
-  return health?.nextTickAt;
+  return health?.[DUTY_HEALTH_FIELDS[duty].next];
 }
 
 function lastAt(
   health: MaintenanceHealth | undefined,
   duty: MaintenanceDuty,
 ): number | undefined {
-  if (duty === 'deadline') return health?.lastDeadlineAt;
-  if (duty === 'sweep') return health?.lastSweepAt;
-  if (duty === 'purge') return health?.lastPurgeAt;
-  return health?.lastTickAt;
+  return health?.[DUTY_HEALTH_FIELDS[duty].last];
 }
 
 function lastAttemptAt(
   health: MaintenanceHealth | undefined,
   duty: MaintenanceDuty,
 ): number | undefined {
-  if (duty === 'deadline') return health?.lastDeadlineAttemptAt;
-  if (duty === 'sweep') return health?.lastSweepAttemptAt;
-  if (duty === 'purge') return health?.lastPurgeAttemptAt;
-  return health?.lastTickAttemptAt;
+  return health?.[DUTY_HEALTH_FIELDS[duty].attempt];
 }
 
 function lastError(
   health: MaintenanceHealth | undefined,
   duty: MaintenanceDuty,
 ): string | undefined {
-  const value =
-    duty === 'deadline'
-      ? health?.lastDeadlineError
-      : duty === 'sweep'
-        ? health?.lastSweepError
-        : duty === 'purge'
-          ? health?.lastPurgeError
-          : health?.lastTickError;
+  const value = health?.[DUTY_HEALTH_FIELDS[duty].error];
   return typeof value === 'string' && value.length > 0 ? value : undefined;
 }
 
@@ -2187,10 +2266,7 @@ function setNextAt(
   duty: MaintenanceDuty,
   value: number,
 ): void {
-  if (duty === 'deadline') health.nextDeadlineAt = value;
-  else if (duty === 'sweep') health.nextSweepAt = value;
-  else if (duty === 'purge') health.nextPurgeAt = value;
-  else health.nextTickAt = value;
+  health[DUTY_HEALTH_FIELDS[duty].next] = value;
 }
 
 function setLastAt(
@@ -2198,10 +2274,7 @@ function setLastAt(
   duty: MaintenanceDuty,
   value: number,
 ): void {
-  if (duty === 'deadline') health.lastDeadlineAt = value;
-  else if (duty === 'sweep') health.lastSweepAt = value;
-  else if (duty === 'purge') health.lastPurgeAt = value;
-  else health.lastTickAt = value;
+  health[DUTY_HEALTH_FIELDS[duty].last] = value;
 }
 
 function setLastAttemptAt(
@@ -2209,10 +2282,7 @@ function setLastAttemptAt(
   duty: MaintenanceDuty,
   value: number,
 ): void {
-  if (duty === 'deadline') health.lastDeadlineAttemptAt = value;
-  else if (duty === 'sweep') health.lastSweepAttemptAt = value;
-  else if (duty === 'purge') health.lastPurgeAttemptAt = value;
-  else health.lastTickAttemptAt = value;
+  health[DUTY_HEALTH_FIELDS[duty].attempt] = value;
 }
 
 function setLastError(
@@ -2220,21 +2290,14 @@ function setLastError(
   duty: MaintenanceDuty,
   value: string,
 ): void {
-  const bounded = value.slice(0, 1_024);
-  if (duty === 'deadline') health.lastDeadlineError = bounded;
-  else if (duty === 'sweep') health.lastSweepError = bounded;
-  else if (duty === 'purge') health.lastPurgeError = bounded;
-  else health.lastTickError = bounded;
+  health[DUTY_HEALTH_FIELDS[duty].error] = value.slice(0, 1_024);
 }
 
 function clearLastError(
   health: MaintenanceHealth,
   duty: MaintenanceDuty,
 ): void {
-  if (duty === 'deadline') delete health.lastDeadlineError;
-  else if (duty === 'sweep') delete health.lastSweepError;
-  else if (duty === 'purge') delete health.lastPurgeError;
-  else delete health.lastTickError;
+  delete health[DUTY_HEALTH_FIELDS[duty].error];
 }
 
 function advancePast(dueAt: number, interval: number, now: number): number {
