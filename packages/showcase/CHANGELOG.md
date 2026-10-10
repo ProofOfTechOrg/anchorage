@@ -1,5 +1,25 @@
 # showcase
 
+## 0.0.31
+
+### Patch Changes
+
+- Updated dependencies [a444885]
+- Updated dependencies [a444885]
+- Updated dependencies [e9f4ada]
+- Updated dependencies [187059b]
+- Updated dependencies [ff90acb]
+- Updated dependencies [d2a76bf]
+- Updated dependencies [d2a76bf]
+- Updated dependencies [a444885]
+- Updated dependencies [9351f21]
+- Updated dependencies [9351f21]
+- Updated dependencies [e9f4ada]
+- Updated dependencies [080d34e]
+- Updated dependencies [a444885]
+- Updated dependencies [95e563c]
+  - @proofoftech/flowsafe@0.27.0
+
 ## 0.0.30
 
 ### Patch Changes
