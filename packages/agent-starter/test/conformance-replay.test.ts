@@ -9,6 +9,14 @@ import { describe, expect, it } from 'vitest';
 
 import { isExpectedReplayRefusal } from '../src/conformance/state-durable-objects.js';
 
+// One instance, so the cross-action check offers the decision action exactly the
+// refusal the resume action accepts.
+const NOT_SUSPENDED_REFUSAL = new RunRouteError(
+  409,
+  "run 'r' is 'success', not 'suspended'",
+  { code: 'RUN_NOT_SUSPENDED' },
+);
+
 /**
  * The gate reads `rejected: true` plus HTTP 409 as proof that FlowSafe refuses
  * a replayed decision and a raw resume. With a blanket catch it would read the
@@ -42,10 +50,7 @@ describe('replay refusal classification', () => {
 
   it('accepts the runner refusing a raw resume because it is not suspended', () => {
     expect(
-      isExpectedReplayRefusal(
-        'flowsafe-replay-resume',
-        new RunRouteError(409, "run 'r' is 'success', not 'suspended'"),
-      ),
+      isExpectedReplayRefusal('flowsafe-replay-resume', NOT_SUSPENDED_REFUSAL),
     ).toBe(true);
   });
 
@@ -60,6 +65,29 @@ describe('replay refusal classification', () => {
     ['an unknown run', new RunRouteError(404, "no run 'r' found")],
     ['a malformed resume body', new RunRouteError(400, 'invalid resume data')],
     ['an oversized body', new RunRouteError(413, 'payload too large')],
+    // A 409 that carries no reason or another reason came from a different
+    // check than the not-suspended bar.
+    [
+      'a terminal conflict without a reason',
+      new RunRouteError(
+        409,
+        "run 'r' of workflow 'w' is already terminal with status 'running'",
+      ),
+    ],
+    [
+      'a changed suspension',
+      new RunRouteError(409, 'suspension changed', {
+        code: 'SUSPENSION_CHANGED',
+      }),
+    ],
+    [
+      'a stale mutation epoch',
+      new RunRouteError(409, 'mutation epoch mismatch', {
+        code: 'MUTATION_EPOCH_MISMATCH',
+        classification: 'stale',
+        mutationEpoch: 1,
+      }),
+    ],
   ])('rejects %s on the resume replay', (_label, error) => {
     expect(isExpectedReplayRefusal('flowsafe-replay-resume', error)).toBe(
       false,
@@ -76,7 +104,7 @@ describe('replay refusal classification', () => {
     expect(
       isExpectedReplayRefusal(
         'flowsafe-replay-decision',
-        new RunRouteError(409, 'not suspended'),
+        NOT_SUSPENDED_REFUSAL,
       ),
     ).toBe(false);
   });

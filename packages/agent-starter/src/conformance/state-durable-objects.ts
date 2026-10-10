@@ -11,6 +11,7 @@ import {
   DurableObjectRunner,
   doErrorResponse,
   executionFenceFor,
+  type RunNotSuspendedError,
   verifyDurableObjectDeploymentRequest,
 } from '@proofoftech/flowsafe/do-runner';
 import {
@@ -22,6 +23,7 @@ import {
   type FlowsafeRunnerLifecycleConfig,
   queueApprovalForSuspension,
   RunRouteError,
+  runRouteReason,
 } from '@proofoftech/flowsafe/host-kit';
 
 import {
@@ -151,6 +153,9 @@ function logStateFailure(action: unknown, error: unknown): void {
   );
 }
 
+const RUN_NOT_SUSPENDED: RunNotSuspendedError['reason']['code'] =
+  'RUN_NOT_SUSPENDED';
+
 export type ReplayAction =
   | 'flowsafe-replay-decision'
   | 'flowsafe-replay-resume';
@@ -176,11 +181,17 @@ export function isExpectedReplayRefusal(
     );
   }
   // The raw resume reached the runner and the runner refused it BECAUSE the run
-  // is no longer suspended: RunNotSuspendedError, which the Durable Object maps
-  // to 409 (`do-error-response.ts`). Not a status class — a 404, 400 or 413 from
-  // the same topology means the request never reached the bar, and reporting
-  // those as a refusal would attest a defense that was never exercised.
-  return error instanceof RunRouteError && error.status === 409;
+  // is no longer suspended: RunNotSuspendedError, a 409 carrying its reason
+  // code. Not a status class — a 404, 400 or 413 from the same topology means
+  // the request never reached the bar, and a 409 without that code, such as
+  // the conflict a resume meets while a leg of the run is still executing,
+  // came from a different check; reporting any of those as this refusal would
+  // attest a defense that was never exercised.
+  return (
+    error instanceof RunRouteError &&
+    error.status === 409 &&
+    runRouteReason(error)?.code === RUN_NOT_SUSPENDED
+  );
 }
 
 export class ConformanceState {
