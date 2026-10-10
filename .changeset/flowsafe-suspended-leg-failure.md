@@ -1,5 +1,0 @@
----
-'@proofoftech/flowsafe': minor
----
-
-Breaking: a durable-agent start or approval resume that fails while its run stays stored `suspended`, for example on a transient storage failure, no longer ends the run's stream with a terminal `error` event and no longer releases the run's thread, when the run's status can be read after the failure. The run, its stream and its thread registration stay as at a suspension until the next resume or a terminate ends them. The resume and `streamUntilPersisted()` still answer with the error; the thread host's start route answers such a start with the run's suspended state, as its start recovery already did. When the status read fails too, the leg publishes its error and releases the thread as before. Before this change that event armed Mastra's 30-second cleanup of the run, which removed the registry entries and stream history of a resume of the run inside that delay, so that resume's observers missed its later events, and the run's thread was released while the run was still suspended. An observer that took that `error` event as the run's end should read the run's status instead.
