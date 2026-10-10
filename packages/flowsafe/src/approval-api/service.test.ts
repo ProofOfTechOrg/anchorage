@@ -3,11 +3,14 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import {
+  DeploymentIdentityError,
   type ExecutionFenceDatabase,
   ExecutionFencedError,
   type ExecutionFenceState,
   ExecutionFenceStore,
+  RunNotSuspendedError,
 } from '../do-runner/index.js';
+import { RunRouteError } from '../host-kit/run-route-error.js';
 import type {
   ApprovalActor,
   ApprovalAuditEvent,
@@ -60,6 +63,8 @@ const REVIEWER: ApprovalActor = {
 const VIEWER: ApprovalActor = { id: 'vic', role: 'viewer' };
 
 const T0 = Date.parse('2026-07-06T12:00:00.000Z');
+
+const FAULT = 'D1_ERROR: connect ECONNREFUSED 10.0.7.4:5432 db=acme-prod';
 
 interface Harness {
   service: ApprovalService;
@@ -616,17 +621,85 @@ describe('ApprovalService.decide', () => {
     );
 
     // #then — decision persisted; failure reported, not thrown
-    expect(result.resume).toEqual({
-      attempted: true,
-      ok: false,
-      error: 'DO unreachable',
-    });
+    expect(result.resume).toMatchObject({ attempted: true, ok: false });
     expect(await harness.store.get(record.id)).toMatchObject({
       status: 'approved',
     });
     expect(harness.events).toContainEqual(
       expect.objectContaining({ action: 'approval.resume', decision: 'error' }),
     );
+  });
+
+  it.each([
+    ['an unclassified failure', new Error(FAULT)],
+    ['a deployment identity failure', new DeploymentIdentityError(FAULT)],
+    ['a 5xx without a reason code', new RunRouteError(503, FAULT)],
+  ])('reports %s of the resume without its message and keeps the original in the log and the audit trail', async (_label, failure) => {
+    // #given
+    const harness = makeHarness({
+      resumeRun: vi.fn().mockRejectedValue(failure),
+    });
+    const record = await seedPending(harness, { stepPath: ['approval'] });
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      // #when
+      const result = await harness.service.decide(
+        record.id,
+        { decision: 'approve' },
+        REVIEWER,
+      );
+
+      // #then
+      expect(result.resume).toEqual({
+        attempted: true,
+        ok: false,
+        error: 'internal error',
+      });
+      expect(String(logged.mock.calls[0]?.[0])).toContain(FAULT);
+      expect(harness.events).toContainEqual(
+        expect.objectContaining({
+          action: 'approval.resume',
+          decision: 'error',
+          reason: FAULT,
+        }),
+      );
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
+  it.each([
+    [
+      'a refusal that carries a reason code',
+      new RunNotSuspendedError('wf', 'acme_run-1', 'success'),
+      'RUN_NOT_SUSPENDED',
+    ],
+    [
+      'a 4xx without a reason code',
+      new RunRouteError(404, 'run not found'),
+      undefined,
+    ],
+  ])('keeps the message of the resume refusal for %s', async (_label, refusal, code) => {
+    // #given
+    const harness = makeHarness({
+      resumeRun: vi.fn().mockRejectedValue(refusal),
+    });
+    const record = await seedPending(harness, { stepPath: ['approval'] });
+
+    // #when
+    const result = await harness.service.decide(
+      record.id,
+      { decision: 'approve' },
+      REVIEWER,
+    );
+
+    // #then
+    expect(result.resume).toEqual({
+      attempted: true,
+      ok: false,
+      error: refusal.message,
+      ...(code === undefined ? {} : { code }),
+    });
   });
 
   it('resumes rejected decisions too — the workflow learns the outcome', async () => {
@@ -2281,6 +2354,30 @@ describe('ApprovalService.decideBatch', () => {
     expect(result.results[0]?.resume).toEqual({ attempted: false });
   });
 
+  it('reports an unexpected per-record failure in a batch without its message', async () => {
+    // #given
+    const harness = makeHarness();
+    const record = await seedPending(harness);
+    vi.spyOn(harness.store, 'get').mockRejectedValueOnce(new Error(FAULT));
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      // #when
+      const { results } = await harness.service.decideBatch(
+        [record.id],
+        { decision: 'approve' },
+        REVIEWER,
+      );
+
+      // #then
+      expect(results).toEqual([
+        { id: record.id, ok: false, error: 'internal error', code: 'error' },
+      ]);
+      expect(String(logged.mock.calls[0]?.[0])).toContain(FAULT);
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
   it('resumes only records with trusted resumability provenance in a batch', async () => {
     // #given — one inert decision record and one suspension-bound record.
     const resumeRun = vi.fn().mockResolvedValue({ status: 'success' });
@@ -2639,6 +2736,31 @@ describe('ApprovalService.decide and the deployment execution fence', () => {
     await expect(harness.store.get(record.id)).resolves.toMatchObject({
       status: 'pending',
     });
+  });
+
+  it('reports a record the fence refuses in a batch as unavailable with the fence reason', async () => {
+    // #given
+    const harness = makeHarness({
+      executionFence: await fenceAt('migration-locked'),
+    });
+    const record = await seedPending(harness, { stepPath: ['approval'] });
+
+    // #when
+    const { results } = await harness.service.decideBatch(
+      [record.id],
+      { decision: 'approve' },
+      REVIEWER,
+    );
+
+    // #then
+    expect(results).toEqual([
+      expect.objectContaining({
+        id: record.id,
+        ok: false,
+        code: 'unavailable',
+        reason: { code: 'EXECUTION_FENCED', state: 'migration-locked' },
+      }),
+    ]);
   });
 
   it('keeps list and read open while locked', async () => {

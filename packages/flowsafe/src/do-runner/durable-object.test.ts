@@ -4617,6 +4617,7 @@ describe('DurableObjectRunner suspension deadlines', () => {
     expect(response.status).toBe(503);
     await expect(response.json()).resolves.toMatchObject({
       error: expect.stringContaining('state is not readable'),
+      reason: { code: 'RUN_STATE_UNREADABLE' },
     });
     expect(values.has('flowsafe:run-owner-recovery:v1')).toBe(true);
   });

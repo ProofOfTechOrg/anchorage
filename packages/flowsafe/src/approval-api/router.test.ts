@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-import { describe, expect, it } from 'vitest';
-import { createActorResolver } from './actor-context.js';
+import { describe, expect, it, vi } from 'vitest';
+import { type ActorContext, createActorResolver } from './actor-context.js';
 import type { ApprovalRole } from './contract.js';
 import {
   CLIENT_CREATE_FIELDS,
@@ -120,6 +120,47 @@ describe('createApprovalRouter', () => {
 
     // #then
     expect(response?.status).toBe(401);
+  });
+
+  it('marks approval responses as not cacheable', async () => {
+    // #given
+    const { handle } = makeHandler();
+
+    // #when
+    const response = await handle(req('/api/approvals'));
+
+    // #then — records name the actors and payloads of a decision
+    expect(response?.status).toBe(200);
+    expect(response?.headers.get('cache-control')).toBe('no-store');
+  });
+
+  it('answers an unexpected failure with a generic 500 that is not cached and logs the original', async () => {
+    // #given
+    const fault = 'D1_ERROR: connect ECONNREFUSED 10.0.7.4:5432 db=acme-prod';
+    const handle = createApprovalRouter({
+      resolve: async () =>
+        ({
+          actor: { id: 'opal', role: 'operator' },
+          service: () => ({
+            list: async () => {
+              throw new Error(fault);
+            },
+          }),
+        }) as unknown as ActorContext,
+    });
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      // #when
+      const response = await handle(req('/api/approvals'));
+
+      // #then
+      expect(response?.status).toBe(500);
+      expect(response?.headers.get('cache-control')).toBe('no-store');
+      expect(await response?.json()).toEqual({ error: 'internal error' });
+      expect(String(logged.mock.calls[0]?.[0])).toContain(fault);
+    } finally {
+      logged.mockRestore();
+    }
   });
 
   it('404s the create route by default', async () => {

@@ -64,6 +64,7 @@ import {
   type ResourceOwner,
   RUN_START_ROLES,
 } from '../approval-api/index.js';
+import { isRefusalStatus } from '../do-runner/do-status-error.js';
 import {
   InvalidMutationEpochError,
   type MutationEpochContext,
@@ -1198,7 +1199,7 @@ export function createScheduleRouter(
           error.status,
         );
       }
-      if (error instanceof RunRouteError) {
+      if (error instanceof RunRouteError && isRefusalStatus(error.status)) {
         await audit(
           'rejected',
           error.status === 404

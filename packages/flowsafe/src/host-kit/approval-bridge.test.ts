@@ -939,17 +939,18 @@ describe('resumeRunWithRequeue', () => {
       REVIEWER,
     );
 
-    // #then — the mint error surfaces, not a swallowed one
+    // #then — the resume is reported failed, not swallowed
     expect(decided.resume).toMatchObject({ attempted: true, ok: false });
-    expect(decided.resume.error).toMatch(/only a valid automated principal/);
 
-    // #then — the event still fires, with no actor and no provenance
+    // #then — the event still fires with the mint error, no actor and no
+    // provenance
     const requeue = events.filter(
       (event) => event.action === 'approval.requeue',
     );
     expect(requeue).toHaveLength(1);
     expect(requeue[0]).toMatchObject({
       decision: 'error',
+      reason: expect.stringMatching(/only a valid automated principal/),
       actor: null,
       detail: { runId: 'acme_run-9', suspended: [['gate2']] },
     });
@@ -1001,7 +1002,6 @@ describe('resumeRunWithRequeue', () => {
     // #then — the decision is durable regardless, but its resume is reported
     // failed rather than silently swallowed
     expect(decided.resume).toMatchObject({ attempted: true, ok: false });
-    expect(decided.resume.error).toMatch(/gate filing\(s\) failed/);
 
     // #then — an explicit audit event flags the wedge: the run is now
     // suspended at gate2 with no approval record and no other signal
@@ -1011,6 +1011,7 @@ describe('resumeRunWithRequeue', () => {
     expect(requeueEvents).toHaveLength(1);
     expect(requeueEvents[0]).toMatchObject({
       decision: 'error',
+      reason: expect.stringMatching(/gate filing\(s\) failed/),
       resource: `approval:${gate1.id}`,
       // The event is emitted by automation, so it is attributed to the
       // platform's own bookkeeping principal — a derived least-privileged role

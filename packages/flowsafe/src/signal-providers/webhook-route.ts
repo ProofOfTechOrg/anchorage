@@ -22,6 +22,7 @@ import {
   type ApprovalRole,
   RUN_START_ROLES,
 } from '../approval-api/index.js';
+import { isRefusalStatus } from '../do-runner/do-status-error.js';
 import {
   admitsDrainableExecution,
   type ExecutionFenceWiring,
@@ -857,7 +858,7 @@ export function createSubscriptionRouter(
       await finishCommittedMutation(providerId, externalResourceId);
       return json({ subscription });
     } catch (error) {
-      if (error instanceof RunRouteError) {
+      if (error instanceof RunRouteError && isRefusalStatus(error.status)) {
         await audit('rejected', {
           reason:
             error.status === 404

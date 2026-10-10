@@ -8,15 +8,22 @@
 // (grants.ts) derives requestContext grants from approved records at
 // start/resume. Nothing here ever reads capability data from client input.
 
+import {
+  codedReason,
+  isPublishedRefusal,
+  isRefusalStatus,
+} from '../do-runner/do-status-error.js';
 import type { D1RunExecutionIdentity } from '../do-runner/execution-admission.js';
 import {
   admitsExistingRun,
   ExecutionFencedError,
   type ExecutionFenceWiring,
+  isExecutionFenceRefusal,
   readExecutionFence,
 } from '../do-runner/execution-fence.js';
 import { isPathSafeId } from '../do-runner/path-safe-id.js';
 import { validateTablePrefix } from '../do-runner/table-prefix.js';
+import { internalErrorMessage } from '../internal-error-response.js';
 import type {
   ApprovalActor,
   ApprovalAuditSink,
@@ -741,11 +748,18 @@ export class ApprovalService {
         const { record, resume } = await this.decide(id, input, authorized);
         results.push({ id, ok: true, record, resume });
       } catch (error) {
+        const code = approvalErrorCode(error);
         results.push({
           id,
           ok: false,
-          error: errorMessage(error),
-          code: batchDecideErrorCode(error),
+          // As the single-record route answers: an unclassified failure's
+          // message stays in the server log.
+          error:
+            code === 'error'
+              ? internalErrorMessage('approvals.batch', error)
+              : errorMessage(error),
+          code,
+          ...(isExecutionFenceRefusal(error) ? { reason: error.reason } : {}),
         });
       }
     }
@@ -992,13 +1006,24 @@ export class ApprovalService {
           runId: record.runId,
         },
       });
-      const code = (error as { reason?: { code?: unknown } } | null)?.reason
-        ?.code;
+      const { status, reason } = (error ?? {}) as {
+        status?: unknown;
+        reason?: unknown;
+      };
+      const code = codedReason(reason)?.code;
+      // A refusal at a 4xx status, or one that publishes a reason code,
+      // carries a caller-safe message; any other failure's can name storage or
+      // deployment detail.
+      const published = isRefusalStatus(status)
+        ? isPublishedRefusal(status, reason)
+        : code !== undefined;
       return {
         attempted: true,
         ok: false,
-        error: message,
-        ...(typeof code === 'string' ? { code } : {}),
+        error: published
+          ? message
+          : internalErrorMessage('approvals.resume', error),
+        ...(code === undefined ? {} : { code }),
       };
     }
   }
@@ -1296,10 +1321,15 @@ function errorMessage(error: unknown): string {
   }
 }
 
-// Maps a per-record decide() failure to BatchDecideItem.code — the same
-// classification errorResponse (router.ts) applies to thrown errors, kept as
-// data because a batch envelope has one HTTP status for N outcomes.
-function batchDecideErrorCode(error: unknown): BatchDecideItem['code'] {
+/**
+ * @internal A decide() failure's BatchDecideItem code. The router answers a
+ * single-record failure with the status of the same code, so a batch item and
+ * the single-record route classify one failure alike.
+ */
+export function approvalErrorCode(
+  error: unknown,
+): NonNullable<BatchDecideItem['code']> {
+  if (isExecutionFenceRefusal(error)) return 'unavailable';
   if (error instanceof UnknownApprovalError) return 'not-found';
   if (error instanceof ApprovalConflictError) return 'conflict';
   if (error instanceof ApprovalAuthzError) return 'forbidden';

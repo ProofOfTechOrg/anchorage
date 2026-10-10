@@ -913,30 +913,50 @@ describe('createAgentRouter', () => {
     expect(body).not.toContain('10.0.7.4');
   });
 
-  it('still collapses a 5xx with NO structured reason into a generic 500', async () => {
-    // #given — the passthrough is narrow on purpose: only a code the DO
-    // deliberately published survives a 5xx; an unclassified fault must not
-    // start leaking its message to callers.
-    const host = topology();
-    host.start.mockRejectedValueOnce(
-      new RunRouteError(502, 'upstream exploded with connection details'),
-    );
-    const router = createAgentRouter({
-      agents,
-      resolve: async () => context(),
-      topology: host,
-    });
+  it.each([
+    {
+      label: 'a RunRouteError without a reason code at 503',
+      thrown: new RunRouteError(503, 'persisted start is not readable'),
+      status: 503,
+      body: { error: 'persisted start is not readable' },
+    },
+    {
+      label: 'a RunRouteError whose status no refusal carries',
+      thrown: new RunRouteError(200, 'not a refusal'),
+      status: 500,
+      body: { error: 'internal server error' },
+    },
+  ])('answers $label from the topology with $status', async ({
+    thrown,
+    status,
+    body,
+  }) => {
+    // #given
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const host = topology();
+      host.start.mockRejectedValueOnce(thrown);
+      const router = createAgentRouter({
+        agents,
+        resolve: async () => context(),
+        topology: host,
+      });
 
-    // #then
-    const response = await router(
-      new Request('https://host/agents/writer/runs', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ prompt: 'go' }),
-      }),
-    );
-    expect(response?.status).toBe(500);
-    expect(await response?.json()).toEqual({ error: 'internal server error' });
+      // #when
+      const response = await router(
+        new Request('https://host/agents/writer/runs', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ prompt: 'go' }),
+        }),
+      );
+
+      // #then
+      expect(response?.status).toBe(status);
+      expect(await response?.json()).toEqual(body);
+    } finally {
+      logged.mockRestore();
+    }
   });
 
   it('maps an asynchronously rejected observation to its route status', async () => {

@@ -293,6 +293,32 @@ describe('createSubscriptionRouter', () => {
     expect(await factory.store().listForThread('acme_t1')).toEqual([]);
   });
 
+  it.each([
+    200, 600,
+  ])('answers a host RunRouteError whose status is %s with a generic 500', async (status) => {
+    const validateThreadTarget = vi.fn(async () => {
+      throw new RunRouteError(status, 'not a refusal');
+    });
+    const { router, factory } = setup({ validateThreadTarget });
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    try {
+      const response = await router(
+        req('POST', 'acme_t1', {
+          providerId: 'github',
+          externalResourceId: 'github:acme/repo',
+          resourceKey: 'user-42',
+        }),
+      );
+
+      expect(response?.status).toBe(500);
+      expect(await response?.json()).toEqual({ error: 'internal error' });
+      expect(await factory.store().listForThread('acme_t1')).toEqual([]);
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
   it('refuses a thread and resource owned by different principals', async () => {
     const base = ctx('operator');
     const resolved: ActorContext = {

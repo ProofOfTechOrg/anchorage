@@ -3981,6 +3981,68 @@ describe('createThreadAgentHost', () => {
     );
   });
 
+  describe('an approval resume of a run that has ended', () => {
+    function endedRunFixture(status: 'success' | 'timed_out') {
+      const fixture = harness();
+      fixture.setSummary({ runId: 'acme_run', status });
+      fixture.state.set(THREAD_BINDING_KEY, {
+        version: 1,
+        agentId: 'writer',
+        resourceId: RESOURCE_ID,
+      });
+      return fixture;
+    }
+
+    function resumeRequest(): Request {
+      return new Request('https://thread/_flowsafe/agent-host/resume', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          agentId: 'writer',
+          threadId: 'acme_thread',
+          resourceId: RESOURCE_ID,
+          runId: 'acme_run',
+          entryPath: 'approval.resume',
+          requestedBy: 'reviewer-1',
+          resumeData: { approved: true },
+        }),
+      });
+    }
+
+    it.each([
+      'success',
+      'timed_out',
+    ] as const)('is refused as not suspended when the run ended %s', async (status) => {
+      // #given — the terminal finalization deleted the run record, so only the
+      // snapshot's execution owner is left to tell the starter why
+      const fixture = endedRunFixture(status);
+
+      // #when / #then
+      await expect(
+        fixture.host.route(resumeRequest(), fixture.scope),
+      ).rejects.toMatchObject({
+        status: 409,
+        reason: { code: 'RUN_NOT_SUSPENDED' },
+      });
+      expect(mocked.resumeViaRuntime).not.toHaveBeenCalled();
+    });
+
+    it('keeps the 404 for a principal that did not start the run', async () => {
+      // #given
+      const fixture = endedRunFixture('success');
+      const scope: ThreadScope = {
+        ...fixture.scope,
+        principal: { kind: 'human', id: 'operator-2', role: 'operator' },
+      };
+
+      // #when / #then
+      await expect(
+        fixture.host.route(resumeRequest(), scope),
+      ).rejects.toMatchObject({ status: 404 });
+      expect(mocked.resumeViaRuntime).not.toHaveBeenCalled();
+    });
+  });
+
   it.each([
     ['an overlong requester', 'r'.repeat(201)],
     ['an all-whitespace requester', ' '.repeat(200)],

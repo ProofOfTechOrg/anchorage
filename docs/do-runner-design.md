@@ -597,6 +597,7 @@ The runner preserves stable statuses and structured refusal reasons across Durab
 | `InvalidStartIdempotencyRequestError` | `400` | `INVALID_START_IDEMPOTENCY_REQUEST` | The key or reservation request is malformed |
 | `InvalidInventoryRequestError` | `400` | `INVALID_INVENTORY_REQUEST` | The category, cursor, or limit is invalid |
 | `RunStateNotStorableError` | `422` | `RUN_STATE_NOT_STORABLE` | The run state SQLite cannot parse as JSON; it was not stored |
+| `RunStateUnreadableError` | `503` | `RUN_STATE_UNREADABLE` | An authoritative run-state read did not reach storage; retry |
 | `RunNotSuspendedError` | `409` | `RUN_NOT_SUSPENDED` | A resume found the run not suspended, for example ended |
 | `SuspensionChangedError` | `409` | `SUSPENSION_CHANGED` | A resume named a suspension its step has since left |
 
@@ -604,7 +605,7 @@ The runtime also distinguishes unknown workflows, unknown runs, duplicate runs, 
 
 The Durable Object maps known errors to stable HTTP status codes through `doErrorResponse()`. Unknown failures return an internal error without copying arbitrary thrown data to an audit sink.
 
-`createRunRouter()` returns HTTP 500 with `{ "error": "internal error" }` for unexpected failures and retains the original error in server diagnostics. Its typed refusals preserve their status, message and reason. Hosts that construct `RunRouteError` must supply caller-safe, JSON-compatible message/reason values; the router does not sanitize them. Runtime-authored `RunLifecycleBlockedError.reason` reports `DISPUTED_SETTLEMENT` with a fixed message. A host that constructs that error is responsible for its supplied message too.
+`createRunRouter()` returns HTTP 500 with `{ "error": "internal error" }` for unexpected failures and retains the original error in server diagnostics. It classifies errors through the run object's own mapping, so a typed refusal answers the same status in process and through the run object, with its message and reason. A `5xx` that carries no reason code, such as a `DeploymentIdentityError`, answers its status with `{ "error": "internal error" }` and is logged. `doSummary()` and the run and agent topologies apply that rule to a run or thread object's answer. The signal ingestion router applies it to the thread object's answer it forwards, and the stream router to the run or hub object's answer to a WebSocket upgrade it forwards. The run, agent and stream routers therefore pass every `RunRouteError` through with its status, message and reason. A non-ok answer whose body is not JSON keeps its status; below `500` it answers a status-only message. A refusal whose status is outside `400`-`599` answers `500`. Hosts that construct `RunRouteError` must supply caller-safe, JSON-compatible message/reason values; the router does not sanitize them. Runtime-authored `RunLifecycleBlockedError.reason` reports `DISPUTED_SETTLEMENT` with a fixed message. A host that constructs that error is responsible for its supplied message too.
 
 The runner does not provide an administrative “reset to last good state” API. Recovery uses authoritative D1 state, the approval redrive path, or deployment decommissioning.
 

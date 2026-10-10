@@ -28,6 +28,7 @@ import {
 } from '../audit-export/index.js';
 import { parseRunRetentionCursor } from '../do-runner/d1-storage.js';
 import { credentialsMatch } from '../do-runner/deployment-identity.js';
+import { isRefusalStatus, refusalBody } from '../do-runner/do-status-error.js';
 import type { DurableObjectRunLifecycleHooks } from '../do-runner/durable-object.js';
 import {
   InvalidMutationEpochError,
@@ -1005,14 +1006,8 @@ async function executionFenceAdminResponse<Env extends FlowsafeWorkerEnv>(
     });
     return json(executionFenceReadingPayload(reading));
   } catch (error) {
-    if (error instanceof DoStatusError) {
-      return json(
-        {
-          error: error.message,
-          ...(error.reason === undefined ? {} : { reason: error.reason }),
-        },
-        error.status,
-      );
+    if (error instanceof DoStatusError && isRefusalStatus(error.status)) {
+      return json(refusalBody(error.message, error.reason), error.status);
     }
     console.error(
       JSON.stringify({
@@ -1117,14 +1112,8 @@ async function inventoryAdminResponse<Env extends FlowsafeWorkerEnv>(
       }),
     );
   } catch (error) {
-    if (error instanceof DoStatusError) {
-      return json(
-        {
-          error: error.message,
-          ...(error.reason === undefined ? {} : { reason: error.reason }),
-        },
-        error.status,
-      );
+    if (error instanceof DoStatusError && isRefusalStatus(error.status)) {
+      return json(refusalBody(error.message, error.reason), error.status);
     }
     console.error(
       JSON.stringify({

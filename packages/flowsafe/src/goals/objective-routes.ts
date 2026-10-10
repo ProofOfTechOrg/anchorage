@@ -54,6 +54,7 @@ import {
   type ApprovalRole,
   RUN_START_ROLES,
 } from '../approval-api/index.js';
+import { isRefusalStatus } from '../do-runner/do-status-error.js';
 import {
   admitsWorkAuthoring,
   type ExecutionFenceWiring,
@@ -579,7 +580,7 @@ export function createObjectiveRouter(
           error.status,
         );
       }
-      if (error instanceof RunRouteError) {
+      if (error instanceof RunRouteError && isRefusalStatus(error.status)) {
         // A post-auth denial: the target 404 or a smuggled memory-id 400.
         await audit(
           'rejected',

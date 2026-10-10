@@ -53,6 +53,7 @@ import {
   type AutomatedExecutionPrincipal,
   assertExecutionPrincipal,
   isExecutionPrincipalId,
+  isOwnedBy,
 } from '../approval-api/principal.js';
 import { errorMessageOf } from '../do-runner/cause-chain.js';
 import {
@@ -70,6 +71,7 @@ import {
   isPathSafeId,
   type RequestContextProvider,
   type ResumeRunOptions,
+  RunNotSuspendedError,
   type RunSummary,
   resolveScheduleStartOwner,
   resourceIdFromKey,
@@ -2689,7 +2691,24 @@ export function createThreadAgentHost(
           const body = resumeBody;
           const ref = runRef(scope, body);
           const snapshotExecution = await snapshotExecutionFor(scope, ref);
-          await statusFor(scope, ref, snapshotExecution.state);
+          const { summary: latest } = await statusFor(
+            scope,
+            ref,
+            snapshotExecution.state,
+          );
+          const { state } = snapshotExecution;
+          // An ended run's record is deleted, so only the snapshot's execution
+          // owner tells the principal that started it why its resume is refused.
+          if (
+            isTerminalRunStatus(latest.status) &&
+            state.kind !== 'legacy' &&
+            isOwnedBy(state.execution.owner, scope.principal)
+          )
+            throw new RunNotSuspendedError(
+              state.execution.workflowId,
+              ref.runId,
+              latest.status,
+            );
           const stored = await readRun(ref.runId);
           if (
             !stored ||

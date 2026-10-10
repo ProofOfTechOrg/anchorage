@@ -12,27 +12,28 @@ import {
   RUN_START_ROLES,
 } from '../approval-api/index.js';
 import {
+  refusalReason,
+  refusalStatus,
+} from '../do-runner/do-error-response.js';
+import {
+  isPublishedRefusal,
+  refusalBody,
+} from '../do-runner/do-status-error.js';
+import {
   assertNoReservedExecutionContext,
   ReservedExecutionContextError,
 } from '../do-runner/execution-context.js';
 import {
   beginIdempotentStart,
-  DoStatusError,
   type ExecutionFenceWiring,
   InvalidRunRequestError,
   type PersistedStartResult,
-  RunAlreadyExistsError,
-  RunLifecycleBlockedError,
-  RunSettledConflictError,
   type RunSummary,
-  RunTerminalConflictError,
   requireStartIdempotency,
   StartIdempotencyUnsupportedError,
   type StartIdempotencyWiring,
   type StartReservation,
   type StartReservationReading,
-  UnknownRunError,
-  UnknownWorkflowError,
 } from '../do-runner/index.js';
 import {
   exceedsRunInputDepth,
@@ -42,7 +43,7 @@ import { readBoundedBody } from '../http-body.js';
 import { internalErrorResponse } from '../internal-error-response.js';
 import { queueApprovalForSuspension } from './approval-bridge.js';
 import { requireResourceAccess } from './resource-access.js';
-import { RunRouteError } from './run-route-error.js';
+import { RunRouteError, runRouteErrorBody } from './run-route-error.js';
 import type { WorkflowMeta } from './workflow-meta.js';
 
 export interface RunRouterOptions {
@@ -250,51 +251,28 @@ function errorResponse(error: unknown): Response {
     return json({ error: error.message, reason: 'reserved-context-key' }, 400);
   }
   if (error instanceof RunRouteError) {
-    return json(
-      {
-        error: error.message,
-        ...(error.reason === undefined ? {} : { reason: error.reason }),
-      },
-      error.status,
-    );
+    const body = runRouteErrorBody(error);
+    if (body) return json(body, error.status);
   }
   if (error instanceof ActorResolutionError) {
     // Authenticated but malformed claims are a verifier bug, surfaced as
     // forbidden rather than a retryable 500.
     return json({ error: 'forbidden' }, 403);
   }
-  if (
-    error instanceof UnknownWorkflowError ||
-    error instanceof UnknownRunError
-  ) {
-    return json({ error: error.message }, 404);
+  const status = refusalStatus(error);
+  const reason = refusalReason(error);
+  // A classified 5xx without a reason code can name deployment detail in its
+  // message.
+  if (status !== undefined && isPublishedRefusal(status, reason)) {
+    return json(
+      refusalBody(
+        error instanceof Error ? error.message : String(error),
+        reason,
+      ),
+      status,
+    );
   }
-  if (
-    error instanceof RunAlreadyExistsError ||
-    error instanceof RunTerminalConflictError ||
-    error instanceof RunSettledConflictError
-  ) {
-    return json({ error: error.message }, 409);
-  }
-  if (error instanceof RunLifecycleBlockedError) {
-    return json({ error: error.message, reason: error.reason }, 409);
-  }
-  if (error instanceof InvalidRunRequestError) {
-    return json({ error: error.message }, 400);
-  }
-  if (error instanceof DoStatusError) {
-    const { status } = error;
-    if (Number.isInteger(status) && status >= 400 && status <= 599) {
-      return json(
-        {
-          error: error.message,
-          ...(error.reason === undefined ? {} : { reason: error.reason }),
-        },
-        status,
-      );
-    }
-  }
-  return internalErrorResponse('runs', error);
+  return internalErrorResponse('runs', error, status);
 }
 
 const MAX_RUN_BODY_BYTES = 1_048_576;

@@ -476,6 +476,32 @@ describe('createScheduleRouter — create', () => {
     expect(store.owners.size).toBe(0);
   });
 
+  it.each([
+    200, 600,
+  ])('answers a host RunRouteError whose status is %s with a generic 500', async (status) => {
+    const validateThreadTarget = vi.fn(async () => {
+      throw new RunRouteError(status, 'not a refusal');
+    });
+    const { call, store } = harness(ctx('acme', 'operator'), {
+      validateThreadTarget,
+    });
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    const response = await call('POST', '/api/schedules', {
+      agentId: 'a1',
+      prompt: 'go',
+      cron: '*/5 * * * *',
+      threadId: 'acme_thread',
+      resourceId: 'acme_resource',
+    });
+
+    expect(response).toEqual({
+      status: 500,
+      body: { error: 'internal error' },
+    });
+    expect(store.m.size).toBe(0);
+  });
+
   it('normalizes a valid threaded agent target and strips unsupported nested fields', async () => {
     const { call, store } = harness(ctx('acme', 'operator'));
     const res = await call('POST', '/api/schedules', {

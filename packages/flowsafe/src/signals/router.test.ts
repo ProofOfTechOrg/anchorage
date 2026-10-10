@@ -721,7 +721,7 @@ describe('createSignalRouter — the P6 ingestion gate', () => {
   });
 
   it.each([
-    403, 404, 422, 503,
+    403, 404, 422,
   ])('audits one downstream %s rejection and preserves its public response', async (status) => {
     const { topology } = recordingTopology();
     const response = new Response('private downstream refusal', {
@@ -759,6 +759,109 @@ describe('createSignalRouter — the P6 ingestion gate', () => {
     } else {
       expect(result).toBe(response);
       expect(await result?.text()).toBe('private downstream refusal');
+    }
+  });
+
+  it.each([
+    [
+      'a JSON body',
+      Response.json(
+        { error: 'D1_ERROR: connect ECONNREFUSED 10.0.7.4:5432 db=acme-prod' },
+        { status: 500 },
+      ),
+      500,
+    ],
+    [
+      'a text body',
+      new Response('private downstream refusal', {
+        status: 503,
+        headers: { 'content-type': 'text/plain', 'retry-after': '5' },
+      }),
+      503,
+    ],
+  ])('replaces the message of a forwarded thread object 5xx answer that carries no reason code: %s', async (_label, downstream, status) => {
+    // #given
+    const { topology } = recordingTopology();
+    vi.spyOn(topology, 'send').mockResolvedValue(downstream);
+    const audit = vi.fn();
+    const router = createSignalRouter({
+      resolve: async () => actorContext('operator'),
+      topology,
+      audit,
+    });
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      // #when
+      const result = await router(
+        post(`/api/threads/${OWNED_THREAD}/message`, {}),
+      );
+
+      // #then
+      expect(result?.status).toBe(status);
+      expect(await result?.text()).toBe(
+        JSON.stringify({ error: 'internal error' }),
+      );
+      expect(audit).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({
+          outcome: 'rejected',
+          reason: `downstream-${status}`,
+        }),
+      );
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
+  it('forwards a thread object 5xx answer that carries a reason code unchanged', async () => {
+    // #given
+    const { topology } = recordingTopology();
+    const downstream = Response.json(
+      {
+        error: 'deployment execution is fenced',
+        reason: { code: 'EXECUTION_FENCED', state: 'migration-locked' },
+      },
+      { status: 503 },
+    );
+    vi.spyOn(topology, 'send').mockResolvedValue(downstream);
+    const router = createSignalRouter({
+      resolve: async () => actorContext('operator'),
+      topology,
+    });
+
+    // #when
+    const result = await router(
+      post(`/api/threads/${OWNED_THREAD}/message`, {}),
+    );
+
+    // #then
+    expect(result).toBe(downstream);
+  });
+
+  it.each([
+    200, 600,
+  ])('answers a host RunRouteError whose status is %s with a generic 500', async (status) => {
+    // #given
+    const { topology, calls } = recordingTopology();
+    const router = createSignalRouter({
+      resolve: async () => actorContext('operator'),
+      topology,
+      validateThreadTarget: async () => {
+        throw new RunRouteError(status, 'not a refusal');
+      },
+    });
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      // #when
+      const result = await router(
+        post(`/api/threads/${OWNED_THREAD}/message`, {}),
+      );
+
+      // #then
+      expect(result?.status).toBe(500);
+      expect(await result?.json()).toEqual({ error: 'internal error' });
+      expect(calls).toHaveLength(0);
+    } finally {
+      logged.mockRestore();
     }
   });
 
@@ -908,8 +1011,8 @@ describe('createSignalRouter — the P6 ingestion gate', () => {
               },
             };
     const { topology } = recordingTopology();
-    const response = new Response('unavailable', {
-      status: 503,
+    const response = new Response('conflict', {
+      status: 409,
       headers: { 'retry-after': '9' },
     });
     vi.spyOn(topology, 'send').mockResolvedValue(response);
@@ -928,7 +1031,7 @@ describe('createSignalRouter — the P6 ingestion gate', () => {
       expect(audit).toHaveBeenCalledExactlyOnceWith(
         expect.objectContaining({
           outcome: 'rejected',
-          reason: 'downstream-503',
+          reason: 'downstream-409',
         }),
       );
       expect(log).toHaveBeenCalledOnce();

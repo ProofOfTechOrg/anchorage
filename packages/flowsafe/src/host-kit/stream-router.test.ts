@@ -698,21 +698,149 @@ describe('createStreamRouter run-route passthrough', () => {
     expect(body).not.toContain('10.0.7.4');
   });
 
-  it('still collapses a 5xx with NO structured reason', async () => {
-    // #given — the passthrough is narrow on purpose (see run-route-error.ts).
-    const router = routerWith(() =>
-      Promise.reject(
-        new RunRouteError(502, 'upstream exploded with connection details'),
+  it.each([
+    {
+      label: 'a RunRouteError without a reason code',
+      thrown: new RunRouteError(503, 'persisted start is not readable'),
+      status: 503,
+      body: { error: 'persisted start is not readable' },
+    },
+    {
+      label: 'an unexpected failure',
+      thrown: new Error('upstream exploded with connection details'),
+      status: 500,
+      body: { error: 'internal error' },
+    },
+    {
+      label: 'a RunRouteError whose status no refusal carries',
+      thrown: new RunRouteError(200, 'not a refusal'),
+      status: 500,
+      body: { error: 'internal error' },
+    },
+  ])('answers $label from the run status read with $status and a caller-safe body', async ({
+    thrown,
+    status,
+    body,
+  }) => {
+    // #given
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const router = routerWith(() => Promise.reject(thrown));
+
+      // #when
+      const response = await router(
+        authedPost({ channel: 'run', runId: RUN_ID, workflowId: 'wf' }),
+      );
+
+      // #then
+      expect(response?.status).toBe(status);
+      expect(await response?.json()).toEqual(body);
+    } finally {
+      logged.mockRestore();
+    }
+  });
+});
+
+describe('createStreamRouter upgrade forwards of a failing object', () => {
+  const FAULT = 'D1_ERROR: connect ECONNREFUSED 10.0.7.4:5432 db=acme-prod';
+
+  function answering(response: () => Response) {
+    return {
+      idFromName: (name: string) => name,
+      get: () => ({ fetch: async () => response() }),
+    };
+  }
+
+  function runRouterAnswering(response: () => Response) {
+    return makeRouter(
+      recordingHub([]),
+      answering(response) as unknown as RunnerNamespaceLike,
+    );
+  }
+
+  async function runUpgradeRequest(): Promise<Request> {
+    const ticket = await mintStreamTicket({
+      secret: SECRET,
+      channel: 'run',
+      workflowId: 'wf',
+      runId: RUN_ID,
+      actor: REVIEWER,
+    });
+    return wsGet(`/api/stream/run/wf/${RUN_ID}?ticket=${ticket}`);
+  }
+
+  it('answers an unclassified 5xx of the run object with its status and no fault detail', async () => {
+    // #given
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const router = runRouterAnswering(() =>
+        Response.json({ error: FAULT }, { status: 500 }),
+      );
+
+      // #when
+      const response = await router(await runUpgradeRequest());
+
+      // #then
+      expect(response?.status).toBe(500);
+      const text = (await response?.text()) ?? '';
+      expect(JSON.parse(text)).toEqual({ error: 'internal error' });
+      expect(text).not.toContain(FAULT);
+      expect(String(logged.mock.calls[0]?.[0])).toContain(FAULT);
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
+  it('forwards a 5xx of the run object that carries a reason code unchanged', async () => {
+    // #given
+    const router = runRouterAnswering(() =>
+      Response.json(
+        {
+          error: 'deployment execution is fenced',
+          reason: { code: 'EXECUTION_FENCED', state: 'migration-locked' },
+        },
+        { status: 503 },
       ),
     );
 
+    // #when
+    const response = await router(await runUpgradeRequest());
+
     // #then
-    const response = await router(
-      authedPost({ channel: 'run', runId: RUN_ID, workflowId: 'wf' }),
-    );
-    expect(response?.status).toBe(500);
+    expect(response?.status).toBe(503);
     expect(await response?.json()).toEqual({
-      error: 'upstream exploded with connection details',
+      error: 'deployment execution is fenced',
+      reason: { code: 'EXECUTION_FENCED', state: 'migration-locked' },
     });
+  });
+
+  it('answers an unclassified 5xx of the hub object with its status and no fault detail', async () => {
+    // #given
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const router = makeRouter(
+        answering(() =>
+          Response.json({ error: FAULT }, { status: 500 }),
+        ) as unknown as HubNamespaceLike,
+        recordingRunner([]),
+      );
+      const ticket = await mintStreamTicket({
+        secret: SECRET,
+        channel: 'hub',
+        actor: REVIEWER,
+      });
+
+      // #when
+      const response = await router(wsGet(`/api/stream/hub?ticket=${ticket}`));
+
+      // #then
+      expect(response?.status).toBe(500);
+      const text = (await response?.text()) ?? '';
+      expect(JSON.parse(text)).toEqual({ error: 'internal error' });
+      expect(text).not.toContain(FAULT);
+      expect(String(logged.mock.calls[0]?.[0])).toContain(FAULT);
+    } finally {
+      logged.mockRestore();
+    }
   });
 });

@@ -297,6 +297,32 @@ describe('createObjectiveRouter — bounded ingestion gate', () => {
     expect(raw.size).toBe(0);
   });
 
+  it.each([
+    200, 600,
+  ])('answers a host RunRouteError whose status is %s with a generic 500', async (status) => {
+    const { store, raw } = memoryStore();
+    const router = createObjectiveRouter({
+      resolve: async () => actorContext('operator'),
+      store,
+      validateThreadTarget: async () => {
+        throw new RunRouteError(status, 'not a refusal');
+      },
+    });
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    try {
+      const response = await router(
+        req('PUT', OWNED_THREAD, { objective: 'orphan me' }),
+      );
+
+      expect(response?.status).toBe(500);
+      expect(await response?.json()).toEqual({ error: 'internal error' });
+      expect(raw.size).toBe(0);
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
   it('403 for a read-only role on a WRITE, and audits the rejection', async () => {
     const { store, raw } = memoryStore();
     const events: ObjectiveAuditEvent[] = [];

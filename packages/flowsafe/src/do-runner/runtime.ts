@@ -32,7 +32,6 @@ import {
   type AnyWorkflow,
   cleanStepResult,
   type WorkflowRunState,
-  type WorkflowRunStatus,
   type WorkflowState,
   type WorkflowStateField,
 } from '@mastra/core/workflows';
@@ -173,7 +172,7 @@ export class RunNotSuspendedError extends DoStatusError {
   readonly status = 409;
   readonly reason = { code: 'RUN_NOT_SUSPENDED' } as const;
 
-  constructor(workflowId: string, runId: string, runStatus: WorkflowRunStatus) {
+  constructor(workflowId: string, runId: string, runStatus: RunStatus) {
     super(
       `run '${runId}' of workflow '${workflowId}' is '${runStatus}', not 'suspended'`,
     );
@@ -199,15 +198,23 @@ export class SuspensionChangedError extends DoStatusError {
 
 /**
  * An authoritative run-state read did not succeed, so nothing that read
- * returned is evidence about the run. One cause is Mastra answering from its
- * in-memory fallback instead of from storage — what comes back then describes
- * the Run object this isolate happens to hold rather than what is persisted.
+ * returned is evidence about the run: 503 with `reason.code`
+ * `RUN_STATE_UNREADABLE`. One cause is Mastra answering from its in-memory
+ * fallback instead of from storage — what comes back then describes the Run
+ * object this isolate happens to hold rather than what is persisted.
  * Distinct from UnknownRunError: the run may
  * well exist and be suspended — nothing about it could be READ. The message
  * therefore names no cause: it is minted where the read failed, not where the
  * reason is known.
+ *
+ * Retryable: the caller asked for nothing wrong and the condition clears on its
+ * own, so it is not a 500 that reads as a code fault, and a 404 or a summary
+ * would invite a conclusion from a read that never happened.
  */
-export class RunStateUnreadableError extends Error {
+export class RunStateUnreadableError extends DoStatusError {
+  readonly status = 503;
+  readonly reason = { code: 'RUN_STATE_UNREADABLE' } as const;
+
   constructor(workflowId: string, runId: string, options?: ErrorOptions) {
     super(
       `run '${runId}' of workflow '${workflowId}' state is not readable`,

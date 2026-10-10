@@ -562,7 +562,8 @@ export const MAX_APPROVAL_BATCH_DECIDE = 100;
  * Per-record outcome of a batch decide. `ok: false` carries the reason —
  * `code` mirrors the HTTP status the same failure would produce on the
  * single-record decide route ('not-found' 404, 'conflict' 409, 'forbidden'
- * 403 — separation of duties, 'invalid' 400, 'error' 500).
+ * 403 — separation of duties, 'invalid' 400, 'unavailable' 503 — the
+ * execution fence, 'error' 500 — with the generic `error` message).
  */
 export interface BatchDecideItem {
   id: string;
@@ -570,7 +571,18 @@ export interface BatchDecideItem {
   record?: ApprovalRecord;
   resume?: ResumeOutcome;
   error?: string;
-  code?: 'not-found' | 'conflict' | 'forbidden' | 'invalid' | 'error';
+  code?:
+    | 'not-found'
+    | 'conflict'
+    | 'forbidden'
+    | 'invalid'
+    | 'unavailable'
+    | 'error';
+  /**
+   * The fence's `reason` when `code` is `unavailable`, as the single-record
+   * route renders it.
+   */
+  reason?: { readonly code: string };
 }
 
 /**
@@ -591,13 +603,25 @@ export interface ResumeOutcome {
   ok?: boolean;
   /** RunSummary (or whatever resumeRun returns) on success. */
   summary?: unknown;
+  /**
+   * The failed resume's message when the thrown value carries a reason code
+   * or a 4xx `status`. The message of any other failure can name storage or
+   * deployment detail, so it is `internal error` here. The original is logged:
+   * for an answer read from a run or thread object, on that reader's
+   * `route-internal-error` line, and for a failure in process, on the
+   * `approvals.resume` line and in the `approval.resume` audit event. A
+   * refusal `RunnerRuntime` throws in process through `resumeViaRuntime`,
+   * such as `UnknownRunError`, carries no `status`, so it is
+   * `internal error` too.
+   */
   error?: string;
   /**
    * The `reason.code` the failed resume's error carried, if any.
    * `SUSPENSION_CHANGED`: the step left the suspension this decision was for,
    * and a redrive is refused again. `RUN_NOT_SUSPENDED`: the run was not
    * suspended when the resume read it; read the run's status to learn whether
-   * it has ended, which refuses every redrive.
+   * it has ended, which refuses every redrive. `RUN_STATE_UNREADABLE`: the
+   * run's state could not be read; a redrive can succeed once it can.
    */
   code?: string;
 }

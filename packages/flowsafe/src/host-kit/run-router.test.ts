@@ -24,6 +24,7 @@ import {
 } from '../approval-api/index.js';
 import { RESERVED_EXECUTION_CONTEXT_KEYS } from '../do-runner/execution-context.js';
 import {
+  DeploymentIdentityError,
   doErrorResponse,
   ExecutionFencedError,
   type ExecutionFenceWiring,
@@ -33,6 +34,7 @@ import {
   MutationEpochMismatchError,
   RunLifecycleBlockedError,
   RunNotSuspendedError,
+  RunStateUnreadableError,
   type RunSummary,
   RunTerminalConflictError,
   type StartIdempotencyDatabase,
@@ -1865,6 +1867,12 @@ describe('createRunRouter — error mapping', () => {
       400,
       undefined,
     ],
+    [
+      'RunStateUnreadableError -> 503',
+      new RunStateUnreadableError('open-flow', 'r1'),
+      503,
+      { code: 'RUN_STATE_UNREADABLE' },
+    ],
   ])('maps %s', async (_label, error, status, reason) => {
     // #given — an in-process host throws the do-runner's typed errors
     const { handle } = makeHarness({
@@ -1955,6 +1963,128 @@ describe('createRunRouter — error mapping', () => {
       error: error.message,
       reason: error.reason,
     });
+  });
+
+  describe('a run object answering a failure', () => {
+    const STORAGE_FAULT =
+      'D1_ERROR: connect ECONNREFUSED 10.0.7.4:5432 db=acme-prod';
+    const conflict = new RunTerminalConflictError(
+      'open-flow',
+      'acme_r1',
+      'success',
+    );
+
+    function statusThrough(answer: () => Response) {
+      const fetch = vi.fn(async () => answer());
+      const topology = createDoRunTopology(
+        { idFromName: (name: string) => name, get: () => ({ fetch }) },
+        TEST_DEPLOYMENT_IDENTITY_SECRET,
+      );
+      return makeHarness({ status: topology.status });
+    }
+
+    it.each<[string, () => Response, number, unknown]>([
+      [
+        'an unclassified failure',
+        () => doErrorResponse(new Error(STORAGE_FAULT)),
+        500,
+        { error: 'internal error' },
+      ],
+      [
+        'a deployment identity failure',
+        () => doErrorResponse(new DeploymentIdentityError(STORAGE_FAULT)),
+        503,
+        { error: 'internal error' },
+      ],
+      [
+        'a terminal conflict',
+        () => doErrorResponse(conflict),
+        409,
+        { error: conflict.message },
+      ],
+    ])('answers %s read through a run object stub with its status and no fault detail', async (_label, answer, status, body) => {
+      // #given
+      const { handle } = statusThrough(answer);
+      const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        // #when
+        const response = await handle(req('/runs/open-flow/acme_r1'));
+
+        // #then
+        expect(response?.status).toBe(status);
+        const text = (await response?.text()) ?? '';
+        expect(JSON.parse(text)).toEqual(body);
+        expect(text).not.toContain(STORAGE_FAULT);
+      } finally {
+        logged.mockRestore();
+      }
+    });
+
+    it.each<[string, number, unknown]>([
+      ['5xx', 503, { error: 'internal error' }],
+      ['4xx', 409, { error: 'run request failed with status 409' }],
+    ])('keeps the status of a non-JSON %s answer', async (_label, status, body) => {
+      // #given
+      const { handle } = statusThrough(
+        () => new Response('error code: 1102', { status }),
+      );
+      const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        // #when
+        const response = await handle(req('/runs/open-flow/acme_r1'));
+
+        // #then
+        expect(response?.status).toBe(status);
+        expect(await response?.json()).toEqual(body);
+      } finally {
+        logged.mockRestore();
+      }
+    });
+  });
+
+  it('answers a deployment identity failure thrown in process with 503 and a generic message', async () => {
+    // #given
+    const fault = 'deployment tag acme-prod does not match binding DB';
+    const { handle } = makeHarness({
+      status: async () => {
+        throw new DeploymentIdentityError(fault);
+      },
+    });
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      // #when
+      const response = await handle(req('/runs/open-flow/acme_r1'));
+
+      // #then
+      expect(response?.status).toBe(503);
+      expect(response?.headers.get('cache-control')).toBe('no-store');
+      expect(await response?.json()).toEqual({ error: 'internal error' });
+      expect(String(logged.mock.calls[0]?.[0])).toContain(fault);
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
+  it.each([
+    200, 600,
+  ])('answers a host RunRouteError whose status is %s with a generic 500', async (status) => {
+    // #given
+    const { handle } = makeHarness({
+      status: async () => {
+        throw new RunRouteError(status, 'not a refusal');
+      },
+    });
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      // #when
+      const response = await handle(req('/runs/open-flow/acme_r1'));
+
+      // #then
+      expect(response?.status).toBe(500);
+      expect(await response?.json()).toEqual({ error: 'internal error' });
+    } finally {
+      logged.mockRestore();
+    }
   });
 });
 

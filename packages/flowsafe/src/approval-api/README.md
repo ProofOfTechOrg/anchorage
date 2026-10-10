@@ -74,8 +74,11 @@ never resumes a run.
 - **Process batch decisions through the single-record path**: `decideBatch()`
   deduplicates at most 100 IDs and calls `decide()` sequentially for each one.
   Every record retains the same compare-and-swap, separation-of-duties, audit,
-  and resume behavior. Per-record failures appear in the HTTP 200 response;
-  malformed input, an unauthorized role, or more than 100 unique IDs rejects
+  and resume behavior. Per-record failures appear in the HTTP 200 response
+  with the `code` of the status the single-record route would answer: a record
+  the execution fence refuses reports `unavailable` with the fence's `reason`,
+  and an unexpected failure reports `error` with the message `internal error`.
+  Malformed input, an unauthorized role, or more than 100 unique IDs rejects
   the whole request.
 - **Derive grants instead of transporting them**: The public resume route
   carries only `{ step, resumeData }`. The runner reads approved records from
@@ -107,7 +110,15 @@ never resumes a run.
   `SUSPENSION_CHANGED` is refused on every retry: the step has moved on to
   another suspension, so decide that suspension's approval instead. A resume
   whose `code` is `RUN_NOT_SUSPENDED` found the run not suspended; read the
-  run's status to learn whether it has ended, which refuses every retry.
+  run's status to learn whether it has ended, which refuses every retry. A
+  resume whose `code` is `RUN_STATE_UNREADABLE` could not read the run's state;
+  a retry can succeed once it can. A failure that carries neither a `code` nor
+  a 4xx status reports `internal error` as its `error`, and so does a refusal
+  `RunnerRuntime` throws in process through `resumeViaRuntime`, such as an
+  unknown run, which carries no status. The original message is logged: on the
+  reader's `route-internal-error` line for an answer read from a run or thread
+  object, and on the `approvals.resume` line and in the `approval.resume` audit
+  event for a failure in process.
 - **Enforce separation of duties by default**: `decide()` rejects the
   requester and a reviewer who approved an earlier sequential gate in the same
   run. Parallel gates filed before either decision do not trigger the
