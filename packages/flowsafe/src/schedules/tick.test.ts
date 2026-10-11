@@ -1401,6 +1401,117 @@ describe('createScheduleTick', () => {
 
   it.each([
     {
+      label: 'a corrupt cron on a schedule of an unknown kind',
+      schedule: workflowSchedule({
+        cron: '0 0 30 2 *',
+        target: { type: 'webhook' } as never,
+      }),
+      loseClaim: false,
+      target: 'workflow',
+      outcome: 'failed',
+      reason: 'invalid-cron',
+    },
+    {
+      label: 'a lost claim on a schedule of an unknown kind',
+      schedule: workflowSchedule({ target: { type: 'webhook' } as never }),
+      loseClaim: true,
+      target: 'workflow',
+      outcome: 'lost',
+      reason: 'lost: concurrent-claim',
+    },
+    {
+      label: 'a target of an unknown kind the policy refuses',
+      schedule: workflowSchedule({ target: { type: 'webhook' } as never }),
+      loseClaim: false,
+      target: 'workflow',
+      outcome: 'failed',
+      reason: 'unknown-target',
+    },
+    {
+      label: 'a target of an unknown kind nested past the depth bound',
+      schedule: workflowSchedule({
+        target: {
+          type: 'webhook',
+          agentId: 'a1',
+          inputData: { topic: nestedArray(MAX_RUN_INPUT_DEPTH) },
+        } as never,
+      }),
+      loseClaim: false,
+      target: 'workflow',
+      outcome: 'failed',
+      reason: 'input-too-deep',
+    },
+    {
+      label: 'a target of an unknown kind the policy admits',
+      schedule: workflowSchedule({
+        target: { type: 'webhook', agentId: 'a1' } as never,
+      }),
+      loseClaim: false,
+      target: 'workflow',
+      outcome: 'failed',
+      reason: 'invalid-workflow-target',
+    },
+    {
+      label: 'a corrupt cron on an agent schedule',
+      schedule: workflowSchedule({
+        cron: '0 0 30 2 *',
+        target: { type: 'agent', agentId: 'a1', prompt: 'go' },
+        ownerType: 'agent',
+        ownerId: 'a1',
+      }),
+      loseClaim: false,
+      target: 'agent',
+      outcome: 'failed',
+      reason: 'invalid-cron',
+    },
+    {
+      label: 'a lost claim on an agent schedule',
+      schedule: workflowSchedule({
+        target: { type: 'agent', agentId: 'a1', prompt: 'go' },
+        ownerType: 'agent',
+        ownerId: 'a1',
+      }),
+      loseClaim: true,
+      target: 'agent',
+      outcome: 'lost',
+      reason: 'lost: concurrent-claim',
+    },
+  ])('audits $label under the target kind the tick dispatches it as', async ({
+    schedule,
+    loseClaim,
+    target,
+    outcome,
+    reason,
+  }) => {
+    // #given a due schedule, of an agent target or of a stored kind that is
+    // neither workflow nor agent
+    const store = new FakeStore();
+    store.seed(schedule);
+    const start = vi.fn();
+    const events: ScheduleTickAuditEvent[] = [];
+
+    // #when the tick fires it
+    await createScheduleTick({
+      store: loseClaim
+        ? forwardingStore(store, { claimScheduleFire: async () => false })
+        : store,
+      start,
+      audit: (event) => {
+        events.push(event);
+      },
+      now: () => NOW,
+    })();
+
+    // #then the fire's one event names the target kind the tick dispatches
+    // it as (an unknown kind as a workflow), and nothing is sent
+    expect(events).toEqual([
+      expect.objectContaining({ target, outcome, reason }),
+    ]);
+    expect(start).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
       label: 'a workflow inputData',
       field: 'inputData',
       schedule: workflowSchedule({
@@ -1591,19 +1702,9 @@ describe('createScheduleTick', () => {
         },
       },
     ],
-    [
-      'has a target kind the audit event does not name',
-      {
-        getSchedule: async () => ({
-          ...workflowSchedule({ id: 'schedule_gone' }),
-          target: { type: 'webhook' } as unknown as Schedule['target'],
-        }),
-      },
-    ],
   ])('settles a deferred fire claimed without a dispatch record whose schedule %s, and logs it in place of an audit event', async (_label, overrides) => {
     // #given a deferred fire claimed without a dispatch record, and a store
-    // that returns no schedule for it, fails to read it, or returns one whose
-    // target kind is neither workflow nor agent
+    // that returns no schedule for it or fails to read it
     const store = new FakeStore();
     store.triggers.push(claimedWithoutDispatch('schedule_gone'));
     const events: ScheduleTickAuditEvent[] = [];
@@ -1628,6 +1729,53 @@ describe('createScheduleTick', () => {
       expect(loggedTypes(log.mock.calls)).toEqual([
         'schedule-tick-bookkeeping-error',
       ]);
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it('settles and audits as a workflow a deferred fire claimed without a dispatch record whose schedule stores a target kind other than workflow or agent', async () => {
+    // #given a deferred fire claimed without a dispatch record, and a store
+    // that returns its schedule with an unknown target kind
+    const store = new FakeStore();
+    store.triggers.push(claimedWithoutDispatch('schedule_foreign'));
+    const events: ScheduleTickAuditEvent[] = [];
+    const log = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    // #when the tick reconciles it
+    try {
+      const result = await createScheduleTick({
+        store: forwardingStore(store, {
+          getSchedule: async () =>
+            workflowSchedule({
+              id: 'schedule_foreign',
+              target: { type: 'webhook' } as never,
+            }),
+        }),
+        start: vi.fn(),
+        audit: (event) => {
+          events.push(event);
+        },
+        now: () => NOW,
+      })();
+
+      // #then the fire is settled as failed and audited once with the
+      // workflow target the tick dispatches an unknown kind as, and nothing is
+      // logged
+      expect(result).toEqual({ ...IDLE_TALLY, failed: 1, reconciled: 1 });
+      expect(store.triggers[0]).toMatchObject({ outcome: 'failed' });
+      expect(events).toEqual([
+        {
+          type: 'schedule.fire',
+          scheduleId: 'schedule_foreign',
+          target: 'workflow',
+          outcome: 'failed',
+          reason: 'invalid-deferred-dispatch',
+          runId: 'run-claimed',
+          timestamp: expect.any(String),
+        },
+      ]);
+      expect(log).not.toHaveBeenCalled();
     } finally {
       log.mockRestore();
     }

@@ -343,9 +343,10 @@ export interface ScheduleTickAuditEvent {
   /** Infrastructure-verified deployment tag for audit attribution. */
   deploymentTag?: string;
   /**
-   * The fire's target kind. A deferred fire settled without a dispatch record
-   * that parses names its schedule's target as the store reads it at
-   * settlement.
+   * The fire's target kind. A stored kind other than `agent` is audited as
+   * `workflow`, as the tick dispatches it. A deferred fire settled without a
+   * dispatch record that parses names its schedule's target as the store reads
+   * it at settlement.
    */
   target: 'workflow' | 'agent';
   outcome: ScheduleFireOutcome;
@@ -381,9 +382,9 @@ export interface ScheduleTickOptions {
   /**
    * Every fire attempt is audited through this (accepted OR skipped/failed),
    * except a deferred fire settled without a dispatch record that parses
-   * whose schedule is not stored, cannot be read, or has a target kind other
-   * than `workflow` or `agent`: the tick logs
-   * `schedule-tick-bookkeeping-error` for it instead. Absent ⇒ no audit.
+   * whose schedule is not stored or cannot be read, and a lost claim whose
+   * schedule cannot be read: the tick logs `schedule-tick-bookkeeping-error`
+   * for them instead. Absent ⇒ no audit.
    */
   audit?: ScheduleTickAuditSink;
   /**
@@ -812,14 +813,22 @@ function isPermanentDispatchError(error: unknown): boolean {
 }
 
 /**
+ * The audit target of a stored target kind: the tick dispatches every kind
+ * other than `agent` as a workflow, so the audit names it the same way.
+ */
+function auditTargetOfKind(kind: unknown): ScheduleTickAuditEvent['target'] {
+  return kind === 'agent' ? 'agent' : 'workflow';
+}
+
+/**
  * The audit target of a fire settled without a dispatch record that parses:
- * its schedule's target kind as the store reads it.
+ * its schedule's stored kind mapped as auditTargetOfKind maps it, or
+ * `undefined` for a schedule that is not stored.
  */
 function scheduleAuditTarget(
   schedule: Schedule | null,
 ): ScheduleTickAuditEvent['target'] | undefined {
-  const type: unknown = schedule?.target.type;
-  return type === 'workflow' || type === 'agent' ? type : undefined;
+  return schedule ? auditTargetOfKind(schedule.target.type) : undefined;
 }
 
 /**
@@ -1351,7 +1360,7 @@ export function createScheduleTick(
     at: number,
     result: ScheduleTickResult,
   ): Promise<void> => {
-    const targetType = schedule.target.type;
+    const targetType = auditTargetOfKind(schedule.target.type);
     // 1. Compute the next fire time. A corrupt cron cannot be advanced — the
     // facade validates cron at create, so this is a defense-in-depth edge. We do
     // NOT CAS-claim it (leaving nextFireAt would hot-loop, but a permanently
@@ -1514,7 +1523,7 @@ export function createScheduleTick(
       return;
     }
 
-    if (targetType === 'agent') {
+    if (schedule.target.type === 'agent') {
       const target = normalizeAndSanitizeAgentTarget(
         schedule.id,
         schedule.target,
