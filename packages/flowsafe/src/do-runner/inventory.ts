@@ -1033,7 +1033,7 @@ export class DeploymentInventory {
             'permit_consumed_at',
           ],
           where:
-            "status NOT IN ('failed', 'settled') OR (permit_consumed_at IS NOT NULL AND executor_quiescent_at IS NULL)",
+            "status <> 'failed' OR (permit_consumed_at IS NOT NULL AND executor_quiescent_at IS NULL)",
           binds: [],
         };
       case 'approvals-waiting':

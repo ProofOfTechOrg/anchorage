@@ -231,6 +231,22 @@ describe('remote step journal dispatch admission', () => {
     ).toBeDefined();
   });
 
+  it('grants raw authority to one concurrent D1 consume winner', async () => {
+    const h = await fixture();
+    const invocation = await h.journal.register(ADDRESS, 10_000, PRINCIPAL);
+    const permit = await h.journal.issuePermit(invocation.invocationId, 1_000);
+    const outcomes = await Promise.all([
+      h.journal.consumePermit(permit),
+      h.reopen().consumePermit(permit),
+    ]);
+    expect(outcomes.filter((item) => item.kind === 'accepted')).toHaveLength(1);
+    expect(outcomes.filter((item) => item.kind === 'already-consumed')).toEqual(
+      [{ kind: 'already-consumed' }],
+    );
+    const winner = outcomes.find((item) => item.kind === 'accepted');
+    expect(winner).toMatchObject({ rawPermit: expect.any(String) });
+  });
+
   it('recovers one permit after a journal instance is replaced', async () => {
     const h = await fixture();
     const invocation = await h.journal.register(ADDRESS, 10_000, PRINCIPAL);
@@ -314,14 +330,14 @@ describe('remote step journal dispatch admission', () => {
       executor_quiescent_at: expect.any(Number),
     });
     expect(
-      await h.journal.readRecordedResult(invocation.invocationId),
+      await h.journal.readRetainedResult(invocation.invocationId),
     ).toMatchObject({
       resultJson: bytes,
       resultDigest: stored.result_digest,
     });
   });
 
-  it('settles a verified result only after the physical run advances', async () => {
+  it('retains drain work after an unproven run advancement', async () => {
     const h = await fixture();
     const invocation = await h.journal.register(ADDRESS, 10_000, PRINCIPAL);
     const permit = await h.journal.issuePermit(invocation.invocationId, 1_000);
@@ -333,24 +349,19 @@ describe('remote step journal dispatch admission', () => {
       '{"value":"done"}',
       '{"receipt":"verified"}',
     );
-    await expect(
-      h.journal.settleAfterResume(invocation.invocationId),
-    ).rejects.toMatchObject({ status: 409 });
+    expect((await h.journal.get(invocation.invocationId))?.status).toBe(
+      'result-retained',
+    );
     h.setSummary({ runId: ADDRESS.runId, status: 'success' });
     h.sqlite
       .prepare('UPDATE mastra_workflow_snapshot SET snapshot = ?')
       .run('{"status":"success"}');
+    expect((await h.reopen().get(invocation.invocationId))?.status).toBe(
+      'result-retained',
+    );
     expect(
-      await h.journal.settleAfterResume(invocation.invocationId),
-    ).toMatchObject({
-      status: 'settled',
-    });
-    expect(
-      (await h.reopen().settleAfterResume(invocation.invocationId)).status,
-    ).toBe('settled');
-    expect(
-      (await new DeploymentInventory(h.db).read('remote-steps')).entries,
-    ).toEqual([]);
+      (await new DeploymentInventory(h.db).read('remote-steps')).count,
+    ).toBe(1);
   });
 
   it('records verified completion from a prior epoch without resuming a locked run', async () => {
@@ -375,9 +386,33 @@ describe('remote step journal dispatch admission', () => {
         '{"receipt":"verified"}',
       ),
     ).toMatchObject({ kind: 'recorded' });
-    await expect(
-      h.journal.settleAfterResume(invocation.invocationId),
-    ).rejects.toMatchObject({ status: 409 });
+    expect((await h.journal.get(invocation.invocationId))?.status).toBe(
+      'result-retained',
+    );
+    expect(
+      (await new DeploymentInventory(h.db).read('remote-steps')).count,
+    ).toBe(1);
+  });
+
+  it('retains a verified late result as drain work after cancellation', async () => {
+    const h = await fixture();
+    const invocation = await h.journal.register(ADDRESS, 10_000, PRINCIPAL);
+    const permit = await h.journal.issuePermit(invocation.invocationId, 1_000);
+    const consumed = await h.journal.consumePermit(permit);
+    if (consumed.kind !== 'accepted') throw new Error('permit was not won');
+    h.setSummary({ runId: ADDRESS.runId, status: 'cancelled' });
+    h.sqlite
+      .prepare('UPDATE mastra_workflow_snapshot SET snapshot = ?')
+      .run('{"status":"cancelled"}');
+    await h.journal.recordResult(
+      invocation.invocationId,
+      consumed.rawPermit,
+      '{"value":"done"}',
+      '{"receipt":"verified"}',
+    );
+    expect((await h.journal.get(invocation.invocationId))?.status).toBe(
+      'result-retained',
+    );
     expect(
       (await new DeploymentInventory(h.db).read('remote-steps')).count,
     ).toBe(1);

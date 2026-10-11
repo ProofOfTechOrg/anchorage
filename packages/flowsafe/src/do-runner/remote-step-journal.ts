@@ -21,7 +21,6 @@ import {
   lifecycleFromRequestContext,
   RUN_LIFECYCLE_CONTEXT_KEY,
 } from './run-lifecycle.js';
-import { isTerminalRunStatus } from './run-terminal-state.js';
 import type { RunnerRuntime, RunSummary } from './runtime.js';
 import { validateTablePrefix } from './table-prefix.js';
 
@@ -89,7 +88,7 @@ export interface RemoteStepInvocation extends RemoteStepAddress {
   resumeCount?: number;
   request: unknown;
   deadlineAt: number;
-  status: 'pending' | 'dispatched' | 'result-recorded' | 'settled' | 'failed';
+  status: 'pending' | 'dispatched' | 'result-retained' | 'failed';
   permitGeneration: number;
   permitEpoch?: number;
   permitRevision?: number;
@@ -215,9 +214,7 @@ function decode(row: JournalRow): RemoteStepInvocation {
     (row.resume_count !== -1 && row.resume_count < 1) ||
     !Number.isSafeInteger(row.permit_generation) ||
     row.permit_generation < 0 ||
-    !['pending', 'dispatched', 'result-recorded', 'settled', 'failed'].includes(
-      row.status,
-    )
+    !['pending', 'dispatched', 'result-retained', 'failed'].includes(row.status)
   )
     throw new RemoteStepRefusal(503, 'remote step journal is unreadable');
   return {
@@ -834,7 +831,7 @@ export class RemoteStepJournal {
     const result = await this.#db
       .prepare(`UPDATE ${REMOTE_STEP_TABLE}
         SET result_json = ?, result_digest = ?, quiescence_digest = ?,
-            executor_quiescent_at = ?, status = 'result-recorded'
+            executor_quiescent_at = ?, status = 'result-retained'
         WHERE invocation_id = ? AND permit_digest = ?
           AND permit_consumed_at IS NOT NULL AND result_json IS NULL
           AND status = 'dispatched'
@@ -861,7 +858,7 @@ export class RemoteStepJournal {
     return replay(after);
   }
 
-  async readRecordedResult(
+  async readRetainedResult(
     invocationId: string,
   ): Promise<RecordedRemoteStepResult | undefined> {
     if (!isPathSafeId(invocationId))
@@ -880,7 +877,7 @@ export class RemoteStepJournal {
     const executorQuiescentAt = row.executor_quiescent_at;
     if (resultJson === null) return undefined;
     if (
-      !['result-recorded', 'settled'].includes(row.status) ||
+      row.status !== 'result-retained' ||
       row.permit_consumed_at === null ||
       typeof resultDigest !== 'string' ||
       !SHA256_HEX.test(resultDigest) ||
@@ -903,63 +900,5 @@ export class RemoteStepJournal {
       quiescenceDigest,
       executorQuiescentAt,
     };
-  }
-
-  async settleAfterResume(invocationId: string): Promise<RemoteStepInvocation> {
-    const invocation = await this.get(invocationId);
-    if (
-      !invocation ||
-      !['result-recorded', 'settled'].includes(invocation.status)
-    )
-      throw new RemoteStepRefusal(409, 'remote step has no result to settle');
-    const result = await this.readRecordedResult(invocationId);
-    if (!result)
-      throw new RemoteStepRefusal(503, 'remote step result is unreadable');
-    const state = await this.#execution(invocation, invocation.principal);
-    if (state.execution.startToken !== invocation.startToken)
-      throw new RemoteStepRefusal(409, 'remote step run generation changed');
-    const summary = await this.#runtime.authoritativeStatus(
-      invocation.workflowId,
-      invocation.runId,
-    );
-    if (!summary)
-      throw new RemoteStepRefusal(503, 'remote step run is unreadable');
-    if (summary.status === 'suspended') {
-      const key = invocation.stepPath.join('.');
-      const stillCurrent =
-        (summary.suspended ?? []).some(
-          (path) =>
-            JSON.stringify(path) === JSON.stringify(invocation.stepPath),
-        ) &&
-        summary.suspendedAt?.[key] === invocation.suspendedAt &&
-        summary.resumeCount?.[key] === invocation.resumeCount;
-      if (stillCurrent)
-        throw new RemoteStepRefusal(409, 'remote step has not resumed');
-    } else if (!isTerminalRunStatus(summary.status)) {
-      throw new RemoteStepRefusal(409, 'remote step resume is still active');
-    }
-    if (invocation.status === 'settled') return invocation;
-    const snapshot = await this.#snapshot(invocation);
-    const written = rowResult(
-      await this.#db
-        .prepare(`UPDATE ${REMOTE_STEP_TABLE} SET status = 'settled'
-          WHERE invocation_id = ? AND status = 'result-recorded'
-            AND result_digest = ? AND executor_quiescent_at IS NOT NULL
-            AND EXISTS (SELECT 1 FROM "${invocation.tablePrefix}mastra_workflow_snapshot"
-              WHERE workflow_name = ? AND run_id = ? AND snapshot = ?)
-          RETURNING *`)
-        .bind(
-          invocationId,
-          result.resultDigest,
-          invocation.workflowId,
-          invocation.runId,
-          snapshot,
-        )
-        .all(),
-    );
-    if (written) return decode(written);
-    const after = await this.get(invocationId);
-    if (after?.status === 'settled') return after;
-    throw new RemoteStepRefusal(409, 'remote step settlement changed');
   }
 }
