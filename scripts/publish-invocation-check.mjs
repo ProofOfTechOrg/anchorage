@@ -34,12 +34,23 @@ import {
   command,
   failureReason,
   missingPeerEdgeViolation,
+  npmDryRunVersionViolation,
   PUBLISH_PREREQUISITES,
   peerFloorGrammarViolations,
   prerequisiteManifests,
   prerequisitePeerEdges,
   publishInvocation,
 } from './publish-ordered.mjs';
+
+const npmVersion = command('npm', ['--version'], { capture: true });
+const npmVersionViolation =
+  npmVersion.error || npmVersion.status !== 0
+    ? `npm --version: ${failureReason(npmVersion)}\n${npmVersion.stderr}`
+    : npmDryRunVersionViolation(npmVersion.stdout);
+if (npmVersionViolation) {
+  console.error(`FAIL ${npmVersionViolation}`);
+  process.exit(1);
+}
 
 const manifests = prerequisiteManifests();
 // Version containment belongs to publishRelease after pending changesets bump versions.
