@@ -10,6 +10,10 @@ export {
   ReservedExecutionContextError,
   stripReservedExecutionContext,
 } from '../do-runner/index.js';
+export type {
+  RecordedRemoteStepResult,
+  RemoteStepInvocation,
+} from '../do-runner/remote-step-journal.js';
 export {
   type AgentApprovalResumer,
   type AgentApprovalResumerOptions,
@@ -50,6 +54,7 @@ export {
   type AgentThreadTopology,
   type AgentThreadTopologyOptions,
   createAgentThreadTopology,
+  type RemoteStepContinuationReader,
 } from './thread-topology.js';
 export {
   AGENT_AUDIT_CONTEXT_KEY,

@@ -1471,7 +1471,11 @@ function sourceFileSystem(): SourceFileSystem {
   ).process?.getBuiltinModule?.('node:fs') as SourceFileSystem;
 }
 
-type SourceFile = { readonly file: string; readonly source: string };
+type SourceFile = {
+  readonly file: string;
+  readonly source: string;
+  readonly parsed?: ts.SourceFile;
+};
 
 type SourceUrlModule = { fileURLToPath(url: URL): string };
 
@@ -1516,14 +1520,14 @@ function walkSourceFiles(
  * Every actual predicate/delegation call. Definitions, re-exports and comments
  * are not calls; the defining module's own nomination gates remain visible.
  */
-function predicateCallSites({ file, source }: SourceFile): GateSite[] {
+function predicateCallSites({
+  file,
+  source,
+  parsed: cached,
+}: SourceFile): GateSite[] {
   const found: GateSite[] = [];
-  const parsed = ts.createSourceFile(
-    file,
-    source,
-    ts.ScriptTarget.Latest,
-    true,
-  );
+  const parsed =
+    cached ?? ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true);
   const visit = (node: ts.Node): void => {
     if (ts.isCallExpression(node)) {
       const expression = node.expression;
@@ -1560,13 +1564,13 @@ function predicateCallSites({ file, source }: SourceFile): GateSite[] {
   return found;
 }
 
-function sqlAdmissionSites({ file, source }: SourceFile): GateSite[] {
-  const parsed = ts.createSourceFile(
-    file,
-    source,
-    ts.ScriptTarget.Latest,
-    true,
-  );
+function sqlAdmissionSites({
+  file,
+  source,
+  parsed: cached,
+}: SourceFile): GateSite[] {
+  const parsed =
+    cached ?? ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true);
   const found: GateSite[] = [];
   const admissionBindings = new Set<string>();
   const collectBindings = (node: ts.Node): void => {
@@ -1622,9 +1626,15 @@ function sqlAdmissionSites({ file, source }: SourceFile): GateSite[] {
 function gateCallSites(): GateSite[] {
   const found: GateSite[] = [];
   walkSourceFiles(sourceRoot(), (sourceFile) => {
+    const parsed = ts.createSourceFile(
+      sourceFile.file,
+      sourceFile.source,
+      ts.ScriptTarget.Latest,
+      true,
+    );
     found.push(
-      ...predicateCallSites(sourceFile),
-      ...sqlAdmissionSites(sourceFile),
+      ...predicateCallSites({ ...sourceFile, parsed }),
+      ...sqlAdmissionSites({ ...sourceFile, parsed }),
     );
   });
   return found;
