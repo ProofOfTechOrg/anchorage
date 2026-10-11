@@ -49,7 +49,10 @@ import {
   resourceIdFromKey,
   SUSPENSION_TIMEOUT_RESUME_KEY,
 } from '../do-runner/index.js';
-import { REMOTE_STEP_MARKER } from '../do-runner/remote-step-journal.js';
+import {
+  REMOTE_STEP_MARKER,
+  RemoteStepJournal,
+} from '../do-runner/remote-step-journal.js';
 import { runInputDepthMessage } from '../do-runner/run-input-depth.js';
 import { lifecycleFromRequestContext } from '../do-runner/run-lifecycle.js';
 import {
@@ -269,6 +272,7 @@ function harness(
       runId: string,
     ) => Promise<void>;
     remoteSteps?: RemoteStepContinuationReader;
+    stateStorage?: AgentThreadStateStorage;
   } = {},
 ): Harness {
   const state = new Map<string, unknown>();
@@ -528,7 +532,7 @@ function harness(
       storageScopes.push(instanceScope);
       return storage;
     },
-    stateStorage: () => stateStorage,
+    stateStorage: () => options.stateStorage ?? stateStorage,
     resourceAccess: () => resourceAccess,
     scheduleSource: () => scheduleSource,
     ...(options.discardScheduleDispatch
@@ -7440,6 +7444,7 @@ async function hostAgentLifecycleFixture(
       .all();
   return {
     ...fixture,
+    binding,
     storage,
     app,
     sql,
@@ -7465,6 +7470,116 @@ function hostAgentLifecycleRequest(suffix = '', query = '') {
     suffix ? { method: 'POST' } : undefined,
   );
 }
+
+it('reads a retained remote result from D1 after the agent host is recreated', async () => {
+  const fixture = await hostAgentLifecycleFixture({
+    mode: 'fenced',
+    provenance: 'modern',
+  });
+  onTestFinished(() => {
+    vi.restoreAllMocks();
+    fixture.sql.close();
+  });
+  fixture.snapshot.suspendedPaths = { tool: [0] };
+  Object.assign(fixture.snapshot.context, {
+    tool: {
+      status: 'suspended',
+      payload: {},
+      startedAt: 50,
+      suspendedAt: 1000,
+      suspendPayload: {
+        type: 'suspension',
+        toolName: 'remote_lookup',
+        toolCallId: 'call-1',
+        toolCallSuspended: {
+          remoteStep: REMOTE_STEP_MARKER,
+          request: { account: 'acme' },
+        },
+      },
+    },
+  });
+  await fixture.persist();
+  await fixture.host.route(hostAgentLifecycleRequest(), fixture.scope);
+  const journal = new RemoteStepJournal({
+    db: fixture.binding,
+    fence: fixture.fence,
+    runtime: fixture.app.runtime,
+    deploymentId: 'deployment',
+    tablePrefix: 'host_lifecycle_',
+    allowedToolIds: ['remote_lookup'],
+    verifyCompletion: async () => undefined,
+  });
+  await journal.initialize();
+  const invocation = await journal.register(
+    {
+      deploymentId: 'deployment',
+      tablePrefix: 'host_lifecycle_',
+      workflowId: fixture.execution.workflowId,
+      agentId: 'writer',
+      threadId: 'acme_thread',
+      resourceId: RESOURCE_ID,
+      runId: 'acme_run',
+    },
+    Date.now() + 60_000,
+    fixture.scope.principal,
+  );
+  const permit = await journal.issuePermit(invocation.invocationId, 5_000);
+  const consumed = await journal.consumePermit(permit);
+  if (consumed.kind !== 'accepted') throw new Error('permit was not won');
+  await journal.recordResult(
+    invocation.invocationId,
+    consumed.rawPermit,
+    '{"answer":1}',
+    '{"receipt":"complete"}',
+  );
+
+  const freshApp = init(
+    { storage: fixture.storage },
+    { executionFence: fixture.fence, startIdempotency: fixture.reservations },
+  );
+  const reopened = new RemoteStepJournal({
+    db: fixture.binding,
+    fence: fixture.fence,
+    runtime: freshApp.runtime,
+    deploymentId: 'deployment',
+    tablePrefix: 'host_lifecycle_',
+    allowedToolIds: ['remote_lookup'],
+    verifyCompletion: async () => undefined,
+  });
+  const fresh = harness(['writer'], {
+    init: freshApp,
+    storage: fixture.storage,
+    stateStorage: fixture.stateStorage,
+    resourceAccess: fixture.resources,
+    remoteSteps: {
+      deploymentId: 'deployment',
+      tablePrefix: 'host_lifecycle_',
+      get: reopened.get.bind(reopened),
+      readRetainedResult: reopened.readRetainedResult.bind(reopened),
+    },
+  });
+  const resume = vi
+    .spyOn(FlowsafeDurableAgent.prototype, 'resumeViaRuntime')
+    .mockResolvedValue({ runId: 'acme_run', status: 'suspended' });
+  const response = await fresh.host.route(
+    new Request('https://thread/_flowsafe/agent-host/remote-step-resume', {
+      method: 'POST',
+      body: JSON.stringify({ invocationId: invocation.invocationId }),
+    }),
+    fresh.scope,
+  );
+  expect(response?.status).toBe(200);
+  expect(resume).toHaveBeenCalledWith(
+    expect.objectContaining({
+      runId: 'acme_run',
+      requestedBy: 'operator-1',
+      requestedByKind: 'human',
+      step: ['tool'],
+      resumeData: { answer: 1 },
+      expectedSuspension: { suspendedAt: 1000 },
+    }),
+  );
+});
 
 describe('agent host selector lookup isolation', () => {
   it.each([
