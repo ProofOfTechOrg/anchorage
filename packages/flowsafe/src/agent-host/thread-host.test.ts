@@ -1429,7 +1429,12 @@ describe('direct thread host capture', () => {
       mutationEpoch: 2,
       startIdentity: {
         owner: { kind: principal.kind, id: principal.id },
-        target: { kind: 'agent', id: 'writer', threadId: 'acme_thread' },
+        target: {
+          kind: 'agent',
+          id: 'writer',
+          threadId: 'acme_thread',
+          resourceId: RESOURCE_ID,
+        },
       },
       agentStart: { threaded },
       onPreparedStartIdentity: expect.any(Function),
@@ -3141,7 +3146,12 @@ describe('createThreadAgentHost', () => {
       {
         startIdentity: {
           owner: HUMAN_OWNER,
-          target: { kind: 'agent', id: 'writer', threadId: 'acme_thread' },
+          target: {
+            kind: 'agent',
+            id: 'writer',
+            threadId: 'acme_thread',
+            resourceId: RESOURCE_ID,
+          },
         },
         agentStart: { threaded: false },
         onPreparedStartIdentity: expect.any(Function),
@@ -3465,7 +3475,12 @@ describe('createThreadAgentHost', () => {
       {
         startIdentity: {
           owner: { kind: 'service', id: 'webhook-dispatcher' },
-          target: { kind: 'agent', id: 'writer', threadId: 'acme_thread' },
+          target: {
+            kind: 'agent',
+            id: 'writer',
+            threadId: 'acme_thread',
+            resourceId: RESOURCE_ID,
+          },
         },
         agentStart: { threaded: true },
         onPreparedStartIdentity: expect.any(Function),
@@ -3710,7 +3725,12 @@ describe('createThreadAgentHost', () => {
       {
         startIdentity: {
           owner: { kind: 'system', id: 'signal-dispatcher' },
-          target: { kind: 'agent', id: 'writer', threadId: 'acme_thread' },
+          target: {
+            kind: 'agent',
+            id: 'writer',
+            threadId: 'acme_thread',
+            resourceId: RESOURCE_ID,
+          },
         },
         agentStart: { threaded: true },
         onPreparedStartIdentity: expect.any(Function),
@@ -7315,7 +7335,12 @@ async function hostAgentLifecycleFixture(
     await reservations.bindPreparedStart(claim, {
       ...execution,
       owner: HUMAN_OWNER,
-      target: { kind: 'agent', id: 'writer', threadId: 'acme_thread' },
+      target: {
+        kind: 'agent',
+        id: 'writer',
+        threadId: 'acme_thread',
+        resourceId: RESOURCE_ID,
+      },
     });
   }
   const recovery = ownerRecovery('acme_run', {
@@ -7399,6 +7424,7 @@ async function hostAgentLifecycleFixture(
                         kind: 'agent',
                         id: snapshotAgentId,
                         threadId: snapshotThreadId,
+                        resourceId: snapshotResourceId,
                       },
                     },
                     agentStart: { threaded },
@@ -7694,6 +7720,8 @@ describe('agent host selector lookup isolation', () => {
         const context = f.snapshot.requestContext;
         if (!context) throw new Error('missing snapshot context');
         context['flowsafe.runProvenance'].startIdentity.target.threadId =
+          'other-thread';
+        context['flowsafe.runProvenance'].startIdentity.target.resourceId =
           'other-thread';
         Object.assign(context, {
           threadId: 'other-thread',

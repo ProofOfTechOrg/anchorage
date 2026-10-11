@@ -15,7 +15,6 @@ import {
   executionFenceAdmissionSql,
   executionFenceAdmissionValues,
 } from './execution-fence.js';
-import { resourceIdFromKey } from './memory-id.js';
 import { isPathSafeId } from './path-safe-id.js';
 import {
   lifecycleFromRequestContext,
@@ -750,7 +749,11 @@ export class RemoteStepJournal {
       address.runId,
     );
     const target = state?.provenance.startIdentity?.target;
-    if (state?.storage !== 'd1' || target?.kind !== 'agent')
+    if (
+      state?.storage !== 'd1' ||
+      target?.kind !== 'agent' ||
+      !isPathSafeId(target.resourceId)
+    )
       throw new RemoteStepRefusal(
         503,
         'remote step run identity is unreadable',
@@ -762,7 +765,7 @@ export class RemoteStepJournal {
         (state.provenance.startIdentity?.owner.kind !== principal.kind ||
           state.provenance.startIdentity.owner.id !== principal.id)) ||
       state.execution.tablePrefix !== address.tablePrefix ||
-      address.resourceId !== resourceIdFromKey(address.threadId)
+      address.resourceId !== target.resourceId
     )
       throw new RemoteStepRefusal(409, 'remote step run identity changed');
     return state;

@@ -92,6 +92,7 @@ describe('remote step journal dispatch admission', () => {
               kind: 'agent',
               id: ADDRESS.agentId,
               threadId: ADDRESS.threadId,
+              resourceId: ADDRESS.resourceId,
             },
           },
         },
@@ -188,6 +189,77 @@ describe('remote step journal dispatch admission', () => {
         }),
       },
     ]);
+  });
+
+  it('accepts the resource recorded at start when the host maps a thread elsewhere', async () => {
+    const h = await fixture();
+    const original = h.runtime.authoritativeStartState.bind(h.runtime);
+    h.runtime.authoritativeStartState = (async (
+      workflowId: string,
+      runId: string,
+    ) => {
+      const state = await original(workflowId, runId);
+      if (!state) return state;
+      return {
+        ...state,
+        provenance: {
+          ...state.provenance,
+          startIdentity: {
+            ...state.provenance.startIdentity,
+            target: {
+              kind: 'agent',
+              id: ADDRESS.agentId,
+              threadId: ADDRESS.threadId,
+              resourceId: 'account-7',
+            },
+          },
+        },
+      } as typeof state;
+    }) as typeof h.runtime.authoritativeStartState;
+
+    const invocation = await h.journal.register(
+      { ...ADDRESS, resourceId: 'account-7' },
+      10_000,
+      PRINCIPAL,
+    );
+    expect(invocation.resourceId).toBe('account-7');
+  });
+
+  it('refuses remote dispatch when legacy start provenance lacks a resource', async () => {
+    const h = await fixture();
+    const original = h.runtime.authoritativeStartState.bind(h.runtime);
+    h.runtime.authoritativeStartState = (async (
+      workflowId: string,
+      runId: string,
+    ) => {
+      const state = await original(workflowId, runId);
+      if (!state) return state;
+      return {
+        ...state,
+        provenance: {
+          ...state.provenance,
+          startIdentity: {
+            ...state.provenance.startIdentity,
+            target: {
+              kind: 'agent',
+              id: ADDRESS.agentId,
+              threadId: ADDRESS.threadId,
+            },
+          },
+        },
+      } as typeof state;
+    }) as typeof h.runtime.authoritativeStartState;
+
+    await expect(
+      h.journal.register(ADDRESS, 10_000, PRINCIPAL),
+    ).rejects.toMatchObject({
+      status: 503,
+    });
+    expect(
+      h.sqlite
+        .prepare(`SELECT count(*) AS count FROM ${REMOTE_STEP_TABLE}`)
+        .get(),
+    ).toEqual({ count: 0 });
   });
 
   it('upgrades a prior journal while preserving an existing invocation', async () => {
@@ -861,6 +933,7 @@ describe('remote step journal dispatch admission', () => {
           kind: 'agent',
           id: ADDRESS.agentId,
           threadId: ADDRESS.threadId,
+          resourceId: ADDRESS.resourceId,
         },
       },
       agentStart: { threaded: false },

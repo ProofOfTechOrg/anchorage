@@ -2544,7 +2544,8 @@ export class FlowsafeDurableAgent<
         throw new Error('agent observation identity is malformed');
       const observedAgentId = identity.target.id;
       const observedThreadId = identity.target.threadId;
-      const observedResourceId = resourceIdFromKey(observedThreadId);
+      const observedResourceId =
+        identity.target.resourceId ?? resourceIdFromKey(observedThreadId);
       const context = state.snapshot.requestContext;
       const record = (value: unknown): Record<string, unknown> => {
         if (value === null || typeof value !== 'object' || Array.isArray(value))

@@ -2151,6 +2151,7 @@ export function createThreadAgentHost(
             kind: 'agent',
             id: ref.agentId,
             threadId: ref.threadId,
+            resourceId: ref.resourceId,
           }),
         },
       );
