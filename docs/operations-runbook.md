@@ -221,6 +221,8 @@ wrangler d1 execute <database> --remote --config wrangler.jsonc \
 
 `statusError` names why the last pass could not decide the fire. Fix what it names, and the next pass settles the fire and completes a pending deletion. Do not settle a fire through direct SQL: the store completes a pending deletion only when the tick settles the fire.
 
+A fire whose claim is stored without a dispatch record, as when the run-cap check throws after the claim, or whose dispatch record does not parse, cannot be sent or looked up. The next pass records it `failed` with reason `invalid-deferred-dispatch` and audits a `schedule.fire` event with its schedule's target as the store reads it. When its schedule cannot be read, has a target kind other than `workflow` or `agent`, or is no longer stored (as when it is pending deletion), the pass logs `schedule-tick-bookkeeping-error` in place of the event. When the fire was the last deferred fire of a schedule pending deletion, the settlement also completes the deletion, which removes the fire's trigger history.
+
 ## Retention policy
 
 | Data | Eligible |

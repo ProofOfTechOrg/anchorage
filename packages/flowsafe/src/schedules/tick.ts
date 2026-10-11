@@ -336,6 +336,11 @@ export interface ScheduleTickAuditEvent {
   scheduleId: string;
   /** Infrastructure-verified deployment tag for audit attribution. */
   deploymentTag?: string;
+  /**
+   * The fire's target kind. A deferred fire settled without a dispatch record
+   * that parses names its schedule's target as the store reads it at
+   * settlement.
+   */
   target: 'workflow' | 'agent';
   outcome: ScheduleFireOutcome;
   /** The minted runId for a published fire. */
@@ -367,7 +372,13 @@ export interface ScheduleTickOptions {
   deploymentTag?: string;
   /** The deployment run cap. Absent means uncapped. */
   runCap?: ScheduleTickRunCap;
-  /** Every fire attempt is audited through this (accepted OR skipped/failed). Absent ⇒ no audit. */
+  /**
+   * Every fire attempt is audited through this (accepted OR skipped/failed),
+   * except a deferred fire settled without a dispatch record that parses
+   * whose schedule is not stored, cannot be read, or has a target kind other
+   * than `workflow` or `agent`: the tick logs
+   * `schedule-tick-bookkeeping-error` for it instead. Absent ⇒ no audit.
+   */
   audit?: ScheduleTickAuditSink;
   /**
    * The deployment execution fence, read ONCE per pass and BEFORE any CAS
@@ -795,6 +806,17 @@ function isPermanentDispatchError(error: unknown): boolean {
 }
 
 /**
+ * The audit target of a fire settled without a dispatch record that parses:
+ * its schedule's target kind as the store reads it.
+ */
+function scheduleAuditTarget(
+  schedule: Schedule | null,
+): ScheduleTickAuditEvent['target'] | undefined {
+  const type: unknown = schedule?.target.type;
+  return type === 'workflow' || type === 'agent' ? type : undefined;
+}
+
+/**
  * Age at which a lookup's 404 decides a threadless agent start the target did
  * not refuse. The tick sends a start only at its fire, and the target commits
  * an admitted start's run ownership, or its start recovery resolves the start,
@@ -972,12 +994,21 @@ export function createScheduleTick(
       ref.runId,
     );
 
+  /**
+   * Settles as `failed` (`invalid-deferred-dispatch`) a deferred fire whose
+   * stored dispatch can be neither sent again nor decided by a lookup, counts
+   * it, and audits it with the stored dispatch's target when it parsed, or
+   * else its schedule's. A failed write counts the fire as deferred and
+   * audits nothing.
+   */
   const settleMalformedDispatch = async (
     trigger: ScheduleTrigger,
     result: ScheduleTickResult,
     error = 'stored deferred dispatch is malformed',
     recorded: Record<string, unknown> = {},
+    target?: ScheduleTickAuditEvent['target'],
   ): Promise<void> => {
+    const runId = trigger.runId ?? undefined;
     try {
       await store.recordTrigger({
         ...trigger,
@@ -988,16 +1019,49 @@ export function createScheduleTick(
           ...recorded,
         }),
       });
-      result.failed += 1;
-      result.reconciled += 1;
     } catch (bookkeepingError) {
       result.deferred += 1;
+      logBookkeepingError(trigger.scheduleId, runId, bookkeepingError);
+      return;
+    }
+    result.failed += 1;
+    result.reconciled += 1;
+    if (!options.audit) return;
+    let auditTarget = target;
+    if (auditTarget === undefined) {
+      try {
+        auditTarget = scheduleAuditTarget(
+          await store.getSchedule(trigger.scheduleId),
+        );
+      } catch (readError) {
+        logBookkeepingError(
+          trigger.scheduleId,
+          runId,
+          `the fire is not audited: its schedule cannot be read: ${
+            readError instanceof Error ? readError.message : String(readError)
+          }`,
+        );
+        return;
+      }
+    }
+    if (auditTarget === undefined) {
       logBookkeepingError(
         trigger.scheduleId,
-        trigger.runId ?? undefined,
-        bookkeepingError,
+        runId,
+        'the fire is not audited: its schedule target is unavailable',
       );
+      return;
     }
+    await auditOrLog(
+      {
+        scheduleId: trigger.scheduleId,
+        target: auditTarget,
+        outcome: 'failed',
+        reason: 'invalid-deferred-dispatch',
+        ...(runId === undefined ? {} : { runId }),
+      },
+      runId,
+    );
   };
 
   const reconcileDeferred = async (
@@ -1032,6 +1096,7 @@ export function createScheduleTick(
                   ? lookupError.message
                   : String(lookupError),
             },
+            stored.ref.target,
           );
           continue;
         }
