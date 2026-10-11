@@ -5813,13 +5813,43 @@ describe('RunnerRuntime run lifecycle', () => {
     ).resolves.toBe(false);
     releasePreparation();
 
-    // #then the resume is refused and its leg's abort names the transition
+    // #then the resume is refused as a run that is ending with that
+    // transition, and its leg's abort names the transition
     await expect(resuming).rejects.toMatchObject({
       name: 'RunTerminalConflictError',
+      message: new RunTerminalConflictError(
+        'held-workflow',
+        runId,
+        status,
+        'ending',
+      ).message,
     });
     expect(legAbort.signal.reason).toMatchObject({
       name: 'AbortError',
       cause: { name },
+    });
+  });
+
+  it('reports a run with no recorded cancellation or timeout when its terminal cleanup is requested', async () => {
+    // #given a run suspended at its step
+    const { runtime } = heldRuntime({ suspendFirst: true });
+    const runId = 'cleanup-not-ended';
+    await runtime.start('held-workflow', { runId, inputData: {} });
+
+    // #when terminal cleanup is requested for it
+    const cleanup = runtime.completeTerminalCleanup('held-workflow', runId, 0);
+
+    // #then the 409 conflict says no terminal transition is recorded and
+    // names the run's status
+    await expect(cleanup).rejects.toMatchObject({
+      name: 'RunTerminalConflictError',
+      status: 409,
+      message: new RunTerminalConflictError(
+        'held-workflow',
+        runId,
+        'suspended',
+        'no-terminal-transition',
+      ).message,
     });
   });
 
@@ -6112,10 +6142,47 @@ describe('RunnerRuntime run lifecycle', () => {
     await expect(starting).resolves.toMatchObject({ status: 'success' });
     await expect(cancellation).rejects.toMatchObject({
       name: 'RunTerminalConflictError',
+      message: new RunTerminalConflictError(
+        'reconcile-lock',
+        'reconcile-race',
+        'success',
+      ).message,
     });
     await expect(
       runtime.status('reconcile-lock', 'reconcile-race'),
     ).resolves.toMatchObject({ status: 'success' });
+  });
+});
+
+describe('RunTerminalConflictError', () => {
+  it.each([
+    ['terminal', 'cancelled', "is already terminal with status 'cancelled'"],
+    ['ending', 'timed_out', "is ending with status 'timed_out'"],
+    [
+      'leg-running',
+      'running',
+      "has a leg running in this runtime with status 'running'",
+    ],
+    [
+      'no-terminal-transition',
+      'success',
+      "has no recorded cancellation or timeout with status 'success'",
+    ],
+  ] as const)('states the %s condition with the run status', (conflict, runStatus, condition) => {
+    // #given a conflict naming that condition
+    const error = new RunTerminalConflictError(
+      'wf-1',
+      'run-1',
+      runStatus,
+      conflict,
+    );
+
+    // #then the 409 message names the run, its workflow, the condition and
+    // the status
+    expect(error).toMatchObject({
+      status: 409,
+      message: `run 'run-1' of workflow 'wf-1' ${condition}`,
+    });
   });
 });
 

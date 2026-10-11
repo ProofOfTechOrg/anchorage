@@ -1,0 +1,5 @@
+---
+'@proofoftech/flowsafe': patch
+---
+
+`RunTerminalConflictError` states the condition that refused the call instead of reporting every refusal as an ended run. A resume refused because a cancellation or timeout is recorded but has not yet ended the run reads `run '<runId>' of workflow '<workflowId>' is ending with status 'cancelled'` (or `'timed_out'`); before, it read `is already terminal` with the run's stored status, such as `'suspended'`. An approval decision whose resume runs in process through `resumeViaRuntime(runtime)` and races a cancellation or timeout reports that message in `DecideResult.resume.error`. Terminal cleanup requested for a run with no recorded cancellation or timeout reads `run '<runId>' of workflow '<workflowId>' has no recorded cancellation or timeout with status '<status>'`. A refusal for a run that has ended keeps `run '<runId>' of workflow '<workflowId>' is already terminal with status '<status>'`. The status stays `409`, and the constructor takes an optional fourth argument naming the condition: `'terminal'` (the default), `'ending'`, `'leg-running'` or `'no-terminal-transition'`.

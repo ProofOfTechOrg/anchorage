@@ -246,16 +246,33 @@ export class RunAlreadyExistsError extends Error {
   }
 }
 
+const RUN_CONFLICT_CONDITIONS = {
+  terminal: 'is already terminal',
+  ending: 'is ending',
+  'leg-running': 'has a leg running in this runtime',
+  'no-terminal-transition': 'has no recorded cancellation or timeout',
+} as const;
+
 /**
  * A leg, terminal transition or terminal cleanup that the run's lifecycle
- * state does not admit: 409.
+ * state does not admit: 409. `conflict` picks the condition the message
+ * states; the default reports an ended run.
  */
 export class RunTerminalConflictError extends Error {
   readonly status = 409;
 
-  constructor(workflowId: string, runId: string, runStatus: RunStatus) {
+  constructor(
+    workflowId: string,
+    runId: string,
+    runStatus: RunStatus,
+    conflict:
+      | 'terminal'
+      | 'ending'
+      | 'leg-running'
+      | 'no-terminal-transition' = 'terminal',
+  ) {
     super(
-      `run '${runId}' of workflow '${workflowId}' is already terminal with status '${runStatus}'`,
+      `run '${runId}' of workflow '${workflowId}' ${RUN_CONFLICT_CONDITIONS[conflict]} with status '${runStatus}'`,
     );
     this.name = 'RunTerminalConflictError';
   }
@@ -2000,7 +2017,12 @@ export class RunnerRuntime {
       const activeKey = this.#runKey(workflowId, runId);
       const active: ActiveRun = legAbort ? { legAbort } : {};
       if (this.#activeRuns.has(activeKey))
-        throw new RunTerminalConflictError(workflowId, runId, 'running');
+        throw new RunTerminalConflictError(
+          workflowId,
+          runId,
+          'running',
+          'leg-running',
+        );
       const leaveLeg = this.#registerLeg(activeKey, active, workflowId, runId);
       let provenance: RunProvenance | undefined;
       let engineEntered = false;
@@ -2058,10 +2080,19 @@ export class RunnerRuntime {
             // cancel to cut, so its abort names the run's end the way a cut
             // leg's does.
             if (ending) legAbort?.abort(terminalLegAbortReason(ending));
+            if (ending && !currentLifecycle?.terminal) {
+              throw new RunTerminalConflictError(
+                workflowId,
+                runId,
+                ending,
+                'ending',
+              );
+            }
             throw new RunTerminalConflictError(
               workflowId,
               runId,
               current.status as RunStatus,
+              ending ? 'terminal' : 'leg-running',
             );
           }
           active.lifecycle = effectiveLifecycle(
@@ -2522,6 +2553,7 @@ export class RunnerRuntime {
           workflowId,
           runId,
           state.status as RunStatus,
+          'no-terminal-transition',
         );
       }
       if (lifecycle.terminal.cleanupCompletedAt !== undefined) {
