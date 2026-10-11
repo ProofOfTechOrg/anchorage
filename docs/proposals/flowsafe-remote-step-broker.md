@@ -121,7 +121,116 @@ For the shared protocol and migration checkpoint, run the owning package's whole
 
 The implementation is auth, migration, data-retention, and concurrency work. Each code checkpoint is T2: clean-code, QA, architecture, and security lanes. This plan gets one design-level review when added; reviewers do not simulate its commands. A change to this plan after implementation starts records the departure once at completion. Merge a reviewed feature branch into `dev`, not `main`; publish only through Anchorage's version workflow.
 
+## Addendum: bind remote steps to the started resource
+
+Baseline for this addendum: `plan/flowsafe-remote-step-broker` at `3c286b84a25564e2ae604da70dbae3a27f1ffe3e`, read 2026-10-11. Reconfirm the appendix anchors before editing. A host's `ActorContext.resourceIdFromKey(threadId)` may return a resource distinct from the thread ID. The current remote-step journal compares its address with the package default `resourceIdFromKey(threadId)`, while start provenance records only the thread ID. This prevents a valid host mapping from dispatching and leaves no independent start-time resource proof for a journal row.
+
+Implement this before enabling remote-step dispatch or result continuation:
+
+1. Record the effective `resourceId` at agent start in versioned, durable start provenance. The topology resolves its trusted `ActorContext.resourceIdFromKey(threadId)` once for the winning start and sends that value with the internal start. Threaded starts use the selected thread; unthreaded starts use the newly minted thread. Persist the value in the reservation claim and result, runtime snapshot, and host recovery record. A caller-supplied address does not establish this binding.
+2. Inject a host-owned resource resolver into `ThreadAgentHostOptions`, wired from the same deployment mapping as the topology. The target host has no `ActorContext`; it must independently resolve and compare the received resource at start and its binding read, `selectedAgentState`, owner recovery, normal status, termination, and approval or remote resume paths. Update `FlowsafeDurableAgent.authoritativeAgentStartState` to select and compare the persisted start resource rather than deriving it from the thread. Update topology replay and `publicApproval`/`publicAgentRunEnvelope` projections to compare the persisted target resource with the expected run resource. Audit the same start identity checks in `StartIdempotencyStore`, fenced workflow admission, and runtime reconstruction. A changed mapping or missing proof refuses broker authority without silently rewriting the run's binding.
+3. Make the authoritative start state expose the recorded resource alongside agent, thread, owner, workflow, run, and start token. At journal registration, permit claim and consume, result recording, and recovery, compare the complete persisted binding against the invocation. The thread host independently checks that same binding before resume. Require the currently trusted topology mapping and stored host binding to agree with the start-time value. Do not substitute the package default mapping for the host's mapping.
+4. Upgrade existing snapshots, reservations, and journal state through the repository's versioned D1 and durable-state patterns. A legacy run may proceed only when an independently persisted, run-specific host binding proves its resource ID and agrees with its start token, owner, thread, and run. Otherwise keep it unreadable for remote-step authority and visible to recovery or drain inventory. Do not synthesize a missing resource ID from a thread ID, current mapper, or caller address; do not add a permissive schema default. A mixed old/new deployment must refuse remote-step dispatch until both sides understand the new binding. Existing non-broker run status and ordinary approval resume retain their current compatibility behavior.
+5. Test a host mapping such as `thread-1 → account-7` across both threaded and unthreaded starts, fresh-host restart, registration, permit consume, result intake, and resume. Test a changed mapper, a mismatched journal resource, a forged caller resource, a legacy start without independent proof, and a corrupted stored binding. Each refusal must occur before an external effect or resume. Use a real D1/workerd path for the upgrade and fresh-isolate case; in-memory mocks alone do not prove it.
+
+The chosen authority is the persisted start binding checked again by the trusted host. Reject using `resourceIdFromKey(threadId)` inside the journal: it is the package's identity validator, not the host's resource mapping. Reject trusting the journal's resource column or current mapping alone: either can differ from the resource at start. Reject deriving legacy values from thread IDs: a valid host can map them to different resources. This extends the existing start identity and journal boundary; it adds no dependency, public route, or new authentication scheme.
+
+Reuse `createAgentThreadTopology`'s `expectedResource` and `sendStart`, the thread host's `snapshotExecutionFor` and owner recovery, `RunnerRuntime.authoritativeStartState`, `StartReservationStore`'s staged schema migration, and `RemoteStepJournal.#execution`. Existing `packages/flowsafe/scripts/spike-verify.mjs` drives `packages/flowsafe/spike/worker.ts` on real workerd and D1, including process kill and restart. Extend that pair with an `FR1` resource-binding scenario; the current script has no such proof. Keep WFP grant policy, customer identities, external executor credentials, and ordinary approval semantics out of this change. Do not change the host's resource mapping for existing users as a migration shortcut.
+
+Scoped verification for the binding checkpoint, with each command's full output and exit status recorded in a new `/tmp` log:
+
+```bash
+pnpm --filter @proofoftech/flowsafe exec vitest run src/agent-host/thread-topology.test.ts src/agent-host/thread-host.test.ts src/do-runner/remote-step-journal.test.ts src/do-runner/start-idempotency.test.ts src/do-runner/execution-admission.test.ts
+pnpm --filter @proofoftech/flowsafe typecheck
+pnpm --filter @proofoftech/flowsafe build
+pnpm --filter @proofoftech/flowsafe spike:verify
+```
+
+The `spike:verify` command must execute the new `FR1` scenario in `spike-verify.mjs`, backed by the spike worker's thread host and journal. `FR1` starts a remote-step run under a non-identity mapping, kills workerd, verifies the port is closed, restarts on the same D1, then registers, consumes a permit, records a result, and resumes through the target host. It also seeds a pre-upgrade start without independent resource proof and asserts refusal before permit or resume. Check the named `FR1` pass and refusal observations in that command's log; an unchanged spike run does not satisfy this gate. Because the start identity and D1 schema are shared contracts, run the FlowSafe package suite once at that checkpoint under the quality-gate exception. Run T2 clean-code, QA, architecture, and security lanes on its actual diff and in-reach start, host, runtime, journal, and migration contracts. The final repository suite and release gate remain as stated above.
+
 ## Appendix: current-state anchors
+
+### Resource authority
+
+These snippets are verbatim at the addendum baseline. They identify risky auth and migration edits; re-read the containing symbols before changing them.
+
+`packages/flowsafe/src/do-runner/execution-admission.ts`, `StartIdentity` currently records an agent target without its resource:
+
+```typescript
+    | {
+        readonly kind: 'agent';
+        readonly id: string;
+        readonly threadId: string;
+      };
+```
+
+After: add a required, path-safe `resourceId` to the versioned agent target and propagate it through normalization, serialization, replay, and authoritative start reads. Legacy records without separately proved binding refuse broker authority.
+
+`packages/flowsafe/src/agent-host/thread-topology.ts`, `sendStart` currently resolves the resource again when sending to the target host:
+
+```typescript
+                threadId: targetThreadId,
+                resourceId: context.resourceIdFromKey(targetThreadId),
+                runId: targetRunId,
+```
+
+After: capture the trusted mapping with the start decision and pass that exact resource into the host, reservation, and persisted start provenance. On a replay, verify the winning reservation's recorded resource before sending; a new mapping must not silently change the run's resource.
+
+`packages/flowsafe/src/agent-host/thread-host.ts`, normal start, selection, and recovery currently compare against the package default instead of a host-owned mapping:
+
+```typescript
+if (ref.resourceId !== resourceIdFromKey(scope.threadId))
+  throw new AgentHostRequestError(404, 'run not found');
+```
+
+The selector uses the same condition; owner recovery compares `stored.resourceId !== resourceIdFromKey(threadId)`. After: inject the deployment's trusted resolver through `ThreadAgentHostOptions`, validate and capture its output, and compare it with the persisted start identity and stored binding at each entry. Keep this check independent of the received internal request.
+
+`packages/flowsafe/src/agent-runner/durable-agent-runner.ts`, `authoritativeAgentStartState` currently derives the observed resource:
+
+```typescript
+const observedAgentId = identity.target.id;
+const observedThreadId = identity.target.threadId;
+const observedResourceId = resourceIdFromKey(observedThreadId);
+```
+
+After: read `observedResourceId` from the validated, versioned start identity and compare the snapshot's context and memory against it. Ordinary legacy reads retain their explicit compatibility path; a legacy record cannot obtain broker authority without independent proof.
+
+`packages/flowsafe/src/agent-host/thread-topology.ts`, `publicApproval` currently rejects a resource that differs from the default mapping:
+
+```typescript
+target.agentId !== execution.target.id ||
+target.threadId !== execution.target.threadId ||
+target.resourceId !== resourceIdFromKey(target.threadId)
+```
+
+After: compare the approval target and replay envelope with `execution.target.resourceId`, then separately compare that persisted value with the topology's current trusted mapping before admission.
+
+`packages/flowsafe/src/do-runner/remote-step-journal.ts`, `RemoteStepJournal.#execution` currently checks:
+
+```typescript
+      target.id !== address.agentId ||
+      target.threadId !== address.threadId ||
+      (principal !== undefined &&
+        (state.provenance.startIdentity?.owner.kind !== principal.kind ||
+          state.provenance.startIdentity.owner.id !== principal.id)) ||
+      state.execution.tablePrefix !== address.tablePrefix ||
+      address.resourceId !== resourceIdFromKey(address.threadId)
+```
+
+After: compare `address.resourceId` with the resource recorded in authoritative start provenance. Reject absent or conflicting provenance before an invocation, permit, result, or resume obtains authority. `RemoteStepJournal.register` currently accepts the address and principal as inputs; they remain claims until this check succeeds.
+
+`packages/flowsafe/src/agent-host/thread-host.ts`, the remote-result route currently checks the start target but not its resource:
+
+```typescript
+            state.execution.target.kind !== 'agent' ||
+            state.execution.target.id !== invocation.agentId ||
+            state.execution.target.threadId !== invocation.threadId ||
+            state.execution.owner.kind !== invocation.principal.kind ||
+```
+
+After: compare the persisted start resource, invocation resource, stored host binding, and trusted mapping before `withExecution` and `resumeViaRuntime`. Refuse on any missing or unequal value. Keep the stored principal and exact suspension checks that follow.
+
+### Earlier proposal anchors
 
 These are verbatim at the baseline commit. Reconfirm them before applying the plan.
 
