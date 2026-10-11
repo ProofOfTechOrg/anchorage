@@ -19,6 +19,7 @@ import { RunRouteError } from '../host-kit/run-route-error.js';
 import {
   type AgentThreadDispatchTopology,
   createAgentThreadTopology,
+  type RemoteStepContinuationReader,
 } from './thread-topology.js';
 
 const DEPLOYMENT_IDENTITY_SECRET = 'test-deployment-identity-secret-0001';
@@ -29,7 +30,7 @@ interface Hit {
   init?: ThreadRequestInit;
 }
 
-function harness(): {
+function harness(remoteSteps?: RemoteStepContinuationReader): {
   topology: AgentThreadDispatchTopology;
   hits: Hit[];
 } {
@@ -50,7 +51,7 @@ function harness(): {
             summary: { runId: body.runId, status: 'success' },
           });
         }
-        if (url.endsWith('/resume')) {
+        if (url.endsWith('/resume') || url.endsWith('/remote-step-resume')) {
           const body = JSON.parse(init?.body ?? '{}') as Record<string, string>;
           return Response.json({
             agentId: body.agentId,
@@ -92,10 +93,58 @@ function harness(): {
     topology: createAgentThreadTopology(namespace, DEPLOYMENT_IDENTITY_SECRET, {
       startIdempotency: 'none',
       executionFence: 'none',
+      ...(remoteSteps ? { remoteSteps } : {}),
     }),
     hits,
   };
 }
+
+it('routes a retained result under the journaled principal and sends only its id', async () => {
+  const principal = {
+    kind: 'human' as const,
+    id: 'original',
+    role: 'operator' as const,
+  };
+  const reader: RemoteStepContinuationReader = {
+    deploymentId: 'deployment',
+    tablePrefix: '',
+    get: vi.fn(async () => ({
+      invocationId: 'invocation_1',
+      deploymentId: 'deployment',
+      tablePrefix: '',
+      workflowId: 'durable-agentic-loop',
+      agentId: 'writer',
+      threadId: 'acme_thread',
+      resourceId: 'acme_resource_acme_thread',
+      runId: 'acme_run',
+      principal,
+      startToken: 'generation',
+      stepPath: ['tool'],
+      suspendedAt: 1000,
+      request: {},
+      deadlineAt: 9999999999999,
+      status: 'result-retained' as const,
+      permitGeneration: 1,
+    })),
+    readRetainedResult: vi.fn(async () => ({
+      invocationId: 'invocation_1',
+      resultJson: '{"answer":1}',
+      resultDigest: 'digest',
+      quiescenceDigest: 'evidence',
+      executorQuiescentAt: 1000,
+    })),
+  };
+  const { topology, hits } = harness(reader);
+  await topology.resumeRemoteStep(context().value, 'invocation_1');
+  const sent = hits[0];
+  expect(sent?.url).toContain('/_flowsafe/agent-host/remote-step-resume');
+  expect(JSON.parse(sent?.init?.body ?? '{}')).toEqual({
+    invocationId: 'invocation_1',
+  });
+  expect(sent?.init?.headers?.['x-flowsafe-principal']).toBe(
+    '{"kind":"human","id":"original","role":"operator"}',
+  );
+});
 
 function context() {
   let runMints = 0;

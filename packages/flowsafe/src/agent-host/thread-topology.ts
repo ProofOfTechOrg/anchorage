@@ -30,6 +30,10 @@ import {
   type StartReservation,
   type StartReservationReading,
 } from '../do-runner/index.js';
+import type {
+  RecordedRemoteStepResult,
+  RemoteStepInvocation,
+} from '../do-runner/remote-step-journal.js';
 import {
   isTerminalRunStatus,
   type RunStatus,
@@ -120,6 +124,16 @@ export interface AgentThreadTopologyOptions {
    * for a host with no fence.
    */
   executionFence: ExecutionFenceWiring;
+  remoteSteps?: RemoteStepContinuationReader;
+}
+
+export interface RemoteStepContinuationReader {
+  deploymentId: string;
+  tablePrefix: string;
+  get(invocationId: string): Promise<RemoteStepInvocation | undefined>;
+  readRetainedResult(
+    invocationId: string,
+  ): Promise<RecordedRemoteStepResult | undefined>;
 }
 
 export interface AgentThreadRunRef {
@@ -181,6 +195,10 @@ export interface AgentThreadDispatchTopology extends AgentThreadBoundTopology {
     context: ActorContext,
     input: AgentThreadRunRef,
   ): Promise<AgentRunEnvelope | undefined>;
+  resumeRemoteStep(
+    context: ActorContext,
+    invocationId: string,
+  ): Promise<AgentRunEnvelope>;
 }
 
 function errorFrom(response: Response): Promise<RunRouteError> {
@@ -733,6 +751,37 @@ export function createAgentThreadTopology<Id>(
               entryPath: 'approval.resume',
               requestedBy: record.decidedBy,
             }),
+          },
+        ),
+      );
+    },
+    resumeRemoteStep: async (context, invocationId) => {
+      const reader = options.remoteSteps;
+      if (!reader) throw new RunRouteError(503, 'remote steps are unavailable');
+      if (!isPathSafeId(invocationId))
+        throw new RunRouteError(404, 'invocation not found');
+      const invocation = await reader.get(invocationId);
+      if (
+        invocation?.status !== 'result-retained' ||
+        invocation.deploymentId !== reader.deploymentId ||
+        invocation.tablePrefix !== reader.tablePrefix ||
+        !isPathSafeId(invocation.agentId) ||
+        !isPathSafeId(invocation.runId) ||
+        !(await reader.readRetainedResult(invocationId))
+      )
+        throw new RunRouteError(404, 'invocation not found');
+      return envelope(
+        await threads.send(
+          {
+            principal: invocation.principal,
+            mutationEpoch: context.mutationEpoch,
+          },
+          invocation.threadId,
+          `${AGENT_HOST_ROUTE_PREFIX}/remote-step-resume`,
+          {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ invocationId }),
           },
         ),
       );

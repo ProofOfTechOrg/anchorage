@@ -49,6 +49,7 @@ import {
   resourceIdFromKey,
   SUSPENSION_TIMEOUT_RESUME_KEY,
 } from '../do-runner/index.js';
+import { REMOTE_STEP_MARKER } from '../do-runner/remote-step-journal.js';
 import { runInputDepthMessage } from '../do-runner/run-input-depth.js';
 import { lifecycleFromRequestContext } from '../do-runner/run-lifecycle.js';
 import {
@@ -63,7 +64,10 @@ import {
   type PrincipalPermissionResolver,
   type ThreadAgentStartInput,
 } from './thread-host.js';
-import { createAgentThreadTopology } from './thread-topology.js';
+import {
+  createAgentThreadTopology,
+  type RemoteStepContinuationReader,
+} from './thread-topology.js';
 import type { AgentAutomationRule, Permission } from './types.js';
 
 const mocked = vi.hoisted(() => ({
@@ -264,6 +268,7 @@ function harness(
       dispatchId: string,
       runId: string,
     ) => Promise<void>;
+    remoteSteps?: RemoteStepContinuationReader;
   } = {},
 ): Harness {
   const state = new Map<string, unknown>();
@@ -425,13 +430,13 @@ function harness(
             : undefined;
         return {
           kind: summary.status === 'pending' ? 'initial' : 'result',
-          storage: 'unfenced',
+          storage: options.remoteSteps ? 'd1' : 'unfenced',
           execution: (
             state.get(OWNER_RECOVERY_PREFIX + runId) as
               | { execution?: unknown }
               | undefined
           )?.execution ?? {
-            tablePrefix: null,
+            tablePrefix: options.remoteSteps?.tablePrefix ?? null,
             workflowId: 'durable-agentic-loop',
             runId,
             startToken: 'test-generation',
@@ -529,6 +534,7 @@ function harness(
     ...(options.discardScheduleDispatch
       ? { discardScheduleDispatch: options.discardScheduleDispatch }
       : {}),
+    ...(options.remoteSteps ? { remoteSteps: options.remoteSteps } : {}),
     approvalService: (instanceScope) => {
       approvalScopes.push(instanceScope);
       if (options.approvalService) return options.approvalService;
@@ -3952,6 +3958,108 @@ describe('createThreadAgentHost', () => {
       'init',
       'threadId',
     ]);
+  });
+
+  it('resumes a retained remote result for its stored run and suspension', async () => {
+    const principal: ExecutionPrincipal = {
+      kind: 'human',
+      id: 'operator-1',
+      role: 'operator',
+    };
+    const reader: RemoteStepContinuationReader = {
+      deploymentId: 'deployment',
+      tablePrefix: '',
+      get: vi.fn(async () => ({
+        invocationId: 'invocation_1',
+        deploymentId: 'deployment',
+        tablePrefix: '',
+        workflowId: 'durable-agentic-loop',
+        agentId: 'writer',
+        threadId: 'acme_thread',
+        resourceId: RESOURCE_ID,
+        runId: 'acme_run',
+        principal,
+        startToken: 'test-generation',
+        stepPath: ['tool'],
+        suspendedAt: 1000,
+        request: {},
+        deadlineAt: 9999999999999,
+        status: 'result-retained' as const,
+        permitGeneration: 1,
+      })),
+      readRetainedResult: vi.fn(async () => ({
+        invocationId: 'invocation_1',
+        resultJson: '{"answer":1}',
+        resultDigest: 'digest',
+        quiescenceDigest: 'evidence',
+        executorQuiescentAt: 1000,
+      })),
+    };
+    const fixture = harness(['writer'], { remoteSteps: reader });
+    seedSuspendedApprovalRun(fixture);
+    fixture.setSummary({
+      runId: 'acme_run',
+      status: 'suspended',
+      suspended: [['tool']],
+      suspendedAt: { tool: 1000 },
+      suspendPayload: {
+        tool: {
+          type: 'suspension',
+          toolCallSuspended: { remoteStep: REMOTE_STEP_MARKER },
+        },
+      },
+    });
+    mocked.resumeViaRuntime.mockResolvedValue({
+      runId: 'acme_run',
+      status: 'suspended',
+      suspended: [['next']],
+    });
+    const request = new Request(
+      'https://thread/_flowsafe/agent-host/remote-step-resume',
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          invocationId: 'invocation_1',
+          resultJson: '{"answer":999}',
+        }),
+      },
+    );
+    const response = await fixture.host.route(request, fixture.scope);
+    expect(response?.status).toBe(200);
+    expect(mocked.resumeViaRuntime).toHaveBeenCalledWith(
+      expect.objectContaining({
+        runId: 'acme_run',
+        requestedBy: 'operator-1',
+        step: ['tool'],
+        resumeData: { answer: 1 },
+        expectedSuspension: { suspendedAt: 1000 },
+      }),
+    );
+
+    mocked.resumeViaRuntime.mockClear();
+    fixture.setSummary({
+      runId: 'acme_run',
+      status: 'suspended',
+      suspended: [['tool']],
+      suspendedAt: { tool: 1001 },
+      suspendPayload: {
+        tool: {
+          type: 'suspension',
+          toolCallSuspended: { remoteStep: REMOTE_STEP_MARKER },
+        },
+      },
+    });
+    await expect(
+      fixture.host.route(
+        new Request('https://thread/_flowsafe/agent-host/remote-step-resume', {
+          method: 'POST',
+          body: JSON.stringify({ invocationId: 'invocation_1' }),
+        }),
+        fixture.scope,
+      ),
+    ).rejects.toMatchObject({ status: 409 });
+    expect(mocked.resumeViaRuntime).not.toHaveBeenCalled();
   });
 
   it('accepts an approval-resume requester exactly at the principal-id bound', async () => {

@@ -82,6 +82,7 @@ import {
 } from '../do-runner/index.js';
 import { isDefinitiveInitialAdmissionRefusal } from '../do-runner/initial-admission-refusal.js';
 import { mastraRegistryEntries } from '../do-runner/mastra-registry.js';
+import { REMOTE_STEP_MARKER } from '../do-runner/remote-step-journal.js';
 import {
   exceedsRunInputDepth,
   runInputDepthMessage,
@@ -113,6 +114,7 @@ import { createAgentModuleCatalog } from './catalog.js';
 import {
   AGENT_HOST_ROUTE_PREFIX,
   publicAgentRunEnvelope,
+  type RemoteStepContinuationReader,
 } from './thread-topology.js';
 import {
   createTrustedAgentRequestContext,
@@ -171,6 +173,7 @@ export type {
 } from './types.js';
 
 export interface ThreadAgentHostOptions {
+  remoteSteps?: RemoteStepContinuationReader;
   /** Narrows automated entry beyond what each agent's metadata declares. */
   authorizeAutomatedEntry?: AutomatedEntryAuthorizer;
   /**
@@ -2588,6 +2591,12 @@ export function createThreadAgentHost(
         preflightUrl.pathname === `${AGENT_HOST_ROUTE_PREFIX}/resume`
           ? await objectBody(request)
           : undefined;
+      const remoteStepBody =
+        request.method === 'POST' &&
+        preflightUrl.pathname ===
+          `${AGENT_HOST_ROUTE_PREFIX}/remote-step-resume`
+          ? await objectBody(request)
+          : undefined;
       return withDispatchLock(async () => {
         const url = new URL(request.url);
 
@@ -2691,6 +2700,150 @@ export function createThreadAgentHost(
                 : {}),
             }),
           );
+        }
+
+        if (remoteStepBody) {
+          const reader = options.remoteSteps;
+          if (!reader)
+            throw new AgentHostRequestError(
+              503,
+              'remote steps are unavailable',
+            );
+          const invocationId = remoteStepBody.invocationId;
+          if (!isPathSafeId(invocationId))
+            throw new AgentHostRequestError(404, 'invocation not found');
+          const invocation = await reader.get(invocationId);
+          const retained = await reader.readRetainedResult(invocationId);
+          if (
+            !invocation ||
+            !retained ||
+            retained.invocationId !== invocationId ||
+            invocation.status !== 'result-retained' ||
+            invocation.deploymentId !== reader.deploymentId ||
+            invocation.tablePrefix !== reader.tablePrefix ||
+            invocation.threadId !== scope.threadId ||
+            !samePrincipal(invocation.principal, scope.principal) ||
+            invocation.deadlineAt <= Date.now()
+          )
+            throw new AgentHostRequestError(404, 'invocation not found');
+          const ref = {
+            agentId: invocation.agentId,
+            resourceId: invocation.resourceId,
+            runId: invocation.runId,
+          };
+          const selected = await snapshotExecutionFor(scope, ref);
+          const state = selected.state;
+          if (
+            state.kind !== 'result' ||
+            state.storage !== 'd1' ||
+            state.execution.tablePrefix !== invocation.tablePrefix ||
+            state.execution.workflowId !== invocation.workflowId ||
+            state.execution.startToken !== invocation.startToken ||
+            state.execution.target.kind !== 'agent' ||
+            state.execution.target.id !== invocation.agentId ||
+            state.execution.target.threadId !== invocation.threadId ||
+            state.execution.owner.kind !== invocation.principal.kind ||
+            state.execution.owner.id !== invocation.principal.id
+          )
+            throw new AgentHostRequestError(409, 'remote step run changed');
+          const stored = await readRun(ref.runId);
+          if (
+            !stored ||
+            stored.agentId !== ref.agentId ||
+            !samePrincipal(stored.principal, invocation.principal)
+          )
+            throw new AgentHostRequestError(404, 'run not found');
+          const key = invocation.stepPath.join('.');
+          const summary = state.summary;
+          const payload =
+            summary.suspendPayload !== null &&
+            typeof summary.suspendPayload === 'object' &&
+            !Array.isArray(summary.suspendPayload)
+              ? (summary.suspendPayload as Record<string, unknown>)[key]
+              : undefined;
+          const suspended =
+            payload !== null && typeof payload === 'object'
+              ? (payload as Record<string, unknown>)
+              : undefined;
+          const tool =
+            suspended?.toolCallSuspended !== null &&
+            typeof suspended?.toolCallSuspended === 'object'
+              ? (suspended.toolCallSuspended as Record<string, unknown>)
+              : undefined;
+          if (
+            summary.status !== 'suspended' ||
+            !summary.suspended?.some(
+              (path) =>
+                JSON.stringify(path) === JSON.stringify(invocation.stepPath),
+            ) ||
+            summary.suspendedAt?.[key] !== invocation.suspendedAt ||
+            summary.resumeCount?.[key] !== invocation.resumeCount ||
+            suspended?.type !== 'suspension' ||
+            tool?.remoteStep !== REMOTE_STEP_MARKER
+          )
+            throw new AgentHostRequestError(
+              409,
+              'remote step suspension changed',
+            );
+          let recordedResult: unknown;
+          try {
+            recordedResult = JSON.parse(retained.resultJson);
+          } catch {
+            throw new AgentHostRequestError(
+              503,
+              'remote step result is unreadable',
+            );
+          }
+          const { current, module, principalPermissions } = await authorize(
+            scope,
+            ref.agentId,
+            'remote-step.resume',
+            stored.principal,
+          );
+          const durable = current.agents.get(module.meta.id);
+          if (!durable) throw new Error('guarded agent was not registered');
+          const execution: TrustedAgentExecution = {
+            agentId: ref.agentId,
+            deploymentTag: scope.deploymentTag,
+            principal: stored.principal,
+            threadId: scope.threadId,
+            resourceId: ref.resourceId,
+            runId: ref.runId,
+            entryPath: 'remote-step.resume',
+            principalPermissions,
+            safeContext: selected.safeContext,
+          };
+          const resumed = await withExecution(execution, () =>
+            durable.resumeViaRuntime({
+              runId: ref.runId,
+              requestedBy: stored.principal.id,
+              step: [...invocation.stepPath],
+              resumeData: recordedResult,
+              expectedSuspension: {
+                suspendedAt: invocation.suspendedAt,
+                ...(invocation.resumeCount === undefined
+                  ? {}
+                  : { resumeCount: invocation.resumeCount }),
+              },
+              ...(selected.threaded
+                ? {
+                    memory: {
+                      thread: scope.threadId,
+                      resource: ref.resourceId,
+                    },
+                  }
+                : {}),
+            }),
+          );
+          const result = await envelopeFor(
+            scope,
+            ref,
+            stored.principal,
+            resumed,
+          );
+          if (isTerminalRunStatus(resumed.status))
+            await finalizeTerminalAgentState(scope, ref, undefined, stored);
+          return json(result);
         }
 
         if (resumeBody) {

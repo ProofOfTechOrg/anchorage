@@ -159,7 +159,7 @@ function automationCheckFor(
     // human approves it — a decided approval and a stranded run. The narrowing
     // that matters is still enforced: a kind removed from the declaration
     // entirely can no longer resume.
-    if (entryPath === 'approval.resume') {
+    if (entryPath === 'approval.resume' || entryPath === 'remote-step.resume') {
       return rules.some((rule) => rule.kind === principal.kind);
     }
     return rules.some(

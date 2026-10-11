@@ -15,6 +15,7 @@ export const AGENT_RUN_STORAGE_KEY_PREFIX = 'flowsafe:agent-run:v1:';
 export const AGENT_ENTRY_PATHS = [
   'http.start',
   'approval.resume',
+  'remote-step.resume',
   'signal.message',
   'signal.queue',
   'signal.reactive',
