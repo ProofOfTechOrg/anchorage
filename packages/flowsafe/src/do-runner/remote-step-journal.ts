@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { EXECUTION_FENCE_TABLE } from '#deployment-identity-protocol';
+import {
+  assertExecutionPrincipal,
+  type ExecutionPrincipal,
+} from '../approval-api/principal.js';
+import { credentialsMatch } from './deployment-identity.js';
 import { DoStatusError } from './do-status-error.js';
 import {
   admitsExistingRun,
@@ -16,12 +21,50 @@ import {
   lifecycleFromRequestContext,
   RUN_LIFECYCLE_CONTEXT_KEY,
 } from './run-lifecycle.js';
+import { isTerminalRunStatus } from './run-terminal-state.js';
 import type { RunnerRuntime, RunSummary } from './runtime.js';
 import { validateTablePrefix } from './table-prefix.js';
 
 export const REMOTE_STEP_TABLE = 'flowsafe_remote_step_invocations';
 export const REMOTE_STEP_MARKER = 'flowsafe.remote-step/v1';
 export const MAX_REMOTE_STEP_REQUEST_BYTES = 16_384;
+export const MAX_REMOTE_STEP_RESULT_BYTES = 16_384;
+
+const SHA256_HEX = /^[a-f0-9]{64}$/;
+const RAW_PERMIT = /^[A-Za-z0-9_-]{43}$/;
+
+function boundedJsonBytes(value: string): void {
+  if (
+    typeof value !== 'string' ||
+    new TextEncoder().encode(value).length > MAX_REMOTE_STEP_RESULT_BYTES
+  )
+    throw new RemoteStepRefusal(400, 'remote step JSON exceeds its limit');
+  try {
+    JSON.parse(value);
+  } catch {
+    throw new RemoteStepRefusal(400, 'remote step JSON is malformed');
+  }
+}
+
+function rawDispatchPermit(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(32));
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary)
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+}
+
+async function sha256Hex(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    'SHA-256',
+    new TextEncoder().encode(value),
+  );
+  return Array.from(new Uint8Array(digest), (byte) =>
+    byte.toString(16).padStart(2, '0'),
+  ).join('');
+}
 
 const SNAPSHOT_EXECUTION_OPEN_SQL = `json_valid(snapshot)
   AND json_type(snapshot, '$.requestContext."${RUN_LIFECYCLE_CONTEXT_KEY}".transitionIntent') IS NULL
@@ -39,12 +82,14 @@ export interface RemoteStepAddress {
 
 export interface RemoteStepInvocation extends RemoteStepAddress {
   invocationId: string;
+  principal: ExecutionPrincipal;
+  startToken: string;
   stepPath: readonly string[];
   suspendedAt: number;
   resumeCount?: number;
   request: unknown;
   deadlineAt: number;
-  status: 'pending' | 'dispatched' | 'failed';
+  status: 'pending' | 'dispatched' | 'result-recorded' | 'settled' | 'failed';
   permitGeneration: number;
   permitEpoch?: number;
   permitRevision?: number;
@@ -60,6 +105,14 @@ export interface RemoteStepPermit {
   expiresAt: number;
 }
 
+export interface RecordedRemoteStepResult {
+  invocationId: string;
+  resultJson: string;
+  resultDigest: string;
+  quiescenceDigest: string;
+  executorQuiescentAt: number;
+}
+
 class RemoteStepRefusal extends DoStatusError {
   readonly status: number;
 
@@ -72,6 +125,8 @@ class RemoteStepRefusal extends DoStatusError {
 
 type JournalRow = {
   invocation_id: string;
+  principal_json: string;
+  start_token: string;
   deployment_id: string;
   table_prefix: string;
   workflow_id: string;
@@ -90,6 +145,11 @@ type JournalRow = {
   permit_revision: number | null;
   permit_expires_at: number | null;
   permit_consumed_at: number | null;
+  permit_digest: string | null;
+  result_json: string | null;
+  result_digest: string | null;
+  quiescence_digest: string | null;
+  executor_quiescent_at: number | null;
 };
 
 function record(value: unknown): Record<string, unknown> | undefined {
@@ -114,6 +174,7 @@ function decode(row: JournalRow): RemoteStepInvocation {
     typeof row.step_path !== 'string' ||
     row.step_path.length > 1_024 ||
     typeof row.request_json !== 'string' ||
+    typeof row.principal_json !== 'string' ||
     new TextEncoder().encode(row.request_json).length >
       MAX_REMOTE_STEP_REQUEST_BYTES ||
     !isPathSafeId(row.deployment_id) ||
@@ -121,7 +182,8 @@ function decode(row: JournalRow): RemoteStepInvocation {
     !isPathSafeId(row.agent_id) ||
     !isPathSafeId(row.thread_id) ||
     !isPathSafeId(row.resource_id) ||
-    !isPathSafeId(row.run_id)
+    !isPathSafeId(row.run_id) ||
+    !isPathSafeId(row.start_token)
   )
     throw new RemoteStepRefusal(503, 'remote step journal is unreadable');
   try {
@@ -131,9 +193,14 @@ function decode(row: JournalRow): RemoteStepInvocation {
   }
   let stepPath: unknown;
   let request: unknown;
+  let principal: ExecutionPrincipal;
   try {
     stepPath = JSON.parse(row.step_path);
     request = JSON.parse(row.request_json);
+    principal = assertExecutionPrincipal(
+      JSON.parse(row.principal_json),
+      'stored remote step principal',
+    );
   } catch {
     throw new RemoteStepRefusal(503, 'remote step journal is unreadable');
   }
@@ -148,11 +215,15 @@ function decode(row: JournalRow): RemoteStepInvocation {
     (row.resume_count !== -1 && row.resume_count < 1) ||
     !Number.isSafeInteger(row.permit_generation) ||
     row.permit_generation < 0 ||
-    !['pending', 'dispatched', 'failed'].includes(row.status)
+    !['pending', 'dispatched', 'result-recorded', 'settled', 'failed'].includes(
+      row.status,
+    )
   )
     throw new RemoteStepRefusal(503, 'remote step journal is unreadable');
   return {
     invocationId: row.invocation_id,
+    principal,
+    startToken: row.start_token,
     deploymentId: row.deployment_id,
     tablePrefix: row.table_prefix,
     workflowId: row.workflow_id,
@@ -245,6 +316,12 @@ export class RemoteStepJournal {
   readonly #deploymentId: string;
   readonly #tablePrefix: string;
   readonly #allowedToolIds: ReadonlySet<string>;
+  readonly #verifyCompletion: (input: {
+    invocation: RemoteStepInvocation;
+    rawPermit: string;
+    resultJson: string;
+    evidenceJson: string;
+  }) => Promise<void>;
 
   constructor(input: {
     db: ExecutionFenceDatabase;
@@ -256,6 +333,12 @@ export class RemoteStepJournal {
     deploymentId: string;
     tablePrefix: string;
     allowedToolIds: readonly string[];
+    verifyCompletion: (input: {
+      invocation: RemoteStepInvocation;
+      rawPermit: string;
+      resultJson: string;
+      evidenceJson: string;
+    }) => Promise<void>;
     now?: () => number;
   }) {
     if (!input.fence.usesDatabase(input.db))
@@ -270,12 +353,15 @@ export class RemoteStepJournal {
       new Set(input.allowedToolIds).size !== input.allowedToolIds.length
     )
       throw new Error('remote step tool ids are malformed');
+    if (typeof input.verifyCompletion !== 'function')
+      throw new Error('remote step completion verifier is required');
     this.#db = input.db;
     this.#fence = input.fence;
     this.#runtime = input.runtime;
     this.#deploymentId = input.deploymentId;
     this.#tablePrefix = input.tablePrefix;
     this.#allowedToolIds = new Set(input.allowedToolIds);
+    this.#verifyCompletion = input.verifyCompletion;
     this.#now = input.now ?? Date.now;
   }
 
@@ -283,6 +369,8 @@ export class RemoteStepJournal {
     await this.#db
       .prepare(`CREATE TABLE IF NOT EXISTS ${REMOTE_STEP_TABLE} (
         invocation_id TEXT PRIMARY KEY,
+        principal_json TEXT NOT NULL,
+        start_token TEXT NOT NULL,
         deployment_id TEXT NOT NULL,
         table_prefix TEXT NOT NULL,
         workflow_id TEXT NOT NULL,
@@ -301,6 +389,11 @@ export class RemoteStepJournal {
         permit_revision INTEGER,
         permit_expires_at INTEGER,
         permit_consumed_at INTEGER,
+        permit_digest TEXT,
+        result_json TEXT,
+        result_digest TEXT,
+        quiescence_digest TEXT,
+        executor_quiescent_at INTEGER,
         UNIQUE (deployment_id, table_prefix, workflow_id, agent_id,
           thread_id, resource_id, run_id, step_path, suspended_at, resume_count)
       )`)
@@ -357,6 +450,7 @@ export class RemoteStepJournal {
   async register(
     address: RemoteStepAddress,
     hostDeadlineAt: number,
+    originalPrincipal: ExecutionPrincipal,
   ): Promise<RemoteStepInvocation> {
     if (
       address.deploymentId !== this.#deploymentId ||
@@ -370,6 +464,16 @@ export class RemoteStepJournal {
     )
       throw new RemoteStepRefusal(400, 'remote step address is malformed');
     validateTablePrefix(address.tablePrefix);
+    let principal: ExecutionPrincipal;
+    try {
+      principal = assertExecutionPrincipal(
+        originalPrincipal,
+        'remote step principal',
+      );
+    } catch {
+      throw new RemoteStepRefusal(400, 'remote step principal is malformed');
+    }
+    const execution = await this.#execution(address, principal);
     const { suspension, snapshot } = await this.#stableSnapshot(address);
     const summary = await this.#runtime.authoritativeStatus(
       address.workflowId,
@@ -385,16 +489,18 @@ export class RemoteStepJournal {
     const stepPath = JSON.stringify(suspension.stepPath);
     await this.#db
       .prepare(`INSERT INTO ${REMOTE_STEP_TABLE} (
-        invocation_id, deployment_id, table_prefix, workflow_id, agent_id,
+        invocation_id, principal_json, start_token, deployment_id, table_prefix, workflow_id, agent_id,
         thread_id, resource_id, run_id, step_path, suspended_at, resume_count,
         request_json, deadline_at, status)
-        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending'
+        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending'
         WHERE EXISTS (SELECT 1 FROM "${address.tablePrefix}mastra_workflow_snapshot"
           WHERE workflow_name = ? AND run_id = ? AND snapshot = ?
             AND ${SNAPSHOT_EXECUTION_OPEN_SQL})
         ON CONFLICT DO NOTHING`)
       .bind(
         invocationId,
+        JSON.stringify(principal),
+        execution.execution.startToken,
         address.deploymentId,
         address.tablePrefix,
         address.workflowId,
@@ -418,7 +524,7 @@ export class RemoteStepJournal {
         WHERE deployment_id = ? AND table_prefix = ? AND workflow_id = ?
           AND agent_id = ? AND thread_id = ? AND resource_id = ? AND run_id = ?
           AND step_path = ? AND suspended_at = ? AND resume_count = ?
-          AND request_json = ?
+          AND request_json = ? AND principal_json = ? AND start_token = ?
           AND EXISTS (SELECT 1 FROM "${address.tablePrefix}mastra_workflow_snapshot"
             WHERE workflow_name = ? AND run_id = ? AND snapshot = ?
               AND ${SNAPSHOT_EXECUTION_OPEN_SQL})
@@ -436,6 +542,8 @@ export class RemoteStepJournal {
         suspension.suspendedAt,
         suspension.resumeCount ?? -1,
         suspension.requestJson,
+        JSON.stringify(principal),
+        execution.execution.startToken,
         address.workflowId,
         address.runId,
         snapshot,
@@ -462,7 +570,7 @@ export class RemoteStepJournal {
     return row ? decode(row) : undefined;
   }
 
-  async #execution(address: RemoteStepAddress) {
+  async #execution(address: RemoteStepAddress, principal?: ExecutionPrincipal) {
     const state = await this.#runtime.authoritativeStartState(
       address.workflowId,
       address.runId,
@@ -476,6 +584,9 @@ export class RemoteStepJournal {
     if (
       target.id !== address.agentId ||
       target.threadId !== address.threadId ||
+      (principal !== undefined &&
+        (state.provenance.startIdentity?.owner.kind !== principal.kind ||
+          state.provenance.startIdentity.owner.id !== principal.id)) ||
       state.execution.tablePrefix !== address.tablePrefix ||
       address.resourceId !== resourceIdFromKey(address.threadId)
     )
@@ -485,7 +596,10 @@ export class RemoteStepJournal {
 
   async #admission(invocation: RemoteStepInvocation, priorBindings: number) {
     const observed = await this.#fence.readForAdmission();
-    const proof = (await this.#execution(invocation)).execution;
+    const proof = (await this.#execution(invocation, invocation.principal))
+      .execution;
+    if (proof.startToken !== invocation.startToken)
+      throw new RemoteStepRefusal(409, 'remote step run generation changed');
     if (!admitsExistingRun(observed.reading, proof))
       throw new RemoteStepRefusal(503, 'remote step execution is fenced');
     const schema = await captureExecutionFenceAdmissionSchema(
@@ -562,7 +676,8 @@ export class RemoteStepJournal {
       .prepare(`UPDATE ${REMOTE_STEP_TABLE} SET
         status = 'dispatched', permit_generation = permit_generation + 1,
         permit_epoch = ?, permit_revision = ?,
-        permit_expires_at = MIN(?, deadline_at), permit_consumed_at = NULL
+        permit_expires_at = MIN(?, deadline_at), permit_consumed_at = NULL,
+        permit_digest = NULL
         WHERE invocation_id = ? AND permit_generation = ? AND deadline_at > ?
           AND status IN ('pending', 'dispatched')
           AND permit_consumed_at IS NULL AND request_json = ?
@@ -597,7 +712,9 @@ export class RemoteStepJournal {
 
   async consumePermit(
     permit: RemoteStepPermit,
-  ): Promise<'accepted' | 'already-consumed'> {
+  ): Promise<
+    { kind: 'accepted'; rawPermit: string } | { kind: 'already-consumed' }
+  > {
     const invocation = await this.get(permit.invocationId);
     if (!invocation) throw new RemoteStepRefusal(404, 'invocation not found');
     if (
@@ -607,7 +724,8 @@ export class RemoteStepJournal {
       invocation.permitExpiresAt !== permit.expiresAt
     )
       throw new RemoteStepRefusal(409, 'remote step permit changed');
-    if (invocation.permitConsumedAt !== undefined) return 'already-consumed';
+    if (invocation.permitConsumedAt !== undefined)
+      return { kind: 'already-consumed' };
     const now = this.#now();
     const { suspension, snapshot } = await this.#stableSnapshot(invocation);
     if (
@@ -618,9 +736,12 @@ export class RemoteStepJournal {
         JSON.stringify(invocation.stepPath)
     )
       throw new RemoteStepRefusal(409, 'remote step suspension changed');
-    const gate = await this.#admission(invocation, 12);
+    const rawPermit = rawDispatchPermit();
+    const permitDigest = await sha256Hex(rawPermit);
+    const gate = await this.#admission(invocation, 13);
     const result = await this.#db
-      .prepare(`UPDATE ${REMOTE_STEP_TABLE} SET permit_consumed_at = ?
+      .prepare(`UPDATE ${REMOTE_STEP_TABLE}
+        SET permit_consumed_at = ?, permit_digest = ?
         WHERE invocation_id = ? AND permit_generation = ?
           AND permit_epoch = ? AND permit_revision = ?
           AND permit_expires_at = ? AND permit_expires_at > ?
@@ -632,6 +753,7 @@ export class RemoteStepJournal {
           AND ${gate.predicate} RETURNING invocation_id`)
       .bind(
         now,
+        permitDigest,
         permit.invocationId,
         permit.generation,
         permit.mutationEpoch,
@@ -646,13 +768,198 @@ export class RemoteStepJournal {
         ...gate.values,
       )
       .all();
-    if (rowResult(result)) return 'accepted';
+    if (rowResult(result)) return { kind: 'accepted', rawPermit };
     const after = await this.get(permit.invocationId);
     if (
       after?.permitGeneration === permit.generation &&
       after.permitConsumedAt !== undefined
     )
-      return 'already-consumed';
+      return { kind: 'already-consumed' };
     throw new RemoteStepRefusal(409, 'remote step permit is unavailable');
+  }
+
+  async recordResult(
+    invocationId: string,
+    rawPermit: string,
+    resultJson: string,
+    evidenceJson: string,
+  ): Promise<
+    | { kind: 'recorded'; resultJson: string; resultDigest: string }
+    | { kind: 'replay'; resultJson: string; resultDigest: string }
+  > {
+    if (!isPathSafeId(invocationId) || !RAW_PERMIT.test(rawPermit))
+      throw new RemoteStepRefusal(
+        400,
+        'remote step result identity is malformed',
+      );
+    boundedJsonBytes(resultJson);
+    boundedJsonBytes(evidenceJson);
+    const stored = rowResult(
+      await this.#db
+        .prepare(`SELECT * FROM ${REMOTE_STEP_TABLE} WHERE invocation_id = ?`)
+        .bind(invocationId)
+        .all(),
+    );
+    if (!stored) throw new RemoteStepRefusal(404, 'invocation not found');
+    const invocation = decode(stored);
+    const permitDigest = stored.permit_digest;
+    if (
+      typeof permitDigest !== 'string' ||
+      !SHA256_HEX.test(permitDigest) ||
+      invocation.permitConsumedAt === undefined
+    )
+      throw new RemoteStepRefusal(409, 'remote step permit was not consumed');
+    const presentedDigest = await sha256Hex(rawPermit);
+    if (!(await credentialsMatch(presentedDigest, permitDigest)))
+      throw new RemoteStepRefusal(403, 'remote step permit is invalid');
+    const resultDigest = await sha256Hex(resultJson);
+    const quiescenceDigest = await sha256Hex(evidenceJson);
+    const replay = (row: JournalRow) => {
+      if (
+        row.result_json !== resultJson ||
+        row.result_digest !== resultDigest ||
+        row.quiescence_digest !== quiescenceDigest ||
+        !positiveTime(row.executor_quiescent_at)
+      )
+        throw new RemoteStepRefusal(409, 'remote step result conflicts');
+      return { kind: 'replay' as const, resultJson, resultDigest };
+    };
+    if (stored.result_json !== null) return replay(stored);
+    await this.#verifyCompletion({
+      invocation,
+      rawPermit,
+      resultJson,
+      evidenceJson,
+    });
+    const result = await this.#db
+      .prepare(`UPDATE ${REMOTE_STEP_TABLE}
+        SET result_json = ?, result_digest = ?, quiescence_digest = ?,
+            executor_quiescent_at = ?, status = 'result-recorded'
+        WHERE invocation_id = ? AND permit_digest = ?
+          AND permit_consumed_at IS NOT NULL AND result_json IS NULL
+          AND status = 'dispatched'
+        RETURNING *`)
+      .bind(
+        resultJson,
+        resultDigest,
+        quiescenceDigest,
+        this.#now(),
+        invocationId,
+        permitDigest,
+      )
+      .all();
+    if (rowResult(result))
+      return { kind: 'recorded', resultJson, resultDigest };
+    const after = rowResult(
+      await this.#db
+        .prepare(`SELECT * FROM ${REMOTE_STEP_TABLE} WHERE invocation_id = ?`)
+        .bind(invocationId)
+        .all(),
+    );
+    if (!after)
+      throw new RemoteStepRefusal(503, 'remote step result is unreadable');
+    return replay(after);
+  }
+
+  async readRecordedResult(
+    invocationId: string,
+  ): Promise<RecordedRemoteStepResult | undefined> {
+    if (!isPathSafeId(invocationId))
+      throw new RemoteStepRefusal(400, 'invocation id is malformed');
+    const row = rowResult(
+      await this.#db
+        .prepare(`SELECT * FROM ${REMOTE_STEP_TABLE} WHERE invocation_id = ?`)
+        .bind(invocationId)
+        .all(),
+    );
+    if (!row) return undefined;
+    decode(row);
+    const resultJson = row.result_json;
+    const resultDigest = row.result_digest;
+    const quiescenceDigest = row.quiescence_digest;
+    const executorQuiescentAt = row.executor_quiescent_at;
+    if (resultJson === null) return undefined;
+    if (
+      !['result-recorded', 'settled'].includes(row.status) ||
+      row.permit_consumed_at === null ||
+      typeof resultDigest !== 'string' ||
+      !SHA256_HEX.test(resultDigest) ||
+      typeof quiescenceDigest !== 'string' ||
+      !SHA256_HEX.test(quiescenceDigest) ||
+      !positiveTime(executorQuiescentAt)
+    )
+      throw new RemoteStepRefusal(503, 'remote step result is unreadable');
+    try {
+      boundedJsonBytes(resultJson);
+    } catch {
+      throw new RemoteStepRefusal(503, 'remote step result is unreadable');
+    }
+    if ((await sha256Hex(resultJson)) !== resultDigest)
+      throw new RemoteStepRefusal(503, 'remote step result is unreadable');
+    return {
+      invocationId,
+      resultJson,
+      resultDigest,
+      quiescenceDigest,
+      executorQuiescentAt,
+    };
+  }
+
+  async settleAfterResume(invocationId: string): Promise<RemoteStepInvocation> {
+    const invocation = await this.get(invocationId);
+    if (
+      !invocation ||
+      !['result-recorded', 'settled'].includes(invocation.status)
+    )
+      throw new RemoteStepRefusal(409, 'remote step has no result to settle');
+    const result = await this.readRecordedResult(invocationId);
+    if (!result)
+      throw new RemoteStepRefusal(503, 'remote step result is unreadable');
+    const state = await this.#execution(invocation, invocation.principal);
+    if (state.execution.startToken !== invocation.startToken)
+      throw new RemoteStepRefusal(409, 'remote step run generation changed');
+    const summary = await this.#runtime.authoritativeStatus(
+      invocation.workflowId,
+      invocation.runId,
+    );
+    if (!summary)
+      throw new RemoteStepRefusal(503, 'remote step run is unreadable');
+    if (summary.status === 'suspended') {
+      const key = invocation.stepPath.join('.');
+      const stillCurrent =
+        (summary.suspended ?? []).some(
+          (path) =>
+            JSON.stringify(path) === JSON.stringify(invocation.stepPath),
+        ) &&
+        summary.suspendedAt?.[key] === invocation.suspendedAt &&
+        summary.resumeCount?.[key] === invocation.resumeCount;
+      if (stillCurrent)
+        throw new RemoteStepRefusal(409, 'remote step has not resumed');
+    } else if (!isTerminalRunStatus(summary.status)) {
+      throw new RemoteStepRefusal(409, 'remote step resume is still active');
+    }
+    if (invocation.status === 'settled') return invocation;
+    const snapshot = await this.#snapshot(invocation);
+    const written = rowResult(
+      await this.#db
+        .prepare(`UPDATE ${REMOTE_STEP_TABLE} SET status = 'settled'
+          WHERE invocation_id = ? AND status = 'result-recorded'
+            AND result_digest = ? AND executor_quiescent_at IS NOT NULL
+            AND EXISTS (SELECT 1 FROM "${invocation.tablePrefix}mastra_workflow_snapshot"
+              WHERE workflow_name = ? AND run_id = ? AND snapshot = ?)
+          RETURNING *`)
+        .bind(
+          invocationId,
+          result.resultDigest,
+          invocation.workflowId,
+          invocation.runId,
+          snapshot,
+        )
+        .all(),
+    );
+    if (written) return decode(written);
+    const after = await this.get(invocationId);
+    if (after?.status === 'settled') return after;
+    throw new RemoteStepRefusal(409, 'remote step settlement changed');
   }
 }

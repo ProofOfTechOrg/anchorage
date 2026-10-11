@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import { createD1Storage } from './d1-storage.js';
@@ -23,6 +23,11 @@ const ADDRESS = {
   resourceId: 'thread-1',
   runId: 'run-1',
 };
+const PRINCIPAL = {
+  kind: 'human',
+  id: 'operator-1',
+  role: 'operator',
+} as const;
 
 describe('remote step journal dispatch admission', () => {
   const databases: Array<{ close(): void }> = [];
@@ -82,6 +87,7 @@ describe('remote step journal dispatch admission', () => {
         },
         provenance: {
           startIdentity: {
+            owner: { kind: PRINCIPAL.kind, id: PRINCIPAL.id },
             target: {
               kind: 'agent',
               id: ADDRESS.agentId,
@@ -94,6 +100,7 @@ describe('remote step journal dispatch admission', () => {
       RunnerRuntime,
       'authoritativeStatus' | 'authoritativeStartState'
     >;
+    const verifyCompletion = vi.fn(async () => undefined);
     const journal = new RemoteStepJournal({
       db,
       fence,
@@ -101,6 +108,7 @@ describe('remote step journal dispatch admission', () => {
       deploymentId: ADDRESS.deploymentId,
       tablePrefix: ADDRESS.tablePrefix,
       allowedToolIds: ['remote_lookup'],
+      verifyCompletion,
       now: () => now,
     });
     await journal.initialize();
@@ -108,6 +116,7 @@ describe('remote step journal dispatch admission', () => {
       db,
       fence,
       journal,
+      verifyCompletion,
       runtime,
       reopen: () =>
         new RemoteStepJournal({
@@ -117,6 +126,7 @@ describe('remote step journal dispatch admission', () => {
           deploymentId: ADDRESS.deploymentId,
           tablePrefix: ADDRESS.tablePrefix,
           allowedToolIds: ['remote_lookup'],
+          verifyCompletion,
           now: () => now,
         }),
       sqlite,
@@ -151,8 +161,8 @@ describe('remote step journal dispatch admission', () => {
   it('converges repeated observation on one invocation without a permit', async () => {
     const h = await fixture();
     const [first, replay] = await Promise.all([
-      h.journal.register(ADDRESS, 10_000),
-      h.journal.register(ADDRESS, 10_000),
+      h.journal.register(ADDRESS, 10_000, PRINCIPAL),
+      h.journal.register(ADDRESS, 10_000, PRINCIPAL),
     ]);
     expect(replay.invocationId).toBe(first.invocationId);
     expect(first).toMatchObject({
@@ -180,18 +190,42 @@ describe('remote step journal dispatch admission', () => {
     ]);
   });
 
-  it('accepts one permit consumption and refuses replay as effect authority', async () => {
+  it('binds registration to the original execution principal', async () => {
     const h = await fixture();
-    const invocation = await h.journal.register(ADDRESS, 10_000);
+    const invocation = await h.journal.register(ADDRESS, 10_000, PRINCIPAL);
+    expect(invocation.principal).toEqual(PRINCIPAL);
+    await expect(
+      h.journal.register(ADDRESS, 10_000, {
+        kind: 'human',
+        id: 'other',
+        role: 'admin',
+      }),
+    ).rejects.toMatchObject({ status: 409 });
+  });
+
+  it('returns raw effect authority only to the winning consume call', async () => {
+    const h = await fixture();
+    const invocation = await h.journal.register(ADDRESS, 10_000, PRINCIPAL);
     const permit = await h.journal.issuePermit(invocation.invocationId, 1_000);
     expect(permit).toMatchObject({ generation: 1, expiresAt: 2_000 });
-    expect(await h.journal.consumePermit(permit)).toBe('accepted');
-    expect(await h.journal.consumePermit(permit)).toBe('already-consumed');
+    const winner = await h.journal.consumePermit(permit);
+    expect(winner).toMatchObject({
+      kind: 'accepted',
+      rawPermit: expect.stringMatching(/^[A-Za-z0-9_-]{43}$/),
+    });
+    expect(await h.journal.consumePermit(permit)).toEqual({
+      kind: 'already-consumed',
+    });
+    const stored = h.sqlite
+      .prepare(`SELECT permit_digest FROM ${REMOTE_STEP_TABLE}`)
+      .get() as { permit_digest: string };
+    expect(stored.permit_digest).toMatch(/^[a-f0-9]{64}$/);
+    expect(JSON.stringify(stored)).not.toContain(
+      (winner as { rawPermit: string }).rawPermit,
+    );
     await expect(
       h.journal.issuePermit(invocation.invocationId, 1_000),
-    ).rejects.toMatchObject({
-      status: 409,
-    });
+    ).rejects.toMatchObject({ status: 409 });
     expect(
       (await h.journal.get(invocation.invocationId))?.permitConsumedAt,
     ).toBeDefined();
@@ -199,14 +233,199 @@ describe('remote step journal dispatch admission', () => {
 
   it('recovers one permit after a journal instance is replaced', async () => {
     const h = await fixture();
-    const invocation = await h.journal.register(ADDRESS, 10_000);
+    const invocation = await h.journal.register(ADDRESS, 10_000, PRINCIPAL);
     const permit = await h.journal.issuePermit(invocation.invocationId, 1_000);
     const recovered = h.reopen();
     expect(await recovered.issuePermit(invocation.invocationId, 1_000)).toEqual(
       permit,
     );
-    expect(await recovered.consumePermit(permit)).toBe('accepted');
-    expect(await h.reopen().consumePermit(permit)).toBe('already-consumed');
+    expect(await recovered.consumePermit(permit)).toMatchObject({
+      kind: 'accepted',
+      rawPermit: expect.any(String),
+    });
+    expect(await h.reopen().consumePermit(permit)).toEqual({
+      kind: 'already-consumed',
+    });
+  });
+
+  it('stores one verified JSON result and replays only the same bytes', async () => {
+    const h = await fixture();
+    const invocation = await h.journal.register(ADDRESS, 10_000, PRINCIPAL);
+    const permit = await h.journal.issuePermit(invocation.invocationId, 1_000);
+    const consumed = await h.journal.consumePermit(permit);
+    if (consumed.kind !== 'accepted') throw new Error('permit was not won');
+    const bytes = '{ "value": "done" }';
+    const evidence = '{"receipt":"verified-completion"}';
+    expect(
+      await h.journal.recordResult(
+        invocation.invocationId,
+        consumed.rawPermit,
+        bytes,
+        evidence,
+      ),
+    ).toMatchObject({ kind: 'recorded', resultJson: bytes });
+    expect(h.verifyCompletion).toHaveBeenCalledOnce();
+    expect(h.verifyCompletion).toHaveBeenCalledWith(
+      expect.objectContaining({
+        invocation: expect.objectContaining({
+          invocationId: invocation.invocationId,
+        }),
+        rawPermit: consumed.rawPermit,
+        resultJson: bytes,
+        evidenceJson: evidence,
+      }),
+    );
+    expect(
+      await h
+        .reopen()
+        .recordResult(
+          invocation.invocationId,
+          consumed.rawPermit,
+          bytes,
+          evidence,
+        ),
+    ).toMatchObject({ kind: 'replay', resultJson: bytes });
+    expect(h.verifyCompletion).toHaveBeenCalledOnce();
+    await expect(
+      h.journal.recordResult(
+        invocation.invocationId,
+        consumed.rawPermit,
+        '{"value":"done"}',
+        evidence,
+      ),
+    ).rejects.toMatchObject({ status: 409 });
+    await expect(
+      h.journal.recordResult(
+        invocation.invocationId,
+        consumed.rawPermit,
+        bytes,
+        '{"receipt":"different"}',
+      ),
+    ).rejects.toMatchObject({ status: 409 });
+    const stored = h.sqlite
+      .prepare(
+        `SELECT result_json, result_digest, executor_quiescent_at
+         FROM ${REMOTE_STEP_TABLE}`,
+      )
+      .get() as Record<string, unknown>;
+    expect(stored).toMatchObject({
+      result_json: bytes,
+      result_digest: expect.stringMatching(/^[a-f0-9]{64}$/),
+      executor_quiescent_at: expect.any(Number),
+    });
+    expect(
+      await h.journal.readRecordedResult(invocation.invocationId),
+    ).toMatchObject({
+      resultJson: bytes,
+      resultDigest: stored.result_digest,
+    });
+  });
+
+  it('settles a verified result only after the physical run advances', async () => {
+    const h = await fixture();
+    const invocation = await h.journal.register(ADDRESS, 10_000, PRINCIPAL);
+    const permit = await h.journal.issuePermit(invocation.invocationId, 1_000);
+    const consumed = await h.journal.consumePermit(permit);
+    if (consumed.kind !== 'accepted') throw new Error('permit was not won');
+    await h.journal.recordResult(
+      invocation.invocationId,
+      consumed.rawPermit,
+      '{"value":"done"}',
+      '{"receipt":"verified"}',
+    );
+    await expect(
+      h.journal.settleAfterResume(invocation.invocationId),
+    ).rejects.toMatchObject({ status: 409 });
+    h.setSummary({ runId: ADDRESS.runId, status: 'success' });
+    h.sqlite
+      .prepare('UPDATE mastra_workflow_snapshot SET snapshot = ?')
+      .run('{"status":"success"}');
+    expect(
+      await h.journal.settleAfterResume(invocation.invocationId),
+    ).toMatchObject({
+      status: 'settled',
+    });
+    expect(
+      (await h.reopen().settleAfterResume(invocation.invocationId)).status,
+    ).toBe('settled');
+    expect(
+      (await new DeploymentInventory(h.db).read('remote-steps')).entries,
+    ).toEqual([]);
+  });
+
+  it('records verified completion from a prior epoch without resuming a locked run', async () => {
+    const h = await fixture();
+    const invocation = await h.journal.register(ADDRESS, 10_000, PRINCIPAL);
+    const permit = await h.journal.issuePermit(invocation.invocationId, 1_000);
+    const consumed = await h.journal.consumePermit(permit);
+    if (consumed.kind !== 'accepted') throw new Error('permit was not won');
+    const before = await h.fence.read();
+    await h.fence.transition({
+      expected: 'open',
+      next: 'migration-locked',
+      expectedMutationEpoch: before.mutationEpoch,
+      expectedRevision: before.transitionRevision,
+      advanceMutationEpoch: true,
+    });
+    expect(
+      await h.journal.recordResult(
+        invocation.invocationId,
+        consumed.rawPermit,
+        '{"value":"done"}',
+        '{"receipt":"verified"}',
+      ),
+    ).toMatchObject({ kind: 'recorded' });
+    await expect(
+      h.journal.settleAfterResume(invocation.invocationId),
+    ).rejects.toMatchObject({ status: 409 });
+    expect(
+      (await new DeploymentInventory(h.db).read('remote-steps')).count,
+    ).toBe(1);
+  });
+
+  it('keeps a consumed claim active if completion verification fails', async () => {
+    const h = await fixture();
+    const invocation = await h.journal.register(ADDRESS, 10_000, PRINCIPAL);
+    const permit = await h.journal.issuePermit(invocation.invocationId, 1_000);
+    const consumed = await h.journal.consumePermit(permit);
+    if (consumed.kind !== 'accepted') throw new Error('permit was not won');
+    h.verifyCompletion.mockRejectedValueOnce(new Error('unverified executor'));
+    await expect(
+      h.journal.recordResult(
+        invocation.invocationId,
+        consumed.rawPermit,
+        '{"value":"done"}',
+        '{"receipt":"unverified"}',
+      ),
+    ).rejects.toThrow('unverified executor');
+    expect((await h.journal.get(invocation.invocationId))?.status).toBe(
+      'dispatched',
+    );
+    expect(
+      (await new DeploymentInventory(h.db).read('remote-steps')).count,
+    ).toBe(1);
+  });
+
+  it('refuses a wrong raw permit before calling the completion verifier', async () => {
+    const h = await fixture();
+    const invocation = await h.journal.register(ADDRESS, 10_000, PRINCIPAL);
+    const permit = await h.journal.issuePermit(invocation.invocationId, 1_000);
+    const consumed = await h.journal.consumePermit(permit);
+    if (consumed.kind !== 'accepted') throw new Error('permit was not won');
+    const wrong =
+      consumed.rawPermit === 'A'.repeat(43) ? 'B'.repeat(43) : 'A'.repeat(43);
+    await expect(
+      h.journal.recordResult(
+        invocation.invocationId,
+        wrong,
+        '{"value":"done"}',
+        '{"receipt":"verified"}',
+      ),
+    ).rejects.toMatchObject({ status: 403 });
+    expect(h.verifyCompletion).not.toHaveBeenCalled();
+    expect((await h.journal.get(invocation.invocationId))?.status).toBe(
+      'dispatched',
+    );
   });
 
   it.each([
@@ -214,7 +433,7 @@ describe('remote step journal dispatch admission', () => {
     'consume',
   ] as const)('refuses %s when the stored suspension request changes', async (operation) => {
     const h = await fixture();
-    const invocation = await h.journal.register(ADDRESS, 10_000);
+    const invocation = await h.journal.register(ADDRESS, 10_000, PRINCIPAL);
     const permit =
       operation === 'consume'
         ? await h.journal.issuePermit(invocation.invocationId, 1_000)
@@ -229,8 +448,8 @@ describe('remote step journal dispatch admission', () => {
 
   it('tightens a repeated registration to the earlier host deadline', async () => {
     const h = await fixture();
-    const first = await h.journal.register(ADDRESS, 10_000);
-    const repeated = await h.journal.register(ADDRESS, 1_500);
+    const first = await h.journal.register(ADDRESS, 10_000, PRINCIPAL);
+    const repeated = await h.journal.register(ADDRESS, 1_500, PRINCIPAL);
     expect(repeated.invocationId).toBe(first.invocationId);
     expect(repeated.deadlineAt).toBe(1_500);
     h.setNow(1_501);
@@ -241,7 +460,7 @@ describe('remote step journal dispatch admission', () => {
 
   it('caps a permit when the host deadline tightens after preflight', async () => {
     const h = await fixture();
-    const invocation = await h.journal.register(ADDRESS, 10_000);
+    const invocation = await h.journal.register(ADDRESS, 10_000, PRINCIPAL);
     const prepare = h.db.prepare.bind(h.db);
     h.db.prepare = (sql) => {
       const statement = prepare(sql);
@@ -254,7 +473,7 @@ describe('remote step journal dispatch admission', () => {
           return {
             ...bound,
             all: async <T = unknown>() => {
-              await h.journal.register(ADDRESS, 1_500);
+              await h.journal.register(ADDRESS, 1_500, PRINCIPAL);
               return bound.all<T>();
             },
           };
@@ -274,7 +493,7 @@ describe('remote step journal dispatch admission', () => {
     'consume',
   ] as const)('refuses %s while a cancellation intent is persisted', async (operation) => {
     const h = await fixture();
-    const invocation = await h.journal.register(ADDRESS, 10_000);
+    const invocation = await h.journal.register(ADDRESS, 10_000, PRINCIPAL);
     const permit =
       operation === 'consume'
         ? await h.journal.issuePermit(invocation.invocationId, 1_000)
@@ -321,7 +540,9 @@ describe('remote step journal dispatch admission', () => {
         },
       },
     });
-    await expect(h.journal.register(ADDRESS, 10_000)).rejects.toMatchObject({
+    await expect(
+      h.journal.register(ADDRESS, 10_000, PRINCIPAL),
+    ).rejects.toMatchObject({
       status: 400,
     });
   });
@@ -335,15 +556,18 @@ describe('remote step journal dispatch admission', () => {
       deploymentId: ADDRESS.deploymentId,
       tablePrefix: ADDRESS.tablePrefix,
       allowedToolIds: ['other_tool'],
+      verifyCompletion: h.verifyCompletion,
     });
-    await expect(restricted.register(ADDRESS, 10_000)).rejects.toMatchObject({
+    await expect(
+      restricted.register(ADDRESS, 10_000, PRINCIPAL),
+    ).rejects.toMatchObject({
       status: 503,
     });
   });
 
   it('refuses a corrupted persisted table identity before building a query', async () => {
     const h = await fixture();
-    const invocation = await h.journal.register(ADDRESS, 10_000);
+    const invocation = await h.journal.register(ADDRESS, 10_000, PRINCIPAL);
     h.sqlite
       .prepare(`UPDATE ${REMOTE_STEP_TABLE} SET table_prefix = ?`)
       .run('bad"_prefix');
@@ -356,7 +580,7 @@ describe('remote step journal dispatch admission', () => {
 
   it('refuses an unconsumed permit after the fence moves to migration lock', async () => {
     const h = await fixture();
-    const invocation = await h.journal.register(ADDRESS, 10_000);
+    const invocation = await h.journal.register(ADDRESS, 10_000, PRINCIPAL);
     const permit = await h.journal.issuePermit(invocation.invocationId, 1_000);
     const before = await h.fence.read();
     await h.fence.transition({
@@ -376,7 +600,7 @@ describe('remote step journal dispatch admission', () => {
 
   it('refuses a permit when the fence moves after preflight but before the write', async () => {
     const h = await fixture();
-    const invocation = await h.journal.register(ADDRESS, 10_000);
+    const invocation = await h.journal.register(ADDRESS, 10_000, PRINCIPAL);
     const permit = await h.journal.issuePermit(invocation.invocationId, 1_000);
     const prepare = h.db.prepare.bind(h.db);
     h.db.prepare = (sql) => {
@@ -413,7 +637,7 @@ describe('remote step journal dispatch admission', () => {
 
   it('refuses dispatch after cancellation or deadline', async () => {
     const h = await fixture();
-    const invocation = await h.journal.register(ADDRESS, 10_000);
+    const invocation = await h.journal.register(ADDRESS, 10_000, PRINCIPAL);
     const permit = await h.journal.issuePermit(invocation.invocationId, 1_000);
     h.setSummary({ runId: ADDRESS.runId, status: 'cancelled' });
     h.sqlite
@@ -498,9 +722,14 @@ describe('remote step journal dispatch admission', () => {
       deploymentId: ADDRESS.deploymentId,
       tablePrefix: ADDRESS.tablePrefix,
       allowedToolIds: ['remote_lookup'],
+      verifyCompletion: async () => undefined,
     });
     await journal.initialize();
-    const invocation = await journal.register(ADDRESS, Date.now() + 60_000);
+    const invocation = await journal.register(
+      ADDRESS,
+      Date.now() + 60_000,
+      PRINCIPAL,
+    );
     const permit = await journal.issuePermit(invocation.invocationId, 30_000);
     expect(permit.generation).toBe(1);
     expect(

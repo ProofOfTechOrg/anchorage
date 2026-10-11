@@ -495,6 +495,7 @@ describe('Mastra persistence guards (D1Store SQL over node:sqlite)', () => {
       deploymentId: 'census-deployment',
       tablePrefix: '',
       allowedToolIds: ['census-tool'],
+      verifyCompletion: async () => undefined,
     }).initialize();
     sqlite.exec(
       `CREATE TABLE IF NOT EXISTS ${DEPLOYMENT_SENTINEL_TABLE} (
