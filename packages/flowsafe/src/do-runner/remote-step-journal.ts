@@ -444,50 +444,99 @@ export class RemoteStepJournal {
         version INTEGER NOT NULL
       )`)
       .run();
-    const schema = await this.#db
-      .prepare(`PRAGMA table_xinfo(${REMOTE_STEP_TABLE})`)
-      .all();
-    const columns = record(schema)?.results;
-    if (
-      !Array.isArray(columns) ||
-      columns.some(
-        (column) =>
-          typeof record(column)?.name !== 'string' ||
-          record(column)?.hidden !== 0,
-      )
-    )
-      throw new RemoteStepRefusal(503, 'remote step schema is unreadable');
-    const names = columns.map((column) => record(column)?.name);
-    const samePrefix = (expected: readonly string[]) =>
-      names.length === expected.length &&
-      names.every((name, index) => {
-        const column = record(columns[index]);
-        return (
-          name === expected[index] &&
-          column?.type ===
-            (REMOTE_STEP_INTEGER_COLUMNS.has(name as string)
-              ? 'INTEGER'
-              : 'TEXT') &&
-          column?.notnull === (index > 0 && index <= 16 ? 1 : 0) &&
-          column?.pk === (index === 0 ? 1 : 0)
-        );
-      });
-    const versions = await this.#db
-      .prepare(`SELECT id, version FROM ${REMOTE_STEP_SCHEMA_TABLE} LIMIT 2`)
-      .all();
-    const rows = record(versions)?.results;
-    if (!Array.isArray(rows) || rows.length > 1)
-      throw new RemoteStepRefusal(503, 'remote step schema is unreadable');
-    if (rows.length === 1) {
-      if (
-        record(rows[0])?.id !== 1 ||
-        record(rows[0])?.version !== 2 ||
-        !samePrefix(REMOTE_STEP_COLUMNS)
-      )
+    const readSchema = async () => {
+      const schema = await this.#db
+        .prepare(`PRAGMA table_xinfo(${REMOTE_STEP_TABLE})`)
+        .all();
+      const columns = record(schema)?.results;
+      if (!Array.isArray(columns))
         throw new RemoteStepRefusal(503, 'remote step schema is unreadable');
-      return;
-    }
-    if (samePrefix(REMOTE_STEP_COLUMNS.slice(0, -4))) {
+      const samePrefix = (expected: readonly string[]) =>
+        columns.length === expected.length &&
+        columns.every((value, index) => {
+          const column = record(value);
+          const name = column?.name;
+          return (
+            name === expected[index] &&
+            column?.type ===
+              (REMOTE_STEP_INTEGER_COLUMNS.has(name as string)
+                ? 'INTEGER'
+                : 'TEXT') &&
+            column?.notnull === (index > 0 && index <= 16 ? 1 : 0) &&
+            column?.pk === (index === 0 ? 1 : 0) &&
+            column?.hidden === 0 &&
+            column?.dflt_value === (name === 'permit_generation' ? '0' : null)
+          );
+        });
+      const indexes = record(
+        await this.#db.prepare(`PRAGMA index_list(${REMOTE_STEP_TABLE})`).all(),
+      )?.results;
+      if (!Array.isArray(indexes))
+        throw new RemoteStepRefusal(503, 'remote step schema is unreadable');
+      const suspensionKey = [
+        'deployment_id',
+        'table_prefix',
+        'workflow_id',
+        'agent_id',
+        'thread_id',
+        'resource_id',
+        'run_id',
+        'step_path',
+        'suspended_at',
+        'resume_count',
+      ];
+      let uniqueSuspension = false;
+      for (const value of indexes) {
+        const indexRow = record(value);
+        const name = indexRow?.name;
+        if (
+          indexRow?.unique !== 1 ||
+          indexRow?.origin !== 'u' ||
+          indexRow?.partial !== 0 ||
+          typeof name !== 'string' ||
+          !/^sqlite_autoindex_flowsafe_remote_step_invocations_[1-9][0-9]*$/.test(
+            name,
+          )
+        )
+          continue;
+        const details = record(
+          await this.#db.prepare(`PRAGMA index_info('${name}')`).all(),
+        )?.results;
+        if (
+          Array.isArray(details) &&
+          details.length === suspensionKey.length &&
+          details.every(
+            (part, index) =>
+              record(part)?.seqno === index &&
+              record(part)?.name === suspensionKey[index],
+          )
+        )
+          uniqueSuspension = true;
+      }
+      if (!uniqueSuspension)
+        throw new RemoteStepRefusal(503, 'remote step schema is unreadable');
+      const versions = await this.#db
+        .prepare(`SELECT id, version FROM ${REMOTE_STEP_SCHEMA_TABLE} LIMIT 2`)
+        .all();
+      const rows = record(versions)?.results;
+      if (!Array.isArray(rows) || rows.length > 1)
+        throw new RemoteStepRefusal(503, 'remote step schema is unreadable');
+      if (rows.length === 1) {
+        if (
+          record(rows[0])?.id !== 1 ||
+          record(rows[0])?.version !== 2 ||
+          !samePrefix(REMOTE_STEP_COLUMNS)
+        )
+          throw new RemoteStepRefusal(503, 'remote step schema is unreadable');
+        return 'current';
+      }
+      if (samePrefix(REMOTE_STEP_COLUMNS.slice(0, -4))) return 'prior';
+      if (samePrefix(REMOTE_STEP_COLUMNS)) return 'unversioned-current';
+      throw new RemoteStepRefusal(503, 'remote step schema is unreadable');
+    };
+    const stage = await readSchema();
+    if (stage === 'current') return;
+    if (stage === 'prior') {
       const transactional = this.#db as ExecutionFenceDatabase & {
         batch?: (
           statements: ReturnType<ExecutionFenceDatabase['prepare']>[],
@@ -498,26 +547,31 @@ export class RemoteStepJournal {
           503,
           'remote step schema upgrade is unavailable',
         );
-      await transactional.batch([
-        ...REMOTE_STEP_RESULT_COLUMNS.map((column) =>
-          this.#db.prepare(
-            `ALTER TABLE ${REMOTE_STEP_TABLE} ADD COLUMN ${column} ${column === 'executor_quiescent_at' ? 'INTEGER' : 'TEXT'}`,
+      try {
+        await transactional.batch([
+          ...REMOTE_STEP_RESULT_COLUMNS.map((column) =>
+            this.#db.prepare(
+              `ALTER TABLE ${REMOTE_STEP_TABLE} ADD COLUMN ${column} ${column === 'executor_quiescent_at' ? 'INTEGER' : 'TEXT'}`,
+            ),
           ),
-        ),
-        this.#db.prepare(
-          `INSERT INTO ${REMOTE_STEP_SCHEMA_TABLE} (id, version) VALUES (1, 2)`,
-        ),
-      ]);
+          this.#db.prepare(
+            `INSERT INTO ${REMOTE_STEP_SCHEMA_TABLE} (id, version) VALUES (1, 2)`,
+          ),
+        ]);
+      } catch (error) {
+        if ((await readSchema()) !== 'current') throw error;
+      }
       return;
     }
-    if (!samePrefix(REMOTE_STEP_COLUMNS)) {
-      throw new RemoteStepRefusal(503, 'remote step schema is unreadable');
+    try {
+      await this.#db
+        .prepare(
+          `INSERT INTO ${REMOTE_STEP_SCHEMA_TABLE} (id, version) VALUES (1, 2)`,
+        )
+        .run();
+    } catch (error) {
+      if ((await readSchema()) !== 'current') throw error;
     }
-    await this.#db
-      .prepare(
-        `INSERT INTO ${REMOTE_STEP_SCHEMA_TABLE} (id, version) VALUES (1, 2)`,
-      )
-      .run();
   }
 
   async #snapshot(address: RemoteStepAddress): Promise<string> {

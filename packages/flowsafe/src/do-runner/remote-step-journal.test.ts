@@ -239,6 +239,73 @@ describe('remote step journal dispatch admission', () => {
     ).toMatchObject({ invocation_id: invocation.invocationId });
   });
 
+  it('refuses an unversioned journal without its suspension uniqueness constraint', async () => {
+    const h = await fixture();
+    const ddl = (
+      h.sqlite
+        .prepare(
+          `SELECT sql FROM sqlite_schema WHERE name = '${REMOTE_STEP_TABLE}'`,
+        )
+        .get() as { sql: string }
+    ).sql;
+    h.sqlite.exec(`DROP TABLE ${REMOTE_STEP_TABLE}`);
+    h.sqlite.exec('DROP TABLE flowsafe_remote_step_schema');
+    h.sqlite.exec(ddl.replace(/,\s*UNIQUE \(deployment_id,[^)]*\)/, ''));
+
+    await expect(h.reopen().initialize()).rejects.toMatchObject({
+      status: 503,
+    });
+  });
+
+  it('refuses an unversioned journal without the permit-generation default', async () => {
+    const h = await fixture();
+    const ddl = (
+      h.sqlite
+        .prepare(
+          `SELECT sql FROM sqlite_schema WHERE name = '${REMOTE_STEP_TABLE}'`,
+        )
+        .get() as { sql: string }
+    ).sql;
+    h.sqlite.exec(`DROP TABLE ${REMOTE_STEP_TABLE}`);
+    h.sqlite.exec('DROP TABLE flowsafe_remote_step_schema');
+    h.sqlite.exec(
+      ddl.replace(
+        'permit_generation INTEGER NOT NULL DEFAULT 0',
+        'permit_generation INTEGER NOT NULL',
+      ),
+    );
+
+    await expect(h.reopen().initialize()).rejects.toMatchObject({
+      status: 503,
+    });
+  });
+
+  it('converges when another initializer wins the same journal upgrade', async () => {
+    const h = await fixture();
+    const invocation = await h.journal.register(ADDRESS, 10_000, PRINCIPAL);
+    for (const column of [
+      'executor_quiescent_at',
+      'quiescence_digest',
+      'result_digest',
+      'result_json',
+    ])
+      h.sqlite.exec(`ALTER TABLE ${REMOTE_STEP_TABLE} DROP COLUMN ${column}`);
+    h.sqlite.exec('DROP TABLE flowsafe_remote_step_schema');
+    const originalBatch = h.db.batch.bind(h.db);
+    h.db.batch = async (statements) => {
+      h.db.batch = originalBatch;
+      await h.reopen().initialize();
+      return originalBatch(statements);
+    };
+
+    await h.reopen().initialize();
+
+    expect(await h.reopen().get(invocation.invocationId)).toMatchObject({
+      invocationId: invocation.invocationId,
+      status: 'pending',
+    });
+  });
+
   it('binds registration to the original execution principal', async () => {
     const h = await fixture();
     const invocation = await h.journal.register(ADDRESS, 10_000, PRINCIPAL);
