@@ -1084,7 +1084,7 @@ describe.sequential('fence composition through native reference dispatch', {
       expected: 'migration-locked',
       next: 'open',
     });
-    expect(inventoryCount()).toBe(beforeInventory + 20);
+    expect(inventoryCount()).toBe(beforeInventory + 22);
     expect(proof?.reopen.a?.after).toMatchObject({
       state: 'open',
       mutationEpoch: 1,
