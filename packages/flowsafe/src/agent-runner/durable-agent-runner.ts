@@ -2037,53 +2037,110 @@ export class FlowsafeDurableAgent<
     let rehydrated = false;
     let leg: ResumedThreadLeg | undefined;
     const legAbort = new AbortController();
+    const resumeOptions: ResumeRunOptions = {
+      ...(options.step !== undefined ? { step: options.step } : {}),
+      ...(options.resumeData !== undefined
+        ? { resumeData: options.resumeData }
+        : {}),
+      ...(options.expectedSuspension !== undefined
+        ? { expectedSuspension: options.expectedSuspension }
+        : {}),
+      requestedBy: options.requestedBy,
+      requestedByKind: 'human',
+      legAbort,
+      prepareExecution: async (requestContext, workflowInput) => {
+        const current = await this.#runtime.authoritativeStatus(
+          this.getWorkflow().id,
+          options.runId,
+        );
+        const step = Array.isArray(options.step)
+          ? options.step.join('.')
+          : (options.step ??
+            (current?.suspended?.length === 1
+              ? current.suspended[0]?.join('.')
+              : undefined));
+        const payload = isRecord(current?.suspendPayload)
+          ? current.suspendPayload
+          : undefined;
+        const suspension =
+          step && isRecord(payload?.[step]) ? payload[step] : undefined;
+        if (suspension?.type === 'suspension') {
+          const toolName = suspension.toolName;
+          if (
+            typeof toolName !== 'string' ||
+            typeof suspension.toolCallId !== 'string' ||
+            !isRecord(suspension.toolCallSuspended)
+          )
+            throw new RunStateUnreadableError(
+              this.getWorkflow().id,
+              options.runId,
+            );
+          const tools = (await this.listTools({
+            requestContext,
+          })) as Record<string, unknown>;
+          const tool = tools[toolName];
+          const schema = isRecord(tool) ? tool.resumeSchema : undefined;
+          const standard = isRecord(schema) ? schema['~standard'] : undefined;
+          if (!isRecord(standard) || typeof standard.validate !== 'function')
+            throw new RunStateUnreadableError(
+              this.getWorkflow().id,
+              options.runId,
+            );
+          const validated: unknown = await standard.validate(
+            options.resumeData,
+          );
+          if (!isRecord(validated))
+            throw new RunStateUnreadableError(
+              this.getWorkflow().id,
+              options.runId,
+            );
+          if (validated.issues !== undefined)
+            throw new InvalidRunRequestError(
+              'resume data does not match suspended tool',
+            );
+          if (!Object.hasOwn(validated, 'value'))
+            throw new RunStateUnreadableError(
+              this.getWorkflow().id,
+              options.runId,
+            );
+          resumeOptions.resumeData = validated.value;
+        }
+        const offset = (
+          await this.pubsub.getHistory(AGENT_STREAM_TOPIC(options.runId))
+        ).length;
+        const modelSettings = persistedModelSettings(workflowInput);
+        await this.#rehydrateRegistry({
+          runId: options.runId,
+          requestContext,
+          abortController: legAbort,
+          ...(memory !== undefined ? { memory } : {}),
+          ...(modelSettings !== undefined ? { modelSettings } : {}),
+        });
+        rehydrated = true;
+        const observed = await this.observe(options.runId, { offset });
+        if (this.#threadRuntime) {
+          leg = this.#trackResumedLeg(options.runId);
+          await this.#threadRuntime.registerRun(
+            this as unknown as Parameters<
+              Mastra['agentThreadStreamRuntime']['registerRun']
+            >[0],
+            bindResumedLegLifecycle(observed.output, leg),
+            {
+              runId: options.runId,
+              ...(memory !== undefined ? { memory } : {}),
+            } as Parameters<
+              Mastra['agentThreadStreamRuntime']['registerRun']
+            >[2],
+            this.getPubSub(),
+          );
+        }
+      },
+    };
     try {
       const summary = await this.#runtime.resume(
         this.getWorkflow().id,
         options.runId,
-        {
-          ...(options.step !== undefined ? { step: options.step } : {}),
-          ...(options.resumeData !== undefined
-            ? { resumeData: options.resumeData }
-            : {}),
-          ...(options.expectedSuspension !== undefined
-            ? { expectedSuspension: options.expectedSuspension }
-            : {}),
-          requestedBy: options.requestedBy,
-          requestedByKind: 'human',
-          legAbort,
-          prepareExecution: async (requestContext, workflowInput) => {
-            const offset = (
-              await this.pubsub.getHistory(AGENT_STREAM_TOPIC(options.runId))
-            ).length;
-            const modelSettings = persistedModelSettings(workflowInput);
-            await this.#rehydrateRegistry({
-              runId: options.runId,
-              requestContext,
-              abortController: legAbort,
-              ...(memory !== undefined ? { memory } : {}),
-              ...(modelSettings !== undefined ? { modelSettings } : {}),
-            });
-            rehydrated = true;
-            const observed = await this.observe(options.runId, { offset });
-            if (this.#threadRuntime) {
-              leg = this.#trackResumedLeg(options.runId);
-              await this.#threadRuntime.registerRun(
-                this as unknown as Parameters<
-                  Mastra['agentThreadStreamRuntime']['registerRun']
-                >[0],
-                bindResumedLegLifecycle(observed.output, leg),
-                {
-                  runId: options.runId,
-                  ...(memory !== undefined ? { memory } : {}),
-                } as Parameters<
-                  Mastra['agentThreadStreamRuntime']['registerRun']
-                >[2],
-                this.getPubSub(),
-              );
-            }
-          },
-        },
+        resumeOptions,
       );
       const terminalError = legTerminalError(
         summary,
