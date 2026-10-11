@@ -150,14 +150,24 @@ export type { RunStatus } from './run-terminal-state.js';
 
 import type { StartIdempotencyStore } from './start-idempotency.js';
 
+// Each run refusal below that extends Error rather than DoStatusError carries
+// the status the run object answers it with as a plain `status` field;
+// DoStatusError (do-status-error.ts) says why.
+
+/** A workflow id this runtime has not registered: 404. */
 export class UnknownWorkflowError extends Error {
+  readonly status = 404;
+
   constructor(workflowId: string) {
     super(`unknown workflow '${workflowId}'`);
     this.name = 'UnknownWorkflowError';
   }
 }
 
+/** No stored run under this workflow and run id: 404. */
 export class UnknownRunError extends Error {
+  readonly status = 404;
+
   constructor(workflowId: string, runId: string) {
     super(`no run '${runId}' found for workflow '${workflowId}'`);
     this.name = 'UnknownRunError';
@@ -224,46 +234,85 @@ export class RunStateUnreadableError extends DoStatusError {
   }
 }
 
+/** A start whose run id names a run that already exists: 409. */
 export class RunAlreadyExistsError extends Error {
-  constructor(workflowId: string, runId: string, status: RunStatus) {
+  readonly status = 409;
+
+  constructor(workflowId: string, runId: string, runStatus: RunStatus) {
     super(
-      `run '${runId}' of workflow '${workflowId}' already exists (status '${status}')`,
+      `run '${runId}' of workflow '${workflowId}' already exists (status '${runStatus}')`,
     );
     this.name = 'RunAlreadyExistsError';
   }
 }
 
+const RUN_CONFLICT_CONDITIONS = {
+  terminal: 'is already terminal',
+  ending: 'is ending',
+  'leg-running': 'has a leg running in this runtime',
+  'no-terminal-transition': 'has no recorded cancellation or timeout',
+} as const;
+
+/**
+ * A leg, terminal transition or terminal cleanup that the run's lifecycle
+ * state does not admit: 409. `conflict` picks the condition the message
+ * states; the default reports an ended run.
+ */
 export class RunTerminalConflictError extends Error {
-  constructor(workflowId: string, runId: string, status: RunStatus) {
+  readonly status = 409;
+
+  constructor(
+    workflowId: string,
+    runId: string,
+    runStatus: RunStatus,
+    conflict:
+      | 'terminal'
+      | 'ending'
+      | 'leg-running'
+      | 'no-terminal-transition' = 'terminal',
+  ) {
     super(
-      `run '${runId}' of workflow '${workflowId}' is already terminal with status '${status}'`,
+      `run '${runId}' of workflow '${workflowId}' ${RUN_CONFLICT_CONDITIONS[conflict]} with status '${runStatus}'`,
     );
     this.name = 'RunTerminalConflictError';
   }
 }
 
-/** A request the caller can fix: bad input/resume data or step selection. */
+/** A request the caller can fix (bad input/resume data or step selection): 400. */
 export class InvalidRunRequestError extends Error {
+  readonly status = 400;
+
   constructor(message: string) {
     super(message);
     this.name = 'InvalidRunRequestError';
   }
 }
 
-// Core surfaces input/resume-schema violations and wrong-step selections as
-// untyped Errors. Message matching is brittle, so it is scoped to choosing
-// the HTTP-facing error class only; anything unmatched propagates unchanged
-// (a 500 at the DO boundary).
-const CLIENT_ERROR_MARKERS = [
-  'Invalid input',
-  'Invalid resume data',
-  'was not suspended',
-  'No snapshot found',
+// Only core's own shapes of a caller-fixable refusal answer 400: anchored
+// leading text, never a substring a foreign error can carry. The schema
+// violation is read by id and category because `instanceof` fails across
+// module copies of core.
+const SCHEMA_VIOLATION_ID = 'WORKFLOW_SCHEMA_VALIDATION_FAILED';
+const CLIENT_ERROR_PREFIXES = [
+  'Request context validation failed for workflow ',
+  'This workflow run was not suspended',
+  'This workflow step "',
+  'No snapshot found for this workflow run: ',
 ];
+
+function isSchemaViolation(error: Error): boolean {
+  return (
+    'id' in error &&
+    error.id === SCHEMA_VIOLATION_ID &&
+    'category' in error &&
+    error.category === 'USER'
+  );
+}
 
 function asClientError(error: unknown): InvalidRunRequestError | undefined {
   if (!(error instanceof Error)) return undefined;
-  return CLIENT_ERROR_MARKERS.some((marker) => error.message.includes(marker))
+  return isSchemaViolation(error) ||
+    CLIENT_ERROR_PREFIXES.some((prefix) => error.message.startsWith(prefix))
     ? new InvalidRunRequestError(error.message)
     : undefined;
 }
@@ -1979,7 +2028,12 @@ export class RunnerRuntime {
       const activeKey = this.#runKey(workflowId, runId);
       const active: ActiveRun = legAbort ? { legAbort } : {};
       if (this.#activeRuns.has(activeKey))
-        throw new RunTerminalConflictError(workflowId, runId, 'running');
+        throw new RunTerminalConflictError(
+          workflowId,
+          runId,
+          'running',
+          'leg-running',
+        );
       const leaveLeg = this.#registerLeg(activeKey, active, workflowId, runId);
       let provenance: RunProvenance | undefined;
       let engineEntered = false;
@@ -2037,10 +2091,19 @@ export class RunnerRuntime {
             // cancel to cut, so its abort names the run's end the way a cut
             // leg's does.
             if (ending) legAbort?.abort(terminalLegAbortReason(ending));
+            if (ending && !currentLifecycle?.terminal) {
+              throw new RunTerminalConflictError(
+                workflowId,
+                runId,
+                ending,
+                'ending',
+              );
+            }
             throw new RunTerminalConflictError(
               workflowId,
               runId,
               current.status as RunStatus,
+              ending ? 'terminal' : 'leg-running',
             );
           }
           active.lifecycle = effectiveLifecycle(
@@ -2501,6 +2564,7 @@ export class RunnerRuntime {
           workflowId,
           runId,
           state.status as RunStatus,
+          'no-terminal-transition',
         );
       }
       if (lifecycle.terminal.cleanupCompletedAt !== undefined) {

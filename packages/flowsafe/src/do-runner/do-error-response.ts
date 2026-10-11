@@ -46,21 +46,19 @@ export function refusalStatus(error: unknown): number | undefined {
   // problem, not the caller's — 503 so monitors separate a wiring fault from
   // a code fault. Fail closed: nothing below this line runs for one.
   if (error instanceof DeploymentIdentityError) return 503;
+  // The plain-Error run refusals carry their own status (see DoStatusError), so
+  // an in-process caller that reads `status` and this mapping answer them alike.
   if (
     error instanceof UnknownWorkflowError ||
-    error instanceof UnknownRunError
-  ) {
-    return 404;
-  }
-  if (
+    error instanceof UnknownRunError ||
     error instanceof RunAlreadyExistsError ||
     error instanceof RunTerminalConflictError ||
     error instanceof RunSettledConflictError ||
-    error instanceof RunLifecycleBlockedError
+    error instanceof InvalidRunRequestError
   ) {
-    return 409;
+    return error.status;
   }
-  if (error instanceof InvalidRunRequestError) return 400;
+  if (error instanceof RunLifecycleBlockedError) return 409;
   // Range-checked even though the base states the contract, because the base
   // cannot enforce it: see isRefusalStatus.
   if (error instanceof DoStatusError && isRefusalStatus(error.status))

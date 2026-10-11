@@ -110,11 +110,14 @@ The changesets base is `dev`. `onlyUpdatePeerDependentsWhenOutOfRange` prevents 
 5. For changes affecting Workers for Platforms behavior covered by the [paid namespace gate](fleet-control.md#run-paid-namespace-conformance), run `pnpm fleet-control:credentialed` against a disposable paid account using the exact versioned release candidate. Retain the successful proof and final scratch inventory before promotion. Ordinary Worker releases that do not change WFP behavior do not require this step.
 6. Open the promotion pull request from `dev` to `main`.
 7. Confirm the promotion contains no pending changeset files.
-8. Merge to `main`.
-9. The release workflow publishes unpublished package versions to npm with provenance, creates tags, and creates GitHub releases. It publishes the `PUBLISH_PREREQUISITES` packages in `scripts/publish-ordered.mjs` before the rest, so each exact or minimum package dependency is available first.
-10. Confirm npm tarballs, export smoke tests, release notes, Pages API docs, and the production showcase.
+8. Confirm the publish credentials: each package the release publishes has a trusted publisher on npmjs.com naming `ProofOfTechOrg/anchorage`, `release.yml` and the `npm` environment, with `npm publish` allowed; the `npm` GitHub environment's deployment branches allow only `main`, and it holds the `NPM_TOKEN` secret; no repository or organization secret is named `NPM_TOKEN`. npm expires a new trusted-publisher configuration that completes no publish within two days, so create one no earlier than two days before this merge.
+9. Merge to `main`.
+10. The release workflow publishes unpublished package versions to npm with provenance, creates tags, and creates GitHub releases. It publishes the `PUBLISH_PREREQUISITES` packages in `scripts/publish-ordered.mjs` before the rest, so each exact or minimum package dependency is available first.
+11. Confirm npm tarballs, export smoke tests, release notes, Pages API docs, and the production showcase. `npm view @proofoftech/<package>@<version> _npmUser.trustedPublisher --json` prints the trusted publisher of a version published through OIDC and nothing for one that fell back to `NPM_TOKEN`.
 
 The release workflow never opens version pull requests or commits to `main`. A pending changeset on `main` is a freeze-window failure.
+
+`NPM_TOKEN` is a granular access token with publish rights on the `@proofoftech` scope and two-factor bypass, which npm expires after at most 90 days. npm publishes with it only when the OIDC exchange fails, and it reports no error for that exchange, so the `_npmUser.trustedPublisher` check is what shows which credential published. A publish that fails with `E401`, `E404` or `ENEEDAUTH` had no valid credential, and one that fails with `EOTP` used a token without two-factor bypass.
 
 ## Mastra compatibility
 
@@ -161,7 +164,7 @@ Repository administrators separately own:
 
 - GitHub Pages for generated API docs;
 - private vulnerability reporting;
-- npm trusted publishing or `NPM_TOKEN`;
+- npm trusted publishing, the `npm` GitHub environment, and `NPM_TOKEN`;
 - the showcase's Cloudflare bindings, secrets, domain, and OAuth callback;
 - branch protection and required checks.
 

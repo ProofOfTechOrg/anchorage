@@ -635,7 +635,7 @@ Workers for Platforms outbound handlers do not cover Durable Object network call
 
 The paid gate verifies the provider behavior that local tests cannot reproduce. Treat a passing run as a mandatory release condition for changes to Workers for Platforms provisioning, bindings, limits, migrations, routing, or FlowSafe runtime integration.
 
-The paid namespace gate passed for [`16108dd`](https://github.com/ProofOfTechOrg/anchorage/commit/16108ddaf768c2a06347c2e1a50a34b97fca31c4) on 2026-10-09 at 08:09:24 UTC. The retained result reports `ok: true`; final inventory confirmed removal of the proof-created tenant and shared scratch resources. Rerun this gate before promotion for later release candidates that change WFP behavior.
+The paid namespace gate last passed for [`6fb979a`](https://github.com/ProofOfTechOrg/anchorage/commit/6fb979a7dd8abac99cfb041e958d613c822d03d7), the FlowSafe 0.27.0 and Fleet Control 0.6.0 release candidate, on 2026-10-10 at 18:41:09 UTC. The retained result reports `ok: true` with every contract flag `true`; final inventory confirmed removal of the proof-created tenant and shared scratch resources. The first pass was for [`16108dd`](https://github.com/ProofOfTechOrg/anchorage/commit/16108ddaf768c2a06347c2e1a50a34b97fca31c4) on 2026-10-09. Rerun this gate before promotion for later release candidates that change WFP behavior.
 
 The separate control-plane factory proof verified lifecycle continuation across local workerd restarts and export-backed decommission against real Cloudflare resources. It used persistent local native D1 and R2 bindings, beginning provisioning at [`64f76b0`](https://github.com/ProofOfTechOrg/anchorage/commit/64f76b0f7861f70cbea788c581991bb9240eb3d2) and completing recovery and cleanup at [`ed57157`](https://github.com/ProofOfTechOrg/anchorage/commit/ed57157f2e3ef648f9ecc36e458c6a30c8c8f2cc). Remotely hosted control-plane durability and deployed CPU/subrequest budgets remain outside that proof.
 
@@ -681,7 +681,7 @@ The runner starts the FlowSafe run and observes its pending WebSocket update on 
 Set these environment variables:
 
 - `CLOUDFLARE_ACCOUNT_ID`
-- `CLOUDFLARE_API_TOKEN` with API Tokens Read, Zone Read, Workers Routes Read, and Workers Routes Write for every zone in the account, plus account-scoped Workers Scripts Edit and D1 Edit, and Workers R2 Storage Edit when application R2 is enabled. [Security threat model](security-threat-model.md) lists the route families the client calls with this token.
+- `CLOUDFLARE_API_TOKEN` with API Tokens Read, Zone Read, Workers Routes Read, and Workers Routes Write for every zone in the account, plus account-scoped Workers Scripts Edit, D1 Edit, and Workers KV Storage Edit, and Workers R2 Storage Edit when application R2 is enabled. The runner writes, lists and deletes host-routing and script-inventory entries in the routing KV namespace with this token. [Security threat model](security-threat-model.md) lists the other route families the client calls with this token.
 - `FLEET_CONFORMANCE_CONFIG`
 - `FLEET_MAINTENANCE_CAPABILITY_PRIVATE_JWK` containing the fleet-private Ed25519 signing JWK
 - `FLEET_STATE_EGRESS_ROOT_SECRET` containing the shared state-egress derivation secret

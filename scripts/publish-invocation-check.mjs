@@ -9,12 +9,16 @@
 //
 // The grammar check validates prerequisite peer edges. `--dry-run` runs prepack,
 // packs the tarball, and parses the full argv through `npm publish`, then stops.
-// It makes no registry request at all —
+// With npm 10 it makes no registry request at all —
 // verified by pointing npm at an unroutable registry, which still exits 0
 // immediately. That is what makes it safe to run on every build with no
 // credentials, and it is also the limit: this cannot catch authentication,
 // scope permissions, provenance/OIDC, or an already-published version. Those
-// remain first-run-on-main risks, and all of them fail loudly.
+// remain first-run-on-main risks. Each fails loudly except a failed OIDC
+// exchange, after which npm publishes with the release job's fallback token
+// when one is set. npm 11's dry run attempts the OIDC token exchange and reads
+// the registry, refusing a version that is already published, so this check
+// must run on npm 10.
 //
 // The PR-time check deliberately skips peer-version containment. Between a
 // floor raise and the Version Packages PR, the source tree legitimately has
@@ -30,12 +34,23 @@ import {
   command,
   failureReason,
   missingPeerEdgeViolation,
+  npmDryRunVersionViolation,
   PUBLISH_PREREQUISITES,
   peerFloorGrammarViolations,
   prerequisiteManifests,
   prerequisitePeerEdges,
   publishInvocation,
 } from './publish-ordered.mjs';
+
+const npmVersion = command('npm', ['--version'], { capture: true });
+const npmVersionViolation =
+  npmVersion.error || npmVersion.status !== 0
+    ? `npm --version: ${failureReason(npmVersion)}\n${npmVersion.stderr}`
+    : npmDryRunVersionViolation(npmVersion.stdout);
+if (npmVersionViolation) {
+  console.error(`FAIL ${npmVersionViolation}`);
+  process.exit(1);
+}
 
 const manifests = prerequisiteManifests();
 // Version containment belongs to publishRelease after pending changesets bump versions.

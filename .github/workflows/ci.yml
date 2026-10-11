@@ -245,10 +245,11 @@ jobs:
 
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
 
+      # No pnpm store cache: this job installs packages younger than the
+      # release-age gate, so its store is not saved for other jobs to restore.
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: pnpm
 
       - name: Install (frozen lockfile)
         run: pnpm install --frozen-lockfile
