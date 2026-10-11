@@ -437,7 +437,7 @@ async function readInventoryIndex() {
 }
 
 // One category, PAGED TO EXHAUSTION through the inventory's own cursors — the
-// sweep an operator's drain proof is actually made of, not a single page that
+// sweep an operator's drain proof needs, not a single page that
 // could hide the rows behind it. `limit: 3` forces several continuations even
 // on the spike's small data, so the keyset is exercised rather than skipped.
 async function sweepInventoryCategory(category) {
@@ -466,7 +466,7 @@ async function sweepInventoryCategory(category) {
   throw new Error(`inventory paging did not terminate for ${category}`);
 }
 
-// Every WORK category, swept. The drain proof is defined over exactly these.
+// Every WORK category, swept for the seeded-row visibility check.
 async function sweepInventoryWork(index) {
   const work = index.categories.filter((entry) => entry.class === 'work');
   const swept = {};
@@ -3183,13 +3183,13 @@ async function main() {
     },
   );
 
-  // --- Drain inventory (F2): the migration proof, on real workerd -----------
+  // --- Drain inventory (F2): seeded-row visibility on real workerd ----------
   // Unit tests can prove the queries are pure SELECTs against the real schemas.
   // What they cannot prove is that those queries read the SAME D1 that real
   // HTTP traffic on real workerd wrote its runs, approvals, reservations,
   // notifications, and tasks into — and that the numbers MOVE as that work
   // drains. An inventory that reported the right shape over the wrong database
-  // would pass every unit test and certify a deployment that still owed work.
+  // would pass every unit test while missing this work.
 
   await step(
     'FV1 inventory index: every category, its class, the states no query can ' +
@@ -3203,7 +3203,9 @@ async function main() {
         .filter((entry) => entry.class === 'standing')
         .map((entry) => entry.category);
       assert(
-        work.length === 7 && standing.length === 2,
+        work.length === 8 &&
+          work.includes('remote-steps') &&
+          standing.length === 2,
         'the index splits work from standing configuration',
         { work, standing },
       );
@@ -3225,16 +3227,13 @@ async function main() {
   );
 
   await step(
-    'FV2 drain proof: seeded work appears while draining, leaves as it is ' +
-      'finished, and reads empty across TWO consecutive sweeps before the lock',
+    'FV2 seeded inventory: work appears while draining, leaves as it is ' +
+      'finished, and stays absent under the lock',
     async () => {
       const index = await readInventoryIndex();
 
-      // A BASELINE, because this deployment has been running scenarios for the
-      // whole spike and legitimately still holds work from them. The proof
-      // below is over the seeded DELTA: these exact rows appear, and these
-      // exact rows are gone — which is the same claim an empty sweep makes,
-      // stated about rows whose lifecycle this step controls.
+      // A baseline accounts for work left by earlier spike scenarios. This
+      // check follows the seeded rows; it does not prove that all work drained.
       const before = await sweepInventoryWork(index);
 
       // Seed: a suspended run with a pending approval, and a keyed start
@@ -3322,9 +3321,8 @@ async function main() {
         keyedDecided,
       );
 
-      // The proof: the seeded rows are gone, and STILL gone on a second full
-      // sweep. One sweep is a point-in-time reading: traffic can still create
-      // or complete work while it runs, so the contract asks for two.
+      // The seeded rows are gone on repeated reads. A migration drain proof
+      // also requires an empty work inventory across the recovery interval.
       const gone = (sweep) =>
         !sweep.runs.keys.some((key) => key.endsWith(`/${drained.runId}`)) &&
         !sweep.runs.keys.some((key) => key.endsWith(`/${keyed.body.runId}`)) &&
@@ -3340,7 +3338,7 @@ async function main() {
       const second = await sweepInventoryWork(index);
       assert(
         gone(second),
-        'the second consecutive sweep agrees — the drain proof holds',
+        'the repeated sweep no longer reports the seeded work',
         {
           runs: second.runs.keys,
           approvals: second['approvals-waiting'].keys,
@@ -3357,18 +3355,16 @@ async function main() {
       );
       assert(
         schedules.class === 'standing' && schedules.keys.length >= 1,
-        'schedules are still reported while the drain proof passes',
+        'schedules are still reported while seeded work clears',
         schedules,
       );
       assert(
         subscriptions.class === 'standing' && subscriptions.keys.length >= 1,
-        'provider subscriptions are still reported while the proof passes',
+        'provider subscriptions are still reported while seeded work clears',
         subscriptions,
       );
 
-      // Lock: the proof held, so the deployment may stop executing. The
-      // inventory keeps answering — reads are ungated in every state, which is
-      // what lets an operator verify the lock they just took.
+      // The lock keeps inventory reads available while refusing new execution.
       await moveFence('draining', 'migration-locked');
       const locked = await sweepInventoryWork(index);
       assert(
@@ -3381,7 +3377,7 @@ async function main() {
         headers: AUTH.operator,
       });
       assertFenced(
-        'a run start after the drain proof locked the deployment',
+        'a run start under the migration lock',
         refusedStart,
         'migration-locked',
       );
@@ -3484,8 +3480,8 @@ try {
       'class, the Durable Object journal window it cannot see, and the rule an ' +
       'empty answer means something under; seeded runs, an approval, and a ' +
       'start reservation appeared as outstanding work while draining, left as ' +
-      'each was finished, and read absent across TWO consecutive full sweeps ' +
-      'paged through the keyset — after which the deployment locked, still ' +
+      'each was finished, and stayed absent on repeated paged reads ' +
+      'through the keyset — after which the deployment locked, still ' +
       'answered the same inventory, and refused to mint, while its schedules ' +
       'and provider subscriptions kept being reported as standing ' +
       'configuration a migration carries rather than drains. ' +
