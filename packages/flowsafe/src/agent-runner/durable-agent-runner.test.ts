@@ -3958,6 +3958,32 @@ describe('FlowsafeDurableAgent thread runtime registration and rehydration', () 
     expect(agent.getPubSub()).toBe(pubsub);
   });
 
+  it('passes an explicit automated requester kind to the runtime resume', async () => {
+    const { runtime, resume } = fakeRuntime();
+    const agent = createFlowsafeDurableAgent({ agent: testAgent(), runtime });
+    await agent.resumeViaRuntime({
+      runId: 'run-1',
+      requestedBy: 'service-1',
+      requestedByKind: 'service',
+    });
+    expect(resume).toHaveBeenCalledWith(
+      expect.anything(),
+      'run-1',
+      expect.objectContaining({
+        requestedBy: 'service-1',
+        requestedByKind: 'service',
+      }),
+    );
+    await expect(
+      agent.resumeViaRuntime({
+        runId: 'run-2',
+        requestedBy: 'service-1',
+        requestedByKind: 'forged' as never,
+      }),
+    ).rejects.toBeInstanceOf(InvalidRunRequestError);
+    expect(resume).toHaveBeenCalledTimes(1);
+  });
+
   it('resumes observation after retained earlier events on the observer bus', async () => {
     const pubsub = new EventEmitterPubSub();
     const { runtime, resume } = fakeRuntime({

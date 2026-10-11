@@ -2022,12 +2022,17 @@ export class FlowsafeDurableAgent<
   async resumeViaRuntime(options: {
     runId: string;
     requestedBy: string;
+    requestedByKind?: ExecutionPrincipalKind;
     step?: string | string[];
     resumeData?: unknown;
     memory?: DurableAgentStreamOptions<TOutput>['memory'];
     expectedSuspension?: ResumeRunOptions['expectedSuspension'];
   }): Promise<RunSummary> {
     this.#assertCallerRunId(options.runId);
+    const requestedByKind =
+      options.requestedByKind === undefined ? 'human' : options.requestedByKind;
+    if (!isExecutionPrincipalKind(requestedByKind))
+      throw new InvalidRunRequestError('requestedByKind is malformed');
     const memory = this.#guardedCallOptionMapper
       ? (this.#guardedCallOptionMapper(
           'memory',
@@ -2046,7 +2051,7 @@ export class FlowsafeDurableAgent<
         ? { expectedSuspension: options.expectedSuspension }
         : {}),
       requestedBy: options.requestedBy,
-      requestedByKind: 'human',
+      requestedByKind,
       legAbort,
       prepareExecution: async (requestContext, workflowInput) => {
         const current = await this.#runtime.authoritativeStatus(

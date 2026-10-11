@@ -3962,9 +3962,9 @@ describe('createThreadAgentHost', () => {
 
   it('resumes a retained remote result for its stored run and suspension', async () => {
     const principal: ExecutionPrincipal = {
-      kind: 'human',
-      id: 'operator-1',
-      role: 'operator',
+      kind: 'service',
+      id: 'executor-service',
+      purpose: 'remote-step-run',
     };
     const reader: RemoteStepContinuationReader = {
       deploymentId: 'deployment',
@@ -3995,7 +3995,11 @@ describe('createThreadAgentHost', () => {
         executorQuiescentAt: 1000,
       })),
     };
-    const fixture = harness(['writer'], { remoteSteps: reader });
+    const fixture = harness(['writer'], {
+      remoteSteps: reader,
+      principal,
+      allowedAutomation: [{ kind: 'service', entryPaths: ['http.start'] }],
+    });
     seedSuspendedApprovalRun(fixture);
     fixture.setSummary({
       runId: 'acme_run',
@@ -4030,7 +4034,8 @@ describe('createThreadAgentHost', () => {
     expect(mocked.resumeViaRuntime).toHaveBeenCalledWith(
       expect.objectContaining({
         runId: 'acme_run',
-        requestedBy: 'operator-1',
+        requestedBy: 'executor-service',
+        requestedByKind: 'service',
         step: ['tool'],
         resumeData: { answer: 1 },
         expectedSuspension: { suspendedAt: 1000 },
@@ -4059,6 +4064,67 @@ describe('createThreadAgentHost', () => {
         fixture.scope,
       ),
     ).rejects.toMatchObject({ status: 409 });
+    expect(mocked.resumeViaRuntime).not.toHaveBeenCalled();
+  });
+
+  it('refuses a reserved timeout envelope in a retained remote result', async () => {
+    const principal: ExecutionPrincipal = {
+      kind: 'human',
+      id: 'operator-1',
+      role: 'operator',
+    };
+    const reader: RemoteStepContinuationReader = {
+      deploymentId: 'deployment',
+      tablePrefix: '',
+      get: async () => ({
+        invocationId: 'invocation_1',
+        deploymentId: 'deployment',
+        tablePrefix: '',
+        workflowId: 'durable-agentic-loop',
+        agentId: 'writer',
+        threadId: 'acme_thread',
+        resourceId: RESOURCE_ID,
+        runId: 'acme_run',
+        principal,
+        startToken: 'test-generation',
+        stepPath: ['tool'],
+        suspendedAt: 1000,
+        request: {},
+        deadlineAt: 9999999999999,
+        status: 'result-retained',
+        permitGeneration: 1,
+      }),
+      readRetainedResult: async () => ({
+        invocationId: 'invocation_1',
+        resultJson: JSON.stringify({ [SUSPENSION_TIMEOUT_RESUME_KEY]: true }),
+        resultDigest: 'digest',
+        quiescenceDigest: 'evidence',
+        executorQuiescentAt: 1000,
+      }),
+    };
+    const fixture = harness(['writer'], { remoteSteps: reader });
+    seedSuspendedApprovalRun(fixture);
+    fixture.setSummary({
+      runId: 'acme_run',
+      status: 'suspended',
+      suspended: [['tool']],
+      suspendedAt: { tool: 1000 },
+      suspendPayload: {
+        tool: {
+          type: 'suspension',
+          toolCallSuspended: { remoteStep: REMOTE_STEP_MARKER },
+        },
+      },
+    });
+    await expect(
+      fixture.host.route(
+        new Request('https://thread/_flowsafe/agent-host/remote-step-resume', {
+          method: 'POST',
+          body: JSON.stringify({ invocationId: 'invocation_1' }),
+        }),
+        fixture.scope,
+      ),
+    ).rejects.toMatchObject({ status: 400 });
     expect(mocked.resumeViaRuntime).not.toHaveBeenCalled();
   });
 

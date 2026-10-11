@@ -2818,7 +2818,8 @@ export function createThreadAgentHost(
               runId: ref.runId,
               requestedBy: stored.principal.id,
               step: [...invocation.stepPath],
-              resumeData: recordedResult,
+              resumeData: resumeData(recordedResult),
+              requestedByKind: stored.principal.kind,
               expectedSuspension: {
                 suspendedAt: invocation.suspendedAt,
                 ...(invocation.resumeCount === undefined
