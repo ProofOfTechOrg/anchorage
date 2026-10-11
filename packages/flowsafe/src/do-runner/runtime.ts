@@ -288,20 +288,31 @@ export class InvalidRunRequestError extends Error {
   }
 }
 
-// Core surfaces input/resume-schema violations and wrong-step selections as
-// untyped Errors. Message matching is brittle, so it is scoped to choosing
-// the HTTP-facing error class only; anything unmatched propagates unchanged
-// (a 500 at the DO boundary).
-const CLIENT_ERROR_MARKERS = [
-  'Invalid input',
-  'Invalid resume data',
-  'was not suspended',
-  'No snapshot found',
+// Only core's own shapes of a caller-fixable refusal answer 400: anchored
+// leading text, never a substring a foreign error can carry. The schema
+// violation is read by id and category because `instanceof` fails across
+// module copies of core.
+const SCHEMA_VIOLATION_ID = 'WORKFLOW_SCHEMA_VALIDATION_FAILED';
+const CLIENT_ERROR_PREFIXES = [
+  'Request context validation failed for workflow ',
+  'This workflow run was not suspended',
+  'This workflow step "',
+  'No snapshot found for this workflow run: ',
 ];
+
+function isSchemaViolation(error: Error): boolean {
+  return (
+    'id' in error &&
+    error.id === SCHEMA_VIOLATION_ID &&
+    'category' in error &&
+    error.category === 'USER'
+  );
+}
 
 function asClientError(error: unknown): InvalidRunRequestError | undefined {
   if (!(error instanceof Error)) return undefined;
-  return CLIENT_ERROR_MARKERS.some((marker) => error.message.includes(marker))
+  return isSchemaViolation(error) ||
+    CLIENT_ERROR_PREFIXES.some((prefix) => error.message.startsWith(prefix))
     ? new InvalidRunRequestError(error.message)
     : undefined;
 }

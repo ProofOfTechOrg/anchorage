@@ -4351,6 +4351,111 @@ describe('RunnerRuntime', () => {
     ).rejects.toBeInstanceOf(InvalidRunRequestError);
   });
 
+  it('classifies a start whose input fails the workflow input schema as a 400 carrying the schema text', async () => {
+    // #given
+    const { runtime } = buildRuntime(new InMemoryStore());
+
+    // #when / #then
+    await expect(
+      runtime.start('echo', {
+        runId: crypto.randomUUID(),
+        inputData: { value: 123 },
+      }),
+    ).rejects.toMatchObject({
+      name: 'InvalidRunRequestError',
+      status: 400,
+      message: expect.stringContaining('Invalid input data'),
+    });
+  });
+
+  it('classifies a start whose request context fails the workflow request-context schema as a 400 carrying the schema text', async () => {
+    // #given a workflow that declares a request-context schema
+    const { runtime, createStep, createWorkflow } = init(
+      { storage: new InMemoryStore() },
+      { startIdempotency: 'none', executionFence: 'none' },
+    );
+    createWorkflow({
+      id: 'tenant-scoped',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+      requestContextSchema: z.object({ tenant: z.string() }),
+    })
+      .then(
+        createStep({
+          id: 'noop',
+          inputSchema: z.object({}),
+          outputSchema: z.object({}),
+          execute: async () => ({}),
+        }),
+      )
+      .commit();
+
+    // #when a start carries a request context that fails it
+    const starting = runtime.start('tenant-scoped', {
+      runId: crypto.randomUUID(),
+      inputData: {},
+      storedRequestContext: { tenant: 7 },
+    });
+
+    // #then it is refused as a request the caller can fix
+    await expect(starting).rejects.toMatchObject({
+      name: 'InvalidRunRequestError',
+      status: 400,
+      message: expect.stringContaining(
+        "Request context validation failed for workflow 'tenant-scoped'",
+      ),
+    });
+  });
+
+  it('propagates a foreign start-leg error unchanged when its text contains a client-error phrase', async () => {
+    // #given — a storage read inside the start leg fails with schema-library
+    // text, carrying a caller category under an id core does not use for
+    // schema violations
+    const storage = new InMemoryStore();
+    const { runtime } = buildRuntime(storage);
+    const foreign = Object.assign(
+      new Error(
+        '[{"code":"invalid_type","path":["internal","field"],"message":"Invalid input: expected string, received number"}]',
+      ),
+      { id: 'STORAGE_ROW_PARSE_FAILED', category: 'USER' },
+    );
+    const workflows = await storage.getStore('workflows');
+    if (!workflows) throw new Error('workflows storage missing');
+    vi.spyOn(workflows, 'getWorkflowRunById').mockRejectedValueOnce(foreign);
+
+    // #when / #then — not reclassified as a 400 that publishes the text
+    await expect(
+      runtime.start('echo', {
+        runId: crypto.randomUUID(),
+        inputData: { value: 'x' },
+      }),
+    ).rejects.toBe(foreign);
+  });
+
+  it('propagates a foreign resume-leg error unchanged when its text contains a client-error phrase', async () => {
+    // #given — a storage read inside the resume leg fails with schema-library text
+    const storage = new InMemoryStore();
+    const { runtime } = buildRuntime(storage);
+    const started = await runtime.start('demo-approval', {
+      runId: crypto.randomUUID(),
+      inputData: { topic: 'foreign' },
+    });
+    const foreign = new Error(
+      '[{"code":"invalid_type","path":["internal","field"],"message":"Invalid input: expected string, received number"}]',
+    );
+    const workflows = await storage.getStore('workflows');
+    if (!workflows) throw new Error('workflows storage missing');
+    vi.spyOn(workflows, 'getWorkflowRunById').mockRejectedValueOnce(foreign);
+
+    // #when / #then — not reclassified as a 400 that publishes the text
+    await expect(
+      runtime.resume('demo-approval', started.runId, {
+        step: 'approval',
+        resumeData: { approvedBy: 'carol' },
+      }),
+    ).rejects.toBe(foreign);
+  });
+
   it('honors caller-provided runIds', async () => {
     // #given
     const { runtime } = buildRuntime(new InMemoryStore());
