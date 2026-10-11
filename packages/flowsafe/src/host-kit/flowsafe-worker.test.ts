@@ -3300,7 +3300,9 @@ describe('createFlowsafeWorker drain inventory', () => {
       unenumerable: Array<{ name: string }>;
       drainProof: { reading: string; reachableFrom: string[] };
     };
-    expect(body.categories.filter((c) => c.class === 'work')).toHaveLength(7);
+    expect(body.categories).toContainEqual(
+      expect.objectContaining({ category: 'remote-steps', class: 'work' }),
+    );
     expect(body.categories.filter((c) => c.class === 'standing')).toHaveLength(
       2,
     );

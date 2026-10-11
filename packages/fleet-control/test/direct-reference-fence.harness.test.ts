@@ -260,15 +260,16 @@ describe.sequential('reference fence composition at release 1', {
     });
   });
 
-  it('counts the fence, index and category reads as eleven maintenance subrequests', async () => {
+  it('counts the fence, index and category reads as maintenance subrequests', async () => {
     const { response, value } = await fixture.call({
       kind: 'tenant-fence',
       role: 'a',
       operation: 'inventory',
     });
     expect(value.ok).toBe(true);
-    expect(2 + INVENTORY_CATEGORIES.length).toBe(11);
-    expect(response.headers.get('X-Direct-Maintenance-Attempts')).toBe('11');
+    expect(response.headers.get('X-Direct-Maintenance-Attempts')).toBe(
+      String(2 + INVENTORY_CATEGORIES.length),
+    );
   });
 
   it('replays numeric and null fence bindings through the database clone', async () => {

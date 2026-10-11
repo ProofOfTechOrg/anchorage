@@ -1291,6 +1291,11 @@ type GateSite = {
 
 const GATE_SITES: ReadonlyArray<GateSite & { drivenBy: string }> = [
   {
+    file: 'do-runner/remote-step-journal.ts',
+    predicate: 'admitsExistingRun',
+    drivenBy: 'do-runner/remote-step-journal.test.ts',
+  },
+  {
     file: 'do-runner/execution-fence.ts',
     predicate: 'admitsExistingRun',
     // Captured reservation binding agrees with the requested proof generation.

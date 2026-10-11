@@ -85,7 +85,7 @@ export const DIRECT_SCENARIO_ARRAY_MAXIMA = Object.freeze({
   auditFindings: 16,
   footprintVersionIds: 8,
   deploymentVersions: 2,
-  inventoryCategories: 9,
+  inventoryCategories: 10,
   inventory: Object.freeze({
     databaseIds: 2,
     namespaceIds: 4,
