@@ -647,7 +647,11 @@ async function realAgentBridgeFixture(
 }
 
 describe('durable tool suspension after host restart', () => {
-  it('restores the tool payload and applies the result to the suspended call', async () => {
+  it.each([
+    ['object', { key: 'account-7' }],
+    ['scalar', 'account-7'],
+    ['array', ['account-7']],
+  ])('restores a %s tool payload and applies the result to the suspended call', async (_shape, suspendedPayload) => {
     const runId = 'remote-tool-resume';
     const toolId = 'remote_lookup';
     const received: unknown[] = [];
@@ -655,7 +659,7 @@ describe('durable tool suspension after host restart', () => {
       id: toolId,
       description: 'Wait for a remote lookup result',
       inputSchema: z.object({ key: z.string() }),
-      suspendSchema: z.object({ key: z.string() }),
+      suspendSchema: z.unknown(),
       resumeSchema: z.object({ value: z.string() }),
       execute: async ({ key }, context) => {
         const result = context?.agent?.resumeData;
@@ -669,7 +673,7 @@ describe('durable tool suspension after host restart', () => {
         }
         if (!context?.agent?.suspend)
           throw new Error('tool suspension unavailable');
-        await context.agent.suspend({ key });
+        await context.agent.suspend(suspendedPayload);
       },
     });
     const text = localModelFixture(() => undefined);
@@ -742,7 +746,7 @@ describe('durable tool suspension after host restart', () => {
       ).toMatchObject({
         type: 'suspension',
         toolCallId: 'remote-call-1',
-        toolCallSuspended: { key: 'account-7' },
+        toolCallSuspended: suspendedPayload,
       });
       expect(received).toEqual([]);
 
@@ -813,7 +817,7 @@ describe('durable tool suspension after host restart', () => {
       ).toMatchObject({
         type: 'suspension',
         toolCallId: 'remote-call-2',
-        toolCallSuspended: { key: 'account-7' },
+        toolCallSuspended: suspendedPayload,
       });
       const nextTimestamp = resumed.suspendedAt?.[nextKey];
       if (typeof nextTimestamp !== 'number') {
@@ -836,12 +840,12 @@ describe('durable tool suspension after host restart', () => {
         {
           key: 'account-7',
           result: { value: 'found' },
-          payload: { key: 'account-7' },
+          payload: suspendedPayload,
         },
         {
           key: 'account-7',
           result: { value: 'again' },
-          payload: { key: 'account-7' },
+          payload: suspendedPayload,
         },
       ]);
       registryFor(restored).clear();

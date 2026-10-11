@@ -2068,8 +2068,7 @@ export class FlowsafeDurableAgent<
           const toolName = suspension.toolName;
           if (
             typeof toolName !== 'string' ||
-            typeof suspension.toolCallId !== 'string' ||
-            !isRecord(suspension.toolCallSuspended)
+            typeof suspension.toolCallId !== 'string'
           )
             throw new RunStateUnreadableError(
               this.getWorkflow().id,
