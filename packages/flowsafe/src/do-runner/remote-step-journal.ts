@@ -12,12 +12,20 @@ import {
 } from './execution-fence.js';
 import { resourceIdFromKey } from './memory-id.js';
 import { isPathSafeId } from './path-safe-id.js';
+import {
+  lifecycleFromRequestContext,
+  RUN_LIFECYCLE_CONTEXT_KEY,
+} from './run-lifecycle.js';
 import type { RunnerRuntime, RunSummary } from './runtime.js';
 import { validateTablePrefix } from './table-prefix.js';
 
 export const REMOTE_STEP_TABLE = 'flowsafe_remote_step_invocations';
 export const REMOTE_STEP_MARKER = 'flowsafe.remote-step/v1';
 export const MAX_REMOTE_STEP_REQUEST_BYTES = 16_384;
+
+const SNAPSHOT_EXECUTION_OPEN_SQL = `json_valid(snapshot)
+  AND json_type(snapshot, '$.requestContext."${RUN_LIFECYCLE_CONTEXT_KEY}".transitionIntent') IS NULL
+  AND json_type(snapshot, '$.requestContext."${RUN_LIFECYCLE_CONTEXT_KEY}".terminal') IS NULL`;
 
 export interface RemoteStepAddress {
   deploymentId: string;
@@ -42,7 +50,6 @@ export interface RemoteStepInvocation extends RemoteStepAddress {
   permitRevision?: number;
   permitExpiresAt?: number;
   permitConsumedAt?: number;
-  permitClosedAt?: number;
 }
 
 export interface RemoteStepPermit {
@@ -83,7 +90,6 @@ type JournalRow = {
   permit_revision: number | null;
   permit_expires_at: number | null;
   permit_consumed_at: number | null;
-  permit_closed_at: number | null;
 };
 
 function record(value: unknown): Record<string, unknown> | undefined {
@@ -171,9 +177,6 @@ function decode(row: JournalRow): RemoteStepInvocation {
     ...(row.permit_consumed_at === null
       ? {}
       : { permitConsumedAt: row.permit_consumed_at }),
-    ...(row.permit_closed_at === null
-      ? {}
-      : { permitClosedAt: row.permit_closed_at }),
   };
 }
 
@@ -298,7 +301,6 @@ export class RemoteStepJournal {
         permit_revision INTEGER,
         permit_expires_at INTEGER,
         permit_consumed_at INTEGER,
-        permit_closed_at INTEGER,
         UNIQUE (deployment_id, table_prefix, workflow_id, agent_id,
           thread_id, resource_id, run_id, step_path, suspended_at, resume_count)
       )`)
@@ -335,6 +337,12 @@ export class RemoteStepJournal {
   async #stableSnapshot(address: RemoteStepAddress) {
     const before = await this.#current(address);
     const snapshot = await this.#snapshot(address);
+    const state = await this.#execution(address);
+    const lifecycle = lifecycleFromRequestContext(
+      state.snapshot.requestContext,
+    );
+    if (lifecycle?.transitionIntent || lifecycle?.terminal)
+      throw new RemoteStepRefusal(409, 'remote step run is ending');
     const after = await this.#current(address);
     if (
       before.suspendedAt !== after.suspendedAt ||
@@ -362,7 +370,6 @@ export class RemoteStepJournal {
     )
       throw new RemoteStepRefusal(400, 'remote step address is malformed');
     validateTablePrefix(address.tablePrefix);
-    await this.#execution(address);
     const { suspension, snapshot } = await this.#stableSnapshot(address);
     const summary = await this.#runtime.authoritativeStatus(
       address.workflowId,
@@ -383,7 +390,8 @@ export class RemoteStepJournal {
         request_json, deadline_at, status)
         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending'
         WHERE EXISTS (SELECT 1 FROM "${address.tablePrefix}mastra_workflow_snapshot"
-          WHERE workflow_name = ? AND run_id = ? AND snapshot = ?)
+          WHERE workflow_name = ? AND run_id = ? AND snapshot = ?
+            AND ${SNAPSHOT_EXECUTION_OPEN_SQL})
         ON CONFLICT DO NOTHING`)
       .bind(
         invocationId,
@@ -405,11 +413,18 @@ export class RemoteStepJournal {
       )
       .run();
     const result = await this.#db
-      .prepare(`SELECT * FROM ${REMOTE_STEP_TABLE}
+      .prepare(`UPDATE ${REMOTE_STEP_TABLE}
+        SET deadline_at = MIN(deadline_at, ?)
         WHERE deployment_id = ? AND table_prefix = ? AND workflow_id = ?
           AND agent_id = ? AND thread_id = ? AND resource_id = ? AND run_id = ?
-          AND step_path = ? AND suspended_at = ? AND resume_count = ?`)
+          AND step_path = ? AND suspended_at = ? AND resume_count = ?
+          AND request_json = ?
+          AND EXISTS (SELECT 1 FROM "${address.tablePrefix}mastra_workflow_snapshot"
+            WHERE workflow_name = ? AND run_id = ? AND snapshot = ?
+              AND ${SNAPSHOT_EXECUTION_OPEN_SQL})
+        RETURNING *`)
       .bind(
+        deadlineAt,
         address.deploymentId,
         address.tablePrefix,
         address.workflowId,
@@ -420,6 +435,10 @@ export class RemoteStepJournal {
         stepPath,
         suspension.suspendedAt,
         suspension.resumeCount ?? -1,
+        suspension.requestJson,
+        address.workflowId,
+        address.runId,
+        snapshot,
       )
       .all();
     const row = rowResult(result);
@@ -461,12 +480,12 @@ export class RemoteStepJournal {
       address.resourceId !== resourceIdFromKey(address.threadId)
     )
       throw new RemoteStepRefusal(409, 'remote step run identity changed');
-    return state.execution;
+    return state;
   }
 
   async #admission(invocation: RemoteStepInvocation, priorBindings: number) {
     const observed = await this.#fence.readForAdmission();
-    const proof = await this.#execution(invocation);
+    const proof = (await this.#execution(invocation)).execution;
     if (!admitsExistingRun(observed.reading, proof))
       throw new RemoteStepRefusal(503, 'remote step execution is fenced');
     const schema = await captureExecutionFenceAdmissionSchema(
@@ -509,11 +528,12 @@ export class RemoteStepJournal {
     if (
       suspension.suspendedAt !== invocation.suspendedAt ||
       suspension.resumeCount !== invocation.resumeCount ||
+      suspension.requestJson !== JSON.stringify(invocation.request) ||
       JSON.stringify(suspension.stepPath) !==
         JSON.stringify(invocation.stepPath)
     )
       throw new RemoteStepRefusal(409, 'remote step suspension changed');
-    const gate = await this.#admission(invocation, 9);
+    const gate = await this.#admission(invocation, 10);
     if (
       invocation.status === 'dispatched' &&
       invocation.permitConsumedAt === undefined &&
@@ -531,8 +551,7 @@ export class RemoteStepJournal {
       };
     if (
       invocation.status === 'failed' ||
-      (invocation.permitConsumedAt !== undefined &&
-        invocation.permitClosedAt === undefined)
+      invocation.permitConsumedAt !== undefined
     )
       throw new RemoteStepRefusal(409, 'remote step dispatch is active');
     const epoch = gate.observed.mutationEpoch;
@@ -542,13 +561,14 @@ export class RemoteStepJournal {
     const result = await this.#db
       .prepare(`UPDATE ${REMOTE_STEP_TABLE} SET
         status = 'dispatched', permit_generation = permit_generation + 1,
-        permit_epoch = ?, permit_revision = ?, permit_expires_at = ?,
-        permit_consumed_at = NULL, permit_closed_at = NULL
+        permit_epoch = ?, permit_revision = ?,
+        permit_expires_at = MIN(?, deadline_at), permit_consumed_at = NULL
         WHERE invocation_id = ? AND permit_generation = ? AND deadline_at > ?
           AND status IN ('pending', 'dispatched')
-          AND (permit_consumed_at IS NULL OR permit_closed_at IS NOT NULL)
+          AND permit_consumed_at IS NULL AND request_json = ?
           AND EXISTS (SELECT 1 FROM "${address.tablePrefix}mastra_workflow_snapshot"
-            WHERE workflow_name = ? AND run_id = ? AND snapshot = ?)
+            WHERE workflow_name = ? AND run_id = ? AND snapshot = ?
+              AND ${SNAPSHOT_EXECUTION_OPEN_SQL})
           AND ${gate.predicate} RETURNING *`)
       .bind(
         epoch,
@@ -557,6 +577,7 @@ export class RemoteStepJournal {
         invocationId,
         invocation.permitGeneration,
         now,
+        suspension.requestJson,
         invocation.workflowId,
         invocation.runId,
         snapshot,
@@ -570,7 +591,7 @@ export class RemoteStepJournal {
       generation: row.permit_generation,
       mutationEpoch: epoch,
       transitionRevision: revision,
-      expiresAt,
+      expiresAt: row.permit_expires_at as number,
     };
   }
 
@@ -592,20 +613,22 @@ export class RemoteStepJournal {
     if (
       suspension.suspendedAt !== invocation.suspendedAt ||
       suspension.resumeCount !== invocation.resumeCount ||
+      suspension.requestJson !== JSON.stringify(invocation.request) ||
       JSON.stringify(suspension.stepPath) !==
         JSON.stringify(invocation.stepPath)
     )
       throw new RemoteStepRefusal(409, 'remote step suspension changed');
-    const gate = await this.#admission(invocation, 11);
+    const gate = await this.#admission(invocation, 12);
     const result = await this.#db
       .prepare(`UPDATE ${REMOTE_STEP_TABLE} SET permit_consumed_at = ?
         WHERE invocation_id = ? AND permit_generation = ?
           AND permit_epoch = ? AND permit_revision = ?
           AND permit_expires_at = ? AND permit_expires_at > ?
           AND deadline_at > ? AND permit_consumed_at IS NULL
-          AND status = 'dispatched'
+          AND status = 'dispatched' AND request_json = ?
           AND EXISTS (SELECT 1 FROM "${invocation.tablePrefix}mastra_workflow_snapshot"
-            WHERE workflow_name = ? AND run_id = ? AND snapshot = ?)
+            WHERE workflow_name = ? AND run_id = ? AND snapshot = ?
+              AND ${SNAPSHOT_EXECUTION_OPEN_SQL})
           AND ${gate.predicate} RETURNING invocation_id`)
       .bind(
         now,
@@ -616,6 +639,7 @@ export class RemoteStepJournal {
         permit.expiresAt,
         now,
         now,
+        suspension.requestJson,
         invocation.workflowId,
         invocation.runId,
         snapshot,
@@ -630,22 +654,5 @@ export class RemoteStepJournal {
     )
       return 'already-consumed';
     throw new RemoteStepRefusal(409, 'remote step permit is unavailable');
-  }
-
-  async closePermit(permit: RemoteStepPermit): Promise<void> {
-    const result = await this.#db
-      .prepare(`UPDATE ${REMOTE_STEP_TABLE} SET permit_closed_at = ?
-        WHERE invocation_id = ? AND permit_generation = ?
-          AND permit_consumed_at IS NOT NULL AND permit_closed_at IS NULL
-        RETURNING invocation_id`)
-      .bind(this.#now(), permit.invocationId, permit.generation)
-      .all();
-    if (rowResult(result)) return;
-    const current = await this.get(permit.invocationId);
-    if (
-      current?.permitGeneration !== permit.generation ||
-      current.permitClosedAt === undefined
-    )
-      throw new RemoteStepRefusal(409, 'remote step permit close conflicts');
   }
 }

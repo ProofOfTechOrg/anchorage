@@ -1031,10 +1031,8 @@ export class DeploymentInventory {
             'deadline_at',
             'permit_generation',
             'permit_consumed_at',
-            'permit_closed_at',
           ],
-          where:
-            "status <> 'failed' OR (permit_consumed_at IS NOT NULL AND permit_closed_at IS NULL)",
+          where: "status <> 'failed' OR permit_consumed_at IS NOT NULL",
           binds: [],
         };
       case 'approvals-waiting':
