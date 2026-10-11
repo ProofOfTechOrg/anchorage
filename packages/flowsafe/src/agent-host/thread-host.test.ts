@@ -9,6 +9,7 @@ import { nestedArray } from '../../test-support/deep-json.js';
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import {
   AgentRunSelectorMismatchError,
+  type AgentStartAuthority,
   FlowsafeDurableAgent,
 } from '../agent-runner/durable-agent-runner.js';
 import {
@@ -273,6 +274,7 @@ function harness(
     ) => Promise<void>;
     remoteSteps?: RemoteStepContinuationReader;
     stateStorage?: AgentThreadStateStorage;
+    resourceIdFromKey?: (threadId: string) => string;
   } = {},
 ): Harness {
   const state = new Map<string, unknown>();
@@ -382,7 +384,12 @@ function harness(
             kind: options.principal?.kind ?? 'human',
             id: options.principal?.id ?? 'operator-1',
           },
-          target: { kind: 'agent', id: 'writer', threadId: 'acme_thread' },
+          target: {
+            kind: 'agent',
+            id: 'writer',
+            threadId: 'acme_thread',
+            resourceId: RESOURCE_ID,
+          },
         };
         const current = snapshot as {
           requestContext: Record<string, unknown>;
@@ -501,6 +508,9 @@ function harness(
     },
   };
   const host = createThreadAgentHost({
+    ...(options.resourceIdFromKey
+      ? { resourceIdFromKey: options.resourceIdFromKey }
+      : {}),
     ...(options.authorizeAutomatedEntry
       ? { authorizeAutomatedEntry: options.authorizeAutomatedEntry }
       : {}),
@@ -2121,6 +2131,23 @@ describe('createThreadAgentHost owner recovery', () => {
 });
 
 describe('createThreadAgentHost', () => {
+  it('starts under a trusted nonidentity resource mapping', async () => {
+    const f = harness(['writer'], {
+      resourceIdFromKey: () => 'account-7',
+    });
+
+    await f.host.start(f.scope, {
+      agentId: 'writer',
+      threadId: 'acme_thread',
+      resourceId: 'account-7',
+      runId: 'account-run',
+      prompt: 'go',
+      entryPath: 'http.start',
+    });
+
+    const authority = mocked.stream.mock.calls[0]?.[7] as AgentStartAuthority;
+    expect(authority.startIdentity.target.resourceId).toBe('account-7');
+  });
   it.each([
     ['top-level', [{ role: 'system', content: 'x' }]],
     ['once-nested', [[{ role: 'system', content: 'x' }]]],
@@ -7245,6 +7272,7 @@ async function hostAgentLifecycleFixture(
     journal?: boolean;
     lifecycle?: boolean;
     snapshotTarget?: { agentId: string; threadId: string };
+    resourceIdFromKey?: (threadId: string) => string;
   } = {},
 ) {
   const core = await vi.importActual<typeof import('@mastra/core/mastra')>(
@@ -7306,6 +7334,9 @@ async function hostAgentLifecycleFixture(
   };
   const dispatch = vi.fn(async () => {});
   const fixture = harness(['writer'], {
+    ...(input.resourceIdFromKey
+      ? { resourceIdFromKey: input.resourceIdFromKey }
+      : {}),
     storage,
     init: app,
     resourceAccess: resources,
@@ -7605,9 +7636,66 @@ it('reads a retained remote result from D1 after the agent host is recreated', a
       expectedSuspension: { suspendedAt: 1000 },
     }),
   );
+  await fixture.stateStorage.put(THREAD_BINDING_KEY, {
+    version: 1,
+    agentId: 'writer',
+    resourceId: 'other-resource',
+  });
+  const displaced = await fresh.host
+    .route(
+      new Request('https://thread/_flowsafe/agent-host/remote-step-resume', {
+        method: 'POST',
+        body: JSON.stringify({ invocationId: invocation.invocationId }),
+      }),
+      fresh.scope,
+    )
+    .catch((error) => error);
+  expect(displaced).toMatchObject({ status: 404 });
+  expect(resume).toHaveBeenCalledTimes(1);
 });
 
 describe('agent host selector lookup isolation', () => {
+  it.each([
+    ['modern', 'status'],
+    ['modern', 'resume'],
+    ['v1', 'status'],
+  ] as const)('refuses an unthreaded %s run started under an older resource mapping on %s', async (provenance, route) => {
+    const f = await hostAgentLifecycleFixture({
+      provenance,
+      threaded: false,
+      resourceIdFromKey: () => 'account-7',
+    });
+    onTestFinished(() => {
+      vi.restoreAllMocks();
+      f.sql.close();
+    });
+    const resume = vi.spyOn(FlowsafeDurableAgent.prototype, 'resumeViaRuntime');
+    const request =
+      route === 'status'
+        ? new Request(
+            'https://thread/_flowsafe/agent-host/runs/writer/acme_run?resourceId=account-7',
+          )
+        : new Request('https://thread/_flowsafe/agent-host/resume', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              agentId: 'writer',
+              threadId: 'acme_thread',
+              resourceId: 'account-7',
+              runId: 'acme_run',
+              requestedBy: 'reviewer-2',
+              entryPath: 'approval.resume',
+              resumeData: {},
+            }),
+          });
+    const outcome = await f.host
+      .route(request, f.scope)
+      .catch((error) => error);
+    if (route === 'status') expect(outcome).toMatchObject({ status: 404 });
+    else expect(outcome).toBeInstanceOf(AgentRunSelectorMismatchError);
+    expect(resume).not.toHaveBeenCalled();
+  });
+
   it.each([
     ['modern', true, 'status'],
     ['modern', false, 'stream'],

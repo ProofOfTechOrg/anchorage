@@ -174,6 +174,7 @@ export type {
 
 export interface ThreadAgentHostOptions {
   remoteSteps?: RemoteStepContinuationReader;
+  resourceIdFromKey?: (threadId: string) => string;
   /** Narrows automated entry beyond what each agent's metadata declares. */
   authorizeAutomatedEntry?: AutomatedEntryAuthorizer;
   /**
@@ -623,6 +624,17 @@ function ndjson(
 export function createThreadAgentHost(
   options: ThreadAgentHostOptions,
 ): ThreadAgentHost {
+  const resourceForThread = (threadId: string): string => {
+    let resourceId: string;
+    try {
+      resourceId = (options.resourceIdFromKey ?? resourceIdFromKey)(threadId);
+    } catch {
+      throw new AgentHostRequestError(503, 'resource mapping is unavailable');
+    }
+    if (!isPathSafeId(resourceId))
+      throw new AgentHostRequestError(503, 'resource mapping is unavailable');
+    return resourceId;
+  };
   let catalogPromise: Promise<AgentModuleCatalog> | undefined;
   let runtime:
     | {
@@ -886,7 +898,7 @@ export function createThreadAgentHost(
         scope,
         {
           agentId: runRecord.agentId,
-          resourceId: resourceIdFromKey(scope.threadId),
+          resourceId: resourceForThread(scope.threadId),
           runId,
         },
         { includeLegacy: true },
@@ -1059,7 +1071,7 @@ export function createThreadAgentHost(
         !isPathSafeId(stored.agentId) ||
         !isPathSafeId(stored.threadId) ||
         !isPathSafeId(stored.resourceId) ||
-        stored.resourceId !== resourceIdFromKey(threadId) ||
+        stored.resourceId !== resourceForThread(threadId) ||
         !isPathSafeId(stored.runId) ||
         !isPathSafeId(stored.token) ||
         ownerRecoveryKey(stored.runId) !== key ||
@@ -1206,6 +1218,14 @@ export function createThreadAgentHost(
   };
 
   type NormalAgentRunState = AuthoritativeAgentStartState | LegacyAgentRunState;
+  const matchesStartResource = (
+    threadId: string,
+    resourceId: string,
+    persistedResourceId: string | undefined,
+  ): boolean =>
+    persistedResourceId === undefined
+      ? resourceId === resourceIdFromKey(threadId)
+      : persistedResourceId === resourceId;
 
   async function selectedAgentState(
     scope: AgentThreadInstanceScope,
@@ -1222,23 +1242,47 @@ export function createThreadAgentHost(
     readOptions?: { readonly includeLegacy: true },
   ): Promise<NormalAgentRunState | null> {
     const includeLegacy = readOptions?.includeLegacy === true;
-    if (ref.resourceId !== resourceIdFromKey(scope.threadId))
+    if (ref.resourceId !== resourceForThread(scope.threadId))
       throw new AgentHostRequestError(404, 'run not found');
     const current = await runtimeFor(scope);
     const durable = current.agents.get(ref.agentId);
     if (!current.catalog.get(ref.agentId) || !durable)
       throw new AgentHostRequestError(404, 'agent not found');
+    const assertSelectedResource = <T extends NormalAgentRunState | null>(
+      state: T,
+    ): T => {
+      const target =
+        state && state.kind !== 'legacy' ? state.execution.target : undefined;
+      if (
+        state &&
+        (target?.kind === 'workflow' ||
+          !matchesStartResource(
+            scope.threadId,
+            ref.resourceId,
+            target?.kind === 'agent' ? target.resourceId : undefined,
+          ))
+      )
+        throw new AgentRunSelectorMismatchError(
+          durable.getWorkflow().id,
+          ref.runId,
+        );
+      return state;
+    };
     if (includeLegacy)
-      return durable.authoritativeAgentStartState(
+      return assertSelectedResource(
+        await durable.authoritativeAgentStartState(
+          scope.init.runtime,
+          scope.threadId,
+          ref.runId,
+          { includeLegacy: true },
+        ),
+      );
+    return assertSelectedResource(
+      await durable.authoritativeAgentStartState(
         scope.init.runtime,
         scope.threadId,
         ref.runId,
-        { includeLegacy: true },
-      );
-    return durable.authoritativeAgentStartState(
-      scope.init.runtime,
-      scope.threadId,
-      ref.runId,
+      ),
     );
   }
 
@@ -1271,6 +1315,11 @@ export function createThreadAgentHost(
       state.execution.target.kind !== 'agent' ||
       state.execution.target.id !== recovery.agentId ||
       state.execution.target.threadId !== recovery.threadId ||
+      !matchesStartResource(
+        recovery.threadId,
+        recovery.resourceId,
+        state.execution.target.resourceId,
+      ) ||
       state.execution.owner.kind !== recovery.runRecord.principal.kind ||
       state.execution.owner.id !== recovery.runRecord.principal.id
     )
@@ -1365,7 +1414,7 @@ export function createThreadAgentHost(
     if (state.kind === 'legacy') {
       const ref = {
         agentId: expected.agentId,
-        resourceId: resourceIdFromKey(scope.threadId),
+        resourceId: resourceForThread(scope.threadId),
         runId,
       };
       await assertLegacyTerminalCurrent(scope, ref, state, expected);
@@ -1380,6 +1429,11 @@ export function createThreadAgentHost(
       state.execution.target.kind !== 'agent' ||
       state.execution.target.id !== expected.agentId ||
       state.execution.target.threadId !== scope.threadId ||
+      !matchesStartResource(
+        scope.threadId,
+        resourceForThread(scope.threadId),
+        state.execution.target.resourceId,
+      ) ||
       state.execution.owner.kind !== expected.principal.kind ||
       state.execution.owner.id !== expected.principal.id
     )
@@ -2220,7 +2274,7 @@ export function createThreadAgentHost(
         entry,
         scope.principal,
       );
-      if (ref.resourceId !== resourceIdFromKey(scope.threadId)) {
+      if (ref.resourceId !== resourceForThread(scope.threadId)) {
         throw new AgentHostRequestError(404, 'run not found');
       }
       const execution: TrustedAgentExecution = {
@@ -2469,7 +2523,7 @@ export function createThreadAgentHost(
     resolveBoundAgent: async (scope, input) => {
       const binding = await readBinding();
       if (!binding) throw new AgentHostRequestError(404, 'agent not found');
-      if (binding.resourceId !== resourceIdFromKey(scope.threadId)) {
+      if (binding.resourceId !== resourceForThread(scope.threadId)) {
         throw new AgentHostRequestError(404, 'agent not found');
       }
       if (input.agentId && input.agentId !== binding.agentId) {
@@ -2610,7 +2664,7 @@ export function createThreadAgentHost(
           const binding = await readBinding();
           if (
             !resourceId ||
-            resourceId !== resourceIdFromKey(scope.threadId) ||
+            resourceId !== resourceForThread(scope.threadId) ||
             binding?.resourceId !== resourceId ||
             (agentId !== null && binding.agentId !== agentId)
           ) {
@@ -2743,6 +2797,7 @@ export function createThreadAgentHost(
             state.execution.target.kind !== 'agent' ||
             state.execution.target.id !== invocation.agentId ||
             state.execution.target.threadId !== invocation.threadId ||
+            state.execution.target.resourceId !== invocation.resourceId ||
             state.execution.owner.kind !== invocation.principal.kind ||
             state.execution.owner.id !== invocation.principal.id
           )
@@ -2752,6 +2807,14 @@ export function createThreadAgentHost(
             !stored ||
             stored.agentId !== ref.agentId ||
             !samePrincipal(stored.principal, invocation.principal)
+          )
+            throw new AgentHostRequestError(404, 'run not found');
+          const binding = await readBinding();
+          if (
+            (selected.threaded &&
+              (binding?.agentId !== ref.agentId ||
+                binding.resourceId !== ref.resourceId)) ||
+            (!selected.threaded && binding)
           )
             throw new AgentHostRequestError(404, 'run not found');
           const key = invocation.stepPath.join('.');
