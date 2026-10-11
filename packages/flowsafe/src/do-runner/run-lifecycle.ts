@@ -123,9 +123,12 @@ export class RunLifecycleBlockedError extends Error {
  * A snapshot write over a settled run row that does not advance the row's
  * lifecycle, or one whose run provenance names another start than the stored
  * row's, settled or not: the stored row stands, and the writer (typically an
- * execution leg still running on another instance) is refused.
+ * execution leg still running on another instance) is refused. Status 409, a
+ * plain `status` field (see DoStatusError for why it is not a subclass).
  */
 export class RunSettledConflictError extends Error {
+  readonly status = 409;
+
   constructor(workflowId: string, runId: string) {
     super(
       `run '${runId}' of workflow '${workflowId}' is already settled; the write does not advance its lifecycle`,

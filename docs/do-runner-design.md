@@ -601,7 +601,7 @@ The runner preserves stable statuses and structured refusal reasons across Durab
 | `RunNotSuspendedError` | `409` | `RUN_NOT_SUSPENDED` | A resume found the run not suspended, for example ended |
 | `SuspensionChangedError` | `409` | `SUSPENSION_CHANGED` | A resume named a suspension its step has since left |
 
-The runtime also distinguishes unknown workflows, unknown runs, duplicate runs, client-fixable input or resume-data errors, and internal execution or storage failures.
+`UnknownWorkflowError` and `UnknownRunError` (`404`), `RunAlreadyExistsError`, `RunTerminalConflictError` and `RunSettledConflictError` (`409`), and `InvalidRunRequestError` (`400`) carry no reason code. Each carries the status the run object answers it with as `status`, so code that reads `status` from one thrown in process, such as the approval service's `DecideResult.resume.error` report for a host wired with `resumeViaRuntime(runtime)`, reads the same status. Internal execution or storage failures carry neither and answer `500`.
 
 The Durable Object maps known errors to stable HTTP status codes through `doErrorResponse()`. Unknown failures return an internal error without copying arbitrary thrown data to an audit sink.
 

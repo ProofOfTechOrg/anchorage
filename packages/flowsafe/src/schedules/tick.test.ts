@@ -13,7 +13,9 @@ import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import {
   type ExecutionFenceDatabase,
   ExecutionFenceStore,
+  InvalidRunRequestError,
   RESERVED_EXECUTION_CONTEXT_KEYS,
+  UnknownWorkflowError,
 } from '../do-runner/index.js';
 import {
   MAX_RUN_INPUT_DEPTH,
@@ -833,11 +835,20 @@ describe('createScheduleTick', () => {
     );
   });
 
-  it.each([
-    400, 403, 404, 422,
-  ])('settles an unthreaded agent start refusal with status %s as failed when its run was never reserved', async (statusCode) => {
-    // #given an unthreaded agent schedule whose start the host refuses before
-    // it reserves a run, so the host answers 404 for the run's status
+  it.each<[string, Error]>([
+    ['status 400', Object.assign(new Error('refused'), { status: 400 })],
+    ['status 403', Object.assign(new Error('refused'), { status: 403 })],
+    ['status 404', Object.assign(new Error('refused'), { status: 404 })],
+    ['status 422', Object.assign(new Error('refused'), { status: 422 })],
+    [
+      'a runtime InvalidRunRequestError',
+      new InvalidRunRequestError('agentStart is malformed'),
+    ],
+    ['a runtime UnknownWorkflowError', new UnknownWorkflowError('a1')],
+  ])('settles an unthreaded agent start refused with %s as failed when its run was never reserved', async (_label, refusal) => {
+    // #given an unthreaded agent schedule whose start seam throws a refusal
+    // carrying its status before a run is reserved, so the host answers 404
+    // for the run's status
     const store = new FakeStore();
     store.seed(
       workflowSchedule({
@@ -848,7 +859,7 @@ describe('createScheduleTick', () => {
       }),
     );
     const startAgent = vi.fn(async () => {
-      throw Object.assign(new Error('refused'), { status: statusCode });
+      throw refusal;
     });
     const events: ScheduleTickAuditEvent[] = [];
 
@@ -869,7 +880,7 @@ describe('createScheduleTick', () => {
     expect(result).toMatchObject({ fired: 0, failed: 1, deferred: 0 });
     expect(store.triggers[0]).toMatchObject({
       outcome: 'failed',
-      error: 'refused',
+      error: refusal.message,
       metadata: { reason: 'dispatch-refused' },
     });
     expect(store.schedules.get('agent_refused')?.nextFireAt).toBeGreaterThan(

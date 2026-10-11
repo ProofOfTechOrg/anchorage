@@ -36,10 +36,11 @@ import {
   BREAKWATER_ISOLATION_SCOPE_KEY,
 } from '../do-runner/breakwater-keys.js';
 import { init } from '../do-runner/init.js';
-import type {
-  RunLeg,
-  RunnerRuntime,
-  RunSummary,
+import {
+  type RunLeg,
+  type RunnerRuntime,
+  type RunSummary,
+  UnknownRunError,
 } from '../do-runner/runtime.js';
 import { createActorResolver } from './actor-context.js';
 import type { ApprovalActor, ApprovalAuditSink } from './contract.js';
@@ -1254,6 +1255,37 @@ describe('approval queue end to end', () => {
       { status: 'success' },
     );
     expect(harness.publishes()).toBe(0);
+  });
+
+  it('reports the refusal of an in-process resume whose run does not exist with its message', async () => {
+    // #given an approval filed for a step of a run the runtime holds no row
+    // for, as after retention removed it
+    const harness = buildHarness();
+    const runId = `acme_${crypto.randomUUID()}`;
+    const { record } = await harness.service.create(
+      {
+        workflowId: 'launch',
+        runId,
+        stepPath: ['approval'],
+        title: 'Publish launch post',
+      },
+      OPERATOR,
+    );
+
+    // #when the reviewer approves and decide() resumes through resumeViaRuntime
+    const decided = await harness.service.decide(
+      record.id,
+      { decision: 'approve' },
+      REVIEWER,
+    );
+
+    // #then the resume reports the runtime's unknown-run refusal, as the run
+    // object's 404 answer does, rather than `internal error`
+    expect(decided.resume).toEqual({
+      attempted: true,
+      ok: false,
+      error: new UnknownRunError('launch', runId).message,
+    });
   });
 
   it('a spent approval does not mint into a NO-PAYLOAD re-suspension (falsy-resume regression)', async () => {

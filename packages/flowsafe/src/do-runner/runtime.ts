@@ -150,14 +150,24 @@ export type { RunStatus } from './run-terminal-state.js';
 
 import type { StartIdempotencyStore } from './start-idempotency.js';
 
+// Each run refusal below that extends Error rather than DoStatusError carries
+// the status the run object answers it with as a plain `status` field;
+// DoStatusError (do-status-error.ts) says why.
+
+/** A workflow id this runtime has not registered: 404. */
 export class UnknownWorkflowError extends Error {
+  readonly status = 404;
+
   constructor(workflowId: string) {
     super(`unknown workflow '${workflowId}'`);
     this.name = 'UnknownWorkflowError';
   }
 }
 
+/** No stored run under this workflow and run id: 404. */
 export class UnknownRunError extends Error {
+  readonly status = 404;
+
   constructor(workflowId: string, runId: string) {
     super(`no run '${runId}' found for workflow '${workflowId}'`);
     this.name = 'UnknownRunError';
@@ -224,26 +234,37 @@ export class RunStateUnreadableError extends DoStatusError {
   }
 }
 
+/** A start whose run id names a run that already exists: 409. */
 export class RunAlreadyExistsError extends Error {
-  constructor(workflowId: string, runId: string, status: RunStatus) {
+  readonly status = 409;
+
+  constructor(workflowId: string, runId: string, runStatus: RunStatus) {
     super(
-      `run '${runId}' of workflow '${workflowId}' already exists (status '${status}')`,
+      `run '${runId}' of workflow '${workflowId}' already exists (status '${runStatus}')`,
     );
     this.name = 'RunAlreadyExistsError';
   }
 }
 
+/**
+ * A leg, terminal transition or terminal cleanup that the run's lifecycle
+ * state does not admit: 409.
+ */
 export class RunTerminalConflictError extends Error {
-  constructor(workflowId: string, runId: string, status: RunStatus) {
+  readonly status = 409;
+
+  constructor(workflowId: string, runId: string, runStatus: RunStatus) {
     super(
-      `run '${runId}' of workflow '${workflowId}' is already terminal with status '${status}'`,
+      `run '${runId}' of workflow '${workflowId}' is already terminal with status '${runStatus}'`,
     );
     this.name = 'RunTerminalConflictError';
   }
 }
 
-/** A request the caller can fix: bad input/resume data or step selection. */
+/** A request the caller can fix (bad input/resume data or step selection): 400. */
 export class InvalidRunRequestError extends Error {
+  readonly status = 400;
+
   constructor(message: string) {
     super(message);
     this.name = 'InvalidRunRequestError';

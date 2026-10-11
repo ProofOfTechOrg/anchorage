@@ -605,14 +605,13 @@ export interface ResumeOutcome {
   summary?: unknown;
   /**
    * The failed resume's message when the thrown value carries a reason code
-   * or a 4xx `status`. The message of any other failure can name storage or
-   * deployment detail, so it is `internal error` here. The original is logged:
-   * for an answer read from a run or thread object, on that reader's
-   * `route-internal-error` line, and for a failure in process, on the
-   * `approvals.resume` line and in the `approval.resume` audit event. A
-   * refusal `RunnerRuntime` throws in process through `resumeViaRuntime`,
-   * such as `UnknownRunError`, carries no `status`, so it is
-   * `internal error` too.
+   * or a 4xx `status`, as a refusal `RunnerRuntime` throws in process through
+   * `resumeViaRuntime` does. The message of any other failure can name
+   * storage or deployment detail, so it is
+   * `internal error` here. The original is logged: for an answer read from a
+   * run or thread object, on that reader's `route-internal-error` line, and
+   * for a failure in process, on the `approvals.resume` line and in the
+   * `approval.resume` audit event.
    */
   error?: string;
   /**

@@ -34,6 +34,7 @@ import {
   MutationEpochMismatchError,
   RunLifecycleBlockedError,
   RunNotSuspendedError,
+  RunSettledConflictError,
   RunStateUnreadableError,
   type RunSummary,
   RunTerminalConflictError,
@@ -1872,6 +1873,12 @@ describe('createRunRouter — error mapping', () => {
       new RunStateUnreadableError('open-flow', 'r1'),
       503,
       { code: 'RUN_STATE_UNREADABLE' },
+    ],
+    [
+      'RunSettledConflictError -> 409',
+      new RunSettledConflictError('open-flow', 'r1'),
+      409,
+      undefined,
     ],
   ])('maps %s', async (_label, error, status, reason) => {
     // #given — an in-process host throws the do-runner's typed errors

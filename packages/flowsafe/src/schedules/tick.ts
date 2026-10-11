@@ -179,7 +179,9 @@ export interface ScheduleTickStartAgentInput {
  * for a non-2xx response carries the status answered by the thread Durable
  * Object's start route as a numeric `status` property. An adapter that reaches
  * the route through another hop must not forward that hop's own status as a
- * refusal. Statuses 400, 403, 404 and 422 fail this fire, and the schedule keeps
+ * refusal. A startAgent that starts the agent through `RunnerRuntime` in
+ * process can let the runtime's refusal escape: it carries the status the run
+ * object answers it with. Statuses 400, 403, 404 and 422 fail this fire, and the schedule keeps
  * firing, once {@link ScheduleTickStatus} states that the run does not exist,
  * at that fire or on a later pass. A lookup that returns `undefined` fails the
  * fire after any other failure too, and one that returns a run resolves the
@@ -204,7 +206,11 @@ export interface ScheduleTickSignalAgentInput
  * hop's own status as a refusal. Statuses 400, 403, 404 and 422, which includes
  * a signal content denial, fail this fire, and the schedule keeps firing,
  * unless the target already stored a receipt for the fire, which then decides
- * it. Any other failure is retried on a later pass. The 404
+ * it. Any other failure is retried on a later pass. A signalAgent that calls
+ * the thread host in process and lets a runtime refusal escape fails the fire
+ * when the refusal's `status`, the one the run object answers it with, is 400
+ * or 404, while the same refusal through a thread object's signal route
+ * answers 502 and is retried. The 404
  * classification assumes D1 reads see the tick's own writes, using the default
  * primary-consistent D1 access without read-replication sessions.
  */
