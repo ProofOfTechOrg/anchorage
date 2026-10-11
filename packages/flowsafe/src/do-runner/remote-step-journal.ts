@@ -25,6 +25,49 @@ import type { RunnerRuntime, RunSummary } from './runtime.js';
 import { validateTablePrefix } from './table-prefix.js';
 
 export const REMOTE_STEP_TABLE = 'flowsafe_remote_step_invocations';
+export const REMOTE_STEP_SCHEMA_TABLE = 'flowsafe_remote_step_schema';
+const REMOTE_STEP_RESULT_COLUMNS = [
+  'result_json',
+  'result_digest',
+  'quiescence_digest',
+  'executor_quiescent_at',
+] as const;
+const REMOTE_STEP_COLUMNS = [
+  'invocation_id',
+  'principal_json',
+  'start_token',
+  'deployment_id',
+  'table_prefix',
+  'workflow_id',
+  'agent_id',
+  'thread_id',
+  'resource_id',
+  'run_id',
+  'step_path',
+  'suspended_at',
+  'resume_count',
+  'request_json',
+  'deadline_at',
+  'status',
+  'permit_generation',
+  'permit_epoch',
+  'permit_revision',
+  'permit_expires_at',
+  'permit_consumed_at',
+  'permit_digest',
+  ...REMOTE_STEP_RESULT_COLUMNS,
+] as const;
+const REMOTE_STEP_INTEGER_COLUMNS = new Set<string>([
+  'suspended_at',
+  'resume_count',
+  'deadline_at',
+  'permit_generation',
+  'permit_epoch',
+  'permit_revision',
+  'permit_expires_at',
+  'permit_consumed_at',
+  'executor_quiescent_at',
+]);
 export const REMOTE_STEP_MARKER = 'flowsafe.remote-step/v1';
 export const MAX_REMOTE_STEP_REQUEST_BYTES = 16_384;
 export const MAX_REMOTE_STEP_RESULT_BYTES = 16_384;
@@ -394,6 +437,86 @@ export class RemoteStepJournal {
         UNIQUE (deployment_id, table_prefix, workflow_id, agent_id,
           thread_id, resource_id, run_id, step_path, suspended_at, resume_count)
       )`)
+      .run();
+    await this.#db
+      .prepare(`CREATE TABLE IF NOT EXISTS ${REMOTE_STEP_SCHEMA_TABLE} (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        version INTEGER NOT NULL
+      )`)
+      .run();
+    const schema = await this.#db
+      .prepare(`PRAGMA table_xinfo(${REMOTE_STEP_TABLE})`)
+      .all();
+    const columns = record(schema)?.results;
+    if (
+      !Array.isArray(columns) ||
+      columns.some(
+        (column) =>
+          typeof record(column)?.name !== 'string' ||
+          record(column)?.hidden !== 0,
+      )
+    )
+      throw new RemoteStepRefusal(503, 'remote step schema is unreadable');
+    const names = columns.map((column) => record(column)?.name);
+    const samePrefix = (expected: readonly string[]) =>
+      names.length === expected.length &&
+      names.every((name, index) => {
+        const column = record(columns[index]);
+        return (
+          name === expected[index] &&
+          column?.type ===
+            (REMOTE_STEP_INTEGER_COLUMNS.has(name as string)
+              ? 'INTEGER'
+              : 'TEXT') &&
+          column?.notnull === (index > 0 && index <= 16 ? 1 : 0) &&
+          column?.pk === (index === 0 ? 1 : 0)
+        );
+      });
+    const versions = await this.#db
+      .prepare(`SELECT id, version FROM ${REMOTE_STEP_SCHEMA_TABLE} LIMIT 2`)
+      .all();
+    const rows = record(versions)?.results;
+    if (!Array.isArray(rows) || rows.length > 1)
+      throw new RemoteStepRefusal(503, 'remote step schema is unreadable');
+    if (rows.length === 1) {
+      if (
+        record(rows[0])?.id !== 1 ||
+        record(rows[0])?.version !== 2 ||
+        !samePrefix(REMOTE_STEP_COLUMNS)
+      )
+        throw new RemoteStepRefusal(503, 'remote step schema is unreadable');
+      return;
+    }
+    if (samePrefix(REMOTE_STEP_COLUMNS.slice(0, -4))) {
+      const transactional = this.#db as ExecutionFenceDatabase & {
+        batch?: (
+          statements: ReturnType<ExecutionFenceDatabase['prepare']>[],
+        ) => Promise<unknown>;
+      };
+      if (typeof transactional.batch !== 'function')
+        throw new RemoteStepRefusal(
+          503,
+          'remote step schema upgrade is unavailable',
+        );
+      await transactional.batch([
+        ...REMOTE_STEP_RESULT_COLUMNS.map((column) =>
+          this.#db.prepare(
+            `ALTER TABLE ${REMOTE_STEP_TABLE} ADD COLUMN ${column} ${column === 'executor_quiescent_at' ? 'INTEGER' : 'TEXT'}`,
+          ),
+        ),
+        this.#db.prepare(
+          `INSERT INTO ${REMOTE_STEP_SCHEMA_TABLE} (id, version) VALUES (1, 2)`,
+        ),
+      ]);
+      return;
+    }
+    if (!samePrefix(REMOTE_STEP_COLUMNS)) {
+      throw new RemoteStepRefusal(503, 'remote step schema is unreadable');
+    }
+    await this.#db
+      .prepare(
+        `INSERT INTO ${REMOTE_STEP_SCHEMA_TABLE} (id, version) VALUES (1, 2)`,
+      )
       .run();
   }
 

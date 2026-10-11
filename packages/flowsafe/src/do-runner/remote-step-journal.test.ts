@@ -190,6 +190,55 @@ describe('remote step journal dispatch admission', () => {
     ]);
   });
 
+  it('upgrades a prior journal while preserving an existing invocation', async () => {
+    const h = await fixture();
+    const invocation = await h.journal.register(ADDRESS, 10_000, PRINCIPAL);
+    for (const column of [
+      'executor_quiescent_at',
+      'quiescence_digest',
+      'result_digest',
+      'result_json',
+    ])
+      h.sqlite.exec(`ALTER TABLE ${REMOTE_STEP_TABLE} DROP COLUMN ${column}`);
+    h.sqlite.exec('DROP TABLE flowsafe_remote_step_schema');
+
+    await h.reopen().initialize();
+
+    expect(await h.reopen().get(invocation.invocationId)).toMatchObject({
+      invocationId: invocation.invocationId,
+      status: 'pending',
+    });
+    const columns = h.sqlite
+      .prepare(`PRAGMA table_xinfo(${REMOTE_STEP_TABLE})`)
+      .all() as Array<{ name: string }>;
+    expect(columns.map((column) => column.name)).toContain(
+      'executor_quiescent_at',
+    );
+  });
+
+  it('refuses an unknown journal schema version before dispatch', async () => {
+    const h = await fixture();
+    h.sqlite.exec('UPDATE flowsafe_remote_step_schema SET version = 3');
+
+    await expect(h.reopen().initialize()).rejects.toMatchObject({
+      status: 503,
+    });
+  });
+
+  it('refuses a partial journal schema without changing its rows', async () => {
+    const h = await fixture();
+    const invocation = await h.journal.register(ADDRESS, 10_000, PRINCIPAL);
+    h.sqlite.exec('DROP TABLE flowsafe_remote_step_schema');
+    h.sqlite.exec(`ALTER TABLE ${REMOTE_STEP_TABLE} DROP COLUMN result_digest`);
+
+    await expect(h.reopen().initialize()).rejects.toMatchObject({
+      status: 503,
+    });
+    expect(
+      h.sqlite.prepare(`SELECT invocation_id FROM ${REMOTE_STEP_TABLE}`).get(),
+    ).toMatchObject({ invocation_id: invocation.invocationId });
+  });
+
   it('binds registration to the original execution principal', async () => {
     const h = await fixture();
     const invocation = await h.journal.register(ADDRESS, 10_000, PRINCIPAL);

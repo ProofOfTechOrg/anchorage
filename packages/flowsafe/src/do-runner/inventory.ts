@@ -70,7 +70,10 @@ import {
   DUE_NOTIFICATION_SQL,
   notificationTimestampMillis,
 } from './notification-predicate.js';
-import { REMOTE_STEP_TABLE } from './remote-step-journal.js';
+import {
+  REMOTE_STEP_SCHEMA_TABLE,
+  REMOTE_STEP_TABLE,
+} from './remote-step-journal.js';
 import {
   START_IDEMPOTENCY_TABLE,
   START_RESERVATION_STATES,
@@ -292,6 +295,13 @@ export interface FlowsafeTableEntry {
  * characters.
  */
 export const FLOWSAFE_TABLES: readonly FlowsafeTableEntry[] = [
+  {
+    table: REMOTE_STEP_SCHEMA_TABLE,
+    purpose: 'remote invocation journal schema version',
+    accounting: {
+      excluded: 'schema metadata contains no run or external dispatch work',
+    },
+  },
   {
     table: REMOTE_STEP_TABLE,
     purpose: 'durable remote tool invocations and their dispatch permits',
