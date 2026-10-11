@@ -25,11 +25,19 @@ import { validateTablePrefix } from './table-prefix.js';
 
 export const REMOTE_STEP_TABLE = 'flowsafe_remote_step_invocations';
 export const REMOTE_STEP_SCHEMA_TABLE = 'flowsafe_remote_step_schema';
+const REMOTE_STEP_RECOVERY_INDEX = 'flowsafe_remote_step_recovery';
+const REMOTE_STEP_RECOVERY_INDEX_SQL = `CREATE INDEX ${REMOTE_STEP_RECOVERY_INDEX} ON ${REMOTE_STEP_TABLE} (invocation_id) WHERE status IN ('result-retained', 'resuming')`;
 const REMOTE_STEP_RESULT_COLUMNS = [
   'result_json',
   'result_digest',
   'quiescence_digest',
   'executor_quiescent_at',
+] as const;
+const REMOTE_STEP_SETTLEMENT_COLUMNS = [
+  'resume_lease_owner',
+  'resume_lease_expires_at',
+  'settled_at',
+  'settlement_outcome',
 ] as const;
 const REMOTE_STEP_COLUMNS = [
   'invocation_id',
@@ -55,6 +63,7 @@ const REMOTE_STEP_COLUMNS = [
   'permit_consumed_at',
   'permit_digest',
   ...REMOTE_STEP_RESULT_COLUMNS,
+  ...REMOTE_STEP_SETTLEMENT_COLUMNS,
 ] as const;
 const REMOTE_STEP_INTEGER_COLUMNS = new Set<string>([
   'suspended_at',
@@ -66,6 +75,8 @@ const REMOTE_STEP_INTEGER_COLUMNS = new Set<string>([
   'permit_expires_at',
   'permit_consumed_at',
   'executor_quiescent_at',
+  'resume_lease_expires_at',
+  'settled_at',
 ]);
 export const REMOTE_STEP_MARKER = 'flowsafe.remote-step/v1';
 export const MAX_REMOTE_STEP_REQUEST_BYTES = 16_384;
@@ -130,12 +141,24 @@ export interface RemoteStepInvocation extends RemoteStepAddress {
   resumeCount?: number;
   request: unknown;
   deadlineAt: number;
-  status: 'pending' | 'dispatched' | 'result-retained' | 'failed';
+  status:
+    | 'pending'
+    | 'dispatched'
+    | 'result-retained'
+    | 'resuming'
+    | 'settled'
+    | 'failed';
   permitGeneration: number;
   permitEpoch?: number;
   permitRevision?: number;
   permitExpiresAt?: number;
   permitConsumedAt?: number;
+  resumeLeaseExpiresAt?: number;
+  settlementOutcome?:
+    | 'applied'
+    | 'terminal-not-success'
+    | 'deadline-expired'
+    | 'advanced-without-proof';
 }
 
 export interface RemoteStepPermit {
@@ -191,6 +214,10 @@ type JournalRow = {
   result_digest: string | null;
   quiescence_digest: string | null;
   executor_quiescent_at: number | null;
+  resume_lease_owner: string | null;
+  resume_lease_expires_at: number | null;
+  settled_at: number | null;
+  settlement_outcome: string | null;
 };
 
 function record(value: unknown): Record<string, unknown> | undefined {
@@ -256,7 +283,36 @@ function decode(row: JournalRow): RemoteStepInvocation {
     (row.resume_count !== -1 && row.resume_count < 1) ||
     !Number.isSafeInteger(row.permit_generation) ||
     row.permit_generation < 0 ||
-    !['pending', 'dispatched', 'result-retained', 'failed'].includes(row.status)
+    ![
+      'pending',
+      'dispatched',
+      'result-retained',
+      'resuming',
+      'settled',
+      'failed',
+    ].includes(row.status) ||
+    (row.settlement_outcome !== null &&
+      ![
+        'applied',
+        'terminal-not-success',
+        'deadline-expired',
+        'advanced-without-proof',
+      ].includes(row.settlement_outcome)) ||
+    (row.status === 'resuming' &&
+      (!isPathSafeId(row.resume_lease_owner) ||
+        !positiveTime(row.resume_lease_expires_at) ||
+        row.result_json === null)) ||
+    (row.status !== 'resuming' &&
+      (row.resume_lease_owner !== null ||
+        row.resume_lease_expires_at !== null)) ||
+    (row.status === 'settled' && row.settlement_outcome !== 'applied') ||
+    (row.status === 'settled' &&
+      (row.result_json === null ||
+        row.result_digest === null ||
+        !positiveTime(row.executor_quiescent_at))) ||
+    (row.settlement_outcome !== null &&
+      ((row.status !== 'settled' && row.status !== 'failed') ||
+        !positiveTime(row.settled_at)))
   )
     throw new RemoteStepRefusal(503, 'remote step journal is unreadable');
   return {
@@ -287,6 +343,18 @@ function decode(row: JournalRow): RemoteStepInvocation {
     ...(row.permit_consumed_at === null
       ? {}
       : { permitConsumedAt: row.permit_consumed_at }),
+    ...(row.resume_lease_expires_at === null
+      ? {}
+      : { resumeLeaseExpiresAt: row.resume_lease_expires_at }),
+    ...(row.settlement_outcome === null
+      ? {}
+      : {
+          settlementOutcome: row.settlement_outcome as
+            | 'applied'
+            | 'terminal-not-success'
+            | 'deadline-expired'
+            | 'advanced-without-proof',
+        }),
   };
 }
 
@@ -433,6 +501,10 @@ export class RemoteStepJournal {
         result_digest TEXT,
         quiescence_digest TEXT,
         executor_quiescent_at INTEGER,
+        resume_lease_owner TEXT,
+        resume_lease_expires_at INTEGER,
+        settled_at INTEGER,
+        settlement_outcome TEXT,
         UNIQUE (deployment_id, table_prefix, workflow_id, agent_id,
           thread_id, resource_id, run_id, step_path, suspended_at, resume_count)
       )`)
@@ -514,6 +586,22 @@ export class RemoteStepJournal {
       }
       if (!uniqueSuspension)
         throw new RemoteStepRefusal(503, 'remote step schema is unreadable');
+      const recoveryIndex = indexes.find(
+        (value) => record(value)?.name === REMOTE_STEP_RECOVERY_INDEX,
+      );
+      const recoveryDefinition = record(
+        await this.#db
+          .prepare('SELECT sql FROM sqlite_schema WHERE type = ? AND name = ?')
+          .bind('index', REMOTE_STEP_RECOVERY_INDEX)
+          .all(),
+      )?.results;
+      const validRecoveryIndex =
+        record(recoveryIndex)?.unique === 0 &&
+        record(recoveryIndex)?.origin === 'c' &&
+        record(recoveryIndex)?.partial === 1 &&
+        Array.isArray(recoveryDefinition) &&
+        recoveryDefinition.length === 1 &&
+        record(recoveryDefinition[0])?.sql === REMOTE_STEP_RECOVERY_INDEX_SQL;
       const versions = await this.#db
         .prepare(`SELECT id, version FROM ${REMOTE_STEP_SCHEMA_TABLE} LIMIT 2`)
         .all();
@@ -523,19 +611,29 @@ export class RemoteStepJournal {
       if (rows.length === 1) {
         if (
           record(rows[0])?.id !== 1 ||
-          record(rows[0])?.version !== 2 ||
-          !samePrefix(REMOTE_STEP_COLUMNS)
+          (record(rows[0])?.version !== 3 && record(rows[0])?.version !== 2) ||
+          !samePrefix(
+            record(rows[0])?.version === 3
+              ? REMOTE_STEP_COLUMNS
+              : REMOTE_STEP_COLUMNS.slice(0, -4),
+          ) ||
+          (record(rows[0])?.version === 3 && !validRecoveryIndex)
         )
           throw new RemoteStepRefusal(503, 'remote step schema is unreadable');
-        return 'current';
+        return record(rows[0])?.version === 3 ? 'current' : 'prior-v2';
       }
-      if (samePrefix(REMOTE_STEP_COLUMNS.slice(0, -4))) return 'prior';
+      if (samePrefix(REMOTE_STEP_COLUMNS.slice(0, -8))) return 'prior-v1';
+      if (samePrefix(REMOTE_STEP_COLUMNS.slice(0, -4))) return 'unversioned-v2';
       if (samePrefix(REMOTE_STEP_COLUMNS)) return 'unversioned-current';
       throw new RemoteStepRefusal(503, 'remote step schema is unreadable');
     };
     const stage = await readSchema();
     if (stage === 'current') return;
-    if (stage === 'prior') {
+    if (
+      stage === 'prior-v1' ||
+      stage === 'prior-v2' ||
+      stage === 'unversioned-v2'
+    ) {
       const transactional = this.#db as ExecutionFenceDatabase & {
         batch?: (
           statements: ReturnType<ExecutionFenceDatabase['prepare']>[],
@@ -548,13 +646,22 @@ export class RemoteStepJournal {
         );
       try {
         await transactional.batch([
-          ...REMOTE_STEP_RESULT_COLUMNS.map((column) =>
+          ...(stage === 'prior-v1' ? REMOTE_STEP_RESULT_COLUMNS : []).map(
+            (column) =>
+              this.#db.prepare(
+                `ALTER TABLE ${REMOTE_STEP_TABLE} ADD COLUMN ${column} ${column === 'executor_quiescent_at' ? 'INTEGER' : 'TEXT'}`,
+              ),
+          ),
+          ...REMOTE_STEP_SETTLEMENT_COLUMNS.map((column) =>
             this.#db.prepare(
-              `ALTER TABLE ${REMOTE_STEP_TABLE} ADD COLUMN ${column} ${column === 'executor_quiescent_at' ? 'INTEGER' : 'TEXT'}`,
+              `ALTER TABLE ${REMOTE_STEP_TABLE} ADD COLUMN ${column} ${REMOTE_STEP_INTEGER_COLUMNS.has(column) ? 'INTEGER' : 'TEXT'}`,
             ),
           ),
+          this.#db.prepare(REMOTE_STEP_RECOVERY_INDEX_SQL),
           this.#db.prepare(
-            `INSERT INTO ${REMOTE_STEP_SCHEMA_TABLE} (id, version) VALUES (1, 2)`,
+            stage === 'prior-v2'
+              ? `UPDATE ${REMOTE_STEP_SCHEMA_TABLE} SET version = 3 WHERE id = 1 AND version = 2`
+              : `INSERT INTO ${REMOTE_STEP_SCHEMA_TABLE} (id, version) VALUES (1, 3)`,
           ),
         ]);
       } catch (error) {
@@ -562,12 +669,23 @@ export class RemoteStepJournal {
       }
       return;
     }
+    const transactional = this.#db as ExecutionFenceDatabase & {
+      batch?: (
+        statements: ReturnType<ExecutionFenceDatabase['prepare']>[],
+      ) => Promise<unknown>;
+    };
+    if (typeof transactional.batch !== 'function')
+      throw new RemoteStepRefusal(
+        503,
+        'remote step schema upgrade is unavailable',
+      );
     try {
-      await this.#db
-        .prepare(
-          `INSERT INTO ${REMOTE_STEP_SCHEMA_TABLE} (id, version) VALUES (1, 2)`,
-        )
-        .run();
+      await transactional.batch([
+        this.#db.prepare(REMOTE_STEP_RECOVERY_INDEX_SQL),
+        this.#db.prepare(
+          `INSERT INTO ${REMOTE_STEP_SCHEMA_TABLE} (id, version) VALUES (1, 3)`,
+        ),
+      ]);
     } catch (error) {
       if ((await readSchema()) !== 'current') throw error;
     }
@@ -765,6 +883,8 @@ export class RemoteStepJournal {
         (state.provenance.startIdentity?.owner.kind !== principal.kind ||
           state.provenance.startIdentity.owner.id !== principal.id)) ||
       state.execution.tablePrefix !== address.tablePrefix ||
+      state.execution.workflowId !== address.workflowId ||
+      state.execution.runId !== address.runId ||
       address.resourceId !== target.resourceId
     )
       throw new RemoteStepRefusal(409, 'remote step run identity changed');
@@ -1056,8 +1176,9 @@ export class RemoteStepJournal {
     const quiescenceDigest = row.quiescence_digest;
     const executorQuiescentAt = row.executor_quiescent_at;
     if (resultJson === null) return undefined;
+    if (row.status === 'settled' || row.status === 'failed') return undefined;
     if (
-      row.status !== 'result-retained' ||
+      !['result-retained', 'resuming'].includes(row.status) ||
       row.permit_consumed_at === null ||
       typeof resultDigest !== 'string' ||
       !SHA256_HEX.test(resultDigest) ||
@@ -1080,5 +1201,253 @@ export class RemoteStepJournal {
       quiescenceDigest,
       executorQuiescentAt,
     };
+  }
+
+  async claimResume(invocationId: string, leaseMs: number): Promise<string> {
+    if (
+      !isPathSafeId(invocationId) ||
+      !Number.isSafeInteger(leaseMs) ||
+      leaseMs < 1 ||
+      leaseMs > 60_000
+    )
+      throw new RemoteStepRefusal(400, 'remote step resume claim is malformed');
+    const invocation = await this.get(invocationId);
+    if (!invocation) throw new RemoteStepRefusal(404, 'invocation not found');
+    if (invocation.status !== 'result-retained')
+      throw new RemoteStepRefusal(409, 'remote step result is unavailable');
+    const start = await this.#execution(invocation, invocation.principal);
+    if (start.execution.startToken !== invocation.startToken)
+      throw new RemoteStepRefusal(409, 'remote step run generation changed');
+    if (!(await this.readRetainedResult(invocationId)))
+      throw new RemoteStepRefusal(409, 'remote step result is unavailable');
+    const now = this.#now();
+    const owner = crypto.randomUUID();
+    const result = await this.#db
+      .prepare(`UPDATE ${REMOTE_STEP_TABLE}
+        SET status = 'resuming', resume_lease_owner = ?, resume_lease_expires_at = ?
+        WHERE invocation_id = ? AND deployment_id = ? AND table_prefix = ?
+          AND workflow_id = ? AND agent_id = ? AND thread_id = ?
+          AND resource_id = ? AND run_id = ? AND start_token = ?
+          AND permit_generation = ? AND permit_epoch IS ?
+          AND result_digest IS NOT NULL
+          AND status = 'result-retained'
+        RETURNING invocation_id`)
+      .bind(
+        owner,
+        now + leaseMs,
+        invocationId,
+        invocation.deploymentId,
+        invocation.tablePrefix,
+        invocation.workflowId,
+        invocation.agentId,
+        invocation.threadId,
+        invocation.resourceId,
+        invocation.runId,
+        invocation.startToken,
+        invocation.permitGeneration,
+        invocation.permitEpoch ?? null,
+      )
+      .all();
+    if (!rowResult(result))
+      throw new RemoteStepRefusal(409, 'remote step resume is claimed');
+    return owner;
+  }
+
+  async settleAfterResume(
+    invocationId: string,
+    leaseOwner: string,
+    witnessed?: RunSummary,
+  ): Promise<
+    | 'retry'
+    | 'applied'
+    | 'terminal-not-success'
+    | 'deadline-expired'
+    | 'advanced-without-proof'
+  > {
+    if (!isPathSafeId(invocationId) || !isPathSafeId(leaseOwner))
+      throw new RemoteStepRefusal(400, 'remote step resume claim is malformed');
+    const invocation = await this.get(invocationId);
+    if (invocation?.status !== 'resuming')
+      throw new RemoteStepRefusal(409, 'remote step resume claim changed');
+    const start = await this.#execution(invocation, invocation.principal);
+    if (start.execution.startToken !== invocation.startToken)
+      throw new RemoteStepRefusal(409, 'remote step run generation changed');
+    const current = await this.#runtime.authoritativeStatus(
+      invocation.workflowId,
+      invocation.runId,
+    );
+    if (!current || current.runId !== invocation.runId)
+      throw new RemoteStepRefusal(503, 'remote step outcome is unreadable');
+    const same = (summary: RunSummary) => {
+      if (summary.status !== 'suspended') return false;
+      const key = invocation.stepPath.join('.');
+      const pathPresent = summary.suspended?.some(
+        (path) => JSON.stringify(path) === JSON.stringify(invocation.stepPath),
+      );
+      const suspended = record(record(summary.suspendPayload)?.[key]);
+      const tool = record(suspended?.toolCallSuspended);
+      return (
+        pathPresent === true &&
+        summary.suspendedAt?.[key] === invocation.suspendedAt &&
+        summary.resumeCount?.[key] === invocation.resumeCount &&
+        suspended?.type === 'suspension' &&
+        tool?.remoteStep === REMOTE_STEP_MARKER &&
+        JSON.stringify(tool.request) === JSON.stringify(invocation.request)
+      );
+    };
+    const sameObservedOutcome = (left: RunSummary, right: RunSummary) =>
+      left.runId === right.runId &&
+      left.status === right.status &&
+      ((left.status === 'success' &&
+        JSON.stringify(left.result) === JSON.stringify(right.result)) ||
+        (left.status === 'suspended' &&
+          JSON.stringify(left.suspended) === JSON.stringify(right.suspended) &&
+          JSON.stringify(left.suspendedAt) ===
+            JSON.stringify(right.suspendedAt) &&
+          JSON.stringify(left.resumeCount) ===
+            JSON.stringify(right.resumeCount) &&
+          JSON.stringify(left.suspendPayload) ===
+            JSON.stringify(right.suspendPayload)));
+    let outcome:
+      | 'retry'
+      | 'applied'
+      | 'terminal-not-success'
+      | 'deadline-expired'
+      | 'advanced-without-proof';
+    if (same(current))
+      outcome =
+        this.#now() >= invocation.deadlineAt ? 'deadline-expired' : 'retry';
+    else if (current.status === 'suspended' || current.status === 'success')
+      outcome =
+        witnessed && sameObservedOutcome(witnessed, current) && !same(witnessed)
+          ? 'applied'
+          : 'advanced-without-proof';
+    else if (
+      [
+        'failed',
+        'tripwire',
+        'canceled',
+        'bailed',
+        'skipped',
+        'cancelled',
+        'timed_out',
+      ].includes(current.status)
+    )
+      outcome = 'terminal-not-success';
+    else
+      throw new RemoteStepRefusal(503, 'remote step outcome is still changing');
+    const result = await this.#db
+      .prepare(`UPDATE ${REMOTE_STEP_TABLE}
+        SET status = ?, resume_lease_owner = NULL, resume_lease_expires_at = NULL,
+            settled_at = ?, settlement_outcome = ?
+        WHERE invocation_id = ? AND status = 'resuming'
+          AND resume_lease_owner = ? AND permit_generation = ?
+          AND permit_epoch IS ? AND start_token = ?
+          AND deployment_id = ? AND table_prefix = ? AND workflow_id = ?
+          AND agent_id = ? AND thread_id = ? AND resource_id = ? AND run_id = ?
+        RETURNING invocation_id`)
+      .bind(
+        outcome === 'retry'
+          ? 'result-retained'
+          : outcome === 'applied'
+            ? 'settled'
+            : 'failed',
+        outcome === 'retry' ? null : this.#now(),
+        outcome === 'retry' ? null : outcome,
+        invocationId,
+        leaseOwner,
+        invocation.permitGeneration,
+        invocation.permitEpoch ?? null,
+        invocation.startToken,
+        invocation.deploymentId,
+        invocation.tablePrefix,
+        invocation.workflowId,
+        invocation.agentId,
+        invocation.threadId,
+        invocation.resourceId,
+        invocation.runId,
+      )
+      .all();
+    if (!rowResult(result))
+      throw new RemoteStepRefusal(409, 'remote step resume claim changed');
+    return outcome;
+  }
+
+  async recoverableResults(
+    limit: number,
+    afterInvocationId = '',
+  ): Promise<{ invocationIds: string[]; nextCursor?: string }> {
+    if (
+      !Number.isSafeInteger(limit) ||
+      limit < 1 ||
+      limit > 100 ||
+      (afterInvocationId !== '' && !isPathSafeId(afterInvocationId))
+    )
+      throw new RemoteStepRefusal(
+        400,
+        'remote step recovery limit is malformed',
+      );
+    const now = this.#now();
+    const rows = record(
+      await this.#db
+        .prepare(`SELECT invocation_id, status, resume_lease_expires_at
+        FROM ${REMOTE_STEP_TABLE} INDEXED BY ${REMOTE_STEP_RECOVERY_INDEX}
+        WHERE invocation_id > ?
+          AND status IN ('result-retained', 'resuming')
+        ORDER BY invocation_id LIMIT ?`)
+        .bind(afterInvocationId, limit)
+        .all(),
+    )?.results;
+    if (
+      !Array.isArray(rows) ||
+      rows.some(
+        (row) =>
+          !isPathSafeId(record(row)?.invocation_id) ||
+          !['result-retained', 'resuming'].includes(
+            record(row)?.status as string,
+          ) ||
+          (record(row)?.status === 'resuming' &&
+            !positiveTime(record(row)?.resume_lease_expires_at)),
+      )
+    )
+      throw new RemoteStepRefusal(
+        503,
+        'remote step recovery scan is unreadable',
+      );
+    const invocationIds = rows
+      .filter((row) => {
+        const value = record(row);
+        return (
+          value?.status === 'result-retained' ||
+          (value?.status === 'resuming' &&
+            positiveTime(value.resume_lease_expires_at) &&
+            value.resume_lease_expires_at <= now)
+        );
+      })
+      .map((row) => record(row)?.invocation_id as string);
+    const last = rows.at(-1);
+    return {
+      invocationIds,
+      ...(rows.length === limit && last
+        ? { nextCursor: record(last)?.invocation_id as string }
+        : {}),
+    };
+  }
+
+  async reconcileResult(
+    invocationId: string,
+  ): Promise<
+    | 'retry'
+    | 'applied'
+    | 'terminal-not-success'
+    | 'deadline-expired'
+    | 'advanced-without-proof'
+    | 'pending-quiescence'
+  > {
+    const invocation = await this.get(invocationId);
+    if (!invocation) throw new RemoteStepRefusal(404, 'invocation not found');
+    if (invocation.status === 'resuming') return 'pending-quiescence';
+    const owner = await this.claimResume(invocationId, 60_000);
+    return this.settleAfterResume(invocationId, owner);
   }
 }

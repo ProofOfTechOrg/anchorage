@@ -2768,16 +2768,25 @@ export function createThreadAgentHost(
           if (!isPathSafeId(invocationId))
             throw new AgentHostRequestError(404, 'invocation not found');
           const invocation = await reader.get(invocationId);
+          if (
+            !invocation ||
+            invocation.deploymentId !== reader.deploymentId ||
+            invocation.tablePrefix !== reader.tablePrefix ||
+            invocation.threadId !== scope.threadId ||
+            !samePrincipal(invocation.principal, scope.principal)
+          )
+            throw new AgentHostRequestError(404, 'invocation not found');
+          if (invocation.status === 'resuming')
+            throw new AgentHostRequestError(
+              503,
+              'remote step resume awaits executor quiescence',
+            );
           const retained = await reader.readRetainedResult(invocationId);
           if (
             !invocation ||
             !retained ||
             retained.invocationId !== invocationId ||
             invocation.status !== 'result-retained' ||
-            invocation.deploymentId !== reader.deploymentId ||
-            invocation.tablePrefix !== reader.tablePrefix ||
-            invocation.threadId !== scope.threadId ||
-            !samePrincipal(invocation.principal, scope.principal) ||
             invocation.deadlineAt <= Date.now()
           )
             throw new AgentHostRequestError(404, 'invocation not found');
@@ -2877,6 +2886,7 @@ export function createThreadAgentHost(
             principalPermissions,
             safeContext: selected.safeContext,
           };
+          const leaseOwner = await reader.claimResume(invocationId, 60_000);
           const resumed = await withExecution(execution, () =>
             durable.resumeViaRuntime({
               runId: ref.runId,
@@ -2900,6 +2910,21 @@ export function createThreadAgentHost(
                 : {}),
             }),
           );
+          const settlement = await reader.settleAfterResume(
+            invocationId,
+            leaseOwner,
+            resumed,
+          );
+          if (settlement === 'retry' || settlement === 'advanced-without-proof')
+            throw new AgentHostRequestError(
+              503,
+              'remote step resume outcome is unresolved',
+            );
+          if (settlement !== 'applied')
+            throw new AgentHostRequestError(
+              409,
+              'remote step result was not applied',
+            );
           const result = await envelopeFor(
             scope,
             ref,

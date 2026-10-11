@@ -38,6 +38,7 @@ import {
   isTerminalRunStatus,
   type RunStatus,
 } from '../do-runner/run-terminal-state.js';
+import type { RunSummary } from '../do-runner/runtime.js';
 import {
   captureReservation,
   type StartReservationOwner,
@@ -134,6 +135,18 @@ export interface RemoteStepContinuationReader {
   readRetainedResult(
     invocationId: string,
   ): Promise<RecordedRemoteStepResult | undefined>;
+  claimResume(invocationId: string, leaseMs: number): Promise<string>;
+  settleAfterResume(
+    invocationId: string,
+    leaseOwner: string,
+    witnessed?: RunSummary,
+  ): Promise<
+    | 'retry'
+    | 'applied'
+    | 'terminal-not-success'
+    | 'deadline-expired'
+    | 'advanced-without-proof'
+  >;
 }
 
 export interface AgentThreadRunRef {
@@ -761,6 +774,11 @@ export function createAgentThreadTopology<Id>(
       if (!isPathSafeId(invocationId))
         throw new RunRouteError(404, 'invocation not found');
       const invocation = await reader.get(invocationId);
+      if (invocation?.status === 'resuming')
+        throw new RunRouteError(
+          503,
+          'remote step resume awaits executor quiescence',
+        );
       if (
         invocation?.status !== 'result-retained' ||
         invocation.deploymentId !== reader.deploymentId ||

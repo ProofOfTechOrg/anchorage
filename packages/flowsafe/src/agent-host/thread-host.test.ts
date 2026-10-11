@@ -4045,6 +4045,8 @@ describe('createThreadAgentHost', () => {
         quiescenceDigest: 'evidence',
         executorQuiescentAt: 1000,
       })),
+      claimResume: vi.fn(async () => 'lease-1'),
+      settleAfterResume: vi.fn(async () => 'applied' as const),
     };
     const fixture = harness(['writer'], {
       remoteSteps: reader,
@@ -4064,11 +4066,12 @@ describe('createThreadAgentHost', () => {
         },
       },
     });
-    mocked.resumeViaRuntime.mockResolvedValue({
+    const resumed = {
       runId: 'acme_run',
-      status: 'suspended',
+      status: 'suspended' as const,
       suspended: [['next']],
-    });
+    };
+    mocked.resumeViaRuntime.mockResolvedValue(resumed);
     const request = new Request(
       'https://thread/_flowsafe/agent-host/remote-step-resume',
       {
@@ -4091,6 +4094,12 @@ describe('createThreadAgentHost', () => {
         resumeData: { answer: 1 },
         expectedSuspension: { suspendedAt: 1000 },
       }),
+    );
+    expect(reader.claimResume).toHaveBeenCalledWith('invocation_1', 60_000);
+    expect(reader.settleAfterResume).toHaveBeenCalledWith(
+      'invocation_1',
+      'lease-1',
+      resumed,
     );
 
     mocked.resumeViaRuntime.mockClear();
@@ -4115,6 +4124,227 @@ describe('createThreadAgentHost', () => {
         fixture.scope,
       ),
     ).rejects.toMatchObject({ status: 409 });
+    expect(mocked.resumeViaRuntime).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['terminal-not-success', 409],
+    ['deadline-expired', 409],
+    ['retry', 503],
+    ['advanced-without-proof', 503],
+  ] as const)('refuses a stale successful resume response when settlement is %s', async (settlement, expectedStatus) => {
+    const principal: ExecutionPrincipal = {
+      kind: 'human',
+      id: 'operator-1',
+      role: 'operator',
+    };
+    const reader: RemoteStepContinuationReader = {
+      deploymentId: 'deployment',
+      tablePrefix: '',
+      get: async () => ({
+        invocationId: 'invocation_1',
+        deploymentId: 'deployment',
+        tablePrefix: '',
+        workflowId: 'durable-agentic-loop',
+        agentId: 'writer',
+        threadId: 'acme_thread',
+        resourceId: RESOURCE_ID,
+        runId: 'acme_run',
+        principal,
+        startToken: 'test-generation',
+        stepPath: ['tool'],
+        suspendedAt: 1000,
+        request: {},
+        deadlineAt: 9999999999999,
+        status: 'result-retained',
+        permitGeneration: 1,
+      }),
+      readRetainedResult: async () => ({
+        invocationId: 'invocation_1',
+        resultJson: '{"answer":1}',
+        resultDigest: 'digest',
+        quiescenceDigest: 'evidence',
+        executorQuiescentAt: 1000,
+      }),
+      claimResume: vi.fn(async () => 'lease-1'),
+      settleAfterResume: vi.fn(async () => settlement),
+    };
+    const fixture = harness(['writer'], { remoteSteps: reader });
+    seedSuspendedApprovalRun(fixture);
+    fixture.setSummary({
+      runId: 'acme_run',
+      status: 'suspended',
+      suspended: [['tool']],
+      suspendedAt: { tool: 1000 },
+      suspendPayload: {
+        tool: {
+          type: 'suspension',
+          toolCallSuspended: { remoteStep: REMOTE_STEP_MARKER },
+        },
+      },
+    });
+    const stale = { runId: 'acme_run', status: 'success' as const };
+    mocked.resumeViaRuntime.mockResolvedValue(stale);
+
+    await expect(
+      fixture.host.route(
+        new Request('https://thread/_flowsafe/agent-host/remote-step-resume', {
+          method: 'POST',
+          body: JSON.stringify({ invocationId: 'invocation_1' }),
+        }),
+        fixture.scope,
+      ),
+    ).rejects.toMatchObject({ status: expectedStatus });
+    expect(reader.settleAfterResume).toHaveBeenCalledWith(
+      'invocation_1',
+      'lease-1',
+      stale,
+    );
+  });
+
+  it('waits for an in-flight resume before considering its expired lease', async () => {
+    const principal: ExecutionPrincipal = {
+      kind: 'human',
+      id: 'operator-1',
+      role: 'operator',
+    };
+    const entered = deferredSignal();
+    const release = deferredSignal();
+    let status: 'result-retained' | 'resuming' | 'settled' = 'result-retained';
+    const reader: RemoteStepContinuationReader = {
+      deploymentId: 'deployment',
+      tablePrefix: '',
+      get: async () => ({
+        invocationId: 'invocation_1',
+        deploymentId: 'deployment',
+        tablePrefix: '',
+        workflowId: 'durable-agentic-loop',
+        agentId: 'writer',
+        threadId: 'acme_thread',
+        resourceId: RESOURCE_ID,
+        runId: 'acme_run',
+        principal,
+        startToken: 'test-generation',
+        stepPath: ['tool'],
+        suspendedAt: 1000,
+        request: {},
+        deadlineAt: 9999999999999,
+        status,
+        permitGeneration: 1,
+        ...(status === 'resuming'
+          ? { resumeLeaseExpiresAt: Date.now() - 1 }
+          : {}),
+      }),
+      readRetainedResult: async () => ({
+        invocationId: 'invocation_1',
+        resultJson: '{"answer":1}',
+        resultDigest: 'digest',
+        quiescenceDigest: 'evidence',
+        executorQuiescentAt: 1000,
+      }),
+      claimResume: vi.fn(async () => {
+        status = 'resuming';
+        return 'lease-1';
+      }),
+      settleAfterResume: vi.fn(async () => {
+        status = 'settled';
+        return 'applied' as const;
+      }),
+    };
+    const fixture = harness(['writer'], { remoteSteps: reader });
+    seedSuspendedApprovalRun(fixture);
+    fixture.setSummary({
+      runId: 'acme_run',
+      status: 'suspended',
+      suspended: [['tool']],
+      suspendedAt: { tool: 1000 },
+      suspendPayload: {
+        tool: {
+          type: 'suspension',
+          toolCallSuspended: { remoteStep: REMOTE_STEP_MARKER },
+        },
+      },
+    });
+    mocked.resumeViaRuntime.mockImplementation(async () => {
+      entered.resolve();
+      await release.promise;
+      return { runId: 'acme_run', status: 'suspended' };
+    });
+    const request = () =>
+      new Request('https://thread/_flowsafe/agent-host/remote-step-resume', {
+        method: 'POST',
+        body: JSON.stringify({ invocationId: 'invocation_1' }),
+      });
+    const first = fixture.host.route(request(), fixture.scope);
+    await entered.promise;
+    const second = fixture.host
+      .route(request(), fixture.scope)
+      .catch((error) => error);
+    try {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(reader.claimResume).toHaveBeenCalledTimes(1);
+    } finally {
+      release.resolve();
+    }
+    expect((await first)?.status).toBe(200);
+    expect(await second).toMatchObject({ status: 404 });
+    expect(reader.claimResume).toHaveBeenCalledTimes(1);
+    expect(mocked.resumeViaRuntime).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses an expired lease even when the run advanced', async () => {
+    const principal: ExecutionPrincipal = {
+      kind: 'human',
+      id: 'operator-1',
+      role: 'operator',
+    };
+    const reader: RemoteStepContinuationReader = {
+      deploymentId: 'deployment',
+      tablePrefix: '',
+      get: async () => ({
+        invocationId: 'invocation_1',
+        deploymentId: 'deployment',
+        tablePrefix: '',
+        workflowId: 'durable-agentic-loop',
+        agentId: 'writer',
+        threadId: 'acme_thread',
+        resourceId: RESOURCE_ID,
+        runId: 'acme_run',
+        principal,
+        startToken: 'test-generation',
+        stepPath: ['tool'],
+        suspendedAt: 1000,
+        request: {},
+        deadlineAt: 9999999999999,
+        status: 'resuming',
+        resumeLeaseExpiresAt: Date.now() - 1,
+        permitGeneration: 1,
+      }),
+      readRetainedResult: vi.fn(async () => ({
+        invocationId: 'invocation_1',
+        resultJson: '{"answer":1}',
+        resultDigest: 'digest',
+        quiescenceDigest: 'evidence',
+        executorQuiescentAt: 1000,
+      })),
+      claimResume: vi.fn(async () => 'lease-2'),
+      settleAfterResume: vi.fn(async () => 'applied' as const),
+    };
+    const fixture = harness(['writer'], { remoteSteps: reader });
+    seedSuspendedApprovalRun(fixture);
+    fixture.setSummary({ runId: 'acme_run', status: 'success' });
+
+    await expect(
+      fixture.host.route(
+        new Request('https://thread/_flowsafe/agent-host/remote-step-resume', {
+          method: 'POST',
+          body: JSON.stringify({ invocationId: 'invocation_1' }),
+        }),
+        fixture.scope,
+      ),
+    ).rejects.toMatchObject({ status: 503 });
+    expect(reader.claimResume).not.toHaveBeenCalled();
+    expect(reader.readRetainedResult).not.toHaveBeenCalled();
     expect(mocked.resumeViaRuntime).not.toHaveBeenCalled();
   });
 
@@ -4152,6 +4382,8 @@ describe('createThreadAgentHost', () => {
         quiescenceDigest: 'evidence',
         executorQuiescentAt: 1000,
       }),
+      claimResume: async () => 'lease-1',
+      settleAfterResume: async () => 'applied' as const,
     };
     const fixture = harness(['writer'], { remoteSteps: reader });
     seedSuspendedApprovalRun(fixture);
@@ -7278,6 +7510,7 @@ async function hostAgentLifecycleFixture(
   const core = await vi.importActual<typeof import('@mastra/core/mastra')>(
     '@mastra/core/mastra',
   );
+
   const { InMemoryStore } = await import('@mastra/core/storage');
   const breakwater = await vi.importActual<
     typeof import('@proofoftech/breakwater')
@@ -7613,11 +7846,34 @@ it('reads a retained remote result from D1 after the agent host is recreated', a
       tablePrefix: 'host_lifecycle_',
       get: reopened.get.bind(reopened),
       readRetainedResult: reopened.readRetainedResult.bind(reopened),
+      claimResume: reopened.claimResume.bind(reopened),
+      settleAfterResume: async () => 'applied' as const,
     },
   });
   const resume = vi
     .spyOn(FlowsafeDurableAgent.prototype, 'resumeViaRuntime')
     .mockResolvedValue({ runId: 'acme_run', status: 'suspended' });
+  await fixture.stateStorage.put(THREAD_BINDING_KEY, {
+    version: 1,
+    agentId: 'writer',
+    resourceId: 'other-resource',
+  });
+  const displaced = await fresh.host
+    .route(
+      new Request('https://thread/_flowsafe/agent-host/remote-step-resume', {
+        method: 'POST',
+        body: JSON.stringify({ invocationId: invocation.invocationId }),
+      }),
+      fresh.scope,
+    )
+    .catch((error) => error);
+  expect(displaced).toMatchObject({ status: 404 });
+  expect(resume).not.toHaveBeenCalled();
+  await fixture.stateStorage.put(THREAD_BINDING_KEY, {
+    version: 1,
+    agentId: 'writer',
+    resourceId: RESOURCE_ID,
+  });
   const response = await fresh.host.route(
     new Request('https://thread/_flowsafe/agent-host/remote-step-resume', {
       method: 'POST',
@@ -7636,21 +7892,38 @@ it('reads a retained remote result from D1 after the agent host is recreated', a
       expectedSuspension: { suspendedAt: 1000 },
     }),
   );
-  await fixture.stateStorage.put(THREAD_BINDING_KEY, {
-    version: 1,
-    agentId: 'writer',
-    resourceId: 'other-resource',
-  });
-  const displaced = await fresh.host
-    .route(
+  const leaseBefore = await fixture.binding
+    .prepare(
+      'SELECT resume_lease_owner FROM flowsafe_remote_step_invocations WHERE invocation_id = ?',
+    )
+    .bind(invocation.invocationId)
+    .all();
+  expect(leaseBefore.results).toMatchObject([
+    { resume_lease_owner: expect.any(String) },
+  ]);
+  fixture.binding
+    .prepare(
+      'UPDATE flowsafe_remote_step_invocations SET resume_lease_expires_at = ? WHERE invocation_id = ?',
+    )
+    .bind(Date.now() - 1, invocation.invocationId)
+    .run();
+  await expect(
+    fresh.host.route(
       new Request('https://thread/_flowsafe/agent-host/remote-step-resume', {
         method: 'POST',
         body: JSON.stringify({ invocationId: invocation.invocationId }),
       }),
       fresh.scope,
-    )
-    .catch((error) => error);
-  expect(displaced).toMatchObject({ status: 404 });
+    ),
+  ).rejects.toMatchObject({ status: 503 });
+  expect(
+    await fixture.binding
+      .prepare(
+        'SELECT resume_lease_owner FROM flowsafe_remote_step_invocations WHERE invocation_id = ?',
+      )
+      .bind(invocation.invocationId)
+      .all(),
+  ).toMatchObject({ results: leaseBefore.results });
   expect(resume).toHaveBeenCalledTimes(1);
 });
 

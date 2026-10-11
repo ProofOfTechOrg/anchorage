@@ -137,6 +137,22 @@ describe('remote step journal dispatch admission', () => {
       setSummary: (value: RunSummary) => {
         summary = value;
       },
+      retainResult: async () => {
+        const invocation = await journal.register(ADDRESS, 10_000, PRINCIPAL);
+        const permit = await journal.issuePermit(
+          invocation.invocationId,
+          1_000,
+        );
+        const consumed = await journal.consumePermit(permit);
+        if (consumed.kind !== 'accepted') throw new Error('permit was not won');
+        await journal.recordResult(
+          invocation.invocationId,
+          consumed.rawPermit,
+          '{"value":"done"}',
+          '{"receipt":"verified"}',
+        );
+        return { invocation, rawPermit: consumed.rawPermit };
+      },
       setRequest: (account: string) => {
         summary = {
           ...summary,
@@ -265,7 +281,12 @@ describe('remote step journal dispatch admission', () => {
   it('upgrades a prior journal while preserving an existing invocation', async () => {
     const h = await fixture();
     const invocation = await h.journal.register(ADDRESS, 10_000, PRINCIPAL);
+    h.sqlite.exec('DROP INDEX flowsafe_remote_step_recovery');
     for (const column of [
+      'settlement_outcome',
+      'settled_at',
+      'resume_lease_expires_at',
+      'resume_lease_owner',
       'executor_quiescent_at',
       'quiescence_digest',
       'result_digest',
@@ -288,9 +309,47 @@ describe('remote step journal dispatch admission', () => {
     );
   });
 
+  it('upgrades a live v2 result without losing its retained bytes', async () => {
+    const h = await fixture();
+    const invocation = await h.journal.register(ADDRESS, 10_000, PRINCIPAL);
+    const permit = await h.journal.issuePermit(invocation.invocationId, 1_000);
+    const consumed = await h.journal.consumePermit(permit);
+    if (consumed.kind !== 'accepted') throw new Error('permit was not won');
+    await h.journal.recordResult(
+      invocation.invocationId,
+      consumed.rawPermit,
+      '{"value":"kept"}',
+      '{"receipt":"verified"}',
+    );
+    h.sqlite.exec('DROP INDEX flowsafe_remote_step_recovery');
+    for (const column of [
+      'settlement_outcome',
+      'settled_at',
+      'resume_lease_expires_at',
+      'resume_lease_owner',
+    ])
+      h.sqlite.exec(`ALTER TABLE ${REMOTE_STEP_TABLE} DROP COLUMN ${column}`);
+    h.sqlite.exec('UPDATE flowsafe_remote_step_schema SET version = 2');
+
+    await h.reopen().initialize();
+
+    expect(
+      await h.reopen().readRetainedResult(invocation.invocationId),
+    ).toMatchObject({
+      resultJson: '{"value":"kept"}',
+    });
+    expect(
+      h.sqlite.prepare('SELECT version FROM flowsafe_remote_step_schema').get(),
+    ).toEqual({ version: 3 });
+    expect(await h.reopen().recoverableResults(1)).toEqual({
+      invocationIds: [invocation.invocationId],
+      nextCursor: invocation.invocationId,
+    });
+  });
+
   it('refuses an unknown journal schema version before dispatch', async () => {
     const h = await fixture();
-    h.sqlite.exec('UPDATE flowsafe_remote_step_schema SET version = 3');
+    h.sqlite.exec('UPDATE flowsafe_remote_step_schema SET version = 4');
 
     await expect(h.reopen().initialize()).rejects.toMatchObject({
       status: 503,
@@ -355,7 +414,12 @@ describe('remote step journal dispatch admission', () => {
   it('converges when another initializer wins the same journal upgrade', async () => {
     const h = await fixture();
     const invocation = await h.journal.register(ADDRESS, 10_000, PRINCIPAL);
+    h.sqlite.exec('DROP INDEX flowsafe_remote_step_recovery');
     for (const column of [
+      'settlement_outcome',
+      'settled_at',
+      'resume_lease_expires_at',
+      'resume_lease_owner',
       'executor_quiescent_at',
       'quiescence_digest',
       'result_digest',
@@ -550,6 +614,145 @@ describe('remote step journal dispatch admission', () => {
     expect(
       (await new DeploymentInventory(h.db).read('remote-steps')).count,
     ).toBe(1);
+  });
+
+  it('settles a witnessed new suspension and keeps callback replay idempotent', async () => {
+    const h = await fixture();
+    const { invocation, rawPermit } = await h.retainResult();
+    const owner = await h.journal.claimResume(invocation.invocationId, 1_000);
+    await expect(
+      h.reopen().claimResume(invocation.invocationId, 1_000),
+    ).rejects.toMatchObject({ status: 409 });
+    const next: RunSummary = {
+      runId: ADDRESS.runId,
+      status: 'suspended',
+      suspended: [['next']],
+      suspendedAt: { next: 1_100 },
+      suspendPayload: { next: { type: 'suspension' } },
+    };
+    expect(
+      await h.reopen().settleAfterResume(invocation.invocationId, owner, next),
+    ).toBe('retry');
+    const nextOwner = await h.journal.claimResume(
+      invocation.invocationId,
+      1_000,
+    );
+    h.setSummary(next);
+    expect(
+      await h
+        .reopen()
+        .settleAfterResume(invocation.invocationId, nextOwner, next),
+    ).toBe('applied');
+    expect(await h.journal.get(invocation.invocationId)).toMatchObject({
+      status: 'settled',
+      settlementOutcome: 'applied',
+    });
+    expect(
+      (await new DeploymentInventory(h.db).read('remote-steps')).count,
+    ).toBe(0);
+    expect(await h.journal.recoverableResults(1)).toEqual({
+      invocationIds: [],
+    });
+    expect(
+      await h.journal.recoverableResults(1, invocation.invocationId),
+    ).toEqual({ invocationIds: [] });
+    expect(
+      await h.journal.recordResult(
+        invocation.invocationId,
+        rawPermit,
+        '{"value":"done"}',
+        '{"receipt":"verified"}',
+      ),
+    ).toMatchObject({ kind: 'replay' });
+    expect(
+      await h.journal.readRetainedResult(invocation.invocationId),
+    ).toBeUndefined();
+    h.sqlite
+      .prepare(`UPDATE ${REMOTE_STEP_TABLE} SET result_digest = NULL`)
+      .run();
+    expect(
+      (await new DeploymentInventory(h.db).read('remote-steps')).count,
+    ).toBe(1);
+  });
+
+  it('retains an expired claim across another journal instance until its owner settles', async () => {
+    const h = await fixture();
+    const { invocation } = await h.retainResult();
+    const owner = await h.journal.claimResume(invocation.invocationId, 100);
+    expect(await h.reopen().recoverableResults(10)).toEqual({
+      invocationIds: [],
+    });
+    h.setNow(1_101);
+    expect(await h.reopen().recoverableResults(10)).toEqual({
+      invocationIds: [invocation.invocationId],
+    });
+    await expect(
+      h.journal.claimResume(invocation.invocationId, 1_000),
+    ).rejects.toMatchObject({ status: 409 });
+    expect(await h.reopen().reconcileResult(invocation.invocationId)).toBe(
+      'pending-quiescence',
+    );
+    expect(await h.journal.get(invocation.invocationId)).toMatchObject({
+      status: 'resuming',
+    });
+    expect(
+      h.sqlite
+        .prepare(`SELECT resume_lease_owner FROM ${REMOTE_STEP_TABLE}`)
+        .get(),
+    ).toEqual({ resume_lease_owner: owner });
+    expect(
+      (await new DeploymentInventory(h.db).read('remote-steps')).count,
+    ).toBe(1);
+    h.setSummary({ runId: ADDRESS.runId, status: 'success' });
+    expect(
+      await h.journal.settleAfterResume(invocation.invocationId, owner, {
+        runId: ADDRESS.runId,
+        status: 'success',
+      }),
+    ).toBe('applied');
+    expect(await h.journal.get(invocation.invocationId)).toMatchObject({
+      status: 'settled',
+      settlementOutcome: 'applied',
+    });
+    expect(
+      (await new DeploymentInventory(h.db).read('remote-steps')).count,
+    ).toBe(0);
+  });
+
+  it('retains uncertain advancement when no resume lease was claimed', async () => {
+    const h = await fixture();
+    const { invocation } = await h.retainResult();
+    h.setSummary({ runId: ADDRESS.runId, status: 'success' });
+    expect(await h.reopen().reconcileResult(invocation.invocationId)).toBe(
+      'advanced-without-proof',
+    );
+    expect(await h.journal.get(invocation.invocationId)).toMatchObject({
+      status: 'failed',
+      settlementOutcome: 'advanced-without-proof',
+    });
+    expect(
+      (await new DeploymentInventory(h.db).read('remote-steps')).count,
+    ).toBe(1);
+    await expect(
+      h.journal.claimResume(invocation.invocationId, 1_000),
+    ).rejects.toMatchObject({ status: 409 });
+  });
+
+  it('records cancellation separately from a successful result application', async () => {
+    const h = await fixture();
+    const { invocation } = await h.retainResult();
+    const owner = await h.journal.claimResume(invocation.invocationId, 1_000);
+    h.setSummary({ runId: ADDRESS.runId, status: 'cancelled' });
+    expect(
+      await h.journal.settleAfterResume(invocation.invocationId, owner),
+    ).toBe('terminal-not-success');
+    expect(await h.journal.get(invocation.invocationId)).toMatchObject({
+      status: 'failed',
+      settlementOutcome: 'terminal-not-success',
+    });
+    expect(
+      (await new DeploymentInventory(h.db).read('remote-steps')).count,
+    ).toBe(0);
   });
 
   it('records verified completion from a prior epoch without resuming a locked run', async () => {

@@ -133,6 +133,8 @@ it('routes a retained result under the journaled principal and sends only its id
       quiescenceDigest: 'evidence',
       executorQuiescentAt: 1000,
     })),
+    claimResume: vi.fn(async () => 'lease-1'),
+    settleAfterResume: vi.fn(async () => 'applied' as const),
   };
   const { topology, hits } = harness(reader);
   await topology.resumeRemoteStep(context().value, 'invocation_1');
@@ -144,6 +146,17 @@ it('routes a retained result under the journaled principal and sends only its id
   expect(sent?.init?.headers?.['x-flowsafe-principal']).toBe(
     '{"kind":"human","id":"original","role":"operator"}',
   );
+  const stored = await reader.get('invocation_1');
+  if (!stored) throw new Error('invocation was not found');
+  vi.mocked(reader.get).mockResolvedValue({
+    ...stored,
+    status: 'resuming',
+    resumeLeaseExpiresAt: Date.now() - 1,
+  });
+  await expect(
+    topology.resumeRemoteStep(context().value, 'invocation_1'),
+  ).rejects.toMatchObject({ status: 503 });
+  expect(hits).toHaveLength(1);
 });
 
 function context() {
