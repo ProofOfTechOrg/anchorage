@@ -70,6 +70,7 @@ import {
   DUE_NOTIFICATION_SQL,
   notificationTimestampMillis,
 } from './notification-predicate.js';
+import { REMOTE_STEP_TABLE } from './remote-step-journal.js';
 import {
   START_IDEMPOTENCY_TABLE,
   START_RESERVATION_STATES,
@@ -122,6 +123,7 @@ export type InventoryCategoryClass = 'work' | 'standing';
  */
 export const INVENTORY_CATEGORIES = [
   'runs',
+  'remote-steps',
   'approvals-waiting',
   'schedule-deferred-dispatches',
   'pending-notifications',
@@ -290,6 +292,11 @@ export interface FlowsafeTableEntry {
  * characters.
  */
 export const FLOWSAFE_TABLES: readonly FlowsafeTableEntry[] = [
+  {
+    table: REMOTE_STEP_TABLE,
+    purpose: 'durable remote tool invocations and their dispatch permits',
+    accounting: { category: 'remote-steps' },
+  },
   {
     table: APPROVALS_TABLE,
     purpose: 'the durable approval queue — one record per suspended decision',
@@ -478,6 +485,13 @@ export const INVENTORY_CATEGORY_DESCRIPTORS: readonly InventoryCategoryDescripto
       table: SNAPSHOT_TABLE,
       holds:
         'a workflow or agent run that has not reached a terminal state (cancelled and timed_out count as live until their lifecycle cleanup completes)',
+    },
+    {
+      category: 'remote-steps',
+      class: 'work',
+      table: REMOTE_STEP_TABLE,
+      holds:
+        'a remote invocation without a recorded result or an external dispatch not confirmed stopped',
     },
     {
       category: 'approvals-waiting',
@@ -1004,6 +1018,24 @@ export class DeploymentInventory {
                     ELSE 1 END`,
           binds: RUN_TERMINAL_STATUSES,
           annotate: annotateRunOwners,
+        };
+      case 'remote-steps':
+        return {
+          key: ['invocation_id'],
+          detail: [
+            'workflow_id',
+            'run_id',
+            'agent_id',
+            'thread_id',
+            'status',
+            'deadline_at',
+            'permit_generation',
+            'permit_consumed_at',
+            'permit_closed_at',
+          ],
+          where:
+            "status <> 'failed' OR (permit_consumed_at IS NOT NULL AND permit_closed_at IS NULL)",
+          binds: [],
         };
       case 'approvals-waiting':
         // OPEN_STATUSES, not just 'pending': a claimed or escalated approval is
