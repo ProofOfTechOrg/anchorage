@@ -15,10 +15,17 @@ name: Release
 # mispublish: merge the regenerated Version Packages PR into dev and re-cut
 # the release PR.
 #
-# Requires the NPM_TOKEN repo secret (an npm automation token with publish
-# rights on the @proofoftech scope). Without it the publish step fails loudly
-# with ENEEDAUTH — nothing partial happens. `showcase` is private and never
-# publishes. Provenance: id-token: write + NPM_CONFIG_PROVENANCE below.
+# Publishes through npm trusted publishing: npm exchanges the job's OIDC token
+# (id-token: write) for a short-lived publish credential when the package's
+# trusted publisher names this repository, release.yml and the `npm`
+# environment. npm checks no branch, so the `npm` environment's deployment
+# branch policy is what limits publishing to main. When the exchange fails,
+# npm publishes with the NPM_TOKEN secret instead and reports no error;
+# docs/maintainer-guide.md "Release flow" covers both credentials and how to
+# tell which one published. NPM_CONFIG_PROVENANCE below requests provenance on
+# both paths: without it, npm enables provenance for an OIDC publish only after
+# a separate visibility lookup succeeds. A refused publish uploads nothing for
+# that package. `showcase` is private and never publishes.
 
 on:
   push:
@@ -36,6 +43,7 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    environment: npm
     # scripts/github-yaml-check.test.mjs checks this budget from constants in
     # scripts/publish-ordered.mjs: both probes for each prerequisite, its
     # visibility deadline, and a policy reserve. It does not bound publish time.
@@ -81,6 +89,21 @@ jobs:
       - name: Verify release publish invocation
         run: pnpm test:release-invocation
 
+      # Trusted publishing needs npm 11.5.1 or later, and Node 22 ships npm 10;
+      # pnpm publish hands the packed tarball to the npm on PATH. This runs
+      # after the invocation check because npm 11's dry run reads the registry
+      # and refuses a version that is already published. npm 12 changes
+      # install-time defaults, so the pin is an 11.x release, and the pinned
+      # sha512 keeps a substituted registry copy from installing.
+      - name: Install npm for trusted publishing
+        run: |
+          curl --fail --silent --show-error --location --retry 3 --max-time 120 \
+            --output "$RUNNER_TEMP/npm.tgz" \
+            https://registry.npmjs.org/npm/-/npm-11.21.0.tgz
+          echo "668bfc2a16a63677a22dd10bb63e5800bb4d9895b82f87c22d3ce37e9cd71b6c3a3121dc7f453181d94ae6e9680ae92c593fbb986514ef08bbf5c3ba46a8af3e  $RUNNER_TEMP/npm.tgz" | sha512sum --check --strict -
+          npm install --global --ignore-scripts "$RUNNER_TEMP/npm.tgz"
+          test "$(npm --version)" = 11.21.0
+
       # Publish Breakwater, then Flowsafe, each waiting for registry
       # visibility, before Changesets fans out over the remainder. Flowsafe needs
       # Breakwater for its agent-host peer floor, and fleet-control packs an
@@ -92,5 +115,7 @@ jobs:
           publish: pnpm release:publish
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Used only when the OIDC exchange fails, such as for a package whose
+          # trusted publisher is missing or expired.
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           NPM_CONFIG_PROVENANCE: 'true'

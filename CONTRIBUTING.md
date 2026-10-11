@@ -92,8 +92,9 @@ versions to npm with provenance and pushes the release tags — it refuses,
 loudly, if an unversioned changeset reached `main` (a feature merged into
 `dev` between the two merges; merge the regenerated Version Packages PR and
 re-cut the release PR). There is no post-release sync step: `main` never gets
-commits of its own. Publishing needs the `NPM_TOKEN` repository secret (an npm
-automation token with publish rights on the `@proofoftech` scope). `showcase`
+commits of its own. Publishing uses npm trusted publishing, with the
+`NPM_TOKEN` secret as a fallback; the maintainer guide's
+[release flow](docs/maintainer-guide.md#release-flow) covers both. `showcase`
 is private and never publishes.
 
 ## Governance
