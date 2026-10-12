@@ -2,7 +2,7 @@
 
 Anchorage is a library, not a hosted control plane. Deploy one uniquely named Worker, D1 database, and set of Durable Object namespaces for each organization. The Worker script name is the Durable Object namespace boundary: replace the template's `replace-me` segment with the deployment tag and never reuse that script name for another organization. You also own optional R2 and Queue resources, the identity verifier, policies, maintenance schedules, and the provisioning system that keeps every resource set one-to-one.
 
-This reference configures the tenant application Worker. Run account-level Fleet operations in a separate [trusted control-plane Worker](fleet-control.md#run-the-trusted-control-plane-in-a-worker). Keep its provider token, Fleet/quota databases, and export bucket out of these tenant bindings.
+This reference configures the tenant application Worker. Run account-level provisioning in a separate trusted control plane. Keep its provider token, provisioning databases, and export bucket out of these tenant bindings.
 
 Choose one starting point:
 
@@ -15,7 +15,7 @@ The baseline is intentionally smaller. Advanced features are supported and opt-i
 
 ## Cloudflare compatibility
 
-Use the Worker runtime with `nodejs_compat`, D1, and SQLite-backed Durable Objects. These settings belong to the tenant templates; the [Fleet host has its own runtime configuration](fleet-control.md#size-the-worker-for-its-workload). Treat Durable Object migration tags as append-only. Add a new migration tag when introducing the hub, thread, or provider-host class; never edit an already deployed tag.
+Use the Worker runtime with `nodejs_compat`, D1, and SQLite-backed Durable Objects. These settings belong to the tenant templates; a trusted provisioning control plane has its own runtime configuration. Treat Durable Object migration tags as append-only. Add a new migration tag when introducing the hub, thread, or provider-host class; never edit an already deployed tag.
 
 The checked-in configurations pin a compatibility date that the repository verifies. Review Cloudflare release notes before changing it.
 
@@ -188,8 +188,6 @@ Set `mutationEpoch` on `createFlowsafeWorker()` to a nonnegative safe-integer nu
 `createActorResolver()` and `createPrincipalActorContext()` also accept a scalar epoch. Custom resolvers must derive it from trusted host or verified credential data, never a client-selected field.
 
 The topologies stamp `x-flowsafe-mutation-epoch` for internal calls, replacing or removing incoming values. `createActorResolver()` refuses that header on public requests. Both Durable Object shells capture it before deployment verification and decode the captured value only afterward.
-
-[Roll out an artifact under the execution fence](fleet-control.md#roll-out-an-artifact-under-the-execution-fence) in the Fleet Control guide carries the procedure that applies this configuration.
 
 Fenced Runtime starts enforce the captured caller epoch at the initial D1 write and bind their generated execution identity with the winning claim and proof. Both hosts journal preparation and recover only exact owned generations. Generation-aware retention still requires implementation and acceptance before enabling artifact epochs across the deployment. An explicitly unfenced Runtime retains ordinary persistence and supplies no atomic fence guarantee.
 

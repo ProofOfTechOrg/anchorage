@@ -13,8 +13,8 @@ import { parseLlmSpikeConfig } from './spike-llm-config.mjs';
 const FLOWSAFE = dirname(dirname(fileURLToPath(import.meta.url)));
 const WRANGLER = join(FLOWSAFE, '../../node_modules/.bin/wrangler');
 const CONFIG = join(FLOWSAFE, 'spike/wrangler.jsonc');
-// Distinct from every other harness default (spike:verify 8799,
-// durability-benchmark 8801, conformance:verify 8821) so two can run at once.
+// Distinct from the other local harness defaults so concurrent runs do not
+// claim the same port.
 const PORT = parsePort(process.env.SPIKE_LLM_PORT ?? 8811, 'SPIKE_LLM_PORT');
 const BASE = `http://127.0.0.1:${PORT}`;
 const {

@@ -7,14 +7,8 @@ import { isInvokedAsEntryPoint } from './entry-point.mjs';
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 
-// Ordered because `changeset publish` fans out with Promise.all: it has no
-// topological ordering and no wait. Breakwater is Flowsafe's peer dependency,
-// which npm never resolves at install, so that edge is only a consumer-facing
-// warning. Flowsafe is different: fleet-control packs an EXACT
-// `@proofoftech/flowsafe` version out of `workspace:*`, a hard dependency npm
-// does resolve. If the two published concurrently and Flowsafe's half failed,
-// fleet-control would sit on the registry permanently depending on a version
-// that does not exist, and npm forbids republishing a version.
+// Ordered because `changeset publish` has no ordering or wait. Breakwater
+// publishes first so consumers can satisfy Flowsafe's peer floor immediately.
 export const PUBLISH_PREREQUISITES = Object.freeze([
   {
     name: '@proofoftech/breakwater',

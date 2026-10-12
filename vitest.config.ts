@@ -6,13 +6,6 @@ export default defineConfig({
     projects: [
       // Placement rule: a package's default suite arrives through this glob.
       'packages/*/vitest.config.ts',
-      // Package-local configs naming non-default file sets do not match the
-      // glob and are registered by explicit path. They sit beside the package
-      // so their include paths resolve against it. They import nothing from the
-      // package's default config, so an option added there does not reach the
-      // direct-scenario suites.
-      'packages/fleet-control/vitest.direct-scenario.config.ts',
-      'packages/fleet-control/vitest.direct-scenario-seams.config.ts',
       // Root rule: a `vitest.*.config.*` at the repository root is registered
       // here — by glob where a family shares a name shape, by explicit name
       // otherwise — and `scripts/architecture-positive-controls.test.mjs` turns

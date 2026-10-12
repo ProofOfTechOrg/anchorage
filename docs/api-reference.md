@@ -65,24 +65,6 @@ The migration and idempotency surfaces are grouped by subpath:
 | `@proofoftech/flowsafe/background-tasks` | `BackgroundTaskHost`, `BackgroundTaskReads`, and `EXECUTION_FENCE_SUSPEND_KEY` |
 | `@proofoftech/flowsafe/deployment-identity-protocol` | `EXECUTION_FENCE_TABLE`, `EXECUTION_FENCE_ROW_ID`, `EXECUTION_FENCE_STATES`, `INITIAL_EXECUTION_FENCE_STATES`, `EXECUTION_FENCE_DDL`, `InitialExecutionFenceState`, `assertInitialExecutionFenceState`, and `provisionDeploymentIdentityProtocol` |
 
-## fleet-control root export
-
-`@proofoftech/fleet-control` exposes trusted provisioning and fleet lifecycle operations from its root:
-
-| Surface | Main exports |
-| --- | --- |
-| Provisioning | `provisionDeployment`, `cleanupDeploymentArtifacts`, `advanceDecommissionDeployment`, `advanceBackendSwitchDecommission`, `decommissionDeployment`, `forceDecommissionDeployment`, `ProvisionDeploymentOptions`, `AdvanceDecommissionDeploymentOptions`, `AdvanceBackendSwitchDecommissionOptions`, `DecommissionAdvanceAction`, `DecommissionAdvanceResult`, `ProvisioningBackend`, `PlainWorkerProvisioningApi`, `PlainWorkerCleanupOutcome`, `PlainWorkerDatabaseExportResult`, `PlainWorkerDatabaseInventoryEntry`, `PlainWorkerDeploymentStatus`, `PlainWorkerMutationOutcome`, `PlainWorkerUploadIntent`, `PlainWorkerUploadIntentBase`, `PlainWorkerUploadOutcome`, `PlainWorkerVersionBinding`, `PlainWorkerVersionDetail`, `PlainWorkerVersionSummary`, `PlainWorkerRouteApi`, and `SeedDeploymentIdentityOptions` |
-| Fleet lifecycle | `migrateFleet`, `rollbackExternalRelease`, `auditFleetDrift`, `fleetVersionReport`, `FleetRecord`, and `D1FleetStateStore` |
-| Active-route attestation | `attestFleetRecordActiveRoute`, `attestConvergedActiveRoute`, `ActiveRouteAttestation`, `ActiveRouteAttestationError`, `ActiveRouteExpectation`, `AttestConvergedActiveRouteOptions`, and `ObservedActiveRoute` |
-| Settlement | `fleetSettlementKey`, `FleetSettlementContext`, `FleetSettlementEntry`, and `FleetSettlementHost` |
-| Backends and provider client | `PlainWorkerBackend`, `PlainWorkerBackendOptions`, `CloudflareApiPlainWorkerBackend`, `CloudflareApiPlainWorkerBackendOptions`, `WranglerLoopBackend`, `WorkersForPlatformsBackend`, `CloudflareProvisioningClient`, `CloudflareClientOptions`, `PlainWorkerCloudflareClientOptions`, `CloudflarePlaneCapabilityError`, `D1CloudflareApiRateCoordinator`, and `ProcessLocalCloudflareApiRateCoordinator` |
-
-## fleet-control Worker library
-
-`@proofoftech/fleet-control/cloudflare-control-plane` is a library for a dedicated trusted Cloudflare control-plane Worker. Start with `createCloudflareControlPlane` and `CloudflareControlPlaneOptions`; the returned `CloudflareControlPlane` coordinates ordinary-Worker deployments through durable Fleet state. See the [Fleet Control guide](fleet-control.md) for deployment ownership and authorization.
-
-The subpath also exposes `D1FleetStateDatabase`, `D1CloudflareApiRateCoordinator`, and `R2DatabaseExportStore`. Its declarations require `@cloudflare/workers-types >=5.20260730.1 <6`. The `workers/*` entries remain deployable platform Workers.
-
 ## Browser and server boundaries
 
 Safe browser imports:
@@ -114,11 +96,11 @@ The agent CLI module can be constructed in another runtime when you inject `Agen
 
 Flowsafe does not impose a CSS or design-system dependency. Its default approval views render semantic HTML.
 
-Wrangler is a host tool, not a peer dependency. Hosts that run `flowsafe-provision` or Fleet Control's Wrangler backend must provide Wrangler `>=4.118 <5`.
+Wrangler is a host tool, not a peer dependency. Hosts that run `flowsafe-provision` must provide Wrangler `>=4.118 <5`.
 
 ## Compatibility policy
 
-All three public packages are pre-1.0. Public exported types, documented behavior, and package subpaths are the compatibility surface. Changesets describe each release. A breaking change can occur in a minor version before 1.0 and will be called out in the changelog.
+Both public packages are pre-1.0. Public exported types, documented behavior, and package subpaths are the compatibility surface. Changesets describe each release. A breaking change can occur in a minor version before 1.0 and will be called out in the changelog.
 
 The repository runs a non-blocking canary against the newest Mastra 1.x. The declared peer range, not a passing canary, defines supported compatibility.
 

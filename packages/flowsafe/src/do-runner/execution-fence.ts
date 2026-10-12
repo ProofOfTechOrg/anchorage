@@ -100,7 +100,7 @@ export { ExecutionFenceUnreadableError } from './execution-admission.js';
  * constraints that make every CAS below total rather than "the CAS, on
  * whichever row you meant". That module is also the only file both sides can
  * share: it ships at the package root for the provisioning CLI and
- * fleet-control, neither of which can import this package's TypeScript.
+ * a provisioning control plane, neither of which can import this package's TypeScript.
  *
  * Not re-exported because a raw constant with two homes is a constant two
  * consumers can disagree about. `@proofoftech/flowsafe/deployment-identity-protocol`

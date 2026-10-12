@@ -22,7 +22,6 @@ pnpm typecheck
 pnpm test
 pnpm build
 pnpm --filter @proofoftech/flowsafe spike:verify
-pnpm test:direct-scenario
 ```
 
 Feature and fix pull requests target `dev`; `main` is the release branch.

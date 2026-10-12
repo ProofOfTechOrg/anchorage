@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Shared line-oriented edge patterns for Flowsafe's packed declaration gates
-// and source leaf-edge tests. Fleet Control's static graph uses a TypeScript AST
-// walk because it resolves a different surface.
+// and source leaf-edge tests.
 // This file imports nothing relative: packed .mjs gates load its .ts path under
 // Node type stripping, where a .js specifier has no emitted file to resolve.
 
