@@ -788,6 +788,7 @@ export function createAgentThreadTopology<Id>(
         !(await reader.readRetainedResult(invocationId))
       )
         throw new RunRouteError(404, 'invocation not found');
+      expectedResource(context, invocation.threadId, invocation.resourceId);
       return envelope(
         await threads.send(
           {

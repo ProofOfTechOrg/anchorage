@@ -207,7 +207,7 @@ describe('remote step journal dispatch admission', () => {
     ]);
   });
 
-  it('accepts the resource recorded at start when the host maps a thread elsewhere', async () => {
+  it('registers the resource recorded in start provenance independently of the thread id', async () => {
     const h = await fixture();
     const original = h.runtime.authoritativeStartState.bind(h.runtime);
     h.runtime.authoritativeStartState = (async (

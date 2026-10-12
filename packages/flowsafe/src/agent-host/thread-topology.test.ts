@@ -99,7 +99,7 @@ function harness(remoteSteps?: RemoteStepContinuationReader): {
   };
 }
 
-it('routes a retained result under the journaled principal and sends only its id', async () => {
+it('routes a retained result under the journaled principal and refuses a changed resource mapping', async () => {
   const principal = {
     kind: 'human' as const,
     id: 'original',
@@ -148,6 +148,14 @@ it('routes a retained result under the journaled principal and sends only its id
   );
   const stored = await reader.get('invocation_1');
   if (!stored) throw new Error('invocation was not found');
+  vi.mocked(reader.get).mockResolvedValue({
+    ...stored,
+    resourceId: 'displaced-resource',
+  });
+  await expect(
+    topology.resumeRemoteStep(context().value, 'invocation_1'),
+  ).rejects.toMatchObject({ status: 404 });
+  expect(hits).toHaveLength(1);
   vi.mocked(reader.get).mockResolvedValue({
     ...stored,
     status: 'resuming',

@@ -7505,6 +7505,7 @@ async function hostAgentLifecycleFixture(
     lifecycle?: boolean;
     snapshotTarget?: { agentId: string; threadId: string };
     resourceIdFromKey?: (threadId: string) => string;
+    startResourceId?: string;
   } = {},
 ) {
   const core = await vi.importActual<typeof import('@mastra/core/mastra')>(
@@ -7534,6 +7535,7 @@ async function hostAgentLifecycleFixture(
   const threaded = input.threaded ?? true;
   const status = input.status ?? 'suspended';
   const version = input.provenance ?? 'v1';
+  const startResourceId = input.startResourceId ?? RESOURCE_ID;
   const sql = openSqlite() as ReturnType<typeof openSqlite> & { close(): void };
   const binding = sqliteUnitDatabase(sql) as ExecutionFenceDatabase &
     ResourceOwnershipDatabase;
@@ -7603,7 +7605,7 @@ async function hostAgentLifecycleFixture(
         kind: 'agent',
         id: 'writer',
         threadId: 'acme_thread',
-        resourceId: RESOURCE_ID,
+        resourceId: startResourceId,
       },
     });
   }
@@ -7612,15 +7614,22 @@ async function hostAgentLifecycleFixture(
     token: 'host-lifecycle-attempt',
     execution,
     threaded,
+    resourceId: startResourceId,
     ...(claim ? { startReservation: claim } : {}),
   });
   seedRecoveryState(fixture.state, 'acme_run', recovery, threaded);
+  if (threaded && startResourceId !== RESOURCE_ID)
+    fixture.state.set(THREAD_BINDING_KEY, {
+      version: 1,
+      agentId: 'writer',
+      resourceId: startResourceId,
+    });
   if (!input.journal) fixture.state.delete(TEST_OWNER_RECOVERY_KEY);
   await resources.reserveAll(
     [
       { kind: 'run', resourceId: 'acme_run' },
       { kind: 'thread', resourceId: 'acme_thread' },
-      { kind: 'resource', resourceId: RESOURCE_ID },
+      { kind: 'resource', resourceId: startResourceId },
     ],
     HUMAN_OWNER,
     recovery.token as string,
@@ -7631,7 +7640,10 @@ async function hostAgentLifecycleFixture(
   if (!workflows) throw new Error('missing host workflow domain');
   const snapshotAgentId = input.snapshotTarget?.agentId ?? 'writer';
   const snapshotThreadId = input.snapshotTarget?.threadId ?? 'acme_thread';
-  const snapshotResourceId = resourceIdFromKey(snapshotThreadId);
+  const snapshotResourceId =
+    snapshotThreadId === 'acme_thread'
+      ? startResourceId
+      : resourceIdFromKey(snapshotThreadId);
   const snapshot: import('@mastra/core/workflows').WorkflowRunState = {
     runId: 'acme_run',
     status:
@@ -7754,17 +7766,25 @@ async function hostAgentLifecycleFixture(
   };
 }
 
-function hostAgentLifecycleRequest(suffix = '', query = '') {
+function hostAgentLifecycleRequest(
+  suffix = '',
+  query = '',
+  resourceId = RESOURCE_ID,
+) {
   return new Request(
-    `https://thread/_flowsafe/agent-host/runs/writer/acme_run${suffix}?resourceId=${RESOURCE_ID}${query}`,
+    `https://thread/_flowsafe/agent-host/runs/writer/acme_run${suffix}?resourceId=${resourceId}${query}`,
     suffix ? { method: 'POST' } : undefined,
   );
 }
 
-it('reads a retained remote result from D1 after the agent host is recreated', async () => {
+it('resumes a retained mapped-resource result from D1 after the agent host is recreated', async () => {
+  const mappedResourceId = 'account-7';
+  const mappedResource = () => mappedResourceId;
   const fixture = await hostAgentLifecycleFixture({
     mode: 'fenced',
     provenance: 'modern',
+    resourceIdFromKey: mappedResource,
+    startResourceId: mappedResourceId,
   });
   onTestFinished(() => {
     vi.restoreAllMocks();
@@ -7789,7 +7809,10 @@ it('reads a retained remote result from D1 after the agent host is recreated', a
     },
   });
   await fixture.persist();
-  await fixture.host.route(hostAgentLifecycleRequest(), fixture.scope);
+  await fixture.host.route(
+    hostAgentLifecycleRequest('', '', mappedResourceId),
+    fixture.scope,
+  );
   const journal = new RemoteStepJournal({
     db: fixture.binding,
     fence: fixture.fence,
@@ -7807,7 +7830,7 @@ it('reads a retained remote result from D1 after the agent host is recreated', a
       workflowId: fixture.execution.workflowId,
       agentId: 'writer',
       threadId: 'acme_thread',
-      resourceId: RESOURCE_ID,
+      resourceId: mappedResourceId,
       runId: 'acme_run',
     },
     Date.now() + 60_000,
@@ -7837,6 +7860,7 @@ it('reads a retained remote result from D1 after the agent host is recreated', a
     verifyCompletion: async () => undefined,
   });
   const fresh = harness(['writer'], {
+    resourceIdFromKey: mappedResource,
     init: freshApp,
     storage: fixture.storage,
     stateStorage: fixture.stateStorage,
@@ -7872,7 +7896,7 @@ it('reads a retained remote result from D1 after the agent host is recreated', a
   await fixture.stateStorage.put(THREAD_BINDING_KEY, {
     version: 1,
     agentId: 'writer',
-    resourceId: RESOURCE_ID,
+    resourceId: mappedResourceId,
   });
   const response = await fresh.host.route(
     new Request('https://thread/_flowsafe/agent-host/remote-step-resume', {
