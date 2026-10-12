@@ -3389,10 +3389,12 @@ async function main() {
     'RS1 remote-step journal: real D1 permit winner and retained result survive process death',
     async () => {
       await killServer(currentServer);
+      // The fixture status is stale so a summary detached from the persisted
+      // snapshot cannot register the still-suspended run.
       await executeLocalD1(
         stateDir,
         'CREATE TABLE spike_remote_step_fixture (id INTEGER PRIMARY KEY, resource_id TEXT NOT NULL, status TEXT NOT NULL); ' +
-          "INSERT INTO spike_remote_step_fixture VALUES (1, 'account-7', 'suspended'); " +
+          "INSERT INTO spike_remote_step_fixture VALUES (1, 'account-7', 'success'); " +
           'CREATE TABLE spike_remote_mastra_workflow_snapshot (workflow_name TEXT NOT NULL, run_id TEXT NOT NULL, snapshot TEXT NOT NULL, PRIMARY KEY (workflow_name, run_id)); ' +
           "INSERT INTO spike_remote_mastra_workflow_snapshot VALUES ('durable-agentic-loop', 'spike-remote-run', '{\"status\":\"suspended\"}');",
       );
@@ -3509,8 +3511,7 @@ async function main() {
       await killServer(currentServer);
       await executeLocalD1(
         stateDir,
-        "UPDATE spike_remote_step_fixture SET status = 'success' WHERE id = 1; " +
-          'UPDATE spike_remote_mastra_workflow_snapshot SET snapshot = \'{"status":"success"}\' WHERE run_id = \'spike-remote-run\';',
+        'UPDATE spike_remote_mastra_workflow_snapshot SET snapshot = \'{"status":"success"}\' WHERE run_id = \'spike-remote-run\';',
       );
       await launchServer(
         'gen-remote-4',

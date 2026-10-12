@@ -3095,8 +3095,8 @@ async function handleRemoteStepProbe(
     return json({ error: 'method not allowed' }, 405);
   try {
     const fixture = await env.DB.prepare(
-      'SELECT resource_id, status FROM spike_remote_step_fixture WHERE id = 1',
-    ).first<{ resource_id: string; status: string }>();
+      'SELECT resource_id FROM spike_remote_step_fixture WHERE id = 1',
+    ).first<{ resource_id: string }>();
     const snapshot = await env.DB.prepare(
       'SELECT snapshot FROM spike_remote_mastra_workflow_snapshot WHERE workflow_name = ? AND run_id = ?',
     )
@@ -3104,8 +3104,11 @@ async function handleRemoteStepProbe(
       .first<{ snapshot: string }>();
     if (!fixture || !snapshot)
       throw new Error('remote-step fixture is unavailable');
+    const persisted = JSON.parse(snapshot.snapshot) as { status?: unknown };
+    if (persisted.status !== 'suspended' && persisted.status !== 'success')
+      throw new Error('remote-step snapshot status is unavailable');
     const summary: RunSummary =
-      fixture.status === 'success'
+      persisted.status === 'success'
         ? {
             runId: 'spike-remote-run',
             status: 'success',
@@ -3132,7 +3135,7 @@ async function handleRemoteStepProbe(
       authoritativeStatus: async () => summary,
       authoritativeStartState: async () => ({
         storage: 'd1',
-        snapshot: JSON.parse(snapshot.snapshot),
+        snapshot: persisted,
         execution: {
           tablePrefix: 'spike_remote_',
           workflowId: 'durable-agentic-loop',
