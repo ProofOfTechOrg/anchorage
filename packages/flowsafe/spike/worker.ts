@@ -139,6 +139,7 @@ import {
   isSuspensionTimeoutResumeData,
   mintThreadId,
   type RunnerRuntime,
+  type RunSummary,
   resourceIdFromKey,
   type StartIdempotencyStore,
   SUSPENSION_DEADLINE_PAYLOAD_KEY,
@@ -150,6 +151,11 @@ import {
   verifyDurableObjectDeploymentIdentity,
   verifyDurableObjectDeploymentRequest,
 } from '../src/do-runner/index.js';
+import {
+  REMOTE_STEP_MARKER,
+  RemoteStepJournal,
+  type RemoteStepPermit,
+} from '../src/do-runner/remote-step-journal.js';
 import {
   createObjectiveRouter,
   type ObjectiveAuditEvent,
@@ -3073,6 +3079,158 @@ async function handleInventoryProbe(
   }
 }
 
+// Local workerd fixture: the journal reads a persisted suspension and start
+// identity without entering Mastra. It proves D1 recovery, not agent replay.
+async function handleRemoteStepProbe(
+  request: Request,
+  env: Env,
+): Promise<Response | null> {
+  const path = new URL(request.url).pathname;
+  if (!path.startsWith('/spike/remote-step/')) return null;
+  const operation = path.slice('/spike/remote-step/'.length);
+  if (
+    request.method !==
+    (operation === 'read' || operation === 'scan' ? 'GET' : 'POST')
+  )
+    return json({ error: 'method not allowed' }, 405);
+  try {
+    const fixture = await env.DB.prepare(
+      'SELECT resource_id, status FROM spike_remote_step_fixture WHERE id = 1',
+    ).first<{ resource_id: string; status: string }>();
+    const snapshot = await env.DB.prepare(
+      'SELECT snapshot FROM spike_remote_mastra_workflow_snapshot WHERE workflow_name = ? AND run_id = ?',
+    )
+      .bind('durable-agentic-loop', 'spike-remote-run')
+      .first<{ snapshot: string }>();
+    if (!fixture || !snapshot)
+      throw new Error('remote-step fixture is unavailable');
+    const summary: RunSummary =
+      fixture.status === 'success'
+        ? {
+            runId: 'spike-remote-run',
+            status: 'success',
+            result: { answer: 1 },
+          }
+        : {
+            runId: 'spike-remote-run',
+            status: 'suspended',
+            suspended: [['durable-agentic-execution']],
+            suspendedAt: { 'durable-agentic-execution': 1000 },
+            suspendPayload: {
+              'durable-agentic-execution': {
+                type: 'suspension',
+                toolName: 'remote_lookup',
+                toolCallId: 'call-1',
+                toolCallSuspended: {
+                  remoteStep: REMOTE_STEP_MARKER,
+                  request: { account: 'acme' },
+                },
+              },
+            },
+          };
+    const runtime = {
+      authoritativeStatus: async () => summary,
+      authoritativeStartState: async () => ({
+        storage: 'd1',
+        snapshot: JSON.parse(snapshot.snapshot),
+        execution: {
+          tablePrefix: 'spike_remote_',
+          workflowId: 'durable-agentic-loop',
+          runId: 'spike-remote-run',
+          startToken: 'spike-start-token',
+        },
+        provenance: {
+          startIdentity: {
+            owner: { kind: 'human', id: 'operator-1' },
+            target: {
+              kind: 'agent',
+              id: 'writer',
+              threadId: 'spike-remote-thread',
+              resourceId: fixture.resource_id,
+            },
+          },
+        },
+      }),
+    } as unknown as Pick<
+      RunnerRuntime,
+      'authoritativeStatus' | 'authoritativeStartState'
+    >;
+    const journal = new RemoteStepJournal({
+      db: env.DB as unknown as never,
+      fence: executionFenceForEnv(env),
+      runtime,
+      deploymentId: 'spike',
+      tablePrefix: 'spike_remote_',
+      allowedToolIds: ['remote_lookup'],
+      verifyCompletion: async () => undefined,
+    });
+    await journal.initialize();
+    const body =
+      request.method === 'POST'
+        ? ((await request.json()) as Record<string, unknown>)
+        : {};
+    const invocationId =
+      request.method === 'GET'
+        ? (new URL(request.url).searchParams.get('invocationId') ?? '')
+        : String(body.invocationId ?? '');
+    switch (operation) {
+      case 'register':
+        return json(
+          await journal.register(
+            {
+              deploymentId: 'spike',
+              tablePrefix: 'spike_remote_',
+              workflowId: 'durable-agentic-loop',
+              agentId: 'writer',
+              threadId: 'spike-remote-thread',
+              resourceId: String(body.resourceId ?? ''),
+              runId: 'spike-remote-run',
+            },
+            Date.now() + 120_000,
+            { kind: 'human', id: 'operator-1', role: 'operator' },
+          ),
+        );
+      case 'issue':
+        return json(await journal.issuePermit(invocationId, 60_000));
+      case 'consume':
+        return json(
+          await journal.consumePermit(body.permit as RemoteStepPermit),
+        );
+      case 'record':
+        return json(
+          await journal.recordResult(
+            invocationId,
+            String(body.rawPermit),
+            '{"answer":1}',
+            '{"receipt":"complete"}',
+          ),
+        );
+      case 'read':
+        return json({
+          invocation: await journal.get(invocationId),
+          result: await journal.readRetainedResult(invocationId),
+        });
+      case 'scan':
+        return json(await journal.recoverableResults(10));
+      case 'claim':
+        return json({ owner: await journal.claimResume(invocationId, 60_000) });
+      case 'reconcile':
+        return json({ outcome: await journal.reconcileResult(invocationId) });
+      case 'settle':
+        return json({
+          outcome: await journal.settleAfterResume(
+            invocationId,
+            String(body.owner),
+          ),
+        });
+      default:
+        return json({ error: 'not found' }, 404);
+    }
+  } catch (error) {
+    return doErrorResponse(error);
+  }
+}
+
 const handler: ExportedHandler<Env> = {
   async fetch(
     request: CfRequest,
@@ -3124,6 +3282,9 @@ const handler: ExportedHandler<Env> = {
     // refusing everything else.
     const inventoryProbe = await handleInventoryProbe(routed, env);
     if (inventoryProbe) return inventoryProbe;
+
+    const remoteStepProbe = await handleRemoteStepProbe(routed, env);
+    if (remoteStepProbe) return remoteStepProbe;
 
     const agentProbeResponse = await handleLiveAgentRoute(routed, env, resolve);
     if (agentProbeResponse) return agentProbeResponse;

@@ -3386,6 +3386,176 @@ async function main() {
   );
 
   await step(
+    'RS1 remote-step journal: real D1 permit winner and retained result survive process death',
+    async () => {
+      await killServer(currentServer);
+      await executeLocalD1(
+        stateDir,
+        'CREATE TABLE spike_remote_step_fixture (id INTEGER PRIMARY KEY, resource_id TEXT NOT NULL, status TEXT NOT NULL); ' +
+          "INSERT INTO spike_remote_step_fixture VALUES (1, 'account-7', 'suspended'); " +
+          'CREATE TABLE spike_remote_mastra_workflow_snapshot (workflow_name TEXT NOT NULL, run_id TEXT NOT NULL, snapshot TEXT NOT NULL, PRIMARY KEY (workflow_name, run_id)); ' +
+          "INSERT INTO spike_remote_mastra_workflow_snapshot VALUES ('durable-agentic-loop', 'spike-remote-run', '{\"status\":\"suspended\"}');",
+      );
+      await launchServer(
+        'gen-remote-1',
+        stateDir,
+        join(tmpDir, 'gen-remote-1.log'),
+      );
+      const wrong = await http('POST', '/spike/remote-step/register', {
+        body: { resourceId: 'spike-remote-thread' },
+      });
+      assert(
+        wrong.status === 409,
+        'the thread id cannot stand in for the mapped resource',
+        wrong,
+      );
+      const registered = await http('POST', '/spike/remote-step/register', {
+        body: { resourceId: 'account-7' },
+      });
+      assert(
+        registered.status === 200 &&
+          typeof registered.body.invocationId === 'string',
+        'the mapped-resource invocation was registered',
+        registered,
+      );
+      const invocationId = registered.body.invocationId;
+      const issued = await http('POST', '/spike/remote-step/issue', {
+        body: { invocationId },
+      });
+      assert(
+        issued.status === 200 && issued.body.generation === 1,
+        'the dispatch permit was issued',
+        issued,
+      );
+      const attempts = await Promise.all(
+        [0, 1].map(() =>
+          http('POST', '/spike/remote-step/consume', {
+            body: { permit: issued.body },
+          }),
+        ),
+      );
+      assert(
+        attempts.filter((attempt) => attempt.body.kind === 'accepted')
+          .length === 1 &&
+          attempts.filter((attempt) => attempt.body.kind === 'already-consumed')
+            .length === 1,
+        'concurrent permit consumption has one winner',
+        attempts,
+      );
+      const rawPermit = attempts.find(
+        (attempt) => attempt.body.kind === 'accepted',
+      ).body.rawPermit;
+      const recorded = await http('POST', '/spike/remote-step/record', {
+        body: { invocationId, rawPermit },
+      });
+      assert(
+        recorded.status === 200 && recorded.body.kind === 'recorded',
+        'the result was retained',
+        recorded,
+      );
+      await killServer(currentServer);
+      await executeLocalD1(
+        stateDir,
+        "UPDATE spike_remote_step_fixture SET resource_id = 'account-8' WHERE id = 1;",
+      );
+      await launchServer(
+        'gen-remote-2',
+        stateDir,
+        join(tmpDir, 'gen-remote-2.log'),
+      );
+      const retained = await http(
+        'GET',
+        `/spike/remote-step/read?invocationId=${invocationId}`,
+      );
+      assert(
+        retained.status === 200 &&
+          retained.body.invocation.status === 'result-retained' &&
+          retained.body.result.resultJson === '{"answer":1}',
+        'fresh workerd process reads the persisted result',
+        retained,
+      );
+      const displaced = await http('POST', '/spike/remote-step/claim', {
+        body: { invocationId },
+      });
+      assert(
+        displaced.status === 409,
+        'changed mapped-resource provenance refuses a resume claim',
+        displaced,
+      );
+      await killServer(currentServer);
+      await executeLocalD1(
+        stateDir,
+        "UPDATE spike_remote_step_fixture SET resource_id = 'account-7' WHERE id = 1;",
+      );
+      await launchServer(
+        'gen-remote-3',
+        stateDir,
+        join(tmpDir, 'gen-remote-3.log'),
+      );
+      const scan = await http('GET', '/spike/remote-step/scan');
+      assert(
+        scan.status === 200 && scan.body.invocationIds.includes(invocationId),
+        'fresh process recovery scan finds the retained result',
+        scan,
+      );
+      const claimed = await http('POST', '/spike/remote-step/claim', {
+        body: { invocationId },
+      });
+      assert(
+        claimed.status === 200 && typeof claimed.body.owner === 'string',
+        'one resume claim was persisted',
+        claimed,
+      );
+      await killServer(currentServer);
+      await executeLocalD1(
+        stateDir,
+        "UPDATE spike_remote_step_fixture SET status = 'success' WHERE id = 1; " +
+          'UPDATE spike_remote_mastra_workflow_snapshot SET snapshot = \'{"status":"success"}\' WHERE run_id = \'spike-remote-run\';',
+      );
+      await launchServer(
+        'gen-remote-4',
+        stateDir,
+        join(tmpDir, 'gen-remote-4.log'),
+      );
+      const ambiguous = await http('POST', '/spike/remote-step/reconcile', {
+        body: { invocationId },
+      });
+      assert(
+        ambiguous.status === 200 &&
+          ambiguous.body.outcome === 'pending-quiescence',
+        'fresh process does not replay an ambiguous resume',
+        ambiguous,
+      );
+      const settled = await http('POST', '/spike/remote-step/settle', {
+        body: { invocationId, owner: claimed.body.owner },
+      });
+      assert(
+        settled.status === 200 &&
+          settled.body.outcome === 'advanced-without-proof',
+        'advanced snapshot without a returned witness remains unresolved',
+        settled,
+      );
+      const final = await http(
+        'GET',
+        `/spike/remote-step/read?invocationId=${invocationId}`,
+      );
+      assert(
+        final.status === 200 &&
+          final.body.invocation.status === 'failed' &&
+          final.body.invocation.settlementOutcome === 'advanced-without-proof',
+        'the unresolved outcome remains durable',
+        final,
+      );
+      const drain = await sweepInventoryCategory('remote-steps');
+      assert(
+        drain.class === 'work' && drain.keys.includes(invocationId),
+        'the unresolved result remains in operator drain inventory',
+        drain,
+      );
+    },
+  );
+
+  await step(
     'S deployment sentinel mismatch: a freshly started Worker refuses a D1 ' +
       'provisioned for another deployment',
     async () => {
@@ -3485,6 +3655,10 @@ try {
       'answered the same inventory, and refused to mint, while its schedules ' +
       'and provider subscriptions kept being reported as standing ' +
       'configuration a migration carries rather than drains. ' +
+      'Remote-step journal (RS1): a single permit winner retained a result ' +
+      'across process death, changed mapped-resource provenance refused a ' +
+      'resume claim, and an advanced snapshot without a returned witness ' +
+      'remained in operator drain inventory after another restart. ' +
       'Finally, a fresh Worker refused a D1 sentinel stamped for ' +
       'another deployment with 503 before authentication or routing.',
   );
