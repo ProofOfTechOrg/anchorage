@@ -3,7 +3,13 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
+import { createAgentThreadTopology } from '../agent-host/thread-topology.js';
+import type { FlowsafeWorkerEnv } from '../host-kit/flowsafe-worker.js';
+import { createFlowsafeWorker } from '../host-kit/flowsafe-worker.js';
+import { approvalStoreFactoryFor } from '../host-kit/host-approval-service.js';
+import { staticTokenVerifier } from '../host-kit/verifier.js';
 import { createD1Storage } from './d1-storage.js';
+import { credentialsMatch } from './deployment-identity.js';
 import { ExecutionFenceStore } from './execution-fence.js';
 import { init } from './init.js';
 import { DeploymentInventory } from './inventory.js';
@@ -208,6 +214,190 @@ describe('remote step journal dispatch admission', () => {
         }),
       },
     ]);
+  });
+
+  it('refuses unauthorized dispatch and replay before the trusted effect', async () => {
+    const h = await fixture();
+    const invocation = await h.journal.register(ADDRESS, 10_000, PRINCIPAL);
+    const owner = { kind: PRINCIPAL.kind, id: PRINCIPAL.id };
+    const resources = approvalStoreFactoryFor(h.db).resources();
+    for (const kind of ['thread', 'resource', 'run'] as const) {
+      const id = kind === 'run' ? ADDRESS.runId : ADDRESS.threadId;
+      expect(await resources.claim(kind, id, owner)).toBe(true);
+    }
+    const topology = createAgentThreadTopology(
+      {
+        idFromName: (name) => name,
+        get: () => ({
+          fetch: async () => {
+            throw new Error('dispatch admission must not address a thread');
+          },
+        }),
+      },
+      'test-deployment-identity-secret-0001',
+      {
+        startIdempotency: 'none',
+        executionFence: 'none',
+        remoteStepDispatch: h.journal,
+      },
+    );
+    type Env = FlowsafeWorkerEnv & { DISPATCH_FIXTURE_SECRET: string };
+    const effect = vi.fn(async (_rawPermit: string) => undefined);
+    const worker = createFlowsafeWorker<Env>({
+      workflows: [],
+      systemPrincipalId: 'test-system',
+      buildVerifier: () => staticTokenVerifier(new Map()),
+      maintenance: { sweepIntervalMs: 60_000, purgeIntervalMs: 60_000 },
+      preRoutes: async (request, env, _ctx, kit) => {
+        if (new URL(request.url).pathname !== '/__fixture/remote-dispatch')
+          return null;
+        const credential = request.headers.get('x-dispatch-fixture-secret');
+        if (
+          !credential ||
+          !(await credentialsMatch(credential, env.DISPATCH_FIXTURE_SECRET))
+        )
+          return new Response(null, { status: 401 });
+        const input = (await request.json()) as Record<string, unknown>;
+        const keys = Object.keys(input).sort().join(',');
+        const invocationId =
+          input.action === 'issue' && keys === 'action,invocationId'
+            ? input.invocationId
+            : input.action === 'consume' && keys === 'action,permit'
+              ? (input.permit as { invocationId?: unknown } | null)
+                  ?.invocationId
+              : undefined;
+        if (typeof invocationId !== 'string')
+          return new Response(null, { status: 400 });
+        const context = await kit.contextForStoredInvocation(
+          h.journal,
+          invocationId,
+        );
+        if (!context) return new Response(null, { status: 404 });
+        if (input.action === 'issue') {
+          const ticket = await topology.issueRemoteStepDispatch(
+            context,
+            invocationId,
+            1_000,
+          );
+          return Response.json(ticket);
+        }
+        const result = await topology.consumeRemoteStepDispatch(
+          context,
+          input.permit as Parameters<
+            typeof topology.consumeRemoteStepDispatch
+          >[1],
+        );
+        if (result.kind === 'already-consumed')
+          return new Response(null, { status: 409 });
+        await effect(result.rawPermit);
+        return Response.json({ kind: 'accepted' });
+      },
+    });
+    h.sqlite.exec(`CREATE TABLE flowsafe_deployment (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      tenant_tag TEXT NOT NULL,
+      provisioned_at TEXT NOT NULL
+    )`);
+    h.sqlite
+      .prepare(
+        `INSERT INTO flowsafe_deployment VALUES (1, 'acme', '2026-08-10T00:00:00.000Z')`,
+      )
+      .run();
+    const fixtureEnv: Env = {
+      DB: h.db,
+      DEPLOYMENT_TENANT: 'acme',
+      DEPLOYMENT_IDENTITY_SECRET: 'test-deployment-identity-secret-0001',
+      DISPATCH_FIXTURE_SECRET: 'separate-test-dispatch-secret-0001',
+      RUNNER: {
+        idFromName: (name) => name,
+        get: () => ({ fetch: async () => new Response(null, { status: 503 }) }),
+      },
+      MAINTENANCE: {
+        idFromName: (name) => name,
+        get: () => ({ fetch: async () => new Response(null, { status: 503 }) }),
+      },
+    };
+    const ctx = { waitUntil: () => undefined };
+    const send = (body: unknown, secret?: string) =>
+      worker.fetch(
+        new Request('https://host/__fixture/remote-dispatch', {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            ...(secret ? { 'x-dispatch-fixture-secret': secret } : {}),
+          },
+          body: JSON.stringify(body),
+        }),
+        fixtureEnv,
+        ctx,
+      );
+
+    expect(
+      (await send({ action: 'issue', invocationId: invocation.invocationId }))
+        .status,
+    ).toBe(401);
+    expect(
+      (
+        await send(
+          { action: 'issue', invocationId: invocation.invocationId },
+          'wrong-secret',
+        )
+      ).status,
+    ).toBe(401);
+    expect((await h.journal.get(invocation.invocationId))?.status).toBe(
+      'pending',
+    );
+    expect(effect).not.toHaveBeenCalled();
+    expect(
+      (
+        await send(
+          {
+            action: 'issue',
+            invocationId: invocation.invocationId,
+            lifetimeMs: 60_000,
+          },
+          fixtureEnv.DISPATCH_FIXTURE_SECRET,
+        )
+      ).status,
+    ).toBe(400);
+    expect(
+      (
+        await send(
+          {
+            action: 'issue',
+            invocationId: invocation.invocationId,
+            principal: PRINCIPAL,
+          },
+          fixtureEnv.DISPATCH_FIXTURE_SECRET,
+        )
+      ).status,
+    ).toBe(400);
+    expect((await h.journal.get(invocation.invocationId))?.status).toBe(
+      'pending',
+    );
+
+    const issued = await send(
+      { action: 'issue', invocationId: invocation.invocationId },
+      fixtureEnv.DISPATCH_FIXTURE_SECRET,
+    );
+    expect(issued.status).toBe(200);
+    const ticket = (await issued.json()) as {
+      permit: Parameters<typeof topology.consumeRemoteStepDispatch>[1];
+    };
+    expect(ticket).not.toHaveProperty('rawPermit');
+    const consume = { action: 'consume', permit: ticket.permit };
+    expect((await send(consume)).status).toBe(401);
+    expect((await send(consume, 'wrong-secret')).status).toBe(401);
+    expect(effect).not.toHaveBeenCalled();
+    const accepted = await send(consume, fixtureEnv.DISPATCH_FIXTURE_SECRET);
+    expect(accepted.status).toBe(200);
+    expect(await accepted.json()).toEqual({ kind: 'accepted' });
+    expect(effect).toHaveBeenCalledTimes(1);
+    expect(effect).toHaveBeenCalledWith(expect.stringMatching(/^[\w-]{43}$/));
+    expect(
+      (await send(consume, fixtureEnv.DISPATCH_FIXTURE_SECRET)).status,
+    ).toBe(409);
+    expect(effect).toHaveBeenCalledTimes(1);
   });
 
   it('registers the resource recorded in start provenance independently of the thread id', async () => {
