@@ -27,6 +27,12 @@ export const REMOTE_STEP_TABLE = 'flowsafe_remote_step_invocations';
 export const REMOTE_STEP_SCHEMA_TABLE = 'flowsafe_remote_step_schema';
 const REMOTE_STEP_RECOVERY_INDEX = 'flowsafe_remote_step_recovery';
 const REMOTE_STEP_RECOVERY_INDEX_SQL = `CREATE INDEX ${REMOTE_STEP_RECOVERY_INDEX} ON ${REMOTE_STEP_TABLE} (invocation_id) WHERE status IN ('result-retained', 'resuming')`;
+const REMOTE_STEP_AGENT_INDEX = 'flowsafe_remote_step_agent_suspension';
+const REMOTE_STEP_WORKFLOW_INDEX = 'flowsafe_remote_step_workflow_suspension';
+const REMOTE_STEP_AGENT_INDEX_SQL = `CREATE UNIQUE INDEX ${REMOTE_STEP_AGENT_INDEX} ON ${REMOTE_STEP_TABLE} (deployment_id, table_prefix, workflow_id, agent_id, thread_id, resource_id, run_id, step_path, suspended_at, resume_count) WHERE target_kind = 'agent'`;
+const REMOTE_STEP_WORKFLOW_INDEX_SQL = `CREATE UNIQUE INDEX ${REMOTE_STEP_WORKFLOW_INDEX} ON ${REMOTE_STEP_TABLE} (deployment_id, table_prefix, workflow_id, run_id, step_path, suspended_at, resume_count) WHERE target_kind = 'workflow'`;
+const REMOTE_STEP_WRITE_TRIGGER = 'flowsafe_remote_step_write_version';
+const REMOTE_STEP_WRITE_TRIGGER_SQL = `CREATE TRIGGER ${REMOTE_STEP_WRITE_TRIGGER} BEFORE UPDATE ON ${REMOTE_STEP_TABLE} WHEN NEW.write_revision <= OLD.write_revision BEGIN SELECT RAISE(ABORT, 'remote step writer version changed'); END`;
 const REMOTE_STEP_RESULT_COLUMNS = [
   'result_json',
   'result_digest',
@@ -64,6 +70,10 @@ const REMOTE_STEP_COLUMNS = [
   'permit_digest',
   ...REMOTE_STEP_RESULT_COLUMNS,
   ...REMOTE_STEP_SETTLEMENT_COLUMNS,
+  'target_kind',
+  'suspension_marker',
+  'request_digest',
+  'write_revision',
 ] as const;
 const REMOTE_STEP_INTEGER_COLUMNS = new Set<string>([
   'suspended_at',
@@ -77,13 +87,61 @@ const REMOTE_STEP_INTEGER_COLUMNS = new Set<string>([
   'executor_quiescent_at',
   'resume_lease_expires_at',
   'settled_at',
+  'write_revision',
 ]);
 export const REMOTE_STEP_MARKER = 'flowsafe.remote-step/v1';
+export const WORKFLOW_REMOTE_STEP_MARKER = 'flowsafe.remote-step.workflow/v1';
 export const MAX_REMOTE_STEP_REQUEST_BYTES = 16_384;
 export const MAX_REMOTE_STEP_RESULT_BYTES = 16_384;
 
 const SHA256_HEX = /^[a-f0-9]{64}$/;
 const RAW_PERMIT = /^[A-Za-z0-9_-]{43}$/;
+
+function remoteStepTableSql(name: string): string {
+  return `CREATE TABLE IF NOT EXISTS ${name} (
+        invocation_id TEXT PRIMARY KEY,
+        principal_json TEXT NOT NULL,
+        start_token TEXT NOT NULL,
+        deployment_id TEXT NOT NULL,
+        table_prefix TEXT NOT NULL,
+        workflow_id TEXT NOT NULL,
+        agent_id TEXT,
+        thread_id TEXT,
+        resource_id TEXT,
+        run_id TEXT NOT NULL,
+        step_path TEXT NOT NULL,
+        suspended_at INTEGER NOT NULL,
+        resume_count INTEGER NOT NULL,
+        request_json TEXT NOT NULL,
+        deadline_at INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        permit_generation INTEGER NOT NULL DEFAULT 0,
+        permit_epoch INTEGER,
+        permit_revision INTEGER,
+        permit_expires_at INTEGER,
+        permit_consumed_at INTEGER,
+        permit_digest TEXT,
+        result_json TEXT,
+        result_digest TEXT,
+        quiescence_digest TEXT,
+        executor_quiescent_at INTEGER,
+        resume_lease_owner TEXT,
+        resume_lease_expires_at INTEGER,
+        settled_at INTEGER,
+        settlement_outcome TEXT,
+        target_kind TEXT NOT NULL CHECK (target_kind IN ('agent', 'workflow')),
+        suspension_marker TEXT NOT NULL,
+        request_digest TEXT,
+        write_revision INTEGER NOT NULL DEFAULT 0,
+        CHECK ((target_kind = 'agent' AND agent_id IS NOT NULL
+          AND thread_id IS NOT NULL AND resource_id IS NOT NULL
+          AND suspension_marker = '${REMOTE_STEP_MARKER}') OR
+          (target_kind = 'workflow' AND agent_id IS NULL
+          AND thread_id IS NULL AND resource_id IS NULL
+          AND suspension_marker = '${WORKFLOW_REMOTE_STEP_MARKER}'
+          AND request_digest IS NOT NULL))
+      )`;
+}
 
 function boundedJsonBytes(value: string): void {
   if (
@@ -132,6 +190,14 @@ export interface RemoteStepAddress {
   runId: string;
 }
 
+export interface WorkflowRemoteStepAddress {
+  targetKind: 'workflow';
+  deploymentId: string;
+  tablePrefix: string;
+  workflowId: string;
+  runId: string;
+}
+
 export interface RemoteStepInvocation extends RemoteStepAddress {
   invocationId: string;
   principal: ExecutionPrincipal;
@@ -159,6 +225,12 @@ export interface RemoteStepInvocation extends RemoteStepAddress {
     | 'terminal-not-success'
     | 'deadline-expired'
     | 'advanced-without-proof';
+}
+
+export interface WorkflowRemoteStepInvocation
+  extends Omit<RemoteStepInvocation, 'agentId' | 'threadId' | 'resourceId'> {
+  targetKind: 'workflow';
+  requestDigest: string;
 }
 
 export interface RemoteStepPermit {
@@ -218,6 +290,10 @@ type JournalRow = {
   resume_lease_expires_at: number | null;
   settled_at: number | null;
   settlement_outcome: string | null;
+  target_kind: string;
+  suspension_marker: string;
+  request_digest: string | null;
+  write_revision: number;
 };
 
 function record(value: unknown): Record<string, unknown> | undefined {
@@ -239,6 +315,11 @@ function rowResult(value: unknown): JournalRow | undefined {
 
 function decode(row: JournalRow): RemoteStepInvocation {
   if (
+    row.target_kind !== 'agent' ||
+    row.suspension_marker !== REMOTE_STEP_MARKER ||
+    (row.request_digest !== null && !SHA256_HEX.test(row.request_digest)) ||
+    !Number.isSafeInteger(row.write_revision) ||
+    row.write_revision < 0 ||
     typeof row.step_path !== 'string' ||
     row.step_path.length > 1_024 ||
     typeof row.request_json !== 'string' ||
@@ -358,6 +439,129 @@ function decode(row: JournalRow): RemoteStepInvocation {
   };
 }
 
+function decodeWorkflow(row: JournalRow): WorkflowRemoteStepInvocation {
+  if (
+    row.target_kind !== 'workflow' ||
+    row.suspension_marker !== WORKFLOW_REMOTE_STEP_MARKER ||
+    row.agent_id !== null ||
+    row.thread_id !== null ||
+    row.resource_id !== null ||
+    !isPathSafeId(row.invocation_id) ||
+    !isPathSafeId(row.deployment_id) ||
+    !isPathSafeId(row.workflow_id) ||
+    !isPathSafeId(row.run_id) ||
+    !isPathSafeId(row.start_token) ||
+    typeof row.request_digest !== 'string' ||
+    !SHA256_HEX.test(row.request_digest) ||
+    !Number.isSafeInteger(row.write_revision) ||
+    row.write_revision < 0 ||
+    !positiveTime(row.suspended_at) ||
+    !positiveTime(row.deadline_at) ||
+    !Number.isSafeInteger(row.resume_count) ||
+    (row.resume_count !== -1 && row.resume_count < 1) ||
+    !Number.isSafeInteger(row.permit_generation) ||
+    row.permit_generation < 0 ||
+    ![
+      'pending',
+      'dispatched',
+      'result-retained',
+      'resuming',
+      'settled',
+      'failed',
+    ].includes(row.status) ||
+    (row.status === 'resuming' &&
+      (!isPathSafeId(row.resume_lease_owner) ||
+        !positiveTime(row.resume_lease_expires_at) ||
+        row.result_json === null)) ||
+    (row.status !== 'resuming' &&
+      (row.resume_lease_owner !== null ||
+        row.resume_lease_expires_at !== null)) ||
+    typeof row.step_path !== 'string' ||
+    row.step_path.length > 1_024 ||
+    typeof row.request_json !== 'string' ||
+    new TextEncoder().encode(row.request_json).length >
+      MAX_REMOTE_STEP_REQUEST_BYTES
+  )
+    throw new RemoteStepRefusal(503, 'remote step journal is unreadable');
+  try {
+    validateTablePrefix(row.table_prefix);
+    const stepPath: unknown = JSON.parse(row.step_path);
+    const request: unknown = JSON.parse(row.request_json);
+    const principal = assertExecutionPrincipal(
+      JSON.parse(row.principal_json),
+      'stored remote step principal',
+    );
+    if (
+      !Array.isArray(stepPath) ||
+      stepPath.length === 0 ||
+      stepPath.some((part) => typeof part !== 'string' || part === '') ||
+      (row.settlement_outcome !== null &&
+        ![
+          'applied',
+          'terminal-not-success',
+          'deadline-expired',
+          'advanced-without-proof',
+        ].includes(row.settlement_outcome)) ||
+      (row.status === 'settled' && row.settlement_outcome !== 'applied') ||
+      (row.status === 'settled' &&
+        (row.result_json === null ||
+          row.result_digest === null ||
+          !positiveTime(row.executor_quiescent_at))) ||
+      (row.settlement_outcome !== null &&
+        ((row.status !== 'settled' && row.status !== 'failed') ||
+          !positiveTime(row.settled_at)))
+    )
+      throw new Error('invalid workflow row');
+    return {
+      targetKind: 'workflow',
+      invocationId: row.invocation_id,
+      principal,
+      startToken: row.start_token,
+      deploymentId: row.deployment_id,
+      tablePrefix: row.table_prefix,
+      workflowId: row.workflow_id,
+      runId: row.run_id,
+      stepPath,
+      suspendedAt: row.suspended_at,
+      ...(row.resume_count < 0 ? {} : { resumeCount: row.resume_count }),
+      request,
+      requestDigest: row.request_digest,
+      deadlineAt: row.deadline_at,
+      status: row.status as WorkflowRemoteStepInvocation['status'],
+      permitGeneration: row.permit_generation,
+      ...(row.permit_epoch === null ? {} : { permitEpoch: row.permit_epoch }),
+      ...(row.permit_revision === null
+        ? {}
+        : { permitRevision: row.permit_revision }),
+      ...(row.permit_expires_at === null
+        ? {}
+        : { permitExpiresAt: row.permit_expires_at }),
+      ...(row.permit_consumed_at === null
+        ? {}
+        : { permitConsumedAt: row.permit_consumed_at }),
+      ...(row.resume_lease_expires_at === null
+        ? {}
+        : { resumeLeaseExpiresAt: row.resume_lease_expires_at }),
+      ...(row.settlement_outcome === null
+        ? {}
+        : {
+            settlementOutcome:
+              row.settlement_outcome as WorkflowRemoteStepInvocation['settlementOutcome'],
+          }),
+    };
+  } catch {
+    throw new RemoteStepRefusal(503, 'remote step journal is unreadable');
+  }
+}
+
+function decodeAny(
+  row: JournalRow,
+): RemoteStepInvocation | WorkflowRemoteStepInvocation {
+  if (row.target_kind === 'agent') return decode(row);
+  if (row.target_kind === 'workflow') return decodeWorkflow(row);
+  throw new RemoteStepRefusal(503, 'remote step journal is unreadable');
+}
+
 function selectedSuspension(
   summary: RunSummary,
   allowedToolIds: ReadonlySet<string>,
@@ -412,6 +616,48 @@ function selectedSuspension(
   };
 }
 
+function selectedWorkflowSuspension(summary: RunSummary): {
+  stepPath: string[];
+  suspendedAt: number;
+  resumeCount?: number;
+  requestJson: string;
+} {
+  if (summary.status !== 'suspended')
+    throw new RemoteStepRefusal(409, 'run is not suspended');
+  const payloads = record(summary.suspendPayload);
+  const matches = (summary.suspended ?? []).flatMap((path) => {
+    const key = path.join('.');
+    const suspended = record(payloads?.[key]);
+    const remoteStep = record(suspended?.remoteStep);
+    return suspended?.type === 'suspension' &&
+      remoteStep?.marker === WORKFLOW_REMOTE_STEP_MARKER
+      ? [{ path, key, remoteStep }]
+      : [];
+  });
+  if (matches.length !== 1)
+    throw new RemoteStepRefusal(409, 'remote step suspension is ambiguous');
+  const selected = matches[0];
+  if (!selected || !Object.hasOwn(selected.remoteStep, 'request'))
+    throw new RemoteStepRefusal(503, 'remote step suspension is unreadable');
+  const suspendedAt = summary.suspendedAt?.[selected.key];
+  const resumeCount = summary.resumeCount?.[selected.key];
+  const requestJson = JSON.stringify(selected.remoteStep.request);
+  if (
+    !positiveTime(suspendedAt) ||
+    (resumeCount !== undefined &&
+      (!Number.isSafeInteger(resumeCount) || resumeCount < 1)) ||
+    typeof requestJson !== 'string' ||
+    new TextEncoder().encode(requestJson).length > MAX_REMOTE_STEP_REQUEST_BYTES
+  )
+    throw new RemoteStepRefusal(503, 'remote step suspension is unreadable');
+  return {
+    stepPath: selected.path,
+    suspendedAt,
+    ...(resumeCount === undefined ? {} : { resumeCount }),
+    requestJson,
+  };
+}
+
 export class RemoteStepJournal {
   readonly #db: ExecutionFenceDatabase;
   readonly #fence: ExecutionFenceStore;
@@ -425,6 +671,12 @@ export class RemoteStepJournal {
   readonly #allowedToolIds: ReadonlySet<string>;
   readonly #verifyCompletion: (input: {
     invocation: RemoteStepInvocation;
+    rawPermit: string;
+    resultJson: string;
+    evidenceJson: string;
+  }) => Promise<void>;
+  readonly #verifyWorkflowCompletion?: (input: {
+    invocation: WorkflowRemoteStepInvocation;
     rawPermit: string;
     resultJson: string;
     evidenceJson: string;
@@ -454,6 +706,12 @@ export class RemoteStepJournal {
       resultJson: string;
       evidenceJson: string;
     }) => Promise<void>;
+    verifyWorkflowCompletion?: (input: {
+      invocation: WorkflowRemoteStepInvocation;
+      rawPermit: string;
+      resultJson: string;
+      evidenceJson: string;
+    }) => Promise<void>;
     now?: () => number;
   }) {
     if (!input.fence.usesDatabase(input.db))
@@ -477,46 +735,12 @@ export class RemoteStepJournal {
     this.#tablePrefix = input.tablePrefix;
     this.#allowedToolIds = new Set(input.allowedToolIds);
     this.#verifyCompletion = input.verifyCompletion;
+    this.#verifyWorkflowCompletion = input.verifyWorkflowCompletion;
     this.#now = input.now ?? Date.now;
   }
 
   async initialize(): Promise<void> {
-    await this.#db
-      .prepare(`CREATE TABLE IF NOT EXISTS ${REMOTE_STEP_TABLE} (
-        invocation_id TEXT PRIMARY KEY,
-        principal_json TEXT NOT NULL,
-        start_token TEXT NOT NULL,
-        deployment_id TEXT NOT NULL,
-        table_prefix TEXT NOT NULL,
-        workflow_id TEXT NOT NULL,
-        agent_id TEXT NOT NULL,
-        thread_id TEXT NOT NULL,
-        resource_id TEXT NOT NULL,
-        run_id TEXT NOT NULL,
-        step_path TEXT NOT NULL,
-        suspended_at INTEGER NOT NULL,
-        resume_count INTEGER NOT NULL,
-        request_json TEXT NOT NULL,
-        deadline_at INTEGER NOT NULL,
-        status TEXT NOT NULL,
-        permit_generation INTEGER NOT NULL DEFAULT 0,
-        permit_epoch INTEGER,
-        permit_revision INTEGER,
-        permit_expires_at INTEGER,
-        permit_consumed_at INTEGER,
-        permit_digest TEXT,
-        result_json TEXT,
-        result_digest TEXT,
-        quiescence_digest TEXT,
-        executor_quiescent_at INTEGER,
-        resume_lease_owner TEXT,
-        resume_lease_expires_at INTEGER,
-        settled_at INTEGER,
-        settlement_outcome TEXT,
-        UNIQUE (deployment_id, table_prefix, workflow_id, agent_id,
-          thread_id, resource_id, run_id, step_path, suspended_at, resume_count)
-      )`)
-      .run();
+    await this.#db.prepare(remoteStepTableSql(REMOTE_STEP_TABLE)).run();
     await this.#db
       .prepare(`CREATE TABLE IF NOT EXISTS ${REMOTE_STEP_SCHEMA_TABLE} (
         id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -530,7 +754,7 @@ export class RemoteStepJournal {
       const columns = record(schema)?.results;
       if (!Array.isArray(columns))
         throw new RemoteStepRefusal(503, 'remote step schema is unreadable');
-      const samePrefix = (expected: readonly string[]) =>
+      const samePrefix = (expected: readonly string[], v4 = false) =>
         columns.length === expected.length &&
         columns.every((value, index) => {
           const column = record(value);
@@ -541,10 +765,22 @@ export class RemoteStepJournal {
               (REMOTE_STEP_INTEGER_COLUMNS.has(name as string)
                 ? 'INTEGER'
                 : 'TEXT') &&
-            column?.notnull === (index > 0 && index <= 16 ? 1 : 0) &&
+            column?.notnull ===
+              ((index > 0 &&
+                index <= 16 &&
+                !(v4 && index >= 6 && index <= 8)) ||
+              (v4 &&
+                ['target_kind', 'suspension_marker', 'write_revision'].includes(
+                  name as string,
+                ))
+                ? 1
+                : 0) &&
             column?.pk === (index === 0 ? 1 : 0) &&
             column?.hidden === 0 &&
-            column?.dflt_value === (name === 'permit_generation' ? '0' : null)
+            column?.dflt_value ===
+              (name === 'permit_generation' || name === 'write_revision'
+                ? '0'
+                : null)
           );
         });
       const indexes = record(
@@ -592,8 +828,6 @@ export class RemoteStepJournal {
         )
           uniqueSuspension = true;
       }
-      if (!uniqueSuspension)
-        throw new RemoteStepRefusal(503, 'remote step schema is unreadable');
       const recoveryIndex = indexes.find(
         (value) => record(value)?.name === REMOTE_STEP_RECOVERY_INDEX,
       );
@@ -610,6 +844,75 @@ export class RemoteStepJournal {
         Array.isArray(recoveryDefinition) &&
         recoveryDefinition.length === 1 &&
         record(recoveryDefinition[0])?.sql === REMOTE_STEP_RECOVERY_INDEX_SQL;
+      const validV4Index = async (name: string, sql: string) => {
+        const entry = indexes.find((value) => record(value)?.name === name);
+        const definition = record(
+          await this.#db
+            .prepare(
+              'SELECT sql FROM sqlite_schema WHERE type = ? AND name = ?',
+            )
+            .bind('index', name)
+            .all(),
+        )?.results;
+        return (
+          record(entry)?.unique === 1 &&
+          record(entry)?.origin === 'c' &&
+          record(entry)?.partial === 1 &&
+          Array.isArray(definition) &&
+          definition.length === 1 &&
+          record(definition[0])?.sql === sql
+        );
+      };
+      const validV4Table = async () => {
+        const tableDefinition = record(
+          await this.#db
+            .prepare(
+              'SELECT sql FROM sqlite_schema WHERE type = ? AND name = ?',
+            )
+            .bind('table', REMOTE_STEP_TABLE)
+            .all(),
+        )?.results;
+        const tableSql =
+          Array.isArray(tableDefinition) && tableDefinition.length === 1
+            ? record(tableDefinition[0])?.sql
+            : undefined;
+        return (
+          typeof tableSql === 'string' &&
+          tableSql.includes(
+            "target_kind TEXT NOT NULL CHECK (target_kind IN ('agent', 'workflow'))",
+          ) &&
+          tableSql.includes(
+            "CHECK ((target_kind = 'agent' AND agent_id IS NOT NULL",
+          ) &&
+          tableSql.includes("(target_kind = 'workflow' AND agent_id IS NULL") &&
+          tableSql.includes('write_revision INTEGER NOT NULL DEFAULT 0')
+        );
+      };
+      const validV4 = async () => {
+        const trigger = record(
+          await this.#db
+            .prepare(
+              'SELECT sql FROM sqlite_schema WHERE type = ? AND name = ?',
+            )
+            .bind('trigger', REMOTE_STEP_WRITE_TRIGGER)
+            .all(),
+        )?.results;
+        return (
+          (await validV4Table()) &&
+          validRecoveryIndex &&
+          (await validV4Index(
+            REMOTE_STEP_AGENT_INDEX,
+            REMOTE_STEP_AGENT_INDEX_SQL,
+          )) &&
+          (await validV4Index(
+            REMOTE_STEP_WORKFLOW_INDEX,
+            REMOTE_STEP_WORKFLOW_INDEX_SQL,
+          )) &&
+          Array.isArray(trigger) &&
+          trigger.length === 1 &&
+          record(trigger[0])?.sql === REMOTE_STEP_WRITE_TRIGGER_SQL
+        );
+      };
       const versions = await this.#db
         .prepare(`SELECT id, version FROM ${REMOTE_STEP_SCHEMA_TABLE} LIMIT 2`)
         .all();
@@ -617,26 +920,40 @@ export class RemoteStepJournal {
       if (!Array.isArray(rows) || rows.length > 1)
         throw new RemoteStepRefusal(503, 'remote step schema is unreadable');
       if (rows.length === 1) {
+        if (record(rows[0])?.id === 1 && record(rows[0])?.version === 4) {
+          if (!samePrefix(REMOTE_STEP_COLUMNS, true) || !(await validV4()))
+            throw new RemoteStepRefusal(
+              503,
+              'remote step schema is unreadable',
+            );
+          return 'current-v4';
+        }
         if (
           record(rows[0])?.id !== 1 ||
           (record(rows[0])?.version !== 3 && record(rows[0])?.version !== 2) ||
+          !uniqueSuspension ||
           !samePrefix(
             record(rows[0])?.version === 3
-              ? REMOTE_STEP_COLUMNS
-              : REMOTE_STEP_COLUMNS.slice(0, -4),
+              ? REMOTE_STEP_COLUMNS.slice(0, -4)
+              : REMOTE_STEP_COLUMNS.slice(0, -8),
           ) ||
           (record(rows[0])?.version === 3 && !validRecoveryIndex)
         )
           throw new RemoteStepRefusal(503, 'remote step schema is unreadable');
-        return record(rows[0])?.version === 3 ? 'current' : 'prior-v2';
+        return record(rows[0])?.version === 3 ? 'prior-v3' : 'prior-v2';
       }
-      if (samePrefix(REMOTE_STEP_COLUMNS.slice(0, -8))) return 'prior-v1';
-      if (samePrefix(REMOTE_STEP_COLUMNS.slice(0, -4))) return 'unversioned-v2';
-      if (samePrefix(REMOTE_STEP_COLUMNS)) return 'unversioned-current';
+      if (uniqueSuspension && samePrefix(REMOTE_STEP_COLUMNS.slice(0, -12)))
+        return 'prior-v1';
+      if (uniqueSuspension && samePrefix(REMOTE_STEP_COLUMNS.slice(0, -8)))
+        return 'unversioned-v2';
+      if (uniqueSuspension && samePrefix(REMOTE_STEP_COLUMNS.slice(0, -4)))
+        return 'unversioned-v3';
+      if (samePrefix(REMOTE_STEP_COLUMNS, true) && (await validV4Table()))
+        return 'unversioned-v4';
       throw new RemoteStepRefusal(503, 'remote step schema is unreadable');
     };
     const stage = await readSchema();
-    if (stage === 'current') return;
+    if (stage === 'current-v4') return;
     if (
       stage === 'prior-v1' ||
       stage === 'prior-v2' ||
@@ -673,9 +990,10 @@ export class RemoteStepJournal {
           ),
         ]);
       } catch (error) {
-        if ((await readSchema()) !== 'current') throw error;
+        const current = await readSchema();
+        if (current !== 'prior-v3' && current !== 'current-v4') throw error;
       }
-      return;
+      return this.initialize();
     }
     const transactional = this.#db as ExecutionFenceDatabase & {
       batch?: (
@@ -687,19 +1005,65 @@ export class RemoteStepJournal {
         503,
         'remote step schema upgrade is unavailable',
       );
-    try {
-      await transactional.batch([
-        this.#db.prepare(REMOTE_STEP_RECOVERY_INDEX_SQL),
-        this.#db.prepare(
-          `INSERT INTO ${REMOTE_STEP_SCHEMA_TABLE} (id, version) VALUES (1, 3)`,
-        ),
-      ]);
-    } catch (error) {
-      if ((await readSchema()) !== 'current') throw error;
+    if (stage === 'unversioned-v3') {
+      try {
+        await transactional.batch([
+          this.#db.prepare(REMOTE_STEP_RECOVERY_INDEX_SQL),
+          this.#db.prepare(
+            `INSERT INTO ${REMOTE_STEP_SCHEMA_TABLE} (id, version) VALUES (1, 3)`,
+          ),
+        ]);
+      } catch (error) {
+        if ((await readSchema()) !== 'prior-v3') throw error;
+      }
+      return this.initialize();
     }
+    if (stage === 'prior-v3') {
+      const replacement = `${REMOTE_STEP_TABLE}_v4`;
+      try {
+        await transactional.batch([
+          this.#db.prepare(remoteStepTableSql(replacement)),
+          this.#db.prepare(`INSERT INTO ${replacement} (${REMOTE_STEP_COLUMNS.join(', ')})
+            SELECT ${REMOTE_STEP_COLUMNS.slice(0, -4).join(', ')}, 'agent', '${REMOTE_STEP_MARKER}', NULL, 0 FROM ${REMOTE_STEP_TABLE}`),
+          this.#db.prepare(`DROP TABLE ${REMOTE_STEP_TABLE}`),
+          this.#db.prepare(
+            `ALTER TABLE ${replacement} RENAME TO ${REMOTE_STEP_TABLE}`,
+          ),
+          this.#db.prepare(REMOTE_STEP_RECOVERY_INDEX_SQL),
+          this.#db.prepare(REMOTE_STEP_AGENT_INDEX_SQL),
+          this.#db.prepare(REMOTE_STEP_WORKFLOW_INDEX_SQL),
+          this.#db.prepare(REMOTE_STEP_WRITE_TRIGGER_SQL),
+          this.#db.prepare(
+            `UPDATE ${REMOTE_STEP_SCHEMA_TABLE} SET version = 4 WHERE id = 1 AND version = 3`,
+          ),
+        ]);
+      } catch (error) {
+        if ((await readSchema()) !== 'current-v4') throw error;
+      }
+      return;
+    }
+    if (stage === 'unversioned-v4') {
+      try {
+        await transactional.batch([
+          this.#db.prepare(REMOTE_STEP_RECOVERY_INDEX_SQL),
+          this.#db.prepare(REMOTE_STEP_AGENT_INDEX_SQL),
+          this.#db.prepare(REMOTE_STEP_WORKFLOW_INDEX_SQL),
+          this.#db.prepare(REMOTE_STEP_WRITE_TRIGGER_SQL),
+          this.#db.prepare(
+            `INSERT INTO ${REMOTE_STEP_SCHEMA_TABLE} (id, version) VALUES (1, 4)`,
+          ),
+        ]);
+      } catch (error) {
+        if ((await readSchema()) !== 'current-v4') throw error;
+      }
+      return;
+    }
+    throw new RemoteStepRefusal(503, 'remote step schema is unreadable');
   }
 
-  async #snapshot(address: RemoteStepAddress): Promise<string> {
+  async #snapshot(
+    address: RemoteStepAddress | WorkflowRemoteStepAddress,
+  ): Promise<string> {
     const result = await this.#db
       .prepare(
         `SELECT snapshot FROM "${address.tablePrefix}mastra_workflow_snapshot"
@@ -717,16 +1081,20 @@ export class RemoteStepJournal {
     return record(rows[0])?.snapshot as string;
   }
 
-  async #current(address: RemoteStepAddress) {
+  async #current(address: RemoteStepAddress | WorkflowRemoteStepAddress) {
     const summary = await this.#runtime.authoritativeStatus(
       address.workflowId,
       address.runId,
     );
     if (!summary) throw new RemoteStepRefusal(404, 'run not found');
-    return selectedSuspension(summary, this.#allowedToolIds);
+    return 'targetKind' in address
+      ? selectedWorkflowSuspension(summary)
+      : selectedSuspension(summary, this.#allowedToolIds);
   }
 
-  async #stableSnapshot(address: RemoteStepAddress) {
+  async #stableSnapshot(
+    address: RemoteStepAddress | WorkflowRemoteStepAddress,
+  ) {
     const before = await this.#current(address);
     const snapshot = await this.#snapshot(address);
     const state = await this.#execution(address);
@@ -790,8 +1158,8 @@ export class RemoteStepJournal {
       .prepare(`INSERT INTO ${REMOTE_STEP_TABLE} (
         invocation_id, principal_json, start_token, deployment_id, table_prefix, workflow_id, agent_id,
         thread_id, resource_id, run_id, step_path, suspended_at, resume_count,
-        request_json, deadline_at, status)
-        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending'
+        request_json, deadline_at, status, target_kind, suspension_marker)
+        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'agent', '${REMOTE_STEP_MARKER}'
         WHERE EXISTS (SELECT 1 FROM "${address.tablePrefix}mastra_workflow_snapshot"
           WHERE workflow_name = ? AND run_id = ? AND snapshot = ?
             AND ${SNAPSHOT_EXECUTION_OPEN_SQL})
@@ -819,7 +1187,7 @@ export class RemoteStepJournal {
       .run();
     const result = await this.#db
       .prepare(`UPDATE ${REMOTE_STEP_TABLE}
-        SET deadline_at = MIN(deadline_at, ?)
+        SET deadline_at = MIN(deadline_at, ?), write_revision = write_revision + 1
         WHERE deployment_id = ? AND table_prefix = ? AND workflow_id = ?
           AND agent_id = ? AND thread_id = ? AND resource_id = ? AND run_id = ?
           AND step_path = ? AND suspended_at = ? AND resume_count = ?
@@ -857,7 +1225,128 @@ export class RemoteStepJournal {
     return decode(row);
   }
 
+  async registerWorkflow(
+    address: WorkflowRemoteStepAddress,
+    hostDeadlineAt: number,
+    originalPrincipal: ExecutionPrincipal,
+  ): Promise<WorkflowRemoteStepInvocation> {
+    if (
+      address.targetKind !== 'workflow' ||
+      address.deploymentId !== this.#deploymentId ||
+      address.tablePrefix !== this.#tablePrefix ||
+      !isPathSafeId(address.workflowId) ||
+      !isPathSafeId(address.runId) ||
+      !positiveTime(hostDeadlineAt)
+    )
+      throw new RemoteStepRefusal(400, 'remote step address is malformed');
+    validateTablePrefix(address.tablePrefix);
+    let principal: ExecutionPrincipal;
+    try {
+      principal = assertExecutionPrincipal(
+        originalPrincipal,
+        'remote step principal',
+      );
+    } catch {
+      throw new RemoteStepRefusal(400, 'remote step principal is malformed');
+    }
+    const execution = await this.#execution(address, principal);
+    const { suspension, snapshot } = await this.#stableSnapshot(address);
+    const summary = await this.#runtime.authoritativeStatus(
+      address.workflowId,
+      address.runId,
+    );
+    const deadlineAt = Math.min(
+      hostDeadlineAt,
+      summary?.deadlineAt ?? hostDeadlineAt,
+    );
+    if (deadlineAt <= this.#now())
+      throw new RemoteStepRefusal(409, 'remote step deadline elapsed');
+    const requestDigest = await sha256Hex(suspension.requestJson);
+    const stepPath = JSON.stringify(suspension.stepPath);
+    const invocationId = crypto.randomUUID();
+    await this.#db
+      .prepare(`INSERT INTO ${REMOTE_STEP_TABLE} (
+        invocation_id, principal_json, start_token, deployment_id, table_prefix,
+        workflow_id, run_id, step_path, suspended_at, resume_count, request_json,
+        deadline_at, status, target_kind, suspension_marker, request_digest)
+        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'workflow',
+          '${WORKFLOW_REMOTE_STEP_MARKER}', ?
+        WHERE EXISTS (SELECT 1 FROM "${address.tablePrefix}mastra_workflow_snapshot"
+          WHERE workflow_name = ? AND run_id = ? AND snapshot = ?
+            AND ${SNAPSHOT_EXECUTION_OPEN_SQL})
+        ON CONFLICT DO NOTHING`)
+      .bind(
+        invocationId,
+        JSON.stringify(principal),
+        execution.execution.startToken,
+        address.deploymentId,
+        address.tablePrefix,
+        address.workflowId,
+        address.runId,
+        stepPath,
+        suspension.suspendedAt,
+        suspension.resumeCount ?? -1,
+        suspension.requestJson,
+        deadlineAt,
+        requestDigest,
+        address.workflowId,
+        address.runId,
+        snapshot,
+      )
+      .run();
+    const row = rowResult(
+      await this.#db
+        .prepare(`UPDATE ${REMOTE_STEP_TABLE}
+          SET deadline_at = MIN(deadline_at, ?), write_revision = write_revision + 1
+          WHERE target_kind = 'workflow' AND deployment_id = ?
+            AND table_prefix = ? AND workflow_id = ? AND run_id = ?
+            AND step_path = ? AND suspended_at = ? AND resume_count = ?
+            AND request_json = ? AND request_digest = ?
+            AND principal_json = ? AND start_token = ?
+            AND EXISTS (SELECT 1 FROM "${address.tablePrefix}mastra_workflow_snapshot"
+              WHERE workflow_name = ? AND run_id = ? AND snapshot = ?
+                AND ${SNAPSHOT_EXECUTION_OPEN_SQL})
+          RETURNING *`)
+        .bind(
+          deadlineAt,
+          address.deploymentId,
+          address.tablePrefix,
+          address.workflowId,
+          address.runId,
+          stepPath,
+          suspension.suspendedAt,
+          suspension.resumeCount ?? -1,
+          suspension.requestJson,
+          requestDigest,
+          JSON.stringify(principal),
+          execution.execution.startToken,
+          address.workflowId,
+          address.runId,
+          snapshot,
+        )
+        .all(),
+    );
+    if (!row)
+      throw new RemoteStepRefusal(
+        409,
+        'remote step registration did not settle',
+      );
+    return decodeWorkflow(row);
+  }
+
   async get(invocationId: string): Promise<RemoteStepInvocation | undefined> {
+    const row = await this.#getRow(invocationId);
+    return row?.target_kind === 'agent' ? decode(row) : undefined;
+  }
+
+  async getWorkflow(
+    invocationId: string,
+  ): Promise<WorkflowRemoteStepInvocation | undefined> {
+    const row = await this.#getRow(invocationId);
+    return row?.target_kind === 'workflow' ? decodeWorkflow(row) : undefined;
+  }
+
+  async #getRow(invocationId: string): Promise<JournalRow | undefined> {
     if (!isPathSafeId(invocationId))
       throw new RemoteStepRefusal(400, 'invocation id is malformed');
     const row = rowResult(
@@ -866,7 +1355,14 @@ export class RemoteStepJournal {
         .bind(invocationId)
         .all(),
     );
-    return row ? decode(row) : undefined;
+    return row;
+  }
+
+  async #getAny(
+    invocationId: string,
+  ): Promise<RemoteStepInvocation | WorkflowRemoteStepInvocation | undefined> {
+    const row = await this.#getRow(invocationId);
+    return row ? decodeAny(row) : undefined;
   }
 
   async readDispatchRequestJson(invocationId: string): Promise<string> {
@@ -883,37 +1379,54 @@ export class RemoteStepJournal {
     return row.request_json;
   }
 
-  async #execution(address: RemoteStepAddress, principal?: ExecutionPrincipal) {
+  async #execution(
+    address: RemoteStepAddress | WorkflowRemoteStepAddress,
+    principal?: ExecutionPrincipal,
+  ) {
     const state = await this.#runtime.authoritativeStartState(
       address.workflowId,
       address.runId,
     );
     const target = state?.provenance.startIdentity?.target;
-    if (
-      state?.storage !== 'd1' ||
-      target?.kind !== 'agent' ||
-      !isPathSafeId(target.resourceId)
-    )
+    if (state?.storage !== 'd1' || !target)
       throw new RemoteStepRefusal(
         503,
         'remote step run identity is unreadable',
       );
     if (
-      target.id !== address.agentId ||
-      target.threadId !== address.threadId ||
       (principal !== undefined &&
         (state.provenance.startIdentity?.owner.kind !== principal.kind ||
           state.provenance.startIdentity.owner.id !== principal.id)) ||
       state.execution.tablePrefix !== address.tablePrefix ||
       state.execution.workflowId !== address.workflowId ||
-      state.execution.runId !== address.runId ||
+      state.execution.runId !== address.runId
+    )
+      throw new RemoteStepRefusal(409, 'remote step run identity changed');
+    if ('targetKind' in address) {
+      if (
+        target.kind !== 'workflow' ||
+        target.id !== address.workflowId ||
+        state.provenance.agentStart !== undefined
+      )
+        throw new RemoteStepRefusal(409, 'remote step run identity changed');
+    } else if (target.kind !== 'agent' || !isPathSafeId(target.resourceId)) {
+      throw new RemoteStepRefusal(
+        503,
+        'remote step run identity is unreadable',
+      );
+    } else if (
+      target.id !== address.agentId ||
+      target.threadId !== address.threadId ||
       address.resourceId !== target.resourceId
     )
       throw new RemoteStepRefusal(409, 'remote step run identity changed');
     return state;
   }
 
-  async #admission(invocation: RemoteStepInvocation, priorBindings: number) {
+  async #admission(
+    invocation: RemoteStepInvocation | WorkflowRemoteStepInvocation,
+    priorBindings: number,
+  ) {
     const observed = await this.#fence.readForAdmission();
     const proof = (await this.#execution(invocation, invocation.principal))
       .execution;
@@ -948,8 +1461,13 @@ export class RemoteStepJournal {
     invocationId: string,
     lifetimeMs: number,
   ): Promise<RemoteStepPermit> {
-    const invocation = await this.get(invocationId);
+    const invocation = await this.#getAny(invocationId);
     if (!invocation) throw new RemoteStepRefusal(404, 'invocation not found');
+    if ('targetKind' in invocation && !this.#verifyWorkflowCompletion)
+      throw new RemoteStepRefusal(
+        503,
+        'workflow remote step completion is unavailable',
+      );
     if (!positiveTime(lifetimeMs))
       throw new RemoteStepRefusal(400, 'permit lifetime is malformed');
     const now = this.#now();
@@ -963,10 +1481,12 @@ export class RemoteStepJournal {
       suspension.resumeCount !== invocation.resumeCount ||
       suspension.requestJson !== JSON.stringify(invocation.request) ||
       JSON.stringify(suspension.stepPath) !==
-        JSON.stringify(invocation.stepPath)
+        JSON.stringify(invocation.stepPath) ||
+      ('targetKind' in invocation &&
+        (await sha256Hex(suspension.requestJson)) !== invocation.requestDigest)
     )
       throw new RemoteStepRefusal(409, 'remote step suspension changed');
-    const gate = await this.#admission(invocation, 10);
+    const gate = await this.#admission(invocation, 13);
     if (
       invocation.status === 'dispatched' &&
       invocation.permitConsumedAt === undefined &&
@@ -996,10 +1516,12 @@ export class RemoteStepJournal {
         status = 'dispatched', permit_generation = permit_generation + 1,
         permit_epoch = ?, permit_revision = ?,
         permit_expires_at = MIN(?, deadline_at), permit_consumed_at = NULL,
-        permit_digest = NULL
+        permit_digest = NULL, write_revision = write_revision + 1
         WHERE invocation_id = ? AND permit_generation = ? AND deadline_at > ?
           AND status IN ('pending', 'dispatched')
           AND permit_consumed_at IS NULL AND request_json = ?
+          AND target_kind = ? AND suspension_marker = ?
+          AND request_digest IS ?
           AND EXISTS (SELECT 1 FROM "${address.tablePrefix}mastra_workflow_snapshot"
             WHERE workflow_name = ? AND run_id = ? AND snapshot = ?
               AND ${SNAPSHOT_EXECUTION_OPEN_SQL})
@@ -1012,6 +1534,11 @@ export class RemoteStepJournal {
         invocation.permitGeneration,
         now,
         suspension.requestJson,
+        'targetKind' in invocation ? 'workflow' : 'agent',
+        'targetKind' in invocation
+          ? WORKFLOW_REMOTE_STEP_MARKER
+          : REMOTE_STEP_MARKER,
+        'targetKind' in invocation ? invocation.requestDigest : null,
         invocation.workflowId,
         invocation.runId,
         snapshot,
@@ -1034,8 +1561,13 @@ export class RemoteStepJournal {
   ): Promise<
     { kind: 'accepted'; rawPermit: string } | { kind: 'already-consumed' }
   > {
-    const invocation = await this.get(permit.invocationId);
+    const invocation = await this.#getAny(permit.invocationId);
     if (!invocation) throw new RemoteStepRefusal(404, 'invocation not found');
+    if ('targetKind' in invocation && !this.#verifyWorkflowCompletion)
+      throw new RemoteStepRefusal(
+        503,
+        'workflow remote step completion is unavailable',
+      );
     if (
       invocation.permitGeneration !== permit.generation ||
       invocation.permitEpoch !== permit.mutationEpoch ||
@@ -1052,20 +1584,24 @@ export class RemoteStepJournal {
       suspension.resumeCount !== invocation.resumeCount ||
       suspension.requestJson !== JSON.stringify(invocation.request) ||
       JSON.stringify(suspension.stepPath) !==
-        JSON.stringify(invocation.stepPath)
+        JSON.stringify(invocation.stepPath) ||
+      ('targetKind' in invocation &&
+        (await sha256Hex(suspension.requestJson)) !== invocation.requestDigest)
     )
       throw new RemoteStepRefusal(409, 'remote step suspension changed');
     const rawPermit = rawDispatchPermit();
     const permitDigest = await sha256Hex(rawPermit);
-    const gate = await this.#admission(invocation, 13);
+    const gate = await this.#admission(invocation, 16);
     const result = await this.#db
       .prepare(`UPDATE ${REMOTE_STEP_TABLE}
-        SET permit_consumed_at = ?, permit_digest = ?
+        SET permit_consumed_at = ?, permit_digest = ?, write_revision = write_revision + 1
         WHERE invocation_id = ? AND permit_generation = ?
           AND permit_epoch = ? AND permit_revision = ?
           AND permit_expires_at = ? AND permit_expires_at > ?
           AND deadline_at > ? AND permit_consumed_at IS NULL
           AND status = 'dispatched' AND request_json = ?
+          AND target_kind = ? AND suspension_marker = ?
+          AND request_digest IS ?
           AND EXISTS (SELECT 1 FROM "${invocation.tablePrefix}mastra_workflow_snapshot"
             WHERE workflow_name = ? AND run_id = ? AND snapshot = ?
               AND ${SNAPSHOT_EXECUTION_OPEN_SQL})
@@ -1081,6 +1617,11 @@ export class RemoteStepJournal {
         now,
         now,
         suspension.requestJson,
+        'targetKind' in invocation ? 'workflow' : 'agent',
+        'targetKind' in invocation
+          ? WORKFLOW_REMOTE_STEP_MARKER
+          : REMOTE_STEP_MARKER,
+        'targetKind' in invocation ? invocation.requestDigest : null,
         invocation.workflowId,
         invocation.runId,
         snapshot,
@@ -1088,7 +1629,7 @@ export class RemoteStepJournal {
       )
       .all();
     if (rowResult(result)) return { kind: 'accepted', rawPermit };
-    const after = await this.get(permit.invocationId);
+    const after = await this.#getAny(permit.invocationId);
     if (
       after?.permitGeneration === permit.generation &&
       after.permitConsumedAt !== undefined
@@ -1120,7 +1661,7 @@ export class RemoteStepJournal {
         .all(),
     );
     if (!stored) throw new RemoteStepRefusal(404, 'invocation not found');
-    const invocation = decode(stored);
+    const invocation = decodeAny(stored);
     const permitDigest = stored.permit_digest;
     if (
       typeof permitDigest !== 'string' ||
@@ -1144,16 +1685,31 @@ export class RemoteStepJournal {
       return { kind: 'replay' as const, resultJson, resultDigest };
     };
     if (stored.result_json !== null) return replay(stored);
-    await this.#verifyCompletion({
-      invocation,
-      rawPermit,
-      resultJson,
-      evidenceJson,
-    });
+    if ('targetKind' in invocation) {
+      if (!this.#verifyWorkflowCompletion)
+        throw new RemoteStepRefusal(
+          503,
+          'workflow remote step completion is unavailable',
+        );
+      await this.#verifyWorkflowCompletion({
+        invocation,
+        rawPermit,
+        resultJson,
+        evidenceJson,
+      });
+    } else {
+      await this.#verifyCompletion({
+        invocation,
+        rawPermit,
+        resultJson,
+        evidenceJson,
+      });
+    }
     const result = await this.#db
       .prepare(`UPDATE ${REMOTE_STEP_TABLE}
         SET result_json = ?, result_digest = ?, quiescence_digest = ?,
-            executor_quiescent_at = ?, status = 'result-retained'
+            executor_quiescent_at = ?, status = 'result-retained',
+            write_revision = write_revision + 1
         WHERE invocation_id = ? AND permit_digest = ?
           AND permit_consumed_at IS NOT NULL AND result_json IS NULL
           AND status = 'dispatched'
@@ -1192,7 +1748,7 @@ export class RemoteStepJournal {
         .all(),
     );
     if (!row) return undefined;
-    decode(row);
+    decodeAny(row);
     const resultJson = row.result_json;
     const resultDigest = row.result_digest;
     const quiescenceDigest = row.quiescence_digest;
@@ -1246,7 +1802,8 @@ export class RemoteStepJournal {
     const owner = crypto.randomUUID();
     const result = await this.#db
       .prepare(`UPDATE ${REMOTE_STEP_TABLE}
-        SET status = 'resuming', resume_lease_owner = ?, resume_lease_expires_at = ?
+        SET status = 'resuming', resume_lease_owner = ?, resume_lease_expires_at = ?,
+            write_revision = write_revision + 1
         WHERE invocation_id = ? AND deployment_id = ? AND table_prefix = ?
           AND workflow_id = ? AND agent_id = ? AND thread_id = ?
           AND resource_id = ? AND run_id = ? AND start_token = ?
@@ -1361,7 +1918,7 @@ export class RemoteStepJournal {
     const result = await this.#db
       .prepare(`UPDATE ${REMOTE_STEP_TABLE}
         SET status = ?, resume_lease_owner = NULL, resume_lease_expires_at = NULL,
-            settled_at = ?, settlement_outcome = ?
+            settled_at = ?, settlement_outcome = ?, write_revision = write_revision + 1
         WHERE invocation_id = ? AND status = 'resuming'
           AND resume_lease_owner = ? AND permit_generation = ?
           AND permit_epoch IS ? AND start_token = ?
@@ -1415,6 +1972,7 @@ export class RemoteStepJournal {
         .prepare(`SELECT invocation_id, status, resume_lease_expires_at
         FROM ${REMOTE_STEP_TABLE} INDEXED BY ${REMOTE_STEP_RECOVERY_INDEX}
         WHERE invocation_id > ?
+          AND target_kind = 'agent'
           AND status IN ('result-retained', 'resuming')
         ORDER BY invocation_id LIMIT ?`)
         .bind(afterInvocationId, limit)

@@ -155,6 +155,7 @@ import {
   REMOTE_STEP_MARKER,
   RemoteStepJournal,
   type RemoteStepPermit,
+  WORKFLOW_REMOTE_STEP_MARKER,
 } from '../src/do-runner/remote-step-journal.js';
 import {
   createObjectiveRouter,
@@ -3091,9 +3092,11 @@ async function handleRemoteStepProbe(
   if (env.SPIKE_REMOTE_STEP_PROOF !== 'enabled')
     return json({ error: 'not found' }, 404);
   const operation = path.slice('/spike/remote-step/'.length);
+  const workflow = operation.startsWith('workflow-');
+  const action = workflow ? operation.slice('workflow-'.length) : operation;
+  const runId = workflow ? 'spike-workflow-run' : 'spike-remote-run';
   if (
-    request.method !==
-    (operation === 'read' || operation === 'scan' ? 'GET' : 'POST')
+    request.method !== (action === 'read' || action === 'scan' ? 'GET' : 'POST')
   )
     return json({ error: 'method not allowed' }, 405);
   try {
@@ -3103,7 +3106,7 @@ async function handleRemoteStepProbe(
     const snapshot = await env.DB.prepare(
       'SELECT snapshot FROM spike_remote_mastra_workflow_snapshot WHERE workflow_name = ? AND run_id = ?',
     )
-      .bind('durable-agentic-loop', 'spike-remote-run')
+      .bind('durable-agentic-loop', runId)
       .first<{ snapshot: string }>();
     if (!fixture || !snapshot)
       throw new Error('remote-step fixture is unavailable');
@@ -3113,27 +3116,43 @@ async function handleRemoteStepProbe(
     const summary: RunSummary =
       persisted.status === 'success'
         ? {
-            runId: 'spike-remote-run',
+            runId,
             status: 'success',
             result: { answer: 1 },
           }
-        : {
-            runId: 'spike-remote-run',
-            status: 'suspended',
-            suspended: [['durable-agentic-execution']],
-            suspendedAt: { 'durable-agentic-execution': 1000 },
-            suspendPayload: {
-              'durable-agentic-execution': {
-                type: 'suspension',
-                toolName: 'remote_lookup',
-                toolCallId: 'call-1',
-                toolCallSuspended: {
-                  remoteStep: REMOTE_STEP_MARKER,
-                  request: { account: 'acme' },
+        : workflow
+          ? {
+              runId,
+              status: 'suspended',
+              suspended: [['execute']],
+              suspendedAt: { execute: 1000 },
+              suspendPayload: {
+                execute: {
+                  type: 'suspension',
+                  remoteStep: {
+                    marker: WORKFLOW_REMOTE_STEP_MARKER,
+                    request: { version: 2, input: { query: 'x' } },
+                  },
                 },
               },
-            },
-          };
+            }
+          : {
+              runId,
+              status: 'suspended',
+              suspended: [['durable-agentic-execution']],
+              suspendedAt: { 'durable-agentic-execution': 1000 },
+              suspendPayload: {
+                'durable-agentic-execution': {
+                  type: 'suspension',
+                  toolName: 'remote_lookup',
+                  toolCallId: 'call-1',
+                  toolCallSuspended: {
+                    remoteStep: REMOTE_STEP_MARKER,
+                    request: { account: 'acme' },
+                  },
+                },
+              },
+            };
     const runtime = {
       authoritativeStatus: async () => summary,
       authoritativeStartState: async () => ({
@@ -3142,18 +3161,20 @@ async function handleRemoteStepProbe(
         execution: {
           tablePrefix: 'spike_remote_',
           workflowId: 'durable-agentic-loop',
-          runId: 'spike-remote-run',
+          runId,
           startToken: 'spike-start-token',
         },
         provenance: {
           startIdentity: {
             owner: { kind: 'human', id: 'operator-1' },
-            target: {
-              kind: 'agent',
-              id: 'writer',
-              threadId: 'spike-remote-thread',
-              resourceId: fixture.resource_id,
-            },
+            target: workflow
+              ? { kind: 'workflow', id: 'durable-agentic-loop' }
+              : {
+                  kind: 'agent',
+                  id: 'writer',
+                  threadId: 'spike-remote-thread',
+                  resourceId: fixture.resource_id,
+                },
           },
         },
       }),
@@ -3169,6 +3190,7 @@ async function handleRemoteStepProbe(
       tablePrefix: 'spike_remote_',
       allowedToolIds: ['remote_lookup'],
       verifyCompletion: async () => undefined,
+      ...(workflow ? { verifyWorkflowCompletion: async () => undefined } : {}),
     });
     await journal.initialize();
     const body =
@@ -3179,22 +3201,34 @@ async function handleRemoteStepProbe(
       request.method === 'GET'
         ? (new URL(request.url).searchParams.get('invocationId') ?? '')
         : String(body.invocationId ?? '');
-    switch (operation) {
+    switch (action) {
       case 'register':
         return json(
-          await journal.register(
-            {
-              deploymentId: 'spike',
-              tablePrefix: 'spike_remote_',
-              workflowId: 'durable-agentic-loop',
-              agentId: 'writer',
-              threadId: 'spike-remote-thread',
-              resourceId: String(body.resourceId ?? ''),
-              runId: 'spike-remote-run',
-            },
-            Date.now() + 120_000,
-            { kind: 'human', id: 'operator-1', role: 'operator' },
-          ),
+          await (workflow
+            ? journal.registerWorkflow(
+                {
+                  targetKind: 'workflow',
+                  deploymentId: 'spike',
+                  tablePrefix: 'spike_remote_',
+                  workflowId: 'durable-agentic-loop',
+                  runId,
+                },
+                Date.now() + 120_000,
+                { kind: 'human', id: 'operator-1', role: 'operator' },
+              )
+            : journal.register(
+                {
+                  deploymentId: 'spike',
+                  tablePrefix: 'spike_remote_',
+                  workflowId: 'durable-agentic-loop',
+                  agentId: 'writer',
+                  threadId: 'spike-remote-thread',
+                  resourceId: String(body.resourceId ?? ''),
+                  runId,
+                },
+                Date.now() + 120_000,
+                { kind: 'human', id: 'operator-1', role: 'operator' },
+              )),
         );
       case 'issue':
         return json(await journal.issuePermit(invocationId, 60_000));
@@ -3213,7 +3247,9 @@ async function handleRemoteStepProbe(
         );
       case 'read':
         return json({
-          invocation: await journal.get(invocationId),
+          invocation: workflow
+            ? await journal.getWorkflow(invocationId)
+            : await journal.get(invocationId),
           result: await journal.readRetainedResult(invocationId),
         });
       case 'scan':

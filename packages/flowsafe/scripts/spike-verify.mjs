@@ -176,7 +176,8 @@ function startServer(generation, stateDir, logPath) {
       // with, so a valid webhook is ACCEPTED and a forged one REJECTED (E-S2).
       '--var',
       `GITHUB_WEBHOOK_SECRET:${GITHUB_WEBHOOK_SECRET}`,
-      ...(generation.startsWith('gen-remote-')
+      ...(generation.startsWith('gen-remote-') ||
+      generation.startsWith('gen-workflow-remote-')
         ? ['--var', 'SPIKE_REMOTE_STEP_PROOF:enabled']
         : []),
     ],
@@ -3584,6 +3585,108 @@ async function main() {
         drain.class === 'work' && drain.keys.includes(invocationId),
         'the unresolved result remains in operator drain inventory',
         drain,
+      );
+    },
+  );
+
+  await step(
+    'RS2 workflow-target journal: D1 permit and retained result survive process death without resume',
+    async () => {
+      await killServer(currentServer);
+      await executeLocalD1(
+        stateDir,
+        "INSERT INTO spike_remote_mastra_workflow_snapshot VALUES ('durable-agentic-loop', 'spike-workflow-run', '{\"status\":\"suspended\"}');",
+      );
+      await launchServer(
+        'gen-workflow-remote-1',
+        stateDir,
+        join(tmpDir, 'gen-workflow-remote-1.log'),
+      );
+      const registered = await http(
+        'POST',
+        '/spike/remote-step/workflow-register',
+        {
+          body: {},
+        },
+      );
+      assert(
+        registered.status === 200 &&
+          registered.body.targetKind === 'workflow' &&
+          typeof registered.body.invocationId === 'string',
+        'trusted workflow provenance registered a workflow row',
+        registered,
+      );
+      const invocationId = registered.body.invocationId;
+      const issued = await http('POST', '/spike/remote-step/workflow-issue', {
+        body: { invocationId },
+      });
+      assert(
+        issued.status === 200 && issued.body.generation === 1,
+        'workflow dispatch permit was issued',
+        issued,
+      );
+      const attempts = await Promise.all(
+        [0, 1].map(() =>
+          http('POST', '/spike/remote-step/workflow-consume', {
+            body: { permit: issued.body },
+          }),
+        ),
+      );
+      assert(
+        attempts.filter((attempt) => attempt.body.kind === 'accepted')
+          .length === 1 &&
+          attempts.filter((attempt) => attempt.body.kind === 'already-consumed')
+            .length === 1,
+        'workflow permit consumption has one winner',
+        attempts,
+      );
+      const rawPermit = attempts.find(
+        (attempt) => attempt.body.kind === 'accepted',
+      ).body.rawPermit;
+      const recorded = await http(
+        'POST',
+        '/spike/remote-step/workflow-record',
+        {
+          body: { invocationId, rawPermit },
+        },
+      );
+      assert(
+        recorded.status === 200 && recorded.body.kind === 'recorded',
+        'workflow result was retained',
+        recorded,
+      );
+      await killServer(currentServer);
+      await launchServer(
+        'gen-workflow-remote-2',
+        stateDir,
+        join(tmpDir, 'gen-workflow-remote-2.log'),
+      );
+      const retained = await http(
+        'GET',
+        `/spike/remote-step/workflow-read?invocationId=${invocationId}`,
+      );
+      assert(
+        retained.status === 200 &&
+          retained.body.invocation.status === 'result-retained' &&
+          retained.body.result.resultJson === '{"answer":1}',
+        'fresh workerd process reads the workflow result',
+        retained,
+      );
+      const replay = await http('POST', '/spike/remote-step/workflow-consume', {
+        body: { permit: issued.body },
+      });
+      assert(
+        replay.status === 200 && replay.body.kind === 'already-consumed',
+        'fresh process does not grant workflow effect authority twice',
+        replay,
+      );
+      const claim = await http('POST', '/spike/remote-step/workflow-claim', {
+        body: { invocationId },
+      });
+      assert(
+        claim.status === 404,
+        'workflow continuation remains unavailable',
+        claim,
       );
     },
   );

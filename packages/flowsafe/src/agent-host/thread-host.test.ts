@@ -7925,9 +7925,9 @@ it('resumes a retained mapped-resource result from D1 after the agent host is re
   expect(leaseBefore.results).toMatchObject([
     { resume_lease_owner: expect.any(String) },
   ]);
-  fixture.binding
+  await fixture.binding
     .prepare(
-      'UPDATE flowsafe_remote_step_invocations SET resume_lease_expires_at = ? WHERE invocation_id = ?',
+      'UPDATE flowsafe_remote_step_invocations SET resume_lease_expires_at = ?, write_revision = write_revision + 1 WHERE invocation_id = ?',
     )
     .bind(Date.now() - 1, invocation.invocationId)
     .run();

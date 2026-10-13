@@ -17,6 +17,7 @@ import {
   REMOTE_STEP_MARKER,
   REMOTE_STEP_TABLE,
   RemoteStepJournal,
+  WORKFLOW_REMOTE_STEP_MARKER,
 } from './remote-step-journal.js';
 import type { RunnerRuntime, RunSummary } from './runtime.js';
 
@@ -179,6 +180,105 @@ describe('remote step journal dispatch admission', () => {
           .run(JSON.stringify({ status: 'suspended', request: { account } }));
       },
     };
+  }
+
+  function restoreV3Schema(h: Awaited<ReturnType<typeof fixture>>) {
+    const columns = (
+      h.sqlite
+        .prepare(`PRAGMA table_xinfo(${REMOTE_STEP_TABLE})`)
+        .all() as Array<{ name: string }>
+    )
+      .slice(0, -4)
+      .map(({ name }) => name)
+      .join(', ');
+    h.sqlite.exec(`CREATE TABLE ${REMOTE_STEP_TABLE}_v3 (
+      invocation_id TEXT PRIMARY KEY, principal_json TEXT NOT NULL,
+      start_token TEXT NOT NULL, deployment_id TEXT NOT NULL,
+      table_prefix TEXT NOT NULL, workflow_id TEXT NOT NULL,
+      agent_id TEXT NOT NULL, thread_id TEXT NOT NULL,
+      resource_id TEXT NOT NULL, run_id TEXT NOT NULL,
+      step_path TEXT NOT NULL, suspended_at INTEGER NOT NULL,
+      resume_count INTEGER NOT NULL, request_json TEXT NOT NULL,
+      deadline_at INTEGER NOT NULL, status TEXT NOT NULL,
+      permit_generation INTEGER NOT NULL DEFAULT 0, permit_epoch INTEGER,
+      permit_revision INTEGER, permit_expires_at INTEGER,
+      permit_consumed_at INTEGER, permit_digest TEXT, result_json TEXT,
+      result_digest TEXT, quiescence_digest TEXT, executor_quiescent_at INTEGER,
+      resume_lease_owner TEXT, resume_lease_expires_at INTEGER,
+      settled_at INTEGER, settlement_outcome TEXT,
+      UNIQUE (deployment_id, table_prefix, workflow_id, agent_id,
+        thread_id, resource_id, run_id, step_path, suspended_at, resume_count)
+    )`);
+    h.sqlite.exec(
+      `INSERT INTO ${REMOTE_STEP_TABLE}_v3 (${columns}) SELECT ${columns} FROM ${REMOTE_STEP_TABLE}`,
+    );
+    h.sqlite.exec(`DROP TABLE ${REMOTE_STEP_TABLE}`);
+    h.sqlite.exec(
+      `ALTER TABLE ${REMOTE_STEP_TABLE}_v3 RENAME TO ${REMOTE_STEP_TABLE}`,
+    );
+    h.sqlite.exec(
+      `CREATE INDEX flowsafe_remote_step_recovery ON ${REMOTE_STEP_TABLE} (invocation_id) WHERE status IN ('result-retained', 'resuming')`,
+    );
+    h.sqlite.exec('UPDATE flowsafe_remote_step_schema SET version = 3');
+  }
+
+  async function workflowFixture() {
+    const h = await fixture();
+    const original = h.runtime.authoritativeStartState.bind(h.runtime);
+    h.runtime.authoritativeStartState = (async (
+      workflowId: string,
+      runId: string,
+    ) => {
+      const state = await original(workflowId, runId);
+      if (!state) return state;
+      return {
+        ...state,
+        provenance: {
+          startIdentity: {
+            owner: { kind: PRINCIPAL.kind, id: PRINCIPAL.id },
+            target: { kind: 'workflow', id: ADDRESS.workflowId },
+          },
+        },
+      } as typeof state;
+    }) as typeof h.runtime.authoritativeStartState;
+    const request = { version: 2, input: { query: 'x' } };
+    const summary = (value: unknown): RunSummary => ({
+      runId: ADDRESS.runId,
+      status: 'suspended',
+      suspended: [['execute']],
+      suspendedAt: { execute: 500 },
+      suspendPayload: {
+        execute: {
+          type: 'suspension',
+          remoteStep: {
+            marker: WORKFLOW_REMOTE_STEP_MARKER,
+            request: value,
+          },
+        },
+      },
+    });
+    h.setSummary(summary(request));
+    const verifyWorkflowCompletion = vi.fn(async () => undefined);
+    const journal = () =>
+      new RemoteStepJournal({
+        db: h.db,
+        fence: h.fence,
+        runtime: h.runtime,
+        deploymentId: ADDRESS.deploymentId,
+        tablePrefix: ADDRESS.tablePrefix,
+        allowedToolIds: ['remote_lookup'],
+        verifyCompletion: h.verifyCompletion,
+        verifyWorkflowCompletion,
+        now: () => 1_000,
+      });
+    const address = {
+      targetKind: 'workflow',
+      deploymentId: ADDRESS.deploymentId,
+      tablePrefix: ADDRESS.tablePrefix,
+      workflowId: ADDRESS.workflowId,
+      runId: ADDRESS.runId,
+    } as const;
+    return { ...h, address, journal, summary, verifyWorkflowCompletion };
   }
 
   it('converges repeated observation on one invocation without a permit', async () => {
@@ -474,6 +574,7 @@ describe('remote step journal dispatch admission', () => {
   it('upgrades a prior journal while preserving an existing invocation', async () => {
     const h = await fixture();
     const invocation = await h.journal.register(ADDRESS, 10_000, PRINCIPAL);
+    restoreV3Schema(h);
     h.sqlite.exec('DROP INDEX flowsafe_remote_step_recovery');
     for (const column of [
       'settlement_outcome',
@@ -514,6 +615,7 @@ describe('remote step journal dispatch admission', () => {
       '{"value":"kept"}',
       '{"receipt":"verified"}',
     );
+    restoreV3Schema(h);
     h.sqlite.exec('DROP INDEX flowsafe_remote_step_recovery');
     for (const column of [
       'settlement_outcome',
@@ -533,16 +635,37 @@ describe('remote step journal dispatch admission', () => {
     });
     expect(
       h.sqlite.prepare('SELECT version FROM flowsafe_remote_step_schema').get(),
-    ).toEqual({ version: 3 });
+    ).toEqual({ version: 4 });
     expect(await h.reopen().recoverableResults(1)).toEqual({
       invocationIds: [invocation.invocationId],
       nextCursor: invocation.invocationId,
     });
   });
 
+  it('preserves a live v3 resume lease while upgrading the journal', async () => {
+    const h = await fixture();
+    const { invocation } = await h.retainResult();
+    const owner = await h.journal.claimResume(invocation.invocationId, 1_000);
+    restoreV3Schema(h);
+    const reopened = h.reopen();
+    await reopened.initialize();
+    expect(await reopened.get(invocation.invocationId)).toMatchObject({
+      status: 'resuming',
+      resumeLeaseExpiresAt: 2_000,
+    });
+    expect(
+      await reopened.readRetainedResult(invocation.invocationId),
+    ).toMatchObject({
+      resultJson: '{"value":"done"}',
+    });
+    expect(
+      await reopened.settleAfterResume(invocation.invocationId, owner),
+    ).toBe('retry');
+  });
+
   it('refuses an unknown journal schema version before dispatch', async () => {
     const h = await fixture();
-    h.sqlite.exec('UPDATE flowsafe_remote_step_schema SET version = 4');
+    h.sqlite.exec('UPDATE flowsafe_remote_step_schema SET version = 99');
 
     await expect(h.reopen().initialize()).rejects.toMatchObject({
       status: 503,
@@ -565,6 +688,7 @@ describe('remote step journal dispatch admission', () => {
 
   it('refuses an unversioned journal without its suspension uniqueness constraint', async () => {
     const h = await fixture();
+    restoreV3Schema(h);
     const ddl = (
       h.sqlite
         .prepare(
@@ -604,9 +728,32 @@ describe('remote step journal dispatch admission', () => {
     });
   });
 
+  it('refuses an unversioned workflow journal with a changed target constraint', async () => {
+    const h = await fixture();
+    const ddl = (
+      h.sqlite
+        .prepare(
+          `SELECT sql FROM sqlite_schema WHERE name = '${REMOTE_STEP_TABLE}'`,
+        )
+        .get() as { sql: string }
+    ).sql;
+    h.sqlite.exec(`DROP TABLE ${REMOTE_STEP_TABLE}`);
+    h.sqlite.exec('DROP TABLE flowsafe_remote_step_schema');
+    h.sqlite.exec(
+      ddl.replace(
+        "CHECK ((target_kind = 'agent' AND agent_id IS NOT NULL",
+        "CHECK ((target_kind = 'agent' AND agent_id IS NULL",
+      ),
+    );
+    await expect(h.reopen().initialize()).rejects.toMatchObject({
+      status: 503,
+    });
+  });
+
   it('converges when another initializer wins the same journal upgrade', async () => {
     const h = await fixture();
     const invocation = await h.journal.register(ADDRESS, 10_000, PRINCIPAL);
+    restoreV3Schema(h);
     h.sqlite.exec('DROP INDEX flowsafe_remote_step_recovery');
     for (const column of [
       'settlement_outcome',
@@ -861,7 +1008,9 @@ describe('remote step journal dispatch admission', () => {
       await h.journal.readRetainedResult(invocation.invocationId),
     ).toBeUndefined();
     h.sqlite
-      .prepare(`UPDATE ${REMOTE_STEP_TABLE} SET result_digest = NULL`)
+      .prepare(
+        `UPDATE ${REMOTE_STEP_TABLE} SET result_digest = NULL, write_revision = write_revision + 1`,
+      )
       .run();
     expect(
       (await new DeploymentInventory(h.db).read('remote-steps')).count,
@@ -1188,7 +1337,9 @@ describe('remote step journal dispatch admission', () => {
     const h = await fixture();
     const invocation = await h.journal.register(ADDRESS, 10_000, PRINCIPAL);
     h.sqlite
-      .prepare(`UPDATE ${REMOTE_STEP_TABLE} SET table_prefix = ?`)
+      .prepare(
+        `UPDATE ${REMOTE_STEP_TABLE} SET table_prefix = ?, write_revision = write_revision + 1`,
+      )
       .run('bad"_prefix');
     await expect(
       h.journal.issuePermit(invocation.invocationId, 1_000),
@@ -1270,6 +1421,170 @@ describe('remote step journal dispatch admission', () => {
       h.journal.issuePermit(invocation.invocationId, 1_000),
     ).rejects.toMatchObject({
       status: 409,
+    });
+  });
+
+  it('retains a workflow result across journal reopen and rejects permit replay', async () => {
+    const h = await workflowFixture();
+    const journal = h.journal();
+    const first = await journal.registerWorkflow(h.address, 10_000, PRINCIPAL);
+    const replay = await journal.registerWorkflow(h.address, 10_000, PRINCIPAL);
+    expect(replay.invocationId).toBe(first.invocationId);
+    expect(first.requestDigest).toBe(
+      'f908a6c18fa0b52b0f1295fc8f1cb5db083020cb18dab24ebf26637f55a9af49',
+    );
+    expect(await journal.get(first.invocationId)).toBeUndefined();
+    expect(await journal.getWorkflow(first.invocationId)).toMatchObject({
+      targetKind: 'workflow',
+      status: 'pending',
+      stepPath: ['execute'],
+    });
+    await expect(
+      h.reopen().issuePermit(first.invocationId, 1_000),
+    ).rejects.toMatchObject({
+      status: 503,
+    });
+    const permit = await journal.issuePermit(first.invocationId, 1_000);
+    const winner = await journal.consumePermit(permit);
+    if (winner.kind !== 'accepted') throw new Error('permit was not won');
+    expect(await h.journal().consumePermit(permit)).toEqual({
+      kind: 'already-consumed',
+    });
+    await expect(
+      journal.recordResult(
+        first.invocationId,
+        'A'.repeat(43),
+        '{"value":"done"}',
+        '{"receipt":"verified"}',
+      ),
+    ).rejects.toMatchObject({ status: 403 });
+    expect(h.verifyWorkflowCompletion).not.toHaveBeenCalled();
+    expect(
+      await journal.recordResult(
+        first.invocationId,
+        winner.rawPermit,
+        '{"value":"done"}',
+        '{"receipt":"verified"}',
+      ),
+    ).toMatchObject({ kind: 'recorded' });
+    expect(h.verifyWorkflowCompletion).toHaveBeenCalledExactlyOnceWith({
+      invocation: expect.objectContaining({
+        invocationId: first.invocationId,
+        targetKind: 'workflow',
+        requestDigest: first.requestDigest,
+        status: 'dispatched',
+      }),
+      rawPermit: winner.rawPermit,
+      resultJson: '{"value":"done"}',
+      evidenceJson: '{"receipt":"verified"}',
+    });
+    const reopened = h.journal();
+    await reopened.initialize();
+    expect(await reopened.readRetainedResult(first.invocationId)).toMatchObject(
+      {
+        resultJson: '{"value":"done"}',
+      },
+    );
+    expect(await reopened.recoverableResults(10)).toEqual({
+      invocationIds: [],
+    });
+    expect(
+      (await new DeploymentInventory(h.db).read('remote-steps')).entries,
+    ).toEqual([expect.objectContaining({ key: [first.invocationId] })]);
+    expect(
+      await reopened.recordResult(
+        first.invocationId,
+        winner.rawPermit,
+        '{"value":"done"}',
+        '{"receipt":"verified"}',
+      ),
+    ).toMatchObject({ kind: 'replay' });
+    await expect(
+      reopened.recordResult(
+        first.invocationId,
+        winner.rawPermit,
+        '{"value":"changed"}',
+        '{"receipt":"verified"}',
+      ),
+    ).rejects.toMatchObject({ status: 409 });
+    expect(h.verifyWorkflowCompletion).toHaveBeenCalledTimes(1);
+    await expect(
+      reopened.claimResume(first.invocationId, 1_000),
+    ).rejects.toMatchObject({
+      status: 404,
+    });
+  });
+
+  it('refuses workflow dispatch when trusted provenance or suspension changes', async () => {
+    const h = await workflowFixture();
+    const journal = h.journal();
+    await expect(
+      journal.registerWorkflow(h.address, 10_000, {
+        ...PRINCIPAL,
+        id: 'another-operator',
+      }),
+    ).rejects.toMatchObject({ status: 409 });
+    const first = await journal.registerWorkflow(h.address, 10_000, PRINCIPAL);
+    h.setSummary(h.summary({ version: 2, input: { query: 'changed' } }));
+    await expect(
+      journal.issuePermit(first.invocationId, 1_000),
+    ).rejects.toMatchObject({
+      status: 409,
+    });
+    h.setSummary(h.summary({ version: 2, input: { query: 'x' } }));
+    const permit = await journal.issuePermit(first.invocationId, 1_000);
+    const before = await h.fence.read();
+    await h.fence.transition({
+      expected: 'open',
+      next: 'migration-locked',
+      expectedMutationEpoch: before.mutationEpoch,
+      expectedRevision: before.transitionRevision,
+      advanceMutationEpoch: true,
+    });
+    await expect(journal.consumePermit(permit)).rejects.toMatchObject({
+      status: 503,
+    });
+  });
+
+  it('rejects stale v3-style journal writes after v4 migration', async () => {
+    const h = await fixture();
+    const invocation = await h.journal.register(ADDRESS, 10_000, PRINCIPAL);
+    restoreV3Schema(h);
+    await h.reopen().initialize();
+    expect(() =>
+      h.sqlite
+        .prepare(
+          `UPDATE ${REMOTE_STEP_TABLE} SET deadline_at = ? WHERE invocation_id = ?`,
+        )
+        .run(9_000, invocation.invocationId),
+    ).toThrow('remote step writer version changed');
+    expect(() =>
+      h.sqlite
+        .prepare(`INSERT INTO ${REMOTE_STEP_TABLE} (
+        invocation_id, principal_json, start_token, deployment_id,
+        table_prefix, workflow_id, agent_id, thread_id, resource_id, run_id,
+        step_path, suspended_at, resume_count, request_json, deadline_at, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`)
+        .run(
+          'old-writer',
+          JSON.stringify(PRINCIPAL),
+          'start-token',
+          ADDRESS.deploymentId,
+          ADDRESS.tablePrefix,
+          ADDRESS.workflowId,
+          ADDRESS.agentId,
+          ADDRESS.threadId,
+          ADDRESS.resourceId,
+          ADDRESS.runId,
+          '["execute"]',
+          500,
+          -1,
+          '{}',
+          10_000,
+        ),
+    ).toThrow();
+    expect(await h.reopen().get(invocation.invocationId)).toMatchObject({
+      deadlineAt: 10_000,
     });
   });
 
