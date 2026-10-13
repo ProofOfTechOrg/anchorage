@@ -338,6 +338,14 @@ export const FLOWSAFE_TABLES: readonly FlowsafeTableEntry[] = [
     },
   },
   {
+    table: 'flowsafe_notification_operation_receipts',
+    purpose: 'immutable receipts for host-owned inbox notification effects',
+    accounting: {
+      excluded:
+        'a receipt records an effect already committed with its inbox row; replay must retain it after the inbox row is settled or removed, so it is historical evidence rather than active work',
+    },
+  },
+  {
     table: RESOURCE_OWNER_TABLE,
     purpose:
       'the resource-ownership registry — who holds a run, thread, resource, or schedule',

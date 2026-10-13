@@ -38,6 +38,150 @@ function sharedStores(): [D1NotificationsStorage, D1NotificationsStorage] {
   ];
 }
 
+describe('host-owned notification operation receipt', () => {
+  it('returns the first durable receipt after a lost acknowledgement without overwriting the inbox', async () => {
+    const db = database();
+    const atomicBatch = db.batch?.bind(db);
+    if (!atomicBatch) throw new Error('D1 batch is unavailable');
+    let loseAcknowledgement = false;
+    const first = new D1NotificationsStorage({
+      prepare: db.prepare.bind(db),
+      async batch(statements) {
+        const results = await atomicBatch(statements);
+        if (loseAcknowledgement) {
+          loseAcknowledgement = false;
+          throw new Error('lost acknowledgement');
+        }
+        return results;
+      },
+    });
+    const retry = new D1NotificationsStorage(db);
+    const input = {
+      id: 'remote-step-notification',
+      threadId: 'thread',
+      source: 'remote-step',
+      kind: 'result',
+      summary: 'Remote work completed',
+      payload: { value: 'private-receipt-canary' },
+      createdAt: new Date('2026-10-13T00:00:00.000Z'),
+    };
+    await first.init();
+    loseAcknowledgement = true;
+    const receipt = await first.createNotificationOnce(
+      'remote-invocation',
+      input,
+    );
+    expect(receipt).toEqual({
+      operationKey: 'remote-invocation',
+      notificationId: input.id,
+      threadId: input.threadId,
+    });
+    const retained = await db
+      .prepare('SELECT * FROM flowsafe_notification_operation_receipts')
+      .first<Record<string, unknown>>();
+    expect(retained?.request_digest).toMatch(/^[a-f0-9]{64}$/);
+    expect(JSON.stringify(retained)).not.toContain(input.summary);
+    expect(JSON.stringify(retained)).not.toContain('private-receipt-canary');
+    const delivered = await retry.getNotification({
+      threadId: input.threadId,
+      id: input.id,
+    });
+    expect(delivered?.summary).toBe(input.summary);
+    expect(
+      await retry.createNotificationOnce('remote-invocation', input),
+    ).toEqual(receipt);
+    await expect(
+      retry.createNotificationOnce('remote-invocation', {
+        ...input,
+        summary: 'Different result',
+      }),
+    ).rejects.toThrow('different request');
+    expect(
+      (await retry.listNotifications({ threadId: input.threadId })).length,
+    ).toBe(1);
+  });
+
+  it('commits one effect under concurrent retry and rejects inbox identity collisions', async () => {
+    const db = database();
+    const left = new D1NotificationsStorage(db);
+    const right = new D1NotificationsStorage(db);
+    const input = {
+      id: 'notification-1',
+      threadId: 'thread',
+      source: 'remote-step',
+      kind: 'result',
+      summary: 'Completed',
+      createdAt: new Date('2026-10-13T00:00:00.000Z'),
+    };
+    const [first, second] = await Promise.all([
+      left.createNotificationOnce('operation-1', input),
+      right.createNotificationOnce('operation-1', input),
+    ]);
+    expect(first).toEqual(second);
+    expect((await left.listNotifications({ threadId: 'thread' })).length).toBe(
+      1,
+    );
+    await expect(
+      right.createNotificationOnce('operation-2', input),
+    ).rejects.toThrow();
+    const receipts = await db
+      .prepare(
+        'SELECT operation_key FROM flowsafe_notification_operation_receipts ORDER BY operation_key',
+      )
+      .all<{ operation_key: string }>();
+    expect(receipts.results).toEqual([{ operation_key: 'operation-1' }]);
+    await left.createNotification({ ...input, id: 'ordinary-notification' });
+    await expect(
+      right.createNotificationOnce('operation-3', {
+        ...input,
+        id: 'ordinary-notification',
+        summary: 'Overwrite attempt',
+      }),
+    ).rejects.toThrow('not committed');
+    expect(
+      (
+        await left.getNotification({
+          threadId: 'thread',
+          id: 'ordinary-notification',
+        })
+      )?.summary,
+    ).toBe('Completed');
+  });
+
+  it('rolls back a receipt when the inbox insert fails after reservation', async () => {
+    const db = database();
+    const notifications = new D1NotificationsStorage(db);
+    await notifications.init();
+    await db
+      .prepare(`CREATE TRIGGER fail_notification_effect
+        BEFORE INSERT ON mastra_notifications
+        WHEN NEW.id = 'blocked-notification'
+        BEGIN SELECT RAISE(ABORT, 'blocked inbox insert'); END`)
+      .run();
+    await expect(
+      notifications.createNotificationOnce('blocked-operation', {
+        id: 'blocked-notification',
+        threadId: 'thread',
+        source: 'remote-step',
+        kind: 'result',
+        summary: 'This effect does not commit',
+        createdAt: new Date('2026-10-13T00:00:00.000Z'),
+      }),
+    ).rejects.toThrow('blocked inbox insert');
+    const receipt = await db
+      .prepare(`SELECT operation_key FROM flowsafe_notification_operation_receipts
+        WHERE operation_key = 'blocked-operation'`)
+      .first();
+    expect(receipt).toBeNull();
+    expect(
+      await notifications.getNotification({
+        threadId: 'thread',
+        id: 'blocked-notification',
+      }),
+    ).toBeNull();
+  });
+});
+
 function interceptFirst(
   db: SignalDatabase,
   intercept: (query: string, read: () => Promise<unknown>) => Promise<unknown>,

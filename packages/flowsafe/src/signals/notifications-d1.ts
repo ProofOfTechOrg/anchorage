@@ -29,6 +29,7 @@ import {
   notificationTimestampMillis,
   notificationTimestampSql,
 } from '../do-runner/notification-predicate.js';
+import { isPathSafeId } from '../do-runner/path-safe-id.js';
 import { validateTablePrefix } from '../do-runner/table-prefix.js';
 import { nonnegativeSafeInteger } from '../numeric-config.js';
 import {
@@ -332,6 +333,8 @@ function isDuplicateColumn(error: unknown): boolean {
  * a template literal is one the census can only match by restating it.
  */
 export const NOTIFICATION_SEQUENCE_TABLE = 'flowsafe_notification_sequence';
+const NOTIFICATION_OPERATION_RECEIPTS_TABLE =
+  'flowsafe_notification_operation_receipts';
 
 export class D1NotificationsStorage
   extends NotificationsStorage
@@ -340,6 +343,7 @@ export class D1NotificationsStorage
   readonly #db: SignalDatabase;
   readonly #table: string;
   readonly #sequenceTable: string;
+  readonly #operationReceiptTable: string;
   readonly #ordinalIndex: string;
   readonly #legacyReplaceTrigger: string;
   readonly #legacyInsertTrigger: string;
@@ -351,6 +355,7 @@ export class D1NotificationsStorage
     this.#db = db;
     this.#table = `${prefix}mastra_notifications`;
     this.#sequenceTable = `${prefix}${NOTIFICATION_SEQUENCE_TABLE}`;
+    this.#operationReceiptTable = `${prefix}${NOTIFICATION_OPERATION_RECEIPTS_TABLE}`;
     this.#ordinalIndex = `idx_${this.#table}_insertion_ordinal`;
     this.#legacyReplaceTrigger = `trg_${this.#table}_preserve_insertion_ordinal`;
     this.#legacyInsertTrigger = `trg_${this.#table}_allocate_insertion_ordinal`;
@@ -413,6 +418,17 @@ export class D1NotificationsStorage
       )
       .run();
     await this.#migrateOrdinalSchema(true);
+    await this.#db
+      .prepare(
+        `CREATE TABLE IF NOT EXISTS ${this.#operationReceiptTable} (
+           operation_key TEXT PRIMARY KEY,
+           request_digest TEXT NOT NULL,
+           thread_id TEXT NOT NULL,
+           notification_id TEXT NOT NULL,
+           UNIQUE (thread_id, notification_id)
+         )`,
+      )
+      .run();
   }
 
   async #migrateOrdinalSchema(retryDuplicateColumn: boolean): Promise<void> {
@@ -545,6 +561,140 @@ export class D1NotificationsStorage
 
   async init(): Promise<void> {
     await this.#ensureSchema();
+  }
+
+  async createNotificationOnce(
+    operationKey: string,
+    input: CreateNotificationInput & { id: string; createdAt: Date },
+  ): Promise<{
+    operationKey: string;
+    notificationId: string;
+    threadId: string;
+  }> {
+    if (
+      !isPathSafeId(operationKey) ||
+      !isPathSafeId(input.id) ||
+      !isPathSafeId(input.threadId) ||
+      !(input.createdAt instanceof Date) ||
+      !Number.isFinite(input.createdAt.getTime())
+    ) {
+      throw new TypeError('notification operation identity is malformed');
+    }
+    await this.#ensureSchema();
+    const batch = this.#db.batch?.bind(this.#db);
+    if (!batch)
+      throw new Error('notification operation requires database.batch()');
+    const record: NotificationRecord = {
+      id: input.id,
+      threadId: input.threadId,
+      source: input.source,
+      kind: input.kind,
+      priority: input.priority ?? 'medium',
+      status: 'pending',
+      summary: input.summary,
+      payload: input.payload,
+      resourceId: input.resourceId,
+      agentId: input.agentId,
+      sourceId: input.sourceId,
+      dedupeKey: input.dedupeKey,
+      coalesceKey: input.coalesceKey,
+      coalescedCount: 1,
+      attributes: input.attributes,
+      createdAt: input.createdAt,
+      updatedAt: input.createdAt,
+      deliverAt: input.deliverAt,
+      summaryAt: input.summaryAt,
+      deliveryReason: input.deliveryReason,
+      deliveryAttempts: 0,
+      metadata: input.metadata,
+    };
+    const values = recordValues(record);
+    validateNotificationDeliveryValues(values, true);
+    const requestJson = JSON.stringify(values);
+    const digestBytes = new Uint8Array(
+      await crypto.subtle.digest(
+        'SHA-256',
+        new TextEncoder().encode(requestJson),
+      ),
+    );
+    const requestDigest = Array.from(digestBytes, (byte) =>
+      byte.toString(16).padStart(2, '0'),
+    ).join('');
+    const receipt = {
+      operationKey,
+      notificationId: input.id,
+      threadId: input.threadId,
+    };
+    const readReceipt = async () =>
+      this.#db
+        .prepare(
+          `SELECT request_digest, thread_id, notification_id
+           FROM ${this.#operationReceiptTable} WHERE operation_key = ?`,
+        )
+        .bind(operationKey)
+        .first<{
+          request_digest: string;
+          thread_id: string;
+          notification_id: string;
+        }>();
+    const existing = await readReceipt();
+    if (existing) {
+      if (existing.request_digest !== requestDigest)
+        throw new Error('notification operation has a different request');
+      return {
+        operationKey,
+        notificationId: existing.notification_id,
+        threadId: existing.thread_id,
+      };
+    }
+    try {
+      // The inbox's legacy insert trigger updates existing IDs, so the receipt
+      // reserves both the operation key and inbox identity before insertion.
+      await batch([
+        this.#db
+          .prepare(
+            `INSERT INTO ${this.#operationReceiptTable}
+             (operation_key, request_digest, thread_id, notification_id)
+             SELECT ?, ?, ?, ?
+             WHERE NOT EXISTS (
+               SELECT 1 FROM ${this.#table}
+               WHERE thread_id = ? AND id = ?
+             )`,
+          )
+          .bind(
+            operationKey,
+            requestDigest,
+            input.threadId,
+            input.id,
+            input.threadId,
+            input.id,
+          ),
+        this.#db
+          .prepare(
+            `INSERT INTO ${this.#table} (${NOTIFICATION_COLUMNS.join(', ')})
+             SELECT ${NOTIFICATION_COLUMNS.map(() => '?').join(', ')}
+             WHERE EXISTS (
+               SELECT 1 FROM ${this.#operationReceiptTable}
+               WHERE operation_key = ? AND request_digest = ?
+             )`,
+          )
+          .bind(...values, operationKey, requestDigest),
+      ]);
+      const committed = await readReceipt();
+      if (!committed)
+        throw new Error('notification operation was not committed');
+      return receipt;
+    } catch (error) {
+      const committed = await readReceipt();
+      if (!committed) throw error;
+      if (committed.request_digest !== requestDigest)
+        throw new Error('notification operation has a different request');
+      return {
+        operationKey,
+        notificationId: committed.notification_id,
+        threadId: committed.thread_id,
+      };
+    }
   }
 
   async createNotification(
