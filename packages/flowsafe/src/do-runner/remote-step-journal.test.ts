@@ -8,6 +8,10 @@ import type { FlowsafeWorkerEnv } from '../host-kit/flowsafe-worker.js';
 import { createFlowsafeWorker } from '../host-kit/flowsafe-worker.js';
 import { approvalStoreFactoryFor } from '../host-kit/host-approval-service.js';
 import { staticTokenVerifier } from '../host-kit/verifier.js';
+import {
+  D1NotificationsStorage,
+  projectNotificationOperation,
+} from '../signals/notifications-d1.js';
 import { createD1Storage } from './d1-storage.js';
 import { credentialsMatch } from './deployment-identity.js';
 import { ExecutionFenceStore } from './execution-fence.js';
@@ -188,7 +192,14 @@ describe('remote step journal dispatch admission', () => {
         .prepare(`PRAGMA table_xinfo(${REMOTE_STEP_TABLE})`)
         .all() as Array<{ name: string }>
     )
-      .slice(0, -4)
+      .slice(
+        0,
+        (
+          h.sqlite
+            .prepare(`PRAGMA table_xinfo(${REMOTE_STEP_TABLE})`)
+            .all() as Array<{ name: string }>
+        ).findIndex(({ name }) => name === 'target_kind'),
+      )
       .map(({ name }) => name)
       .join(', ');
     h.sqlite.exec(`CREATE TABLE ${REMOTE_STEP_TABLE}_v3 (
@@ -635,7 +646,7 @@ describe('remote step journal dispatch admission', () => {
     });
     expect(
       h.sqlite.prepare('SELECT version FROM flowsafe_remote_step_schema').get(),
-    ).toEqual({ version: 4 });
+    ).toEqual({ version: 5 });
     expect(await h.reopen().recoverableResults(1)).toEqual({
       invocationIds: [invocation.invocationId],
       nextCursor: invocation.invocationId,
@@ -1009,7 +1020,7 @@ describe('remote step journal dispatch admission', () => {
     ).toBeUndefined();
     h.sqlite
       .prepare(
-        `UPDATE ${REMOTE_STEP_TABLE} SET result_digest = NULL, write_revision = write_revision + 1`,
+        `UPDATE ${REMOTE_STEP_TABLE} SET result_digest = NULL, write_revision = write_revision + 1, write_generation = write_generation + 1`,
       )
       .run();
     expect(
@@ -1338,7 +1349,7 @@ describe('remote step journal dispatch admission', () => {
     const invocation = await h.journal.register(ADDRESS, 10_000, PRINCIPAL);
     h.sqlite
       .prepare(
-        `UPDATE ${REMOTE_STEP_TABLE} SET table_prefix = ?, write_revision = write_revision + 1`,
+        `UPDATE ${REMOTE_STEP_TABLE} SET table_prefix = ?, write_revision = write_revision + 1, write_generation = write_generation + 1`,
       )
       .run('bad"_prefix');
     await expect(
@@ -1552,7 +1563,7 @@ describe('remote step journal dispatch admission', () => {
     });
   });
 
-  it('rejects stale v3-style journal writes after v4 migration', async () => {
+  it('rejects stale v4-style writes after v5 migration', async () => {
     const h = await fixture();
     const invocation = await h.journal.register(ADDRESS, 10_000, PRINCIPAL);
     restoreV3Schema(h);
@@ -1560,7 +1571,7 @@ describe('remote step journal dispatch admission', () => {
     expect(() =>
       h.sqlite
         .prepare(
-          `UPDATE ${REMOTE_STEP_TABLE} SET deadline_at = ? WHERE invocation_id = ?`,
+          `UPDATE ${REMOTE_STEP_TABLE} SET deadline_at = ?, write_revision = write_revision + 1 WHERE invocation_id = ?`,
         )
         .run(9_000, invocation.invocationId),
     ).toThrow('remote step writer version changed');
@@ -1591,6 +1602,288 @@ describe('remote step journal dispatch admission', () => {
     ).toThrow();
     expect(await h.reopen().get(invocation.invocationId)).toMatchObject({
       deadlineAt: 10_000,
+    });
+  });
+
+  it('binds a notification effect and one continuation admission to the retained result', async () => {
+    const h = await fixture();
+    const { invocation } = await h.retainResult();
+    const input = {
+      threadId: ADDRESS.threadId,
+      source: 'remote-step',
+      kind: 'result',
+      summary: 'Remote work completed',
+      payload: { value: 'done' },
+      createdAt: new Date('2026-10-13T00:00:00.000Z'),
+      deliverAt: new Date('2026-10-14T00:00:00.000Z'),
+    };
+    const prepared = await h.journal.prepareNotificationOperation(
+      invocation.invocationId,
+      'result-notification',
+      input,
+    );
+    const projected = await projectNotificationOperation({
+      ...input,
+      id: prepared.notificationId,
+    });
+    expect(prepared).toMatchObject({
+      state: 'prepared',
+      projectionVersion: 'notification-record-values-v1',
+      projectionJson: projected.requestJson,
+      requestDigest: projected.requestDigest,
+    });
+    expect(await h.reopen().recoverableResults(10)).toEqual({
+      invocationIds: [],
+    });
+    await expect(
+      h.journal.claimResume(invocation.invocationId, 1_000),
+    ).rejects.toMatchObject({ status: 409 });
+    expect(
+      (await h.reopen().admitNotificationEffect(invocation.invocationId)).state,
+    ).toBe('effect-admitted');
+    const notifications = new D1NotificationsStorage(h.db);
+    const receipt = await notifications.createNotificationOnce(
+      prepared.operationKey,
+      { ...input, id: prepared.notificationId },
+    );
+    expect(receipt.requestDigest).toBe(prepared.requestDigest);
+    expect(
+      (
+        await h.journal.recordNotificationReceipt(
+          invocation.invocationId,
+          receipt,
+        )
+      ).state,
+    ).toBe('receipt-recorded');
+    expect(
+      await notifications.readNotificationOperationReceipt(
+        prepared.operationKey,
+      ),
+    ).toEqual(receipt);
+    const owner = await h
+      .reopen()
+      .admitNotificationResume(invocation.invocationId);
+    expect(owner).toMatch(/^[a-f0-9-]{36}$/);
+    await expect(
+      h.journal.admitNotificationResume(invocation.invocationId),
+    ).rejects.toMatchObject({ status: 409 });
+    expect(
+      await h.reopen().readNotificationOperation(invocation.invocationId),
+    ).toMatchObject({
+      state: 'resume-admitted',
+      requestDigest: receipt.requestDigest,
+    });
+    expect(
+      (await new DeploymentInventory(h.db).read('remote-steps')).count,
+    ).toBe(1);
+  });
+
+  it('refuses effect admission when the authoritative snapshot changes at the D1 write', async () => {
+    const h = await fixture();
+    const { invocation } = await h.retainResult();
+    await h.journal.prepareNotificationOperation(
+      invocation.invocationId,
+      'result-notification',
+      {
+        threadId: ADDRESS.threadId,
+        source: 'remote-step',
+        kind: 'result',
+        summary: 'Remote work completed',
+        createdAt: new Date('2026-10-13T00:00:00.000Z'),
+      },
+    );
+    const prepare = h.db.prepare.bind(h.db);
+    h.db.prepare = (sql) => {
+      const statement = prepare(sql);
+      if (!sql.includes("SET operation_state = 'effect-admitted'"))
+        return statement;
+      return {
+        ...statement,
+        bind: (...values) => {
+          const bound = statement.bind(...values);
+          return {
+            ...bound,
+            all: async <T = unknown>() => {
+              h.sqlite
+                .prepare('UPDATE mastra_workflow_snapshot SET snapshot = ?')
+                .run('{"status":"cancelled"}');
+              return bound.all<T>();
+            },
+          };
+        },
+      };
+    };
+    await expect(
+      h.journal.admitNotificationEffect(invocation.invocationId),
+    ).rejects.toMatchObject({ status: 409 });
+    expect(
+      await h.reopen().readNotificationOperation(invocation.invocationId),
+    ).toMatchObject({ state: 'prepared' });
+  });
+
+  it('refuses a changed notification receipt after effect admission', async () => {
+    const h = await fixture();
+    const { invocation } = await h.retainResult();
+    const operation = await h.journal.prepareNotificationOperation(
+      invocation.invocationId,
+      'result-notification',
+      {
+        threadId: ADDRESS.threadId,
+        source: 'remote-step',
+        kind: 'result',
+        summary: 'Remote work completed',
+        createdAt: new Date('2026-10-13T00:00:00.000Z'),
+      },
+    );
+    await h.journal.admitNotificationEffect(invocation.invocationId);
+    await expect(
+      h.journal.recordNotificationReceipt(invocation.invocationId, {
+        operationKey: operation.operationKey,
+        notificationId: operation.notificationId,
+        threadId: ADDRESS.threadId,
+        requestDigest: 'f'.repeat(64),
+      }),
+    ).rejects.toMatchObject({ status: 409 });
+    expect(
+      await h.reopen().readNotificationOperation(invocation.invocationId),
+    ).toMatchObject({ state: 'effect-admitted' });
+  });
+
+  it('refuses stale principal, start token, result and deadline before effect admission', async () => {
+    const cases = [
+      {
+        column: 'principal_json',
+        value: JSON.stringify({ kind: 'human', id: 'other', role: 'operator' }),
+        status: 409,
+      },
+      { column: 'start_token', value: 'other-start', status: 409 },
+      { column: 'result_digest', value: 'f'.repeat(64), status: 503 },
+      { column: 'deadline_at', value: 1_000, status: 409 },
+    ] as const;
+    for (const changed of cases) {
+      const h = await fixture();
+      const { invocation } = await h.retainResult();
+      await h.journal.prepareNotificationOperation(
+        invocation.invocationId,
+        'result-notification',
+        {
+          threadId: ADDRESS.threadId,
+          source: 'remote-step',
+          kind: 'result',
+          summary: 'Remote work completed',
+          createdAt: new Date('2026-10-13T00:00:00.000Z'),
+        },
+      );
+      h.sqlite
+        .prepare(`UPDATE ${REMOTE_STEP_TABLE} SET ${changed.column} = ?,
+        write_revision = write_revision + 1, write_generation = write_generation + 1`)
+        .run(changed.value);
+      await expect(
+        h.journal.admitNotificationEffect(invocation.invocationId),
+      ).rejects.toMatchObject({ status: changed.status });
+      expect(
+        await h.reopen().readNotificationOperation(invocation.invocationId),
+      ).toMatchObject({ state: 'prepared' });
+    }
+  });
+
+  it('refuses effect admission when the fence moves after its read', async () => {
+    const h = await fixture();
+    const { invocation } = await h.retainResult();
+    await h.journal.prepareNotificationOperation(
+      invocation.invocationId,
+      'result-notification',
+      {
+        threadId: ADDRESS.threadId,
+        source: 'remote-step',
+        kind: 'result',
+        summary: 'Remote work completed',
+        createdAt: new Date('2026-10-13T00:00:00.000Z'),
+      },
+    );
+    const prepare = h.db.prepare.bind(h.db);
+    h.db.prepare = (sql) => {
+      const statement = prepare(sql);
+      if (!sql.includes("SET operation_state = 'effect-admitted'"))
+        return statement;
+      return {
+        ...statement,
+        bind: (...values) => {
+          const bound = statement.bind(...values);
+          return {
+            ...bound,
+            all: async <T = unknown>() => {
+              const before = await h.fence.read();
+              await h.fence.transition({
+                expected: 'open',
+                next: 'migration-locked',
+                expectedMutationEpoch: before.mutationEpoch,
+                expectedRevision: before.transitionRevision,
+                advanceMutationEpoch: true,
+              });
+              return bound.all<T>();
+            },
+          };
+        },
+      };
+    };
+    await expect(
+      h.journal.admitNotificationEffect(invocation.invocationId),
+    ).rejects.toMatchObject({ status: 409 });
+    expect(
+      await h.reopen().readNotificationOperation(invocation.invocationId),
+    ).toMatchObject({ state: 'prepared' });
+  });
+
+  it('reads durable effect admission after its write response is lost', async () => {
+    const h = await fixture();
+    const { invocation } = await h.retainResult();
+    const prepared = await h.journal.prepareNotificationOperation(
+      invocation.invocationId,
+      'result-notification',
+      {
+        threadId: ADDRESS.threadId,
+        source: 'remote-step',
+        kind: 'result',
+        summary: 'Remote work completed',
+        createdAt: new Date('2026-10-13T00:00:00.000Z'),
+      },
+    );
+    const prepare = h.db.prepare.bind(h.db);
+    let interrupted = false;
+    h.db.prepare = (sql) => {
+      const statement = prepare(sql);
+      if (!sql.includes("SET operation_state = 'effect-admitted'"))
+        return statement;
+      return {
+        ...statement,
+        bind: (...values) => {
+          const bound = statement.bind(...values);
+          return {
+            ...bound,
+            all: async <T = unknown>() => {
+              const result = await bound.all<T>();
+              if (!interrupted) {
+                interrupted = true;
+                throw new Error('lost admission response');
+              }
+              return result;
+            },
+          };
+        },
+      };
+    };
+    expect(
+      await h.journal.admitNotificationEffect(invocation.invocationId),
+    ).toMatchObject({
+      state: 'effect-admitted',
+      operationKey: prepared.operationKey,
+    });
+    expect(
+      await h.reopen().admitNotificationEffect(invocation.invocationId),
+    ).toMatchObject({
+      state: 'effect-admitted',
+      operationKey: prepared.operationKey,
     });
   });
 

@@ -198,7 +198,7 @@ describe('host-owned notification operation receipt', () => {
       'remote-invocation',
       input,
     );
-    expect(receipt).toEqual({
+    expect(receipt).toMatchObject({
       operationKey: 'remote-invocation',
       notificationId: input.id,
       threadId: input.threadId,
@@ -207,6 +207,7 @@ describe('host-owned notification operation receipt', () => {
       .prepare('SELECT * FROM flowsafe_notification_operation_receipts')
       .first<Record<string, unknown>>();
     expect(retained?.request_digest).toMatch(/^[a-f0-9]{64}$/);
+    expect(receipt.requestDigest).toBe(retained?.request_digest);
     expect(JSON.stringify(retained)).not.toContain(input.summary);
     expect(JSON.stringify(retained)).not.toContain('private-receipt-canary');
     const delivered = await retry.getNotification({

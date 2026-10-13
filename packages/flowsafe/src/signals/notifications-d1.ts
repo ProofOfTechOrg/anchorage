@@ -333,9 +333,74 @@ function isDuplicateColumn(error: unknown): boolean {
  * a template literal is one the census can only match by restating it.
  */
 export const NOTIFICATION_SEQUENCE_TABLE = 'flowsafe_notification_sequence';
+export const NOTIFICATION_OPERATION_PROJECTION_VERSION =
+  'notification-record-values-v1';
 const NOTIFICATION_OPERATION_RECEIPTS_TABLE =
   'flowsafe_notification_operation_receipts';
 export const DEFAULT_NOTIFICATION_OPERATION_RECEIPT_LIMIT = 100_000;
+
+export type NotificationOperationInput = CreateNotificationInput & {
+  id: string;
+  createdAt: Date;
+};
+
+export async function projectNotificationOperation(
+  input: NotificationOperationInput,
+): Promise<{
+  version: typeof NOTIFICATION_OPERATION_PROJECTION_VERSION;
+  values: unknown[];
+  requestJson: string;
+  requestDigest: string;
+}> {
+  if (
+    !isPathSafeId(input.id) ||
+    !isPathSafeId(input.threadId) ||
+    !(input.createdAt instanceof Date) ||
+    !Number.isFinite(input.createdAt.getTime())
+  )
+    throw new TypeError('notification operation identity is malformed');
+  const record: NotificationRecord = {
+    id: input.id,
+    threadId: input.threadId,
+    source: input.source,
+    kind: input.kind,
+    priority: input.priority ?? 'medium',
+    status: 'pending',
+    summary: input.summary,
+    payload: input.payload,
+    resourceId: input.resourceId,
+    agentId: input.agentId,
+    sourceId: input.sourceId,
+    dedupeKey: input.dedupeKey,
+    coalesceKey: input.coalesceKey,
+    coalescedCount: 1,
+    attributes: input.attributes,
+    createdAt: input.createdAt,
+    updatedAt: input.createdAt,
+    deliverAt: input.deliverAt,
+    summaryAt: input.summaryAt,
+    deliveryReason: input.deliveryReason,
+    deliveryAttempts: 0,
+    metadata: input.metadata,
+  };
+  const values = recordValues(record);
+  validateNotificationDeliveryValues(values, true);
+  const requestJson = JSON.stringify(values);
+  const digestBytes = new Uint8Array(
+    await crypto.subtle.digest(
+      'SHA-256',
+      new TextEncoder().encode(requestJson),
+    ),
+  );
+  return {
+    version: NOTIFICATION_OPERATION_PROJECTION_VERSION,
+    values,
+    requestJson,
+    requestDigest: Array.from(digestBytes, (byte) =>
+      byte.toString(16).padStart(2, '0'),
+    ).join(''),
+  };
+}
 
 export class D1NotificationsStorage
   extends NotificationsStorage
@@ -575,11 +640,12 @@ export class D1NotificationsStorage
 
   async createNotificationOnce(
     operationKey: string,
-    input: CreateNotificationInput & { id: string; createdAt: Date },
+    input: NotificationOperationInput,
   ): Promise<{
     operationKey: string;
     notificationId: string;
     threadId: string;
+    requestDigest: string;
   }> {
     if (
       !isPathSafeId(operationKey) ||
@@ -594,46 +660,12 @@ export class D1NotificationsStorage
     const batch = this.#db.batch?.bind(this.#db);
     if (!batch)
       throw new Error('notification operation requires database.batch()');
-    const record: NotificationRecord = {
-      id: input.id,
-      threadId: input.threadId,
-      source: input.source,
-      kind: input.kind,
-      priority: input.priority ?? 'medium',
-      status: 'pending',
-      summary: input.summary,
-      payload: input.payload,
-      resourceId: input.resourceId,
-      agentId: input.agentId,
-      sourceId: input.sourceId,
-      dedupeKey: input.dedupeKey,
-      coalesceKey: input.coalesceKey,
-      coalescedCount: 1,
-      attributes: input.attributes,
-      createdAt: input.createdAt,
-      updatedAt: input.createdAt,
-      deliverAt: input.deliverAt,
-      summaryAt: input.summaryAt,
-      deliveryReason: input.deliveryReason,
-      deliveryAttempts: 0,
-      metadata: input.metadata,
-    };
-    const values = recordValues(record);
-    validateNotificationDeliveryValues(values, true);
-    const requestJson = JSON.stringify(values);
-    const digestBytes = new Uint8Array(
-      await crypto.subtle.digest(
-        'SHA-256',
-        new TextEncoder().encode(requestJson),
-      ),
-    );
-    const requestDigest = Array.from(digestBytes, (byte) =>
-      byte.toString(16).padStart(2, '0'),
-    ).join('');
+    const { values, requestDigest } = await projectNotificationOperation(input);
     const receipt = {
       operationKey,
       notificationId: input.id,
       threadId: input.threadId,
+      requestDigest,
     };
     const readReceipt = async () =>
       this.#db
@@ -655,6 +687,7 @@ export class D1NotificationsStorage
         operationKey,
         notificationId: existing.notification_id,
         threadId: existing.thread_id,
+        requestDigest: existing.request_digest,
       };
     }
     try {
@@ -714,8 +747,47 @@ export class D1NotificationsStorage
         operationKey,
         notificationId: committed.notification_id,
         threadId: committed.thread_id,
+        requestDigest: committed.request_digest,
       };
     }
+  }
+
+  async readNotificationOperationReceipt(operationKey: string): Promise<
+    | {
+        operationKey: string;
+        notificationId: string;
+        threadId: string;
+        requestDigest: string;
+      }
+    | undefined
+  > {
+    if (!isPathSafeId(operationKey))
+      throw new TypeError('notification operation identity is malformed');
+    await this.#ensureSchema();
+    const row = await this.#db
+      .prepare(
+        `SELECT request_digest, thread_id, notification_id
+       FROM ${this.#operationReceiptTable} WHERE operation_key = ?`,
+      )
+      .bind(operationKey)
+      .first<{
+        request_digest: string;
+        thread_id: string;
+        notification_id: string;
+      }>();
+    if (!row) return undefined;
+    if (
+      !/^[a-f0-9]{64}$/.test(row.request_digest) ||
+      !isPathSafeId(row.thread_id) ||
+      !isPathSafeId(row.notification_id)
+    )
+      throw new Error('notification operation receipt is unreadable');
+    return {
+      operationKey,
+      notificationId: row.notification_id,
+      threadId: row.thread_id,
+      requestDigest: row.request_digest,
+    };
   }
 
   async createNotification(
