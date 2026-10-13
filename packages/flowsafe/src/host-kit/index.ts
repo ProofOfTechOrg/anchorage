@@ -74,7 +74,11 @@ export {
   resumeRunWithRequeue,
 } from './approval-bridge.js';
 export { bearerActorAuthenticator, parseActorTokens } from './bearer-auth.js';
-export { type DoResponseLike, doSummary } from './do-response.js';
+export {
+  type DoResponseLike,
+  doSummary,
+  type StartPrincipalReceipt,
+} from './do-response.js';
 export {
   createDoRunTopology,
   type DoRunLifecycleTopology,

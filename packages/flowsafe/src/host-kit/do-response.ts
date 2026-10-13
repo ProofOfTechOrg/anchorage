@@ -7,11 +7,15 @@
 // router's error mapping rather than collapse into a generic 500.
 
 import {
+  assertExecutionPrincipal,
+  type ExecutionPrincipal,
   isExecutionPrincipalId,
   isExecutionPrincipalKind,
 } from '../approval-api/principal.js';
 import { isPublishedRefusal } from '../do-runner/do-status-error.js';
 import {
+  type D1RunExecutionIdentity,
+  normalizeD1RunExecutionIdentity,
   normalizeStartExecutionIdentity,
   type StartExecutionIdentity,
 } from '../do-runner/execution-admission.js';
@@ -313,5 +317,77 @@ export async function doPersistedStart(
     };
   } catch {
     throw new RunRouteError(503, 'persisted start is not readable');
+  }
+}
+
+export interface StartPrincipalReceipt {
+  readonly version: 1;
+  readonly execution: D1RunExecutionIdentity;
+  readonly owner: {
+    readonly kind: ExecutionPrincipal['kind'];
+    readonly id: string;
+  };
+  readonly principal: ExecutionPrincipal;
+}
+
+/** @internal A private DO receipt is trusted only after exact selector and owner checks. */
+export async function doStartPrincipal(
+  response: DoResponseLike,
+  expected: { workflowId: string; runId: string },
+): Promise<StartPrincipalReceipt> {
+  if (!response.ok) {
+    throw await objectAnswerError('run-object', response, 'run');
+  }
+  try {
+    if (response.status !== 200) throw new Error('invalid status');
+    const payload = persistedStartRecord(await response.json());
+    if (
+      Object.keys(payload).sort().join(',') !==
+        'execution,owner,principal,version' ||
+      payload.version !== 1
+    )
+      throw new Error('invalid receipt');
+    const rawExecution = persistedStartRecord(payload.execution);
+    if (
+      Object.keys(rawExecution).sort().join(',') !==
+      'runId,startToken,tablePrefix,workflowId'
+    )
+      throw new Error('invalid execution');
+    const execution = normalizeD1RunExecutionIdentity(rawExecution);
+    if (
+      rawExecution.tablePrefix !== execution.tablePrefix ||
+      execution.workflowId !== expected.workflowId ||
+      execution.runId !== expected.runId
+    )
+      throw new Error('selector mismatch');
+    const owner = persistedStartRecord(payload.owner);
+    if (
+      Object.keys(owner).sort().join(',') !== 'id,kind' ||
+      !isExecutionPrincipalKind(owner.kind) ||
+      !isExecutionPrincipalId(owner.id)
+    )
+      throw new Error('invalid owner');
+    const rawPrincipal = persistedStartRecord(payload.principal);
+    const principal = assertExecutionPrincipal(rawPrincipal, 'start receipt');
+    const principalKeys =
+      principal.kind === 'human'
+        ? 'id,kind,role'
+        : principal.kind === 'agent' && principal.delegatedBy !== undefined
+          ? 'delegatedBy,id,kind,purpose'
+          : 'id,kind,purpose';
+    if (
+      Object.keys(rawPrincipal).sort().join(',') !== principalKeys ||
+      principal.kind !== owner.kind ||
+      principal.id !== owner.id
+    )
+      throw new Error('principal mismatch');
+    return Object.freeze({
+      version: 1,
+      execution,
+      owner: Object.freeze({ kind: owner.kind, id: owner.id }),
+      principal,
+    });
+  } catch {
+    throw new RunRouteError(503, 'run start principal is not readable');
   }
 }
