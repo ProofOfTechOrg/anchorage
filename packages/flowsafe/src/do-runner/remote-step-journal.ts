@@ -430,6 +430,14 @@ export class RemoteStepJournal {
     evidenceJson: string;
   }) => Promise<void>;
 
+  get deploymentId(): string {
+    return this.#deploymentId;
+  }
+
+  get tablePrefix(): string {
+    return this.#tablePrefix;
+  }
+
   constructor(input: {
     db: ExecutionFenceDatabase;
     fence: ExecutionFenceStore;
@@ -859,6 +867,20 @@ export class RemoteStepJournal {
         .all(),
     );
     return row ? decode(row) : undefined;
+  }
+
+  async readDispatchRequestJson(invocationId: string): Promise<string> {
+    if (!isPathSafeId(invocationId))
+      throw new RemoteStepRefusal(400, 'invocation id is malformed');
+    const row = rowResult(
+      await this.#db
+        .prepare(`SELECT * FROM ${REMOTE_STEP_TABLE} WHERE invocation_id = ?`)
+        .bind(invocationId)
+        .all(),
+    );
+    if (!row) throw new RemoteStepRefusal(404, 'invocation not found');
+    decode(row);
+    return row.request_json;
   }
 
   async #execution(address: RemoteStepAddress, principal?: ExecutionPrincipal) {

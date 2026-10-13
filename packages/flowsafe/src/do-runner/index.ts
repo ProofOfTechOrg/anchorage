@@ -224,6 +224,12 @@ export { mintThreadId, resourceIdFromKey } from './memory-id.js';
 export { isPathSafeId, PATH_SAFE_ID_PATTERN } from './path-safe-id.js';
 export type { HostPubSub } from './pubsub.js';
 export { createHostPubSub } from './pubsub.js';
+export {
+  type RemoteStepAddress,
+  type RemoteStepInvocation,
+  RemoteStepJournal,
+  type RemoteStepPermit,
+} from './remote-step-journal.js';
 export type {
   RunEconomicOperation,
   RunLifecyclePrincipal,

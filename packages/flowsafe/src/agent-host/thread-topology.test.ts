@@ -20,6 +20,7 @@ import {
   type AgentThreadDispatchTopology,
   createAgentThreadTopology,
   type RemoteStepContinuationReader,
+  type RemoteStepDispatchReader,
 } from './thread-topology.js';
 
 const DEPLOYMENT_IDENTITY_SECRET = 'test-deployment-identity-secret-0001';
@@ -30,7 +31,10 @@ interface Hit {
   init?: ThreadRequestInit;
 }
 
-function harness(remoteSteps?: RemoteStepContinuationReader): {
+function harness(
+  remoteSteps?: RemoteStepContinuationReader,
+  remoteStepDispatch?: RemoteStepDispatchReader,
+): {
   topology: AgentThreadDispatchTopology;
   hits: Hit[];
 } {
@@ -94,10 +98,123 @@ function harness(remoteSteps?: RemoteStepContinuationReader): {
       startIdempotency: 'none',
       executionFence: 'none',
       ...(remoteSteps ? { remoteSteps } : {}),
+      ...(remoteStepDispatch ? { remoteStepDispatch } : {}),
     }),
     hits,
   };
 }
+
+it('issues a remote dispatch ticket and exposes a raw permit to the consume winner', async () => {
+  const permit = {
+    invocationId: 'invocation_1',
+    generation: 2,
+    mutationEpoch: 7,
+    transitionRevision: 4,
+    expiresAt: 9_999_999_999_999,
+  };
+  const invocation = {
+    invocationId: permit.invocationId,
+    deploymentId: 'deployment',
+    tablePrefix: '',
+    workflowId: 'durable-agentic-loop',
+    agentId: 'writer',
+    threadId: 'acme_thread',
+    resourceId: 'acme_resource_acme_thread',
+    runId: 'acme_run',
+    principal: context().value.principal,
+    startToken: 'private-generation',
+    stepPath: ['tool'],
+    suspendedAt: 1000,
+    request: { script: 'script-1' },
+    deadlineAt: permit.expiresAt,
+    status: 'dispatched' as const,
+    permitGeneration: permit.generation,
+  };
+  const reader: RemoteStepDispatchReader = {
+    deploymentId: invocation.deploymentId,
+    tablePrefix: invocation.tablePrefix,
+    get: vi.fn(async () => invocation),
+    readDispatchRequestJson: vi.fn(async () => '{"script":"script-1"}'),
+    issuePermit: vi.fn(async () => permit),
+    consumePermit: vi
+      .fn()
+      .mockResolvedValueOnce({ kind: 'accepted', rawPermit: 'secret' })
+      .mockResolvedValueOnce({ kind: 'already-consumed' }),
+  };
+  const { topology } = harness(undefined, reader);
+  const ticket = await topology.issueRemoteStepDispatch(
+    context().value,
+    permit.invocationId,
+    60_000,
+  );
+  expect(ticket).toMatchObject({
+    invocationId: permit.invocationId,
+    requestJson: '{"script":"script-1"}',
+    permit,
+  });
+  expect(ticket).not.toHaveProperty('principal');
+  expect(ticket).not.toHaveProperty('startToken');
+  expect(reader.issuePermit).toHaveBeenCalledWith(permit.invocationId, 60_000);
+  expect(
+    await topology.consumeRemoteStepDispatch(context().value, permit),
+  ).toEqual({ kind: 'accepted', rawPermit: 'secret' });
+  expect(
+    await topology.consumeRemoteStepDispatch(context().value, permit),
+  ).toEqual({ kind: 'already-consumed' });
+  const displaced = context().value;
+  await expect(
+    topology.issueRemoteStepDispatch(
+      {
+        ...displaced,
+        principal: { kind: 'human', id: 'other', role: 'operator' },
+      },
+      permit.invocationId,
+      60_000,
+    ),
+  ).rejects.toMatchObject({ status: 404 });
+  expect(reader.issuePermit).toHaveBeenCalledTimes(1);
+  await expect(
+    topology.consumeRemoteStepDispatch(
+      {
+        ...displaced,
+        principal: { kind: 'human', id: 'other', role: 'operator' },
+      },
+      permit,
+    ),
+  ).rejects.toMatchObject({ status: 404 });
+  expect(reader.consumePermit).toHaveBeenCalledTimes(2);
+  const deniedAccess = {
+    ...displaced,
+    canAccessResource: async () => false,
+  };
+  await expect(
+    topology.issueRemoteStepDispatch(deniedAccess, permit.invocationId, 60_000),
+  ).rejects.toMatchObject({ status: 404 });
+  await expect(
+    topology.consumeRemoteStepDispatch(deniedAccess, permit),
+  ).rejects.toMatchObject({ status: 404 });
+  const displacedResource = {
+    ...displaced,
+    resourceIdFromKey: () => 'another-resource',
+  };
+  await expect(
+    topology.issueRemoteStepDispatch(
+      displacedResource,
+      permit.invocationId,
+      60_000,
+    ),
+  ).rejects.toMatchObject({ status: 404 });
+  vi.mocked(reader.get).mockResolvedValueOnce({
+    ...invocation,
+    deploymentId: 'other-deployment',
+  });
+  await expect(
+    topology.issueRemoteStepDispatch(displaced, permit.invocationId, 60_000),
+  ).rejects.toMatchObject({ status: 404 });
+  expect(reader.issuePermit).toHaveBeenCalledTimes(1);
+  expect(reader.readDispatchRequestJson).toHaveBeenCalledTimes(1);
+  expect(reader.consumePermit).toHaveBeenCalledTimes(2);
+});
 
 it('routes a retained result under the journaled principal and refuses a changed resource mapping', async () => {
   const principal = {

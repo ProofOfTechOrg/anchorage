@@ -11,6 +11,7 @@ import {
 import {
   isExecutionPrincipalId,
   isExecutionPrincipalKind,
+  samePrincipal,
 } from '../approval-api/principal.js';
 import {
   APPROVAL_PRIORITIES,
@@ -33,6 +34,7 @@ import {
 import type {
   RecordedRemoteStepResult,
   RemoteStepInvocation,
+  RemoteStepPermit,
 } from '../do-runner/remote-step-journal.js';
 import {
   isTerminalRunStatus,
@@ -126,6 +128,39 @@ export interface AgentThreadTopologyOptions {
    */
   executionFence: ExecutionFenceWiring;
   remoteSteps?: RemoteStepContinuationReader;
+  remoteStepDispatch?: RemoteStepDispatchReader;
+}
+
+export interface RemoteStepDispatchReader {
+  deploymentId: string;
+  tablePrefix: string;
+  get(invocationId: string): Promise<RemoteStepInvocation | undefined>;
+  readDispatchRequestJson(invocationId: string): Promise<string>;
+  issuePermit(
+    invocationId: string,
+    lifetimeMs: number,
+  ): Promise<RemoteStepPermit>;
+  consumePermit(
+    permit: RemoteStepPermit,
+  ): Promise<
+    { kind: 'accepted'; rawPermit: string } | { kind: 'already-consumed' }
+  >;
+}
+
+export interface RemoteStepDispatchTicket {
+  invocationId: string;
+  deploymentId: string;
+  workflowId: string;
+  agentId: string;
+  threadId: string;
+  resourceId: string;
+  runId: string;
+  stepPath: readonly string[];
+  suspendedAt: number;
+  resumeCount?: number;
+  deadlineAt: number;
+  requestJson: string;
+  permit: RemoteStepPermit;
 }
 
 export interface RemoteStepContinuationReader {
@@ -212,6 +247,17 @@ export interface AgentThreadDispatchTopology extends AgentThreadBoundTopology {
     context: ActorContext,
     invocationId: string,
   ): Promise<AgentRunEnvelope>;
+  issueRemoteStepDispatch(
+    context: ActorContext,
+    invocationId: string,
+    lifetimeMs: number,
+  ): Promise<RemoteStepDispatchTicket>;
+  consumeRemoteStepDispatch(
+    context: ActorContext,
+    permit: RemoteStepPermit,
+  ): Promise<
+    { kind: 'accepted'; rawPermit: string } | { kind: 'already-consumed' }
+  >;
 }
 
 function errorFrom(response: Response): Promise<RunRouteError> {
@@ -261,6 +307,46 @@ export function createAgentThreadTopology<Id>(
     namespace,
     deploymentIdentitySecret,
   );
+  const dispatchInvocation = async (
+    context: ActorContext,
+    invocationId: string,
+  ) => {
+    const reader = options.remoteStepDispatch;
+    if (!reader) throw new RunRouteError(503, 'remote steps are unavailable');
+    if (!isPathSafeId(invocationId))
+      throw new RunRouteError(404, 'invocation not found');
+    const invocation = await reader.get(invocationId);
+    if (
+      !invocation ||
+      invocation.deploymentId !== reader.deploymentId ||
+      invocation.tablePrefix !== reader.tablePrefix ||
+      !samePrincipal(invocation.principal, context.principal)
+    )
+      throw new RunRouteError(404, 'invocation not found');
+    expectedResource(context, invocation.threadId, invocation.resourceId);
+    await requireResourceAccess(
+      context,
+      'thread',
+      invocation.threadId,
+      'write',
+      'run',
+    );
+    await requireResourceAccess(
+      context,
+      'resource',
+      invocation.resourceId,
+      'write',
+      'run',
+    );
+    await requireResourceAccess(
+      context,
+      'run',
+      invocation.runId,
+      'write',
+      'run',
+    );
+    return { reader, invocation };
+  };
   const fetchStatus = async (
     context: ActorContext,
     input: AgentThreadRunRef,
@@ -417,6 +503,41 @@ export function createAgentThreadTopology<Id>(
     }
   };
   return {
+    issueRemoteStepDispatch: async (context, invocationId, lifetimeMs) => {
+      await dispatchInvocation(context, invocationId);
+      const reader = options.remoteStepDispatch;
+      if (!reader) throw new RunRouteError(503, 'remote steps are unavailable');
+      const permit = await reader.issuePermit(invocationId, lifetimeMs);
+      const { invocation } = await dispatchInvocation(context, invocationId);
+      if (
+        invocation.status !== 'dispatched' ||
+        invocation.permitGeneration !== permit.generation ||
+        invocation.deadlineAt < permit.expiresAt
+      )
+        throw new RunRouteError(409, 'remote step dispatch changed');
+      const requestJson = await reader.readDispatchRequestJson(invocationId);
+      return {
+        invocationId,
+        deploymentId: invocation.deploymentId,
+        workflowId: invocation.workflowId,
+        agentId: invocation.agentId,
+        threadId: invocation.threadId,
+        resourceId: invocation.resourceId,
+        runId: invocation.runId,
+        stepPath: invocation.stepPath,
+        suspendedAt: invocation.suspendedAt,
+        ...(invocation.resumeCount === undefined
+          ? {}
+          : { resumeCount: invocation.resumeCount }),
+        deadlineAt: invocation.deadlineAt,
+        requestJson,
+        permit,
+      };
+    },
+    consumeRemoteStepDispatch: async (context, permit) => {
+      const { reader } = await dispatchInvocation(context, permit.invocationId);
+      return reader.consumePermit(permit);
+    },
     requireBoundThread: async (context, target: BoundThreadTarget) => {
       const threadId = validThread(target.threadId);
       const resourceId = expectedResource(context, threadId, target.resourceId);

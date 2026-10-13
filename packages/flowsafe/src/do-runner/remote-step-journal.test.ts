@@ -182,6 +182,9 @@ describe('remote step journal dispatch admission', () => {
       h.journal.register(ADDRESS, 10_000, PRINCIPAL),
     ]);
     expect(replay.invocationId).toBe(first.invocationId);
+    expect(await h.journal.readDispatchRequestJson(first.invocationId)).toBe(
+      '{"account":"acme"}',
+    );
     expect(first).toMatchObject({
       status: 'pending',
       permitGeneration: 0,

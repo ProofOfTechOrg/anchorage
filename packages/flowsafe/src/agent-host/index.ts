@@ -13,6 +13,7 @@ export {
 export type {
   RecordedRemoteStepResult,
   RemoteStepInvocation,
+  RemoteStepPermit,
 } from '../do-runner/remote-step-journal.js';
 export {
   type AgentApprovalResumer,
@@ -55,6 +56,8 @@ export {
   type AgentThreadTopologyOptions,
   createAgentThreadTopology,
   type RemoteStepContinuationReader,
+  type RemoteStepDispatchReader,
+  type RemoteStepDispatchTicket,
 } from './thread-topology.js';
 export {
   AGENT_AUDIT_CONTEXT_KEY,
