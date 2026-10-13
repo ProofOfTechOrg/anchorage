@@ -16,6 +16,12 @@ export const STATE_EGRESS_RESOURCE_GROUP_HEADER =
 export const STATE_EGRESS_SCRIPT_HEADER = 'x-anchorage-state-script' as const;
 export const STATE_EGRESS_ROUTE_HOSTNAME_HEADER =
   'x-anchorage-state-route-hostname' as const;
+export const STATE_EGRESS_ACTIVATION_VERSION_HEADER =
+  'x-anchorage-state-activation-version' as const;
+export const STATE_EGRESS_ACTIVATION_KIND_HEADER =
+  'x-anchorage-state-activation-kind' as const;
+export const STATE_EGRESS_DISPATCH_KEY_HEADER =
+  'x-anchorage-state-dispatch-key' as const;
 export const STATE_EGRESS_POLICY_ID_HEADER =
   'x-anchorage-state-policy-id' as const;
 
@@ -29,35 +35,73 @@ export const STATE_EGRESS_HEADERS = {
   policyId: STATE_EGRESS_POLICY_ID_HEADER,
 } as const;
 
-export const STATE_EGRESS_RESERVED_HEADERS =
-  Object.values(STATE_EGRESS_HEADERS);
+export const STATE_EGRESS_PRIVATE_HEADERS = {
+  activationVersion: STATE_EGRESS_ACTIVATION_VERSION_HEADER,
+  activationKind: STATE_EGRESS_ACTIVATION_KIND_HEADER,
+  dispatchKey: STATE_EGRESS_DISPATCH_KEY_HEADER,
+} as const;
+
+export const STATE_EGRESS_RESERVED_HEADERS = [
+  ...Object.values(STATE_EGRESS_HEADERS),
+  ...Object.values(STATE_EGRESS_PRIVATE_HEADERS),
+];
 
 export interface StateEgressBinding {
   fetch(request: Request): Promise<Response>;
 }
 
-export interface StateEgressContext {
+interface StateEgressCommonContext {
   readonly credential: string;
   readonly tenantTag: string;
   readonly environment: string;
   readonly resourceGroupId: string;
   readonly stateScriptName: string;
-  readonly routeHostname: string;
   readonly policyId: string;
 }
 
-/** Exact trusted-state bindings consumed by createStateEgressFetch. */
-export interface StateEgressEnv {
+export type StateEgressContext = StateEgressCommonContext &
+  (
+    | Readonly<{
+        routeHostname: string;
+        activationVersion?: never;
+        activationKind?: never;
+        dispatchKey?: never;
+      }>
+    | Readonly<{
+        routeHostname?: never;
+        activationVersion: '2';
+        activationKind: 'internal-dispatch';
+        dispatchKey: string;
+      }>
+  );
+
+interface StateEgressCommonEnv {
   readonly OUTBOUND_PROXY: StateEgressBinding;
   readonly OUTBOUND_PROXY_CREDENTIAL: string;
   readonly OUTBOUND_TENANT_ID: string;
   readonly OUTBOUND_ENVIRONMENT: string;
   readonly OUTBOUND_RESOURCE_GROUP_ID: string;
   readonly OUTBOUND_STATE_SCRIPT_NAME: string;
-  readonly OUTBOUND_ROUTE_HOSTNAME: string;
   readonly OUTBOUND_POLICY_ID: string;
   readonly DEPLOYMENT_IDENTITY_SECRET: string;
 }
+
+/** Exact trusted-state bindings consumed by createStateEgressFetch. */
+export type StateEgressEnv = StateEgressCommonEnv &
+  (
+    | Readonly<{
+        OUTBOUND_ROUTE_HOSTNAME: string;
+        OUTBOUND_ACTIVATION_VERSION?: never;
+        OUTBOUND_ACTIVATION_KIND?: never;
+        OUTBOUND_DISPATCH_KEY?: never;
+      }>
+    | Readonly<{
+        OUTBOUND_ROUTE_HOSTNAME?: never;
+        OUTBOUND_ACTIVATION_VERSION: '2';
+        OUTBOUND_ACTIVATION_KIND: 'internal-dispatch';
+        OUTBOUND_DISPATCH_KEY: string;
+      }>
+  );
 
 const CREDENTIAL_PATTERN = /^[\x21-\x7e]{32,256}$/;
 const RESOURCE_GROUP_PATTERN = /^[a-f0-9]{20}$/;
@@ -122,21 +166,47 @@ function stateEgressContext(env: StateEgressEnv): StateEgressContext {
   if (!SCRIPT_NAME_PATTERN.test(env.OUTBOUND_STATE_SCRIPT_NAME)) {
     throw new Error('trusted state outbound script is invalid');
   }
-  const routeHostname = canonicalRouteHostname(env.OUTBOUND_ROUTE_HOSTNAME);
-  if (!routeHostname) {
-    throw new Error('trusted state outbound route hostname is invalid');
-  }
   if (!POLICY_ID_PATTERN.test(env.OUTBOUND_POLICY_ID)) {
     throw new Error('trusted state outbound policy is invalid');
   }
-  return {
+  const common = {
     credential: env.OUTBOUND_PROXY_CREDENTIAL,
     tenantTag: env.OUTBOUND_TENANT_ID,
     environment: env.OUTBOUND_ENVIRONMENT,
     resourceGroupId: env.OUTBOUND_RESOURCE_GROUP_ID,
     stateScriptName: env.OUTBOUND_STATE_SCRIPT_NAME,
-    routeHostname,
     policyId: env.OUTBOUND_POLICY_ID,
+  };
+  if (env.OUTBOUND_ACTIVATION_VERSION === undefined) {
+    if (
+      env.OUTBOUND_ACTIVATION_KIND !== undefined ||
+      env.OUTBOUND_DISPATCH_KEY !== undefined
+    ) {
+      throw new Error('trusted state outbound activation is mixed');
+    }
+    const routeHostname =
+      typeof env.OUTBOUND_ROUTE_HOSTNAME === 'string'
+        ? canonicalRouteHostname(env.OUTBOUND_ROUTE_HOSTNAME)
+        : undefined;
+    if (!routeHostname) {
+      throw new Error('trusted state outbound route hostname is invalid');
+    }
+    return { ...common, routeHostname };
+  }
+  if (
+    env.OUTBOUND_ACTIVATION_VERSION !== '2' ||
+    env.OUTBOUND_ACTIVATION_KIND !== 'internal-dispatch' ||
+    env.OUTBOUND_ROUTE_HOSTNAME !== undefined ||
+    env.OUTBOUND_DISPATCH_KEY !==
+      `${env.OUTBOUND_TENANT_ID}:${env.OUTBOUND_ENVIRONMENT}`
+  ) {
+    throw new Error('trusted state outbound private activation is invalid');
+  }
+  return {
+    ...common,
+    activationVersion: '2',
+    activationKind: 'internal-dispatch',
+    dispatchKey: env.OUTBOUND_DISPATCH_KEY,
   };
 }
 
@@ -171,12 +241,22 @@ export function createStateEgressFetch(env: StateEgressEnv): typeof fetch {
     }
     const request = new Request(input, init);
     const headers = new Headers(request.headers);
+    for (const name of STATE_EGRESS_RESERVED_HEADERS) headers.delete(name);
     headers.set(STATE_EGRESS_CREDENTIAL_HEADER, context.credential);
     headers.set(STATE_EGRESS_TENANT_HEADER, context.tenantTag);
     headers.set(STATE_EGRESS_ENVIRONMENT_HEADER, context.environment);
     headers.set(STATE_EGRESS_RESOURCE_GROUP_HEADER, context.resourceGroupId);
     headers.set(STATE_EGRESS_SCRIPT_HEADER, context.stateScriptName);
-    headers.set(STATE_EGRESS_ROUTE_HOSTNAME_HEADER, context.routeHostname);
+    if (context.activationVersion === '2') {
+      headers.set(
+        STATE_EGRESS_ACTIVATION_VERSION_HEADER,
+        context.activationVersion,
+      );
+      headers.set(STATE_EGRESS_ACTIVATION_KIND_HEADER, context.activationKind);
+      headers.set(STATE_EGRESS_DISPATCH_KEY_HEADER, context.dispatchKey);
+    } else {
+      headers.set(STATE_EGRESS_ROUTE_HOSTNAME_HEADER, context.routeHostname);
+    }
     headers.set(STATE_EGRESS_POLICY_ID_HEADER, context.policyId);
     return service.fetch(new Request(request, { headers }));
   };

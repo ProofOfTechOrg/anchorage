@@ -306,6 +306,9 @@ export interface FlowsafeWorkerEnv {
   OUTBOUND_RESOURCE_GROUP_ID?: string;
   OUTBOUND_STATE_SCRIPT_NAME?: string;
   OUTBOUND_ROUTE_HOSTNAME?: string;
+  OUTBOUND_ACTIVATION_VERSION?: string;
+  OUTBOUND_ACTIVATION_KIND?: string;
+  OUTBOUND_DISPATCH_KEY?: string;
   OUTBOUND_POLICY_ID?: string;
   /** Dedicated control-plane credential for maintenance administration. */
   MAINTENANCE_ADMIN_SECRET?: string;
@@ -671,6 +674,9 @@ const STATE_EGRESS_ENV_KEYS = [
   'OUTBOUND_RESOURCE_GROUP_ID',
   'OUTBOUND_STATE_SCRIPT_NAME',
   'OUTBOUND_ROUTE_HOSTNAME',
+  'OUTBOUND_ACTIVATION_VERSION',
+  'OUTBOUND_ACTIVATION_KIND',
+  'OUTBOUND_DISPATCH_KEY',
   'OUTBOUND_POLICY_ID',
 ] as const;
 

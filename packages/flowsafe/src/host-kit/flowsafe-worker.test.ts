@@ -1636,6 +1636,35 @@ describe('createFlowsafeWorker maintenance duties', () => {
     expect(outboundFetch).not.toHaveBeenCalled();
   });
 
+  it('admits a trusted private state egress context without a route hostname', async () => {
+    const worker = makeWorker();
+    const { env, ctx } = makeEnv();
+    const outboundFetch = vi.fn(async () => new Response(null));
+    env.FLEET_RESOURCE_ROLE = 'platform-state';
+    env.FLEET_ENVIRONMENT = 'production';
+    env.FLEET_RESOURCE_GROUP = '0123456789abcdefabcd';
+    env.OUTBOUND_PROXY = { fetch: outboundFetch };
+    env.OUTBOUND_PROXY_CREDENTIAL = 'outbound-state-credential-0000000001';
+    env.OUTBOUND_TENANT_ID = 'acme';
+    env.OUTBOUND_ENVIRONMENT = 'production';
+    env.OUTBOUND_RESOURCE_GROUP_ID = '0123456789abcdefabcd';
+    env.OUTBOUND_STATE_SCRIPT_NAME =
+      'acme-production-state-0123456789abcdefabcd';
+    env.OUTBOUND_ACTIVATION_VERSION = '2';
+    env.OUTBOUND_ACTIVATION_KIND = 'internal-dispatch';
+    env.OUTBOUND_DISPATCH_KEY = 'acme:production';
+    env.OUTBOUND_POLICY_ID = '0123456789abcdefabcd';
+
+    const response = await worker.fetch(
+      new Request('http://host/healthz'),
+      env,
+      ctx,
+    );
+
+    expect(response.status).toBe(200);
+    expect(outboundFetch).not.toHaveBeenCalled();
+  });
+
   it('rejects candidate access to trusted state egress before service use', async () => {
     const worker = makeWorker();
     const { env, ctx } = makeEnv();
@@ -1650,6 +1679,20 @@ describe('createFlowsafeWorker maintenance duties', () => {
 
     expect(response.status).toBe(500);
     expect(outboundFetch).not.toHaveBeenCalled();
+  });
+
+  it('rejects a private dispatch key on a candidate Worker', async () => {
+    const worker = makeWorker();
+    const { env, ctx } = makeEnv();
+    env.OUTBOUND_DISPATCH_KEY = 'acme:production';
+
+    const response = await worker.fetch(
+      new Request('http://host/healthz'),
+      env,
+      ctx,
+    );
+
+    expect(response.status).toBe(500);
   });
 
   it('the purge duty runs ONLY the purge duties', async () => {
