@@ -35,8 +35,8 @@ export const DEPLOYMENT_SENTINEL_COLUMNS = Object.freeze([
 // The vocabulary and the DDL live HERE rather than beside the store that reads
 // them (src/do-runner/execution-fence.ts, which imports them from this module)
 // for one reason: this file is the only place both sides can share. It ships at
-// the package root and is loaded by the provisioning CLI, by fleet-control's
-// backends, and by the runtime — none of which can import the package's
+// the package root and is loaded by the provisioning CLI, a trusted
+// provisioning control plane, and the runtime — none of which can import the package's
 // TypeScript sources. And the two MUST be one string: the store's own
 // `CREATE TABLE IF NOT EXISTS` silently accepts a differently-shaped table this
 // protocol created, so a drifted copy would not fail, it would quietly drop the
@@ -324,8 +324,7 @@ function seedExecutionFenceRow(state, seededAt) {
     // fence an operator closed.
     //
     // `updated_at` is an INTEGER column bound as TEXT because D1's REST query
-    // API takes every parameter as a string (fleet-control's
-    // d1RestParameters rejects anything else). SQLite's INTEGER affinity
+    // API takes every parameter as a string. SQLite's INTEGER affinity
     // converts a well-formed integer literal on write, so the column still
     // holds a number.
     bindings: [EXECUTION_FENCE_ROW_ID, state, String(seededAt)],

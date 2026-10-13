@@ -35,6 +35,14 @@ export interface DoRefusalReason {
  * become this API's 429, and `{status: 0}` — routine on HTTP-client error
  * objects — would make `new Response` raise inside the very catch whose job is
  * to never throw. Everything unrecognized stays a 500.
+ *
+ * The run refusals that runtime.ts and run-lifecycle.ts declare as plain
+ * Errors carry a plain `readonly status` instead, and refusalStatus maps them
+ * by class. A thread object's signal routes render any DoStatusError with its
+ * own status and answer these 502, which the schedule tick retries; as
+ * subclasses they would tell a signal sender that the refusal of its own
+ * host's start was the sender's bad request or unknown thread. A new refusal,
+ * a host's included, extends this class.
  */
 export abstract class DoStatusError extends Error {
   /** The response status, 4xx or 5xx; any other status answers 500. */

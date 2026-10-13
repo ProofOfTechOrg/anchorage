@@ -179,7 +179,9 @@ export interface ScheduleTickStartAgentInput {
  * for a non-2xx response carries the status answered by the thread Durable
  * Object's start route as a numeric `status` property. An adapter that reaches
  * the route through another hop must not forward that hop's own status as a
- * refusal. Statuses 400, 403, 404 and 422 fail this fire, and the schedule keeps
+ * refusal. A startAgent that starts the agent through `RunnerRuntime` in
+ * process can let the runtime's refusal escape: it carries the status the run
+ * object answers it with. Statuses 400, 403, 404 and 422 fail this fire, and the schedule keeps
  * firing, once {@link ScheduleTickStatus} states that the run does not exist,
  * at that fire or on a later pass. A lookup that returns `undefined` fails the
  * fire after any other failure too, and one that returns a run resolves the
@@ -204,7 +206,11 @@ export interface ScheduleTickSignalAgentInput
  * hop's own status as a refusal. Statuses 400, 403, 404 and 422, which includes
  * a signal content denial, fail this fire, and the schedule keeps firing,
  * unless the target already stored a receipt for the fire, which then decides
- * it. Any other failure is retried on a later pass. The 404
+ * it. Any other failure is retried on a later pass. A signalAgent that calls
+ * the thread host in process and lets a runtime refusal escape fails the fire
+ * when the refusal's `status`, the one the run object answers it with, is 400
+ * or 404, while the same refusal through a thread object's signal route
+ * answers 502 and is retried. The 404
  * classification assumes D1 reads see the tick's own writes, using the default
  * primary-consistent D1 access without read-replication sessions.
  */
@@ -336,6 +342,12 @@ export interface ScheduleTickAuditEvent {
   scheduleId: string;
   /** Infrastructure-verified deployment tag for audit attribution. */
   deploymentTag?: string;
+  /**
+   * The fire's target kind. A stored kind other than `agent` is audited as
+   * `workflow`, as the tick dispatches it. A deferred fire settled without a
+   * dispatch record that parses names its schedule's target as the store reads
+   * it at settlement.
+   */
   target: 'workflow' | 'agent';
   outcome: ScheduleFireOutcome;
   /** The minted runId for a published fire. */
@@ -367,7 +379,13 @@ export interface ScheduleTickOptions {
   deploymentTag?: string;
   /** The deployment run cap. Absent means uncapped. */
   runCap?: ScheduleTickRunCap;
-  /** Every fire attempt is audited through this (accepted OR skipped/failed). Absent ⇒ no audit. */
+  /**
+   * Every fire attempt is audited through this (accepted OR skipped/failed),
+   * except a deferred fire settled without a dispatch record that parses
+   * whose schedule is not stored or cannot be read, and a lost claim whose
+   * schedule cannot be read: the tick logs `schedule-tick-bookkeeping-error`
+   * for them instead. Absent ⇒ no audit.
+   */
   audit?: ScheduleTickAuditSink;
   /**
    * The deployment execution fence, read ONCE per pass and BEFORE any CAS
@@ -795,6 +813,25 @@ function isPermanentDispatchError(error: unknown): boolean {
 }
 
 /**
+ * The audit target of a stored target kind: the tick dispatches every kind
+ * other than `agent` as a workflow, so the audit names it the same way.
+ */
+function auditTargetOfKind(kind: unknown): ScheduleTickAuditEvent['target'] {
+  return kind === 'agent' ? 'agent' : 'workflow';
+}
+
+/**
+ * The audit target of a fire settled without a dispatch record that parses:
+ * its schedule's stored kind mapped as auditTargetOfKind maps it, or
+ * `undefined` for a schedule that is not stored.
+ */
+function scheduleAuditTarget(
+  schedule: Schedule | null,
+): ScheduleTickAuditEvent['target'] | undefined {
+  return schedule ? auditTargetOfKind(schedule.target.type) : undefined;
+}
+
+/**
  * Age at which a lookup's 404 decides a threadless agent start the target did
  * not refuse. The tick sends a start only at its fire, and the target commits
  * an admitted start's run ownership, or its start recovery resolves the start,
@@ -972,12 +1009,21 @@ export function createScheduleTick(
       ref.runId,
     );
 
+  /**
+   * Settles as `failed` (`invalid-deferred-dispatch`) a deferred fire whose
+   * stored dispatch can be neither sent again nor decided by a lookup, counts
+   * it, and audits it with the stored dispatch's target when it parsed, or
+   * else its schedule's. A failed write counts the fire as deferred and
+   * audits nothing.
+   */
   const settleMalformedDispatch = async (
     trigger: ScheduleTrigger,
     result: ScheduleTickResult,
     error = 'stored deferred dispatch is malformed',
     recorded: Record<string, unknown> = {},
+    target?: ScheduleTickAuditEvent['target'],
   ): Promise<void> => {
+    const runId = trigger.runId ?? undefined;
     try {
       await store.recordTrigger({
         ...trigger,
@@ -988,16 +1034,49 @@ export function createScheduleTick(
           ...recorded,
         }),
       });
-      result.failed += 1;
-      result.reconciled += 1;
     } catch (bookkeepingError) {
       result.deferred += 1;
+      logBookkeepingError(trigger.scheduleId, runId, bookkeepingError);
+      return;
+    }
+    result.failed += 1;
+    result.reconciled += 1;
+    if (!options.audit) return;
+    let auditTarget = target;
+    if (auditTarget === undefined) {
+      try {
+        auditTarget = scheduleAuditTarget(
+          await store.getSchedule(trigger.scheduleId),
+        );
+      } catch (readError) {
+        logBookkeepingError(
+          trigger.scheduleId,
+          runId,
+          `the fire is not audited: its schedule cannot be read: ${
+            readError instanceof Error ? readError.message : String(readError)
+          }`,
+        );
+        return;
+      }
+    }
+    if (auditTarget === undefined) {
       logBookkeepingError(
         trigger.scheduleId,
-        trigger.runId ?? undefined,
-        bookkeepingError,
+        runId,
+        'the fire is not audited: its schedule target is unavailable',
       );
+      return;
     }
+    await auditOrLog(
+      {
+        scheduleId: trigger.scheduleId,
+        target: auditTarget,
+        outcome: 'failed',
+        reason: 'invalid-deferred-dispatch',
+        ...(runId === undefined ? {} : { runId }),
+      },
+      runId,
+    );
   };
 
   const reconcileDeferred = async (
@@ -1032,6 +1111,7 @@ export function createScheduleTick(
                   ? lookupError.message
                   : String(lookupError),
             },
+            stored.ref.target,
           );
           continue;
         }
@@ -1280,7 +1360,7 @@ export function createScheduleTick(
     at: number,
     result: ScheduleTickResult,
   ): Promise<void> => {
-    const targetType = schedule.target.type;
+    const targetType = auditTargetOfKind(schedule.target.type);
     // 1. Compute the next fire time. A corrupt cron cannot be advanced — the
     // facade validates cron at create, so this is a defense-in-depth edge. We do
     // NOT CAS-claim it (leaving nextFireAt would hot-loop, but a permanently
@@ -1443,7 +1523,7 @@ export function createScheduleTick(
       return;
     }
 
-    if (targetType === 'agent') {
+    if (schedule.target.type === 'agent') {
       const target = normalizeAndSanitizeAgentTarget(
         schedule.id,
         schedule.target,

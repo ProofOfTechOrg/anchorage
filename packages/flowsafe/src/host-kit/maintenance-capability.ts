@@ -64,9 +64,9 @@ const CAPABILITY_AUDIENCE = 'flowsafe-maintenance';
 const CAPABILITY_TYPE = 'flowsafe-maintenance-capability+jwt';
 const CAPABILITY_ASYMMETRIC_TYPE =
   'flowsafe-maintenance-asymmetric-capability+jwt';
-// Named after the protocol, like CAPABILITY_AUDIENCE above, deliberately NOT
-// after the consuming package: the previous value tracked the fleet-control
-// package name, so renaming that package forced a wire break for nothing.
+// Named after the protocol, like CAPABILITY_AUDIENCE above. Consumer package
+// names are outside the capability identity, so renaming a consumer does not
+// force a wire break.
 //
 // Both mintMaintenanceReceipt and verifyMaintenanceReceipt hard-code this, and
 // the issuer runs inside each deployed tenant Worker at whatever Flowsafe that

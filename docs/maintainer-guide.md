@@ -20,7 +20,7 @@ The root `package.json` `engines` field sets the Node and pnpm versions the work
 
 ## Verification
 
-Run these after dependency installation. `pnpm test` leaves out the direct scenario projects, which CI runs in gating jobs of their own; run them locally with `pnpm test:direct-scenario` (below).
+Run these after dependency installation.
 
 ```bash
 pnpm github:check
@@ -36,15 +36,12 @@ pnpm docs:api
 pnpm test:release-order
 pnpm test:release-invocation
 pnpm test:packed-breakwater
-pnpm test:packed-fleet-control
 pnpm test:packed-flowsafe-agent-host
 pnpm test:packed-flowsafe-provisioning
 pnpm --filter @proofoftech/flowsafe test:signals-client-export
 pnpm --filter @proofoftech/flowsafe typecheck:react18
 pnpm --filter showcase run react-doctor
 pnpm --filter @proofoftech/flowsafe spike:verify
-pnpm test:conformance-config
-pnpm conformance:verify
 ```
 
 Additional local checks:
@@ -62,22 +59,6 @@ move its pin to an unaudited commit, or treat an incomplete report as a
 passing scan.
 
 `spike:verify:llm` is a credentialed manual proof, not a merge requirement.
-
-### Direct scenario projects
-
-`pnpm test:direct-scenario` runs the direct scenario Vitest projects. `fleet-control-direct-scenario` takes about thirty-five minutes on a workstation. `fleet-control-direct-scenario-seams` contains the process-loss titles and takes about fifty-five minutes, with fifteen-to-twenty-minute quiet gaps. The projects drive the reference and tenant Workers through full runs on local workerd with native bindings. They need the package dists, so run `pnpm build` first. They reach no network. `pnpm test:direct-scenario:fast` and `pnpm test:direct-scenario:seams` run the projects separately. `pnpm test` runs the root workspace without them.
-
-To run one title, select it through the project's own config so its timeout and includes apply:
-
-```bash
-pnpm --filter @proofoftech/fleet-control exec vitest run \
-  --config vitest.direct-scenario-seams.config.ts \
-  test/direct-credentialed-scenario.seams.test.ts -t '<title>'
-```
-
-Put `--reporter=verbose` directly after `run` when you want the per-title lines; the project prints nothing between titles otherwise. Send the output to a file rather than through a pager or `tail`: a killed run then keeps what it printed.
-
-`pnpm test:packed-fleet-control` installs the packed tarball into a temporary consumer under `$TMPDIR`, so it needs a writable pnpm store and about two minutes; a sandbox that mounts the store read-only cannot run it, and the failure reads as an `EROFS` on the store, not as a test failure.
 
 ## Tooling conventions
 
@@ -107,14 +88,16 @@ The changesets base is `dev`. `onlyUpdatePeerDependentsWhenOutOfRange` prevents 
 2. The version workflow maintains a `Version Packages` pull request against `dev`.
 3. Review generated versions and changelogs, then merge that pull request into `dev`.
 4. Run the full gate on the versioned `dev` commit.
-5. For changes affecting Workers for Platforms behavior covered by the [paid namespace gate](fleet-control.md#run-paid-namespace-conformance), run `pnpm fleet-control:credentialed` against a disposable paid account using the exact versioned release candidate. Retain the successful proof and final scratch inventory before promotion. Ordinary Worker releases that do not change WFP behavior do not require this step.
-6. Open the promotion pull request from `dev` to `main`.
-7. Confirm the promotion contains no pending changeset files.
+5. Open the promotion pull request from `dev` to `main`.
+6. Confirm the promotion contains no pending changeset files.
+7. Confirm the publish credentials: each package the release publishes has a trusted publisher on npmjs.com naming `ProofOfTechOrg/anchorage`, `release.yml` and the `npm` environment, with `npm publish` allowed; the `npm` GitHub environment's deployment branches allow only `main`, and it holds the `NPM_TOKEN` secret; no repository or organization secret is named `NPM_TOKEN`. npm expires a new trusted-publisher configuration that completes no publish within two days, so create one no earlier than two days before this merge.
 8. Merge to `main`.
 9. The release workflow publishes unpublished package versions to npm with provenance, creates tags, and creates GitHub releases. It publishes the `PUBLISH_PREREQUISITES` packages in `scripts/publish-ordered.mjs` before the rest, so each exact or minimum package dependency is available first.
-10. Confirm npm tarballs, export smoke tests, release notes, Pages API docs, and the production showcase.
+10. Confirm npm tarballs, export smoke tests, release notes, Pages API docs, and the production showcase. `npm view @proofoftech/<package>@<version> _npmUser.trustedPublisher --json` prints the trusted publisher of a version published through OIDC and nothing for one that fell back to `NPM_TOKEN`.
 
 The release workflow never opens version pull requests or commits to `main`. A pending changeset on `main` is a freeze-window failure.
+
+`NPM_TOKEN` is a granular access token with publish rights on the `@proofoftech` scope and two-factor bypass, which npm expires after at most 90 days. npm publishes with it only when the OIDC exchange fails, and it reports no error for that exchange, so the `_npmUser.trustedPublisher` check is what shows which credential published. A publish that fails with `E401`, `E404` or `ENEEDAUTH` had no valid credential, and one that fails with `EOTP` used a token without two-factor bypass.
 
 ## Mastra compatibility
 
@@ -161,7 +144,7 @@ Repository administrators separately own:
 
 - GitHub Pages for generated API docs;
 - private vulnerability reporting;
-- npm trusted publishing or `NPM_TOKEN`;
+- npm trusted publishing, the `npm` GitHub environment, and `NPM_TOKEN`;
 - the showcase's Cloudflare bindings, secrets, domain, and OAuth callback;
 - branch protection and required checks.
 

@@ -4351,6 +4351,111 @@ describe('RunnerRuntime', () => {
     ).rejects.toBeInstanceOf(InvalidRunRequestError);
   });
 
+  it('classifies a start whose input fails the workflow input schema as a 400 carrying the schema text', async () => {
+    // #given
+    const { runtime } = buildRuntime(new InMemoryStore());
+
+    // #when / #then
+    await expect(
+      runtime.start('echo', {
+        runId: crypto.randomUUID(),
+        inputData: { value: 123 },
+      }),
+    ).rejects.toMatchObject({
+      name: 'InvalidRunRequestError',
+      status: 400,
+      message: expect.stringContaining('Invalid input data'),
+    });
+  });
+
+  it('classifies a start whose request context fails the workflow request-context schema as a 400 carrying the schema text', async () => {
+    // #given a workflow that declares a request-context schema
+    const { runtime, createStep, createWorkflow } = init(
+      { storage: new InMemoryStore() },
+      { startIdempotency: 'none', executionFence: 'none' },
+    );
+    createWorkflow({
+      id: 'tenant-scoped',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+      requestContextSchema: z.object({ tenant: z.string() }),
+    })
+      .then(
+        createStep({
+          id: 'noop',
+          inputSchema: z.object({}),
+          outputSchema: z.object({}),
+          execute: async () => ({}),
+        }),
+      )
+      .commit();
+
+    // #when a start carries a request context that fails it
+    const starting = runtime.start('tenant-scoped', {
+      runId: crypto.randomUUID(),
+      inputData: {},
+      storedRequestContext: { tenant: 7 },
+    });
+
+    // #then it is refused as a request the caller can fix
+    await expect(starting).rejects.toMatchObject({
+      name: 'InvalidRunRequestError',
+      status: 400,
+      message: expect.stringContaining(
+        "Request context validation failed for workflow 'tenant-scoped'",
+      ),
+    });
+  });
+
+  it('propagates a foreign start-leg error unchanged when its text contains a client-error phrase', async () => {
+    // #given — a storage read inside the start leg fails with schema-library
+    // text, carrying a caller category under an id core does not use for
+    // schema violations
+    const storage = new InMemoryStore();
+    const { runtime } = buildRuntime(storage);
+    const foreign = Object.assign(
+      new Error(
+        '[{"code":"invalid_type","path":["internal","field"],"message":"Invalid input: expected string, received number"}]',
+      ),
+      { id: 'STORAGE_ROW_PARSE_FAILED', category: 'USER' },
+    );
+    const workflows = await storage.getStore('workflows');
+    if (!workflows) throw new Error('workflows storage missing');
+    vi.spyOn(workflows, 'getWorkflowRunById').mockRejectedValueOnce(foreign);
+
+    // #when / #then — not reclassified as a 400 that publishes the text
+    await expect(
+      runtime.start('echo', {
+        runId: crypto.randomUUID(),
+        inputData: { value: 'x' },
+      }),
+    ).rejects.toBe(foreign);
+  });
+
+  it('propagates a foreign resume-leg error unchanged when its text contains a client-error phrase', async () => {
+    // #given — a storage read inside the resume leg fails with schema-library text
+    const storage = new InMemoryStore();
+    const { runtime } = buildRuntime(storage);
+    const started = await runtime.start('demo-approval', {
+      runId: crypto.randomUUID(),
+      inputData: { topic: 'foreign' },
+    });
+    const foreign = new Error(
+      '[{"code":"invalid_type","path":["internal","field"],"message":"Invalid input: expected string, received number"}]',
+    );
+    const workflows = await storage.getStore('workflows');
+    if (!workflows) throw new Error('workflows storage missing');
+    vi.spyOn(workflows, 'getWorkflowRunById').mockRejectedValueOnce(foreign);
+
+    // #when / #then — not reclassified as a 400 that publishes the text
+    await expect(
+      runtime.resume('demo-approval', started.runId, {
+        step: 'approval',
+        resumeData: { approvedBy: 'carol' },
+      }),
+    ).rejects.toBe(foreign);
+  });
+
   it('honors caller-provided runIds', async () => {
     // #given
     const { runtime } = buildRuntime(new InMemoryStore());
@@ -5813,13 +5918,43 @@ describe('RunnerRuntime run lifecycle', () => {
     ).resolves.toBe(false);
     releasePreparation();
 
-    // #then the resume is refused and its leg's abort names the transition
+    // #then the resume is refused as a run that is ending with that
+    // transition, and its leg's abort names the transition
     await expect(resuming).rejects.toMatchObject({
       name: 'RunTerminalConflictError',
+      message: new RunTerminalConflictError(
+        'held-workflow',
+        runId,
+        status,
+        'ending',
+      ).message,
     });
     expect(legAbort.signal.reason).toMatchObject({
       name: 'AbortError',
       cause: { name },
+    });
+  });
+
+  it('reports a run with no recorded cancellation or timeout when its terminal cleanup is requested', async () => {
+    // #given a run suspended at its step
+    const { runtime } = heldRuntime({ suspendFirst: true });
+    const runId = 'cleanup-not-ended';
+    await runtime.start('held-workflow', { runId, inputData: {} });
+
+    // #when terminal cleanup is requested for it
+    const cleanup = runtime.completeTerminalCleanup('held-workflow', runId, 0);
+
+    // #then the 409 conflict says no terminal transition is recorded and
+    // names the run's status
+    await expect(cleanup).rejects.toMatchObject({
+      name: 'RunTerminalConflictError',
+      status: 409,
+      message: new RunTerminalConflictError(
+        'held-workflow',
+        runId,
+        'suspended',
+        'no-terminal-transition',
+      ).message,
     });
   });
 
@@ -6112,10 +6247,47 @@ describe('RunnerRuntime run lifecycle', () => {
     await expect(starting).resolves.toMatchObject({ status: 'success' });
     await expect(cancellation).rejects.toMatchObject({
       name: 'RunTerminalConflictError',
+      message: new RunTerminalConflictError(
+        'reconcile-lock',
+        'reconcile-race',
+        'success',
+      ).message,
     });
     await expect(
       runtime.status('reconcile-lock', 'reconcile-race'),
     ).resolves.toMatchObject({ status: 'success' });
+  });
+});
+
+describe('RunTerminalConflictError', () => {
+  it.each([
+    ['terminal', 'cancelled', "is already terminal with status 'cancelled'"],
+    ['ending', 'timed_out', "is ending with status 'timed_out'"],
+    [
+      'leg-running',
+      'running',
+      "has a leg running in this runtime with status 'running'",
+    ],
+    [
+      'no-terminal-transition',
+      'success',
+      "has no recorded cancellation or timeout with status 'success'",
+    ],
+  ] as const)('states the %s condition with the run status', (conflict, runStatus, condition) => {
+    // #given a conflict naming that condition
+    const error = new RunTerminalConflictError(
+      'wf-1',
+      'run-1',
+      runStatus,
+      conflict,
+    );
+
+    // #then the 409 message names the run, its workflow, the condition and
+    // the status
+    expect(error).toMatchObject({
+      status: 409,
+      message: `run 'run-1' of workflow 'wf-1' ${condition}`,
+    });
   });
 });
 

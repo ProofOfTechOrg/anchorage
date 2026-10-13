@@ -1,6 +1,6 @@
 # Proposal: breakwater improvement roadmap
 
-> This document records roadmap decisions and remaining uncommitted work. Phase A, Phase B steps 1 through 3, Phase C steps 1 through 3, Phase D step 1, and physical-deployment Slices A through E are shipped. The [single-tenant physical-isolation decision](single-tenant-physical-isolation.md) supersedes pooled-host assumptions in the historical analysis below. Supported behavior is documented in [Breakwater architecture](../breakwater-architecture.md), [Durable agents](../durable-agents.md), [Policy engine](../policy-engine-design.md), and [Connector interface](../connector-interface.md).
+> This document records roadmap decisions and remaining uncommitted work. Phase A, Phase B steps 1 through 3, Phase C steps 1 through 3, Phase D step 1, and physical-deployment Slices A through E are shipped. The single-tenant physical-isolation decision supersedes pooled-host assumptions in the historical analysis below. Supported behavior is documented in [Breakwater architecture](../breakwater-architecture.md), [Durable agents](../durable-agents.md), [Policy engine](../policy-engine-design.md), and [Connector interface](../connector-interface.md).
 
 This document turns the limitations and ownership boundaries described in
 [`breakwater-purpose-and-boundaries.md`](../breakwater-purpose-and-boundaries.md)

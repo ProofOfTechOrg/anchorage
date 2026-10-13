@@ -4,6 +4,7 @@ import { isAbsolute, sep } from 'node:path';
 import test from 'node:test';
 import {
   newTagAnnouncement,
+  npmDryRunVersionViolation,
   PROBE_TIMEOUT_MS,
   PUBLISH_PREREQUISITES,
   peerFloorGrammarViolations,
@@ -593,6 +594,32 @@ test('only the dry-run variant carries --dry-run', () => {
       publishInvocation(target, { dryRun: true }).args.includes('--dry-run'),
       `${target.name} pre-flight would publish for real`,
     );
+  }
+});
+
+test('npm 10 satisfies the dry-run pre-flight prerequisite', () => {
+  for (const output of ['10.9.4\n', '10.0.0']) {
+    assert.equal(npmDryRunVersionViolation(output), undefined);
+  }
+});
+
+for (const version of ['11.21.0', '12.0.0']) {
+  test(`npm ${version} fails the dry-run pre-flight prerequisite and names its version`, () => {
+    const message = npmDryRunVersionViolation(`${version}\n`);
+
+    assert.equal(typeof message, 'string');
+    assert.ok(
+      message.includes(version),
+      `the message must name the npm that was found: ${message}`,
+    );
+  });
+}
+
+test('unparseable npm --version output fails the dry-run pre-flight prerequisite', () => {
+  for (const output of ['', 'not-a-version\n', '10.9\n']) {
+    const message = npmDryRunVersionViolation(output);
+
+    assert.ok(message, `${JSON.stringify(output)} must not pass as npm 10`);
   }
 });
 

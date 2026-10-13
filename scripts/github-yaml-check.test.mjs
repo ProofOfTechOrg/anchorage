@@ -22,10 +22,6 @@ import {
   PUBLISH_PREREQUISITES,
   VISIBILITY_DEADLINE_MS,
 } from './publish-ordered.mjs';
-import {
-  explicitProjects,
-  projectSelectors,
-} from './vitest-project-selectors.mjs';
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -92,41 +88,6 @@ function readVerifyGateJob() {
   const steps = (job.steps ?? []).filter((step) => 'run' in step);
   assert.equal(steps.length, 1, 'the verify gate job has one run step');
   return { job, step: steps[0] };
-}
-
-function invokedRootScript(run) {
-  const match = /^pnpm(?:\s+run)?\s+([^\s]+)\s*$/u.exec(run);
-  return match?.[1];
-}
-
-function assertDirectScenarioJobs(manifest, workflow) {
-  const selected = explicitProjects(
-    manifest.scripts['test:direct-scenario'] ?? '',
-  );
-  assert.ok(selected.length > 0, 'test:direct-scenario selects no project');
-  const needs = new Set(workflow.jobs.verify?.needs ?? []);
-  for (const project of selected) {
-    const jobs = Object.entries(workflow.jobs)
-      .filter(([, job]) =>
-        (job.steps ?? []).some((step) => {
-          if (typeof step.run !== 'string') return false;
-          const script = invokedRootScript(step.run);
-          if (!script) return false;
-          const jobProjects = projectSelectors(manifest.scripts[script] ?? '');
-          return jobProjects.length === 1 && jobProjects[0] === project;
-        }),
-      )
-      .map(([name]) => name);
-    assert.ok(
-      jobs.length > 0,
-      `project '${project}' has no CI job whose root script selects it alone`,
-    );
-    for (const job of jobs)
-      assert.ok(
-        needs.has(job),
-        `project '${project}' runs in '${job}', which verify.needs omits`,
-      );
-  }
 }
 
 function runVerifyGate(step, needs) {
@@ -775,13 +736,6 @@ test('the ci.yml gate job stays reachable and depends on its required jobs', () 
   );
 });
 
-test('each direct-scenario project has its own gating CI job', () => {
-  const manifest = JSON.parse(
-    readFileSync(join(repositoryRoot, 'package.json'), 'utf8'),
-  );
-  assertDirectScenarioJobs(manifest, readWorkflow());
-});
-
 // Which label a summary line carries and whether the step exits non-zero are
 // settled only by running the outcome step's own body.
 test('the ci.yml canary reds the job from a final outcome step that reads the ids it pins', () => {
@@ -1209,28 +1163,11 @@ test('the ci.yml gate rejects an empty or non-success needs context', (t) => {
   const { step } = readVerifyGateJob();
   const cases = [
     { needs: {}, succeeds: false },
-    {
-      needs: {
-        'verify-core': { result: 'success' },
-        'direct-scenario': { result: 'success' },
-        'direct-scenario-seams': { result: 'success' },
-      },
-      succeeds: true,
-    },
-    ...['direct-scenario', 'direct-scenario-seams'].flatMap((failedJob) =>
-      ['failure', 'cancelled', 'skipped'].map((result) => ({
-        needs: {
-          'verify-core': { result: 'success' },
-          'direct-scenario': {
-            result: failedJob === 'direct-scenario' ? result : 'success',
-          },
-          'direct-scenario-seams': {
-            result: failedJob === 'direct-scenario-seams' ? result : 'success',
-          },
-        },
-        succeeds: false,
-      })),
-    ),
+    { needs: { 'verify-core': { result: 'success' } }, succeeds: true },
+    ...['failure', 'cancelled', 'skipped'].map((result) => ({
+      needs: { 'verify-core': { result } },
+      succeeds: false,
+    })),
   ];
 
   for (const { needs, succeeds } of cases) {

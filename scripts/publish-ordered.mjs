@@ -7,14 +7,8 @@ import { isInvokedAsEntryPoint } from './entry-point.mjs';
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 
-// Ordered because `changeset publish` fans out with Promise.all: it has no
-// topological ordering and no wait. Breakwater is Flowsafe's peer dependency,
-// which npm never resolves at install, so that edge is only a consumer-facing
-// warning. Flowsafe is different: fleet-control packs an EXACT
-// `@proofoftech/flowsafe` version out of `workspace:*`, a hard dependency npm
-// does resolve. If the two published concurrently and Flowsafe's half failed,
-// fleet-control would sit on the registry permanently depending on a version
-// that does not exist, and npm forbids republishing a version.
+// Ordered because `changeset publish` has no ordering or wait. Breakwater
+// publishes first so consumers can satisfy Flowsafe's peer floor immediately.
 export const PUBLISH_PREREQUISITES = Object.freeze([
   {
     name: '@proofoftech/breakwater',
@@ -56,6 +50,20 @@ export function failureReason(result) {
   if (result.error) return result.error.message;
   if (result.signal) return `killed by ${result.signal}`;
   return `exit ${result.status}`;
+}
+
+const REQUIRED_DRY_RUN_NPM_MAJOR = 10;
+const NPM_VERSION_PATTERN = /^(\d+)\.\d+\.\d+(?:[-+]\S*)?$/;
+
+// Why npm 10: see the publish-invocation-check.mjs header.
+export function npmDryRunVersionViolation(versionOutput) {
+  const version = versionOutput.trim();
+  const match = NPM_VERSION_PATTERN.exec(version);
+  if (!match) {
+    return `npm --version printed ${JSON.stringify(version)}, which is not a version; the publish dry run must run on npm ${REQUIRED_DRY_RUN_NPM_MAJOR}`;
+  }
+  if (Number(match[1]) === REQUIRED_DRY_RUN_NPM_MAJOR) return undefined;
+  return `npm ${version} is installed, but the publish dry run must run on npm ${REQUIRED_DRY_RUN_NPM_MAJOR}, the npm whose dry run is verified to make no registry request (npm 11 and later read the registry and refuse an already-published version)`;
 }
 
 export function prerequisiteManifests() {

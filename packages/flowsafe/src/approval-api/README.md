@@ -112,13 +112,14 @@ never resumes a run.
   whose `code` is `RUN_NOT_SUSPENDED` found the run not suspended; read the
   run's status to learn whether it has ended, which refuses every retry. A
   resume whose `code` is `RUN_STATE_UNREADABLE` could not read the run's state;
-  a retry can succeed once it can. A failure that carries neither a `code` nor
-  a 4xx status reports `internal error` as its `error`, and so does a refusal
-  `RunnerRuntime` throws in process through `resumeViaRuntime`, such as an
-  unknown run, which carries no status. The original message is logged: on the
-  reader's `route-internal-error` line for an answer read from a run or thread
-  object, and on the `approvals.resume` line and in the `approval.resume` audit
-  event for a failure in process.
+  a retry can succeed once it can. A refusal `RunnerRuntime` throws in process
+  through `resumeViaRuntime`, such as an unknown run, carries the status the
+  run object answers it with, so it reports its message in process as the run
+  object's answer does. A failure that carries neither a `code` nor a 4xx
+  status reports `internal error` as its `error`. The original message is
+  logged: on the reader's `route-internal-error` line for an answer read from
+  a run or thread object, and on the `approvals.resume` line and in the
+  `approval.resume` audit event for a failure in process.
 - **Enforce separation of duties by default**: `decide()` rejects the
   requester and a reviewer who approved an earlier sequential gate in the same
   run. Parallel gates filed before either decision do not trigger the

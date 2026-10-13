@@ -41,16 +41,14 @@ Install with `pnpm install --frozen-lockfile`, then run the commands under
 [Verification](docs/maintainer-guide.md#verification) in the maintainer guide.
 
 Lint is one Biome pass at the root, and `pnpm test` is one root vitest run
-covering every package except the direct scenario projects
-(`pnpm test:direct-scenario`). Git hooks (husky) back the gate up:
+covering every package. Git hooks (husky) back the gate up:
 pre-commit runs Biome on staged files and checks the complete `.github` YAML
 directory when a `.github/**/*.{yml,yaml}` file is staged (lint-staged);
 pre-push runs react-doctor on the branch's changed files
 (`pnpm react-doctor:diff`; bypass with `git push --no-verify`). CI also runs a
 non-blocking compatibility probe against the newest `@mastra/core` 1.x release.
 The `protect main` ruleset requires the status check named `verify`, the gate
-job in `ci.yml`; `verify-core` and `direct-scenario` are in that job's `needs`
-list, along with `direct-scenario-seams`. Read the job for the rule it applies
+job in `ci.yml`; `verify-core` is in that job's `needs` list. Read the job for the rule it applies
 to that list.
 
 The showcase app uses mandatory absolute imports — `@/*` for `src`,
@@ -81,8 +79,7 @@ Versioning and publishing run through
 version bumps happening ON `dev` (bump-on-dev). Feature and fix PRs target the
 `dev` integration branch and include a changeset (`pnpm exec changeset` — pick
 the packages, a semver bump, and write the CHANGELOG entry) when they change
-published behavior of `@proofoftech/breakwater`, `@proofoftech/flowsafe`, or
-`@proofoftech/fleet-control`. As
+published behavior of `@proofoftech/breakwater` or `@proofoftech/flowsafe`. As
 changesets accumulate, the version workflow (`.github/workflows/version.yml`)
 maintains a standing **"Version Packages" PR against `dev`** with the pending
 bumps + CHANGELOG entries. Releasing is two merges: merge that PR into `dev`,
@@ -92,8 +89,9 @@ versions to npm with provenance and pushes the release tags — it refuses,
 loudly, if an unversioned changeset reached `main` (a feature merged into
 `dev` between the two merges; merge the regenerated Version Packages PR and
 re-cut the release PR). There is no post-release sync step: `main` never gets
-commits of its own. Publishing needs the `NPM_TOKEN` repository secret (an npm
-automation token with publish rights on the `@proofoftech` scope). `showcase`
+commits of its own. Publishing uses npm trusted publishing, with the
+`NPM_TOKEN` secret as a fallback; the maintainer guide's
+[release flow](docs/maintainer-guide.md#release-flow) covers both. `showcase`
 is private and never publishes.
 
 ## Governance

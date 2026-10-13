@@ -122,7 +122,7 @@ export {
 // EXECUTION_FENCE_ROW_ID, EXECUTION_FENCE_DDL — are deliberately absent: they
 // are the provisioning protocol's, shipped on
 // `@proofoftech/flowsafe/deployment-identity-protocol` where the provisioning
-// CLI and fleet-control can reach them too. Publishing them twice would let a
+// CLI and a provisioning control plane can reach them too. Publishing them twice would let a
 // consumer pin the table name from one subpath and the DDL from the other and
 // never learn they had drifted.
 export type {
