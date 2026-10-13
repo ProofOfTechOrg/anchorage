@@ -15,10 +15,14 @@ import {
   APPROVAL_ROLES,
   createActorResolver,
   createApprovalRouter,
+  createPrincipalActorContext,
   createResourceOwnershipSchema,
+  DECIDER_ROLES,
   RESOURCE_OWNERSHIP_TABLE,
+  selfDecisionExempts,
   trustAutomationPrincipal,
 } from '../approval-api/index.js';
+import type { ExecutionPrincipal } from '../approval-api/principal.js';
 import {
   type AuditProxyNamespaceLike,
   type AuditQueue,
@@ -68,6 +72,7 @@ import {
   verifyDurableObjectDeploymentIdentity,
   verifyDurableObjectDeploymentRequest,
 } from '../do-runner/index.js';
+import { isPathSafeId } from '../do-runner/path-safe-id.js';
 import { validateTablePrefix } from '../do-runner/table-prefix.js';
 import { readBoundedBody } from '../http-body.js';
 import {
@@ -383,7 +388,26 @@ export interface FlowsafeWorkerConfig<Env extends FlowsafeWorkerEnv>
     request: Request,
     env: Env,
     ctx: FlowsafeWorkerContext,
-    kit: { resolve: ActorResolver; topology: DoRunTopology },
+    kit: {
+      resolve: ActorResolver;
+      topology: DoRunTopology;
+      contextForStoredInvocation: (
+        journal: {
+          deploymentId: string;
+          tablePrefix: string;
+          get: (invocationId: string) => Promise<
+            | {
+                invocationId: string;
+                deploymentId: string;
+                tablePrefix: string;
+                principal: ExecutionPrincipal;
+              }
+            | undefined
+          >;
+        },
+        invocationId: string,
+      ) => Promise<ActorContext | undefined>;
+    },
   ) => Promise<Response | null>;
   /** Host policy immediately before a validated start reaches the run DO. */
   beforeStart?: (
@@ -1177,7 +1201,7 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
     'storageTablePrefix',
   );
   // Authenticate before constructing request-scoped services.
-  const buildResolve = (
+  const buildContexts = (
     env: Env,
     topology: DoRunTopology,
     waitUntil: (promise: Promise<unknown>) => void,
@@ -1185,28 +1209,41 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
     selfDecision: SelfDecisionPolicy,
     stream: ApprovalStreamSink | undefined,
     mutationEpoch: number | undefined,
-  ): ActorResolver => {
-    const base = createActorResolver({
+  ) => {
+    const storeFactory = approvalStoreFactoryFor(env.DB, storageTablePrefix);
+    const buildService = (store: ApprovalStore) =>
+      buildConfiguredApprovalService(config, env, topology, {
+        store,
+        executionFence: executionFenceForEnv(env),
+        workflowTablePrefix: (storageTablePrefix ?? '').toLowerCase(),
+        waitUntil,
+        notify,
+        stream,
+        allowSelfDecision: selfDecision,
+      });
+    const resolve = createActorResolver({
       mutationEpoch,
       authenticate: bearerActorAuthenticator(config.buildVerifier(env)),
-      storeFactory: approvalStoreFactoryFor(env.DB, storageTablePrefix),
+      storeFactory,
       deploymentTag: env.DEPLOYMENT_TENANT,
-      buildService: (store) =>
-        buildConfiguredApprovalService(config, env, topology, {
-          store,
-          executionFence: executionFenceForEnv(env),
-          workflowTablePrefix: (storageTablePrefix ?? '').toLowerCase(),
-          waitUntil,
-          notify,
-          stream,
-          allowSelfDecision: selfDecision,
-        }),
+      buildService,
       // The resolver's canSelfDecide display hint reads the SAME policy the
       // service enforces (passed to the shared service builder above), so the
       // /workflows echo can never contradict decide().
       allowSelfDecision: selfDecision,
     });
-    return base;
+    const contextForPrincipal = (principal: ExecutionPrincipal): ActorContext =>
+      createPrincipalActorContext({
+        principal,
+        mutationEpoch,
+        storeFactory,
+        deploymentTag: env.DEPLOYMENT_TENANT,
+        buildService,
+        canSelfDecide: (role) =>
+          DECIDER_ROLES.includes(role) &&
+          selfDecisionExempts(selfDecision, role),
+      });
+    return { resolve, contextForPrincipal };
   };
 
   // Parse ONCE per deployment value, memoized by the RAW
@@ -1595,7 +1632,7 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
               ),
             );
         }
-        const resolve = buildResolve(
+        const { resolve, contextForPrincipal } = buildContexts(
           env,
           topology,
           waitUntil,
@@ -1609,6 +1646,20 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
           const preResponse = await config.preRoutes(request, env, ctx, {
             resolve,
             topology,
+            contextForStoredInvocation: async (journal, invocationId) => {
+              if (!isPathSafeId(invocationId)) return undefined;
+              const invocation = await journal.get(invocationId);
+              if (
+                !invocation ||
+                invocation.invocationId !== invocationId ||
+                invocation.deploymentId !== journal.deploymentId ||
+                invocation.tablePrefix !== journal.tablePrefix ||
+                invocation.tablePrefix !==
+                  (storageTablePrefix ?? '').toLowerCase()
+              )
+                return undefined;
+              return contextForPrincipal(invocation.principal);
+            },
           });
           if (preResponse) return preResponse;
         }

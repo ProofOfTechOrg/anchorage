@@ -936,6 +936,126 @@ describe('createFlowsafeWorker fetch pipeline', () => {
     expect(await list.json()).toEqual([]);
   });
 
+  it('binds a pre-route context to the stored invocation principal', async () => {
+    const journal = {
+      deploymentId: 'deployment-1',
+      tablePrefix: '',
+      get: vi.fn(async () => ({
+        invocationId: 'invocation-1',
+        deploymentId: 'deployment-1',
+        tablePrefix: '',
+        principal: {
+          kind: 'service' as const,
+          id: 'trusted-dispatcher',
+          purpose: 'remote-step',
+        },
+      })),
+    };
+    const worker = makeWorker({
+      preRoutes: async (request, _env, _ctx, kit) => {
+        if (new URL(request.url).pathname !== '/test/stored-principal')
+          return null;
+        const context = await kit.contextForStoredInvocation(
+          journal,
+          'invocation-1',
+        );
+        return Response.json(context?.principal ?? null);
+      },
+    });
+    const { env, ctx } = makeEnv();
+
+    const response = await worker.fetch(
+      new Request('http://host/test/stored-principal'),
+      env,
+      ctx,
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      kind: 'service',
+      id: 'trusted-dispatcher',
+      purpose: 'remote-step',
+    });
+    expect(journal.get).toHaveBeenCalledWith('invocation-1');
+  });
+
+  it.each([
+    {
+      name: 'missing invocation',
+      invocationId: 'invocation-1',
+      row: undefined,
+      reads: 1,
+    },
+    {
+      name: 'mismatched invocation id',
+      invocationId: 'invocation-1',
+      row: { invocationId: 'another-invocation' },
+      reads: 1,
+    },
+    {
+      name: 'mismatched deployment',
+      invocationId: 'invocation-1',
+      row: { deploymentId: 'another-deployment' },
+      reads: 1,
+    },
+    {
+      name: 'mismatched table prefix',
+      invocationId: 'invocation-1',
+      row: { tablePrefix: 'another_' },
+      reads: 1,
+    },
+    {
+      name: 'invalid invocation id',
+      invocationId: '../invocation-1',
+      row: {},
+      reads: 0,
+    },
+  ])('refuses a stored-principal context for $name', async ({
+    invocationId,
+    row,
+    reads,
+  }) => {
+    const stored = {
+      invocationId: 'invocation-1',
+      deploymentId: 'deployment-1',
+      tablePrefix: '',
+      principal: {
+        kind: 'service' as const,
+        id: 'trusted-dispatcher',
+        purpose: 'remote-step',
+      },
+    };
+    const journal = {
+      deploymentId: 'deployment-1',
+      tablePrefix: '',
+      get: vi.fn(async () =>
+        row === undefined ? undefined : { ...stored, ...row },
+      ),
+    };
+    const worker = makeWorker({
+      preRoutes: async (request, _env, _ctx, kit) => {
+        if (new URL(request.url).pathname !== '/test/stored-principal')
+          return null;
+        const context = await kit.contextForStoredInvocation(
+          journal,
+          invocationId,
+        );
+        return Response.json(context?.principal ?? null);
+      },
+    });
+    const { env, ctx } = makeEnv();
+
+    const response = await worker.fetch(
+      new Request('http://host/test/stored-principal'),
+      env,
+      ctx,
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toBeNull();
+    expect(journal.get).toHaveBeenCalledTimes(reads);
+  });
+
   it('mounts the agent router after preRoutes and before the signal router', async () => {
     const order: string[] = [];
     const worker = makeWorker({
