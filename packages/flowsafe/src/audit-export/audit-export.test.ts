@@ -6,6 +6,7 @@ import {
   type AuditMessageBatch,
   type AuditQueueMessage,
   createAuditQueueConsumer,
+  createAuditQueueHandler,
   queueAuditSink,
 } from './index.js';
 
@@ -84,6 +85,24 @@ describe('queueAuditSink', () => {
       action: 'approval.decide',
       decision: 'allowed',
     });
+  });
+});
+
+describe('createAuditQueueHandler', () => {
+  it('retries without acknowledging when the export endpoint is missing', async () => {
+    const { batch, ackAll, retryAll } = makeBatch([
+      { action: 'approval.decide', decision: 'allowed' },
+    ]);
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    try {
+      await createAuditQueueHandler<TestEvent>({})(batch);
+
+      expect(retryAll).toHaveBeenCalledTimes(1);
+      expect(ackAll).not.toHaveBeenCalled();
+    } finally {
+      log.mockRestore();
+    }
   });
 });
 

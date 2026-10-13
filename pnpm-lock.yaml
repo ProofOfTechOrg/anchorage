@@ -124,37 +124,6 @@ importers:
         specifier: ^4.1.8
         version: 4.1.9(@types/node@22.20.0)(happy-dom@20.10.6)(jsdom@25.0.1)(vite@6.4.3(@types/node@22.20.0)(jiti@2.7.0)(yaml@2.9.0))
 
-  packages/fleet-control:
-    dependencies:
-      '@proofoftech/flowsafe':
-        specifier: workspace:*
-        version: link:../flowsafe
-      cloudflare:
-        specifier: 7.0.0
-        version: 7.0.0
-      p-queue:
-        specifier: 9.3.3
-        version: 9.3.3
-    devDependencies:
-      '@cloudflare/workers-types':
-        specifier: 5.20260905.1
-        version: 5.20260905.1
-      '@types/node':
-        specifier: 22.20.0
-        version: 22.20.0
-      typescript:
-        specifier: ^5.6
-        version: 5.9.3
-      vitest:
-        specifier: ^4.1.8
-        version: 4.1.9(@types/node@22.20.0)(happy-dom@20.10.6)(jsdom@25.0.1)(vite@6.4.3(@types/node@22.20.0)(jiti@2.7.0)(yaml@2.9.0))
-      wrangler:
-        specifier: 4.129.0
-        version: 4.129.0(@cloudflare/workers-types@5.20260905.1)
-      zod:
-        specifier: 4.4.3
-        version: 4.4.3
-
   packages/flowsafe:
     dependencies:
       '@mastra/cloudflare-d1':
@@ -1892,10 +1861,6 @@ packages:
   cloudflare@5.2.0:
     resolution: {integrity: sha512-dVzqDpPFYR9ApEC9e+JJshFJZXcw4HzM8W+3DHzO5oy9+8rLC53G7x6fEf9A7/gSuSCxuvndzui5qJKftfIM9A==}
 
-  cloudflare@7.0.0:
-    resolution: {integrity: sha512-ZU8Yp1biaRRf+i1Hlap/VUwSBeKnOa4kkygIU9naE07JILnHdgLr9Wq/iPEeEf2in0N5m1giTp1ohY+cNQZEGQ==}
-    hasBin: true
-
   color-convert@2.0.1:
     resolution: {integrity: sha512-RRECPsj7iu/xb5oKYcsFHSppFNnsj/52OVTRKb4zP5onXwVF3zVmmToNcOfGC+CRDpfK/U584fMg38ZHCaElKQ==}
     engines: {node: '>=7.0.0'}
@@ -2878,16 +2843,8 @@ packages:
     resolution: {integrity: sha512-e8vJF4XdVkzqqSHguEMz41mQO1wKwxKm5ENrUJQUu9kLDCtn83cxbyHZcszr4QC5zEA7WffRRC4gsTecC7J9oA==}
     engines: {node: '>=18'}
 
-  p-queue@9.3.3:
-    resolution: {integrity: sha512-NXAOdnEe5FsZJfT4oK84lE1Y5cFFdWlRuOo5tww8DyNMxyRXwn39fIkUtNLKppcPC+UYU/bXujNCUGDv01y7CA==}
-    engines: {node: '>=20'}
-
   p-retry@7.1.1:
     resolution: {integrity: sha512-J5ApzjyRkkf601HpEeykoiCvzHQjWxPAHhyjFcEUP2SWq0+35NKh8TLhpLw+Dkq5TZBFvUM6UigdE9hIVYTl5w==}
-    engines: {node: '>=20'}
-
-  p-timeout@7.0.1:
-    resolution: {integrity: sha512-AxTM2wDGORHGEkPCt8yqxOTMgpfbEHqF51f/5fJCmwFC3C/zNcGT63SymH2ttOAaiIws2zVg4+izQCjrakcwHg==}
     engines: {node: '>=20'}
 
   p-try@2.2.0:
@@ -5149,8 +5106,6 @@ snapshots:
     transitivePeerDependencies:
       - encoding
 
-  cloudflare@7.0.0: {}
-
   color-convert@2.0.1:
     dependencies:
       color-name: 1.1.4
@@ -6361,16 +6316,9 @@ snapshots:
 
   p-map@7.0.5: {}
 
-  p-queue@9.3.3:
-    dependencies:
-      eventemitter3: 5.0.4
-      p-timeout: 7.0.1
-
   p-retry@7.1.1:
     dependencies:
       is-network-error: 1.3.2
-
-  p-timeout@7.0.1: {}
 
   p-try@2.2.0: {}
 

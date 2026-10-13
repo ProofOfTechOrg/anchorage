@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import assert from 'node:assert/strict';
-import {
-  copyFileSync,
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  symlinkSync,
-  writeFileSync,
-} from 'node:fs';
+import { copyFileSync, mkdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join, relative } from 'node:path';
 import { test } from 'node:test';
 import { pathToFileURL } from 'node:url';
@@ -28,7 +21,6 @@ const { createRoot, run } = createChildProcessFixture({
 const packageScripts = {
   seed: 'packages/flowsafe/scripts/seed-deployment-identity.mjs',
   mint: 'packages/agent-starter/scripts/mint-token.mjs',
-  emit: 'packages/agent-starter/scripts/emit-conformance-config.mjs',
 };
 
 function copy(root, source, destination) {
@@ -41,7 +33,6 @@ function copy(root, source, destination) {
 function fixture(t, kind = 'root') {
   const { root, directory, events } = createRoot(t);
   let entry;
-  let output;
   if (kind === 'root') {
     entry = join(root, 'scripts/guarded.mjs');
     writeFileSync(
@@ -69,14 +60,6 @@ if (isInvokedAsEntryPoint(import.meta.url)) {
         join(root, 'node_modules'),
         'junction',
       );
-    } else {
-      copy(
-        root,
-        'packages/agent-starter/src/conformance/contract.json',
-        'src/conformance/contract.json',
-      );
-      mkdirSync(join(root, 'conformance'));
-      output = join(root, 'conformance/anchorage-starter.conformance.json');
     }
   }
   return {
@@ -85,7 +68,6 @@ if (isInvokedAsEntryPoint(import.meta.url)) {
     entry,
     events,
     kind,
-    output,
     argv: kind === 'seed' ? ['--entry-guard-probe'] : [],
     env: { AUTH_HMAC_SECRET: '' },
   };
@@ -103,28 +85,16 @@ function assertDirect(f, result) {
   } else {
     assert.equal(result.status, 0, result.stderr);
     assert.equal(result.stderr, '');
-    if (f.kind === 'emit') {
-      assert.equal(result.stdout, `wrote ${f.output}\n`);
-      assert.equal(
-        JSON.parse(readFileSync(f.output, 'utf8')).contractVersion,
-        1,
-      );
-    } else {
-      assert.equal(result.stdout, '');
-      assert.equal(activity(f), 'ran\n');
-    }
+    assert.equal(result.stdout, '');
+    assert.equal(activity(f), 'ran\n');
   }
 }
 
-function assertInert(f, result, stdout = '', existingOutput) {
+function assertInert(f, result, stdout = '') {
   assert.equal(result.status, 7, result.stderr);
   assert.equal(result.stdout, stdout);
   assert.equal(result.stderr, '');
   assert.equal(activity(f), '');
-  if (f.output) {
-    if (existingOutput === undefined) assert.equal(existsSync(f.output), false);
-    else assert.equal(readFileSync(f.output, 'utf8'), existingOutput);
-  }
 }
 
 function workerProgram(target, options) {
@@ -136,7 +106,7 @@ worker.on('error', error => { throw error; });
 worker.on('exit', code => { process.exitCode = code; });`;
 }
 
-for (const kind of ['root', 'seed', 'mint', 'emit']) {
+for (const kind of ['root', 'seed', 'mint']) {
   for (const entryKind of ['direct', 'file symlink', 'directory symlink']) {
     test(`${kind}: ${entryKind} invocation is the entry point`, async (t) => {
       const f = fixture(t, kind);
@@ -154,17 +124,15 @@ for (const kind of ['root', 'seed', 'mint', 'emit']) {
     });
   }
 
-  test(`${kind}: an importing entry remains inert and preserves output`, async (t) => {
+  test(`${kind}: an importing entry remains inert`, async (t) => {
     const f = fixture(t, kind);
-    const existingOutput = f.output ? 'existing configuration\n' : undefined;
-    if (f.output) writeFileSync(f.output, existingOutput);
     const entry = join(f.root, 'importer.mjs');
     writeFileSync(
       entry,
       `process.exitCode = 7; await import(${JSON.stringify(pathToFileURL(f.entry).href)});`,
     );
     const result = await run(f, { entry, argv: f.argv, env: f.env });
-    assertInert(f, result, '', existingOutput);
+    assertInert(f, result);
   });
 
   for (const alias of [false, true]) {
@@ -241,7 +209,6 @@ for (const kind of ['root', 'seed', 'mint', 'emit']) {
     assert.equal(result.stdout, '');
     assert.match(result.stderr, /ELOOP: too many symbolic links encountered/u);
     assert.equal(activity(f), '');
-    if (f.output) assert.equal(existsSync(f.output), false);
   });
 
   test(`${kind}: an eval worker import stays inert when its virtual name aliases the module`, async (t) => {

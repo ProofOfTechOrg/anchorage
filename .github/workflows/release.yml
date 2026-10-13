@@ -106,10 +106,8 @@ jobs:
           test "$(npm --version)" = 11.21.0
 
       # Publish Breakwater, then Flowsafe, each waiting for registry
-      # visibility, before Changesets fans out over the remainder. Flowsafe needs
-      # Breakwater for its agent-host peer floor, and fleet-control packs an
-      # exact Flowsafe version, so a concurrent publish could strand it on the
-      # registry depending on a version that never appeared.
+      # visibility, before Changesets fans out over the remainder. Flowsafe
+      # declares a Breakwater peer floor.
       - name: Publish unpublished versions to npm
         uses: changesets/action@a45c4d594aa4e2c509dc14a9f2b3b67ba3780d0d # v1.9.0
         with:
