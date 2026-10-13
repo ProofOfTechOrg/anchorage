@@ -39,6 +39,133 @@ function sharedStores(): [D1NotificationsStorage, D1NotificationsStorage] {
 }
 
 describe('host-owned notification operation receipt', () => {
+  it('refuses a new operation at the retained receipt cap while replay still succeeds', async () => {
+    const db = database();
+    const notifications = new D1NotificationsStorage(db, '', 1);
+    const input = {
+      id: 'notification-1',
+      threadId: 'thread',
+      source: 'remote-step',
+      kind: 'result',
+      summary: 'Completed',
+      createdAt: new Date('2026-10-13T00:00:00.000Z'),
+    };
+    const first = await notifications.createNotificationOnce(
+      'operation-1',
+      input,
+    );
+    await expect(
+      notifications.createNotificationOnce('operation-2', {
+        ...input,
+        id: 'notification-2',
+      }),
+    ).rejects.toThrow('notification operation receipt cap reached');
+    expect(
+      await notifications.createNotificationOnce('operation-1', input),
+    ).toEqual(first);
+    expect(
+      await notifications.getNotification({
+        threadId: 'thread',
+        id: 'notification-2',
+      }),
+    ).toBeNull();
+  });
+
+  it('admits at most one concurrent new operation at the last receipt slot', async () => {
+    const db = database();
+    const left = new D1NotificationsStorage(db, '', 1);
+    const right = new D1NotificationsStorage(db, '', 1);
+    const input = {
+      threadId: 'thread',
+      source: 'remote-step',
+      kind: 'result',
+      summary: 'Completed',
+      createdAt: new Date('2026-10-13T00:00:00.000Z'),
+    };
+    const results = await Promise.allSettled([
+      left.createNotificationOnce('operation-1', {
+        ...input,
+        id: 'notification-1',
+      }),
+      right.createNotificationOnce('operation-2', {
+        ...input,
+        id: 'notification-2',
+      }),
+    ]);
+    expect(
+      results.filter((result) => result.status === 'fulfilled'),
+    ).toHaveLength(1);
+    expect(
+      results.filter((result) => result.status === 'rejected'),
+    ).toHaveLength(1);
+    const receipts = await db
+      .prepare(
+        'SELECT operation_key FROM flowsafe_notification_operation_receipts',
+      )
+      .all<{ operation_key: string }>();
+    expect(receipts.results).toHaveLength(1);
+  });
+
+  it('does not reset a delivered notification when a stale same-key retry reaches the cap', async () => {
+    const db = database();
+    const first = new D1NotificationsStorage(db, '', 1);
+    let signalRead: () => void = () => undefined;
+    let releaseRead: () => void = () => undefined;
+    const readPaused = new Promise<void>((resolve) => {
+      signalRead = resolve;
+    });
+    const readReleased = new Promise<void>((resolve) => {
+      releaseRead = resolve;
+    });
+    let intercepted = false;
+    const retry = new D1NotificationsStorage(
+      interceptFirst(db, async (query, read) => {
+        const result = await read();
+        if (
+          !intercepted &&
+          result === null &&
+          query.includes(
+            'FROM flowsafe_notification_operation_receipts WHERE operation_key = ?',
+          )
+        ) {
+          intercepted = true;
+          signalRead();
+          await readReleased;
+        }
+        return result;
+      }),
+      '',
+      1,
+    );
+    await Promise.all([first.init(), retry.init()]);
+    const input = {
+      id: 'notification-1',
+      threadId: 'thread',
+      source: 'remote-step',
+      kind: 'result',
+      summary: 'Completed',
+      createdAt: new Date('2026-10-13T00:00:00.000Z'),
+    };
+    const pendingRetry = retry.createNotificationOnce('operation-1', input);
+    await readPaused;
+    const receipt = await first.createNotificationOnce('operation-1', input);
+    await first.updateNotification({
+      threadId: input.threadId,
+      id: input.id,
+      status: 'delivered',
+    });
+    releaseRead();
+    expect(await pendingRetry).toEqual(receipt);
+    expect(
+      (
+        await first.getNotification({
+          threadId: input.threadId,
+          id: input.id,
+        })
+      )?.status,
+    ).toBe('delivered');
+  });
+
   it('returns the first durable receipt after a lost acknowledgement without overwriting the inbox', async () => {
     const db = database();
     const atomicBatch = db.batch?.bind(db);

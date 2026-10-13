@@ -335,6 +335,7 @@ function isDuplicateColumn(error: unknown): boolean {
 export const NOTIFICATION_SEQUENCE_TABLE = 'flowsafe_notification_sequence';
 const NOTIFICATION_OPERATION_RECEIPTS_TABLE =
   'flowsafe_notification_operation_receipts';
+export const DEFAULT_NOTIFICATION_OPERATION_RECEIPT_LIMIT = 100_000;
 
 export class D1NotificationsStorage
   extends NotificationsStorage
@@ -344,18 +345,27 @@ export class D1NotificationsStorage
   readonly #table: string;
   readonly #sequenceTable: string;
   readonly #operationReceiptTable: string;
+  readonly #operationReceiptLimit: number;
   readonly #ordinalIndex: string;
   readonly #legacyReplaceTrigger: string;
   readonly #legacyInsertTrigger: string;
   #ready?: Promise<void>;
 
-  constructor(db: SignalDatabase, tablePrefix = '') {
+  constructor(
+    db: SignalDatabase,
+    tablePrefix = '',
+    operationReceiptLimit = DEFAULT_NOTIFICATION_OPERATION_RECEIPT_LIMIT,
+  ) {
     super();
     const prefix = validateTablePrefix(tablePrefix) ?? '';
     this.#db = db;
     this.#table = `${prefix}mastra_notifications`;
     this.#sequenceTable = `${prefix}${NOTIFICATION_SEQUENCE_TABLE}`;
     this.#operationReceiptTable = `${prefix}${NOTIFICATION_OPERATION_RECEIPTS_TABLE}`;
+    this.#operationReceiptLimit = nonnegativeSafeInteger(
+      operationReceiptLimit,
+      'operationReceiptLimit',
+    );
     this.#ordinalIndex = `idx_${this.#table}_insertion_ordinal`;
     this.#legacyReplaceTrigger = `trg_${this.#table}_preserve_insertion_ordinal`;
     this.#legacyInsertTrigger = `trg_${this.#table}_allocate_insertion_ordinal`;
@@ -659,7 +669,9 @@ export class D1NotificationsStorage
              WHERE NOT EXISTS (
                SELECT 1 FROM ${this.#table}
                WHERE thread_id = ? AND id = ?
-             )`,
+             ) AND (
+               SELECT COUNT(*) FROM ${this.#operationReceiptTable}
+             ) < ?`,
           )
           .bind(
             operationKey,
@@ -668,12 +680,13 @@ export class D1NotificationsStorage
             input.id,
             input.threadId,
             input.id,
+            this.#operationReceiptLimit,
           ),
         this.#db
           .prepare(
             `INSERT INTO ${this.#table} (${NOTIFICATION_COLUMNS.join(', ')})
              SELECT ${NOTIFICATION_COLUMNS.map(() => '?').join(', ')}
-             WHERE EXISTS (
+             WHERE changes() = 1 AND EXISTS (
                SELECT 1 FROM ${this.#operationReceiptTable}
                WHERE operation_key = ? AND request_digest = ?
              )`,
@@ -681,8 +694,16 @@ export class D1NotificationsStorage
           .bind(...values, operationKey, requestDigest),
       ]);
       const committed = await readReceipt();
-      if (!committed)
+      if (!committed) {
+        const count = await this.#db
+          .prepare(
+            `SELECT COUNT(*) AS count FROM ${this.#operationReceiptTable}`,
+          )
+          .first<{ count: number }>();
+        if (count && count.count >= this.#operationReceiptLimit)
+          throw new Error('notification operation receipt cap reached');
         throw new Error('notification operation was not committed');
+      }
       return receipt;
     } catch (error) {
       const committed = await readReceipt();
