@@ -2,6 +2,8 @@
 
 > Content type: design plan. Audience: FlowSafe maintainers and deployment hosts. Status: proposed, not implemented.
 
+The dated amendment at the end is the current execution plan. The preceding sections preserve the decision and code baseline from 2026-10-12.
+
 This plan records the limit of safe cross-instance resume recovery on pinned `@mastra/core@1.73.0`. Its `run.resume` can execute arbitrary tool closures, nested agents, background work, model calls and direct network effects outside a FlowSafe-owned adapter. General agent continuation is therefore ineligible for automatic replay. A narrow host-owned operation with an explicit, closed effect set may use a downstream idempotent executor; the subsequent Mastra continuation remains single-admission. An uncertain Mastra continuation stays unresolved and blocks drain until independent evidence or a future runtime contract resolves it.
 
 ## Baseline and evidence
@@ -218,3 +220,114 @@ else if (resumeNested) res = await run.resume({
 ```
 
 The pinned engine's workflow writes include persist, replace and patch paths without a remote-step generation. The closure calls above are enough to rule out an effect adapter that wraps only the FlowSafe host route. A future automatic-continuation proposal must inspect all engine write paths and bind its advancing write to durable resume provenance; a separate post-write journal update cannot serve as the receipt.
+
+## Amendment: execute the host-owned notification operation (2026-10-13)
+
+**Goal and status.** Implement recovery of a selected host-owned notification enqueue after a lost acknowledgement or host restart. `D1NotificationsStorage.createNotificationOnce` is the selected executor; it inserts the notification and immutable request receipt in one D1 batch. A native two-Durable-Object contention fixture has proved local atomicity. No production caller or deployed D1 proof exists. This amendment supersedes the earlier statement that no executor is selected; it does not authorize automatic Mastra `run.resume` replay.
+
+### Current baseline and constraints
+
+- Branch: `plan/flowsafe-remote-step-broker`; amendment base: `97237039350137f42bdc603303f3496f3e7f1431` (2026-10-13). Reconfirm each appendix anchor against the checked-out commit before editing. The historical `4096fbd` baseline above remains a record, not an edit target.
+- Use the repository's locked Node, pnpm, `@mastra/core@1.73.0`, Cloudflare Workers, Durable Objects and D1. Work in a linked worktree. Put checks and build artifacts under `/tmp`, and record an exit status in each log. ASP signing, dispatch policy and customer UI remain in ASP.
+- The 100,000 retained notification receipt cap is approved and implemented per configured D1 table prefix. One D1/prefix per deployment is the supported topology; a multi-prefix deployment must refuse this profile until deployment-wide accounting is designed. Measure D1 `rows_read` and latency near the cap before release; do not silently purge receipts.
+- A workflow-target v4 journal and private workflow route exist, but the selected executor and target-thread recovery below apply to an **agent** invocation. The workflow-target continuation remains a separate gate. The existing `recoverableResults` deliberately selects `target_kind = 'agent'` while drain inventory retains both kinds.
+
+### Operation identity and state contract
+
+The host selects the notification profile from trusted configuration, never from a result body. The profile fixes the notification source, kind, recipient thread/resource, identity and payload construction. Name and version one canonical projection, `notification-record-values-v1`, inside `notifications-d1.ts`; both the journal preparation and `createNotificationOnce` use its `JSON.stringify(recordValues(record))` UTF-8 bytes after defaults and field conversion. Persist the exact `CreateNotificationInput`, projection version, projected bytes and their SHA-256 digest before any effect attempt. The executor computes its receipt `request_digest` from those same bytes and returns or exposes that digest for exact comparison with the journal. Unknown projection versions refuse. Its `operationKey` binds deployment ID, journal invocation ID, run start token, suspension identity and the profile's operation ID; it is stable across host restarts and retries. The journal owns the mapping from this identity to one notification ID. A new resume lease owner does not change either ID. The executor's existing digest check refuses a reused key with changed notification input; the journal compares its stored digest to the executor receipt on every retry.
+
+Use a versioned journal record with states for prepared operation, effect admitted, receipt recorded, resume admitted and unresolved continuation. Keep terminal settlement and retained drain inventory. Preparation stores identity and request but grants no effect authority. Immediately before the first executor call, one conditional D1 write admits that exact host operation. Its SQL predicate checks the current fence row, deadline, stored principal and binding, start token, result digest, journal revision and authoritative suspension identity in the same D1 database transaction; the host's preceding run read is diagnostic, not the authority check. Require a schema path that can compare the authoritative snapshot's current suspension and generation in that transaction. If it cannot, leave the profile disabled. A zero-row or unreadable admission result refuses the effect. The successful write is the effect's linearization point: a later deadline or fence change cannot erase an already admitted operation, whose receipt remains drain work. If the admission write's outcome is ambiguous, reread the durable operation state before any executor call; never infer success from a timeout. After `createNotificationOnce` returns, persist its digest-bearing receipt with an equally bound compare-and-swap. A lost response is recoverable by calling the same method with the exact key and input only for a durably admitted operation; it returns the original receipt or refuses a changed request. Add a read-only receipt lookup inside `D1NotificationsStorage` so recovery can observe an old effect without creating a new one. If no receipt exists and admission was refused or cannot be proved, leave the row unresolved. A cap error before insertion leaves an admitted operation visible; existing-key retry still works at the cap.
+
+Persist a **one-time resume-admitted marker** before entering Mastra. It binds the exact retained result, suspension and operation receipt. The journal must permit one transition into admission and refuse every later attempt, including after lease expiry, deploy and restart. A crash after admission but before the call leaves an unresolved continuation; neither the receipt nor an advanced snapshot proves a second `run.resume` safe. The selected notification can recover automatically, but Mastra continuation cannot until its snapshot writes have generation fencing and attempt-linked provenance. This limit is an explicit release behavior, not a pending implementation shortcut.
+
+### Edit anchors and before → after
+
+The following excerpts are verbatim at the amendment base. Method names in the target sketches specify the contract to implement; inspect the actual types and line positions before editing.
+
+1. **Executor:** `packages/flowsafe/src/signals/notifications-d1.ts`, `D1NotificationsStorage.createNotificationOnce` currently enters with:
+
+   ```typescript
+   async createNotificationOnce(
+     operationKey: string,
+     input: CreateNotificationInput & { id: string; createdAt: Date },
+   ): Promise<{
+     operationKey: string;
+     notificationId: string;
+     threadId: string;
+   }> {
+   ```
+
+   The existing D1 batch inserts a receipt first and gates the inbox insert on `changes() = 1`. Reuse this direct method. Extract its `JSON.stringify(recordValues(record))` projection into one versioned function that the trusted host and executor both call, without changing the bytes or receipt behavior. The adapter constructs and freezes arguments from the prepared journal row. Expose the receipt digest and a read-only lookup under the same storage boundary; do not replace the D1 effect transaction.
+
+2. **Journal:** `packages/flowsafe/src/do-runner/remote-step-journal.ts`, `reconcileResult` currently starts:
+
+   ```typescript
+   if (invocation.status === 'resuming') return 'pending-quiescence';
+   const owner = await this.claimResume(invocationId, 60_000);
+   return this.settleAfterResume(invocationId, owner);
+   ```
+
+   Keep this fail-closed path for ordinary remote steps. Add a separate notification operation path whose order is `prepare` → `admitEffect` → `createNotificationOnce` → `recordReceipt` → `admitResume` → one trusted runtime call → witnessed settlement. `admitEffect` owns the atomic authority predicate described above. Recovery may repeat the executor with the stored key and request after proved effect admission and before `admitResume`; it must never use `claimResume` to reclaim a previously admitted Mastra call.
+
+3. **Host:** `packages/flowsafe/src/agent-host/thread-host.ts`, the retained-result route currently enters Mastra after:
+
+   ```typescript
+   const leaseOwner = await reader.claimResume(invocationId, 60_000);
+   const resumed = await withExecution(execution, () =>
+     durable.resumeViaRuntime({
+   ```
+
+   A notification-profile branch runs inside the same target thread's `withDispatchLock`. It re-reads the authoritative run and stored principal/binding, then requires the conditional `admitEffect` D1 write before calling `createNotificationOnce` from trusted host configuration. It records the receipt, rechecks authority for continuation, then commits the one-time marker before this runtime call. The ordinary branch retains its current fail-closed behavior. A host-only recovery method uses the same lock, authentication and stored-principal checks; it exposes no public result route.
+
+4. **Maintenance:** `createThreadAgentHost.recoverOwnership` currently uses:
+
+   ```typescript
+   return withDispatchLock(async () => {
+     const storage = options.stateStorage();
+   ```
+
+   The recovery method shares this serialization point. A scheduled maintenance Worker advances a durable, bounded D1 cursor over active notification-profile operations and routes each selected item to its owning thread Durable Object. The thread method shares the existing dispatch lock. Its alarm owner also wakes pending local work during no traffic; extend its existing `recoverOwnership` scheduling and delete conditions so notification work cannot be erased by owner recovery. Process a fixed batch, persist the next cursor, wrap at the end and rearm while work remains. Do not install a second independent alarm owner or scan retained terminal history. A failed item stays visible; one item cannot prevent progress through later IDs. A lease expiry schedules inspection but never authorizes another Mastra call.
+
+5. **Migration and mixed writers:** `remote-step-journal.ts` currently recognizes version 4 with:
+
+   ```typescript
+   if (record(rows[0])?.id === 1 && record(rows[0])?.version === 4) {
+   ```
+
+   Its current update trigger is:
+
+   ```typescript
+   const REMOTE_STEP_WRITE_TRIGGER_SQL = `CREATE TRIGGER ${REMOTE_STEP_WRITE_TRIGGER} BEFORE UPDATE ON ${REMOTE_STEP_TABLE} WHEN NEW.write_revision <= OLD.write_revision BEGIN SELECT RAISE(ABORT, 'remote step writer version changed'); END`;
+   ```
+
+   Migrate known v1–v4 rows into a validated v5 layout without losing permits, retained results or unsettled obligations. Add a required `write_generation` initialized to a positive value for migrated rows. Require v5 inserts to supply it and v5 updates to increase it through a D1 trigger; an already-initialized v4 writer preserves the value and is refused. Validate the table, indexes, trigger and exact schema version before reads or writes. Unknown or malformed layouts refuse. An old Worker that initializes after migration sees unknown version; prove both old-writer cases in an old/new Worker exercise before enabling dispatch. Legacy `resuming` rows without the new admission evidence remain unresolved.
+
+### Ordered implementation checkpoints
+
+1. **Journal contract and migration:** Add the v5 operation fields, conditional effect-admission transition, active index and drain inventory projection. Preserve existing v4 behavior and data. Refuse stale writers with the generation trigger and test both old-initialized and fresh old versions. Prove that the admission SQL can compare current fence and authoritative suspension in the same D1 transaction; otherwise keep the profile disabled. Use `remote-step-journal.ts` migration and conditional-write patterns rather than a parallel journal.
+2. **Trusted host executor:** Add the closed notification profile to the target thread host. Derive all effect fields from trusted stored context, share the executor's versioned projection and use `D1NotificationsStorage.createNotificationOnce` directly after proved effect admission. Save its digest-bearing receipt. Add the single-admission transition before runtime entry. Keep `resumeViaRuntime` one-shot and report ambiguous outcomes as unresolved.
+3. **Recovery duty:** Add host-only inspection, a scheduled D1 cursor scan and target-thread alarm wake through the existing owner recovery scheduler. Repeat a previously admitted effect with its stable key; after a refused or ambiguous admission, use read-only receipt inspection and keep missing evidence unresolved. Preserve progress after restart, duplicated alarms and an item that repeatedly fails. Never retry admitted continuation.
+4. **Cutover proof:** Keep the profile default off until native fresh-isolate and deployed D1 proof, old/new Worker refusal, authenticated host route negatives, cap latency measurement and drain inventory checks pass. Review and release via the Anchorage `dev` process; ASP integration follows a published, release-age-eligible FlowSafe version.
+
+No new package is needed. The existing direct D1 notification storage is the smallest integration boundary; a new executor package would duplicate its atomic receipt contract. An external notifier lacks this repository's D1 transaction and cannot satisfy this plan without a separate proof. General Mastra replay, workflow-target continuation, arbitrary tools, payment, customer dispatch and ASP policy are excluded for the reasons above.
+
+### Scoped verification and proof
+
+Select tests from the checkpoint's changed paths and shared contracts. The v5 schema is a shared contract, so run the owning FlowSafe package suite once for that checkpoint under the quality-gate exception. For other checkpoints use the named files below, then changed-file Biome, package typecheck/build when the tool cannot retain config with file targets. Redirect each command to a distinct `/tmp` log with the content ID and `EXIT_STATUS` footer. Run the repository full suite once after the final checkpoint, not at intermediate checkpoints.
+
+```bash
+pnpm --filter @proofoftech/flowsafe exec vitest run \
+  src/do-runner/remote-step-journal.test.ts \
+  src/agent-host/thread-host.test.ts \
+  src/signals/notifications-d1.test.ts
+pnpm exec biome check packages/flowsafe/src/do-runner/remote-step-journal.ts \
+  packages/flowsafe/src/agent-host/thread-host.ts \
+  packages/flowsafe/src/signals/notifications-d1.ts
+pnpm --filter @proofoftech/flowsafe typecheck:test
+pnpm --filter @proofoftech/flowsafe build
+pnpm --filter @proofoftech/flowsafe spike:verify
+```
+
+The gate owner narrows these candidates to the changed-file list and records the exact commands in its logs. All implementation checkpoints are T2: independent clean-code, QA, architecture and security lanes review the checkpoint diff and the called journal, host, D1 notification and alarm contracts. Review this amendment once at design level before implementation.
+
+The live proof must show one D1 notification and receipt when two fresh object instances race, including a lost acknowledgement, same-key retry at the last receipt slot, changed-request refusal and crash before/after receipt. Change the fence, deadline and suspension after preparation but before effect admission: the D1 write must refuse and the inbox must stay empty. Interrupt the admission response: recovery must read its durable result before any effect. Compare the journal's projected request bytes and digest with the executor's receipt digest, including defaulted and date fields. The proof must also show a persisted cursor eventually reaching work beyond one batch, duplicate alarm delivery, restart and no-traffic wake, an old Worker unable to write v5 rows, and blocked drain while Mastra admission is uncertain. Inspect the authoritative D1 receipt and inbox after each fault. Local workerd evidence does not substitute for a deployed D1 exercise. Successful notification recovery never implies automatic continuation; a test that calls `run.resume` twice fails this plan even if it observes one notification.
