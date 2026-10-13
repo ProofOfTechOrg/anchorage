@@ -21,6 +21,7 @@ import {
   createAgentThreadTopology,
   type RemoteStepContinuationReader,
   type RemoteStepDispatchReader,
+  type WorkflowRemoteStepDispatchReader,
 } from './thread-topology.js';
 
 const DEPLOYMENT_IDENTITY_SECRET = 'test-deployment-identity-secret-0001';
@@ -34,6 +35,7 @@ interface Hit {
 function harness(
   remoteSteps?: RemoteStepContinuationReader,
   remoteStepDispatch?: RemoteStepDispatchReader,
+  workflowRemoteStepDispatch?: WorkflowRemoteStepDispatchReader,
 ): {
   topology: AgentThreadDispatchTopology;
   hits: Hit[];
@@ -99,10 +101,178 @@ function harness(
       executionFence: 'none',
       ...(remoteSteps ? { remoteSteps } : {}),
       ...(remoteStepDispatch ? { remoteStepDispatch } : {}),
+      ...(workflowRemoteStepDispatch ? { workflowRemoteStepDispatch } : {}),
     }),
     hits,
   };
 }
+
+it('keeps workflow remote-step dispatch within the stored owner and deployment', async () => {
+  const owner = context().value;
+  const permit = {
+    invocationId: 'workflow-invocation',
+    generation: 2,
+    mutationEpoch: 7,
+    transitionRevision: 4,
+    expiresAt: 9_999_999_999_999,
+  };
+  const invocation = {
+    targetKind: 'workflow' as const,
+    invocationId: permit.invocationId,
+    deploymentId: 'deployment',
+    tablePrefix: '',
+    workflowId: 'customer-workflow',
+    runId: 'workflow-run',
+    principal: owner.principal,
+    startToken: 'stored-start-token',
+    stepPath: ['remote-step'],
+    suspendedAt: 1000,
+    request: { script: 'script-1' },
+    requestDigest: 'stored-request-digest',
+    deadlineAt: permit.expiresAt,
+    status: 'pending' as const,
+    permitGeneration: 1,
+  };
+  const dispatched = {
+    ...invocation,
+    status: 'dispatched' as const,
+    permitGeneration: permit.generation,
+  };
+  const reader: WorkflowRemoteStepDispatchReader = {
+    deploymentId: invocation.deploymentId,
+    tablePrefix: invocation.tablePrefix,
+    registerWorkflow: vi.fn(async () => invocation),
+    getWorkflow: vi
+      .fn()
+      .mockResolvedValueOnce(invocation)
+      .mockResolvedValue(dispatched),
+    readWorkflowDispatchRequestJson: vi.fn(async () => '{"script":"script-1"}'),
+    issuePermit: vi.fn(async () => permit),
+    consumePermit: vi
+      .fn()
+      .mockResolvedValueOnce({ kind: 'accepted', rawPermit: 'winner-secret' })
+      .mockResolvedValueOnce({ kind: 'already-consumed' }),
+    recordResult: vi.fn(async () => ({
+      kind: 'recorded' as const,
+      resultJson: '{"answer":42}',
+      resultDigest: 'stored-result-digest',
+    })),
+  };
+  const { topology } = harness(undefined, undefined, reader);
+  expect(
+    await topology.registerWorkflowRemoteStep(
+      owner,
+      invocation.workflowId,
+      invocation.runId,
+      10_000,
+    ),
+  ).toEqual(invocation);
+  expect(reader.registerWorkflow).toHaveBeenCalledWith(
+    {
+      targetKind: 'workflow',
+      deploymentId: invocation.deploymentId,
+      tablePrefix: invocation.tablePrefix,
+      workflowId: invocation.workflowId,
+      runId: invocation.runId,
+    },
+    10_000,
+    owner.principal,
+  );
+  const ticket = await topology.issueWorkflowRemoteStepDispatch(
+    owner,
+    invocation.invocationId,
+    60_000,
+  );
+  expect(ticket).toMatchObject({
+    invocationId: invocation.invocationId,
+    requestJson: '{"script":"script-1"}',
+    requestDigest: invocation.requestDigest,
+    permit,
+  });
+  expect(ticket).not.toHaveProperty('principal');
+  expect(ticket).not.toHaveProperty('startToken');
+  expect(
+    await topology.getWorkflowRemoteStep(owner, invocation.invocationId),
+  ).toEqual(dispatched);
+  expect(
+    await topology.consumeWorkflowRemoteStepDispatch(owner, permit),
+  ).toEqual({ kind: 'accepted', rawPermit: 'winner-secret' });
+  expect(
+    await topology.consumeWorkflowRemoteStepDispatch(owner, permit),
+  ).toEqual({ kind: 'already-consumed' });
+  expect(
+    await topology.recordWorkflowRemoteStepResult(
+      owner,
+      invocation.invocationId,
+      'winner-secret',
+      '{"answer":42}',
+      '{"quiescent":true}',
+    ),
+  ).toMatchObject({ kind: 'recorded', resultJson: '{"answer":42}' });
+  expect(reader.recordResult).toHaveBeenCalledWith(
+    invocation.invocationId,
+    'winner-secret',
+    '{"answer":42}',
+    '{"quiescent":true}',
+  );
+  const otherPrincipal = {
+    ...owner,
+    principal: {
+      kind: 'human' as const,
+      id: 'other',
+      role: 'operator' as const,
+    },
+  };
+  await expect(
+    topology.issueWorkflowRemoteStepDispatch(
+      otherPrincipal,
+      invocation.invocationId,
+      60_000,
+    ),
+  ).rejects.toMatchObject({ status: 404 });
+  await expect(
+    topology.consumeWorkflowRemoteStepDispatch(otherPrincipal, permit),
+  ).rejects.toMatchObject({ status: 404 });
+  await expect(
+    topology.recordWorkflowRemoteStepResult(
+      otherPrincipal,
+      invocation.invocationId,
+      'winner-secret',
+      '{"answer":42}',
+      '{"quiescent":true}',
+    ),
+  ).rejects.toMatchObject({ status: 404 });
+  const deniedRun = { ...owner, canAccessResource: async () => false };
+  await expect(
+    topology.registerWorkflowRemoteStep(
+      deniedRun,
+      invocation.workflowId,
+      invocation.runId,
+      10_000,
+    ),
+  ).rejects.toMatchObject({ status: 404 });
+  await expect(
+    topology.issueWorkflowRemoteStepDispatch(
+      deniedRun,
+      invocation.invocationId,
+      60_000,
+    ),
+  ).rejects.toMatchObject({ status: 404 });
+  vi.mocked(reader.getWorkflow).mockResolvedValueOnce({
+    ...dispatched,
+    deploymentId: 'another-deployment',
+  });
+  await expect(
+    topology.issueWorkflowRemoteStepDispatch(
+      owner,
+      invocation.invocationId,
+      60_000,
+    ),
+  ).rejects.toMatchObject({ status: 404 });
+  expect(reader.issuePermit).toHaveBeenCalledTimes(1);
+  expect(reader.consumePermit).toHaveBeenCalledTimes(2);
+  expect(reader.recordResult).toHaveBeenCalledTimes(1);
+});
 
 it('issues a remote dispatch ticket and exposes a raw permit to the consume winner', async () => {
   const permit = {

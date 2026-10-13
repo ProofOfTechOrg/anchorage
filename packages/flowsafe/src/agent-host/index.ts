@@ -14,6 +14,7 @@ export type {
   RecordedRemoteStepResult,
   RemoteStepInvocation,
   RemoteStepPermit,
+  WorkflowRemoteStepInvocation,
 } from '../do-runner/remote-step-journal.js';
 export {
   type AgentApprovalResumer,
@@ -58,6 +59,8 @@ export {
   type RemoteStepContinuationReader,
   type RemoteStepDispatchReader,
   type RemoteStepDispatchTicket,
+  type WorkflowRemoteStepDispatchReader,
+  type WorkflowRemoteStepDispatchTicket,
 } from './thread-topology.js';
 export {
   AGENT_AUDIT_CONTEXT_KEY,

@@ -1434,6 +1434,12 @@ describe('remote step journal dispatch admission', () => {
       'f908a6c18fa0b52b0f1295fc8f1cb5db083020cb18dab24ebf26637f55a9af49',
     );
     expect(await journal.get(first.invocationId)).toBeUndefined();
+    expect(
+      await journal.readWorkflowDispatchRequestJson(first.invocationId),
+    ).toBe('{"version":2,"input":{"query":"x"}}');
+    await expect(
+      journal.readDispatchRequestJson(first.invocationId),
+    ).rejects.toMatchObject({ status: 404 });
     expect(await journal.getWorkflow(first.invocationId)).toMatchObject({
       targetKind: 'workflow',
       status: 'pending',

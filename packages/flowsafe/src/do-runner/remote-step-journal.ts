@@ -1366,6 +1366,17 @@ export class RemoteStepJournal {
   }
 
   async readDispatchRequestJson(invocationId: string): Promise<string> {
+    return this.#readDispatchRequestJson(invocationId, 'agent');
+  }
+
+  async readWorkflowDispatchRequestJson(invocationId: string): Promise<string> {
+    return this.#readDispatchRequestJson(invocationId, 'workflow');
+  }
+
+  async #readDispatchRequestJson(
+    invocationId: string,
+    targetKind: 'agent' | 'workflow',
+  ): Promise<string> {
     if (!isPathSafeId(invocationId))
       throw new RemoteStepRefusal(400, 'invocation id is malformed');
     const row = rowResult(
@@ -1375,7 +1386,9 @@ export class RemoteStepJournal {
         .all(),
     );
     if (!row) throw new RemoteStepRefusal(404, 'invocation not found');
-    decode(row);
+    if (row.target_kind !== targetKind)
+      throw new RemoteStepRefusal(404, 'invocation not found');
+    decodeAny(row);
     return row.request_json;
   }
 
