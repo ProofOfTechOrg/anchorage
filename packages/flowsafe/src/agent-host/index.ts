@@ -81,3 +81,7 @@ export type {
   TrustedAgentExecution,
 } from './types.js';
 export { isPermissionIdentifier } from './types.js';
+export {
+  createWorkflowRemoteStepPreRoute,
+  WORKFLOW_REMOTE_STEP_ROUTE,
+} from './workflow-remote-step-route.js';

@@ -394,6 +394,29 @@ export interface FlowsafeWorkerConfig<Env extends FlowsafeWorkerEnv>
     kit: {
       resolve: ActorResolver;
       topology: DoRunTopology;
+      authorizePrivateWorkflowDispatch: (
+        request: Request,
+      ) => Promise<Response | undefined>;
+      contextForStoredWorkflowStart: (
+        workflowId: string,
+        runId: string,
+      ) => Promise<ActorContext | undefined>;
+      contextForStoredWorkflowInvocation: (
+        journal: {
+          deploymentId: string;
+          tablePrefix: string;
+          getWorkflow: (invocationId: string) => Promise<
+            | {
+                invocationId: string;
+                deploymentId: string;
+                tablePrefix: string;
+                principal: ExecutionPrincipal;
+              }
+            | undefined
+          >;
+        },
+        invocationId: string,
+      ) => Promise<ActorContext | undefined>;
       contextForStoredInvocation: (
         journal: {
           deploymentId: string;
@@ -1649,23 +1672,67 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
         );
 
         if (config.preRoutes) {
+          const contextForStoredInvocation = async (
+            journal: {
+              deploymentId: string;
+              tablePrefix: string;
+              get: (invocationId: string) => Promise<
+                | {
+                    invocationId: string;
+                    deploymentId: string;
+                    tablePrefix: string;
+                    principal: ExecutionPrincipal;
+                  }
+                | undefined
+              >;
+            },
+            invocationId: string,
+          ) => {
+            if (!isPathSafeId(invocationId)) return undefined;
+            const invocation = await journal.get(invocationId);
+            if (
+              !invocation ||
+              invocation.invocationId !== invocationId ||
+              invocation.deploymentId !== journal.deploymentId ||
+              invocation.tablePrefix !== journal.tablePrefix ||
+              invocation.tablePrefix !==
+                (storageTablePrefix ?? '').toLowerCase()
+            )
+              return undefined;
+            return contextForPrincipal(invocation.principal);
+          };
           const preResponse = await config.preRoutes(request, env, ctx, {
             resolve,
             topology,
-            contextForStoredInvocation: async (journal, invocationId) => {
-              if (!isPathSafeId(invocationId)) return undefined;
-              const invocation = await journal.get(invocationId);
+            authorizePrivateWorkflowDispatch: async (privateRequest) => {
+              const gate = await authorizeAdminCredential(privateRequest, env, {
+                surface: 'private workflow dispatch',
+                delegateCapability: false,
+              });
+              return gate.authorized ? undefined : gate.response;
+            },
+            contextForStoredWorkflowStart: async (workflowId, runId) => {
+              if (!isPathSafeId(workflowId) || !isPathSafeId(runId))
+                return undefined;
+              const receipt = await topology.startPrincipal(workflowId, runId);
               if (
-                !invocation ||
-                invocation.invocationId !== invocationId ||
-                invocation.deploymentId !== journal.deploymentId ||
-                invocation.tablePrefix !== journal.tablePrefix ||
-                invocation.tablePrefix !==
+                !receipt ||
+                receipt.execution.tablePrefix !==
                   (storageTablePrefix ?? '').toLowerCase()
               )
                 return undefined;
-              return contextForPrincipal(invocation.principal);
+              return contextForPrincipal(receipt.principal);
             },
+            contextForStoredWorkflowInvocation: (journal, invocationId) =>
+              contextForStoredInvocation(
+                {
+                  deploymentId: journal.deploymentId,
+                  tablePrefix: journal.tablePrefix,
+                  get: journal.getWorkflow.bind(journal),
+                },
+                invocationId,
+              ),
+            contextForStoredInvocation,
           });
           if (preResponse) return preResponse;
         }

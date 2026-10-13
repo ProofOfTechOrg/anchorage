@@ -191,6 +191,10 @@ it('keeps workflow remote-step dispatch within the stored owner and deployment',
   });
   expect(ticket).not.toHaveProperty('principal');
   expect(ticket).not.toHaveProperty('startToken');
+  expect(reader.issuePermit).toHaveBeenCalledWith(
+    invocation.invocationId,
+    60_000,
+  );
   expect(
     await topology.getWorkflowRemoteStep(owner, invocation.invocationId),
   ).toEqual(dispatched);
@@ -200,6 +204,8 @@ it('keeps workflow remote-step dispatch within the stored owner and deployment',
   expect(
     await topology.consumeWorkflowRemoteStepDispatch(owner, permit),
   ).toEqual({ kind: 'already-consumed' });
+  expect(reader.consumePermit).toHaveBeenNthCalledWith(1, permit);
+  expect(reader.consumePermit).toHaveBeenNthCalledWith(2, permit);
   expect(
     await topology.recordWorkflowRemoteStepResult(
       owner,
@@ -258,6 +264,19 @@ it('keeps workflow remote-step dispatch within the stored owner and deployment',
       60_000,
     ),
   ).rejects.toMatchObject({ status: 404 });
+  vi.mocked(reader.getWorkflow)
+    .mockResolvedValueOnce(dispatched)
+    .mockResolvedValueOnce({
+      ...dispatched,
+      permitGeneration: permit.generation + 1,
+    });
+  await expect(
+    topology.issueWorkflowRemoteStepDispatch(
+      owner,
+      invocation.invocationId,
+      60_000,
+    ),
+  ).rejects.toMatchObject({ status: 409 });
   vi.mocked(reader.getWorkflow).mockResolvedValueOnce({
     ...dispatched,
     deploymentId: 'another-deployment',
@@ -269,7 +288,7 @@ it('keeps workflow remote-step dispatch within the stored owner and deployment',
       60_000,
     ),
   ).rejects.toMatchObject({ status: 404 });
-  expect(reader.issuePermit).toHaveBeenCalledTimes(1);
+  expect(reader.issuePermit).toHaveBeenCalledTimes(2);
   expect(reader.consumePermit).toHaveBeenCalledTimes(2);
   expect(reader.recordResult).toHaveBeenCalledTimes(1);
 });
