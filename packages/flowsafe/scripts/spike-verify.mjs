@@ -111,6 +111,7 @@ const AUTH = {
 const STREAM_TICKET_SECRET = 'spike-local-stream-secret-do-not-deploy';
 const DEPLOYMENT_TENANT = 'spike';
 const DEPLOYMENT_IDENTITY_SECRET = 'spike-local-deployment-identity-secret';
+const PRIVATE_REMOTE_SECRET = 'spike-local-private-admin-secret-2026';
 const nowSec = () => Math.floor(Date.now() / 1000);
 
 // Track E (M-007): the github webhook signing secret. MUST equal
@@ -168,6 +169,8 @@ function startServer(generation, stateDir, logPath) {
       `DEPLOYMENT_TENANT:${DEPLOYMENT_TENANT}`,
       '--var',
       `DEPLOYMENT_IDENTITY_SECRET:${DEPLOYMENT_IDENTITY_SECRET}`,
+      '--var',
+      `MAINTENANCE_ADMIN_SECRET:${PRIVATE_REMOTE_SECRET}`,
       // Sign stream tickets with the SAME key spike-verify forges with, so the
       // ticket fail-closed probes exercise CLAIM rejection, not signature drift.
       '--var',
@@ -177,7 +180,8 @@ function startServer(generation, stateDir, logPath) {
       '--var',
       `GITHUB_WEBHOOK_SECRET:${GITHUB_WEBHOOK_SECRET}`,
       ...(generation.startsWith('gen-remote-') ||
-      generation.startsWith('gen-workflow-remote-')
+      generation.startsWith('gen-workflow-remote-') ||
+      generation.startsWith('gen-private-remote-')
         ? ['--var', 'SPIKE_REMOTE_STEP_PROOF:enabled']
         : []),
     ],
@@ -3687,6 +3691,151 @@ async function main() {
         claim.status === 404,
         'workflow continuation remains unavailable',
         claim,
+      );
+    },
+  );
+
+  await step(
+    'RS3 private workflow route: trusted start, one permit winner, retained result and restart refusal',
+    async () => {
+      await killServer(currentServer);
+      await launchServer(
+        'gen-private-remote-1',
+        stateDir,
+        join(tmpDir, 'gen-private-remote-1.log'),
+      );
+      const route = '/_flowsafe/workflow-remote-step';
+      const privateHeaders = {
+        authorization: `Bearer ${PRIVATE_REMOTE_SECRET}`,
+      };
+      const absent = await http('POST', `${route}/register`, {
+        body: {
+          workflowId: 'spike-private-remote',
+          runId: 'unknown-run',
+          hostDeadlineAt: Date.now() + 120_000,
+        },
+      });
+      assert(
+        absent.status === 401,
+        'missing private credential is refused',
+        absent,
+      );
+      const wrong = await http('POST', `${route}/register`, {
+        headers: AUTH.admin,
+        body: {
+          workflowId: 'spike-private-remote',
+          runId: 'unknown-run',
+          hostDeadlineAt: Date.now() + 120_000,
+        },
+      });
+      assert(
+        wrong.status === 401,
+        'ordinary admin bearer cannot delegate private authority',
+        wrong,
+      );
+      const started = await http('POST', '/runs', {
+        headers: AUTH.operator,
+        body: {
+          workflowId: 'spike-private-remote',
+          inputData: { query: 'x' },
+        },
+      });
+      assert(
+        started.status === 200 &&
+          started.body.status === 'suspended' &&
+          typeof started.body.runId === 'string',
+        'real workflow suspends under its Durable Object',
+        started,
+      );
+      const runId = started.body.runId;
+      const registered = await http('POST', `${route}/register`, {
+        headers: privateHeaders,
+        body: {
+          workflowId: 'spike-private-remote',
+          runId,
+          hostDeadlineAt: Date.now() + 120_000,
+        },
+      });
+      assert(
+        registered.status === 200 &&
+          typeof registered.body.invocationId === 'string',
+        'verified stored start registers the workflow invocation',
+        registered,
+      );
+      const invocationId = registered.body.invocationId;
+      const issued = await http('POST', `${route}/ticket`, {
+        headers: privateHeaders,
+        body: { invocationId, lifetimeMs: 60_000 },
+      });
+      assert(
+        issued.status === 200 &&
+          issued.body.runId === runId &&
+          issued.body.requestJson === '{"version":2,"input":{"query":"x"}}' &&
+          issued.body.permit?.generation === 1,
+        'private ticket binds the real suspension and dispatch request',
+        issued,
+      );
+      const attempts = await Promise.all(
+        [0, 1].map(() =>
+          http('POST', `${route}/consume`, {
+            headers: privateHeaders,
+            body: { permit: issued.body.permit },
+          }),
+        ),
+      );
+      assert(
+        attempts.filter((attempt) => attempt.body.kind === 'accepted')
+          .length === 1 &&
+          attempts.filter((attempt) => attempt.body.kind === 'already-consumed')
+            .length === 1,
+        'private workflow permit has one consumer',
+        attempts,
+      );
+      const rawPermit = attempts.find(
+        (attempt) => attempt.body.kind === 'accepted',
+      ).body.rawPermit;
+      const recorded = await http('POST', `${route}/result`, {
+        headers: privateHeaders,
+        body: {
+          invocationId,
+          rawPermit,
+          resultJson: '{"answer":1}',
+          evidenceJson: '{"receipt":"complete"}',
+        },
+      });
+      assert(
+        recorded.status === 200 && recorded.body.kind === 'recorded',
+        'private workflow result is retained',
+        recorded,
+      );
+      await killServer(currentServer);
+      await launchServer(
+        'gen-private-remote-2',
+        stateDir,
+        join(tmpDir, 'gen-private-remote-2.log'),
+      );
+      const replay = await http('POST', `${route}/consume`, {
+        headers: privateHeaders,
+        body: { permit: issued.body.permit },
+      });
+      assert(
+        replay.status === 200 && replay.body.kind === 'already-consumed',
+        'fresh process refuses a second effect authority',
+        replay,
+      );
+      const resultReplay = await http('POST', `${route}/result`, {
+        headers: privateHeaders,
+        body: {
+          invocationId,
+          rawPermit,
+          resultJson: '{"answer":1}',
+          evidenceJson: '{"receipt":"complete"}',
+        },
+      });
+      assert(
+        resultReplay.status === 200 && resultReplay.body.kind === 'replay',
+        'fresh process returns the retained result on replay',
+        resultReplay,
       );
     },
   );

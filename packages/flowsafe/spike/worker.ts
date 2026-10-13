@@ -87,7 +87,9 @@ import {
   createAgentRouter,
   createAgentThreadTopology,
   createThreadAgentHost,
+  createWorkflowRemoteStepPreRoute,
   type ThreadAgentHost,
+  WORKFLOW_REMOTE_STEP_ROUTE,
 } from '../src/agent-host/index.js';
 import { readAgentThreadBinding } from '../src/agent-runner/index.js';
 import {
@@ -165,11 +167,14 @@ import {
   abandonApprovalsForRun,
   bearerActorAuthenticator,
   createDoRunTopology,
+  createFlowsafeMaintenanceDurableObject,
+  createFlowsafeWorker,
   createHubTopology,
   createRunRouter,
   createStreamRouter,
   createThreadTopology,
   doSummary,
+  type FlowsafeWorkerConfig,
   RunRouteError,
   staticTokenVerifier,
   type WorkflowMeta,
@@ -215,6 +220,8 @@ interface Env {
   /** Singleton deployment signal-provider host DO; see DemoSignalProviderHost (Track E). */
   SIGNAL_PROVIDER_HOST: DurableObjectNamespace;
   BACKGROUND_TASKS: DurableObjectNamespace;
+  MAINTENANCE: DurableObjectNamespace;
+  MAINTENANCE_ADMIN_SECRET: string;
   SPIKE_REMOTE_STEP_PROOF?: string;
   SPIKE_LLM_MODEL_ID?: string;
   SPIKE_LLM_API_KEY?: string;
@@ -670,6 +677,12 @@ async function countExecution(db: D1Database, counterId: string) {
 
 const WORKFLOWS: ReadonlyArray<WorkflowMeta> = [
   {
+    id: 'spike-private-remote',
+    title: 'Private remote-step proof',
+    description: 'Suspends a real D1-backed workflow for private dispatch',
+    sampleInput: { query: 'x' },
+  },
+  {
     id: 'demo-approval',
     title: 'Demo approval',
     description:
@@ -857,6 +870,28 @@ function defineWorkflows(env: Env): RunnerRuntime {
     .then(research)
     .then(approval)
     .then(publish)
+    .commit();
+
+  createWorkflow({
+    id: 'spike-private-remote',
+    inputSchema: z.object({ query: z.string() }),
+    outputSchema: z.object({ query: z.string() }),
+  })
+    .then(
+      createStep({
+        id: 'execute',
+        inputSchema: z.object({ query: z.string() }),
+        outputSchema: z.object({ query: z.string() }),
+        execute: async ({ inputData, suspend }) =>
+          suspend({
+            type: 'suspension',
+            remoteStep: {
+              marker: WORKFLOW_REMOTE_STEP_MARKER,
+              request: { version: 2, input: { query: inputData.query } },
+            },
+          }),
+      }),
+    )
     .commit();
 
   // FI1/FI2: demo-approval's shape with a COUNTING first step. The step is
@@ -3273,6 +3308,53 @@ async function handleRemoteStepProbe(
   }
 }
 
+const privateRemoteConfig: FlowsafeWorkerConfig<Env> = {
+  systemPrincipalId: SYSTEM_PRINCIPAL_ID,
+  workflows: WORKFLOWS,
+  maintenance: { sweepIntervalMs: 60_000, purgeIntervalMs: 60_000 },
+  buildVerifier: () => staticTokenVerifier(SPIKE_ACTORS),
+  preRoutes: async (request, env, ctx, kit) => {
+    if (
+      !new URL(request.url).pathname.startsWith(
+        `${WORKFLOW_REMOTE_STEP_ROUTE}/`,
+      )
+    )
+      return null;
+    const unauthorized = await kit.authorizePrivateWorkflowDispatch(request);
+    if (unauthorized) return unauthorized;
+    const journal = new RemoteStepJournal({
+      db: env.DB as unknown as never,
+      fence: executionFenceForEnv(env),
+      runtime: defineWorkflows(env),
+      deploymentId: env.DEPLOYMENT_TENANT,
+      tablePrefix: '',
+      allowedToolIds: ['remote_lookup'],
+      verifyCompletion: async () => undefined,
+      verifyWorkflowCompletion: async () => undefined,
+    });
+    await journal.initialize();
+    const dispatch = createAgentThreadTopology(
+      env.THREAD,
+      env.DEPLOYMENT_IDENTITY_SECRET,
+      {
+        startIdempotency: startIdempotencyForEnv(env),
+        executionFence: executionFenceForEnv(env),
+        workflowRemoteStepDispatch: journal,
+      },
+    );
+    return createWorkflowRemoteStepPreRoute(journal, dispatch)(
+      request,
+      env,
+      ctx,
+      kit,
+    );
+  },
+};
+
+const privateRemoteWorker = createFlowsafeWorker(privateRemoteConfig);
+export const DemoPrivateMaintenance =
+  createFlowsafeMaintenanceDurableObject(privateRemoteConfig);
+
 const handler: ExportedHandler<Env> = {
   async fetch(
     request: CfRequest,
@@ -3309,6 +3391,13 @@ const handler: ExportedHandler<Env> = {
       buildService: (store) => buildApprovalService(store, env, streamSink),
     });
     const routed = request as unknown as Request;
+    if (
+      new URL(routed.url).pathname.startsWith(`${WORKFLOW_REMOTE_STEP_ROUTE}/`)
+    ) {
+      if (env.SPIKE_REMOTE_STEP_PROOF !== 'enabled')
+        return json({ error: 'not found' }, 404);
+      return privateRemoteWorker.fetch(routed, env, ctx);
+    }
     const runTopology = createDoRunTopology(
       env.RUNNER,
       env.DEPLOYMENT_IDENTITY_SECRET,
