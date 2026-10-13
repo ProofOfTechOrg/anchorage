@@ -214,6 +214,7 @@ interface Env {
   /** Singleton deployment signal-provider host DO; see DemoSignalProviderHost (Track E). */
   SIGNAL_PROVIDER_HOST: DurableObjectNamespace;
   BACKGROUND_TASKS: DurableObjectNamespace;
+  SPIKE_REMOTE_STEP_PROOF?: string;
   SPIKE_LLM_MODEL_ID?: string;
   SPIKE_LLM_API_KEY?: string;
   SPIKE_LLM_BASE_URL?: string;
@@ -3087,6 +3088,8 @@ async function handleRemoteStepProbe(
 ): Promise<Response | null> {
   const path = new URL(request.url).pathname;
   if (!path.startsWith('/spike/remote-step/')) return null;
+  if (env.SPIKE_REMOTE_STEP_PROOF !== 'enabled')
+    return json({ error: 'not found' }, 404);
   const operation = path.slice('/spike/remote-step/'.length);
   if (
     request.method !==

@@ -176,6 +176,9 @@ function startServer(generation, stateDir, logPath) {
       // with, so a valid webhook is ACCEPTED and a forged one REJECTED (E-S2).
       '--var',
       `GITHUB_WEBHOOK_SECRET:${GITHUB_WEBHOOK_SECRET}`,
+      ...(generation.startsWith('gen-remote-')
+        ? ['--var', 'SPIKE_REMOTE_STEP_PROOF:enabled']
+        : []),
     ],
     {
       cwd: FLOWSAFE,
@@ -764,6 +767,18 @@ async function main() {
 
   await step('gen-1: server ready', () =>
     launchServer('gen-1', stateDir, join(tmpDir, 'gen1.log')),
+  );
+
+  await step(
+    'RS0 remote-step fixture is absent unless explicitly enabled',
+    async () => {
+      const absent = await http('GET', '/spike/remote-step/scan');
+      assert(
+        absent.status === 404,
+        'remote-step fixture stays unmounted',
+        absent,
+      );
+    },
   );
 
   await step(
@@ -3475,6 +3490,23 @@ async function main() {
           retained.body.result.resultJson === '{"answer":1}',
         'fresh workerd process reads the persisted result',
         retained,
+      );
+      const permitReplay = await http('POST', '/spike/remote-step/consume', {
+        body: { permit: issued.body },
+      });
+      assert(
+        permitReplay.status === 200 &&
+          permitReplay.body.kind === 'already-consumed',
+        'fresh process refuses to grant the consumed permit again',
+        permitReplay,
+      );
+      const resultReplay = await http('POST', '/spike/remote-step/record', {
+        body: { invocationId, rawPermit },
+      });
+      assert(
+        resultReplay.status === 200 && resultReplay.body.kind === 'replay',
+        'fresh process reads the retained result without a second effect',
+        resultReplay,
       );
       const displaced = await http('POST', '/spike/remote-step/claim', {
         body: { invocationId },
