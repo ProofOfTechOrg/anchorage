@@ -12,6 +12,7 @@ import {
 } from '../do-runner/start-reservation-contract.js';
 import {
   createFlowsafeMaintenanceDurableObject,
+  ensureRemoteStepNotificationRecoveryDuty,
   type FlowsafeWorkerConfig,
   type FlowsafeWorkerEnv,
   MAINTENANCE_INSTANCE_NAME,
@@ -1164,6 +1165,68 @@ describe('alarm-driven deployment maintenance', () => {
     expect(() => harness({ config })).toThrow(
       /notificationIntervalMs and notificationTick/,
     );
+  });
+
+  it('wakes the optional remote-step recovery duty again after restart without traffic', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const calls: number[] = [];
+    const { instance, internalRequest, reconstruct } = harness({
+      config: {
+        maintenance: {
+          sweepIntervalMs: 15 * 60_000,
+          purgeIntervalMs: 60 * 60_000,
+          remoteStepRecoveryIntervalMs: 1_000,
+        },
+        remoteStepRecoveryTick: () => async () => {
+          calls.push(Date.now());
+          return { scanned: 0, recovered: 0, unresolved: 0 };
+        },
+      },
+    });
+    await healthOf(instance, internalRequest('/ensure', 'POST'));
+    for (let index = 0; index < 4; index += 1) await instance.alarm();
+    expect(calls).toEqual([NOW]);
+    const restarted = reconstruct();
+    await restarted.alarm();
+    expect(calls).toEqual([NOW]);
+    vi.advanceTimersByTime(1_000);
+    await restarted.alarm();
+    expect(calls).toEqual([NOW, NOW + 1_000]);
+  });
+
+  it('arms and verifies the configured remote-step recovery duty before admission', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    const active = harness({
+      config: {
+        maintenance: {
+          sweepIntervalMs: 15 * 60_000,
+          purgeIntervalMs: 60 * 60_000,
+          remoteStepRecoveryIntervalMs: 1_000,
+        },
+        remoteStepRecoveryTick: () => async () => ({ scanned: 0 }),
+      },
+    });
+    const linked = (
+      fixture: ReturnType<typeof harness>,
+    ): FlowsafeWorkerEnv => ({
+      ...fixture.env,
+      MAINTENANCE: {
+        idFromName: (name) => name,
+        get: () => ({
+          fetch: (url, init) => fixture.instance.fetch(new Request(url, init)),
+        }),
+      },
+    });
+    await expect(
+      ensureRemoteStepNotificationRecoveryDuty(linked(active)),
+    ).resolves.toBeUndefined();
+    expect(active.storage.alarmAt).toBe(NOW);
+    await expect(
+      ensureRemoteStepNotificationRecoveryDuty(linked(harness())),
+    ).rejects.toThrow('not armed');
   });
 
   it('rejects non-singleton instances before touching maintenance state', async () => {

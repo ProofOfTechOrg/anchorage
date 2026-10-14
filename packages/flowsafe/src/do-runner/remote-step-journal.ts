@@ -34,6 +34,15 @@ import { validateTablePrefix } from './table-prefix.js';
 
 export const REMOTE_STEP_TABLE = 'flowsafe_remote_step_invocations';
 export const REMOTE_STEP_SCHEMA_TABLE = 'flowsafe_remote_step_schema';
+export const REMOTE_STEP_NOTIFICATION_CURSOR_TABLE =
+  'flowsafe_remote_step_notification_cursor';
+const REMOTE_STEP_NOTIFICATION_CURSOR_SQL = `CREATE TABLE ${REMOTE_STEP_NOTIFICATION_CURSOR_TABLE} (
+  deployment_id TEXT NOT NULL,
+  table_prefix TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  after_invocation_id TEXT NOT NULL,
+  PRIMARY KEY (deployment_id, table_prefix)
+)`;
 const REMOTE_STEP_RECOVERY_INDEX = 'flowsafe_remote_step_recovery';
 const REMOTE_STEP_RECOVERY_INDEX_SQL = `CREATE INDEX ${REMOTE_STEP_RECOVERY_INDEX} ON ${REMOTE_STEP_TABLE} (invocation_id) WHERE status IN ('result-retained', 'resuming')`;
 const REMOTE_STEP_AGENT_INDEX = 'flowsafe_remote_step_agent_suspension';
@@ -935,6 +944,14 @@ export class RemoteStepJournal {
         id INTEGER PRIMARY KEY CHECK (id = 1),
         version INTEGER NOT NULL
       )`)
+      .run();
+    await this.#db
+      .prepare(
+        REMOTE_STEP_NOTIFICATION_CURSOR_SQL.replace(
+          'CREATE TABLE ',
+          'CREATE TABLE IF NOT EXISTS ',
+        ),
+      )
       .run();
     const readSchema = async () => {
       const schema = await this.#db
@@ -2671,6 +2688,98 @@ export class RemoteStepJournal {
     if (!rowResult(result))
       throw new RemoteStepRefusal(409, 'remote step resume claim changed');
     return outcome;
+  }
+
+  async nextNotificationRecoveryBatch(limit: number): Promise<string[]> {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100)
+      throw new RemoteStepRefusal(
+        400,
+        'notification recovery limit is malformed',
+      );
+    await this.initialize();
+    const definition = record(
+      await this.#db
+        .prepare('SELECT sql FROM sqlite_schema WHERE type = ? AND name = ?')
+        .bind('table', REMOTE_STEP_NOTIFICATION_CURSOR_TABLE)
+        .all(),
+    )?.results;
+    if (
+      !Array.isArray(definition) ||
+      definition.length !== 1 ||
+      record(definition[0])?.sql !== REMOTE_STEP_NOTIFICATION_CURSOR_SQL
+    )
+      throw new RemoteStepRefusal(
+        503,
+        'notification recovery cursor is unreadable',
+      );
+    await this.#db
+      .prepare(`INSERT OR IGNORE INTO ${REMOTE_STEP_NOTIFICATION_CURSOR_TABLE}
+        (deployment_id, table_prefix, version, after_invocation_id)
+        VALUES (?, ?, 1, '')`)
+      .bind(this.#deploymentId, this.#tablePrefix)
+      .run();
+    const cursorRows = record(
+      await this.#db
+        .prepare(`SELECT version, after_invocation_id
+          FROM ${REMOTE_STEP_NOTIFICATION_CURSOR_TABLE}
+          WHERE deployment_id = ? AND table_prefix = ?`)
+        .bind(this.#deploymentId, this.#tablePrefix)
+        .all(),
+    )?.results;
+    const cursor =
+      Array.isArray(cursorRows) && cursorRows.length === 1
+        ? record(cursorRows[0])
+        : undefined;
+    const after = cursor?.after_invocation_id;
+    if (
+      cursor?.version !== 1 ||
+      typeof after !== 'string' ||
+      (after !== '' && !isPathSafeId(after))
+    )
+      throw new RemoteStepRefusal(
+        503,
+        'notification recovery cursor is unreadable',
+      );
+    const scan = async (afterInvocationId: string) => {
+      const values = record(
+        await this.#db
+          .prepare(`SELECT invocation_id FROM ${REMOTE_STEP_TABLE}
+            INDEXED BY ${REMOTE_STEP_OPERATION_INDEX}
+            WHERE invocation_id > ? AND deployment_id = ? AND table_prefix = ?
+              AND target_kind = 'agent'
+              AND status IN ('result-retained', 'resuming')
+              AND operation_state IN ('prepared', 'effect-admitted',
+                'receipt-recorded', 'resume-admitted', 'unresolved')
+            ORDER BY invocation_id LIMIT ?`)
+          .bind(afterInvocationId, this.#deploymentId, this.#tablePrefix, limit)
+          .all(),
+      )?.results;
+      if (
+        !Array.isArray(values) ||
+        values.some((value) => !isPathSafeId(record(value)?.invocation_id))
+      )
+        throw new RemoteStepRefusal(
+          503,
+          'notification recovery scan is unreadable',
+        );
+      return values.map((value) => record(value)?.invocation_id as string);
+    };
+    let ids = await scan(after);
+    if (ids.length === 0 && after !== '') ids = await scan('');
+    const next = ids.at(-1) ?? '';
+    const advanced = record(
+      await this.#db
+        .prepare(`UPDATE ${REMOTE_STEP_NOTIFICATION_CURSOR_TABLE}
+          SET after_invocation_id = ?
+          WHERE deployment_id = ? AND table_prefix = ? AND version = 1
+            AND after_invocation_id = ?
+          RETURNING after_invocation_id`)
+        .bind(next, this.#deploymentId, this.#tablePrefix, after)
+        .all(),
+    )?.results;
+    if (!Array.isArray(advanced) || advanced.length !== 1)
+      throw new RemoteStepRefusal(409, 'notification recovery cursor changed');
+    return ids;
   }
 
   async recoverableResults(

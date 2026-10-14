@@ -71,6 +71,7 @@ import {
   notificationTimestampMillis,
 } from './notification-predicate.js';
 import {
+  REMOTE_STEP_NOTIFICATION_CURSOR_TABLE,
   REMOTE_STEP_SCHEMA_TABLE,
   REMOTE_STEP_TABLE,
 } from './remote-step-journal.js';
@@ -295,6 +296,13 @@ export interface FlowsafeTableEntry {
  * characters.
  */
 export const FLOWSAFE_TABLES: readonly FlowsafeTableEntry[] = [
+  {
+    table: REMOTE_STEP_NOTIFICATION_CURSOR_TABLE,
+    purpose: 'position of the scheduled notification operation recovery scan',
+    accounting: {
+      excluded: 'the invocation journal holds the work this cursor revisits',
+    },
+  },
   {
     table: REMOTE_STEP_SCHEMA_TABLE,
     purpose: 'remote invocation journal schema version',

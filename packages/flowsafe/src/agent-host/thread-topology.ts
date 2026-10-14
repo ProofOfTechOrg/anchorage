@@ -1113,6 +1113,81 @@ export function createAgentThreadTopology<Id>(
   };
 }
 
+export function createRemoteStepNotificationRecoveryTick<Id>(options: {
+  journal: RemoteStepJournal;
+  namespace: ThreadNamespaceLike<Id>;
+  deploymentIdentitySecret: string;
+  limit?: number;
+}): () => Promise<{ scanned: number; recovered: number; unresolved: number }> {
+  const limit = options.limit ?? 16;
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100)
+    throw new TypeError('notification recovery limit is malformed');
+  const threads = createThreadTopology(
+    options.namespace,
+    options.deploymentIdentitySecret,
+  );
+  return async () => {
+    const ids = await options.journal.nextNotificationRecoveryBatch(limit);
+    let recovered = 0;
+    let unresolved = 0;
+    let firstFailure: { error: unknown } | undefined;
+    for (const invocationId of ids) {
+      try {
+        const invocation = await options.journal.get(invocationId);
+        if (
+          !invocation ||
+          !['result-retained', 'resuming'].includes(invocation.status)
+        )
+          continue;
+        if (
+          invocation.invocationId !== invocationId ||
+          invocation.deploymentId !== options.journal.deploymentId ||
+          invocation.tablePrefix !== options.journal.tablePrefix
+        )
+          throw new RunRouteError(409, 'remote step recovery identity changed');
+        const operation =
+          await options.journal.readNotificationOperation(invocationId);
+        if (!operation || operation.invocationId !== invocationId)
+          throw new RunRouteError(
+            409,
+            'remote step recovery operation changed',
+          );
+        if (operation.state !== 'effect-admitted') {
+          unresolved += 1;
+          continue;
+        }
+        const response = await threads.send(
+          { principal: invocation.principal },
+          invocation.threadId,
+          `${AGENT_HOST_ROUTE_PREFIX}/remote-step-notification-recover`,
+          {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ invocationId }),
+          },
+        );
+        if (!response.ok)
+          throw new RunRouteError(
+            response.status,
+            'remote step notification recovery failed',
+          );
+        const after =
+          await options.journal.readNotificationOperation(invocationId);
+        if (after?.state !== 'receipt-recorded')
+          throw new RunRouteError(
+            503,
+            'remote step notification receipt is unresolved',
+          );
+        recovered += 1;
+      } catch (error) {
+        firstFailure ??= { error };
+      }
+    }
+    if (firstFailure) throw firstFailure.error;
+    return { scanned: ids.length, recovered, unresolved };
+  };
+}
+
 function publicApproval(
   value: unknown,
   execution: StartExecutionIdentity,

@@ -129,6 +129,39 @@ export interface FlowsafeWorkerContext {
 /** Fixed instance name used by every deployment maintenance namespace. */
 export const MAINTENANCE_INSTANCE_NAME = 'deployment-maintenance';
 
+export async function ensureRemoteStepNotificationRecoveryDuty(
+  env: FlowsafeWorkerEnv,
+): Promise<void> {
+  const id = env.MAINTENANCE.idFromName(MAINTENANCE_INSTANCE_NAME);
+  const response = await env.MAINTENANCE.get(id).fetch(
+    'http://maintenance/ensure',
+    {
+      method: 'POST',
+      headers: deploymentIdentityHeaders(env.DEPLOYMENT_IDENTITY_SECRET),
+    },
+  );
+  if (!response.ok)
+    throw new Error('remote step notification recovery duty is unavailable');
+  let value: unknown;
+  try {
+    value = await response.json();
+  } catch {
+    throw new Error('remote step notification recovery duty is unreadable');
+  }
+  const health =
+    value !== null && typeof value === 'object'
+      ? (value as Record<string, unknown>)
+      : undefined;
+  const next = validTime(health?.nextRemoteStepRecoveryAt);
+  const alarmAt = validTime(health?.alarmAt);
+  if (
+    next === undefined ||
+    alarmAt === undefined ||
+    alarmAt > Math.max(Date.now(), next)
+  )
+    throw new Error('remote step notification recovery duty is not armed');
+}
+
 export interface MaintenanceStubLike {
   fetch(
     url: string,
@@ -147,20 +180,24 @@ export interface MaintenanceHealth {
   nextPurgeAt: number;
   nextTickAt?: number;
   nextNotificationAt?: number;
+  nextRemoteStepRecoveryAt?: number;
   lastSweepAt?: number;
   lastPurgeAt?: number;
   lastTickAt?: number;
   lastNotificationAt?: number;
+  lastRemoteStepRecoveryAt?: number;
   lastDeadlineAt?: number;
   lastSweepAttemptAt?: number;
   lastPurgeAttemptAt?: number;
   lastTickAttemptAt?: number;
   lastNotificationAttemptAt?: number;
+  lastRemoteStepRecoveryAttemptAt?: number;
   lastDeadlineAttemptAt?: number;
   lastSweepError?: string;
   lastPurgeError?: string;
   lastTickError?: string;
   lastNotificationError?: string;
+  lastRemoteStepRecoveryError?: string;
   lastDeadlineError?: string;
 }
 
@@ -369,13 +406,15 @@ export interface FlowsafeWorkerConfig<Env extends FlowsafeWorkerEnv>
    * Recurrence intervals for the singleton maintenance Durable Object. Every
    * duty receives its own alarm invocation; `tickIntervalMs` is required when
    * `scheduleTick` is configured and omitted otherwise, and
-   * `notificationIntervalMs` likewise with `notificationTick`.
+   * `notificationIntervalMs` likewise with `notificationTick`, and
+   * `remoteStepRecoveryIntervalMs` with `remoteStepRecoveryTick`.
    */
   maintenance: {
     sweepIntervalMs: number;
     purgeIntervalMs: number;
     tickIntervalMs?: number;
     notificationIntervalMs?: number;
+    remoteStepRecoveryIntervalMs?: number;
     /** Deadline duty cadence. Defaults to sweepIntervalMs. */
     deadlineIntervalMs?: number;
     /** Maximum runs per deadline pass. Default 100. */
@@ -551,6 +590,7 @@ export interface FlowsafeWorkerConfig<Env extends FlowsafeWorkerEnv>
    * notification duty.
    */
   notificationTick?: (env: Env) => () => Promise<unknown>;
+  remoteStepRecoveryTick?: (env: Env) => () => Promise<unknown>;
   /**
    * Extra purge duties. The
    * returned fields fold into the ONE combined `{type:'maintenance'}` log
@@ -763,7 +803,8 @@ export type MaintenanceDuty =
   | 'sweep'
   | 'purge'
   | 'tick'
-  | 'notification';
+  | 'notification'
+  | 'remoteStepRecovery';
 
 /**
  * The cursor seam a duty resumes from and advances. Each field is optional
@@ -813,6 +854,11 @@ const INJECTED_TICK_DUTIES = {
     builder: 'notificationTick',
     interval: 'notificationIntervalMs',
     logType: 'notification-dispatch',
+  },
+  remoteStepRecovery: {
+    builder: 'remoteStepRecoveryTick',
+    interval: 'remoteStepRecoveryIntervalMs',
+    logType: 'remote-step-notification-recovery',
   },
 } as const;
 
@@ -1940,6 +1986,7 @@ const DUTY_ORDER = [
   'purge',
   'tick',
   'notification',
+  'remoteStepRecovery',
 ] as const;
 
 export type MaintenanceDurableObjectConstructor<Env extends FlowsafeWorkerEnv> =
@@ -1963,6 +2010,7 @@ export function createFlowsafeMaintenanceDurableObject<
     purge: config.maintenance.purgeIntervalMs,
     tick: config.maintenance.tickIntervalMs,
     notification: config.maintenance.notificationIntervalMs,
+    remoteStepRecovery: config.maintenance.remoteStepRecoveryIntervalMs,
   };
   for (const duty of DUTY_ORDER) {
     const interval = intervals[duty];
@@ -2345,6 +2393,12 @@ const DUTY_HEALTH_FIELDS = {
     last: 'lastNotificationAt',
     attempt: 'lastNotificationAttemptAt',
     error: 'lastNotificationError',
+  },
+  remoteStepRecovery: {
+    next: 'nextRemoteStepRecoveryAt',
+    last: 'lastRemoteStepRecoveryAt',
+    attempt: 'lastRemoteStepRecoveryAttemptAt',
+    error: 'lastRemoteStepRecoveryError',
   },
 } as const satisfies Record<
   MaintenanceDuty,

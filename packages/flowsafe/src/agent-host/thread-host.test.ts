@@ -23,6 +23,12 @@ import {
   type RecoverableResourceOwnershipStore,
   type ResourceOwnershipDatabase,
 } from '../approval-api/index.js';
+import { decodeExecutionPrincipal } from '../approval-api/principal.js';
+import {
+  credentialsMatch,
+  DEPLOYMENT_IDENTITY_HEADER,
+} from '../do-runner/deployment-identity.js';
+import { EXECUTION_PRINCIPAL_HEADER } from '../do-runner/execution-principal-header.js';
 import {
   FENCED_WORKFLOW_STORAGE,
   type FencedWorkflowAdmissionCapability,
@@ -57,6 +63,19 @@ import {
 import { runInputDepthMessage } from '../do-runner/run-input-depth.js';
 import { lifecycleFromRequestContext } from '../do-runner/run-lifecycle.js';
 import {
+  createFlowsafeMaintenanceDurableObject,
+  ensureRemoteStepNotificationRecoveryDuty,
+  type FlowsafeWorkerConfig,
+  type FlowsafeWorkerEnv,
+  MAINTENANCE_INSTANCE_NAME,
+  type MaintenanceDurableObjectState,
+} from '../host-kit/flowsafe-worker.js';
+import type {
+  ThreadNamespaceLike,
+  ThreadRequestInit,
+} from '../host-kit/thread-topology.js';
+import { staticTokenVerifier } from '../host-kit/verifier.js';
+import {
   D1SchedulesStorage,
   type ScheduleDatabase,
 } from '../schedules/schedules-d1.js';
@@ -71,6 +90,7 @@ import {
 } from './thread-host.js';
 import {
   createAgentThreadTopology,
+  createRemoteStepNotificationRecoveryTick,
   type RemoteStepContinuationReader,
 } from './thread-topology.js';
 import type { AgentAutomationRule, Permission } from './types.js';
@@ -289,9 +309,24 @@ function harness(
       state.set(key, structuredClone(value));
     },
     delete: async (key) => state.delete(key),
-    list: async <T>({ prefix }: { prefix: string }) =>
+    list: async <T>({
+      prefix,
+      startAfter,
+      limit,
+    }: {
+      prefix: string;
+      startAfter?: string;
+      limit?: number;
+    }) =>
       new Map(
-        [...state.entries()].filter(([key]) => key.startsWith(prefix)),
+        [...state.entries()]
+          .filter(
+            ([key]) =>
+              key.startsWith(prefix) &&
+              (startAfter === undefined || key > startAfter),
+          )
+          .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+          .slice(0, limit),
       ) as Map<string, T>,
     getAlarm: async () =>
       alarm === undefined
@@ -1604,6 +1639,49 @@ describe('direct thread host capture', () => {
 });
 
 describe('createThreadAgentHost owner recovery', () => {
+  it('advances a bounded notification marker cursor past repeatedly failing early items', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    onTestFinished(() => {
+      vi.restoreAllMocks();
+    });
+    const seen: string[] = [];
+    const journal = {
+      deploymentId: 'deployment',
+      tablePrefix: '',
+      get: async (invocationId: string) => {
+        seen.push(invocationId);
+        throw new Error('recovery item unavailable');
+      },
+    } as unknown as RemoteStepJournal;
+    const fixture = harness(['writer'], {
+      remoteSteps: journal,
+      remoteStepNotification: {
+        journal,
+        agentId: 'writer',
+        operationId: 'enqueue-v1',
+        source: 'flowsafe',
+        kind: 'host-owned',
+        summary: 'Agent notification',
+        ensureScheduledRecovery: async () => undefined,
+      },
+    });
+    const ids = Array.from(
+      { length: 18 },
+      (_, index) => `operation-${String(index).padStart(2, '0')}`,
+    );
+    for (const id of ids)
+      await fixture.stateStorage.put(
+        `flowsafe:agent-notification-recovery:v1:${id}`,
+        id,
+      );
+    const recover = () => fixture.host.recoverOwnership(fixture.scope);
+    await expect(recover()).rejects.toThrow('recovery item unavailable');
+    expect(seen).toEqual(ids.slice(0, 16));
+    await expect(recover()).rejects.toThrow('recovery item unavailable');
+    expect(seen).toEqual(ids);
+    await expect(recover()).rejects.toThrow('recovery item unavailable');
+    expect(seen).toEqual([...ids, ...ids.slice(0, 16)]);
+  });
   async function seedPreparingJournal(
     state: Map<string, unknown>,
     resources: InMemoryResourceOwnershipStore,
@@ -8032,6 +8110,7 @@ it('admits a configured notification effect once before agent continuation', asy
     allowedToolIds: ['remote_lookup'],
     verifyCompletion: async () => undefined,
   });
+  const readiness = vi.fn(async () => undefined);
   const host = harness(['writer'], {
     init: freshApp,
     storage: fixture.storage,
@@ -8046,6 +8125,7 @@ it('admits a configured notification effect once before agent continuation', asy
       kind: 'host-owned',
       summary: 'Agent notification',
       payload: { fixed: true },
+      ensureScheduledRecovery: readiness,
     },
   });
   const resume = vi
@@ -8056,6 +8136,13 @@ it('admits a configured notification effect once before agent continuation', asy
       method: 'POST',
       body: JSON.stringify({ invocationId: invocation.invocationId }),
     });
+  readiness.mockRejectedValueOnce(new Error('recovery duty unavailable'));
+  await expect(host.host.route(request(), host.scope)).rejects.toThrow(
+    'recovery duty unavailable',
+  );
+  expect(
+    (await reopened.readNotificationOperation(invocation.invocationId))?.state,
+  ).toBe('prepared');
   const admission = vi
     .spyOn(reopened, 'admitNotificationEffect')
     .mockRejectedValueOnce(new Error('effect admission refused'));
@@ -8115,6 +8202,7 @@ it('admits a configured notification effect once before agent continuation', asy
       kind: 'host-owned',
       summary: 'Changed after deployment',
       payload: { fixed: false },
+      ensureScheduledRecovery: async () => undefined,
     },
   });
   await expect(
@@ -8165,12 +8253,14 @@ it('admits a configured notification effect once before agent continuation', asy
 it.each([
   'before write',
   'after write',
+  'scheduled tick',
 ] as const)('recovers an admitted notification after its deadline without resuming Mastra (%s)', async (failurePoint) => {
   const fixture = await hostAgentLifecycleFixture({
     mode: 'fenced',
     provenance: 'modern',
   });
   onTestFinished(() => {
+    vi.useRealTimers();
     vi.restoreAllMocks();
     fixture.sql.close();
   });
@@ -8252,6 +8342,7 @@ it.each([
       source: 'flowsafe',
       kind: 'host-owned',
       summary: 'Agent notification',
+      ensureScheduledRecovery: async () => undefined,
     },
   });
   const retained = await reopened.readRetainedResult(invocation.invocationId);
@@ -8300,6 +8391,7 @@ it.each([
   expect(
     (await journal.readNotificationOperation(invocation.invocationId))?.state,
   ).toBe('effect-admitted');
+  expect(fixture.alarmAt()).toBeDefined();
   await fixture.binding
     .prepare(
       'UPDATE flowsafe_remote_step_invocations SET deadline_at = ?, write_revision = write_revision + 1, write_generation = write_generation + 1 WHERE invocation_id = ?',
@@ -8337,16 +8429,22 @@ it.each([
       source: 'flowsafe',
       kind: 'host-owned',
       summary: 'Agent notification',
+      ensureScheduledRecovery: async () => undefined,
     },
   });
-  await expect(
-    restarted.host.recoverNotificationOperation(
+  const recoveryRequest = () =>
+    new Request(
+      'https://thread/_flowsafe/agent-host/remote-step-notification-recover',
       {
-        ...restarted.scope,
-        principal: { ...restarted.scope.principal, id: 'different-user' },
+        method: 'POST',
+        body: JSON.stringify({ invocationId: invocation.invocationId }),
       },
-      invocation.invocationId,
-    ),
+    );
+  await expect(
+    restarted.host.route(recoveryRequest(), {
+      ...restarted.scope,
+      principal: { ...restarted.scope.principal, id: 'different-user' },
+    }),
   ).rejects.toMatchObject({ status: 404 });
   if (failurePoint === 'before write')
     expect(
@@ -8356,12 +8454,163 @@ it.each([
         )
         .get(),
     ).toMatchObject({ count: 0 });
-  expect(
-    await restarted.host.recoverNotificationOperation(
+  if (failurePoint === 'before write') {
+    await restarted.host.recoverOwnership({
+      threadId: restarted.scope.threadId,
+      init: restarted.scope.init,
+      deploymentTag: restarted.scope.deploymentTag,
+    });
+  } else if (failurePoint === 'after write') {
+    const recovered = await restarted.host.route(
+      recoveryRequest(),
       restarted.scope,
-      invocation.invocationId,
-    ),
-  ).toBe('receipt-recorded');
+    );
+    expect(recovered?.status).toBe(200);
+    expect(await recovered?.json()).toEqual({ state: 'receipt-recorded' });
+  } else {
+    fixture.sql.exec(`CREATE TABLE flowsafe_deployment (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      tenant_tag TEXT NOT NULL,
+      provisioned_at TEXT NOT NULL
+    ); INSERT INTO flowsafe_deployment VALUES
+      (1, 'acme', '2026-10-14T00:00:00.000Z')`);
+    const secret = 'test-deployment-identity-secret-0001';
+    let failFirst = true;
+    const namespace: ThreadNamespaceLike<string> = {
+      idFromName: (name) => name,
+      get: () => ({
+        fetch: (async (
+          url: Request | string,
+          requestInit?: ThreadRequestInit,
+        ) => {
+          const request =
+            typeof url === 'string' ? new Request(url, requestInit) : url;
+          if (
+            !(await credentialsMatch(
+              request.headers.get(DEPLOYMENT_IDENTITY_HEADER) ?? '',
+              secret,
+            ))
+          )
+            return new Response(null, { status: 403 });
+          const principal = decodeExecutionPrincipal(
+            request.headers.get(EXECUTION_PRINCIPAL_HEADER) ?? '',
+          );
+          if (!principal) return new Response(null, { status: 403 });
+          if (failFirst) {
+            failFirst = false;
+            return new Response(null, { status: 503 });
+          }
+          try {
+            return (
+              (await restarted.host.route(request, {
+                ...restarted.scope,
+                principal,
+              })) ?? new Response(null, { status: 404 })
+            );
+          } catch (error) {
+            return doErrorResponse(error);
+          }
+        }) as ReturnType<ThreadNamespaceLike<string>['get']>['fetch'],
+      }),
+    };
+    const tick = createRemoteStepNotificationRecoveryTick({
+      journal: restartedJournal,
+      namespace,
+      deploymentIdentitySecret: secret,
+      limit: 1,
+    });
+    const values = new Map<string, unknown>();
+    let alarmAt: number | null = null;
+    const maintenanceState: MaintenanceDurableObjectState = {
+      id: { name: MAINTENANCE_INSTANCE_NAME },
+      storage: {
+        get: async <T>(key: string) => values.get(key) as T | undefined,
+        getAlarm: async () => alarmAt,
+        setAlarm: async (time) => {
+          alarmAt = Number(time);
+        },
+        transaction: async (work) => {
+          const writes = new Map<string, unknown>();
+          let planned = alarmAt;
+          const result = await work({
+            get: async <T>(key: string) => values.get(key) as T | undefined,
+            put: async (key, value) => {
+              writes.set(key, structuredClone(value));
+            },
+            setAlarm: async (time) => {
+              planned = Number(time);
+            },
+          });
+          for (const [key, value] of writes) values.set(key, value);
+          alarmAt = planned;
+          return result;
+        },
+      },
+    };
+    const config: FlowsafeWorkerConfig<FlowsafeWorkerEnv> = {
+      workflows: [],
+      systemPrincipalId: 'maintenance-test',
+      buildVerifier: () => staticTokenVerifier(new Map()),
+      maintenance: {
+        sweepIntervalMs: 60_000,
+        purgeIntervalMs: 60_000,
+        remoteStepRecoveryIntervalMs: 1_000,
+      },
+      remoteStepRecoveryTick: () => tick,
+    };
+    const Maintenance = createFlowsafeMaintenanceDurableObject(config);
+    let maintenance: {
+      fetch(request: Request): Promise<Response>;
+      alarm(): Promise<void>;
+    };
+    const env: FlowsafeWorkerEnv = {
+      DB: fixture.binding as FlowsafeWorkerEnv['DB'],
+      DEPLOYMENT_TENANT: 'acme',
+      DEPLOYMENT_IDENTITY_SECRET: secret,
+      RUNNER: {
+        idFromName: (name) => name,
+        get: () => ({ fetch: async () => new Response(null, { status: 503 }) }),
+      },
+      MAINTENANCE: {
+        idFromName: (name) => name,
+        get: () => ({
+          fetch: (url, requestInit) =>
+            maintenance.fetch(new Request(url, requestInit)),
+        }),
+      },
+    };
+    maintenance = new Maintenance(maintenanceState, env);
+    const now = Date.now();
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    await ensureRemoteStepNotificationRecoveryDuty(env);
+    for (let index = 0; index < 4; index += 1) await maintenance.alarm();
+    expect(
+      (
+        await restartedJournal.readNotificationOperation(
+          invocation.invocationId,
+        )
+      )?.state,
+    ).toBe('effect-admitted');
+    expect(
+      fixture.sql
+        .prepare(
+          'SELECT after_invocation_id FROM flowsafe_remote_step_notification_cursor',
+        )
+        .get(),
+    ).toMatchObject({ after_invocation_id: invocation.invocationId });
+    maintenance = new Maintenance(maintenanceState, env);
+    vi.setSystemTime(now + 1_000);
+    await maintenance.alarm();
+    await maintenance.alarm();
+    expect(
+      (
+        await restartedJournal.readNotificationOperation(
+          invocation.invocationId,
+        )
+      )?.state,
+    ).toBe('receipt-recorded');
+  }
   expect(
     await restarted.host.recoverNotificationOperation(
       restarted.scope,
@@ -8371,6 +8620,17 @@ it.each([
   expect(
     (await journal.readNotificationOperation(invocation.invocationId))?.state,
   ).toBe('receipt-recorded');
+  await restarted.host.recoverOwnership({
+    threadId: restarted.scope.threadId,
+    init: restarted.scope.init,
+    deploymentTag: restarted.scope.deploymentTag,
+  });
+  await restarted.host.recoverOwnership({
+    threadId: restarted.scope.threadId,
+    init: restarted.scope.init,
+    deploymentTag: restarted.scope.deploymentTag,
+  });
+  expect(fixture.alarmAt()).toBeUndefined();
   expect(
     fixture.sql
       .prepare(

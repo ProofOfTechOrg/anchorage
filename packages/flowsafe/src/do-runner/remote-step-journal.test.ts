@@ -3,22 +3,36 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
-import { createAgentThreadTopology } from '../agent-host/thread-topology.js';
+import {
+  createAgentThreadTopology,
+  createRemoteStepNotificationRecoveryTick,
+} from '../agent-host/thread-topology.js';
+import { decodeExecutionPrincipal } from '../approval-api/principal.js';
 import type { FlowsafeWorkerEnv } from '../host-kit/flowsafe-worker.js';
 import { createFlowsafeWorker } from '../host-kit/flowsafe-worker.js';
 import { approvalStoreFactoryFor } from '../host-kit/host-approval-service.js';
+import type {
+  ThreadNamespaceLike,
+  ThreadRequestInit,
+} from '../host-kit/thread-topology.js';
 import { staticTokenVerifier } from '../host-kit/verifier.js';
 import {
   D1NotificationsStorage,
+  type NotificationOperationInput,
   projectNotificationOperation,
 } from '../signals/notifications-d1.js';
 import { createD1Storage } from './d1-storage.js';
-import { credentialsMatch } from './deployment-identity.js';
+import {
+  credentialsMatch,
+  DEPLOYMENT_IDENTITY_HEADER,
+} from './deployment-identity.js';
 import { ExecutionFenceStore } from './execution-fence.js';
+import { EXECUTION_PRINCIPAL_HEADER } from './execution-principal-header.js';
 import { init } from './init.js';
 import { DeploymentInventory } from './inventory.js';
 import {
   REMOTE_STEP_MARKER,
+  REMOTE_STEP_NOTIFICATION_CURSOR_TABLE,
   REMOTE_STEP_TABLE,
   RemoteStepJournal,
   WORKFLOW_REMOTE_STEP_MARKER,
@@ -1718,6 +1732,179 @@ describe('remote step journal dispatch admission', () => {
         settlement_outcome: 'terminal-not-success',
       },
     });
+  });
+
+  it('persists a bounded notification recovery cursor across instances and wraps past the final active row', async () => {
+    const h = await fixture();
+    const ids: string[] = [];
+    for (const suspendedAt of [500, 600, 700]) {
+      h.setSummary({
+        runId: ADDRESS.runId,
+        status: 'suspended',
+        suspended: [['durable-agentic-execution']],
+        suspendedAt: { 'durable-agentic-execution': suspendedAt },
+        suspendPayload: {
+          'durable-agentic-execution': {
+            type: 'suspension',
+            toolCallId: `call-${suspendedAt}`,
+            toolName: 'remote_lookup',
+            toolCallSuspended: {
+              remoteStep: REMOTE_STEP_MARKER,
+              request: { account: 'acme' },
+            },
+          },
+        },
+      });
+      const { invocation } = await h.retainResult();
+      await h.journal.prepareNotificationOperation(
+        invocation.invocationId,
+        'result-notification',
+        {
+          threadId: ADDRESS.threadId,
+          source: 'remote-step',
+          kind: 'result',
+          summary: 'Remote work completed',
+          createdAt: new Date('2026-10-13T00:00:00.000Z'),
+        },
+      );
+      ids.push(invocation.invocationId);
+    }
+    const expected = ids.sort();
+    expect(await h.journal.nextNotificationRecoveryBatch(1)).toEqual([
+      expected[0],
+    ]);
+    expect(await h.reopen().nextNotificationRecoveryBatch(1)).toEqual([
+      expected[1],
+    ]);
+    expect(await h.reopen().nextNotificationRecoveryBatch(1)).toEqual([
+      expected[2],
+    ]);
+    expect(await h.reopen().nextNotificationRecoveryBatch(1)).toEqual([
+      expected[0],
+    ]);
+    h.sqlite
+      .prepare(
+        `UPDATE ${REMOTE_STEP_NOTIFICATION_CURSOR_TABLE} SET version = 2`,
+      )
+      .run();
+    await expect(
+      h.reopen().nextNotificationRecoveryBatch(1),
+    ).rejects.toMatchObject({ status: 503 });
+  });
+
+  it('routes recovery with the stored principal and continues past a failed item', async () => {
+    const h = await fixture();
+    const ids: string[] = [];
+    for (const suspendedAt of [500, 600]) {
+      h.setSummary({
+        runId: ADDRESS.runId,
+        status: 'suspended',
+        suspended: [['durable-agentic-execution']],
+        suspendedAt: { 'durable-agentic-execution': suspendedAt },
+        suspendPayload: {
+          'durable-agentic-execution': {
+            type: 'suspension',
+            toolCallId: `call-${suspendedAt}`,
+            toolName: 'remote_lookup',
+            toolCallSuspended: {
+              remoteStep: REMOTE_STEP_MARKER,
+              request: { account: 'acme' },
+            },
+          },
+        },
+      });
+      const { invocation } = await h.retainResult();
+      await h.journal.prepareNotificationOperation(
+        invocation.invocationId,
+        'result-notification',
+        {
+          threadId: ADDRESS.threadId,
+          source: 'remote-step',
+          kind: 'result',
+          summary: 'Remote work completed',
+          createdAt: new Date('2026-10-13T00:00:00.000Z'),
+        },
+      );
+      await h.journal.admitNotificationEffect(invocation.invocationId);
+      ids.push(invocation.invocationId);
+    }
+    const sorted = ids.sort();
+    const firstId = sorted[0];
+    const secondId = sorted[1];
+    if (!firstId || !secondId) throw new Error('recovery items are missing');
+    const secret = 'test-deployment-identity-secret-0001';
+    const sent: string[] = [];
+    let failFirst = true;
+    const namespace: ThreadNamespaceLike<string> = {
+      idFromName: (name) => name,
+      get: (threadId) => ({
+        fetch: (async (
+          url: Request | string,
+          requestInit?: ThreadRequestInit,
+        ) => {
+          const request =
+            typeof url === 'string' ? new Request(url, requestInit) : url;
+          if (
+            threadId !== ADDRESS.threadId ||
+            !(await credentialsMatch(
+              request.headers.get(DEPLOYMENT_IDENTITY_HEADER) ?? '',
+              secret,
+            )) ||
+            JSON.stringify(
+              decodeExecutionPrincipal(
+                request.headers.get(EXECUTION_PRINCIPAL_HEADER) ?? '',
+              ),
+            ) !== JSON.stringify(PRINCIPAL)
+          )
+            return new Response(null, { status: 403 });
+          const body = (await request.json()) as { invocationId: string };
+          sent.push(body.invocationId);
+          if (body.invocationId === firstId && failFirst)
+            return new Response(null, { status: 503 });
+          const operation = await h.journal.readNotificationOperation(
+            body.invocationId,
+          );
+          if (!operation) return new Response(null, { status: 404 });
+          if (operation.state === 'effect-admitted') {
+            const saved = JSON.parse(operation.requestJson) as Omit<
+              NotificationOperationInput,
+              'createdAt'
+            > & {
+              createdAt: string;
+            };
+            const receipt = await h.journal
+              .notificationStorage()
+              .createNotificationOnce(operation.operationKey, {
+                ...saved,
+                createdAt: new Date(saved.createdAt),
+              });
+            await h.journal.recordNotificationReceipt(
+              body.invocationId,
+              receipt,
+            );
+          }
+          return Response.json({ state: 'receipt-recorded' });
+        }) as ReturnType<ThreadNamespaceLike<string>['get']>['fetch'],
+      }),
+    };
+    const tick = createRemoteStepNotificationRecoveryTick({
+      journal: h.journal,
+      namespace,
+      deploymentIdentitySecret: secret,
+      limit: 2,
+    });
+    await expect(tick()).rejects.toMatchObject({ status: 503 });
+    expect(sent).toEqual(sorted);
+    expect((await h.journal.readNotificationOperation(secondId))?.state).toBe(
+      'receipt-recorded',
+    );
+    failFirst = false;
+    expect(await tick()).toEqual({
+      scanned: 2,
+      recovered: 1,
+      unresolved: 1,
+    });
+    expect(sent).toEqual([...sorted, firstId]);
   });
 
   it('advances a limit-one remote-step inventory cursor past active rows', async () => {

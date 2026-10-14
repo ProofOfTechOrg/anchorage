@@ -56,6 +56,7 @@ export {
   type AgentThreadTopology,
   type AgentThreadTopologyOptions,
   createAgentThreadTopology,
+  createRemoteStepNotificationRecoveryTick,
   type RemoteStepContinuationReader,
   type RemoteStepDispatchReader,
   type RemoteStepDispatchTicket,

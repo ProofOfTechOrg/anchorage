@@ -143,7 +143,11 @@ export interface AgentThreadStateStorage {
   get<T = unknown>(key: string): Promise<T | undefined>;
   put<T>(key: string, value: T): Promise<void>;
   delete(key: string): Promise<boolean>;
-  list<T = unknown>(options: { prefix: string }): Promise<Map<string, T>>;
+  list<T = unknown>(options: {
+    prefix: string;
+    startAfter?: string;
+    limit?: number;
+  }): Promise<Map<string, T>>;
   getAlarm(): Promise<number | null>;
   setAlarm(scheduledTime: number | Date): Promise<void>;
   deleteAlarm(): Promise<void>;
@@ -192,6 +196,7 @@ export interface ThreadAgentHostOptions {
     summary: string;
     payload?: unknown;
     receiptLimit?: number;
+    ensureScheduledRecovery: () => Promise<void>;
   };
   resourceIdFromKey?: (threadId: string) => string;
   /** Narrows automated entry beyond what each agent's metadata declares. */
@@ -372,6 +377,11 @@ async function objectBody(request: Request): Promise<Record<string, unknown>> {
 }
 
 const AGENT_OWNER_RECOVERY_PREFIX = 'flowsafe:agent-owner-recovery:v1:';
+const AGENT_NOTIFICATION_RECOVERY_PREFIX =
+  'flowsafe:agent-notification-recovery:v1:';
+const AGENT_NOTIFICATION_RECOVERY_CURSOR_KEY =
+  'flowsafe:agent-notification-recovery-cursor:v1';
+const AGENT_NOTIFICATION_RECOVERY_BATCH = 16;
 const AGENT_OWNER_RECOVERY_DELAY_MS = 60_000;
 
 type AgentOwnerRecovery = {
@@ -695,6 +705,7 @@ export function createThreadAgentHost(
       !notificationProfile.source ||
       !notificationProfile.kind ||
       !notificationProfile.summary ||
+      typeof notificationProfile.ensureScheduledRecovery !== 'function' ||
       (notificationProfile.receiptLimit !== undefined &&
         (!Number.isSafeInteger(notificationProfile.receiptLimit) ||
           notificationProfile.receiptLimit < 0)))
@@ -2289,11 +2300,111 @@ export function createThreadAgentHost(
               firstFailure ??= { error };
             }
           }
+          if (notificationProfile) {
+            const cursor =
+              (await storage.get<unknown>(
+                AGENT_NOTIFICATION_RECOVERY_CURSOR_KEY,
+              )) ?? '';
+            if (
+              typeof cursor !== 'string' ||
+              (cursor !== '' &&
+                (!cursor.startsWith(AGENT_NOTIFICATION_RECOVERY_PREFIX) ||
+                  !isPathSafeId(
+                    cursor.slice(AGENT_NOTIFICATION_RECOVERY_PREFIX.length),
+                  )))
+            )
+              throw new AgentHostRequestError(
+                503,
+                'remote step recovery cursor is unreadable',
+              );
+            let notifications = await storage.list({
+              prefix: AGENT_NOTIFICATION_RECOVERY_PREFIX,
+              ...(cursor === '' ? {} : { startAfter: cursor }),
+              limit: AGENT_NOTIFICATION_RECOVERY_BATCH,
+            });
+            if (notifications.size === 0 && cursor !== '')
+              notifications = await storage.list({
+                prefix: AGENT_NOTIFICATION_RECOVERY_PREFIX,
+                limit: AGENT_NOTIFICATION_RECOVERY_BATCH,
+              });
+            for (const [key, stored] of notifications) {
+              const invocationId = key.slice(
+                AGENT_NOTIFICATION_RECOVERY_PREFIX.length,
+              );
+              try {
+                if (stored !== invocationId || !isPathSafeId(invocationId))
+                  throw new AgentHostRequestError(
+                    503,
+                    'remote step recovery marker is unreadable',
+                  );
+                const invocation =
+                  await notificationProfile.journal.get(invocationId);
+                if (
+                  !invocation ||
+                  invocation.threadId !== scope.threadId ||
+                  invocation.deploymentId !==
+                    notificationProfile.journal.deploymentId ||
+                  invocation.tablePrefix !==
+                    notificationProfile.journal.tablePrefix
+                )
+                  throw new AgentHostRequestError(
+                    503,
+                    'remote step recovery identity changed',
+                  );
+                const operation =
+                  await notificationProfile.journal.readNotificationOperation(
+                    invocationId,
+                  );
+                if (
+                  operation?.state === 'effect-admitted' ||
+                  operation?.state === 'receipt-recorded'
+                ) {
+                  const recovered = await recoverNotificationOperation(
+                    { ...scope, principal: invocation.principal },
+                    invocationId,
+                  );
+                  if (recovered !== 'receipt-recorded')
+                    throw new AgentHostRequestError(
+                      503,
+                      'remote step notification recovery is unresolved',
+                    );
+                } else if (
+                  operation?.state !== 'resume-admitted' &&
+                  operation?.state !== 'unresolved'
+                ) {
+                  throw new AgentHostRequestError(
+                    503,
+                    'remote step notification recovery is unresolved',
+                  );
+                }
+                await storage.delete(key);
+              } catch (error) {
+                console.error(
+                  JSON.stringify({
+                    type: 'remote-step-notification-recovery-failed',
+                    threadId: scope.threadId,
+                    invocationId,
+                    error: errorMessageOf(error),
+                  }),
+                );
+                firstFailure ??= { error };
+              }
+            }
+            const last = [...notifications.keys()].at(-1);
+            await storage.put(
+              AGENT_NOTIFICATION_RECOVERY_CURSOR_KEY,
+              last ?? '',
+            );
+          }
           await withRecoveryLock(async () => {
             const remaining = await storage.list({
               prefix: AGENT_OWNER_RECOVERY_PREFIX,
             });
-            if (remaining.size > 0) {
+            const remainingNotifications = await storage.list({
+              prefix: AGENT_NOTIFICATION_RECOVERY_PREFIX,
+              limit: 1,
+            });
+            if (remaining.size > 0 || remainingNotifications.size > 0) {
               await ensureOwnerRecoveryAlarm(storage);
             } else {
               await storage.deleteAlarm();
@@ -2844,6 +2955,12 @@ export function createThreadAgentHost(
           `${AGENT_HOST_ROUTE_PREFIX}/remote-step-resume`
           ? await objectBody(request)
           : undefined;
+      const notificationRecoveryBody =
+        request.method === 'POST' &&
+        preflightUrl.pathname ===
+          `${AGENT_HOST_ROUTE_PREFIX}/remote-step-notification-recover`
+          ? await objectBody(request)
+          : undefined;
       return withDispatchLock(async () => {
         const url = new URL(request.url);
 
@@ -2947,6 +3064,15 @@ export function createThreadAgentHost(
                 : {}),
             }),
           );
+        }
+
+        if (notificationRecoveryBody) {
+          const invocationId = notificationRecoveryBody.invocationId;
+          if (!isPathSafeId(invocationId))
+            throw new AgentHostRequestError(404, 'invocation not found');
+          return json({
+            state: await recoverNotificationOperation(scope, invocationId),
+          });
         }
 
         if (remoteStepBody) {
@@ -3096,6 +3222,8 @@ export function createThreadAgentHost(
               operation.state === 'prepared' ||
               operation.state === 'effect-admitted'
             ) {
+              if (operation.state === 'prepared')
+                await notificationProfile.ensureScheduledRecovery();
               const admitted =
                 await journal.admitNotificationEffect(invocationId);
               if (
@@ -3106,11 +3234,23 @@ export function createThreadAgentHost(
                   409,
                   'remote step operation changed',
                 );
+              await withRecoveryLock(async () => {
+                const storage = options.stateStorage();
+                await ensureOwnerRecoveryAlarm(storage);
+                await storage.put(
+                  `${AGENT_NOTIFICATION_RECOVERY_PREFIX}${invocationId}`,
+                  invocationId,
+                );
+                await ensureOwnerRecoveryAlarm(storage);
+              });
               const receipt = await notifications.createNotificationOnce(
                 admitted.operationKey,
                 stableInput,
               );
               await journal.recordNotificationReceipt(invocationId, receipt);
+              await options
+                .stateStorage()
+                .delete(`${AGENT_NOTIFICATION_RECOVERY_PREFIX}${invocationId}`);
             } else if (operation.state === 'receipt-recorded') {
               const receipt =
                 await notifications.readNotificationOperationReceipt(

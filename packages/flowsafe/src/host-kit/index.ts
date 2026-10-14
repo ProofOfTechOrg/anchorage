@@ -112,6 +112,7 @@ export {
   createFlowsafeMaintenanceDurableObject,
   createFlowsafeRunnerLifecycle,
   createFlowsafeWorker,
+  ensureRemoteStepNotificationRecoveryDuty,
   MAINTENANCE_INSTANCE_NAME,
 } from './flowsafe-worker.js';
 // hostAuditSink stays module-internal for the same reason as
