@@ -37,7 +37,7 @@
     }
   ],
   "vars": {
-    "DEPLOYMENT_TENANT": "flowsafe-notification-staging",
+    "DEPLOYMENT_TENANT": "flowsafenotificationstaging",
     "NOTIFICATION_PROOF_ENABLED": "false"
   }
 }
