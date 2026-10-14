@@ -861,6 +861,7 @@ function checkOrphanedGuides(root, markdownFiles) {
       const relativePath = toPosix(relative(root, file));
       return (
         relativePath.startsWith('docs/') &&
+        !relativePath.startsWith('docs/plans/') &&
         basename(file).toLowerCase() !== 'claude.md' &&
         !reachable.has(file)
       );
