@@ -82,7 +82,10 @@ import {
 } from '../do-runner/index.js';
 import { isDefinitiveInitialAdmissionRefusal } from '../do-runner/initial-admission-refusal.js';
 import { mastraRegistryEntries } from '../do-runner/mastra-registry.js';
-import { REMOTE_STEP_MARKER } from '../do-runner/remote-step-journal.js';
+import {
+  REMOTE_STEP_MARKER,
+  type RemoteStepJournal,
+} from '../do-runner/remote-step-journal.js';
 import {
   exceedsRunInputDepth,
   runInputDepthMessage,
@@ -110,6 +113,10 @@ import {
   abandonApprovalsForRun,
   reconcileApprovalsForSummary,
 } from '../host-kit/index.js';
+import {
+  type NotificationOperationInput,
+  projectNotificationOperation,
+} from '../signals/notifications-d1.js';
 import { createAgentModuleCatalog } from './catalog.js';
 import {
   AGENT_HOST_ROUTE_PREFIX,
@@ -174,6 +181,16 @@ export type {
 
 export interface ThreadAgentHostOptions {
   remoteSteps?: RemoteStepContinuationReader;
+  remoteStepNotification?: {
+    journal: RemoteStepJournal;
+    agentId: string;
+    operationId: string;
+    source: string;
+    kind: string;
+    summary: string;
+    payload?: unknown;
+    receiptLimit?: number;
+  };
   resourceIdFromKey?: (threadId: string) => string;
   /** Narrows automated entry beyond what each agent's metadata declares. */
   authorizeAutomatedEntry?: AutomatedEntryAuthorizer;
@@ -624,6 +641,24 @@ function ndjson(
 export function createThreadAgentHost(
   options: ThreadAgentHostOptions,
 ): ThreadAgentHost {
+  const notificationProfile = options.remoteStepNotification;
+  if (
+    notificationProfile &&
+    (options.remoteSteps !== notificationProfile.journal ||
+      !isPathSafeId(notificationProfile.agentId) ||
+      !isPathSafeId(notificationProfile.operationId) ||
+      !notificationProfile.source ||
+      !notificationProfile.kind ||
+      !notificationProfile.summary ||
+      (notificationProfile.receiptLimit !== undefined &&
+        (!Number.isSafeInteger(notificationProfile.receiptLimit) ||
+          notificationProfile.receiptLimit < 0)))
+  )
+    throw new TypeError('remote step notification profile is malformed');
+  const notificationReceiptLimit = notificationProfile?.receiptLimit;
+  let notificationStorage:
+    | ReturnType<RemoteStepJournal['notificationStorage']>
+    | undefined;
   const resourceForThread = (threadId: string): string => {
     let resourceId: string;
     try {
@@ -2886,7 +2921,131 @@ export function createThreadAgentHost(
             principalPermissions,
             safeContext: selected.safeContext,
           };
-          const leaseOwner = await reader.claimResume(invocationId, 60_000);
+          let leaseOwner: string;
+          if (
+            notificationProfile &&
+            invocation.agentId === notificationProfile.agentId &&
+            record(invocation.request)?.notificationOperationId ===
+              notificationProfile.operationId
+          ) {
+            const journal = notificationProfile.journal;
+            const existing =
+              await journal.readNotificationOperation(invocationId);
+            if (
+              existing &&
+              (existing.invocationId !== invocationId ||
+                existing.operationId !== notificationProfile.operationId)
+            )
+              throw new AgentHostRequestError(
+                409,
+                'remote step operation changed',
+              );
+            const operation =
+              existing ??
+              (await journal.prepareNotificationOperation(
+                invocationId,
+                notificationProfile.operationId,
+                {
+                  threadId: invocation.threadId,
+                  resourceId: invocation.resourceId,
+                  agentId: invocation.agentId,
+                  source: notificationProfile.source,
+                  kind: notificationProfile.kind,
+                  summary: notificationProfile.summary,
+                  sourceId: invocation.invocationId,
+                  createdAt: new Date(retained.executorQuiescentAt),
+                  ...(notificationProfile.payload === undefined
+                    ? {}
+                    : { payload: notificationProfile.payload }),
+                },
+              ));
+            const savedInput = JSON.parse(operation.requestJson) as Record<
+              string,
+              unknown
+            >;
+            if (typeof savedInput?.createdAt !== 'string')
+              throw new AgentHostRequestError(
+                503,
+                'remote step operation is unreadable',
+              );
+            const stableInput = {
+              ...savedInput,
+              createdAt: new Date(savedInput.createdAt),
+            } as NotificationOperationInput;
+            const projection = await projectNotificationOperation(stableInput);
+            if (
+              JSON.stringify(stableInput) !== operation.requestJson ||
+              stableInput.id !== operation.notificationId ||
+              stableInput.threadId !== invocation.threadId ||
+              stableInput.resourceId !== invocation.resourceId ||
+              stableInput.agentId !== invocation.agentId ||
+              stableInput.sourceId !== invocation.invocationId ||
+              savedInput.createdAt !==
+                new Date(retained.executorQuiescentAt).toISOString() ||
+              projection.version !== operation.projectionVersion ||
+              projection.requestJson !== operation.projectionJson ||
+              projection.requestDigest !== operation.requestDigest
+            )
+              throw new AgentHostRequestError(
+                503,
+                'remote step operation is unreadable',
+              );
+            if (!notificationStorage)
+              notificationStorage = journal.notificationStorage(
+                notificationReceiptLimit,
+              );
+            const notifications = notificationStorage;
+            if (
+              operation.state === 'prepared' ||
+              operation.state === 'effect-admitted'
+            ) {
+              const admitted =
+                await journal.admitNotificationEffect(invocationId);
+              if (
+                admitted.operationKey !== operation.operationKey ||
+                admitted.requestDigest !== operation.requestDigest
+              )
+                throw new AgentHostRequestError(
+                  409,
+                  'remote step operation changed',
+                );
+              const receipt = await notifications.createNotificationOnce(
+                admitted.operationKey,
+                stableInput,
+              );
+              await journal.recordNotificationReceipt(invocationId, receipt);
+            } else if (operation.state === 'receipt-recorded') {
+              const receipt =
+                await notifications.readNotificationOperationReceipt(
+                  operation.operationKey,
+                );
+              if (
+                receipt?.requestDigest !== operation.requestDigest ||
+                receipt.notificationId !== operation.notificationId ||
+                receipt.threadId !== invocation.threadId
+              )
+                throw new AgentHostRequestError(
+                  503,
+                  'remote step notification receipt is unreadable',
+                );
+            } else {
+              throw new AgentHostRequestError(
+                503,
+                'remote step continuation is unresolved',
+              );
+            }
+            execution.principalPermissions = (
+              await authorize(
+                scope,
+                ref.agentId,
+                'remote-step.resume',
+                stored.principal,
+              )
+            ).principalPermissions;
+            leaseOwner = await journal.admitNotificationResume(invocationId);
+          } else {
+            leaseOwner = await reader.claimResume(invocationId, 60_000);
+          }
           const resumed = await withExecution(execution, () =>
             durable.resumeViaRuntime({
               runId: ref.runId,

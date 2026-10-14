@@ -5,7 +5,10 @@ import {
   assertExecutionPrincipal,
   type ExecutionPrincipal,
 } from '../approval-api/principal.js';
+import type { SignalDatabase } from '../signals/d1-shared.js';
 import {
+  D1NotificationsStorage,
+  DEFAULT_NOTIFICATION_OPERATION_RECEIPT_LIMIT,
   NOTIFICATION_OPERATION_PROJECTION_VERSION,
   NOTIFICATION_OPERATION_RECEIPTS_TABLE,
   type NotificationOperationInput,
@@ -861,6 +864,19 @@ export class RemoteStepJournal {
 
   get tablePrefix(): string {
     return this.#tablePrefix;
+  }
+
+  notificationStorage(
+    operationReceiptLimit = DEFAULT_NOTIFICATION_OPERATION_RECEIPT_LIMIT,
+  ): D1NotificationsStorage {
+    const db = this.#db as ExecutionFenceDatabase & SignalDatabase;
+    if (typeof db.batch !== 'function')
+      throw new Error('notification operation requires database.batch()');
+    return new D1NotificationsStorage(
+      db,
+      this.#tablePrefix,
+      operationReceiptLimit,
+    );
   }
 
   constructor(input: {
