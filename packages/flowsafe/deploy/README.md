@@ -218,9 +218,25 @@ See the repository [deployment reference](../../../docs/deployment-reference.md)
 
 ## Run the isolated notification staging control
 
-Use `notification-staging-live.mjs` only with the isolated notification staging Worker and its loopback Service-binding probe. Keep the probe bound to `127.0.0.1`. The script refuses to unlock unless the fence is `migration-locked` at epoch and revision zero, the v5 journal is empty, and the recovery alarm is armed. Its detached watchdog relocks an open fence after controller death or its 15-minute deadline. Both processes request the tracked off deployment only while the current Worker version matches the enabled version supplied to the controller.
+Use `notification-staging-live.mjs` only with the isolated notification staging Worker and its loopback Service-binding probe. Keep the probe bound to `127.0.0.1`. The script refuses to unlock unless the fence is `migration-locked` at epoch and revision zero, the v5 journal is empty, and the recovery alarm is armed. It acquires a Linux `flock` keyed by Cloudflare account and Worker before reading the enabled version. Its detached watchdog inherits the same locked open file descriptor, seals or relocks the fence after controller death or its 15-minute deadline, and performs the tracked off deployment on controller request or recovery. Sealing advances the initially locked fence's revision, so a delayed controller unlock cannot succeed after watchdog shutdown starts. The controller never deploys off itself.
 
-The Wrangler version read and deploy are separate operations. Hold the owning deployment lock across the proof and off deployment, including the watchdog's recovery window. Do not run this control while another actor can deploy the subject Worker; the script cannot enforce that lock remotely.
+Use the same lock for **every** command that can upload, deploy, promote, or change traffic for `anchorage-flowsafe-remote-step-staging`. From `packages/flowsafe`, define the wrapper below and use it for the initial enabled deployment and any other same-Worker deployment command:
+
+```bash
+export FLOWSAFE_CF_ACCOUNT_ID=replace-with-32-lowercase-hex-account-id
+flowsafe_locked_deploy() {
+  [[ "$FLOWSAFE_CF_ACCOUNT_ID" =~ ^[0-9a-f]{32}$ ]] || return 2
+  local lock_dir="/tmp/flowsafe-deploy-locks-$(id -u)"
+  install -d -m 700 "$lock_dir" || return
+  (umask 077; flock -n -E 75 "$lock_dir/${FLOWSAFE_CF_ACCOUNT_ID}-anchorage-flowsafe-remote-step-staging.lock" "$@")
+}
+flowsafe_locked_deploy pnpm exec wrangler deploy \
+  --config deploy/notification-staging.wrangler.jsonc \
+  --var NOTIFICATION_PROOF_ENABLED:true \
+  --outdir /tmp/flowsafe-notification-enable
+```
+
+The wrapper exits `75` if another local deployment owns the lock. Run the control on the same host and Unix user as the wrapper; the lock directory is fixed under `/tmp`, regardless of `TMPDIR`. Set `FLOWSAFE_STAGING_ENABLED_VERSION` from the exact enabled deployment ID before starting the control. The lock serializes cooperating local processes only. A deployment from another host, the Cloudflare dashboard, or an actor that skips this wrapper can still race the version check and deploy. Confirm exclusive deployment control separately before treating the live proof as safe.
 
 Set these environment variables before running `node deploy/notification-staging-live.mjs --run` from `packages/flowsafe`:
 
@@ -229,6 +245,7 @@ Set these environment variables before running `node deploy/notification-staging
 | `FLOWSAFE_STAGING_PROBE_PORT` | Port of the local Service-binding probe |
 | `FLOWSAFE_STAGING_PROBE_SECRET_FILE` | Absolute path to the probe credential in a `0600` file |
 | `FLOWSAFE_CF_TOKEN_FILE` | Absolute path to the Cloudflare API token in a `0600` file |
+| `FLOWSAFE_CF_ACCOUNT_ID` | Cloudflare account ID as 32 lowercase hexadecimal characters; the same value used by the deployment wrapper |
 | `FLOWSAFE_STAGING_ENABLED_VERSION` | Exact 100% enabled subject Worker version ID |
 
-The controller prints the invocation ID only after D1 confirms one settled invocation, its notification, and its operation receipt. It writes watchdog state and its error log under `/tmp/flowsafe-notification-control-<pid>/`. If the controller exits without a confirmed off deployment, inspect that private directory's `watchdog.log` and verify the fence and current Worker version through the authenticated proxy and Wrangler before another attempt. An unconfirmed relock or changed deployment requires operator review; do not directly update the D1 fence row.
+The controller prints the invocation ID only after D1 confirms one settled invocation, its notification, its operation receipt, and the watchdog's confirmed off deployment. It writes watchdog state and its error log under `/tmp/flowsafe-notification-control-<pid>/`. If the controller exits without a confirmed off deployment, inspect that private directory's `watchdog.log` and verify the fence and current Worker version through the authenticated proxy and Wrangler before another attempt. An unconfirmed relock or changed deployment requires operator review; do not directly update the D1 fence row.

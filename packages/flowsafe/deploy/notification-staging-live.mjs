@@ -2,7 +2,9 @@ import { spawn, spawnSync } from 'node:child_process';
 import {
   appendFileSync,
   closeSync,
+  constants,
   existsSync,
+  fstatSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -26,6 +28,9 @@ const config = join(here, 'notification-staging.wrangler.jsonc');
 const database = 'anchorage-flowsafe-remote-step-staging-db';
 const versionPattern =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const accountPattern = /^[0-9a-f]{32}$/;
+const workerName = JSON.parse(readFileSync(config, 'utf8')).name;
+assert(/^[a-z0-9-]+$/.test(workerName), 'invalid staging Worker name');
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -201,34 +206,43 @@ export function createWranglerControl({ command = spawnSync, token }) {
   };
 }
 
-export async function relockIfOpen(probe, expected) {
-  assert(
-    expected?.mutationEpoch === 1 && expected?.transitionRevision === 1,
-    'watchdog owned fence version is missing',
-  );
+export async function sealFence(probe) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const current = await probe('GET', '/admin/execution-fence');
+    assert(
+      current.state === 'migration-locked' || current.state === 'open',
+      'watchdog found an unexpected fence state',
+    );
+    const initial =
+      current.state === 'migration-locked' &&
+      current.mutationEpoch === 0 &&
+      current.transitionRevision === 0 &&
+      current.requireMutationEpoch === false;
+    const open =
+      current.state === 'open' &&
+      current.mutationEpoch === 1 &&
+      current.transitionRevision === 1 &&
+      current.requireMutationEpoch === true;
+    if (current.state === 'migration-locked' && !initial) {
+      confirmedFence(current);
+      return current;
+    }
+    assert(initial || open, 'watchdog fence metadata differs');
+    try {
+      await probe('POST', '/admin/execution-fence', {
+        expected: current.state,
+        next: 'migration-locked',
+        expectedMutationEpoch: current.mutationEpoch,
+        expectedRevision: current.transitionRevision,
+        advanceMutationEpoch: true,
+      });
+    } catch {
+      // The authoritative read resolves a lost response or a competing open CAS.
+    }
+  }
   const current = await probe('GET', '/admin/execution-fence');
-  if (current.state === 'migration-locked') return current;
-  assert(current.state === 'open', 'watchdog found an unexpected fence state');
-  assert(
-    current.requireMutationEpoch === true &&
-      current.mutationEpoch === expected.mutationEpoch &&
-      current.transitionRevision === expected.transitionRevision,
-    'watchdog fence metadata differs',
-  );
-  const locked = await probe('POST', '/admin/execution-fence', {
-    expected: 'open',
-    next: 'migration-locked',
-    expectedMutationEpoch: current.mutationEpoch,
-    expectedRevision: current.transitionRevision,
-    advanceMutationEpoch: true,
-  });
-  assert(
-    locked.state === 'migration-locked' &&
-      locked.mutationEpoch === current.mutationEpoch + 1 &&
-      locked.transitionRevision === current.transitionRevision + 1,
-    'watchdog relock is unconfirmed',
-  );
-  return locked;
+  confirmedFence(current);
+  return current;
 }
 
 function settingsFromEnv(env) {
@@ -247,10 +261,66 @@ function settingsFromEnv(env) {
   const secret = readSecretFile(probeSecretPath);
   const token = privateFile(cfTokenPath);
   assert(token.length > 0, 'Cloudflare token is empty');
-  return { port, expectedVersion, probeSecretPath, cfTokenPath, secret, token };
+  const accountId = env.FLOWSAFE_CF_ACCOUNT_ID;
+  assert(accountPattern.test(accountId), 'Cloudflare account ID is required');
+  return {
+    port,
+    expectedVersion,
+    probeSecretPath,
+    cfTokenPath,
+    secret,
+    token,
+    accountId,
+  };
+}
+
+function acquireDeploymentLock(accountId) {
+  const directory = join('/tmp', `flowsafe-deploy-locks-${process.getuid()}`);
+  mkdirSync(directory, { mode: 0o700, recursive: true });
+  const directoryInfo = statSync(directory);
+  assert(
+    directoryInfo.isDirectory() &&
+      directoryInfo.uid === process.getuid() &&
+      (directoryInfo.mode & 0o077) === 0,
+    'deployment lock directory is not private',
+  );
+  const path = join(directory, `${accountId}-${workerName}.lock`);
+  const fd = openSync(
+    path,
+    constants.O_CREAT | constants.O_RDWR | constants.O_NOFOLLOW,
+    0o600,
+  );
+  const info = fstatSync(fd);
+  assert(
+    info.isFile() && info.uid === process.getuid() && (info.mode & 0o077) === 0,
+    'deployment lock file is not private',
+  );
+  const result = spawnSync('flock', ['--nonblock', '--exclusive', '3'], {
+    stdio: ['ignore', 'pipe', 'pipe', fd],
+  });
+  assert(result.status === 0, 'deployment lock is unavailable');
+  return fd;
+}
+
+function confirmedFence(current) {
+  assert(
+    current.state === 'migration-locked',
+    'staging fence relock is unconfirmed',
+  );
+  const sealed =
+    current.mutationEpoch === 1 &&
+    current.transitionRevision === 1 &&
+    current.requireMutationEpoch === true;
+  const relocked =
+    current.mutationEpoch === 2 &&
+    current.transitionRevision === 2 &&
+    current.requireMutationEpoch === true;
+  assert(sealed || relocked, 'staging fence metadata differs');
 }
 
 async function watchdog(stateFile) {
+  const lockFd = 3;
+  assert(fstatSync(lockFd).isFile(), 'inherited deployment lock is missing');
   const state = JSON.parse(privateFile(stateFile));
   const {
     port,
@@ -269,7 +339,7 @@ async function watchdog(stateFile) {
     'watchdog enabled version differs',
   );
   writeFileSync(`${stateFile}.ready`, '', { mode: 0o600, flag: 'wx' });
-  while (Date.now() < deadlineAt && !existsSync(`${stateFile}.done`)) {
+  while (Date.now() < deadlineAt && !existsSync(`${stateFile}.off-requested`)) {
     try {
       process.kill(parentPid, 0);
     } catch {
@@ -277,30 +347,15 @@ async function watchdog(stateFile) {
     }
     await new Promise((resolve) => setTimeout(resolve, 1_000));
   }
-  if (existsSync(`${stateFile}.done`)) return;
-  let failure;
-  if (existsSync(`${stateFile}.unlock-attempted`)) {
-    try {
-      const owned = JSON.parse(privateFile(`${stateFile}.unlock-attempted`));
-      await relockIfOpen(probe, owned);
-    } catch (error) {
-      failure = error;
-    }
-  }
-  try {
-    if (cli.currentVersion() === expectedVersion)
-      cli.deployOffIfCurrent(expectedVersion, outdir);
-  } catch (error) {
-    failure = new AggregateError(
-      failure ? [failure, error] : [error],
-      'watchdog off deploy is unconfirmed',
-    );
-  }
-  if (failure) throw failure;
+  await sealFence(probe);
+  cli.deployOffIfCurrent(expectedVersion, outdir);
+  confirmedFence(await probe('GET', '/admin/execution-fence'));
+  writeFileSync(`${stateFile}.off-confirmed`, '', { mode: 0o600, flag: 'wx' });
 }
 
 async function controller() {
   const settings = settingsFromEnv(process.env);
+  const lockFd = acquireDeploymentLock(settings.accountId);
   const cli = createWranglerControl({ token: settings.token });
   assert(
     cli.currentVersion() === settings.expectedVersion &&
@@ -333,7 +388,7 @@ async function controller() {
     [fileURLToPath(import.meta.url), '--watchdog', stateFile],
     {
       detached: true,
-      stdio: ['ignore', watcherLog, watcherLog],
+      stdio: ['ignore', watcherLog, watcherLog, lockFd],
       env: process.env,
     },
   );
@@ -344,12 +399,28 @@ async function controller() {
   while (!existsSync(`${stateFile}.ready`) && Date.now() < readyDeadline) {
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
-  assert(existsSync(`${stateFile}.ready`), 'watchdog readiness is unconfirmed');
+  assert(
+    existsSync(`${stateFile}.ready`) &&
+      watcher.exitCode === null &&
+      watcher.signalCode === null,
+    'watchdog readiness is unconfirmed',
+  );
+  process.kill(watcher.pid, 0);
   const probe = localProbe({ port: settings.port, secret: settings.secret });
   let offConfirmed = false;
   const requestOffDeploy = async () => {
     if (offConfirmed) return;
-    cli.deployOffIfCurrent(settings.expectedVersion, outdir);
+    writeFileSync(`${stateFile}.off-requested`, '', {
+      mode: 0o600,
+      flag: 'wx',
+    });
+    while (!existsSync(`${stateFile}.off-confirmed`)) {
+      assert(
+        watcher.exitCode === null && watcher.signalCode === null,
+        'watchdog exited before off confirmation',
+      );
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
     offConfirmed = true;
   };
   try {
@@ -358,21 +429,14 @@ async function controller() {
       ...trustedD1Checks((sql) => cli.query(sql)),
       requestOffDeploy,
       onBeforeUnlock: async () => {
-        writeFileSync(
-          `${stateFile}.unlock-attempted`,
-          JSON.stringify({
-            mutationEpoch: 1,
-            transitionRevision: 1,
-          }),
-          {
-            mode: 0o600,
-            flag: 'wx',
-          },
+        assert(
+          watcher.exitCode === null && watcher.signalCode === null,
+          'watchdog exited before fence unlock',
         );
+        process.kill(watcher.pid, 0);
       },
     });
     assert(offConfirmed, 'off deploy was not confirmed');
-    writeFileSync(`${stateFile}.done`, '', { mode: 0o600, flag: 'wx' });
     return result;
   } catch (error) {
     appendFileSync(

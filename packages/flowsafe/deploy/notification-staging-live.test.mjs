@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -14,7 +15,7 @@ import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import {
   createWranglerControl,
-  relockIfOpen,
+  sealFence,
 } from './notification-staging-live.mjs';
 
 const enabled = 'aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa';
@@ -121,47 +122,95 @@ test('Wrangler failure preserves exit and stderr in its diagnostic cause', () =>
   );
 });
 
-test('watchdog relock uses a fresh epoch and revision', async () => {
+test('watchdog seals the initial fence against a delayed controller open', async () => {
   const calls = [];
-  let observedRevision = 1;
+  let fence = {
+    state: 'migration-locked',
+    mutationEpoch: 0,
+    transitionRevision: 0,
+    requireMutationEpoch: false,
+  };
   const probe = async (method, path, body) => {
     calls.push({ method, path, body });
-    if (method === 'GET')
-      return {
+    if (method === 'GET') return fence;
+    assert.equal(body.expected, 'migration-locked');
+    assert.equal(body.next, 'migration-locked');
+    assert.equal(body.expectedMutationEpoch, 0);
+    assert.equal(body.expectedRevision, 0);
+    fence = {
+      state: 'migration-locked',
+      mutationEpoch: 1,
+      transitionRevision: 1,
+      requireMutationEpoch: true,
+    };
+    return fence;
+  };
+  assert.deepEqual(await sealFence(probe), fence);
+  assert.equal(calls.filter(({ method }) => method === 'POST').length, 1);
+  assert.equal(fence.mutationEpoch, 1);
+  assert.equal(fence.transitionRevision, 1);
+});
+
+test('watchdog relocks when controller open wins the deadline CAS', async () => {
+  let fence = {
+    state: 'migration-locked',
+    mutationEpoch: 0,
+    transitionRevision: 0,
+    requireMutationEpoch: false,
+  };
+  const probe = async (method, _path, body) => {
+    if (method === 'GET') return fence;
+    if (body.expected === 'migration-locked') {
+      fence = {
         state: 'open',
         mutationEpoch: 1,
-        transitionRevision: observedRevision,
+        transitionRevision: 1,
         requireMutationEpoch: true,
       };
-    return {
+      throw new Error('controller open won');
+    }
+    assert.deepEqual(body, {
+      expected: 'open',
+      next: 'migration-locked',
+      expectedMutationEpoch: 1,
+      expectedRevision: 1,
+      advanceMutationEpoch: true,
+    });
+    fence = {
       state: 'migration-locked',
       mutationEpoch: 2,
       transitionRevision: 2,
       requireMutationEpoch: true,
     };
+    return fence;
   };
-  assert.equal(
-    (await relockIfOpen(probe, { mutationEpoch: 1, transitionRevision: 1 }))
-      .state,
-    'migration-locked',
-  );
-  assert.deepEqual(calls[1].body, {
-    expected: 'open',
-    next: 'migration-locked',
-    expectedMutationEpoch: 1,
-    expectedRevision: 1,
-    advanceMutationEpoch: true,
-  });
-  calls.length = 0;
-  observedRevision = 2;
-  await assert.rejects(
-    relockIfOpen(probe, { mutationEpoch: 1, transitionRevision: 1 }),
-    /metadata differs/,
-  );
-  assert.equal(calls.length, 1);
+  assert.deepEqual(await sealFence(probe), fence);
+  assert.equal(fence.state, 'migration-locked');
+  assert.equal(fence.transitionRevision, 2);
 });
 
-test('controller waits for watchdog readiness and watchdog recovers after parent death', async () => {
+test('watchdog resolves a lost relock response from the authoritative fence', async () => {
+  let fence = {
+    state: 'open',
+    mutationEpoch: 1,
+    transitionRevision: 1,
+    requireMutationEpoch: true,
+  };
+  const probe = async (method, _path, body) => {
+    if (method === 'GET') return fence;
+    assert.equal(body.expected, 'open');
+    fence = {
+      state: 'migration-locked',
+      mutationEpoch: 2,
+      transitionRevision: 2,
+      requireMutationEpoch: true,
+    };
+    throw new Error('response lost after commit');
+  };
+  assert.deepEqual(await sealFence(probe), fence);
+});
+
+async function exerciseWatchdog(outcome) {
   const directory = mkdtempSync(join(tmpdir(), 'flowsafe-live-watchdog-test-'));
   const secret = 's'.repeat(32);
   const tokenFile = join(directory, 'cf-token');
@@ -170,6 +219,15 @@ test('controller waits for watchdog readiness and watchdog recovers after parent
   const offFile = join(directory, 'off-deploy');
   const offConfirmedFile = join(directory, 'off-confirmed');
   const watcherPidFile = join(directory, 'watchdog-pid');
+  const deployStartedFile = join(directory, 'deploy-started');
+  const releaseDeployFile = join(directory, 'release-deploy');
+  const accountId =
+    outcome === 'parent death' ? 'c'.repeat(32) : 'd'.repeat(32);
+  const lockFile = join(
+    '/tmp',
+    `flowsafe-deploy-locks-${process.getuid()}`,
+    `${accountId}-anchorage-flowsafe-remote-step-staging.lock`,
+  );
   writeFileSync(tokenFile, 'fake-token', { mode: 0o600 });
   writeFileSync(secretFile, secret, { mode: 0o600 });
   writeFileSync(
@@ -178,13 +236,21 @@ test('controller waits for watchdog readiness and watchdog recovers after parent
 import { syncBuiltinESMExports } from 'node:module';
 import { existsSync, writeFileSync } from 'node:fs';
 const originalSpawn = childProcess.spawn;
+const originalSpawnSync = childProcess.spawnSync;
+const originalNow = Date.now;
+Date.now = () => originalNow() +
+  (process.env.TEST_CLOCK_JUMP === 'true' &&
+   !process.argv.includes('--watchdog') &&
+   existsSync(process.env.TEST_DEPLOY_STARTED_FILE) ? 300_000 : 0);
+let counts = 0;
 childProcess.spawn = (...args) => {
   const child = originalSpawn(...args);
   if (args[1]?.includes('--watchdog'))
     writeFileSync(process.env.TEST_WATCHDOG_PID_FILE, String(child.pid));
   return child;
 };
-childProcess.spawnSync = (executable, args) => {
+childProcess.spawnSync = (executable, args, options) => {
+  if (executable === 'flock') return originalSpawnSync(executable, args, options);
   if (!executable.endsWith('/node_modules/.bin/wrangler'))
     throw new Error('unexpected synchronous command');
   const off = existsSync(process.env.TEST_OFF_FILE);
@@ -204,9 +270,20 @@ childProcess.spawnSync = (executable, args) => {
       ? [{ sql: 'write_generation INTEGER NOT NULL, operation_state TEXT' }]
       : args.at(-1).includes('COUNT(*) AS count')
         ? [{ count: 0 }]
-        : [{ notifications: 0, receipts: 0 }],
+        : args.at(-1).includes('FROM flowsafe_remote_step_invocations i')
+          ? [{ status: 'settled', settlement_outcome: 'applied',
+            operation_state: 'resume-admitted', thread_id: 'thread',
+            notification_id: 'notification', receipt_key: 'key',
+            receipt_digest: 'a'.repeat(64), receipt_thread_id: 'thread',
+            receipt_notification_id: 'notification',
+            stored_notification_id: 'notification', source: 'flowsafe-staging',
+            kind: 'host-owned-notification' }]
+          : [{ notifications: counts, receipts: counts++ }],
   }] : null;
   if (command === 'deploy') {
+    writeFileSync(process.env.TEST_DEPLOY_STARTED_FILE, 'started');
+    while (!existsSync(process.env.TEST_RELEASE_DEPLOY_FILE))
+      originalSpawnSync('sleep', ['0.02']);
     writeFileSync(process.env.TEST_OFF_FILE, 'deployed');
     return { status: 0, stdout: 'deployed' };
   }
@@ -232,10 +309,17 @@ syncBuiltinESMExports();
     requests.push(`${method} ${path}`);
     if (method === 'POST' && path === '/start') {
       startReceived = true;
+      if (outcome === 'parent death') return;
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(
+        JSON.stringify({ status: 'suspended', invocationId: 'invocation' }),
+      );
       return;
     }
     let value;
-    if (path === '/admin/maintenance-status') {
+    if (path === '/complete') {
+      value = { invocationId: 'invocation', status: 'success' };
+    } else if (path === '/admin/maintenance-status') {
       value = { alarmAt: 1, nextRemoteStepRecoveryAt: 1 };
     } else if (path === '/admin/execution-fence' && method === 'POST') {
       const chunks = [];
@@ -281,9 +365,13 @@ syncBuiltinESMExports();
           FLOWSAFE_STAGING_ENABLED_VERSION: enabled,
           FLOWSAFE_STAGING_PROBE_SECRET_FILE: secretFile,
           FLOWSAFE_CF_TOKEN_FILE: tokenFile,
+          FLOWSAFE_CF_ACCOUNT_ID: accountId,
           TEST_OFF_FILE: offFile,
           TEST_OFF_CONFIRMED_FILE: offConfirmedFile,
           TEST_WATCHDOG_PID_FILE: watcherPidFile,
+          TEST_DEPLOY_STARTED_FILE: deployStartedFile,
+          TEST_RELEASE_DEPLOY_FILE: releaseDeployFile,
+          TEST_CLOCK_JUMP: outcome === 'controller request' ? 'true' : 'false',
         },
         stdio: 'ignore',
       },
@@ -304,10 +392,17 @@ syncBuiltinESMExports();
     await waitFor(() => existsSync(watcherPidFile));
     watcherPid = Number(readFileSync(watcherPidFile, 'utf8'));
     await waitFor(() => startReceived);
-    assert(existsSync(`${stateFile}.unlock-attempted`));
-    assert.equal(fence.state, 'open');
     assert.equal(existsSync(offFile), false);
-    controller.kill('SIGKILL');
+    if (outcome === 'parent death') {
+      assert.equal(fence.state, 'open');
+      controller.kill('SIGKILL');
+    }
+    await waitFor(() => existsSync(deployStartedFile));
+    assert.equal(
+      spawnSync('flock', ['--nonblock', lockFile, 'true']).status,
+      1,
+    );
+    writeFileSync(releaseDeployFile, 'release');
     await waitFor(() => existsSync(offConfirmedFile));
     assert.equal(readFileSync(offFile, 'utf8'), 'deployed');
     assert.deepEqual(fence, {
@@ -320,7 +415,13 @@ syncBuiltinESMExports();
       requests.filter((request) => request === 'POST /admin/execution-fence'),
       ['POST /admin/execution-fence', 'POST /admin/execution-fence'],
     );
-    assert.equal(existsSync(`${stateFile}.done`), false);
+    if (outcome === 'controller request') {
+      await waitFor(() => controller.exitCode !== null);
+      assert.equal(controller.exitCode, 0);
+    }
+    await waitFor(
+      () => spawnSync('flock', ['--nonblock', lockFile, 'true']).status === 0,
+    );
   } finally {
     controller?.kill('SIGKILL');
     if (Number.isInteger(watcherPid)) {
@@ -332,6 +433,69 @@ syncBuiltinESMExports();
     }
     server.closeAllConnections();
     await new Promise((resolve) => server.close(resolve));
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+test('watchdog owns off deployment after parent death', () =>
+  exerciseWatchdog('parent death'));
+
+test('watchdog owns off deployment after controller request', () =>
+  exerciseWatchdog('controller request'));
+
+test('controller refuses a contended deployment lock before Wrangler preflight', async () => {
+  const directory = mkdtempSync(
+    join(tmpdir(), 'flowsafe-lock-contention-test-'),
+  );
+  const accountId = 'e'.repeat(32);
+  const lockDirectory = join(
+    '/tmp',
+    `flowsafe-deploy-locks-${process.getuid()}`,
+  );
+  const lockFile = join(
+    lockDirectory,
+    `${accountId}-anchorage-flowsafe-remote-step-staging.lock`,
+  );
+  mkdirSync(lockDirectory, { recursive: true, mode: 0o700 });
+  writeFileSync(lockFile, '', { mode: 0o600 });
+  const secretFile = join(directory, 'probe-secret');
+  const tokenFile = join(directory, 'cf-token');
+  writeFileSync(secretFile, 's'.repeat(32), { mode: 0o600 });
+  writeFileSync(tokenFile, 'fake-token', { mode: 0o600 });
+  const holder = spawn('flock', ['--exclusive', lockFile, 'sleep', '5'], {
+    stdio: 'ignore',
+  });
+  try {
+    const deadline = Date.now() + 3_000;
+    while (spawnSync('flock', ['--nonblock', lockFile, 'true']).status !== 1) {
+      assert(Date.now() < deadline, 'lock holder did not acquire lock');
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    const result = spawnSync(
+      process.execPath,
+      [
+        fileURLToPath(
+          new URL('./notification-staging-live.mjs', import.meta.url),
+        ),
+        '--run',
+      ],
+      {
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          FLOWSAFE_STAGING_PROBE_PORT: '12345',
+          FLOWSAFE_STAGING_ENABLED_VERSION: enabled,
+          FLOWSAFE_STAGING_PROBE_SECRET_FILE: secretFile,
+          FLOWSAFE_CF_TOKEN_FILE: tokenFile,
+          FLOWSAFE_CF_ACCOUNT_ID: accountId,
+        },
+      },
+    );
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /deployment lock is unavailable/);
+    assert.doesNotMatch(result.stderr, /Wrangler/);
+  } finally {
+    holder.kill('SIGKILL');
     rmSync(directory, { recursive: true, force: true });
   }
 });
