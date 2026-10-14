@@ -30,3 +30,31 @@ it('forwards a staging request only after the local caller supplies the probe cr
     'x-flowsafe-staging-probe': secret,
   });
 });
+
+it('keeps start and completion on the authenticated private service binding', async () => {
+  const secret = 'staging-local-probe-secret-32-bytes-minimum';
+  const fetch = vi.fn(async () => new Response(null, { status: 204 }));
+  const env = {
+    SUBJECT: { fetch } as unknown as Fetcher,
+    STAGING_PROBE_SECRET: secret,
+  };
+  for (const path of ['/start', '/complete']) {
+    const body =
+      path === '/complete' ? '{"invocationId":"invocation-1"}' : undefined;
+    const request = (credential?: string) =>
+      new Request(`http://127.0.0.1${path}`, {
+        method: 'POST',
+        ...(credential
+          ? { headers: { authorization: `Bearer ${credential}` } }
+          : {}),
+        ...(body ? { body } : {}),
+      });
+    expect((await handler.fetch(request(), env)).status).toBe(403);
+    expect(fetch).not.toHaveBeenCalled();
+    expect((await handler.fetch(request(secret), env)).status).toBe(204);
+    const forwarded = fetch.mock.calls.at(-1);
+    expect(forwarded?.[0]).toBe(`http://subject/__staging${path}`);
+    if (body) expect(forwarded?.[1]?.body).toBe(body);
+    fetch.mockClear();
+  }
+});
