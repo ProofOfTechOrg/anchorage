@@ -58,3 +58,90 @@ it('keeps start and completion on the authenticated private service binding', as
     fetch.mockClear();
   }
 });
+
+it('authenticates local admin requests and supplies only the proxy-owned admin credential', async () => {
+  const probeSecret = 'staging-local-probe-secret-32-bytes-minimum';
+  const adminSecret = 'staging-admin-secret-32-bytes-minimum';
+  const fetch = vi.fn(async () => new Response(null, { status: 200 }));
+  const env = {
+    SUBJECT: { fetch } as unknown as Fetcher,
+    STAGING_PROBE_SECRET: probeSecret,
+    MAINTENANCE_ADMIN_SECRET: adminSecret,
+  };
+  for (const [method, path, body] of [
+    ['GET', '/admin/execution-fence', undefined],
+    ['POST', '/admin/execution-fence', '{"expected":"open","next":"draining"}'],
+    ['GET', '/admin/maintenance-status', undefined],
+  ] as const) {
+    const request = (credential: string) =>
+      new Request(`http://127.0.0.1${path}`, {
+        method,
+        headers: { authorization: `Bearer ${credential}` },
+        ...(body ? { body } : {}),
+      });
+    expect((await handler.fetch(request('wrong'), env)).status).toBe(403);
+    expect(fetch).not.toHaveBeenCalled();
+    expect((await handler.fetch(request(probeSecret), env)).status).toBe(200);
+    expect(fetch).toHaveBeenCalledOnce();
+    expect(fetch.mock.calls[0]?.[0]).toBe(`http://subject${path}`);
+    expect(fetch.mock.calls[0]?.[1]).toMatchObject({
+      method,
+      headers: { authorization: `Bearer ${adminSecret}` },
+    });
+    expect(fetch.mock.calls[0]?.[1]?.body).toBe(body);
+    fetch.mockClear();
+  }
+});
+
+it('rejects unlisted admin operations, query strings, and oversized writes', async () => {
+  const secret = 'staging-local-probe-secret-32-bytes-minimum';
+  const fetch = vi.fn(async () => new Response(null, { status: 200 }));
+  const env = {
+    SUBJECT: { fetch } as unknown as Fetcher,
+    STAGING_PROBE_SECRET: secret,
+    MAINTENANCE_ADMIN_SECRET: 'staging-admin-secret-32-bytes-minimum',
+  };
+  const headers = { authorization: `Bearer ${secret}` };
+  for (const request of [
+    new Request('http://127.0.0.1/admin/inventory', { headers }),
+    new Request('http://127.0.0.1/admin/execution-fence', {
+      method: 'DELETE',
+      headers,
+    }),
+    new Request('http://127.0.0.1/admin/execution-fence?state=open', {
+      headers,
+    }),
+  ]) {
+    expect((await handler.fetch(request, env)).status).toBe(404);
+  }
+  expect(
+    (
+      await handler.fetch(
+        new Request('http://127.0.0.1/admin/execution-fence', {
+          method: 'POST',
+          headers,
+          body: 'x'.repeat(4_097),
+        }),
+        env,
+      )
+    ).status,
+  ).toBe(413);
+  expect(fetch).not.toHaveBeenCalled();
+});
+
+it('fails closed when the admin credential is missing or reused as the caller credential', async () => {
+  const secret = 'staging-local-probe-secret-32-bytes-minimum';
+  const fetch = vi.fn(async () => new Response(null, { status: 200 }));
+  const env = {
+    SUBJECT: { fetch } as unknown as Fetcher,
+    STAGING_PROBE_SECRET: secret,
+    MAINTENANCE_ADMIN_SECRET: undefined as string | undefined,
+  };
+  const request = new Request('http://127.0.0.1/admin/execution-fence', {
+    headers: { authorization: `Bearer ${secret}` },
+  });
+  expect((await handler.fetch(request, env)).status).toBe(503);
+  env.MAINTENANCE_ADMIN_SECRET = secret;
+  expect((await handler.fetch(request, env)).status).toBe(503);
+  expect(fetch).not.toHaveBeenCalled();
+});
