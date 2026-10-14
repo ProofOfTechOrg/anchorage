@@ -41,12 +41,71 @@ import {
   type SignalDatabase,
   type SignalStatement,
 } from './d1-shared.js';
-import type {
-  NotificationDeliveryFailure,
-  NotificationDeliveryObservation,
-  NotificationDeliveryStorage,
-  NotificationDeliveryUpdateResult,
-} from './notification-dispatch.js';
+
+/** Scalar values preserve the attempted observation across asynchronous writes. */
+export type NotificationDeliveryObservation = Readonly<{
+  id: string;
+  threadId: string;
+  source: string;
+  kind: string;
+  priority: NotificationRecord['priority'];
+  status: NotificationRecord['status'];
+  summary: string;
+  payload: string | null;
+  resourceId: string | null;
+  agentId: string | null;
+  sourceId: string | null;
+  dedupeKey: string | null;
+  coalesceKey: string | null;
+  coalescedCount: number;
+  attributes: string | null;
+  createdAt: string;
+  updatedAt: string;
+  deliverAt: string | null;
+  summaryAt: string | null;
+  deliveryReason: string | null;
+  deliveryAttempts: number;
+  lastDeliveryAttemptAt: string | null;
+  lastDeliveryError: string | null;
+  deliveredSignalId: string | null;
+  summarySignalId: string | null;
+  deliveredAt: string | null;
+  seenAt: string | null;
+  dismissedAt: string | null;
+  archivedAt: string | null;
+  discardedAt: string | null;
+  metadata: string | null;
+}>;
+
+export type NotificationDeliveryFailure =
+  | Readonly<{
+      type: 'retry';
+      updatedAt: string;
+      deliveryAttempts: number;
+      lastDeliveryAttemptAt: string;
+      lastDeliveryError: string;
+      deliverAt?: string;
+      summaryAt?: string;
+    }>
+  | Readonly<{
+      type: 'discard';
+      updatedAt: string;
+      deliveryAttempts: number;
+      lastDeliveryAttemptAt: string;
+      lastDeliveryError: string;
+    }>
+  | Readonly<{ type: 'exhausted'; updatedAt: string }>;
+
+export type NotificationDeliveryUpdateResult =
+  | { applied: true; record: NotificationRecord }
+  | { applied: false };
+
+export interface NotificationDeliveryStorage extends NotificationsStorage {
+  updateNotificationDeliveryIfUnchanged(input: {
+    expected: NotificationDeliveryObservation;
+    failure: NotificationDeliveryFailure;
+  }): Promise<NotificationDeliveryUpdateResult>;
+}
 
 /** The raw row shape `mastra_notifications` stores and `rowToRecord` reads. */
 interface NotificationRow {
