@@ -215,3 +215,20 @@ pnpm --filter @proofoftech/flowsafe spike:verify
 `spike:verify` adds the workerd boundary: suspend, kill, restart on persisted state, resume from an approved record, and refuse a mismatched deployment sentinel.
 
 See the repository [deployment reference](../../../docs/deployment-reference.md), [operations runbook](../../../docs/operations-runbook.md), and [security threat model](../../../docs/security-threat-model.md) before exposing traffic.
+
+## Run the isolated notification staging control
+
+Use `notification-staging-live.mjs` only with the isolated notification staging Worker and its loopback Service-binding probe. Keep the probe bound to `127.0.0.1`. The script refuses to unlock unless the fence is `migration-locked` at epoch and revision zero, the v5 journal is empty, and the recovery alarm is armed. Its detached watchdog relocks an open fence after controller death or its 15-minute deadline. Both processes request the tracked off deployment only while the current Worker version matches the enabled version supplied to the controller.
+
+The Wrangler version read and deploy are separate operations. Hold the owning deployment lock across the proof and off deployment, including the watchdog's recovery window. Do not run this control while another actor can deploy the subject Worker; the script cannot enforce that lock remotely.
+
+Set these environment variables before running `node deploy/notification-staging-live.mjs --run` from `packages/flowsafe`:
+
+| Variable | Value |
+| --- | --- |
+| `FLOWSAFE_STAGING_PROBE_PORT` | Port of the local Service-binding probe |
+| `FLOWSAFE_STAGING_PROBE_SECRET_FILE` | Absolute path to the probe credential in a `0600` file |
+| `FLOWSAFE_CF_TOKEN_FILE` | Absolute path to the Cloudflare API token in a `0600` file |
+| `FLOWSAFE_STAGING_ENABLED_VERSION` | Exact 100% enabled subject Worker version ID |
+
+The controller prints the invocation ID only after D1 confirms one settled invocation, its notification, and its operation receipt. It writes watchdog state and its error log under `/tmp/flowsafe-notification-control-<pid>/`. If the controller exits without a confirmed off deployment, inspect that private directory's `watchdog.log` and verify the fence and current Worker version through the authenticated proxy and Wrangler before another attempt. An unconfirmed relock or changed deployment requires operator review; do not directly update the D1 fence row.
