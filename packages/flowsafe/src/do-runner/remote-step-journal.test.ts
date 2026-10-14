@@ -1678,6 +1678,152 @@ describe('remote step journal dispatch admission', () => {
     ).toBe(1);
   });
 
+  it('retains an unwitnessed notification continuation in drain inventory after terminal failure', async () => {
+    const h = await fixture();
+    const { invocation } = await h.retainResult();
+    const input = {
+      threadId: ADDRESS.threadId,
+      source: 'remote-step',
+      kind: 'result',
+      summary: 'Remote work completed',
+      createdAt: new Date('2026-10-13T00:00:00.000Z'),
+    };
+    const operation = await h.journal.prepareNotificationOperation(
+      invocation.invocationId,
+      'result-notification',
+      input,
+    );
+    await h.journal.admitNotificationEffect(invocation.invocationId);
+    const receipt = await new D1NotificationsStorage(
+      h.db,
+    ).createNotificationOnce(operation.operationKey, {
+      ...input,
+      id: operation.notificationId,
+    });
+    await h.journal.recordNotificationReceipt(invocation.invocationId, receipt);
+    const owner = await h.journal.admitNotificationResume(
+      invocation.invocationId,
+    );
+    h.setSummary({ runId: ADDRESS.runId, status: 'cancelled' });
+    expect(
+      await h.journal.settleAfterResume(invocation.invocationId, owner),
+    ).toBe('terminal-not-success');
+    const inventory = await new DeploymentInventory(h.db).read('remote-steps');
+    expect(inventory.count).toBe(1);
+    expect(inventory.entries[0]).toMatchObject({
+      key: [invocation.invocationId],
+      detail: {
+        status: 'failed',
+        operation_state: 'resume-admitted',
+        settlement_outcome: 'terminal-not-success',
+      },
+    });
+  });
+
+  it('advances a limit-one remote-step inventory cursor past active rows', async () => {
+    const h = await fixture();
+    const first = await h.retainResult();
+    h.setSummary({
+      runId: ADDRESS.runId,
+      status: 'suspended',
+      suspended: [['durable-agentic-execution']],
+      suspendedAt: { 'durable-agentic-execution': 600 },
+      suspendPayload: {
+        'durable-agentic-execution': {
+          type: 'suspension',
+          toolCallId: 'call-2',
+          toolName: 'remote_lookup',
+          toolCallSuspended: {
+            remoteStep: REMOTE_STEP_MARKER,
+            request: { account: 'acme' },
+          },
+        },
+      },
+    });
+    const second = await h.journal.register(ADDRESS, 10_000, PRINCIPAL);
+    expect(second.invocationId).not.toBe(first.invocation.invocationId);
+    const inventory = new DeploymentInventory(h.db);
+    const page1 = await inventory.read('remote-steps', { limit: 1 });
+    const page2 = await inventory.read('remote-steps', {
+      limit: 1,
+      cursor: page1.cursor,
+    });
+    expect(page1.count).toBe(2);
+    expect(page2.entries).toHaveLength(1);
+    expect(page2.entries[0]?.key).not.toEqual(page1.entries[0]?.key);
+    expect(page2.count).toBeUndefined();
+    expect(
+      (
+        await inventory.read('remote-steps', {
+          limit: 1,
+          cursor: page2.cursor,
+        })
+      ).entries,
+    ).toEqual([]);
+  });
+
+  it('refuses a second continuation admission after a committed response is lost and the lease expires', async () => {
+    const h = await fixture();
+    const { invocation } = await h.retainResult();
+    h.sqlite
+      .prepare(`UPDATE ${REMOTE_STEP_TABLE}
+        SET deadline_at = ?, write_revision = write_revision + 1,
+          write_generation = write_generation + 1 WHERE invocation_id = ?`)
+      .run(100_000, invocation.invocationId);
+    const input = {
+      threadId: ADDRESS.threadId,
+      source: 'remote-step',
+      kind: 'result',
+      summary: 'Remote work completed',
+      createdAt: new Date('2026-10-13T00:00:00.000Z'),
+    };
+    const operation = await h.journal.prepareNotificationOperation(
+      invocation.invocationId,
+      'result-notification',
+      input,
+    );
+    await h.journal.admitNotificationEffect(invocation.invocationId);
+    const receipt = await new D1NotificationsStorage(
+      h.db,
+    ).createNotificationOnce(operation.operationKey, {
+      ...input,
+      id: operation.notificationId,
+    });
+    await h.journal.recordNotificationReceipt(invocation.invocationId, receipt);
+    const prepare = h.db.prepare.bind(h.db);
+    h.db.prepare = (sql) => {
+      const statement = prepare(sql);
+      if (!sql.includes("operation_state = 'resume-admitted'"))
+        return statement;
+      return {
+        ...statement,
+        bind: (...values) => {
+          const bound = statement.bind(...values);
+          return {
+            ...bound,
+            all: async <T = unknown>() => {
+              await bound.all<T>();
+              throw new Error('lost continuation admission response');
+            },
+          };
+        },
+      };
+    };
+    await expect(
+      h.journal.admitNotificationResume(invocation.invocationId),
+    ).rejects.toThrow('lost continuation admission response');
+    expect(
+      await h.reopen().readNotificationOperation(invocation.invocationId),
+    ).toMatchObject({
+      state: 'resume-admitted',
+      requestDigest: receipt.requestDigest,
+    });
+    h.setNow(61_001);
+    await expect(
+      h.reopen().admitNotificationResume(invocation.invocationId),
+    ).rejects.toMatchObject({ status: 409 });
+  });
+
   it('refuses effect admission when the authoritative snapshot changes at the D1 write', async () => {
     const h = await fixture();
     const { invocation } = await h.retainResult();
@@ -1742,6 +1888,35 @@ describe('remote step journal dispatch admission', () => {
         notificationId: operation.notificationId,
         threadId: ADDRESS.threadId,
         requestDigest: 'f'.repeat(64),
+      }),
+    ).rejects.toMatchObject({ status: 409 });
+    expect(
+      await h.reopen().readNotificationOperation(invocation.invocationId),
+    ).toMatchObject({ state: 'effect-admitted' });
+  });
+
+  it('refuses a matching claimed receipt when D1 has no notification effect', async () => {
+    const h = await fixture();
+    const { invocation } = await h.retainResult();
+    const operation = await h.journal.prepareNotificationOperation(
+      invocation.invocationId,
+      'result-notification',
+      {
+        threadId: ADDRESS.threadId,
+        source: 'remote-step',
+        kind: 'result',
+        summary: 'Remote work completed',
+        createdAt: new Date('2026-10-13T00:00:00.000Z'),
+      },
+    );
+    await new D1NotificationsStorage(h.db).init();
+    await h.journal.admitNotificationEffect(invocation.invocationId);
+    await expect(
+      h.journal.recordNotificationReceipt(invocation.invocationId, {
+        operationKey: operation.operationKey,
+        notificationId: operation.notificationId,
+        threadId: ADDRESS.threadId,
+        requestDigest: operation.requestDigest,
       }),
     ).rejects.toMatchObject({ status: 409 });
     expect(

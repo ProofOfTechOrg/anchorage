@@ -7,6 +7,7 @@ import {
 } from '../approval-api/principal.js';
 import {
   NOTIFICATION_OPERATION_PROJECTION_VERSION,
+  NOTIFICATION_OPERATION_RECEIPTS_TABLE,
   type NotificationOperationInput,
   projectNotificationOperation,
 } from '../signals/notifications-d1.js';
@@ -2376,6 +2377,9 @@ export class RemoteStepJournal {
         AND operation_state = 'effect-admitted' AND operation_key = ?
         AND notification_id = ? AND notification_request_digest = ?
         AND result_digest = ? AND write_revision = ? AND write_generation = ?
+        AND EXISTS (SELECT 1 FROM "${stored.table_prefix}${NOTIFICATION_OPERATION_RECEIPTS_TABLE}"
+          WHERE operation_key = ? AND request_digest = ?
+            AND thread_id = ? AND notification_id = ?)
       RETURNING *`)
         .bind(
           this.#now(),
@@ -2386,6 +2390,10 @@ export class RemoteStepJournal {
           stored.result_digest,
           stored.write_revision,
           stored.write_generation,
+          operation.operationKey,
+          operation.requestDigest,
+          stored.thread_id,
+          operation.notificationId,
         )
         .all(),
     );

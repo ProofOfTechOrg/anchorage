@@ -893,7 +893,10 @@ export class DeploymentInventory {
         `unknown inventory category '${String(category)}'`,
       );
     }
-    const query = this.#queryFor(category);
+    const query =
+      category === 'remote-steps'
+        ? await this.#remoteStepQuery()
+        : this.#queryFor(category);
     const table = this.#tableFor(descriptor);
     const cursor = parseCursor(options.cursor, category, query.key.length);
     const limit = clampLimit(options.limit);
@@ -957,6 +960,31 @@ export class DeploymentInventory {
     return descriptor.table.startsWith('mastra_')
       ? `${this.#prefix}${descriptor.table}`
       : descriptor.table;
+  }
+
+  async #remoteStepQuery(): Promise<CategoryQuery> {
+    const base = this.#queryFor('remote-steps');
+    const { results } = await this.#db
+      .prepare('SELECT name FROM pragma_table_xinfo(?)')
+      .bind(REMOTE_STEP_TABLE)
+      .all<{ name: unknown }>();
+    const columns = new Set(results.map((row) => row.name));
+    if (!columns.has('operation_state')) return base;
+    if (!columns.has('resume_admitted_at'))
+      throw new Error('remote step inventory schema is unreadable');
+    return {
+      ...base,
+      detail: [
+        ...base.detail,
+        'operation_state',
+        'resume_admitted_at',
+        'settlement_outcome',
+      ],
+      where: `((${base.where}) OR
+        (operation_state IN ('resume-admitted', 'unresolved')
+          AND status IN ('failed', 'settled')
+          AND settlement_outcome IS NOT 'applied'))`,
+    };
   }
 
   async #page(

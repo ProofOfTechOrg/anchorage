@@ -335,7 +335,7 @@ function isDuplicateColumn(error: unknown): boolean {
 export const NOTIFICATION_SEQUENCE_TABLE = 'flowsafe_notification_sequence';
 export const NOTIFICATION_OPERATION_PROJECTION_VERSION =
   'notification-record-values-v1';
-const NOTIFICATION_OPERATION_RECEIPTS_TABLE =
+export const NOTIFICATION_OPERATION_RECEIPTS_TABLE =
   'flowsafe_notification_operation_receipts';
 export const DEFAULT_NOTIFICATION_OPERATION_RECEIPT_LIMIT = 100_000;
 
