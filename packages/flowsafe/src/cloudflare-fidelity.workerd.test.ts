@@ -21,6 +21,12 @@ interface TestBindings {
 }
 
 const db = (): D1Database => (env as unknown as TestBindings).DB;
+const notificationRequestDigests = {
+  'operation-1':
+    '69d0b9cae1fecec25e3fdad599bc1d4b441761843e4c399563c43b4f8e27699c',
+  'operation-2':
+    '96bdec0f9c3160a3bdd190c24543168f4a4bcc5b7041507c996b042fc593f1dc',
+} as const;
 
 function receiptActor(name: string) {
   const namespace = (env as unknown as TestBindings).SIGNAL_PROVIDER_HOST;
@@ -129,11 +135,13 @@ describe('FlowSafe Cloudflare fidelity', () => {
         operationKey: 'operation-1',
         notificationId: 'notification-1',
         threadId: 'thread',
+        requestDigest: notificationRequestDigests['operation-1'],
       },
       {
         operationKey: 'operation-1',
         notificationId: 'notification-1',
         threadId: 'thread',
+        requestDigest: notificationRequestDigests['operation-1'],
       },
     ]);
     const receipts = await db()
@@ -196,16 +204,32 @@ describe('FlowSafe Cloudflare fidelity', () => {
       200, 409,
     ]);
     const receipts = await db()
-      .prepare(`SELECT operation_key, notification_id
+      .prepare(`SELECT operation_key, notification_id, request_digest
         FROM flowsafe_notification_operation_receipts
         WHERE operation_key IN ('operation-1', 'operation-2')`)
-      .all<{ operation_key: string; notification_id: string }>();
+      .all<{
+        operation_key: string;
+        notification_id: string;
+        request_digest: string;
+      }>();
     const inbox = await db()
       .prepare('SELECT id FROM mastra_notifications')
       .all<{ id: string }>();
     expect([
-      [{ operation_key: 'operation-1', notification_id: 'notification-1' }],
-      [{ operation_key: 'operation-2', notification_id: 'notification-2' }],
+      [
+        {
+          operation_key: 'operation-1',
+          notification_id: 'notification-1',
+          request_digest: notificationRequestDigests['operation-1'],
+        },
+      ],
+      [
+        {
+          operation_key: 'operation-2',
+          notification_id: 'notification-2',
+          request_digest: notificationRequestDigests['operation-2'],
+        },
+      ],
     ]).toContainEqual(receipts.results);
     const winner = receipts.results[0];
     if (!winner) throw new Error('receipt is missing');
@@ -231,6 +255,7 @@ describe('FlowSafe Cloudflare fidelity', () => {
       operationKey: winner.operation_key,
       notificationId: winner.notification_id,
       threadId: 'thread',
+      requestDigest: winner.request_digest,
     });
   }, 30_000);
 });
