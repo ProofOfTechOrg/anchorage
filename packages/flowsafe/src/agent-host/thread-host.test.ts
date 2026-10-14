@@ -60,6 +60,7 @@ import {
   D1SchedulesStorage,
   type ScheduleDatabase,
 } from '../schedules/schedules-d1.js';
+import { D1NotificationsStorage } from '../signals/notifications-d1.js';
 import {
   type AgentThreadInstanceScope,
   type AgentThreadStateStorage,
@@ -8159,6 +8160,235 @@ it('admits a configured notification effect once before agent continuation', asy
       )
       .get(),
   ).toMatchObject({ count: 1 });
+});
+
+it.each([
+  'before write',
+  'after write',
+] as const)('recovers an admitted notification after its deadline without resuming Mastra (%s)', async (failurePoint) => {
+  const fixture = await hostAgentLifecycleFixture({
+    mode: 'fenced',
+    provenance: 'modern',
+  });
+  onTestFinished(() => {
+    vi.restoreAllMocks();
+    fixture.sql.close();
+  });
+  fixture.snapshot.suspendedPaths = { tool: [0] };
+  Object.assign(fixture.snapshot.context, {
+    tool: {
+      status: 'suspended',
+      payload: {},
+      startedAt: 50,
+      suspendedAt: 1000,
+      suspendPayload: {
+        type: 'suspension',
+        toolName: 'remote_lookup',
+        toolCallId: 'call-1',
+        toolCallSuspended: {
+          remoteStep: REMOTE_STEP_MARKER,
+          request: { notificationOperationId: 'enqueue-v1' },
+        },
+      },
+    },
+  });
+  await fixture.persist();
+  await fixture.host.route(hostAgentLifecycleRequest(), fixture.scope);
+  const journal = new RemoteStepJournal({
+    db: fixture.binding,
+    fence: fixture.fence,
+    runtime: fixture.app.runtime,
+    deploymentId: 'deployment',
+    tablePrefix: 'host_lifecycle_',
+    allowedToolIds: ['remote_lookup'],
+    verifyCompletion: async () => undefined,
+  });
+  await journal.initialize();
+  const invocation = await journal.register(
+    {
+      deploymentId: 'deployment',
+      tablePrefix: 'host_lifecycle_',
+      workflowId: fixture.execution.workflowId,
+      agentId: 'writer',
+      threadId: 'acme_thread',
+      resourceId: RESOURCE_ID,
+      runId: 'acme_run',
+    },
+    Date.now() + 60_000,
+    fixture.scope.principal,
+  );
+  const permit = await journal.issuePermit(invocation.invocationId, 5_000);
+  const consumed = await journal.consumePermit(permit);
+  if (consumed.kind !== 'accepted') throw new Error('permit was not won');
+  await journal.recordResult(
+    invocation.invocationId,
+    consumed.rawPermit,
+    '{"untrusted":"result"}',
+    '{"receipt":"complete"}',
+  );
+  const freshApp = init(
+    { storage: fixture.storage },
+    { executionFence: fixture.fence, startIdempotency: fixture.reservations },
+  );
+  const reopened = new RemoteStepJournal({
+    db: fixture.binding,
+    fence: fixture.fence,
+    runtime: freshApp.runtime,
+    deploymentId: 'deployment',
+    tablePrefix: 'host_lifecycle_',
+    allowedToolIds: ['remote_lookup'],
+    verifyCompletion: async () => undefined,
+  });
+  const host = harness(['writer'], {
+    init: freshApp,
+    storage: fixture.storage,
+    stateStorage: fixture.stateStorage,
+    resourceAccess: fixture.resources,
+    remoteSteps: reopened,
+    remoteStepNotification: {
+      journal: reopened,
+      agentId: 'writer',
+      operationId: 'enqueue-v1',
+      source: 'flowsafe',
+      kind: 'host-owned',
+      summary: 'Agent notification',
+    },
+  });
+  const retained = await reopened.readRetainedResult(invocation.invocationId);
+  if (!retained) throw new Error('retained result is missing');
+  await reopened.prepareNotificationOperation(
+    invocation.invocationId,
+    'enqueue-v1',
+    {
+      threadId: invocation.threadId,
+      resourceId: invocation.resourceId,
+      agentId: invocation.agentId,
+      source: 'flowsafe',
+      kind: 'host-owned',
+      summary: 'Agent notification',
+      sourceId: invocation.invocationId,
+      createdAt: new Date(retained.executorQuiescentAt),
+    },
+  );
+  expect(
+    await host.host.recoverNotificationOperation(
+      host.scope,
+      invocation.invocationId,
+    ),
+  ).toBe('unresolved');
+  const resume = vi.spyOn(FlowsafeDurableAgent.prototype, 'resumeViaRuntime');
+  const create = D1NotificationsStorage.prototype.createNotificationOnce;
+  const lostCall = vi
+    .spyOn(D1NotificationsStorage.prototype, 'createNotificationOnce')
+    .mockImplementationOnce(async function (
+      this: D1NotificationsStorage,
+      ...args: Parameters<typeof create>
+    ) {
+      if (failurePoint === 'after write') await create.apply(this, args);
+      throw new Error('executor unavailable after admission');
+    });
+  await expect(
+    host.host.route(
+      new Request('https://thread/_flowsafe/agent-host/remote-step-resume', {
+        method: 'POST',
+        body: JSON.stringify({ invocationId: invocation.invocationId }),
+      }),
+      host.scope,
+    ),
+  ).rejects.toThrow('executor unavailable after admission');
+  lostCall.mockRestore();
+  expect(
+    (await journal.readNotificationOperation(invocation.invocationId))?.state,
+  ).toBe('effect-admitted');
+  await fixture.binding
+    .prepare(
+      'UPDATE flowsafe_remote_step_invocations SET deadline_at = ?, write_revision = write_revision + 1, write_generation = write_generation + 1 WHERE invocation_id = ?',
+    )
+    .bind(Date.now() - 1, invocation.invocationId)
+    .run();
+  const restartedStorage = createD1Storage({
+    binding: fixture.binding,
+    tablePrefix: 'host_lifecycle_',
+  });
+  await restartedStorage.init();
+  const restartedApp = init(
+    { storage: restartedStorage },
+    { executionFence: fixture.fence, startIdempotency: fixture.reservations },
+  );
+  const restartedJournal = new RemoteStepJournal({
+    db: fixture.binding,
+    fence: fixture.fence,
+    runtime: restartedApp.runtime,
+    deploymentId: 'deployment',
+    tablePrefix: 'host_lifecycle_',
+    allowedToolIds: ['remote_lookup'],
+    verifyCompletion: async () => undefined,
+  });
+  const restarted = harness(['writer'], {
+    init: restartedApp,
+    storage: restartedStorage,
+    stateStorage: { ...fixture.stateStorage },
+    resourceAccess: fixture.resources,
+    remoteSteps: restartedJournal,
+    remoteStepNotification: {
+      journal: restartedJournal,
+      agentId: 'writer',
+      operationId: 'enqueue-v1',
+      source: 'flowsafe',
+      kind: 'host-owned',
+      summary: 'Agent notification',
+    },
+  });
+  await expect(
+    restarted.host.recoverNotificationOperation(
+      {
+        ...restarted.scope,
+        principal: { ...restarted.scope.principal, id: 'different-user' },
+      },
+      invocation.invocationId,
+    ),
+  ).rejects.toMatchObject({ status: 404 });
+  if (failurePoint === 'before write')
+    expect(
+      fixture.sql
+        .prepare(
+          "SELECT COUNT(*) AS count FROM sqlite_master WHERE name = 'host_lifecycle_mastra_notifications'",
+        )
+        .get(),
+    ).toMatchObject({ count: 0 });
+  expect(
+    await restarted.host.recoverNotificationOperation(
+      restarted.scope,
+      invocation.invocationId,
+    ),
+  ).toBe('receipt-recorded');
+  expect(
+    await restarted.host.recoverNotificationOperation(
+      restarted.scope,
+      invocation.invocationId,
+    ),
+  ).toBe('receipt-recorded');
+  expect(
+    (await journal.readNotificationOperation(invocation.invocationId))?.state,
+  ).toBe('receipt-recorded');
+  expect(
+    fixture.sql
+      .prepare(
+        'SELECT COUNT(*) AS count FROM host_lifecycle_mastra_notifications',
+      )
+      .get(),
+  ).toMatchObject({ count: 1 });
+  await expect(
+    restarted.host.route(
+      new Request('https://thread/_flowsafe/agent-host/remote-step-resume', {
+        method: 'POST',
+        body: JSON.stringify({ invocationId: invocation.invocationId }),
+      }),
+      restarted.scope,
+    ),
+  ).rejects.toMatchObject({ status: 404 });
+  expect(resume).not.toHaveBeenCalled();
+  expect(D1NotificationsStorage.prototype.createNotificationOnce).toBe(create);
 });
 
 describe('agent host selector lookup isolation', () => {
