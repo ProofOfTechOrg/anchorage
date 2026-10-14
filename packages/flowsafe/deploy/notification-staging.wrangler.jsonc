@@ -1,0 +1,43 @@
+{
+  "$schema": "https://unpkg.com/wrangler/config-schema.json",
+  "name": "anchorage-flowsafe-remote-step-staging",
+  "main": "./notification-staging.worker.ts",
+  "compatibility_date": "2026-10-14",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": false,
+  "secrets": {
+    "required": [
+      "DEPLOYMENT_IDENTITY_SECRET",
+      "MAINTENANCE_ADMIN_SECRET",
+      "STAGING_PROBE_SECRET"
+    ]
+  },
+  "durable_objects": {
+    "bindings": [
+      { "name": "RUNNER", "class_name": "NotificationStagingRunner" },
+      { "name": "THREAD", "class_name": "NotificationStagingThread" },
+      { "name": "MAINTENANCE", "class_name": "NotificationStagingMaintenance" }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "notification-staging-v1",
+      "new_sqlite_classes": [
+        "NotificationStagingRunner",
+        "NotificationStagingThread",
+        "NotificationStagingMaintenance"
+      ]
+    }
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "anchorage-flowsafe-remote-step-staging-db",
+      "database_id": "b863a219-2096-4e13-92fe-4db592b67944"
+    }
+  ],
+  "vars": {
+    "DEPLOYMENT_TENANT": "flowsafe-notification-staging",
+    "NOTIFICATION_PROOF_ENABLED": "false"
+  }
+}

@@ -17,6 +17,8 @@
   },
   "include": [
     "./worker.ts",
+    "./notification-staging.worker.ts",
+    "./notification-staging-probe.worker.ts",
     "../src/**/*.ts",
     "../test-support/maintenance-alarm-harness-worker.ts"
   ],

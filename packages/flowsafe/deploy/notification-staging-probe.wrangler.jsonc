@@ -1,0 +1,16 @@
+{
+  "$schema": "https://unpkg.com/wrangler/config-schema.json",
+  "name": "anchorage-flowsafe-remote-step-staging-probe-local",
+  "main": "./notification-staging-probe.worker.ts",
+  "compatibility_date": "2026-10-14",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": false,
+  "dev": { "ip": "127.0.0.1" },
+  "services": [
+    {
+      "binding": "SUBJECT",
+      "service": "anchorage-flowsafe-remote-step-staging",
+      "remote": true
+    }
+  ]
+}
