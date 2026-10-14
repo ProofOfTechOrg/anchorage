@@ -93,6 +93,22 @@ test('changed version or disabled flag refuses before deploy', () => {
   );
 });
 
+test('Wrangler failure preserves exit and stderr in its diagnostic cause', () => {
+  const cli = createWranglerControl({
+    token: 'fake-token',
+    command: () => ({ status: 1, signal: null, stderr: 'deployment rejected' }),
+  });
+  assert.throws(
+    () => cli.currentVersion(),
+    (error) => {
+      assert.match(error.message, /Wrangler deployments list failed/);
+      assert.match(error.cause?.message, /exit=1/);
+      assert.match(error.cause?.message, /deployment rejected/);
+      return true;
+    },
+  );
+});
+
 test('watchdog relock uses a fresh epoch and revision', async () => {
   const calls = [];
   let observedRevision = 1;

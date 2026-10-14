@@ -73,7 +73,19 @@ export function createWranglerControl({ command = spawnSync, token }) {
         WRANGLER_SEND_METRICS: 'false',
       },
     });
-    assert(result.status === 0, `Wrangler ${args[0]} ${args[1]} failed`);
+    if (result.status !== 0) {
+      const details = [
+        `exit=${result.status ?? 'none'}`,
+        `signal=${result.signal ?? 'none'}`,
+        result.error?.message,
+        result.stderr?.slice(-2_048),
+      ]
+        .filter(Boolean)
+        .join(' | ');
+      throw new Error(`Wrangler ${args[0]} ${args[1]} failed`, {
+        cause: new Error(details),
+      });
+    }
     return result.stdout;
   }
   function json(args) {
