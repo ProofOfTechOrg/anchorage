@@ -408,12 +408,14 @@ export function createAgentThreadTopology<Id>(
     context: ActorContext,
     invocationId: string,
     access: 'read' | 'write',
+    loadedInvocation?: WorkflowRemoteStepInvocation,
   ) => {
     const reader = options.workflowRemoteStepDispatch;
     if (!reader) throw new RunRouteError(503, 'remote steps are unavailable');
     if (!isPathSafeId(invocationId))
       throw new RunRouteError(404, 'invocation not found');
-    const invocation = await reader.getWorkflow(invocationId);
+    const invocation =
+      loadedInvocation ?? (await reader.getWorkflow(invocationId));
     if (
       invocation?.targetKind !== 'workflow' ||
       invocation.invocationId !== invocationId ||
@@ -617,8 +619,14 @@ export function createAgentThreadTopology<Id>(
         throw new RunRouteError(404, 'invocation not found');
       const invocation = await reader.getWorkflow(invocationId);
       if (!invocation) return undefined;
-      return (await workflowDispatchInvocation(context, invocationId, 'read'))
-        .invocation;
+      return (
+        await workflowDispatchInvocation(
+          context,
+          invocationId,
+          'read',
+          invocation,
+        )
+      ).invocation;
     },
     issueWorkflowRemoteStepDispatch: async (
       context,
