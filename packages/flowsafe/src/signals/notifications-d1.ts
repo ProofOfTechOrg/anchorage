@@ -574,6 +574,14 @@ export class D1NotificationsStorage
          )`,
       )
       .run();
+    await this.#db
+      .prepare(`CREATE TABLE IF NOT EXISTS ${NOTIFICATION_RECEIPT_SCOPE_TABLE} (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        version INTEGER NOT NULL CHECK (version = 1),
+        table_prefix TEXT NOT NULL,
+        receipt_limit INTEGER NOT NULL CHECK (receipt_limit BETWEEN 0 AND ${DEFAULT_NOTIFICATION_OPERATION_RECEIPT_LIMIT})
+      )`)
+      .run();
   }
 
   async #migrateOrdinalSchema(retryDuplicateColumn: boolean): Promise<void> {
@@ -742,14 +750,6 @@ export class D1NotificationsStorage
       if (retained && prefix !== this.#prefix)
         throw new Error('notification receipt history spans another prefix');
     }
-    await this.#db
-      .prepare(`CREATE TABLE IF NOT EXISTS ${NOTIFICATION_RECEIPT_SCOPE_TABLE} (
-        id INTEGER PRIMARY KEY CHECK (id = 1),
-        version INTEGER NOT NULL CHECK (version = 1),
-        table_prefix TEXT NOT NULL,
-        receipt_limit INTEGER NOT NULL CHECK (receipt_limit BETWEEN 0 AND ${DEFAULT_NOTIFICATION_OPERATION_RECEIPT_LIMIT})
-      )`)
-      .run();
     const columns = await this.#db
       .prepare(`PRAGMA table_info(${NOTIFICATION_RECEIPT_SCOPE_TABLE})`)
       .all<{ name: string; type: string; notnull: number; pk: number }>();
