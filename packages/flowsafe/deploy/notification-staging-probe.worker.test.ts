@@ -31,6 +31,33 @@ it('forwards a staging request only after the local caller supplies the probe cr
   });
 });
 
+it('returns the authenticated subject version through the private binding', async () => {
+  const secret = 'staging-local-probe-secret-32-bytes-minimum';
+  const fetch = vi.fn(async () =>
+    Response.json({
+      versionId: 'aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa',
+      deploymentTenant: 'flowsafenotificationfresh',
+    }),
+  );
+  const env = {
+    SUBJECT: { fetch } as unknown as Fetcher,
+    STAGING_PROBE_SECRET: secret,
+  };
+  const request = (credential: string) =>
+    new Request('http://127.0.0.1/identity', {
+      headers: { authorization: `Bearer ${credential}` },
+    });
+  expect((await handler.fetch(request('wrong'), env)).status).toBe(403);
+  expect(fetch).not.toHaveBeenCalled();
+  const response = await handler.fetch(request(secret), env);
+  expect(response.status).toBe(200);
+  expect(await response.json()).toEqual({
+    versionId: 'aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa',
+    deploymentTenant: 'flowsafenotificationfresh',
+  });
+  expect(fetch.mock.calls[0]?.[0]).toBe('http://subject/__staging/identity');
+});
+
 it('keeps start and completion on the authenticated private service binding', async () => {
   const secret = 'staging-local-probe-secret-32-bytes-minimum';
   const fetch = vi.fn(async () => new Response(null, { status: 204 }));

@@ -10,8 +10,8 @@ import {
 } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { test } from 'node:test';
+import { dirname, join } from 'node:path';
+import { after, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import {
   createWranglerControl,
@@ -20,6 +20,55 @@ import {
 
 const enabled = 'aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa';
 const disabled = 'bbbbbbbb-bbbb-4bbb-bbbb-bbbbbbbbbbbb';
+const bundleDirectory = mkdtempSync(
+  join(tmpdir(), 'flowsafe-test-off-bundle-'),
+);
+const bundlePath = join(bundleDirectory, 'notification-staging.worker.js');
+writeFileSync(bundlePath, 'export default {};', { mode: 0o600 });
+after(() => rmSync(bundleDirectory, { recursive: true, force: true }));
+
+function freshConfig() {
+  const source = JSON.parse(
+    readFileSync(
+      new URL('./notification-staging.wrangler.jsonc', import.meta.url),
+      'utf8',
+    ),
+  );
+  source.name = 'anchorage-flowsafe-remote-step-staging-fresh';
+  source.main = fileURLToPath(
+    new URL('./notification-staging.worker.ts', import.meta.url),
+  );
+  source.alias = Object.fromEntries(
+    Object.entries(source.alias).map(([key, value]) => [
+      key,
+      fileURLToPath(new URL(value, import.meta.url)),
+    ]),
+  );
+  source.d1_databases[0].database_name = 'anchorage-flowsafe-fresh-db';
+  source.d1_databases[0].database_id = 'cccccccc-cccc-4ccc-cccc-cccccccccccc';
+  source.vars.DEPLOYMENT_TENANT = 'flowsafenotificationfresh';
+  return source;
+}
+
+function versionBindings(source, proofEnabled) {
+  return [
+    {
+      name: 'NOTIFICATION_PROOF_ENABLED',
+      type: 'plain_text',
+      text: String(proofEnabled),
+    },
+    {
+      name: 'DEPLOYMENT_TENANT',
+      type: 'plain_text',
+      text: source.vars.DEPLOYMENT_TENANT,
+    },
+    {
+      name: 'DB',
+      type: 'd1',
+      database_id: source.d1_databases[0].database_id,
+    },
+  ];
+}
 
 function fakeCli({ enabledFlag = true, priorVersion } = {}) {
   const calls = [];
@@ -46,17 +95,20 @@ function fakeCli({ enabledFlag = true, priorVersion } = {}) {
       };
     }
     if (args[0] === 'versions') {
+      const source = JSON.parse(
+        readFileSync(
+          new URL('./notification-staging.wrangler.jsonc', import.meta.url),
+          'utf8',
+        ),
+      );
       return {
         status: 0,
         stdout: JSON.stringify({
           resources: {
-            bindings: [
-              {
-                name: 'NOTIFICATION_PROOF_ENABLED',
-                type: 'plain_text',
-                text: args[2] === enabled && enabledFlag ? 'true' : 'false',
-              },
-            ],
+            bindings: versionBindings(
+              source,
+              args[2] === enabled && enabledFlag,
+            ),
           },
         }),
       };
@@ -88,7 +140,11 @@ test('version-checked off deploy uses the tracked false config', () => {
   assert.equal(fixture.cli.currentVersion(), enabled);
   assert.equal(fixture.cli.proofEnabled(enabled), true);
   assert.equal(
-    fixture.cli.deployOffIfCurrent(enabled, '/tmp/staging-off-test'),
+    fixture.cli.deployOffIfCurrent(
+      enabled,
+      '/tmp/staging-off-test',
+      bundlePath,
+    ),
     disabled,
   );
   assert.equal(fixture.cli.proofEnabled(disabled), false);
@@ -99,13 +155,23 @@ test('changed version or disabled flag refuses before deploy', () => {
   const changed = fakeCli();
   changed.change();
   assert.throws(
-    () => changed.cli.deployOffIfCurrent(enabled, '/tmp/staging-off-test'),
+    () =>
+      changed.cli.deployOffIfCurrent(
+        enabled,
+        '/tmp/staging-off-test',
+        bundlePath,
+      ),
     /changed/,
   );
   assert.equal(changed.calls.filter((args) => args[0] === 'deploy').length, 0);
   const disabledFlag = fakeCli({ enabledFlag: false });
   assert.throws(
-    () => disabledFlag.cli.deployOffIfCurrent(enabled, '/tmp/staging-off-test'),
+    () =>
+      disabledFlag.cli.deployOffIfCurrent(
+        enabled,
+        '/tmp/staging-off-test',
+        bundlePath,
+      ),
     /not enabled/,
   );
   assert.equal(
@@ -121,6 +187,137 @@ test('retry evidence requires the immediately prior full off deployment', () => 
   assert.throws(() => absent.cli.priorOffVersion(enabled), /history differs/);
   const enabledPrior = fakeCli({ priorVersion: enabled });
   assert.throws(() => enabledPrior.cli.priorOffVersion(enabled), /not off/);
+});
+
+test('enabled version requires exact D1 and tenant bindings', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'flowsafe-d1-mismatch-test-'));
+  try {
+    const source = freshConfig();
+    const path = join(directory, 'private.wrangler.jsonc');
+    writeFileSync(path, JSON.stringify(source), { mode: 0o600 });
+    let boundDatabaseId = 'dddddddd-dddd-4ddd-dddd-dddddddddddd';
+    let boundTenant = source.vars.DEPLOYMENT_TENANT;
+    const cli = createWranglerControl({
+      configPath: path,
+      token: 'fake-token',
+      command: (_executable, args) => {
+        assert.equal(args[0], 'versions');
+        return {
+          status: 0,
+          stdout: JSON.stringify({
+            resources: {
+              bindings: [
+                {
+                  name: 'NOTIFICATION_PROOF_ENABLED',
+                  type: 'plain_text',
+                  text: 'true',
+                },
+                {
+                  name: 'DEPLOYMENT_TENANT',
+                  type: 'plain_text',
+                  text: boundTenant,
+                },
+                {
+                  name: 'DB',
+                  type: 'd1',
+                  database_id: boundDatabaseId,
+                },
+              ],
+            },
+          }),
+        };
+      },
+    });
+    assert.throws(
+      () => cli.proofEnabled(enabled),
+      /enabled D1 binding differs/,
+    );
+    boundDatabaseId = source.d1_databases[0].database_id;
+    boundTenant = 'wrongtenant';
+    assert.throws(
+      () => cli.proofEnabled(enabled),
+      /enabled deployment tenant differs/,
+    );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('private staging config scopes version, D1, and off deployment to one fresh resource', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'flowsafe-fresh-config-test-'));
+  try {
+    const source = freshConfig();
+    const path = join(directory, 'private.wrangler.jsonc');
+    writeFileSync(path, JSON.stringify(source), { mode: 0o600 });
+    const calls = [];
+    let currentVersion = enabled;
+    const command = (_executable, args) => {
+      calls.push(args);
+      if (args[0] === 'deployments')
+        return {
+          status: 0,
+          stdout: JSON.stringify([
+            {
+              created_on: '2026-10-15T00:00:00.000Z',
+              versions: [{ version_id: currentVersion, percentage: 100 }],
+            },
+          ]),
+        };
+      if (args[0] === 'versions')
+        return {
+          status: 0,
+          stdout: JSON.stringify({
+            resources: {
+              bindings: versionBindings(source, args[2] === enabled),
+            },
+          }),
+        };
+      if (args[0] === 'd1')
+        return {
+          status: 0,
+          stdout: JSON.stringify([{ success: true, results: [] }]),
+        };
+      if (args[0] === 'deploy') {
+        currentVersion = disabled;
+        return { status: 0, stdout: 'deployed' };
+      }
+      throw new Error('unexpected CLI');
+    };
+    const cli = createWranglerControl({
+      command,
+      token: 'fake-token',
+      configPath: path,
+    });
+    assert.equal(cli.currentVersion(), enabled);
+    assert.deepEqual(cli.query('SELECT 1'), []);
+    assert.equal(
+      cli.deployOffIfCurrent(enabled, join(directory, 'off'), bundlePath),
+      disabled,
+    );
+    assert.equal(calls.filter((args) => args[0] === 'deploy').length, 1);
+    for (const args of calls) {
+      assert.equal(args[args.indexOf('--config') + 1], path);
+      if (args[0] === 'd1')
+        assert.equal(args[2], source.d1_databases[0].database_name);
+    }
+    source.routes = [{ pattern: 'example.com/*', zone_name: 'example.com' }];
+    writeFileSync(path, JSON.stringify(source), { mode: 0o600 });
+    assert.throws(
+      () => cli.query('SELECT 1'),
+      /private staging config differs/,
+    );
+    assert.throws(
+      () =>
+        createWranglerControl({
+          command,
+          token: 'fake-token',
+          configPath: path,
+        }),
+      /private staging config differs/,
+    );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test('Wrangler failure preserves exit and stderr in its diagnostic cause', () => {
@@ -271,19 +468,47 @@ async function exerciseWatchdog(outcome) {
       ? 'c'.repeat(32)
       : outcome === 'sealed retry'
         ? 'e'.repeat(32)
-        : 'd'.repeat(32);
+        : outcome === 'fresh config'
+          ? 'f'.repeat(32)
+          : outcome === 'mismatched probe'
+            ? '1'.repeat(32)
+            : 'd'.repeat(32);
+  const workerName =
+    outcome === 'fresh config'
+      ? 'anchorage-flowsafe-remote-step-staging-fresh'
+      : 'anchorage-flowsafe-remote-step-staging';
   const lockFile = join(
     '/tmp',
     `flowsafe-deploy-locks-${process.getuid()}`,
-    `${accountId}-anchorage-flowsafe-remote-step-staging.lock`,
+    `${accountId}-${workerName}.lock`,
   );
   writeFileSync(tokenFile, 'fake-token', { mode: 0o600 });
   writeFileSync(secretFile, secret, { mode: 0o600 });
+  const privateConfigPath = join(directory, 'fresh.wrangler.jsonc');
+  const privateProbeConfigPath = join(directory, 'fresh-probe.wrangler.jsonc');
+  if (outcome === 'fresh config') {
+    writeFileSync(privateConfigPath, JSON.stringify(freshConfig()), {
+      mode: 0o600,
+    });
+    const probeConfig = JSON.parse(
+      readFileSync(
+        new URL('./notification-staging-probe.wrangler.jsonc', import.meta.url),
+        'utf8',
+      ),
+    );
+    probeConfig.main = fileURLToPath(
+      new URL('./notification-staging-probe.worker.ts', import.meta.url),
+    );
+    probeConfig.services[0].service = workerName;
+    writeFileSync(privateProbeConfigPath, JSON.stringify(probeConfig), {
+      mode: 0o600,
+    });
+  }
   writeFileSync(
     preloadFile,
     `import childProcess from 'node:child_process';
 import { syncBuiltinESMExports } from 'node:module';
-import { existsSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 const originalSpawn = childProcess.spawn;
 const originalSpawnSync = childProcess.spawnSync;
 const originalNow = Date.now;
@@ -301,6 +526,13 @@ childProcess.spawnSync = (executable, args, options) => {
   if (executable === 'flock') return originalSpawnSync(executable, args, options);
   if (!executable.endsWith('/node_modules/.bin/wrangler'))
     throw new Error('unexpected synchronous command');
+  if (process.env.TEST_FRESH_CONFIG === 'true') {
+    const configPath = args[args.indexOf('--config') + 1];
+    if (!configPath.endsWith('/off.wrangler.jsonc'))
+      throw new Error('fresh config snapshot was not used');
+    if (args[0] === 'd1' && args[2] !== 'anchorage-flowsafe-fresh-db')
+      throw new Error('fresh D1 was not selected');
+  }
   const off = existsSync(process.env.TEST_OFF_FILE);
   const command = args[0];
   if (off && command === 'deployments')
@@ -321,6 +553,15 @@ childProcess.spawnSync = (executable, args, options) => {
     resources: { bindings: [{
       name: 'NOTIFICATION_PROOF_ENABLED', type: 'plain_text',
       text: off || args[2] === '${disabled}' ? 'false' : 'true',
+    }, {
+      name: 'DEPLOYMENT_TENANT', type: 'plain_text',
+      text: process.env.TEST_FRESH_CONFIG === 'true'
+        ? 'flowsafenotificationfresh' : 'flowsafenotificationstaging',
+    }, {
+      name: 'DB', type: 'd1',
+      database_id: process.env.TEST_FRESH_CONFIG === 'true'
+        ? 'cccccccc-cccc-4ccc-cccc-cccccccccccc'
+        : 'b863a219-2096-4e13-92fe-4db592b67944',
     }] },
   } : command === 'd1' ? [{ success: true, results:
     sql.includes("name IN ('mastra_notifications', 'flowsafe_notification_operation_receipts')")
@@ -344,6 +585,15 @@ childProcess.spawnSync = (executable, args, options) => {
           : [],
   }] : null;
   if (command === 'deploy') {
+    if (args.includes('--dry-run')) {
+      const outdir = args[args.indexOf('--outdir') + 1];
+      mkdirSync(outdir, { recursive: true, mode: 0o700 });
+      writeFileSync(outdir + '/notification-staging.worker.js', 'export default {};');
+      return { status: 0, stdout: 'bundled' };
+    }
+    if (!args[1]?.endsWith('/pinned-off-bundle/notification-staging.worker.js') ||
+        !existsSync(args[1]))
+      throw new Error('pinned off bundle was not used');
     writeFileSync(process.env.TEST_DEPLOY_STARTED_FILE, 'started');
     while (!existsSync(process.env.TEST_RELEASE_DEPLOY_FILE))
       originalSpawnSync('sleep', ['0.02']);
@@ -373,7 +623,7 @@ syncBuiltinESMExports();
     if (method === 'POST' && path === '/start') {
       startReceived = true;
       writeFileSync(effectStartedFile, 'started');
-      if (outcome === 'parent death') return;
+      if (outcome === 'parent death' || outcome === 'fresh config') return;
       response.writeHead(200, { 'content-type': 'application/json' });
       response.end(
         JSON.stringify({ status: 'suspended', invocationId: 'invocation' }),
@@ -383,6 +633,14 @@ syncBuiltinESMExports();
     let value;
     if (path === '/complete') {
       value = { invocationId: 'invocation', status: 'success' };
+    } else if (path === '/identity') {
+      value = {
+        versionId: outcome === 'mismatched probe' ? disabled : enabled,
+        deploymentTenant:
+          outcome === 'fresh config'
+            ? 'flowsafenotificationfresh'
+            : 'flowsafenotificationstaging',
+      };
     } else if (path === '/admin/maintenance-status') {
       value = { alarmAt: 1, nextRemoteStepRecoveryAt: 1 };
     } else if (path === '/admin/execution-fence' && method === 'POST') {
@@ -433,6 +691,12 @@ syncBuiltinESMExports();
           FLOWSAFE_STAGING_PROBE_SECRET_FILE: secretFile,
           FLOWSAFE_CF_TOKEN_FILE: tokenFile,
           FLOWSAFE_CF_ACCOUNT_ID: accountId,
+          ...(outcome === 'fresh config'
+            ? {
+                FLOWSAFE_STAGING_CONFIG_FILE: privateConfigPath,
+                FLOWSAFE_STAGING_PROBE_CONFIG_FILE: privateProbeConfigPath,
+              }
+            : {}),
           TEST_OFF_FILE: offFile,
           TEST_OFF_CONFIRMED_FILE: offConfirmedFile,
           TEST_WATCHDOG_PID_FILE: watcherPidFile,
@@ -441,6 +705,7 @@ syncBuiltinESMExports();
           TEST_EFFECT_STARTED_FILE: effectStartedFile,
           TEST_CLOCK_JUMP: outcome === 'controller request' ? 'true' : 'false',
           TEST_RETRY: outcome === 'sealed retry' ? 'true' : 'false',
+          TEST_FRESH_CONFIG: outcome === 'fresh config' ? 'true' : 'false',
         },
         stdio: 'ignore',
       },
@@ -458,6 +723,18 @@ syncBuiltinESMExports();
       }
     };
     await waitFor(() => existsSync(`${stateFile}.ready`));
+    if (outcome === 'fresh config') {
+      const state = JSON.parse(readFileSync(stateFile, 'utf8'));
+      assert.equal(state.workerName, workerName);
+      assert.equal(
+        state.configPath,
+        join(dirname(stateFile), 'off.wrangler.jsonc'),
+      );
+      assert.equal(
+        readFileSync(state.configPath, 'utf8'),
+        readFileSync(privateConfigPath, 'utf8'),
+      );
+    }
     if (outcome === 'sealed retry')
       assert.equal(
         JSON.parse(readFileSync(stateFile, 'utf8')).baselineEpoch,
@@ -465,9 +742,9 @@ syncBuiltinESMExports();
       );
     await waitFor(() => existsSync(watcherPidFile));
     watcherPid = Number(readFileSync(watcherPidFile, 'utf8'));
-    await waitFor(() => startReceived);
+    if (outcome !== 'mismatched probe') await waitFor(() => startReceived);
     assert.equal(existsSync(offFile), false);
-    if (outcome === 'parent death') {
+    if (outcome === 'parent death' || outcome === 'fresh config') {
       assert.equal(fence.state, 'open');
       controller.kill('SIGKILL');
     }
@@ -481,14 +758,19 @@ syncBuiltinESMExports();
     assert.equal(readFileSync(offFile, 'utf8'), 'deployed');
     assert.deepEqual(fence, {
       state: 'migration-locked',
-      mutationEpoch: outcome === 'sealed retry' ? 3 : 2,
+      mutationEpoch:
+        outcome === 'sealed retry' ? 3 : outcome === 'mismatched probe' ? 1 : 2,
       requireMutationEpoch: true,
-      transitionRevision: outcome === 'sealed retry' ? 3 : 2,
+      transitionRevision:
+        outcome === 'sealed retry' ? 3 : outcome === 'mismatched probe' ? 1 : 2,
     });
     assert.deepEqual(
       requests.filter((request) => request === 'POST /admin/execution-fence'),
-      ['POST /admin/execution-fence', 'POST /admin/execution-fence'],
+      outcome === 'mismatched probe'
+        ? ['POST /admin/execution-fence']
+        : ['POST /admin/execution-fence', 'POST /admin/execution-fence'],
     );
+    if (outcome === 'mismatched probe') assert.equal(startReceived, false);
     if (outcome === 'controller request') {
       await waitFor(() => controller.exitCode !== null);
       assert.equal(controller.exitCode, 0);
@@ -513,6 +795,12 @@ syncBuiltinESMExports();
 
 test('watchdog owns off deployment after parent death', () =>
   exerciseWatchdog('parent death'));
+
+test('fresh Worker watchdog uses the private off config snapshot after parent death', () =>
+  exerciseWatchdog('fresh config'));
+
+test('mismatched authenticated probe subject prevents fence unlock and effect', () =>
+  exerciseWatchdog('mismatched probe'));
 
 test('watchdog owns off deployment after controller request', () =>
   exerciseWatchdog('controller request'));

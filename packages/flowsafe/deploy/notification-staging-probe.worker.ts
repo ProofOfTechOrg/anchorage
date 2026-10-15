@@ -20,8 +20,9 @@ export default {
       return new Response(null, { status: 404 });
     if (url.search || url.hash) return new Response(null, { status: 404 });
     const staging =
-      request.method === 'POST' &&
-      ['/ensure', '/start', '/complete'].includes(url.pathname);
+      (request.method === 'POST' &&
+        ['/ensure', '/start', '/complete'].includes(url.pathname)) ||
+      (request.method === 'GET' && url.pathname === '/identity');
     const admin =
       (request.method === 'GET' &&
         ['/admin/execution-fence', '/admin/maintenance-status'].includes(

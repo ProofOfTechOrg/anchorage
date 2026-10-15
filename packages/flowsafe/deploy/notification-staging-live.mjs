@@ -12,8 +12,9 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve as resolvePath } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isDeepStrictEqual } from 'node:util';
 import {
   localProbe,
   readSecretFile,
@@ -25,13 +26,19 @@ import {
 const here = dirname(fileURLToPath(import.meta.url));
 const flowsafe = dirname(here);
 const wrangler = join(flowsafe, '../../node_modules/.bin/wrangler');
-const config = join(here, 'notification-staging.wrangler.jsonc');
-const database = 'anchorage-flowsafe-remote-step-staging-db';
+const trackedConfigPath = join(here, 'notification-staging.wrangler.jsonc');
+const trackedConfig = JSON.parse(readFileSync(trackedConfigPath, 'utf8'));
+const trackedProbeConfigPath = join(
+  here,
+  'notification-staging-probe.wrangler.jsonc',
+);
+const trackedProbeConfig = JSON.parse(
+  readFileSync(trackedProbeConfigPath, 'utf8'),
+);
 const versionPattern =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const accountPattern = /^[0-9a-f]{32}$/;
-const workerName = JSON.parse(readFileSync(config, 'utf8')).name;
-assert(/^[a-z0-9-]+$/.test(workerName), 'invalid staging Worker name');
+const workerNamePattern = /^[a-z0-9-]+$/;
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -66,8 +73,86 @@ function privateFile(path) {
   return readFileSync(path, 'utf8').trim();
 }
 
-export function createWranglerControl({ command = spawnSync, token }) {
+function stagingConfig(configPath) {
+  const source =
+    configPath === trackedConfigPath
+      ? readFileSync(configPath, 'utf8')
+      : privateFile(configPath);
+  const selected = JSON.parse(source);
+  const expected = structuredClone(trackedConfig);
+  if (configPath !== trackedConfigPath) {
+    assert(
+      workerNamePattern.test(selected.name) &&
+        selected.name !== trackedConfig.name &&
+        /^[a-z0-9-]+$/.test(selected.d1_databases?.[0]?.database_name) &&
+        selected.d1_databases[0].database_name !==
+          trackedConfig.d1_databases[0].database_name &&
+        versionPattern.test(selected.d1_databases[0].database_id) &&
+        selected.d1_databases[0].database_id !==
+          trackedConfig.d1_databases[0].database_id &&
+        /^[a-z0-9]{1,32}$/.test(selected.vars?.DEPLOYMENT_TENANT) &&
+        selected.vars.DEPLOYMENT_TENANT !==
+          trackedConfig.vars.DEPLOYMENT_TENANT,
+      'private staging config resource identity differs',
+    );
+    expected.name = selected.name;
+    expected.main = resolvePath(here, trackedConfig.main);
+    expected.alias = Object.fromEntries(
+      Object.entries(trackedConfig.alias).map(([name, path]) => [
+        name,
+        resolvePath(here, path),
+      ]),
+    );
+    expected.d1_databases[0].database_name =
+      selected.d1_databases[0].database_name;
+    expected.d1_databases[0].database_id = selected.d1_databases[0].database_id;
+    expected.vars.DEPLOYMENT_TENANT = selected.vars.DEPLOYMENT_TENANT;
+  }
+  assert(
+    isDeepStrictEqual(selected, expected),
+    'private staging config differs from the off template',
+  );
+  return {
+    source,
+    name: selected.name,
+    database: selected.d1_databases[0].database_name,
+    databaseId: selected.d1_databases[0].database_id,
+    tenant: selected.vars.DEPLOYMENT_TENANT,
+  };
+}
+
+function verifyProbeConfig(configPath, workerName, fresh) {
+  assert(
+    fresh === (configPath !== trackedProbeConfigPath),
+    'private probe config is required for the selected Worker',
+  );
+  const selected = JSON.parse(
+    configPath === trackedProbeConfigPath
+      ? readFileSync(configPath, 'utf8')
+      : privateFile(configPath),
+  );
+  const expected = structuredClone(trackedProbeConfig);
+  if (fresh) {
+    expected.main = resolvePath(here, trackedProbeConfig.main);
+    expected.services[0].service = workerName;
+  }
+  assert(
+    isDeepStrictEqual(selected, expected),
+    'private probe config differs from the selected Worker',
+  );
+}
+
+export function createWranglerControl({
+  command = spawnSync,
+  token,
+  configPath = trackedConfigPath,
+}) {
+  const selected = stagingConfig(configPath);
   function run(args, timeout = 30_000) {
+    assert(
+      stagingConfig(configPath).source === selected.source,
+      'staging config changed since preflight',
+    );
     const result = command(wrangler, args, {
       cwd: flowsafe,
       encoding: 'utf8',
@@ -100,7 +185,13 @@ export function createWranglerControl({ command = spawnSync, token }) {
     return value;
   }
   function deployments() {
-    const list = json(['deployments', 'list', '--config', config, '--json']);
+    const list = json([
+      'deployments',
+      'list',
+      '--config',
+      configPath,
+      '--json',
+    ]);
     assert(Array.isArray(list) && list.length > 0, 'deployment list is empty');
     const ordered = list
       .map((deployment) => {
@@ -138,7 +229,7 @@ export function createWranglerControl({ command = spawnSync, token }) {
       'view',
       version,
       '--config',
-      config,
+      configPath,
       '--json',
     ]);
     const bindings = detail.resources?.bindings;
@@ -146,9 +237,25 @@ export function createWranglerControl({ command = spawnSync, token }) {
     const flag = bindings.filter(
       (binding) => binding.name === 'NOTIFICATION_PROOF_ENABLED',
     );
+    const d1 = bindings.filter((binding) => binding.name === 'DB');
+    const tenant = bindings.filter(
+      (binding) => binding.name === 'DEPLOYMENT_TENANT',
+    );
     assert(
       flag.length === 1 && flag[0].type === 'plain_text',
       'proof flag binding differs',
+    );
+    assert(
+      d1.length === 1 &&
+        d1[0].type === 'd1' &&
+        d1[0].database_id === selected.databaseId,
+      'enabled D1 binding differs',
+    );
+    assert(
+      tenant.length === 1 &&
+        tenant[0].type === 'plain_text' &&
+        tenant[0].text === selected.tenant,
+      'enabled deployment tenant differs',
     );
     return flag[0].text === 'true';
   }
@@ -169,12 +276,12 @@ export function createWranglerControl({ command = spawnSync, token }) {
       const output = json([
         'd1',
         'execute',
-        database,
+        selected.database,
         '--remote',
         '--yes',
         '--json',
         '--config',
-        config,
+        configPath,
         '--command',
         sql,
       ]);
@@ -187,8 +294,37 @@ export function createWranglerControl({ command = spawnSync, token }) {
       );
       return output[0].results;
     },
-    deployOffIfCurrent(expectedVersion, outdir) {
+    prepareOffBundle(directory) {
+      assert(directory.startsWith('/'), 'absolute off bundle path required');
+      mkdirSync(directory, { mode: 0o700 });
+      run(
+        ['deploy', '--dry-run', '--config', configPath, '--outdir', directory],
+        180_000,
+      );
+      const bundlePath = join(directory, 'notification-staging.worker.js');
+      assert(statSync(bundlePath).isFile(), 'off bundle is missing');
+      run(
+        [
+          'deploy',
+          bundlePath,
+          '--dry-run',
+          '--config',
+          configPath,
+          '--outdir',
+          join(directory, 'bundle-rehearsal'),
+        ],
+        180_000,
+      );
+      return bundlePath;
+    },
+    deployOffIfCurrent(expectedVersion, outdir, bundlePath) {
       assert(versionPattern.test(expectedVersion), 'invalid expected version');
+      assert(
+        typeof bundlePath === 'string' &&
+          bundlePath.startsWith('/') &&
+          statSync(bundlePath).isFile(),
+        'pinned off bundle is required',
+      );
       assert(
         currentVersion() === expectedVersion,
         'enabled deployment changed',
@@ -197,13 +333,10 @@ export function createWranglerControl({ command = spawnSync, token }) {
         proofEnabled(expectedVersion),
         'expected deployment is not enabled',
       );
-      const tracked = JSON.parse(readFileSync(config, 'utf8'));
-      assert(
-        tracked.vars?.NOTIFICATION_PROOF_ENABLED === 'false' &&
-          tracked.workers_dev === false,
-        'tracked off config differs',
+      run(
+        ['deploy', bundlePath, '--config', configPath, '--outdir', outdir],
+        180_000,
       );
-      run(['deploy', '--config', config, '--outdir', outdir], 180_000);
       const next = currentVersion();
       assert(
         next !== expectedVersion && proofEnabled(next) === false,
@@ -280,6 +413,13 @@ function settingsFromEnv(env) {
     priorOffVersion === undefined || versionPattern.test(priorOffVersion),
     'invalid prior off version',
   );
+  const configPath = env.FLOWSAFE_STAGING_CONFIG_FILE ?? trackedConfigPath;
+  const selected = stagingConfig(configPath);
+  verifyProbeConfig(
+    env.FLOWSAFE_STAGING_PROBE_CONFIG_FILE ?? trackedProbeConfigPath,
+    selected.name,
+    configPath !== trackedConfigPath,
+  );
   return {
     port,
     expectedVersion,
@@ -289,10 +429,12 @@ function settingsFromEnv(env) {
     token,
     accountId,
     priorOffVersion,
+    configPath,
+    selected,
   };
 }
 
-function acquireDeploymentLock(accountId) {
+function acquireDeploymentLock(accountId, workerName) {
   const directory = join('/tmp', `flowsafe-deploy-locks-${process.getuid()}`);
   mkdirSync(directory, { mode: 0o700, recursive: true });
   const directoryInfo = statSync(directory);
@@ -349,13 +491,30 @@ async function watchdog(stateFile) {
     deadlineAt,
     outdir,
     baselineEpoch,
+    configPath,
+    workerName,
+    bundlePath,
   } = state;
   assert(
     baselineEpoch === 0 || baselineEpoch === 1,
     'invalid watchdog baseline',
   );
   const probe = localProbe({ port, secret: readSecretFile(probeSecretPath) });
-  const cli = createWranglerControl({ token: privateFile(cfTokenPath) });
+  const selected = stagingConfig(configPath);
+  assert(selected.name === workerName, 'watchdog Worker identity differs');
+  assert(
+    bundlePath ===
+      join(
+        dirname(stateFile),
+        'pinned-off-bundle',
+        'notification-staging.worker.js',
+      ) && statSync(bundlePath).isFile(),
+    'watchdog pinned off bundle is missing',
+  );
+  const cli = createWranglerControl({
+    token: privateFile(cfTokenPath),
+    configPath,
+  });
   assert(
     cli.currentVersion() === expectedVersion &&
       cli.proofEnabled(expectedVersion),
@@ -371,101 +530,123 @@ async function watchdog(stateFile) {
     await new Promise((resolve) => setTimeout(resolve, 1_000));
   }
   await sealFence(probe, baselineEpoch);
-  cli.deployOffIfCurrent(expectedVersion, outdir);
+  cli.deployOffIfCurrent(expectedVersion, outdir, bundlePath);
   confirmedFence(await probe('GET', '/admin/execution-fence'), baselineEpoch);
   writeFileSync(`${stateFile}.off-confirmed`, '', { mode: 0o600, flag: 'wx' });
 }
 
 async function controller() {
   const settings = settingsFromEnv(process.env);
-  const lockFd = acquireDeploymentLock(settings.accountId);
-  const cli = createWranglerControl({ token: settings.token });
-  assert(
-    cli.currentVersion() === settings.expectedVersion &&
-      cli.proofEnabled(settings.expectedVersion),
-    'enabled version preflight differs',
+  const lockFd = acquireDeploymentLock(
+    settings.accountId,
+    settings.selected.name,
   );
-  const probe = localProbe({ port: settings.port, secret: settings.secret });
-  const baselineEpoch = settings.priorOffVersion === undefined ? 0 : 1;
-  if (baselineEpoch === 1) {
-    assert(
-      settings.priorOffVersion !== settings.expectedVersion &&
-        cli.priorOffVersion(settings.expectedVersion) ===
-          settings.priorOffVersion,
-      'retry prior off version is unconfirmed',
-    );
-    const fence = await probe('GET', '/admin/execution-fence');
-    assert(
-      Object.entries(sealedRetryFence).every(
-        ([key, value]) => fence[key] === value,
-      ) &&
-        fence.proofKey === undefined &&
-        fence.proofRunId === undefined,
-      'retry fence is not the exact sealed baseline',
-    );
-  }
   const directory = join(
     tmpdir(),
     `flowsafe-notification-control-${process.pid}`,
   );
   mkdirSync(directory, { mode: 0o700 });
-  const stateFile = join(directory, 'watchdog.json');
-  const outdir = join(directory, 'off-deploy');
-  const watcherLog = openSync(join(directory, 'watchdog.log'), 'wx', 0o600);
-  writeFileSync(
-    stateFile,
-    JSON.stringify({
-      port: settings.port,
-      expectedVersion: settings.expectedVersion,
-      probeSecretPath: settings.probeSecretPath,
-      cfTokenPath: settings.cfTokenPath,
-      parentPid: process.pid,
-      deadlineAt: Date.now() + 900_000,
-      outdir,
-      baselineEpoch,
-    }),
-    { mode: 0o600, flag: 'wx' },
-  );
-  const watcher = spawn(
-    process.execPath,
-    [fileURLToPath(import.meta.url), '--watchdog', stateFile],
-    {
-      detached: true,
-      stdio: ['ignore', watcherLog, watcherLog, lockFd],
-      env: process.env,
-    },
-  );
-  closeSync(watcherLog);
-  watcher.unref();
-  assert(Number.isInteger(watcher.pid), 'watchdog did not start');
-  const readyDeadline = Date.now() + 20_000;
-  while (!existsSync(`${stateFile}.ready`) && Date.now() < readyDeadline) {
-    await new Promise((resolve) => setTimeout(resolve, 100));
-  }
-  assert(
-    existsSync(`${stateFile}.ready`) &&
-      watcher.exitCode === null &&
-      watcher.signalCode === null,
-    'watchdog readiness is unconfirmed',
-  );
-  process.kill(watcher.pid, 0);
-  let offConfirmed = false;
-  const requestOffDeploy = async () => {
-    if (offConfirmed) return;
-    writeFileSync(`${stateFile}.off-requested`, '', {
+  const configPath =
+    settings.configPath === trackedConfigPath
+      ? trackedConfigPath
+      : join(directory, 'off.wrangler.jsonc');
+  if (configPath !== trackedConfigPath)
+    writeFileSync(configPath, settings.selected.source, {
       mode: 0o600,
       flag: 'wx',
     });
-    while (!existsSync(`${stateFile}.off-confirmed`)) {
+  const stateFile = join(directory, 'watchdog.json');
+  const outdir = join(directory, 'off-deploy');
+  let stage = 'enabled-version-preflight';
+  try {
+    const cli = createWranglerControl({ token: settings.token, configPath });
+    assert(
+      cli.currentVersion() === settings.expectedVersion &&
+        cli.proofEnabled(settings.expectedVersion),
+      'enabled version preflight differs',
+    );
+    const probe = localProbe({ port: settings.port, secret: settings.secret });
+    const baselineEpoch = settings.priorOffVersion === undefined ? 0 : 1;
+    if (baselineEpoch === 1) {
       assert(
-        watcher.exitCode === null && watcher.signalCode === null,
-        'watchdog exited before off confirmation',
+        settings.priorOffVersion !== settings.expectedVersion &&
+          cli.priorOffVersion(settings.expectedVersion) ===
+            settings.priorOffVersion,
+        'retry prior off version is unconfirmed',
       );
+      const fence = await probe('GET', '/admin/execution-fence');
+      assert(
+        Object.entries(sealedRetryFence).every(
+          ([key, value]) => fence[key] === value,
+        ) &&
+          fence.proofKey === undefined &&
+          fence.proofRunId === undefined,
+        'retry fence is not the exact sealed baseline',
+      );
+    }
+    stage = 'off-bundle-preparation';
+    const bundlePath = cli.prepareOffBundle(
+      join(directory, 'pinned-off-bundle'),
+    );
+    stage = 'watchdog-start';
+    const watcherLog = openSync(join(directory, 'watchdog.log'), 'wx', 0o600);
+    writeFileSync(
+      stateFile,
+      JSON.stringify({
+        port: settings.port,
+        expectedVersion: settings.expectedVersion,
+        probeSecretPath: settings.probeSecretPath,
+        cfTokenPath: settings.cfTokenPath,
+        parentPid: process.pid,
+        deadlineAt: Date.now() + 900_000,
+        outdir,
+        baselineEpoch,
+        configPath,
+        workerName: settings.selected.name,
+        bundlePath,
+      }),
+      { mode: 0o600, flag: 'wx' },
+    );
+    const watcher = spawn(
+      process.execPath,
+      [fileURLToPath(import.meta.url), '--watchdog', stateFile],
+      {
+        detached: true,
+        stdio: ['ignore', watcherLog, watcherLog, lockFd],
+        env: process.env,
+      },
+    );
+    closeSync(watcherLog);
+    watcher.unref();
+    assert(Number.isInteger(watcher.pid), 'watchdog did not start');
+    const readyDeadline = Date.now() + 20_000;
+    while (!existsSync(`${stateFile}.ready`) && Date.now() < readyDeadline) {
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
-    offConfirmed = true;
-  };
-  try {
+    assert(
+      existsSync(`${stateFile}.ready`) &&
+        watcher.exitCode === null &&
+        watcher.signalCode === null,
+      'watchdog readiness is unconfirmed',
+    );
+    process.kill(watcher.pid, 0);
+    let offConfirmed = false;
+    const requestOffDeploy = async () => {
+      if (offConfirmed) return;
+      writeFileSync(`${stateFile}.off-requested`, '', {
+        mode: 0o600,
+        flag: 'wx',
+      });
+      while (!existsSync(`${stateFile}.off-confirmed`)) {
+        assert(
+          watcher.exitCode === null && watcher.signalCode === null,
+          'watchdog exited before off confirmation',
+        );
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      offConfirmed = true;
+    };
+    stage = 'proof';
     const result = await runNotificationStagingControl({
       probe,
       ...trustedD1Checks((sql) => cli.query(sql)),
@@ -477,6 +658,12 @@ async function controller() {
           'watchdog exited before fence unlock',
         );
         process.kill(watcher.pid, 0);
+        const identity = await probe('GET', '/identity');
+        assert(
+          identity.versionId === settings.expectedVersion &&
+            identity.deploymentTenant === settings.selected.tenant,
+          'authenticated probe subject differs from enabled Worker',
+        );
       },
     });
     assert(offConfirmed, 'off deploy was not confirmed');
@@ -484,9 +671,12 @@ async function controller() {
   } catch (error) {
     appendFileSync(
       join(directory, 'watchdog.log'),
-      `controller: ${privateDiagnostic(error, [settings.secret, settings.token])}\n`,
+      `controller ${stage}: ${privateDiagnostic(error, [settings.secret, settings.token])}\n`,
+      { mode: 0o600 },
     );
-    throw new Error('staging controller failed; inspect private watchdog log');
+    throw new Error(
+      `staging controller failed at ${stage}; inspect private watchdog log`,
+    );
   }
 }
 
@@ -503,7 +693,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
       if (result) process.stdout.write(`${JSON.stringify(result)}\n`);
     },
     (error) => {
-      process.stderr.write(`${privateDiagnostic(error)}\n`);
+      process.stderr.write(`${error.message}\n`);
       process.exitCode = 1;
     },
   );

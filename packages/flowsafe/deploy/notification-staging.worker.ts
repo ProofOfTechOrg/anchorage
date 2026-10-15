@@ -61,6 +61,7 @@ interface Env {
   MAINTENANCE_ADMIN_SECRET: string;
   STAGING_PROBE_SECRET: string;
   NOTIFICATION_PROOF_ENABLED?: string;
+  CF_VERSION_METADATA: { id: string };
   RUNNER: DurableObjectNamespace;
   THREAD: DurableObjectNamespace;
   MAINTENANCE: DurableObjectNamespace;
@@ -328,6 +329,18 @@ const config = {
       !(await credentialsMatch(supplied, env.STAGING_PROBE_SECRET))
     )
       return new Response(null, { status: 403 });
+    if (request.method === 'GET' && url.pathname === '/__staging/identity') {
+      if (
+        !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(
+          env.CF_VERSION_METADATA?.id,
+        )
+      )
+        return new Response(null, { status: 503 });
+      return Response.json({
+        versionId: env.CF_VERSION_METADATA.id,
+        deploymentTenant: env.DEPLOYMENT_TENANT,
+      });
+    }
     if (request.method === 'POST' && url.pathname === '/__staging/ensure') {
       await ensureRemoteStepNotificationRecoveryDuty(env);
       return Response.json({ armed: true });
