@@ -354,6 +354,15 @@ export const FLOWSAFE_TABLES: readonly FlowsafeTableEntry[] = [
     },
   },
   {
+    table: 'flowsafe_notification_receipt_scope',
+    purpose:
+      'the deployment receipt prefix and retained receipt admission limit',
+    accounting: {
+      excluded:
+        'the singleton configures receipt admission and contains no active notification effect',
+    },
+  },
+  {
     table: RESOURCE_OWNER_TABLE,
     purpose:
       'the resource-ownership registry — who holds a run, thread, resource, or schedule',

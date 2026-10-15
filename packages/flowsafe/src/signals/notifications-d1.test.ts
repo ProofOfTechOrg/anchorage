@@ -39,6 +39,161 @@ function sharedStores(): [D1NotificationsStorage, D1NotificationsStorage] {
 }
 
 describe('host-owned notification operation receipt', () => {
+  it('admits only one receipt prefix in a D1 deployment', async () => {
+    const db = database();
+    const left = new D1NotificationsStorage(db, 'left_', 1);
+    const right = new D1NotificationsStorage(db, 'right_', 1);
+    await Promise.all([left.init(), right.init()]);
+    const input = {
+      threadId: 'thread',
+      source: 'remote-step',
+      kind: 'result',
+      summary: 'Completed',
+      createdAt: new Date('2026-10-13T00:00:00.000Z'),
+    };
+    const outcomes = await Promise.allSettled([
+      left.createNotificationOnce('operation-left', {
+        ...input,
+        id: 'notification-left',
+      }),
+      right.createNotificationOnce('operation-right', {
+        ...input,
+        id: 'notification-right',
+      }),
+    ]);
+    expect(
+      outcomes.filter((outcome) => outcome.status === 'fulfilled'),
+    ).toHaveLength(1);
+    expect(
+      outcomes.filter((outcome) => outcome.status === 'rejected'),
+    ).toHaveLength(1);
+  });
+
+  it('retains a prefix and limit across fresh storage instances', async () => {
+    const db = database();
+    const input = {
+      id: 'notification-1',
+      threadId: 'thread',
+      source: 'remote-step',
+      kind: 'result',
+      summary: 'Completed',
+      createdAt: new Date('2026-10-13T00:00:00.000Z'),
+    };
+    const first = new D1NotificationsStorage(db, 'agent_', 1);
+    const receipt = await first.createNotificationOnce('operation-1', input);
+    const fresh = new D1NotificationsStorage(db, 'agent_', 1);
+    expect(await fresh.createNotificationOnce('operation-1', input)).toEqual(
+      receipt,
+    );
+    await expect(
+      new D1NotificationsStorage(db, 'agent_', 2).createNotificationOnce(
+        'operation-2',
+        { ...input, id: 'notification-2' },
+      ),
+    ).rejects.toThrow(
+      'notification receipt scope differs from this deployment',
+    );
+    expect(
+      await fresh.getNotification({ threadId: 'thread', id: 'notification-2' }),
+    ).toBeNull();
+  });
+
+  it('refuses ambiguous nonempty legacy receipt histories', async () => {
+    const db = database();
+    const left = new D1NotificationsStorage(db, 'left_');
+    const right = new D1NotificationsStorage(db, 'right_');
+    await Promise.all([left.init(), right.init()]);
+    for (const prefix of ['left_', 'right_']) {
+      await db
+        .prepare(`INSERT INTO ${prefix}flowsafe_notification_operation_receipts
+          (operation_key, request_digest, thread_id, notification_id)
+          VALUES (?, ?, ?, ?)`)
+        .bind(
+          `legacy-${prefix}`,
+          'a'.repeat(64),
+          'thread',
+          `notification-${prefix}`,
+        )
+        .run();
+    }
+    await expect(
+      left.createNotificationOnce('operation-new', {
+        id: 'notification-new',
+        threadId: 'thread',
+        source: 'remote-step',
+        kind: 'result',
+        summary: 'Completed',
+        createdAt: new Date('2026-10-13T00:00:00.000Z'),
+      }),
+    ).rejects.toThrow('notification receipt history spans another prefix');
+    const receipt = await db
+      .prepare(
+        'SELECT operation_key FROM left_flowsafe_notification_operation_receipts WHERE operation_key = ?',
+      )
+      .bind('operation-new')
+      .first();
+    expect(receipt).toBeNull();
+  });
+
+  it('adopts the single nonempty legacy prefix', async () => {
+    const db = database();
+    const left = new D1NotificationsStorage(db, 'left_');
+    const right = new D1NotificationsStorage(db, 'right_');
+    await Promise.all([left.init(), right.init()]);
+    await db
+      .prepare(`INSERT INTO left_flowsafe_notification_operation_receipts
+        (operation_key, request_digest, thread_id, notification_id)
+        VALUES ('legacy', ?, 'thread', 'notification-legacy')`)
+      .bind('a'.repeat(64))
+      .run();
+    const input = {
+      id: 'notification-new',
+      threadId: 'thread',
+      source: 'remote-step',
+      kind: 'result',
+      summary: 'Completed',
+      createdAt: new Date('2026-10-13T00:00:00.000Z'),
+    };
+    await expect(
+      right.createNotificationOnce('operation-new', input),
+    ).rejects.toThrow('notification receipt history spans another prefix');
+    await expect(
+      left.createNotificationOnce('operation-new', input),
+    ).resolves.toMatchObject({
+      operationKey: 'operation-new',
+      notificationId: 'notification-new',
+    });
+  });
+
+  it('refuses an unknown receipt scope version', async () => {
+    const db = database();
+    await db
+      .prepare(`CREATE TABLE flowsafe_notification_receipt_scope (
+        id INTEGER PRIMARY KEY,
+        version INTEGER NOT NULL,
+        table_prefix TEXT NOT NULL,
+        receipt_limit INTEGER NOT NULL
+      )`)
+      .run();
+    await db
+      .prepare(`INSERT INTO flowsafe_notification_receipt_scope
+        (id, version, table_prefix, receipt_limit) VALUES (1, 2, '', 100000)`)
+      .run();
+    const notifications = new D1NotificationsStorage(db);
+    await expect(
+      notifications.createNotificationOnce('operation-new', {
+        id: 'notification-new',
+        threadId: 'thread',
+        source: 'remote-step',
+        kind: 'result',
+        summary: 'Completed',
+        createdAt: new Date('2026-10-13T00:00:00.000Z'),
+      }),
+    ).rejects.toThrow(
+      'notification receipt scope differs from this deployment',
+    );
+  });
+
   it('refuses a new operation at the retained receipt cap while replay still succeeds', async () => {
     const db = database();
     const notifications = new D1NotificationsStorage(db, '', 1);

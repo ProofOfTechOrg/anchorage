@@ -396,6 +396,8 @@ export const NOTIFICATION_OPERATION_PROJECTION_VERSION =
   'notification-record-values-v1';
 export const NOTIFICATION_OPERATION_RECEIPTS_TABLE =
   'flowsafe_notification_operation_receipts';
+export const NOTIFICATION_RECEIPT_SCOPE_TABLE =
+  'flowsafe_notification_receipt_scope';
 export const DEFAULT_NOTIFICATION_OPERATION_RECEIPT_LIMIT = 100_000;
 
 export type NotificationOperationInput = CreateNotificationInput & {
@@ -470,10 +472,12 @@ export class D1NotificationsStorage
   readonly #sequenceTable: string;
   readonly #operationReceiptTable: string;
   readonly #operationReceiptLimit: number;
+  readonly #prefix: string;
   readonly #ordinalIndex: string;
   readonly #legacyReplaceTrigger: string;
   readonly #legacyInsertTrigger: string;
   #ready?: Promise<void>;
+  #receiptScopeReady?: Promise<void>;
 
   constructor(
     db: SignalDatabase,
@@ -483,6 +487,7 @@ export class D1NotificationsStorage
     super();
     const prefix = validateTablePrefix(tablePrefix) ?? '';
     this.#db = db;
+    this.#prefix = prefix;
     this.#table = `${prefix}mastra_notifications`;
     this.#sequenceTable = `${prefix}${NOTIFICATION_SEQUENCE_TABLE}`;
     this.#operationReceiptTable = `${prefix}${NOTIFICATION_OPERATION_RECEIPTS_TABLE}`;
@@ -490,6 +495,12 @@ export class D1NotificationsStorage
       operationReceiptLimit,
       'operationReceiptLimit',
     );
+    if (
+      this.#operationReceiptLimit > DEFAULT_NOTIFICATION_OPERATION_RECEIPT_LIMIT
+    )
+      throw new RangeError(
+        'operationReceiptLimit exceeds the deployment maximum',
+      );
     this.#ordinalIndex = `idx_${this.#table}_insertion_ordinal`;
     this.#legacyReplaceTrigger = `trg_${this.#table}_preserve_insertion_ordinal`;
     this.#legacyInsertTrigger = `trg_${this.#table}_allocate_insertion_ordinal`;
@@ -697,6 +708,95 @@ export class D1NotificationsStorage
     await this.#ensureSchema();
   }
 
+  #ensureReceiptScope(): Promise<void> {
+    if (!this.#receiptScopeReady) {
+      this.#receiptScopeReady = this.#registerReceiptScope().catch(
+        (error: unknown) => {
+          this.#receiptScopeReady = undefined;
+          throw error;
+        },
+      );
+    }
+    return this.#receiptScopeReady;
+  }
+
+  async #registerReceiptScope(): Promise<void> {
+    const legacyTables = await this.#db
+      .prepare(`SELECT name FROM sqlite_master
+        WHERE type = 'table' AND substr(name, -length(?)) = ?`)
+      .bind(
+        NOTIFICATION_OPERATION_RECEIPTS_TABLE,
+        NOTIFICATION_OPERATION_RECEIPTS_TABLE,
+      )
+      .all<{ name: string }>();
+    for (const { name } of legacyTables.results) {
+      const prefix = name.slice(
+        0,
+        -NOTIFICATION_OPERATION_RECEIPTS_TABLE.length,
+      );
+      if (validateTablePrefix(prefix) !== prefix)
+        throw new Error('notification receipt history has an invalid prefix');
+      const retained = await this.#db
+        .prepare(`SELECT 1 AS retained FROM "${name}" LIMIT 1`)
+        .first<{ retained: number }>();
+      if (retained && prefix !== this.#prefix)
+        throw new Error('notification receipt history spans another prefix');
+    }
+    await this.#db
+      .prepare(`CREATE TABLE IF NOT EXISTS ${NOTIFICATION_RECEIPT_SCOPE_TABLE} (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        version INTEGER NOT NULL CHECK (version = 1),
+        table_prefix TEXT NOT NULL,
+        receipt_limit INTEGER NOT NULL CHECK (receipt_limit BETWEEN 0 AND ${DEFAULT_NOTIFICATION_OPERATION_RECEIPT_LIMIT})
+      )`)
+      .run();
+    const columns = await this.#db
+      .prepare(`PRAGMA table_info(${NOTIFICATION_RECEIPT_SCOPE_TABLE})`)
+      .all<{ name: string; type: string; notnull: number; pk: number }>();
+    if (
+      JSON.stringify(
+        columns.results.map(({ name, type, notnull, pk }) => [
+          name,
+          type,
+          notnull,
+          pk,
+        ]),
+      ) !==
+      JSON.stringify([
+        ['id', 'INTEGER', 0, 1],
+        ['version', 'INTEGER', 1, 0],
+        ['table_prefix', 'TEXT', 1, 0],
+        ['receipt_limit', 'INTEGER', 1, 0],
+      ])
+    )
+      throw new Error('notification receipt scope schema is unknown');
+    await this.#db
+      .prepare(`INSERT INTO ${NOTIFICATION_RECEIPT_SCOPE_TABLE}
+        (id, version, table_prefix, receipt_limit)
+        VALUES (1, 1, ?, ?) ON CONFLICT(id) DO NOTHING`)
+      .bind(this.#prefix, this.#operationReceiptLimit)
+      .run();
+    const scopes = await this.#db
+      .prepare(`SELECT id, version, table_prefix, receipt_limit
+        FROM ${NOTIFICATION_RECEIPT_SCOPE_TABLE}`)
+      .all<{
+        id: number;
+        version: number;
+        table_prefix: string;
+        receipt_limit: number;
+      }>();
+    if (
+      scopes.results.length !== 1 ||
+      scopes.results[0]?.id !== 1 ||
+      scopes.results[0]?.version !== 1 ||
+      scopes.results[0]?.table_prefix !== this.#prefix ||
+      scopes.results[0]?.receipt_limit !== this.#operationReceiptLimit
+    )
+      throw new Error(
+        'notification receipt scope differs from this deployment',
+      );
+  }
+
   async createNotificationOnce(
     operationKey: string,
     input: NotificationOperationInput,
@@ -716,6 +816,7 @@ export class D1NotificationsStorage
       throw new TypeError('notification operation identity is malformed');
     }
     await this.#ensureSchema();
+    await this.#ensureReceiptScope();
     const batch = this.#db.batch?.bind(this.#db);
     if (!batch)
       throw new Error('notification operation requires database.batch()');
