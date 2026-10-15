@@ -221,6 +221,7 @@ async function exerciseWatchdog(outcome) {
   const watcherPidFile = join(directory, 'watchdog-pid');
   const deployStartedFile = join(directory, 'deploy-started');
   const releaseDeployFile = join(directory, 'release-deploy');
+  const effectStartedFile = join(directory, 'effect-started');
   const accountId =
     outcome === 'parent death' ? 'c'.repeat(32) : 'd'.repeat(32);
   const lockFile = join(
@@ -242,7 +243,6 @@ Date.now = () => originalNow() +
   (process.env.TEST_CLOCK_JUMP === 'true' &&
    !process.argv.includes('--watchdog') &&
    existsSync(process.env.TEST_DEPLOY_STARTED_FILE) ? 300_000 : 0);
-let counts = 0;
 childProcess.spawn = (...args) => {
   const child = originalSpawn(...args);
   if (args[1]?.includes('--watchdog'))
@@ -257,6 +257,11 @@ childProcess.spawnSync = (executable, args, options) => {
   const command = args[0];
   if (off && command === 'deployments')
     writeFileSync(process.env.TEST_OFF_CONFIRMED_FILE, 'checked');
+  const sql = args.at(-1);
+  const effectStarted = existsSync(process.env.TEST_EFFECT_STARTED_FILE);
+  if (command === 'd1' && !effectStarted &&
+      sql.includes('FROM flowsafe_notification_operation_receipts'))
+    return { status: 1, stderr: 'no such table: flowsafe_notification_operation_receipts' };
   const response = command === 'deployments' ? [{
     created_on: '2026-10-15T00:00:00.000Z',
     versions: [{ version_id: off ? '${disabled}' : '${enabled}', percentage: 100 }],
@@ -266,11 +271,13 @@ childProcess.spawnSync = (executable, args, options) => {
       text: off ? 'false' : 'true',
     }] },
   } : command === 'd1' ? [{ success: true, results:
-    args.at(-1).includes('sqlite_master')
-      ? [{ sql: 'write_generation INTEGER NOT NULL, operation_state TEXT' }]
-      : args.at(-1).includes('COUNT(*) AS count')
+    sql.includes("name = 'flowsafe_notification_operation_receipts'")
+      ? effectStarted ? [{ name: 'flowsafe_notification_operation_receipts' }] : []
+      : sql.includes('sqlite_master')
+        ? [{ sql: 'write_generation INTEGER NOT NULL, operation_state TEXT' }]
+      : sql.includes('COUNT(*) AS count')
         ? [{ count: 0 }]
-        : args.at(-1).includes('FROM flowsafe_remote_step_invocations i')
+        : sql.includes('FROM flowsafe_remote_step_invocations i')
           ? [{ status: 'settled', settlement_outcome: 'applied',
             operation_state: 'resume-admitted', thread_id: 'thread',
             notification_id: 'notification', receipt_key: 'key',
@@ -278,7 +285,9 @@ childProcess.spawnSync = (executable, args, options) => {
             receipt_notification_id: 'notification',
             stored_notification_id: 'notification', source: 'flowsafe-staging',
             kind: 'host-owned-notification' }]
-          : [{ notifications: counts, receipts: counts++ }],
+          : effectStarted
+            ? [{ notifications: 1, receipts: 1 }]
+            : [{ notifications: 0 }],
   }] : null;
   if (command === 'deploy') {
     writeFileSync(process.env.TEST_DEPLOY_STARTED_FILE, 'started');
@@ -309,6 +318,7 @@ syncBuiltinESMExports();
     requests.push(`${method} ${path}`);
     if (method === 'POST' && path === '/start') {
       startReceived = true;
+      writeFileSync(effectStartedFile, 'started');
       if (outcome === 'parent death') return;
       response.writeHead(200, { 'content-type': 'application/json' });
       response.end(
@@ -371,6 +381,7 @@ syncBuiltinESMExports();
           TEST_WATCHDOG_PID_FILE: watcherPidFile,
           TEST_DEPLOY_STARTED_FILE: deployStartedFile,
           TEST_RELEASE_DEPLOY_FILE: releaseDeployFile,
+          TEST_EFFECT_STARTED_FILE: effectStartedFile,
           TEST_CLOCK_JUMP: outcome === 'controller request' ? 'true' : 'false',
         },
         stdio: 'ignore',

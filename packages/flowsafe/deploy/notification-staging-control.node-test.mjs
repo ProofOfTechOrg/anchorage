@@ -225,3 +225,35 @@ test('D1 proof requires the receipt tuple and one new notification and receipt',
     db.close();
   }
 });
+
+test('D1 preflight accepts an absent receipt table but proof requires its effect', async () => {
+  const db = new DatabaseSync(':memory:');
+  try {
+    db.exec(`CREATE TABLE flowsafe_remote_step_invocations (
+      invocation_id TEXT PRIMARY KEY, status TEXT, settlement_outcome TEXT,
+      operation_state TEXT, thread_id TEXT, notification_id TEXT,
+      operation_key TEXT, notification_request_digest TEXT,
+      write_generation INTEGER NOT NULL
+    );
+    CREATE TABLE mastra_notifications (
+      id TEXT, thread_id TEXT, source TEXT, kind TEXT
+    );`);
+    const checks = trustedD1Checks((sql) => db.prepare(sql).all());
+    await checks.preflightD1();
+    db.exec(`INSERT INTO flowsafe_remote_step_invocations VALUES
+      ('invocation-1', 'settled', 'applied', 'resume-admitted',
+       'thread-1', 'notification-1', 'operation-1', '${'a'.repeat(64)}', 1);
+      INSERT INTO mastra_notifications VALUES
+      ('notification-1', 'thread-1', 'flowsafe-staging', 'host-owned-notification');`);
+    await assert.rejects(checks.verifyD1('invocation-1'), /no such table/);
+    db.exec(`CREATE TABLE flowsafe_notification_operation_receipts (
+      operation_key TEXT PRIMARY KEY, request_digest TEXT,
+      thread_id TEXT, notification_id TEXT
+    );
+    INSERT INTO flowsafe_notification_operation_receipts VALUES
+      ('operation-1', '${'a'.repeat(64)}', 'thread-1', 'notification-1');`);
+    await checks.verifyD1('invocation-1');
+  } finally {
+    db.close();
+  }
+});

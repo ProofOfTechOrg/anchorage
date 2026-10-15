@@ -81,17 +81,19 @@ export function localProbe({ port, secret, fetcher = fetch }) {
 
 export function trustedD1Checks(query) {
   let baseline;
-  const counts = async () => {
+  const counts = async (receiptTableExists = true) => {
     const rows = await query(
-      "SELECT (SELECT COUNT(*) FROM mastra_notifications WHERE source = 'flowsafe-staging' AND kind = 'host-owned-notification') AS notifications, (SELECT COUNT(*) FROM flowsafe_notification_operation_receipts) AS receipts",
+      receiptTableExists
+        ? "SELECT (SELECT COUNT(*) FROM mastra_notifications WHERE source = 'flowsafe-staging' AND kind = 'host-owned-notification') AS notifications, (SELECT COUNT(*) FROM flowsafe_notification_operation_receipts) AS receipts"
+        : "SELECT COUNT(*) AS notifications FROM mastra_notifications WHERE source = 'flowsafe-staging' AND kind = 'host-owned-notification'",
     );
     assert(
       rows.length === 1 &&
         Number.isSafeInteger(rows[0].notifications) &&
-        Number.isSafeInteger(rows[0].receipts),
+        (receiptTableExists ? Number.isSafeInteger(rows[0].receipts) : true),
       'notification baseline is unreadable',
     );
-    return rows[0];
+    return receiptTableExists ? rows[0] : { ...rows[0], receipts: 0 };
   };
   return {
     preflightD1: async () => {
@@ -112,7 +114,17 @@ export function trustedD1Checks(query) {
         rows.length === 1 && rows[0].count === 0,
         'remote step journal is not empty',
       );
-      baseline = await counts();
+      const receiptSchema = await query(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'flowsafe_notification_operation_receipts'",
+      );
+      assert(
+        receiptSchema.length === 0 ||
+          (receiptSchema.length === 1 &&
+            receiptSchema[0].name ===
+              'flowsafe_notification_operation_receipts'),
+        'receipt schema is unreadable',
+      );
+      baseline = await counts(receiptSchema.length === 1);
     },
     verifyD1: async (invocationId) => {
       assert(
