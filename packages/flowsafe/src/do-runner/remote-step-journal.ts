@@ -411,6 +411,63 @@ function rowResult(value: unknown): JournalRow | undefined {
     : undefined;
 }
 
+function validLifecycle(row: JournalRow): boolean {
+  return (
+    Number.isSafeInteger(row.resume_count) &&
+    (row.resume_count === -1 || row.resume_count >= 1) &&
+    Number.isSafeInteger(row.permit_generation) &&
+    row.permit_generation >= 0 &&
+    [
+      'pending',
+      'dispatched',
+      'result-retained',
+      'resuming',
+      'settled',
+      'failed',
+    ].includes(row.status) &&
+    (row.settlement_outcome === null ||
+      [
+        'applied',
+        'terminal-not-success',
+        'deadline-expired',
+        'advanced-without-proof',
+      ].includes(row.settlement_outcome)) &&
+    (row.status !== 'resuming' ||
+      (isPathSafeId(row.resume_lease_owner) &&
+        positiveTime(row.resume_lease_expires_at) &&
+        row.result_json !== null)) &&
+    (row.status === 'resuming' ||
+      (row.resume_lease_owner === null &&
+        row.resume_lease_expires_at === null)) &&
+    (row.status !== 'settled' ||
+      (row.settlement_outcome === 'applied' &&
+        row.result_json !== null &&
+        row.result_digest !== null &&
+        positiveTime(row.executor_quiescent_at))) &&
+    (row.settlement_outcome === null ||
+      ((row.status === 'settled' || row.status === 'failed') &&
+        positiveTime(row.settled_at)))
+  );
+}
+
+function validPayloadBounds(row: JournalRow): boolean {
+  return (
+    typeof row.step_path === 'string' &&
+    row.step_path.length <= 1_024 &&
+    typeof row.request_json === 'string' &&
+    new TextEncoder().encode(row.request_json).length <=
+      MAX_REMOTE_STEP_REQUEST_BYTES
+  );
+}
+
+function validStepPath(value: unknown): value is string[] {
+  return (
+    Array.isArray(value) &&
+    value.length > 0 &&
+    value.every((part) => typeof part === 'string' && part !== '')
+  );
+}
+
 function decode(row: JournalRow): RemoteStepInvocation {
   if (
     row.target_kind !== 'agent' ||
@@ -419,12 +476,8 @@ function decode(row: JournalRow): RemoteStepInvocation {
     !Number.isSafeInteger(row.write_revision) ||
     row.write_revision < 0 ||
     !positiveTime(row.write_generation) ||
-    typeof row.step_path !== 'string' ||
-    row.step_path.length > 1_024 ||
-    typeof row.request_json !== 'string' ||
+    !validPayloadBounds(row) ||
     typeof row.principal_json !== 'string' ||
-    new TextEncoder().encode(row.request_json).length >
-      MAX_REMOTE_STEP_REQUEST_BYTES ||
     !isPathSafeId(row.deployment_id) ||
     !isPathSafeId(row.workflow_id) ||
     !isPathSafeId(row.agent_id) ||
@@ -453,46 +506,11 @@ function decode(row: JournalRow): RemoteStepInvocation {
     throw new RemoteStepRefusal(503, 'remote step journal is unreadable');
   }
   if (
-    !Array.isArray(stepPath) ||
-    stepPath.length === 0 ||
-    stepPath.some((part) => typeof part !== 'string' || part === '') ||
+    !validStepPath(stepPath) ||
     !isPathSafeId(row.invocation_id) ||
     !positiveTime(row.suspended_at) ||
     !positiveTime(row.deadline_at) ||
-    !Number.isSafeInteger(row.resume_count) ||
-    (row.resume_count !== -1 && row.resume_count < 1) ||
-    !Number.isSafeInteger(row.permit_generation) ||
-    row.permit_generation < 0 ||
-    ![
-      'pending',
-      'dispatched',
-      'result-retained',
-      'resuming',
-      'settled',
-      'failed',
-    ].includes(row.status) ||
-    (row.settlement_outcome !== null &&
-      ![
-        'applied',
-        'terminal-not-success',
-        'deadline-expired',
-        'advanced-without-proof',
-      ].includes(row.settlement_outcome)) ||
-    (row.status === 'resuming' &&
-      (!isPathSafeId(row.resume_lease_owner) ||
-        !positiveTime(row.resume_lease_expires_at) ||
-        row.result_json === null)) ||
-    (row.status !== 'resuming' &&
-      (row.resume_lease_owner !== null ||
-        row.resume_lease_expires_at !== null)) ||
-    (row.status === 'settled' && row.settlement_outcome !== 'applied') ||
-    (row.status === 'settled' &&
-      (row.result_json === null ||
-        row.result_digest === null ||
-        !positiveTime(row.executor_quiescent_at))) ||
-    (row.settlement_outcome !== null &&
-      ((row.status !== 'settled' && row.status !== 'failed') ||
-        !positiveTime(row.settled_at)))
+    !validLifecycle(row)
   )
     throw new RemoteStepRefusal(503, 'remote step journal is unreadable');
   return {
@@ -557,30 +575,8 @@ function decodeWorkflow(row: JournalRow): WorkflowRemoteStepInvocation {
     !positiveTime(row.write_generation) ||
     !positiveTime(row.suspended_at) ||
     !positiveTime(row.deadline_at) ||
-    !Number.isSafeInteger(row.resume_count) ||
-    (row.resume_count !== -1 && row.resume_count < 1) ||
-    !Number.isSafeInteger(row.permit_generation) ||
-    row.permit_generation < 0 ||
-    ![
-      'pending',
-      'dispatched',
-      'result-retained',
-      'resuming',
-      'settled',
-      'failed',
-    ].includes(row.status) ||
-    (row.status === 'resuming' &&
-      (!isPathSafeId(row.resume_lease_owner) ||
-        !positiveTime(row.resume_lease_expires_at) ||
-        row.result_json === null)) ||
-    (row.status !== 'resuming' &&
-      (row.resume_lease_owner !== null ||
-        row.resume_lease_expires_at !== null)) ||
-    typeof row.step_path !== 'string' ||
-    row.step_path.length > 1_024 ||
-    typeof row.request_json !== 'string' ||
-    new TextEncoder().encode(row.request_json).length >
-      MAX_REMOTE_STEP_REQUEST_BYTES
+    !validLifecycle(row) ||
+    !validPayloadBounds(row)
   )
     throw new RemoteStepRefusal(503, 'remote step journal is unreadable');
   try {
@@ -591,27 +587,7 @@ function decodeWorkflow(row: JournalRow): WorkflowRemoteStepInvocation {
       JSON.parse(row.principal_json),
       'stored remote step principal',
     );
-    if (
-      !Array.isArray(stepPath) ||
-      stepPath.length === 0 ||
-      stepPath.some((part) => typeof part !== 'string' || part === '') ||
-      (row.settlement_outcome !== null &&
-        ![
-          'applied',
-          'terminal-not-success',
-          'deadline-expired',
-          'advanced-without-proof',
-        ].includes(row.settlement_outcome)) ||
-      (row.status === 'settled' && row.settlement_outcome !== 'applied') ||
-      (row.status === 'settled' &&
-        (row.result_json === null ||
-          row.result_digest === null ||
-          !positiveTime(row.executor_quiescent_at))) ||
-      (row.settlement_outcome !== null &&
-        ((row.status !== 'settled' && row.status !== 'failed') ||
-          !positiveTime(row.settled_at)))
-    )
-      throw new Error('invalid workflow row');
+    if (!validStepPath(stepPath)) throw new Error('invalid workflow row');
     return {
       targetKind: 'workflow',
       invocationId: row.invocation_id,
@@ -2129,16 +2105,15 @@ export class RemoteStepJournal {
   async readRetainedResult(
     invocationId: string,
   ): Promise<RecordedRemoteStepResult | undefined> {
-    if (!isPathSafeId(invocationId))
-      throw new RemoteStepRefusal(400, 'invocation id is malformed');
-    const row = rowResult(
-      await this.#db
-        .prepare(`SELECT * FROM ${REMOTE_STEP_TABLE} WHERE invocation_id = ?`)
-        .bind(invocationId)
-        .all(),
-    );
+    const row = await this.#getRow(invocationId);
     if (!row) return undefined;
     decodeAny(row);
+    return this.#retainedResultFromRow(row);
+  }
+
+  async #retainedResultFromRow(
+    row: JournalRow,
+  ): Promise<RecordedRemoteStepResult | undefined> {
     const resultJson = row.result_json;
     const resultDigest = row.result_digest;
     const quiescenceDigest = row.quiescence_digest;
@@ -2163,7 +2138,7 @@ export class RemoteStepJournal {
     if ((await sha256Hex(resultJson)) !== resultDigest)
       throw new RemoteStepRefusal(503, 'remote step result is unreadable');
     return {
-      invocationId,
+      invocationId: row.invocation_id,
       resultJson,
       resultDigest,
       quiescenceDigest,
@@ -2177,6 +2152,12 @@ export class RemoteStepJournal {
     const row = await this.#getRow(invocationId);
     if (!row) return undefined;
     decodeAny(row);
+    return this.#notificationOperationFromRow(row);
+  }
+
+  async #notificationOperationFromRow(
+    row: JournalRow,
+  ): Promise<RemoteStepNotificationOperation | undefined> {
     const operation = decodeNotificationOperation(row);
     if (
       operation &&
@@ -2196,7 +2177,10 @@ export class RemoteStepJournal {
     const stored = await this.#getRow(invocationId);
     const invocation =
       stored?.target_kind === 'agent' ? decode(stored) : undefined;
-    const retained = await this.readRetainedResult(invocationId);
+    if (stored && !invocation) decodeAny(stored);
+    const retained = stored
+      ? await this.#retainedResultFromRow(stored)
+      : undefined;
     if (
       !stored ||
       !invocation ||
@@ -2229,7 +2213,7 @@ export class RemoteStepJournal {
         400,
         'remote step operation exceeds its limit',
       );
-    const existing = await this.readNotificationOperation(invocationId);
+    const existing = await this.#notificationOperationFromRow(stored);
     if (existing) {
       if (
         existing.operationKey !== operationKey ||
@@ -2289,14 +2273,14 @@ export class RemoteStepJournal {
     const stored = await this.#getRow(invocationId);
     if (!stored) throw new RemoteStepRefusal(404, 'invocation not found');
     const invocation = decode(stored);
-    const operation = await this.readNotificationOperation(invocationId);
+    const operation = await this.#notificationOperationFromRow(stored);
     if (
       !operation ||
       !['prepared', 'effect-admitted'].includes(operation.state)
     )
       throw new RemoteStepRefusal(409, 'remote step operation is unavailable');
     if (operation.state === 'effect-admitted') return operation;
-    const retained = await this.readRetainedResult(invocationId);
+    const retained = await this.#retainedResultFromRow(stored);
     if (!retained || invocation.status !== 'result-retained')
       throw new RemoteStepRefusal(409, 'remote step result is unavailable');
     const { suspension, snapshot } = await this.#stableSnapshot(invocation);
@@ -2389,7 +2373,7 @@ export class RemoteStepJournal {
     const stored = await this.#getRow(invocationId);
     if (!stored) throw new RemoteStepRefusal(404, 'invocation not found');
     decode(stored);
-    const operation = await this.readNotificationOperation(invocationId);
+    const operation = await this.#notificationOperationFromRow(stored);
     if (
       operation?.state !== 'effect-admitted' ||
       receipt.operationKey !== operation.operationKey ||
@@ -2444,7 +2428,7 @@ export class RemoteStepJournal {
     const stored = await this.#getRow(invocationId);
     if (!stored) throw new RemoteStepRefusal(404, 'invocation not found');
     const invocation = decode(stored);
-    const operation = await this.readNotificationOperation(invocationId);
+    const operation = await this.#notificationOperationFromRow(stored);
     if (
       operation?.state !== 'receipt-recorded' ||
       invocation.status !== 'result-retained'
@@ -2453,7 +2437,7 @@ export class RemoteStepJournal {
         409,
         'remote step continuation is unavailable',
       );
-    const retained = await this.readRetainedResult(invocationId);
+    const retained = await this.#retainedResultFromRow(stored);
     if (!retained)
       throw new RemoteStepRefusal(409, 'remote step result is unavailable');
     const { suspension, snapshot } = await this.#stableSnapshot(invocation);
