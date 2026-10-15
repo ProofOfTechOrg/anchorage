@@ -5,7 +5,8 @@
   "compatibility_date": "2026-09-10",
   "compatibility_flags": ["nodejs_compat"],
   "alias": {
-    "@proofoftech/breakwater/agent": "../../breakwater/src/agent/index.ts"
+    "@proofoftech/breakwater/agent": "../../breakwater/src/agent/index.ts",
+    "cloudflare": "./notification-staging-no-rest.ts"
   },
   "workers_dev": false,
   "secrets": {
