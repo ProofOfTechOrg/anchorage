@@ -13,7 +13,9 @@ export {
 export type {
   RecordedRemoteStepResult,
   RemoteStepInvocation,
+  RemoteStepNotificationOperation,
   RemoteStepPermit,
+  WorkflowRemoteStepAddress,
   WorkflowRemoteStepInvocation,
 } from '../do-runner/remote-step-journal.js';
 export {
@@ -82,6 +84,7 @@ export type {
   TrustedAgentExecution,
 } from './types.js';
 export { isPermissionIdentifier } from './types.js';
+export type { WorkflowDispatchPort } from './workflow-remote-step-route.js';
 export {
   createWorkflowRemoteStepPreRoute,
   WORKFLOW_REMOTE_STEP_ROUTE,

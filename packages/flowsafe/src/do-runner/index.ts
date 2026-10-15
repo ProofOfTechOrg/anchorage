@@ -228,7 +228,9 @@ export {
   type RemoteStepAddress,
   type RemoteStepInvocation,
   RemoteStepJournal,
+  type RemoteStepNotificationOperation,
   type RemoteStepPermit,
+  type WorkflowRemoteStepAddress,
 } from './remote-step-journal.js';
 export type {
   RunEconomicOperation,

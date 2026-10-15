@@ -50,7 +50,7 @@ export interface StateEgressBinding {
   fetch(request: Request): Promise<Response>;
 }
 
-interface StateEgressCommonContext {
+export interface StateEgressCommonContext {
   readonly credential: string;
   readonly tenantTag: string;
   readonly environment: string;
@@ -75,7 +75,7 @@ export type StateEgressContext = StateEgressCommonContext &
       }>
   );
 
-interface StateEgressCommonEnv {
+export interface StateEgressCommonEnv {
   readonly OUTBOUND_PROXY: StateEgressBinding;
   readonly OUTBOUND_PROXY_CREDENTIAL: string;
   readonly OUTBOUND_TENANT_ID: string;

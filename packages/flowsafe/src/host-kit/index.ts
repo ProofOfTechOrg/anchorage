@@ -179,6 +179,8 @@ export type {
 export { createRunRouter } from './run-router.js';
 export type {
   StateEgressBinding,
+  StateEgressCommonContext,
+  StateEgressCommonEnv,
   StateEgressContext,
   StateEgressEnv,
 } from './state-egress.js';

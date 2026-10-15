@@ -19,7 +19,7 @@ import type {
 
 export const WORKFLOW_REMOTE_STEP_ROUTE = '/_flowsafe/workflow-remote-step';
 
-type WorkflowDispatchPort = Pick<
+export type WorkflowDispatchPort = Pick<
   AgentThreadDispatchTopology,
   | 'registerWorkflowRemoteStep'
   | 'issueWorkflowRemoteStepDispatch'
