@@ -38,7 +38,12 @@ function createReceipt(
   operationKey: string,
   notificationId: string,
   receiptLimit: number,
-  barrier?: { id: string; participant: string },
+  barrier?: {
+    id: string;
+    participant: string;
+    phase?: 'receipt-read' | 'scope-census';
+  },
+  tablePrefix = '',
 ) {
   return actor.fetch(
     new Request('http://localhost/receipt', {
@@ -47,8 +52,10 @@ function createReceipt(
         operationKey,
         notificationId,
         receiptLimit,
+        tablePrefix,
         barrierId: barrier?.id,
         participant: barrier?.participant,
+        barrierPhase: barrier?.phase,
       }),
     }),
   );
@@ -258,4 +265,92 @@ describe('FlowSafe Cloudflare fidelity', () => {
       requestDigest: winner.request_digest,
     });
   }, 30_000);
+
+  it('admits one receipt prefix across distinct durable objects', async () => {
+    await Promise.all([
+      new D1NotificationsStorage(db(), 'left_').init(),
+      new D1NotificationsStorage(db(), 'right_').init(),
+    ]);
+    await db()
+      .prepare(`CREATE TABLE notification_test_barrier (
+        barrier_id TEXT NOT NULL,
+        participant TEXT NOT NULL,
+        PRIMARY KEY (barrier_id, participant)
+      )`)
+      .run();
+    const responses = await Promise.all([
+      createReceipt(
+        receiptActor('prefix-left'),
+        'operation-1',
+        'notification-1',
+        1,
+        { id: 'prefix-claim', participant: 'left', phase: 'scope-census' },
+        'left_',
+      ),
+      createReceipt(
+        receiptActor('prefix-right'),
+        'operation-2',
+        'notification-2',
+        1,
+        { id: 'prefix-claim', participant: 'right', phase: 'scope-census' },
+        'right_',
+      ),
+    ]);
+    const ready = await db()
+      .prepare(`SELECT participant FROM notification_test_barrier
+        WHERE barrier_id = 'prefix-claim' ORDER BY participant`)
+      .all<{ participant: string }>();
+    expect(ready.results).toEqual([
+      { participant: 'left' },
+      { participant: 'right' },
+    ]);
+    expect(responses.map((response) => response.status).sort()).toEqual([
+      200, 409,
+    ]);
+    const loser = responses.find((response) => response.status === 409);
+    expect(await loser?.json()).toEqual({
+      error: 'notification receipt scope differs from this deployment',
+    });
+    const [leftReceipts, rightReceipts, leftInbox, rightInbox] =
+      await Promise.all([
+        db()
+          .prepare(
+            'SELECT operation_key FROM left_flowsafe_notification_operation_receipts',
+          )
+          .all<{ operation_key: string }>(),
+        db()
+          .prepare(
+            'SELECT operation_key FROM right_flowsafe_notification_operation_receipts',
+          )
+          .all<{ operation_key: string }>(),
+        db()
+          .prepare('SELECT id FROM left_mastra_notifications')
+          .all<{ id: string }>(),
+        db()
+          .prepare('SELECT id FROM right_mastra_notifications')
+          .all<{ id: string }>(),
+      ]);
+    const expected =
+      responses[0]?.status === 200
+        ? {
+            receipts: [[{ operation_key: 'operation-1' }], []],
+            inbox: [[{ id: 'notification-1' }], []],
+            prefix: 'left_',
+          }
+        : {
+            receipts: [[], [{ operation_key: 'operation-2' }]],
+            inbox: [[], [{ id: 'notification-2' }]],
+            prefix: 'right_',
+          };
+    expect([leftReceipts.results, rightReceipts.results]).toEqual(
+      expected.receipts,
+    );
+    expect([leftInbox.results, rightInbox.results]).toEqual(expected.inbox);
+    const scope = await db()
+      .prepare(
+        'SELECT table_prefix, receipt_limit FROM flowsafe_notification_receipt_scope',
+      )
+      .first<{ table_prefix: string; receipt_limit: number }>();
+    expect(scope).toEqual({ table_prefix: expected.prefix, receipt_limit: 1 });
+  });
 });

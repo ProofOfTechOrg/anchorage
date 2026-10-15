@@ -32,8 +32,9 @@ function receiptBarrierDatabase(
   hub: DurableObjectNamespace,
   barrierId: string,
   participant: string,
+  phase: 'receipt-read' | 'scope-census',
 ): SignalDatabase {
-  let observedMissing = false;
+  let barrierEntered = false;
   function intercept(statement: SignalStatement): SignalStatement {
     return {
       bind(...values) {
@@ -41,14 +42,19 @@ function receiptBarrierDatabase(
       },
       async first<T>() {
         const row = await statement.first<T>();
-        if (row === null && !observedMissing) {
-          observedMissing = true;
+        if (phase === 'receipt-read' && row === null && !barrierEntered) {
+          barrierEntered = true;
           await waitForReceiptReaders(db, hub, barrierId, participant);
         }
         return row;
       },
-      all() {
-        return statement.all();
+      async all<T>() {
+        const rows = await statement.all<T>();
+        if (phase === 'scope-census' && !barrierEntered) {
+          barrierEntered = true;
+          await waitForReceiptReaders(db, hub, barrierId, participant);
+        }
+        return rows;
       },
       run() {
         return statement.run();
@@ -58,7 +64,11 @@ function receiptBarrierDatabase(
   return {
     prepare(query) {
       const statement = db.prepare(query);
-      return query.includes('SELECT request_digest, thread_id, notification_id')
+      return (
+        phase === 'scope-census'
+          ? query.includes('SELECT name FROM sqlite_master')
+          : query.includes('SELECT request_digest, thread_id, notification_id')
+      )
         ? intercept(statement)
         : statement;
     },
@@ -128,8 +138,10 @@ export class DemoSignalProviderHost extends TestDurableObject {
       operationKey: string;
       notificationId: string;
       receiptLimit: number;
+      tablePrefix?: string;
       barrierId?: string;
       participant?: string;
+      barrierPhase?: 'receipt-read' | 'scope-census';
     };
     const database =
       input.barrierId && input.participant
@@ -138,11 +150,12 @@ export class DemoSignalProviderHost extends TestDurableObject {
             this.bindings.HUB,
             input.barrierId,
             input.participant,
+            input.barrierPhase ?? 'receipt-read',
           )
         : this.bindings.DB;
     const notifications = new D1NotificationsStorage(
       database,
-      '',
+      input.tablePrefix ?? '',
       input.receiptLimit,
     );
     try {

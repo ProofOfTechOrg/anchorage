@@ -67,6 +67,35 @@ describe('host-owned notification operation receipt', () => {
     expect(
       outcomes.filter((outcome) => outcome.status === 'rejected'),
     ).toHaveLength(1);
+    const rejected = outcomes.find((outcome) => outcome.status === 'rejected');
+    expect(rejected).toMatchObject({
+      reason: {
+        message: 'notification receipt scope differs from this deployment',
+      },
+    });
+    const loserPrefix = outcomes[0]?.status === 'rejected' ? 'left_' : 'right_';
+    const loserOperation =
+      outcomes[0]?.status === 'rejected' ? 'operation-left' : 'operation-right';
+    const loserNotification =
+      outcomes[0]?.status === 'rejected'
+        ? 'notification-left'
+        : 'notification-right';
+    expect(
+      await db
+        .prepare(
+          `SELECT operation_key FROM ${loserPrefix}flowsafe_notification_operation_receipts WHERE operation_key = ?`,
+        )
+        .bind(loserOperation)
+        .first(),
+    ).toBeNull();
+    expect(
+      await db
+        .prepare(
+          `SELECT id FROM ${loserPrefix}mastra_notifications WHERE id = ?`,
+        )
+        .bind(loserNotification)
+        .first(),
+    ).toBeNull();
   });
 
   it('retains a prefix and limit across fresh storage instances', async () => {
