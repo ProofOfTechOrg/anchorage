@@ -11,13 +11,13 @@ import {
   trustedD1Checks,
 } from './notification-staging-control.mjs';
 
-function fixture(failAt, initialState = 'migration-locked') {
+function fixture(failAt, initialState = 'migration-locked', initialEpoch = 0) {
   const calls = [];
   let fence = {
     state: initialState,
-    mutationEpoch: 0,
-    requireMutationEpoch: false,
-    transitionRevision: 0,
+    mutationEpoch: initialEpoch,
+    requireMutationEpoch: initialEpoch !== 0,
+    transitionRevision: initialEpoch,
   };
   const probe = async (method, path, body) => {
     calls.push({ method, path, body });
@@ -118,6 +118,38 @@ test('a successful proof verifies before relock and requests off deploy', async 
   assert.equal(scenario.offRequests(), 1);
 });
 
+test('explicit sealed retry advances the fence monotonically', async () => {
+  const scenario = fixture(null, 'migration-locked', 1);
+  const expectedInitialFence = {
+    state: 'migration-locked',
+    mutationEpoch: 1,
+    requireMutationEpoch: true,
+    transitionRevision: 1,
+  };
+  assert.deepEqual(
+    await runNotificationStagingControl({
+      ...scenario.options,
+      expectedInitialFence,
+    }),
+    { invocationId: 'invocation-1', verdict: 'notification_staging_passed' },
+  );
+  assert.deepEqual(scenario.fence(), {
+    state: 'migration-locked',
+    mutationEpoch: 3,
+    requireMutationEpoch: true,
+    transitionRevision: 3,
+  });
+  assert.deepEqual(
+    scenario.calls
+      .filter(
+        (call) =>
+          call.method === 'POST' && call.path === '/admin/execution-fence',
+      )
+      .map((call) => call.body.expectedRevision),
+    [1, 2],
+  );
+});
+
 test('a conflicting fence is not overwritten while off deploy is still requested', async () => {
   const scenario = fixture();
   scenario.options.verifyD1 = async () => {
@@ -194,6 +226,10 @@ test('D1 proof requires the receipt tuple and one new notification and receipt',
       id TEXT, thread_id TEXT, source TEXT, kind TEXT
     );`);
     const checks = trustedD1Checks((sql) => db.prepare(sql).all());
+    await assert.rejects(
+      checks.preflightD1({ requireAbsentEffectTables: true }),
+      /retry effect tables are present/,
+    );
     await checks.preflightD1();
     db.exec(`INSERT INTO flowsafe_remote_step_invocations VALUES
       ('invocation-1', 'settled', 'applied', 'resume-admitted',
@@ -226,7 +262,7 @@ test('D1 proof requires the receipt tuple and one new notification and receipt',
   }
 });
 
-test('D1 preflight accepts an absent receipt table but proof requires its effect', async () => {
+test('D1 preflight accepts absent notification tables but proof requires the effect', async () => {
   const db = new DatabaseSync(':memory:');
   try {
     db.exec(`CREATE TABLE flowsafe_remote_step_invocations (
@@ -234,19 +270,20 @@ test('D1 preflight accepts an absent receipt table but proof requires its effect
       operation_state TEXT, thread_id TEXT, notification_id TEXT,
       operation_key TEXT, notification_request_digest TEXT,
       write_generation INTEGER NOT NULL
-    );
-    CREATE TABLE mastra_notifications (
-      id TEXT, thread_id TEXT, source TEXT, kind TEXT
     );`);
     const checks = trustedD1Checks((sql) => db.prepare(sql).all());
+    await checks.preflightD1({ requireAbsentEffectTables: true });
     await checks.preflightD1();
     db.exec(`INSERT INTO flowsafe_remote_step_invocations VALUES
       ('invocation-1', 'settled', 'applied', 'resume-admitted',
-       'thread-1', 'notification-1', 'operation-1', '${'a'.repeat(64)}', 1);
-      INSERT INTO mastra_notifications VALUES
-      ('notification-1', 'thread-1', 'flowsafe-staging', 'host-owned-notification');`);
+       'thread-1', 'notification-1', 'operation-1', '${'a'.repeat(64)}', 1);`);
     await assert.rejects(checks.verifyD1('invocation-1'), /no such table/);
-    db.exec(`CREATE TABLE flowsafe_notification_operation_receipts (
+    db.exec(`CREATE TABLE mastra_notifications (
+      id TEXT, thread_id TEXT, source TEXT, kind TEXT
+    );
+    INSERT INTO mastra_notifications VALUES
+      ('notification-1', 'thread-1', 'flowsafe-staging', 'host-owned-notification');
+    CREATE TABLE flowsafe_notification_operation_receipts (
       operation_key TEXT PRIMARY KEY, request_digest TEXT,
       thread_id TEXT, notification_id TEXT
     );

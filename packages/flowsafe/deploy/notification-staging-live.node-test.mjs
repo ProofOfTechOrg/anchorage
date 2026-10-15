@@ -21,7 +21,7 @@ import {
 const enabled = 'aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa';
 const disabled = 'bbbbbbbb-bbbb-4bbb-bbbb-bbbbbbbbbbbb';
 
-function fakeCli({ enabledFlag = true } = {}) {
+function fakeCli({ enabledFlag = true, priorVersion } = {}) {
   const calls = [];
   let version = enabled;
   const command = (_executable, args) => {
@@ -34,6 +34,14 @@ function fakeCli({ enabledFlag = true } = {}) {
             created_on: '2026-10-15T00:00:00.000Z',
             versions: [{ version_id: version, percentage: 100 }],
           },
+          ...(priorVersion
+            ? [
+                {
+                  created_on: '2026-10-14T23:59:00.000Z',
+                  versions: [{ version_id: priorVersion, percentage: 100 }],
+                },
+              ]
+            : []),
         ]),
       };
     }
@@ -46,7 +54,7 @@ function fakeCli({ enabledFlag = true } = {}) {
               {
                 name: 'NOTIFICATION_PROOF_ENABLED',
                 type: 'plain_text',
-                text: version === enabled && enabledFlag ? 'true' : 'false',
+                text: args[2] === enabled && enabledFlag ? 'true' : 'false',
               },
             ],
           },
@@ -106,6 +114,15 @@ test('changed version or disabled flag refuses before deploy', () => {
   );
 });
 
+test('retry evidence requires the immediately prior full off deployment', () => {
+  const prior = fakeCli({ priorVersion: disabled });
+  assert.equal(prior.cli.priorOffVersion(enabled), disabled);
+  const absent = fakeCli();
+  assert.throws(() => absent.cli.priorOffVersion(enabled), /history differs/);
+  const enabledPrior = fakeCli({ priorVersion: enabled });
+  assert.throws(() => enabledPrior.cli.priorOffVersion(enabled), /not off/);
+});
+
 test('Wrangler failure preserves exit and stderr in its diagnostic cause', () => {
   const cli = createWranglerControl({
     token: 'fake-token',
@@ -149,6 +166,33 @@ test('watchdog seals the initial fence against a delayed controller open', async
   assert.equal(calls.filter(({ method }) => method === 'POST').length, 1);
   assert.equal(fence.mutationEpoch, 1);
   assert.equal(fence.transitionRevision, 1);
+});
+
+test('watchdog seals the explicit retry baseline against a delayed controller open', async () => {
+  let fence = {
+    state: 'migration-locked',
+    mutationEpoch: 1,
+    transitionRevision: 1,
+    requireMutationEpoch: true,
+  };
+  const probe = async (method, _path, body) => {
+    if (method === 'GET') return fence;
+    assert.deepEqual(body, {
+      expected: 'migration-locked',
+      next: 'migration-locked',
+      expectedMutationEpoch: 1,
+      expectedRevision: 1,
+      advanceMutationEpoch: true,
+    });
+    fence = {
+      state: 'migration-locked',
+      mutationEpoch: 2,
+      transitionRevision: 2,
+      requireMutationEpoch: true,
+    };
+    return fence;
+  };
+  assert.deepEqual(await sealFence(probe, 1), fence);
 });
 
 test('watchdog relocks when controller open wins the deadline CAS', async () => {
@@ -223,7 +267,11 @@ async function exerciseWatchdog(outcome) {
   const releaseDeployFile = join(directory, 'release-deploy');
   const effectStartedFile = join(directory, 'effect-started');
   const accountId =
-    outcome === 'parent death' ? 'c'.repeat(32) : 'd'.repeat(32);
+    outcome === 'parent death'
+      ? 'c'.repeat(32)
+      : outcome === 'sealed retry'
+        ? 'e'.repeat(32)
+        : 'd'.repeat(32);
   const lockFile = join(
     '/tmp',
     `flowsafe-deploy-locks-${process.getuid()}`,
@@ -260,23 +308,31 @@ childProcess.spawnSync = (executable, args, options) => {
   const sql = args.at(-1);
   const effectStarted = existsSync(process.env.TEST_EFFECT_STARTED_FILE);
   if (command === 'd1' && !effectStarted &&
-      sql.includes('FROM flowsafe_notification_operation_receipts'))
-    return { status: 1, stderr: 'no such table: flowsafe_notification_operation_receipts' };
+      (sql.includes('FROM flowsafe_notification_operation_receipts') ||
+       sql.includes('FROM mastra_notifications')))
+    return { status: 1, stderr: 'notification table is absent' };
   const response = command === 'deployments' ? [{
     created_on: '2026-10-15T00:00:00.000Z',
     versions: [{ version_id: off ? '${disabled}' : '${enabled}', percentage: 100 }],
-  }] : command === 'versions' ? {
+  }, ...(process.env.TEST_RETRY === 'true' ? [{
+    created_on: '2026-10-14T23:59:00.000Z',
+    versions: [{ version_id: '${disabled}', percentage: 100 }],
+  }] : [])] : command === 'versions' ? {
     resources: { bindings: [{
       name: 'NOTIFICATION_PROOF_ENABLED', type: 'plain_text',
-      text: off ? 'false' : 'true',
+      text: off || args[2] === '${disabled}' ? 'false' : 'true',
     }] },
   } : command === 'd1' ? [{ success: true, results:
-    sql.includes("name = 'flowsafe_notification_operation_receipts'")
-      ? effectStarted ? [{ name: 'flowsafe_notification_operation_receipts' }] : []
+    sql.includes("name IN ('mastra_notifications', 'flowsafe_notification_operation_receipts')")
+      ? effectStarted ? [{ name: 'mastra_notifications' },
+        { name: 'flowsafe_notification_operation_receipts' }] : []
       : sql.includes('sqlite_master')
         ? [{ sql: 'write_generation INTEGER NOT NULL, operation_state TEXT' }]
-      : sql.includes('COUNT(*) AS count')
+      : sql.includes('COUNT(*) AS count FROM flowsafe_remote_step_invocations')
         ? [{ count: 0 }]
+      : sql.includes('COUNT(*) AS count FROM mastra_notifications') ||
+        sql.includes('COUNT(*) AS count FROM flowsafe_notification_operation_receipts')
+        ? [{ count: effectStarted ? 1 : 0 }]
         : sql.includes('FROM flowsafe_remote_step_invocations i')
           ? [{ status: 'settled', settlement_outcome: 'applied',
             operation_state: 'resume-admitted', thread_id: 'thread',
@@ -285,9 +341,7 @@ childProcess.spawnSync = (executable, args, options) => {
             receipt_notification_id: 'notification',
             stored_notification_id: 'notification', source: 'flowsafe-staging',
             kind: 'host-owned-notification' }]
-          : effectStarted
-            ? [{ notifications: 1, receipts: 1 }]
-            : [{ notifications: 0 }],
+          : [],
   }] : null;
   if (command === 'deploy') {
     writeFileSync(process.env.TEST_DEPLOY_STARTED_FILE, 'started');
@@ -306,9 +360,9 @@ syncBuiltinESMExports();
   const requests = [];
   let fence = {
     state: 'migration-locked',
-    mutationEpoch: 0,
-    requireMutationEpoch: false,
-    transitionRevision: 0,
+    mutationEpoch: outcome === 'sealed retry' ? 1 : 0,
+    requireMutationEpoch: outcome === 'sealed retry',
+    transitionRevision: outcome === 'sealed retry' ? 1 : 0,
   };
   let startReceived = false;
   const server = createServer(async (request, response) => {
@@ -373,6 +427,9 @@ syncBuiltinESMExports();
           TMPDIR: directory,
           FLOWSAFE_STAGING_PROBE_PORT: String(port),
           FLOWSAFE_STAGING_ENABLED_VERSION: enabled,
+          ...(outcome === 'sealed retry'
+            ? { FLOWSAFE_STAGING_RETRY_OFF_VERSION: disabled }
+            : {}),
           FLOWSAFE_STAGING_PROBE_SECRET_FILE: secretFile,
           FLOWSAFE_CF_TOKEN_FILE: tokenFile,
           FLOWSAFE_CF_ACCOUNT_ID: accountId,
@@ -383,6 +440,7 @@ syncBuiltinESMExports();
           TEST_RELEASE_DEPLOY_FILE: releaseDeployFile,
           TEST_EFFECT_STARTED_FILE: effectStartedFile,
           TEST_CLOCK_JUMP: outcome === 'controller request' ? 'true' : 'false',
+          TEST_RETRY: outcome === 'sealed retry' ? 'true' : 'false',
         },
         stdio: 'ignore',
       },
@@ -400,6 +458,11 @@ syncBuiltinESMExports();
       }
     };
     await waitFor(() => existsSync(`${stateFile}.ready`));
+    if (outcome === 'sealed retry')
+      assert.equal(
+        JSON.parse(readFileSync(stateFile, 'utf8')).baselineEpoch,
+        1,
+      );
     await waitFor(() => existsSync(watcherPidFile));
     watcherPid = Number(readFileSync(watcherPidFile, 'utf8'));
     await waitFor(() => startReceived);
@@ -418,9 +481,9 @@ syncBuiltinESMExports();
     assert.equal(readFileSync(offFile, 'utf8'), 'deployed');
     assert.deepEqual(fence, {
       state: 'migration-locked',
-      mutationEpoch: 2,
+      mutationEpoch: outcome === 'sealed retry' ? 3 : 2,
       requireMutationEpoch: true,
-      transitionRevision: 2,
+      transitionRevision: outcome === 'sealed retry' ? 3 : 2,
     });
     assert.deepEqual(
       requests.filter((request) => request === 'POST /admin/execution-fence'),
@@ -453,6 +516,9 @@ test('watchdog owns off deployment after parent death', () =>
 
 test('watchdog owns off deployment after controller request', () =>
   exerciseWatchdog('controller request'));
+
+test('sealed retry persists watchdog baseline before unlocking and relocks at three', () =>
+  exerciseWatchdog('sealed retry'));
 
 test('controller refuses a contended deployment lock before Wrangler preflight', async () => {
   const directory = mkdtempSync(

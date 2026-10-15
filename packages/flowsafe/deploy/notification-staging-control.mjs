@@ -6,6 +6,12 @@ const initialFence = {
   requireMutationEpoch: false,
   transitionRevision: 0,
 };
+export const sealedRetryFence = {
+  state: 'migration-locked',
+  mutationEpoch: 1,
+  requireMutationEpoch: true,
+  transitionRevision: 1,
+};
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -81,22 +87,33 @@ export function localProbe({ port, secret, fetcher = fetch }) {
 
 export function trustedD1Checks(query) {
   let baseline;
-  const counts = async (receiptTableExists = true) => {
-    const rows = await query(
-      receiptTableExists
-        ? "SELECT (SELECT COUNT(*) FROM mastra_notifications WHERE source = 'flowsafe-staging' AND kind = 'host-owned-notification') AS notifications, (SELECT COUNT(*) FROM flowsafe_notification_operation_receipts) AS receipts"
-        : "SELECT COUNT(*) AS notifications FROM mastra_notifications WHERE source = 'flowsafe-staging' AND kind = 'host-owned-notification'",
-    );
+  const count = async (sql) => {
+    const rows = await query(sql);
     assert(
-      rows.length === 1 &&
-        Number.isSafeInteger(rows[0].notifications) &&
-        (receiptTableExists ? Number.isSafeInteger(rows[0].receipts) : true),
+      rows.length === 1 && Number.isSafeInteger(rows[0].count),
       'notification baseline is unreadable',
     );
-    return receiptTableExists ? rows[0] : { ...rows[0], receipts: 0 };
+    return rows[0].count;
+  };
+  const counts = async ({
+    notificationTableExists = true,
+    receiptTableExists = true,
+  } = {}) => {
+    return {
+      notifications: notificationTableExists
+        ? await count(
+            "SELECT COUNT(*) AS count FROM mastra_notifications WHERE source = 'flowsafe-staging' AND kind = 'host-owned-notification'",
+          )
+        : 0,
+      receipts: receiptTableExists
+        ? await count(
+            'SELECT COUNT(*) AS count FROM flowsafe_notification_operation_receipts',
+          )
+        : 0,
+    };
   };
   return {
-    preflightD1: async () => {
+    preflightD1: async ({ requireAbsentEffectTables = false } = {}) => {
       const schema = await query(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'flowsafe_remote_step_invocations'",
       );
@@ -114,17 +131,29 @@ export function trustedD1Checks(query) {
         rows.length === 1 && rows[0].count === 0,
         'remote step journal is not empty',
       );
-      const receiptSchema = await query(
-        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'flowsafe_notification_operation_receipts'",
+      const notificationSchemas = await query(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('mastra_notifications', 'flowsafe_notification_operation_receipts')",
+      );
+      const present = new Set(notificationSchemas.map((row) => row.name));
+      assert(
+        notificationSchemas.length === present.size &&
+          [...present].every(
+            (name) =>
+              name === 'mastra_notifications' ||
+              name === 'flowsafe_notification_operation_receipts',
+          ),
+        'notification schema is unreadable',
       );
       assert(
-        receiptSchema.length === 0 ||
-          (receiptSchema.length === 1 &&
-            receiptSchema[0].name ===
-              'flowsafe_notification_operation_receipts'),
-        'receipt schema is unreadable',
+        !requireAbsentEffectTables || present.size === 0,
+        'retry effect tables are present',
       );
-      baseline = await counts(receiptSchema.length === 1);
+      baseline = await counts({
+        notificationTableExists: present.has('mastra_notifications'),
+        receiptTableExists: present.has(
+          'flowsafe_notification_operation_receipts',
+        ),
+      });
     },
     verifyD1: async (invocationId) => {
       assert(
@@ -177,10 +206,18 @@ export async function runNotificationStagingControl({
   verifyD1,
   requestOffDeploy,
   onBeforeUnlock = async () => {},
+  expectedInitialFence = initialFence,
 }) {
   assert(
     typeof requestOffDeploy === 'function',
     'off deploy watchdog is required',
+  );
+  assert(
+    expectedInitialFence === initialFence ||
+      Object.entries(sealedRetryFence).every(
+        ([key, value]) => expectedInitialFence?.[key] === value,
+      ),
+    'unsupported staging fence baseline',
   );
   let initial;
   let unlockAttempted = false;
@@ -188,7 +225,7 @@ export async function runNotificationStagingControl({
   let failure;
   try {
     initial = await probe('GET', '/admin/execution-fence');
-    exactFence(initial, initialFence);
+    exactFence(initial, expectedInitialFence);
     const maintenance = await probe('GET', '/admin/maintenance-status');
     assert(
       Number.isSafeInteger(maintenance.alarmAt) &&
@@ -198,7 +235,9 @@ export async function runNotificationStagingControl({
         maintenance.lastRemoteStepRecoveryError === undefined,
       'notification recovery duty is not armed',
     );
-    await preflightD1();
+    await preflightD1({
+      requireAbsentEffectTables: expectedInitialFence.mutationEpoch === 1,
+    });
     await onBeforeUnlock();
     unlockAttempted = true;
     const opened = await probe('POST', '/admin/execution-fence', {
@@ -257,7 +296,7 @@ export async function runNotificationStagingControl({
           });
           exactFence(locked, nextFence(current, 'migration-locked'));
         } else {
-          exactFence(current, initialFence);
+          exactFence(current, expectedInitialFence);
           assert(!outcome, 'successful proof lost its open fence');
         }
       } catch (error) {

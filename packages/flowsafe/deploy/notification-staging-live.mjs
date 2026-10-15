@@ -18,6 +18,7 @@ import {
   localProbe,
   readSecretFile,
   runNotificationStagingControl,
+  sealedRetryFence,
   trustedD1Checks,
 } from './notification-staging-control.mjs';
 
@@ -98,19 +99,10 @@ export function createWranglerControl({ command = spawnSync, token }) {
     assert(value !== null, 'Wrangler returned null');
     return value;
   }
-  function currentVersion() {
-    const deployments = json([
-      'deployments',
-      'list',
-      '--config',
-      config,
-      '--json',
-    ]);
-    assert(
-      Array.isArray(deployments) && deployments.length > 0,
-      'deployment list is empty',
-    );
-    const ordered = deployments
+  function deployments() {
+    const list = json(['deployments', 'list', '--config', config, '--json']);
+    assert(Array.isArray(list) && list.length > 0, 'deployment list is empty');
+    const ordered = list
       .map((deployment) => {
         const createdAt = Date.parse(deployment.created_on);
         assert(
@@ -124,14 +116,20 @@ export function createWranglerControl({ command = spawnSync, token }) {
       ordered.length === 1 || ordered[0].createdAt > ordered[1].createdAt,
       'latest deployment is ambiguous',
     );
-    const latest = ordered[0].deployment;
+    return ordered.map(({ deployment }) => deployment);
+  }
+  function fullVersion(deployment) {
     assert(
-      latest.versions?.length === 1 && latest.versions[0].percentage === 100,
+      deployment.versions?.length === 1 &&
+        deployment.versions[0].percentage === 100,
       'deployment is not a single full version',
     );
-    const id = latest.versions[0].version_id;
+    const id = deployment.versions[0].version_id;
     assert(versionPattern.test(id), 'invalid deployment version');
     return id;
+  }
+  function currentVersion() {
+    return fullVersion(deployments()[0]);
   }
   function proofEnabled(version) {
     assert(versionPattern.test(version), 'invalid version');
@@ -157,6 +155,16 @@ export function createWranglerControl({ command = spawnSync, token }) {
   return {
     currentVersion,
     proofEnabled,
+    priorOffVersion(expectedEnabled) {
+      const ordered = deployments();
+      assert(
+        ordered.length > 1 && fullVersion(ordered[0]) === expectedEnabled,
+        'retry deployment history differs',
+      );
+      const prior = fullVersion(ordered[1]);
+      assert(!proofEnabled(prior), 'prior deployment is not off');
+      return prior;
+    },
     query(sql) {
       const output = json([
         'd1',
@@ -206,7 +214,11 @@ export function createWranglerControl({ command = spawnSync, token }) {
   };
 }
 
-export async function sealFence(probe) {
+export async function sealFence(probe, baselineEpoch = 0) {
+  assert(
+    baselineEpoch === 0 || baselineEpoch === 1,
+    'invalid watchdog baseline',
+  );
   for (let attempt = 0; attempt < 3; attempt++) {
     const current = await probe('GET', '/admin/execution-fence');
     assert(
@@ -215,16 +227,16 @@ export async function sealFence(probe) {
     );
     const initial =
       current.state === 'migration-locked' &&
-      current.mutationEpoch === 0 &&
-      current.transitionRevision === 0 &&
-      current.requireMutationEpoch === false;
+      current.mutationEpoch === baselineEpoch &&
+      current.transitionRevision === baselineEpoch &&
+      current.requireMutationEpoch === (baselineEpoch !== 0);
     const open =
       current.state === 'open' &&
-      current.mutationEpoch === 1 &&
-      current.transitionRevision === 1 &&
+      current.mutationEpoch === baselineEpoch + 1 &&
+      current.transitionRevision === baselineEpoch + 1 &&
       current.requireMutationEpoch === true;
     if (current.state === 'migration-locked' && !initial) {
-      confirmedFence(current);
+      confirmedFence(current, baselineEpoch);
       return current;
     }
     assert(initial || open, 'watchdog fence metadata differs');
@@ -241,7 +253,7 @@ export async function sealFence(probe) {
     }
   }
   const current = await probe('GET', '/admin/execution-fence');
-  confirmedFence(current);
+  confirmedFence(current, baselineEpoch);
   return current;
 }
 
@@ -263,6 +275,11 @@ function settingsFromEnv(env) {
   assert(token.length > 0, 'Cloudflare token is empty');
   const accountId = env.FLOWSAFE_CF_ACCOUNT_ID;
   assert(accountPattern.test(accountId), 'Cloudflare account ID is required');
+  const priorOffVersion = env.FLOWSAFE_STAGING_RETRY_OFF_VERSION;
+  assert(
+    priorOffVersion === undefined || versionPattern.test(priorOffVersion),
+    'invalid prior off version',
+  );
   return {
     port,
     expectedVersion,
@@ -271,6 +288,7 @@ function settingsFromEnv(env) {
     secret,
     token,
     accountId,
+    priorOffVersion,
   };
 }
 
@@ -302,18 +320,18 @@ function acquireDeploymentLock(accountId) {
   return fd;
 }
 
-function confirmedFence(current) {
+function confirmedFence(current, baselineEpoch = 0) {
   assert(
     current.state === 'migration-locked',
     'staging fence relock is unconfirmed',
   );
   const sealed =
-    current.mutationEpoch === 1 &&
-    current.transitionRevision === 1 &&
+    current.mutationEpoch === baselineEpoch + 1 &&
+    current.transitionRevision === baselineEpoch + 1 &&
     current.requireMutationEpoch === true;
   const relocked =
-    current.mutationEpoch === 2 &&
-    current.transitionRevision === 2 &&
+    current.mutationEpoch === baselineEpoch + 2 &&
+    current.transitionRevision === baselineEpoch + 2 &&
     current.requireMutationEpoch === true;
   assert(sealed || relocked, 'staging fence metadata differs');
 }
@@ -330,7 +348,12 @@ async function watchdog(stateFile) {
     parentPid,
     deadlineAt,
     outdir,
+    baselineEpoch,
   } = state;
+  assert(
+    baselineEpoch === 0 || baselineEpoch === 1,
+    'invalid watchdog baseline',
+  );
   const probe = localProbe({ port, secret: readSecretFile(probeSecretPath) });
   const cli = createWranglerControl({ token: privateFile(cfTokenPath) });
   assert(
@@ -347,9 +370,9 @@ async function watchdog(stateFile) {
     }
     await new Promise((resolve) => setTimeout(resolve, 1_000));
   }
-  await sealFence(probe);
+  await sealFence(probe, baselineEpoch);
   cli.deployOffIfCurrent(expectedVersion, outdir);
-  confirmedFence(await probe('GET', '/admin/execution-fence'));
+  confirmedFence(await probe('GET', '/admin/execution-fence'), baselineEpoch);
   writeFileSync(`${stateFile}.off-confirmed`, '', { mode: 0o600, flag: 'wx' });
 }
 
@@ -362,6 +385,25 @@ async function controller() {
       cli.proofEnabled(settings.expectedVersion),
     'enabled version preflight differs',
   );
+  const probe = localProbe({ port: settings.port, secret: settings.secret });
+  const baselineEpoch = settings.priorOffVersion === undefined ? 0 : 1;
+  if (baselineEpoch === 1) {
+    assert(
+      settings.priorOffVersion !== settings.expectedVersion &&
+        cli.priorOffVersion(settings.expectedVersion) ===
+          settings.priorOffVersion,
+      'retry prior off version is unconfirmed',
+    );
+    const fence = await probe('GET', '/admin/execution-fence');
+    assert(
+      Object.entries(sealedRetryFence).every(
+        ([key, value]) => fence[key] === value,
+      ) &&
+        fence.proofKey === undefined &&
+        fence.proofRunId === undefined,
+      'retry fence is not the exact sealed baseline',
+    );
+  }
   const directory = join(
     tmpdir(),
     `flowsafe-notification-control-${process.pid}`,
@@ -380,6 +422,7 @@ async function controller() {
       parentPid: process.pid,
       deadlineAt: Date.now() + 900_000,
       outdir,
+      baselineEpoch,
     }),
     { mode: 0o600, flag: 'wx' },
   );
@@ -406,7 +449,6 @@ async function controller() {
     'watchdog readiness is unconfirmed',
   );
   process.kill(watcher.pid, 0);
-  const probe = localProbe({ port: settings.port, secret: settings.secret });
   let offConfirmed = false;
   const requestOffDeploy = async () => {
     if (offConfirmed) return;
@@ -427,6 +469,7 @@ async function controller() {
     const result = await runNotificationStagingControl({
       probe,
       ...trustedD1Checks((sql) => cli.query(sql)),
+      expectedInitialFence: baselineEpoch === 1 ? sealedRetryFence : undefined,
       requestOffDeploy,
       onBeforeUnlock: async () => {
         assert(
