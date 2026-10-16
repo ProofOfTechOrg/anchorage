@@ -100,7 +100,7 @@ async function run() {
       `INSERT OR IGNORE INTO flowsafe_deployment (id, tenant_tag, provisioned_at) VALUES (1, '${tag}', datetime('now')); ` +
       `${EXECUTION_FENCE_DDL}; ` +
       `INSERT OR IGNORE INTO ${EXECUTION_FENCE_TABLE} (id, state, proof_key, proof_run_id, updated_at) ` +
-      `VALUES ('${EXECUTION_FENCE_ROW_ID}', 'open', NULL, NULL, ${Date.now()});`,
+      `VALUES ('${EXECUTION_FENCE_ROW_ID}', 'migration-locked', NULL, NULL, ${Date.now()});`,
   );
   await lifecycle.start('notification-staging-native', () => {
     const child = spawn(
@@ -128,6 +128,8 @@ async function run() {
         `STAGING_PROBE_SECRET:${probeSecret}`,
         '--var',
         'NOTIFICATION_PROOF_ENABLED:true',
+        '--var',
+        'STAGING_MUTATION_EPOCH:1',
       ],
       {
         cwd: flowsafe,
@@ -148,6 +150,28 @@ async function run() {
     refused.status === 403,
     'private start admitted an unauthenticated call',
     refused,
+  );
+  const opened = await fetch(`http://127.0.0.1:${port}/admin/execution-fence`, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${maintenanceSecret}`,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({
+      expected: 'migration-locked',
+      next: 'open',
+      expectedMutationEpoch: 0,
+      expectedRevision: 0,
+      advanceMutationEpoch: true,
+    }),
+    signal: AbortSignal.timeout(90_000),
+  });
+  expect(opened.status === 200, 'native execution fence did not open');
+  const fence = await opened.json();
+  expect(
+    fence.mutationEpoch === 1 && fence.requireMutationEpoch === true,
+    'native execution fence did not require the enabled epoch',
+    fence,
   );
   const started = await post('/__staging/start', probeSecret);
   expect(started.status === 200, 'guarded start/register failed', {

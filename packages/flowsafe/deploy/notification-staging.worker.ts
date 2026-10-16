@@ -36,6 +36,7 @@ import {
   executionFenceFor,
   type InitResult,
   init,
+  mutationEpochFromHeader,
   type RunnerRuntime,
   startIdempotencyFor,
   ThreadDurableObject,
@@ -60,6 +61,7 @@ interface Env {
   DEPLOYMENT_IDENTITY_SECRET: string;
   MAINTENANCE_ADMIN_SECRET: string;
   STAGING_PROBE_SECRET: string;
+  STAGING_MUTATION_EPOCH: string;
   NOTIFICATION_PROOF_ENABLED?: string;
   CF_VERSION_METADATA: { id: string };
   RUNNER: DurableObjectNamespace;
@@ -296,6 +298,8 @@ export class NotificationStagingThread extends ThreadDurableObject<Env> {
 
 const config = {
   workflows: [],
+  mutationEpoch: (env: Env) =>
+    mutationEpochFromHeader(env.STAGING_MUTATION_EPOCH),
   systemPrincipalId: SYSTEM_ID,
   buildVerifier: () => staticTokenVerifier(new Map()),
   maintenance: {
@@ -363,6 +367,7 @@ const config = {
       },
       storeFactory,
       deploymentTag: env.DEPLOYMENT_TENANT,
+      mutationEpoch: mutationEpochFromHeader(env.STAGING_MUTATION_EPOCH),
       buildService: (store) =>
         new ApprovalService({
           store,

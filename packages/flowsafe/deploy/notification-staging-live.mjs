@@ -16,6 +16,11 @@ import { dirname, join, resolve as resolvePath } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
 import {
+  decodeExecutionFenceMutationMetadata,
+  EXECUTION_FENCE_ROW_ID,
+  EXECUTION_FENCE_TABLE,
+} from '#deployment-identity-protocol';
+import {
   localProbe,
   readSecretFile,
   runNotificationStagingControl,
@@ -222,7 +227,7 @@ export function createWranglerControl({
   function currentVersion() {
     return fullVersion(deployments()[0]);
   }
-  function proofEnabled(version) {
+  function proofEnabled(version, expectedMutationEpoch) {
     assert(versionPattern.test(version), 'invalid version');
     const detail = json([
       'versions',
@@ -257,6 +262,21 @@ export function createWranglerControl({
         tenant[0].text === selected.tenant,
       'enabled deployment tenant differs',
     );
+    if (expectedMutationEpoch !== undefined) {
+      assert(
+        expectedMutationEpoch === 1 || expectedMutationEpoch === 2,
+        'invalid enabled epoch',
+      );
+      const epoch = bindings.filter(
+        (binding) => binding.name === 'STAGING_MUTATION_EPOCH',
+      );
+      assert(
+        epoch.length === 1 &&
+          epoch[0].type === 'plain_text' &&
+          epoch[0].text === String(expectedMutationEpoch),
+        'enabled epoch binding differs',
+      );
+    }
     return flag[0].text === 'true';
   }
   return {
@@ -499,7 +519,9 @@ async function watchdog(stateFile) {
     baselineEpoch === 0 || baselineEpoch === 1,
     'invalid watchdog baseline',
   );
-  const probe = localProbe({ port, secret: readSecretFile(probeSecretPath) });
+  const secret = readSecretFile(probeSecretPath);
+  const token = privateFile(cfTokenPath);
+  const probe = localProbe({ port, secret });
   const selected = stagingConfig(configPath);
   assert(selected.name === workerName, 'watchdog Worker identity differs');
   assert(
@@ -512,12 +534,12 @@ async function watchdog(stateFile) {
     'watchdog pinned off bundle is missing',
   );
   const cli = createWranglerControl({
-    token: privateFile(cfTokenPath),
+    token,
     configPath,
   });
   assert(
     cli.currentVersion() === expectedVersion &&
-      cli.proofEnabled(expectedVersion),
+      cli.proofEnabled(expectedVersion, baselineEpoch + 1),
     'watchdog enabled version differs',
   );
   writeFileSync(`${stateFile}.ready`, '', { mode: 0o600, flag: 'wx' });
@@ -529,9 +551,37 @@ async function watchdog(stateFile) {
     }
     await new Promise((resolve) => setTimeout(resolve, 1_000));
   }
-  await sealFence(probe, baselineEpoch);
+  let sealFailure;
+  try {
+    await sealFence(probe, baselineEpoch);
+  } catch (error) {
+    sealFailure = error;
+  }
   cli.deployOffIfCurrent(expectedVersion, outdir, bundlePath);
-  confirmedFence(await probe('GET', '/admin/execution-fence'), baselineEpoch);
+  try {
+    const rows = cli.query(`SELECT * FROM ${EXECUTION_FENCE_TABLE}`);
+    assert(
+      rows.length === 1 && rows[0].id === EXECUTION_FENCE_ROW_ID,
+      'authoritative fence row differs',
+    );
+    const row = rows[0];
+    const metadata = decodeExecutionFenceMutationMetadata(row);
+    assert(
+      row.proof_key === null &&
+        row.proof_run_id === null &&
+        metadata.proofTablePrefix === null &&
+        metadata.proofWorkflowId === null &&
+        metadata.proofStartToken === null,
+      'authoritative fence proof differs',
+    );
+    confirmedFence({ state: row.state, ...metadata }, baselineEpoch);
+  } catch (error) {
+    const failure = new AggregateError(
+      sealFailure ? [sealFailure, error] : [error],
+      'staging fence relock is unconfirmed',
+    );
+    throw new Error(privateDiagnostic(failure, [secret, token]));
+  }
   writeFileSync(`${stateFile}.off-confirmed`, '', { mode: 0o600, flag: 'wx' });
 }
 
@@ -560,13 +610,13 @@ async function controller() {
   let stage = 'enabled-version-preflight';
   try {
     const cli = createWranglerControl({ token: settings.token, configPath });
+    const baselineEpoch = settings.priorOffVersion === undefined ? 0 : 1;
     assert(
       cli.currentVersion() === settings.expectedVersion &&
-        cli.proofEnabled(settings.expectedVersion),
+        cli.proofEnabled(settings.expectedVersion, baselineEpoch + 1),
       'enabled version preflight differs',
     );
     const probe = localProbe({ port: settings.port, secret: settings.secret });
-    const baselineEpoch = settings.priorOffVersion === undefined ? 0 : 1;
     if (baselineEpoch === 1) {
       assert(
         settings.priorOffVersion !== settings.expectedVersion &&

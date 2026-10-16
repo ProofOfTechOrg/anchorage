@@ -50,13 +50,26 @@ function freshConfig() {
   return source;
 }
 
-function versionBindings(source, proofEnabled) {
+function versionBindings(
+  source,
+  proofEnabled,
+  mutationEpoch = proofEnabled ? 1 : 0,
+) {
   return [
     {
       name: 'NOTIFICATION_PROOF_ENABLED',
       type: 'plain_text',
       text: String(proofEnabled),
     },
+    ...(mutationEpoch === null
+      ? []
+      : [
+          {
+            name: 'STAGING_MUTATION_EPOCH',
+            type: 'plain_text',
+            text: String(mutationEpoch),
+          },
+        ]),
     {
       name: 'DEPLOYMENT_TENANT',
       type: 'plain_text',
@@ -70,7 +83,7 @@ function versionBindings(source, proofEnabled) {
   ];
 }
 
-function fakeCli({ enabledFlag = true, priorVersion } = {}) {
+function fakeCli({ enabledFlag = true, priorVersion, mutationEpoch } = {}) {
   const calls = [];
   let version = enabled;
   const command = (_executable, args) => {
@@ -108,6 +121,7 @@ function fakeCli({ enabledFlag = true, priorVersion } = {}) {
             bindings: versionBindings(
               source,
               args[2] === enabled && enabledFlag,
+              mutationEpoch,
             ),
           },
         }),
@@ -187,6 +201,24 @@ test('retry evidence requires the immediately prior full off deployment', () => 
   assert.throws(() => absent.cli.priorOffVersion(enabled), /history differs/);
   const enabledPrior = fakeCli({ priorVersion: enabled });
   assert.throws(() => enabledPrior.cli.priorOffVersion(enabled), /not off/);
+});
+
+test('enabled version must pin the epoch the controller will open', () => {
+  for (const epoch of [null, '01', '0', '2']) {
+    const fixture = fakeCli({ mutationEpoch: epoch });
+    assert.throws(
+      () => fixture.cli.proofEnabled(enabled, 1),
+      /epoch binding differs/,
+    );
+  }
+  assert.equal(
+    fakeCli({ mutationEpoch: 1 }).cli.proofEnabled(enabled, 1),
+    true,
+  );
+  assert.equal(
+    fakeCli({ mutationEpoch: 2 }).cli.proofEnabled(enabled, 2),
+    true,
+  );
 });
 
 test('enabled version requires exact D1 and tenant bindings', () => {
@@ -463,6 +495,10 @@ async function exerciseWatchdog(outcome) {
   const deployStartedFile = join(directory, 'deploy-started');
   const releaseDeployFile = join(directory, 'release-deploy');
   const effectStartedFile = join(directory, 'effect-started');
+  const fenceFile = join(directory, 'fence.json');
+  const deadProbe =
+    outcome === 'dead probe after relock' ||
+    outcome === 'dead probe while open';
   const accountId =
     outcome === 'parent death'
       ? 'c'.repeat(32)
@@ -508,7 +544,7 @@ async function exerciseWatchdog(outcome) {
     preloadFile,
     `import childProcess from 'node:child_process';
 import { syncBuiltinESMExports } from 'node:module';
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 const originalSpawn = childProcess.spawn;
 const originalSpawnSync = childProcess.spawnSync;
 const originalNow = Date.now;
@@ -554,6 +590,9 @@ childProcess.spawnSync = (executable, args, options) => {
       name: 'NOTIFICATION_PROOF_ENABLED', type: 'plain_text',
       text: off || args[2] === '${disabled}' ? 'false' : 'true',
     }, {
+      name: 'STAGING_MUTATION_EPOCH', type: 'plain_text',
+      text: off || args[2] === '${disabled}' ? '0' : process.env.TEST_RETRY === 'true' ? '2' : '1',
+    }, {
       name: 'DEPLOYMENT_TENANT', type: 'plain_text',
       text: process.env.TEST_FRESH_CONFIG === 'true'
         ? 'flowsafenotificationfresh' : 'flowsafenotificationstaging',
@@ -564,7 +603,9 @@ childProcess.spawnSync = (executable, args, options) => {
         : 'b863a219-2096-4e13-92fe-4db592b67944',
     }] },
   } : command === 'd1' ? [{ success: true, results:
-    sql.includes("name IN ('mastra_notifications', 'flowsafe_notification_operation_receipts')")
+    sql.includes('FROM flowsafe_execution_fence')
+      ? [JSON.parse(readFileSync(process.env.TEST_FENCE_FILE, 'utf8'))]
+      : sql.includes("name IN ('mastra_notifications', 'flowsafe_notification_operation_receipts')")
       ? effectStarted ? [{ name: 'mastra_notifications' },
         { name: 'flowsafe_notification_operation_receipts' }] : []
       : sql.includes('sqlite_master')
@@ -615,14 +656,44 @@ syncBuiltinESMExports();
     transitionRevision: outcome === 'sealed retry' ? 1 : 0,
   };
   let startReceived = false;
+  let probeUnavailable = false;
+  const recordFence = () =>
+    writeFileSync(
+      fenceFile,
+      JSON.stringify({
+        id: 'deployment',
+        state: fence.state,
+        proof_key: null,
+        proof_run_id: null,
+        updated_at: 1,
+        last_transition_request:
+          fence.mutationEpoch === 0 ? null : 'test-transition',
+        transition_revision: fence.transitionRevision,
+        mutation_epoch: fence.mutationEpoch,
+        require_mutation_epoch: Number(fence.requireMutationEpoch),
+        proof_table_prefix: null,
+        proof_workflow_id: null,
+        proof_start_token: null,
+      }),
+    );
+  recordFence();
   const server = createServer(async (request, response) => {
     assert.equal(request.headers.authorization, `Bearer ${secret}`);
     const path = request.url;
     const method = request.method;
     requests.push(`${method} ${path}`);
+    if (probeUnavailable) {
+      response.destroy();
+      return;
+    }
     if (method === 'POST' && path === '/start') {
       startReceived = true;
       writeFileSync(effectStartedFile, 'started');
+      if (outcome === 'dead probe while open') {
+        probeUnavailable = true;
+        response.destroy();
+        return;
+      }
       if (outcome === 'parent death' || outcome === 'fresh config') return;
       response.writeHead(200, { 'content-type': 'application/json' });
       response.end(
@@ -657,6 +728,12 @@ syncBuiltinESMExports();
         requireMutationEpoch: true,
         transitionRevision: fence.transitionRevision + 1,
       };
+      recordFence();
+      if (
+        outcome === 'dead probe after relock' &&
+        fence.state === 'migration-locked'
+      )
+        probeUnavailable = true;
       value = fence;
     } else {
       assert.equal(path, '/admin/execution-fence');
@@ -703,6 +780,7 @@ syncBuiltinESMExports();
           TEST_DEPLOY_STARTED_FILE: deployStartedFile,
           TEST_RELEASE_DEPLOY_FILE: releaseDeployFile,
           TEST_EFFECT_STARTED_FILE: effectStartedFile,
+          TEST_FENCE_FILE: fenceFile,
           TEST_CLOCK_JUMP: outcome === 'controller request' ? 'true' : 'false',
           TEST_RETRY: outcome === 'sealed retry' ? 'true' : 'false',
           TEST_FRESH_CONFIG: outcome === 'fresh config' ? 'true' : 'false',
@@ -757,16 +835,26 @@ syncBuiltinESMExports();
     await waitFor(() => existsSync(offConfirmedFile));
     assert.equal(readFileSync(offFile, 'utf8'), 'deployed');
     assert.deepEqual(fence, {
-      state: 'migration-locked',
+      state: outcome === 'dead probe while open' ? 'open' : 'migration-locked',
       mutationEpoch:
-        outcome === 'sealed retry' ? 3 : outcome === 'mismatched probe' ? 1 : 2,
+        outcome === 'sealed retry'
+          ? 3
+          : outcome === 'mismatched probe' ||
+              outcome === 'dead probe while open'
+            ? 1
+            : 2,
       requireMutationEpoch: true,
       transitionRevision:
-        outcome === 'sealed retry' ? 3 : outcome === 'mismatched probe' ? 1 : 2,
+        outcome === 'sealed retry'
+          ? 3
+          : outcome === 'mismatched probe' ||
+              outcome === 'dead probe while open'
+            ? 1
+            : 2,
     });
     assert.deepEqual(
       requests.filter((request) => request === 'POST /admin/execution-fence'),
-      outcome === 'mismatched probe'
+      outcome === 'mismatched probe' || outcome === 'dead probe while open'
         ? ['POST /admin/execution-fence']
         : ['POST /admin/execution-fence', 'POST /admin/execution-fence'],
     );
@@ -778,6 +866,17 @@ syncBuiltinESMExports();
     await waitFor(
       () => spawnSync('flock', ['--nonblock', lockFile, 'true']).status === 0,
     );
+    if (deadProbe) {
+      await waitFor(() => controller.exitCode !== null);
+      assert.equal(
+        controller.exitCode,
+        outcome === 'dead probe after relock' ? 0 : 1,
+      );
+      assert.equal(
+        existsSync(`${stateFile}.off-confirmed`),
+        outcome === 'dead probe after relock',
+      );
+    }
   } finally {
     controller?.kill('SIGKILL');
     if (Number.isInteger(watcherPid)) {
@@ -807,6 +906,12 @@ test('watchdog owns off deployment after controller request', () =>
 
 test('sealed retry persists watchdog baseline before unlocking and relocks at three', () =>
   exerciseWatchdog('sealed retry'));
+
+test('watchdog deploys off through probe failure after the controller relocks', () =>
+  exerciseWatchdog('dead probe after relock'));
+
+test('watchdog deploys off but refuses confirmation when the dead probe leaves an open fence', () =>
+  exerciseWatchdog('dead probe while open'));
 
 test('controller refuses a contended deployment lock before Wrangler preflight', async () => {
   const directory = mkdtempSync(
