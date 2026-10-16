@@ -2,6 +2,7 @@
   "$schema": "https://unpkg.com/wrangler/config-schema.json",
   "name": "anchorage-flowsafe-remote-step-staging",
   "main": "./notification-staging.worker.ts",
+  "minify": true,
   "compatibility_date": "2026-09-10",
   "compatibility_flags": ["nodejs_compat"],
   "alias": {
