@@ -82,6 +82,7 @@ export {
 export {
   createDoRunTopology,
   type DoRunLifecycleTopology,
+  type DoRunRemoteStepTopology,
   type DoRunStartInput,
   type DoRunTopology,
   type RunnerNamespaceLike,

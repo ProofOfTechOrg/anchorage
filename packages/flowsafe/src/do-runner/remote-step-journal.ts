@@ -16,6 +16,7 @@ import {
 } from '../signals/notifications-d1.js';
 import { credentialsMatch } from './deployment-identity.js';
 import { DoStatusError } from './do-status-error.js';
+import { assertMutationEpoch } from './execution-admission.js';
 import {
   admitsExistingRun,
   captureExecutionFenceAdmissionSchema,
@@ -30,6 +31,7 @@ import {
   RUN_LIFECYCLE_CONTEXT_KEY,
 } from './run-lifecycle.js';
 import type { RunnerRuntime, RunSummary } from './runtime.js';
+import { MASTRA_WORKFLOW_META_KEY } from './suspension-deadline.js';
 import { validateTablePrefix } from './table-prefix.js';
 
 export const REMOTE_STEP_TABLE = 'flowsafe_remote_step_invocations';
@@ -132,6 +134,8 @@ const REMOTE_STEP_INTEGER_COLUMNS = new Set<string>([
 ]);
 export const REMOTE_STEP_MARKER = 'flowsafe.remote-step/v1';
 export const WORKFLOW_REMOTE_STEP_MARKER = 'flowsafe.remote-step.workflow/v1';
+export const WORKFLOW_REMOTE_STEP_RESULT_KEY =
+  'flowsafe.workflowRemoteStepResult';
 export const MAX_REMOTE_STEP_REQUEST_BYTES = 16_384;
 export const MAX_REMOTE_STEP_RESULT_BYTES = 16_384;
 
@@ -314,6 +318,30 @@ export interface RecordedRemoteStepResult {
   quiescenceDigest: string;
   executorQuiescentAt: number;
 }
+
+export interface WorkflowRemoteStepResumeData {
+  [WORKFLOW_REMOTE_STEP_RESULT_KEY]: {
+    version: 1;
+    invocationId: string;
+    requestDigest: string;
+    resultJson: string;
+    resultDigest: string;
+  };
+}
+
+export type WorkflowRemoteStepResumeResult =
+  | { kind: 'applied'; invocationId: string; summary: RunSummary }
+  | { kind: 'already-applied'; invocationId: string };
+
+export type WorkflowRemoteStepContinuationReader = Pick<
+  RemoteStepJournal,
+  | 'deploymentId'
+  | 'tablePrefix'
+  | 'getWorkflow'
+  | 'readRetainedResult'
+  | 'claimWorkflowResume'
+  | 'settleWorkflowAfterResume'
+>;
 
 export interface RemoteStepNotificationOperation {
   invocationId: string;
@@ -1464,7 +1492,7 @@ export class RemoteStepJournal {
       before.requestJson !== after.requestJson
     )
       throw new RemoteStepRefusal(409, 'remote step suspension changed');
-    return { suspension: after, snapshot };
+    return { suspension: after, snapshot, state };
   }
 
   async register(
@@ -2500,6 +2528,187 @@ export class RemoteStepJournal {
     if (!row)
       throw new RemoteStepRefusal(409, 'remote step continuation changed');
     return owner;
+  }
+
+  async claimWorkflowResume(
+    invocationId: string,
+    leaseMs: number,
+    expectedMutationEpoch?: number,
+  ): Promise<string> {
+    if (
+      !isPathSafeId(invocationId) ||
+      !Number.isSafeInteger(leaseMs) ||
+      leaseMs < 1 ||
+      leaseMs > 60_000
+    )
+      throw new RemoteStepRefusal(400, 'remote step resume claim is malformed');
+    const stored = await this.#getRow(invocationId);
+    if (stored?.target_kind !== 'workflow')
+      throw new RemoteStepRefusal(404, 'invocation not found');
+    const invocation = decodeWorkflow(stored);
+    if (invocation.status !== 'result-retained')
+      throw new RemoteStepRefusal(409, 'remote step result is unavailable');
+    const retained = await this.#retainedResultFromRow(stored);
+    if (!retained)
+      throw new RemoteStepRefusal(409, 'remote step result is unavailable');
+    const { suspension, snapshot, state } =
+      await this.#stableSnapshot(invocation);
+    if (state.kind !== 'result')
+      throw new RemoteStepRefusal(409, 'remote step suspension changed');
+    const currentPayload = record(
+      record(state.summary.suspendPayload)?.[suspension.stepPath.join('.')],
+    );
+    if (
+      suspension.stepPath.length !== 1 ||
+      suspension.stepPath[0]?.includes('.') ||
+      (currentPayload && MASTRA_WORKFLOW_META_KEY in currentPayload) ||
+      JSON.stringify(suspension.stepPath) !==
+        JSON.stringify(invocation.stepPath) ||
+      suspension.suspendedAt !== invocation.suspendedAt ||
+      suspension.resumeCount !== invocation.resumeCount ||
+      suspension.requestJson !== stored.request_json ||
+      (await sha256Hex(stored.request_json)) !== invocation.requestDigest
+    )
+      throw new RemoteStepRefusal(409, 'remote step suspension changed');
+    const now = this.#now();
+    if ((state.summary.deadlineAt ?? invocation.deadlineAt) <= now)
+      throw new RemoteStepRefusal(409, 'remote step deadline elapsed');
+    const owner = crypto.randomUUID();
+    const base = [
+      owner,
+      now + leaseMs,
+      invocationId,
+      invocation.deploymentId,
+      invocation.tablePrefix,
+      invocation.workflowId,
+      invocation.runId,
+      invocation.startToken,
+      JSON.stringify(invocation.principal),
+      stored.step_path,
+      invocation.suspendedAt,
+      stored.resume_count,
+      stored.request_json,
+      invocation.requestDigest,
+      retained.resultDigest,
+      invocation.permitGeneration,
+      invocation.permitEpoch ?? null,
+      stored.write_revision,
+      stored.write_generation,
+      now,
+      invocation.workflowId,
+      invocation.runId,
+      snapshot,
+    ];
+    const gate = await this.#admission(invocation, base.length);
+    assertMutationEpoch(gate.observed, expectedMutationEpoch);
+    const result = await this.#db
+      .prepare(`UPDATE ${REMOTE_STEP_TABLE}
+        SET status = 'resuming', resume_lease_owner = ?, resume_lease_expires_at = ?,
+          write_revision = write_revision + 1, write_generation = write_generation + 1
+        WHERE invocation_id = ? AND target_kind = 'workflow' AND operation_state IS NULL
+          AND deployment_id = ? AND table_prefix = ? AND workflow_id = ? AND run_id = ?
+          AND start_token = ? AND principal_json = ? AND step_path = ?
+          AND suspended_at = ? AND resume_count = ? AND request_json = ? AND request_digest = ?
+          AND result_digest = ? AND permit_generation = ? AND permit_epoch IS ?
+          AND write_revision = ? AND write_generation = ? AND deadline_at > ?
+          AND status = 'result-retained'
+          AND EXISTS (SELECT 1 FROM "${invocation.tablePrefix}mastra_workflow_snapshot"
+            WHERE workflow_name = ? AND run_id = ? AND snapshot = ?
+              AND ${SNAPSHOT_EXECUTION_OPEN_SQL})
+          AND ${gate.predicate} RETURNING invocation_id`)
+      .bind(...base, ...gate.values)
+      .all();
+    if (!rowResult(result))
+      throw new RemoteStepRefusal(409, 'remote step resume is claimed');
+    return owner;
+  }
+
+  async settleWorkflowAfterResume(
+    invocationId: string,
+    leaseOwner: string,
+    witnessed: RunSummary,
+  ): Promise<'applied' | 'terminal-not-success' | 'unresolved'> {
+    if (!isPathSafeId(invocationId) || !isPathSafeId(leaseOwner))
+      throw new RemoteStepRefusal(400, 'remote step resume claim is malformed');
+    const stored = await this.#getRow(invocationId);
+    if (stored?.target_kind !== 'workflow')
+      throw new RemoteStepRefusal(404, 'invocation not found');
+    const invocation = decodeWorkflow(stored);
+    if (
+      invocation.status !== 'resuming' ||
+      stored.resume_lease_owner !== leaseOwner
+    )
+      throw new RemoteStepRefusal(409, 'remote step resume claim changed');
+    const retained = await this.#retainedResultFromRow(stored);
+    if (!retained)
+      throw new RemoteStepRefusal(503, 'remote step result is unreadable');
+    const start = await this.#execution(invocation, invocation.principal);
+    if (start.execution.startToken !== invocation.startToken)
+      throw new RemoteStepRefusal(409, 'remote step run generation changed');
+    const current = await this.#runtime.authoritativeStatus(
+      invocation.workflowId,
+      invocation.runId,
+    );
+    if (!current || current.runId !== invocation.runId)
+      throw new RemoteStepRefusal(503, 'remote step outcome is unreadable');
+    const key = invocation.stepPath.join('.');
+    const same =
+      current.status === 'suspended' &&
+      current.suspended?.some(
+        (path) => JSON.stringify(path) === JSON.stringify(invocation.stepPath),
+      ) &&
+      current.suspendedAt?.[key] === invocation.suspendedAt &&
+      current.resumeCount?.[key] === invocation.resumeCount;
+    if (same || JSON.stringify(witnessed) !== JSON.stringify(current))
+      return 'unresolved';
+    const outcome =
+      current.status === 'success' || current.status === 'suspended'
+        ? 'applied'
+        : [
+              'failed',
+              'tripwire',
+              'canceled',
+              'bailed',
+              'skipped',
+              'cancelled',
+              'timed_out',
+            ].includes(current.status)
+          ? 'terminal-not-success'
+          : 'unresolved';
+    if (outcome === 'unresolved') return outcome;
+    const result = await this.#db
+      .prepare(`UPDATE ${REMOTE_STEP_TABLE}
+        SET status = ?, resume_lease_owner = NULL, resume_lease_expires_at = NULL,
+          settled_at = ?, settlement_outcome = ?,
+          write_revision = write_revision + 1, write_generation = write_generation + 1
+        WHERE invocation_id = ? AND target_kind = 'workflow' AND operation_state IS NULL
+          AND status = 'resuming' AND resume_lease_owner = ?
+          AND deployment_id = ? AND table_prefix = ? AND workflow_id = ? AND run_id = ?
+          AND start_token = ? AND principal_json = ? AND permit_generation = ? AND permit_epoch IS ?
+          AND result_digest = ? AND write_revision = ? AND write_generation = ?
+        RETURNING invocation_id`)
+      .bind(
+        outcome === 'applied' ? 'settled' : 'failed',
+        this.#now(),
+        outcome,
+        invocationId,
+        leaseOwner,
+        invocation.deploymentId,
+        invocation.tablePrefix,
+        invocation.workflowId,
+        invocation.runId,
+        invocation.startToken,
+        JSON.stringify(invocation.principal),
+        invocation.permitGeneration,
+        invocation.permitEpoch ?? null,
+        retained.resultDigest,
+        stored.write_revision,
+        stored.write_generation,
+      )
+      .all();
+    if (!rowResult(result))
+      throw new RemoteStepRefusal(409, 'remote step resume claim changed');
+    return outcome;
   }
 
   async claimResume(invocationId: string, leaseMs: number): Promise<string> {

@@ -3696,7 +3696,7 @@ async function main() {
   );
 
   await step(
-    'RS3 private workflow route: trusted start, one permit winner, retained result and restart refusal',
+    'RS3 private workflow route: retained result resumes once after restart',
     async () => {
       await killServer(currentServer);
       await launchServer(
@@ -3836,6 +3836,138 @@ async function main() {
         resultReplay.status === 200 && resultReplay.body.kind === 'replay',
         'fresh process returns the retained result on replay',
         resultReplay,
+      );
+      const resumed = await http('POST', `${route}/resume`, {
+        headers: privateHeaders,
+        body: { invocationId },
+      });
+      assert(
+        resumed.status === 200 &&
+          resumed.body.kind === 'applied' &&
+          resumed.body.summary.status === 'success' &&
+          resumed.body.summary.result.query === 'x' &&
+          resumed.body.summary.result.answer === 1,
+        'fresh RunDO applies the retained result',
+        resumed,
+      );
+      assert(
+        (await executionCount('private-remote-continuation')) === 1,
+        'workflow continuation executed once',
+      );
+      await killServer(currentServer);
+      await launchServer(
+        'gen-private-remote-3',
+        stateDir,
+        join(tmpDir, 'gen-private-remote-3.log'),
+      );
+      const completedReplay = await http('POST', `${route}/resume`, {
+        headers: privateHeaders,
+        body: { invocationId },
+      });
+      assert(
+        completedReplay.status === 200 &&
+          completedReplay.body.kind === 'already-applied',
+        'settled continuation survives process restart',
+        completedReplay,
+      );
+      assert(
+        (await executionCount('private-remote-continuation')) === 1,
+        'settled callback never repeats the continuation',
+      );
+      const uncertainStart = await http('POST', '/runs', {
+        headers: AUTH.operator,
+        body: {
+          workflowId: 'spike-private-remote',
+          inputData: { query: 'uncertain' },
+        },
+      });
+      assert(
+        uncertainStart.status === 200 &&
+          uncertainStart.body.status === 'suspended',
+        'uncertain fixture starts a real workflow',
+        uncertainStart,
+      );
+      const uncertainRegistration = await http('POST', `${route}/register`, {
+        headers: privateHeaders,
+        body: {
+          workflowId: 'spike-private-remote',
+          runId: uncertainStart.body.runId,
+          hostDeadlineAt: Date.now() + 120_000,
+        },
+      });
+      assert(
+        uncertainRegistration.status === 200,
+        'uncertain fixture registers',
+        uncertainRegistration,
+      );
+      const uncertainId = uncertainRegistration.body.invocationId;
+      assert(
+        typeof uncertainId === 'string' && /^[a-f0-9-]{36}$/.test(uncertainId),
+        'uncertain fixture has a canonical UUID',
+        uncertainRegistration,
+      );
+      const uncertainTicket = await http('POST', `${route}/ticket`, {
+        headers: privateHeaders,
+        body: { invocationId: uncertainId, lifetimeMs: 60_000 },
+      });
+      const uncertainPermit = await http('POST', `${route}/consume`, {
+        headers: privateHeaders,
+        body: { permit: uncertainTicket.body.permit },
+      });
+      assert(
+        uncertainPermit.status === 200 &&
+          uncertainPermit.body.kind === 'accepted',
+        'uncertain fixture consumes its permit',
+        uncertainPermit,
+      );
+      const uncertainResult = await http('POST', `${route}/result`, {
+        headers: privateHeaders,
+        body: {
+          invocationId: uncertainId,
+          rawPermit: uncertainPermit.body.rawPermit,
+          resultJson: '{"answer":2}',
+          evidenceJson: '{"receipt":"complete"}',
+        },
+      });
+      assert(
+        uncertainResult.status === 200,
+        'uncertain fixture retains its result',
+        uncertainResult,
+      );
+      await executeLocalD1(
+        stateDir,
+        `UPDATE flowsafe_remote_step_invocations SET status = 'resuming', resume_lease_owner = 'spike-unresolved-claim', resume_lease_expires_at = 1, write_revision = write_revision + 1, write_generation = write_generation + 1 WHERE invocation_id = '${uncertainId}' AND status = 'result-retained';`,
+      );
+      await killServer(currentServer);
+      await launchServer(
+        'gen-private-remote-4',
+        stateDir,
+        join(tmpDir, 'gen-private-remote-4.log'),
+      );
+      const uncertainResume = await http('POST', `${route}/resume`, {
+        headers: privateHeaders,
+        body: { invocationId: uncertainId },
+      });
+      assert(
+        uncertainResume.status === 503,
+        'persisted ambiguous-claim fixture refuses continuation after restart',
+        uncertainResume,
+      );
+      assert(
+        (await executionCount('private-remote-continuation')) === 1,
+        'expired ambiguous claim does not execute',
+      );
+      const inventory = await http(
+        'GET',
+        '/admin/inventory?category=remote-steps',
+      );
+      assert(
+        inventory.status === 200 &&
+          inventory.body.entries.some(
+            (entry) => entry.key?.[0] === uncertainId,
+          ),
+        'ambiguous workflow remains drain inventory',
+        inventory,
       );
     },
   );

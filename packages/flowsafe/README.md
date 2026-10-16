@@ -377,6 +377,10 @@ With a configured fence, Runtime requires the actual D1 domain's positive initia
 
 Use `GET /admin/inventory` while the fence remains `draining`. A drain is proven only after every work category is empty across two complete sweeps at least 60 seconds apart. A pending agent-inbox notification scheduled for later, or carrying no due timestamp, is work and keeps the proof open. Readings are point-in-time observations rather than snapshots and can move in either direction while draining admits work. Empty results cannot over-count, and keyset pagination never skips a row that existed before the sweep began. If you need a hard guarantee, re-sweep once after transitioning to `migration-locked`: an empty post-lock sweep is conclusive; a non-empty one means work is still outstanding, either because it entered after the proof or because the lock parked it before it finished. Return to `draining` and repeat the proof. An inventory read taken under `migration-locked` measures what the fence parked rather than what the deployment would otherwise be doing. Schedules and signal subscriptions are standing configuration and need not empty. Persisted idle signals are deliberately unenumerable and carry into the replacement deployment.
 
+### Continue verified remote results
+
+Trusted hosts can [continue a retained workflow result](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/do-runner-design.md#continue-a-retained-workflow-result) through the owning RunDO. The opt-in private route admits the verified result once and preserves uncertain claims across restarts. It does not enable automatic engine replay.
+
 ### Runtime ids are opaque
 
 The host mints opaque, path-safe run and thread ids. `RunnerRuntime.start()` requires a host-owned run id and has no generation fallback. A run id is single-use: never start one again, even after retention removed its run. The id scopes the snapshot, Durable Object, approval lookup, stream address, and artifact path, but it carries no customer identity.

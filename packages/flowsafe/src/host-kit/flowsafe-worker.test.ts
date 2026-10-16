@@ -981,7 +981,9 @@ describe('createFlowsafeWorker fetch pipeline', () => {
       status: 'pending' as const,
       permitGeneration: 0,
     };
-    const getWorkflow = vi.fn(async () => invocation);
+    const getWorkflow = vi.fn<WorkflowRemoteStepDispatchReader['getWorkflow']>(
+      async () => invocation,
+    );
     const journal = {
       deploymentId: 'deployment-1',
       tablePrefix: '',
@@ -1145,6 +1147,52 @@ describe('createFlowsafeWorker fetch pipeline', () => {
       ctx,
     );
     expect(changed.status).toBe(409);
+    const resume = { invocationId: invocation.invocationId };
+    startRead.mockClear();
+    expect(
+      (await worker.fetch(request('resume', resume, token), env, ctx)).status,
+    ).toBe(404);
+    expect(startRead).not.toHaveBeenCalled();
+    getWorkflow.mockResolvedValue({
+      ...invocation,
+      status: 'settled',
+      settlementOutcome: 'applied',
+    });
+    startRead.mockImplementation(async () =>
+      Response.json({
+        kind: 'already-applied',
+        invocationId: invocation.invocationId,
+      }),
+    );
+    const settled = await worker.fetch(
+      request('resume', resume, token),
+      env,
+      ctx,
+    );
+    expect(settled.status).toBe(200);
+    expect(await settled.json()).toEqual({
+      kind: 'already-applied',
+      invocationId: invocation.invocationId,
+    });
+    expect(startRead).toHaveBeenCalledOnce();
+    startRead.mockClear();
+    getWorkflow.mockResolvedValue({ ...invocation, status: 'resuming' });
+    expect(
+      (await worker.fetch(request('resume', resume, token), env, ctx)).status,
+    ).toBe(404);
+    expect(startRead).not.toHaveBeenCalled();
+    getWorkflow.mockResolvedValue({
+      ...invocation,
+      status: 'settled',
+      settlementOutcome: 'applied',
+    });
+    await approvalStoreFactoryFor(env.DB)
+      .resources()
+      .claim('run', invocation.runId, { kind: 'human', id: 'foreign-owner' });
+    expect(
+      (await worker.fetch(request('resume', resume, token), env, ctx)).status,
+    ).toBe(404);
+    expect(startRead).not.toHaveBeenCalled();
   });
 
   it('binds a pre-route context to the stored invocation principal', async () => {

@@ -158,6 +158,7 @@ import {
   RemoteStepJournal,
   type RemoteStepPermit,
   WORKFLOW_REMOTE_STEP_MARKER,
+  WORKFLOW_REMOTE_STEP_RESULT_KEY,
 } from '../src/do-runner/remote-step-journal.js';
 import {
   createObjectiveRouter,
@@ -875,21 +876,41 @@ function defineWorkflows(env: Env): RunnerRuntime {
   createWorkflow({
     id: 'spike-private-remote',
     inputSchema: z.object({ query: z.string() }),
-    outputSchema: z.object({ query: z.string() }),
+    outputSchema: z.object({ query: z.string(), answer: z.number() }),
   })
     .then(
       createStep({
         id: 'execute',
         inputSchema: z.object({ query: z.string() }),
-        outputSchema: z.object({ query: z.string() }),
-        execute: async ({ inputData, suspend }) =>
-          suspend({
-            type: 'suspension',
-            remoteStep: {
-              marker: WORKFLOW_REMOTE_STEP_MARKER,
-              request: { version: 2, input: { query: inputData.query } },
-            },
+        outputSchema: z.object({ query: z.string(), answer: z.number() }),
+        resumeSchema: z.object({
+          [WORKFLOW_REMOTE_STEP_RESULT_KEY]: z.object({
+            version: z.literal(1),
+            invocationId: z.string(),
+            requestDigest: z.string(),
+            resultJson: z.string(),
+            resultDigest: z.string(),
           }),
+        }),
+        execute: async ({ inputData, resumeData, suspend }) => {
+          if (!resumeData)
+            return suspend({
+              type: 'suspension',
+              remoteStep: {
+                marker: WORKFLOW_REMOTE_STEP_MARKER,
+                request: { version: 2, input: { query: inputData.query } },
+              },
+            });
+          const result = z
+            .object({ answer: z.number() })
+            .parse(
+              JSON.parse(
+                resumeData[WORKFLOW_REMOTE_STEP_RESULT_KEY].resultJson,
+              ),
+            );
+          await countExecution(env.DB, 'private-remote-continuation');
+          return { query: inputData.query, answer: result.answer };
+        },
       }),
     )
     .commit();
@@ -1179,6 +1200,21 @@ export class DemoRunner extends DurableObjectRunner<Env> {
 
   protected build(env: Env): RunnerRuntime {
     return defineWorkflows(env);
+  }
+
+  protected async workflowRemoteSteps(env: Env, runtime: RunnerRuntime) {
+    const journal = new RemoteStepJournal({
+      db: env.DB as unknown as never,
+      fence: executionFenceForEnv(env),
+      runtime,
+      deploymentId: env.DEPLOYMENT_TENANT,
+      tablePrefix: '',
+      allowedToolIds: ['remote_lookup'],
+      verifyCompletion: async () => undefined,
+      verifyWorkflowCompletion: async () => undefined,
+    });
+    await journal.initialize();
+    return journal;
   }
 
   protected runOwnership(env: Env) {

@@ -83,6 +83,7 @@ import {
 import { bearerActorAuthenticator } from './bearer-auth.js';
 import {
   createDoRunTopology,
+  type DoRunRemoteStepTopology,
   type DoRunTopology,
   type RunnerNamespaceLike,
 } from './do-run-topology.js';
@@ -432,7 +433,7 @@ export interface FlowsafeWorkerConfig<Env extends FlowsafeWorkerEnv>
     ctx: FlowsafeWorkerContext,
     kit: {
       resolve: ActorResolver;
-      topology: DoRunTopology;
+      topology: DoRunRemoteStepTopology;
       authorizePrivateWorkflowDispatch: (
         request: Request,
       ) => Promise<Response | undefined>;

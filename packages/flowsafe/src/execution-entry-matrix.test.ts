@@ -1364,6 +1364,12 @@ const GATE_SITES: ReadonlyArray<GateSite & { drivenBy: string }> = [
     drivenBy: 'run object POST /:workflow/:run/resume',
   },
   {
+    file: 'do-runner/durable-object.ts',
+    predicate: 'admitsExistingRun',
+    delegate: 'assertExistingRunAllowed',
+    drivenBy: 'do-runner/durable-object.test.ts',
+  },
+  {
     file: 'do-runner/fenced-workflows-d1.ts',
     predicate: 'admitsRunStart',
     sql: 'initial-snapshot-insert',
