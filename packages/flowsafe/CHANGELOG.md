@@ -1,5 +1,13 @@
 # @proofoftech/flowsafe
 
+## 0.30.0
+
+This release also includes the remote-step APIs prepared for 0.29.0, which was not published to npm.
+
+### Minor Changes
+
+- d1c04c0: Add opt-in workflow remote-result continuation through the owning Durable Object and authenticated private route. Bind the retained result to its stored principal, start, suspension and fence; refuse forged ordinary resumes and replay of uncertain claims. Return an already-applied receipt after completed continuation, including after terminal ownership cleanup.
+
 ## 0.29.0
 
 ### Minor Changes
