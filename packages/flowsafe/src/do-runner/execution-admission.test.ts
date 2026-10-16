@@ -71,6 +71,21 @@ describe('execution identity and epoch helpers', () => {
         .tablePrefix,
     ).toBe('a'.repeat(39));
     expect(normalizeStartIdentity(START)).toEqual(START);
+    expect(
+      normalizeStartIdentity({
+        ...START,
+        target: { ...START.target, resourceId: 'account-7' },
+      }),
+    ).toEqual({
+      ...START,
+      target: { ...START.target, resourceId: 'account-7' },
+    });
+    expect(() =>
+      normalizeStartIdentity({
+        ...START,
+        target: { ...START.target, resourceId: 'bad/resource' },
+      }),
+    ).toThrow(InvalidExecutionIdentityError);
     const workflow = {
       owner: START.owner,
       target: { kind: 'workflow', id: 'logical-parent' },

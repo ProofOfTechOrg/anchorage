@@ -74,7 +74,11 @@ export {
   resumeRunWithRequeue,
 } from './approval-bridge.js';
 export { bearerActorAuthenticator, parseActorTokens } from './bearer-auth.js';
-export { type DoResponseLike, doSummary } from './do-response.js';
+export {
+  type DoResponseLike,
+  doSummary,
+  type StartPrincipalReceipt,
+} from './do-response.js';
 export {
   createDoRunTopology,
   type DoRunLifecycleTopology,
@@ -108,6 +112,7 @@ export {
   createFlowsafeMaintenanceDurableObject,
   createFlowsafeRunnerLifecycle,
   createFlowsafeWorker,
+  ensureRemoteStepNotificationRecoveryDuty,
   MAINTENANCE_INSTANCE_NAME,
 } from './flowsafe-worker.js';
 // hostAuditSink stays module-internal for the same reason as
@@ -174,15 +179,21 @@ export type {
 export { createRunRouter } from './run-router.js';
 export type {
   StateEgressBinding,
+  StateEgressCommonContext,
+  StateEgressCommonEnv,
   StateEgressContext,
   StateEgressEnv,
 } from './state-egress.js';
 export {
   createStateEgressFetch,
+  STATE_EGRESS_ACTIVATION_KIND_HEADER,
+  STATE_EGRESS_ACTIVATION_VERSION_HEADER,
   STATE_EGRESS_CREDENTIAL_HEADER,
+  STATE_EGRESS_DISPATCH_KEY_HEADER,
   STATE_EGRESS_ENVIRONMENT_HEADER,
   STATE_EGRESS_HEADERS,
   STATE_EGRESS_POLICY_ID_HEADER,
+  STATE_EGRESS_PRIVATE_HEADERS,
   STATE_EGRESS_RESERVED_HEADERS,
   STATE_EGRESS_RESOURCE_GROUP_HEADER,
   STATE_EGRESS_ROUTE_HOSTNAME_HEADER,

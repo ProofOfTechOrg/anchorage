@@ -4,6 +4,7 @@ Documents in this directory are design records. Read each document's status befo
 
 - [Breakwater improvement roadmap](breakwater-improvement-roadmap.md): mixed shipped and planned work
 - [Durable result gate](durable-result-gate.md): proposal; not implemented
+- [Remote step broker](flowsafe-remote-step-broker.md): implementation plan; not implemented
 - [Mature package adoption plan](mature-package-adoption-plan.md): implemented and verified
 - [Model gateway policy](model-gateway-policy.md): partially implemented; provider, budget, model-egress, structured-output, and scoring gates remain planned
 

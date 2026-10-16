@@ -305,6 +305,15 @@ Decommission the whole physical resource set after revoking traffic and credenti
 
 When `init()` or `createD1Storage()` receives `tablePrefix`, pass the same value as `storageTablePrefix` to `createFlowsafeWorker()`. The shared rule accepts an empty prefix or requires an ASCII letter or underscore first, followed by ASCII letters, numbers, or underscores. The prefix can contain at most 39 characters so every final Mastra table identifier stays within its 63-character limit. Maintenance applies it to workflow snapshots, threads/messages, background tasks and their snapshots, notifications, thread state, and schedule-trigger history. All six exported low-level purge functions validate the same contract before preparing D1 statements. Approval, resource-owner, deployment-sentinel, subscription, and other fixed-schema tables remain unprefixed. A valid but mismatched value targets a different table family; Flowsafe does not auto-discover it.
 
+Host-owned notification effects register one receipt-writing table prefix and one receipt limit in the deployment's D1 database. The default limit is 100,000 retained receipts; a deployment can set a lower limit. Existing receipts remain available for replay at the limit. Ordinary notification storage can still use other prefixes, but those prefixes cannot write operation receipts in the same deployment.
+
+To upgrade a deployment with retained operation receipts:
+
+1. Lock its execution fence and wait for earlier receipt writers to finish. Keep every Worker and Durable Object that can write the D1 database under exclusive deployment control.
+2. Inspect the D1 tables ending in `flowsafe_notification_operation_receipts`. If more than one prefix has retained rows, leave the fence locked and resolve the histories before enabling effects. Do not delete receipts to meet the limit.
+3. Deploy the version that registers receipt scope to every writer of that D1 database. Set one prefix and one limit across those writers. Check the active versions before unlocking. An older writer can bypass the registration, so do not run mixed versions with the fence open.
+4. Unlock the fence. The first new receipt operation registers the prefix and limit; later writes with a different value fail closed. Check the `flowsafe_notification_receipt_scope` row after the first operation. Fence the deployment again before any rollback to an older writer.
+
 Idle-thread retention does not release thread or resource ownership. A thread can still have an agent binding, schedule, subscription, goal, or other standing wake source after its idle memory rows expire. An explicit host teardown must remove every authoritative standing record before it calls `ActorContext.releaseResource()` for the thread and resource claims.
 
 ## Egress and process execution

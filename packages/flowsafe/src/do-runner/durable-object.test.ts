@@ -637,6 +637,328 @@ async function requireSecondMutationEpoch(
 }
 
 describe('workflow ingress capture', () => {
+  const principalPath = 'http://do/runs/gated/c-run/start-principal';
+  const receiptKey = 'flowsafe:start-principal:v1';
+
+  function namedReader(fixture: ReturnType<typeof workflowIngressFixture>) {
+    const state = {
+      ...fixture.journal.state,
+      id: { name: 'gated:c-run' },
+    } as DurableObjectState;
+    return new TestRunner(state, fixture.env);
+  }
+
+  it('returns the verified full principal from the named run after D1 admission', async () => {
+    const fixture = workflowIngressFixture();
+    const principal: ExecutionPrincipal = {
+      kind: 'agent',
+      id: 'agent-1',
+      purpose: 'customer dispatch',
+      delegatedBy: 'owner-1',
+    };
+    expect(
+      (
+        await fixture.runner.fetch(
+          post('/runs', WORKFLOW_START_BODY, principal),
+        )
+      ).status,
+    ).toBe(200);
+    const response = await namedReader(fixture).fetch(
+      deploymentIdentityRequest(principalPath),
+    );
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual(
+      JSON.parse(fixture.journal.values.get(receiptKey) as string),
+    );
+  });
+
+  it('refuses an unnamed or wrongly named object without reading the receipt', async () => {
+    const fixture = workflowIngressFixture();
+    expect(
+      (await fixture.runner.fetch(post('/runs', WORKFLOW_START_BODY))).status,
+    ).toBe(200);
+    const read = vi.spyOn(fixture.journal.storage, 'get');
+    for (const state of [
+      fixture.journal.state,
+      { ...fixture.journal.state, id: { name: 'gated:other' } },
+    ]) {
+      const response = await new TestRunner(
+        state as DurableObjectState,
+        fixture.env,
+      ).fetch(deploymentIdentityRequest(principalPath));
+      expect(response.status).toBe(404);
+      expect(await response.json()).toEqual({ error: 'run not found' });
+    }
+    expect(read).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['missing', undefined],
+    ['malformed JSON', '{'],
+    ['unknown version', JSON.stringify({ version: 2 })],
+  ])('refuses a %s receipt without disclosing a principal', async (_case, raw) => {
+    const fixture = workflowIngressFixture();
+    if (raw !== undefined) fixture.journal.values.set(receiptKey, raw);
+    const response = await namedReader(fixture).fetch(
+      deploymentIdentityRequest(principalPath),
+    );
+    expect(response.status).toBe(404);
+    expect(await response.json()).toEqual({ error: 'run not found' });
+  });
+
+  it.each([
+    [
+      'extra field',
+      (receipt: Record<string, unknown>) => ({ ...receipt, extra: true }),
+    ],
+    [
+      'changed principal',
+      (receipt: Record<string, unknown>) => ({
+        ...receipt,
+        principal: REPLACEMENT_PRINCIPAL,
+      }),
+    ],
+    [
+      'changed owner',
+      (receipt: Record<string, unknown>) => ({
+        ...receipt,
+        owner: { kind: 'human', id: 'other' },
+      }),
+    ],
+    [
+      'changed generation',
+      (receipt: Record<string, unknown>) => ({
+        ...receipt,
+        execution: { ...(receipt.execution as object), startToken: 'other' },
+      }),
+    ],
+  ])('refuses a receipt with %s', async (_case, change) => {
+    const fixture = workflowIngressFixture();
+    expect(
+      (await fixture.runner.fetch(post('/runs', WORKFLOW_START_BODY))).status,
+    ).toBe(200);
+    const original = JSON.parse(
+      fixture.journal.values.get(receiptKey) as string,
+    );
+    fixture.journal.values.set(receiptKey, JSON.stringify(change(original)));
+    const response = await namedReader(fixture).fetch(
+      deploymentIdentityRequest(principalPath),
+    );
+    expect(response.status).toBe(404);
+    expect(await response.json()).toEqual({ error: 'run not found' });
+  });
+
+  it('refuses unreadable D1 state and wrong workflow provenance', async () => {
+    const fixture = workflowIngressFixture();
+    expect(
+      (await fixture.runner.fetch(post('/runs', WORKFLOW_START_BODY))).status,
+    ).toBe(200);
+    const state = await fixture.runtime.authoritativeStartState(
+      'gated',
+      'c-run',
+    );
+    if (!state) throw new Error('missing admitted workflow');
+    const read = vi.spyOn(fixture.runtime, 'authoritativeStartState');
+    for (const result of [
+      null,
+      {
+        ...state,
+        execution: { ...state.execution, startToken: 'other-generation' },
+      },
+      {
+        ...state,
+        provenance: { ...state.provenance, startToken: 'other-generation' },
+      },
+      {
+        ...state,
+        provenance: {
+          ...state.provenance,
+          startIdentity: {
+            owner: { kind: 'human', id: 'other-owner' },
+            target: { kind: 'workflow', id: 'gated' },
+          },
+        },
+      },
+      {
+        ...state,
+        provenance: {
+          ...state.provenance,
+          startIdentity: {
+            owner: { kind: 'human', id: 'owner-1' },
+            target: { kind: 'agent', id: 'gated', threadId: 'thread-1' },
+          },
+        },
+      },
+    ]) {
+      read.mockResolvedValueOnce(result as typeof state);
+      const response = await namedReader(fixture).fetch(
+        deploymentIdentityRequest(principalPath),
+      );
+      expect(response.status).toBe(404);
+      expect(await response.json()).toEqual({ error: 'run not found' });
+    }
+    read.mockRejectedValueOnce(new Error('D1 unavailable'));
+    const response = await namedReader(fixture).fetch(
+      deploymentIdentityRequest(principalPath),
+    );
+    expect(response.status).toBe(404);
+    expect(await response.json()).toEqual({ error: 'run not found' });
+  });
+
+  it.each([
+    'unfenced',
+    'legacy',
+  ])('refuses a %s authoritative read beside a valid receipt', async (storage) => {
+    const fixture = workflowIngressFixture();
+    expect(
+      (await fixture.runner.fetch(post('/runs', WORKFLOW_START_BODY))).status,
+    ).toBe(200);
+    const state = await fixture.runtime.authoritativeStartState(
+      'gated',
+      'c-run',
+    );
+    if (!state) throw new Error('missing admitted workflow');
+    vi.spyOn(fixture.runtime, 'authoritativeStartState').mockResolvedValueOnce({
+      ...state,
+      storage,
+    } as typeof state);
+    const response = await namedReader(fixture).fetch(
+      deploymentIdentityRequest(principalPath),
+    );
+    expect(response.status).toBe(404);
+    expect(await response.json()).toEqual({ error: 'run not found' });
+  });
+
+  it('persists the trusted principal and prepared identity for a direct start', async () => {
+    const fixture = workflowIngressFixture();
+    const principal: ExecutionPrincipal = {
+      kind: 'agent',
+      id: 'agent-1',
+      purpose: 'customer dispatch',
+      delegatedBy: 'owner-1',
+    };
+    const response = await fixture.runner.fetch(
+      post('/runs', WORKFLOW_START_BODY, principal),
+    );
+    expect(response.status).toBe(200);
+    const stored = fixture.journal.values.get('flowsafe:start-principal:v1');
+    expect(typeof stored).toBe('string');
+    const authoritative = await fixture.runtime.authoritativeStartState(
+      'gated',
+      'c-run',
+    );
+    if (!authoritative || authoritative.kind === 'initial')
+      throw new Error('missing persisted start identity');
+    expect(JSON.parse(stored as string)).toEqual({
+      version: 1,
+      execution: {
+        tablePrefix: '',
+        workflowId: 'gated',
+        runId: 'c-run',
+        startToken: authoritative.execution.startToken,
+      },
+      owner: { kind: 'agent', id: 'agent-1' },
+      principal,
+    });
+  });
+
+  it('does not record a start whose D1 admission fails', async () => {
+    const fixture = workflowIngressFixture(true);
+    await fixture.storage.init();
+    const workflows = (await fixture.storage.getStore(
+      'workflows',
+    )) as FencedWorkflowsStorageD1;
+    const native = workflows[FENCED_WORKFLOW_STORAGE];
+    if (!native) throw new Error('missing managed owned workflow capability');
+    Object.defineProperty(workflows, FENCED_WORKFLOW_STORAGE, {
+      value: {
+        ...native,
+        withInitialAdmission: () => {
+          throw new Error('admission failed');
+        },
+      } satisfies FencedWorkflowAdmissionCapability,
+      configurable: true,
+    });
+    const response = await fixture.runner.fetch(
+      post('/runs', WORKFLOW_START_BODY),
+    );
+    expect(response.status).not.toBe(200);
+    expect(
+      await workflows.loadWorkflowSnapshot({
+        workflowName: 'gated',
+        runId: 'c-run',
+      }),
+    ).toBeNull();
+    expect(fixture.journal.values.has('flowsafe:start-principal:v1')).toBe(
+      false,
+    );
+  });
+
+  it.each([
+    'not-json',
+    JSON.stringify({ version: 2 }),
+    JSON.stringify({ version: 1, principal: REPLACEMENT_PRINCIPAL }),
+  ])('keeps a conflicting start receipt unchanged (%s)', async (existing) => {
+    const fixture = workflowIngressFixture();
+    fixture.journal.values.set('flowsafe:start-principal:v1', existing);
+    const response = await fixture.runner.fetch(
+      post('/runs', WORKFLOW_START_BODY),
+    );
+    expect(response.status).toBe(200);
+    expect(fixture.journal.values.get('flowsafe:start-principal:v1')).toBe(
+      existing,
+    );
+  });
+
+  it('keeps a committed start receipt when its write acknowledgment is lost', async () => {
+    const fixture = workflowIngressFixture();
+    const nativePut = fixture.journal.storage.put.bind(fixture.journal.storage);
+    vi.spyOn(fixture.journal.storage, 'put').mockImplementation(
+      async (key, value) => {
+        await nativePut(key, value);
+        if (key === 'flowsafe:start-principal:v1')
+          throw new Error('write acknowledgment lost');
+      },
+    );
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const response = await fixture.runner.fetch(
+        post('/runs', WORKFLOW_START_BODY),
+      );
+      expect(response.status).toBe(200);
+      expect(
+        JSON.parse(
+          fixture.journal.values.get('flowsafe:start-principal:v1') as string,
+        ),
+      ).toMatchObject({
+        version: 1,
+        owner: { kind: 'human', id: 'owner-1' },
+        principal: OWNER_PRINCIPAL,
+      });
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
+  it('starts normally when the principal receipt cannot be stored', async () => {
+    const fixture = workflowIngressFixture();
+    const nativePut = fixture.journal.storage.put.bind(fixture.journal.storage);
+    vi.spyOn(fixture.journal.storage, 'put').mockImplementation(
+      async (key, value) => {
+        if (key === 'flowsafe:start-principal:v1')
+          throw new Error('receipt storage unavailable');
+        await nativePut(key, value);
+      },
+    );
+    const response = await fixture.runner.fetch(
+      post('/runs', WORKFLOW_START_BODY),
+    );
+    expect(response.status).toBe(200);
+    expect(fixture.journal.values.has('flowsafe:start-principal:v1')).toBe(
+      false,
+    );
+  });
+
   it('starts a queued run after its sender disconnects', async () => {
     const fixture = workflowIngressFixture();
     const hold = await holdWorkflowFifo(fixture);
@@ -861,6 +1183,9 @@ describe('workflow ingress capture', () => {
     }
     const response = await pending;
     expect(response.status).toBe(200);
+    expect(fixture.journal.values.has('flowsafe:start-principal:v1')).toBe(
+      !scheduled,
+    );
     expect(fixture.start).toHaveBeenCalledOnce();
     expect(fixture.start.mock.calls[0]?.[0]).toBe('gated');
     const options = fixture.start.mock.calls[0]?.[1];

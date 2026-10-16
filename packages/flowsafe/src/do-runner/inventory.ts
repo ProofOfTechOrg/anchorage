@@ -71,6 +71,11 @@ import {
   notificationTimestampMillis,
 } from './notification-predicate.js';
 import {
+  REMOTE_STEP_NOTIFICATION_CURSOR_TABLE,
+  REMOTE_STEP_SCHEMA_TABLE,
+  REMOTE_STEP_TABLE,
+} from './remote-step-journal.js';
+import {
   START_IDEMPOTENCY_TABLE,
   START_RESERVATION_STATES,
 } from './start-idempotency.js';
@@ -122,6 +127,7 @@ export type InventoryCategoryClass = 'work' | 'standing';
  */
 export const INVENTORY_CATEGORIES = [
   'runs',
+  'remote-steps',
   'approvals-waiting',
   'schedule-deferred-dispatches',
   'pending-notifications',
@@ -291,6 +297,25 @@ export interface FlowsafeTableEntry {
  */
 export const FLOWSAFE_TABLES: readonly FlowsafeTableEntry[] = [
   {
+    table: REMOTE_STEP_NOTIFICATION_CURSOR_TABLE,
+    purpose: 'position of the scheduled notification operation recovery scan',
+    accounting: {
+      excluded: 'the invocation journal holds the work this cursor revisits',
+    },
+  },
+  {
+    table: REMOTE_STEP_SCHEMA_TABLE,
+    purpose: 'remote invocation journal schema version',
+    accounting: {
+      excluded: 'schema metadata contains no run or external dispatch work',
+    },
+  },
+  {
+    table: REMOTE_STEP_TABLE,
+    purpose: 'durable remote tool invocations and their dispatch permits',
+    accounting: { category: 'remote-steps' },
+  },
+  {
     table: APPROVALS_TABLE,
     purpose: 'the durable approval queue — one record per suspended decision',
     accounting: { category: 'approvals-waiting' },
@@ -318,6 +343,23 @@ export const FLOWSAFE_TABLES: readonly FlowsafeTableEntry[] = [
     accounting: {
       excluded:
         'a single counter row, not a unit of work. The notifications it orders are inventoried under pending-notifications; the counter itself has nothing to finish and is re-derivable from the inbox.',
+    },
+  },
+  {
+    table: 'flowsafe_notification_operation_receipts',
+    purpose: 'immutable receipts for host-owned inbox notification effects',
+    accounting: {
+      excluded:
+        'a receipt records an effect already committed with its inbox row; replay must retain it after the inbox row is settled or removed, so it is historical evidence rather than active work',
+    },
+  },
+  {
+    table: 'flowsafe_notification_receipt_scope',
+    purpose:
+      'the deployment receipt prefix and retained receipt admission limit',
+    accounting: {
+      excluded:
+        'the singleton configures receipt admission and contains no active notification effect',
     },
   },
   {
@@ -478,6 +520,13 @@ export const INVENTORY_CATEGORY_DESCRIPTORS: readonly InventoryCategoryDescripto
       table: SNAPSHOT_TABLE,
       holds:
         'a workflow or agent run that has not reached a terminal state (cancelled and timed_out count as live until their lifecycle cleanup completes)',
+    },
+    {
+      category: 'remote-steps',
+      class: 'work',
+      table: REMOTE_STEP_TABLE,
+      holds:
+        'a remote invocation without a recorded result or an external dispatch not confirmed stopped',
     },
     {
       category: 'approvals-waiting',
@@ -861,7 +910,10 @@ export class DeploymentInventory {
         `unknown inventory category '${String(category)}'`,
       );
     }
-    const query = this.#queryFor(category);
+    const query =
+      category === 'remote-steps'
+        ? await this.#remoteStepQuery()
+        : this.#queryFor(category);
     const table = this.#tableFor(descriptor);
     const cursor = parseCursor(options.cursor, category, query.key.length);
     const limit = clampLimit(options.limit);
@@ -925,6 +977,31 @@ export class DeploymentInventory {
     return descriptor.table.startsWith('mastra_')
       ? `${this.#prefix}${descriptor.table}`
       : descriptor.table;
+  }
+
+  async #remoteStepQuery(): Promise<CategoryQuery> {
+    const base = this.#queryFor('remote-steps');
+    const { results } = await this.#db
+      .prepare('SELECT name FROM pragma_table_xinfo(?)')
+      .bind(REMOTE_STEP_TABLE)
+      .all<{ name: unknown }>();
+    const columns = new Set(results.map((row) => row.name));
+    if (!columns.has('operation_state')) return base;
+    if (!columns.has('resume_admitted_at'))
+      throw new Error('remote step inventory schema is unreadable');
+    return {
+      ...base,
+      detail: [
+        ...base.detail,
+        'operation_state',
+        'resume_admitted_at',
+        'settlement_outcome',
+      ],
+      where: `((${base.where}) OR
+        (operation_state IN ('resume-admitted', 'unresolved')
+          AND status IN ('failed', 'settled')
+          AND settlement_outcome IS NOT 'applied'))`,
+    };
   }
 
   async #page(
@@ -1004,6 +1081,23 @@ export class DeploymentInventory {
                     ELSE 1 END`,
           binds: RUN_TERMINAL_STATUSES,
           annotate: annotateRunOwners,
+        };
+      case 'remote-steps':
+        return {
+          key: ['invocation_id'],
+          detail: [
+            'workflow_id',
+            'run_id',
+            'agent_id',
+            'thread_id',
+            'status',
+            'deadline_at',
+            'permit_generation',
+            'permit_consumed_at',
+          ],
+          where:
+            "status NOT IN ('failed', 'settled') OR settlement_outcome IN ('advanced-without-proof', 'deadline-expired') OR (status = 'settled' AND (settlement_outcome IS NOT 'applied' OR result_json IS NULL OR result_digest IS NULL OR executor_quiescent_at IS NULL)) OR (permit_consumed_at IS NOT NULL AND executor_quiescent_at IS NULL)",
+          binds: [],
         };
       case 'approvals-waiting':
         // OPEN_STATUSES, not just 'pending': a claimed or escalated approval is

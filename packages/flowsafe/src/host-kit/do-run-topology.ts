@@ -25,14 +25,18 @@ import {
   type RunSummary,
   stampMutationEpoch,
 } from '../do-runner/index.js';
+import { isPathSafeId } from '../do-runner/path-safe-id.js';
 import type { PersistedStartResult } from '../do-runner/start-idempotency.js';
 import { captureReservation } from '../do-runner/start-reservation-contract.js';
 import {
   type DoResponseLike,
   doPersistedStart,
   doStartLiveness,
+  doStartPrincipal,
   doSummary,
+  type StartPrincipalReceipt,
 } from './do-response.js';
+import { RunRouteError } from './run-route-error.js';
 import type { RunStartInput } from './run-router.js';
 
 /** The subset of a DurableObjectStub the topology uses. */
@@ -91,6 +95,11 @@ export interface DoRunTopology {
 
 /** Additive run-lifecycle operations returned by createDoRunTopology. */
 export interface DoRunLifecycleTopology extends DoRunTopology {
+  /** Reads the authenticated run object's stored start authority. */
+  startPrincipal(
+    workflowId: string,
+    runId: string,
+  ): Promise<StartPrincipalReceipt | undefined>;
   terminate(
     workflowId: string,
     runId: string,
@@ -146,6 +155,17 @@ export function createDoRunTopology<Id>(
     );
 
   return {
+    startPrincipal: async (workflowId, runId) => {
+      if (!isPathSafeId(workflowId) || !isPathSafeId(runId)) {
+        throw new RunRouteError(400, 'invalid run identity');
+      }
+      const response = await stub(workflowId, runId).fetch(
+        `http://do/runs/${workflowId}/${runId}/start-principal`,
+        { headers: deploymentIdentityHeaders(deploymentIdentitySecret) },
+      );
+      if (response.status === 404) return undefined;
+      return doStartPrincipal(response, { workflowId, runId });
+    },
     start: async ({
       workflowId,
       runId,

@@ -183,6 +183,7 @@ export interface DurableObjectRunLifecycleHooks {
 }
 
 const RUN_OWNER_RECOVERY_KEY = 'flowsafe:run-owner-recovery:v1';
+const START_PRINCIPAL_RECEIPT_KEY = 'flowsafe:start-principal:v1';
 export const RUN_OWNER_RECOVERY_DELAY_MS = 60_000;
 const SUSPENSION_DEADLINE_RETRY_MS = 60_000;
 // How long a run's state may stay unreadable before the entries due under it
@@ -334,6 +335,12 @@ function sameRunRecovery(
         claim.updatedAt === wantedClaim.updatedAt &&
         claim.binding.kind === wantedClaim.binding.kind)
   );
+}
+
+function preparedRunExecution(
+  recovery: RunOwnerRecovery,
+): RunExecutionIdentity | undefined {
+  return recovery.phase === 'preparing' ? undefined : recovery.execution;
 }
 
 interface StartBody {
@@ -1007,6 +1014,115 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
         throw error;
     }
     return prepared;
+  }
+
+  async #recordStartPrincipal(
+    execution: RunExecutionIdentity,
+    owner: DurableObjectRunOwner,
+    principal: ExecutionPrincipal,
+  ): Promise<void> {
+    const storage = this.state?.storage;
+    if (!storage) return;
+    const receipt = JSON.stringify({
+      version: 1,
+      execution: normalizeRunExecutionIdentity(execution),
+      owner,
+      principal,
+    });
+    try {
+      const existing = await storage.get<unknown>(START_PRINCIPAL_RECEIPT_KEY);
+      if (existing !== undefined && existing !== receipt) {
+        console.error('start principal receipt conflicts with prepared start');
+        return;
+      }
+      if (existing === undefined) {
+        try {
+          await storage.put(START_PRINCIPAL_RECEIPT_KEY, receipt);
+        } catch {
+          // A lost acknowledgment is resolved by the read below.
+        }
+      }
+      if ((await storage.get(START_PRINCIPAL_RECEIPT_KEY)) !== receipt)
+        console.error('start principal receipt could not be verified');
+    } catch (error) {
+      console.error('start principal receipt could not be verified', error);
+    }
+  }
+
+  async #startPrincipalReceipt(
+    workflowId: string,
+    runId: string,
+  ): Promise<Response> {
+    const unavailable = () => json({ error: 'run not found' }, 404);
+    const storage = this.state?.storage;
+    if (!storage || this.state?.id?.name !== `${workflowId}:${runId}`)
+      return unavailable();
+    try {
+      const raw = await storage.get<unknown>(START_PRINCIPAL_RECEIPT_KEY);
+      if (typeof raw !== 'string') return unavailable();
+      const parsed: unknown = JSON.parse(raw);
+      if (
+        parsed === null ||
+        typeof parsed !== 'object' ||
+        Array.isArray(parsed)
+      )
+        return unavailable();
+      const receipt = parsed as Record<string, unknown>;
+      if (
+        receipt.version !== 1 ||
+        receipt.owner === null ||
+        typeof receipt.owner !== 'object' ||
+        Array.isArray(receipt.owner) ||
+        receipt.principal === null ||
+        typeof receipt.principal !== 'object' ||
+        Array.isArray(receipt.principal)
+      )
+        return unavailable();
+      const execution = normalizeD1RunExecutionIdentity(receipt.execution);
+      const owner = receipt.owner as Record<string, unknown>;
+      const principal = decodeExecutionPrincipal(
+        JSON.stringify(receipt.principal),
+      );
+      if (
+        !isExecutionPrincipalKind(owner.kind) ||
+        !isExecutionPrincipalId(owner.id) ||
+        !principal ||
+        execution.workflowId !== workflowId ||
+        execution.runId !== runId ||
+        owner.kind !== principal.kind ||
+        owner.id !== principal.id
+      )
+        return unavailable();
+      const canonical = {
+        version: 1,
+        execution,
+        owner: { kind: owner.kind, id: owner.id },
+        principal,
+      };
+      if (JSON.stringify(canonical) !== raw) return unavailable();
+      const state = await this.#ensureRuntime().authoritativeStartState(
+        workflowId,
+        runId,
+      );
+      const identity = state?.provenance.startIdentity;
+      if (
+        state?.storage !== 'd1' ||
+        state.execution.tablePrefix !== execution.tablePrefix ||
+        state.execution.workflowId !== execution.workflowId ||
+        state.execution.runId !== execution.runId ||
+        state.execution.startToken !== execution.startToken ||
+        state.provenance.startToken !== execution.startToken ||
+        identity?.target.kind !== 'workflow' ||
+        identity.target.id !== workflowId ||
+        identity.owner.kind !== owner.kind ||
+        identity.owner.id !== owner.id ||
+        state.provenance.agentStart !== undefined
+      )
+        return unavailable();
+      return json(canonical);
+    } catch {
+      return unavailable();
+    }
   }
 
   #matchingRunState(
@@ -2590,6 +2706,13 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
             frame.unwound = true;
           }
           summary = await this.#finishRunOwner(recovery, summary);
+          const preparedExecution = preparedRunExecution(recovery);
+          if (scheduleId === undefined && preparedExecution)
+            await this.#recordStartPrincipal(
+              preparedExecution,
+              owner,
+              principal,
+            );
           this.#broadcastRunSummary(summary);
           return json(
             await this.#withSuspensionTimers(startWorkflowId, summary),
@@ -2638,6 +2761,17 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
     ) {
       this.#assertRunIdentity(workflowId, runId);
       return json({ live: this.#isStartLive(workflowId, runId) });
+    }
+    if (
+      request.method === 'GET' &&
+      segments.length === 4 &&
+      action === 'start-principal' &&
+      workflowId &&
+      runId
+    ) {
+      if (!isPathSafeId(workflowId) || !isPathSafeId(runId))
+        return json({ error: 'run not found' }, 404);
+      return this.#startPrincipalReceipt(workflowId, runId);
     }
     if (
       request.method === 'GET' &&

@@ -1,0 +1,50 @@
+{
+  "$schema": "https://unpkg.com/wrangler/config-schema.json",
+  "name": "anchorage-flowsafe-remote-step-staging",
+  "main": "./notification-staging.worker.ts",
+  "minify": true,
+  "compatibility_date": "2026-09-10",
+  "compatibility_flags": ["nodejs_compat"],
+  "alias": {
+    "@proofoftech/breakwater/agent": "../../breakwater/src/agent/index.ts",
+    "cloudflare": "./notification-staging-no-rest.ts"
+  },
+  "workers_dev": false,
+  "version_metadata": { "binding": "CF_VERSION_METADATA" },
+  "secrets": {
+    "required": [
+      "DEPLOYMENT_IDENTITY_SECRET",
+      "MAINTENANCE_ADMIN_SECRET",
+      "STAGING_PROBE_SECRET"
+    ]
+  },
+  "durable_objects": {
+    "bindings": [
+      { "name": "RUNNER", "class_name": "NotificationStagingRunner" },
+      { "name": "THREAD", "class_name": "NotificationStagingThread" },
+      { "name": "MAINTENANCE", "class_name": "NotificationStagingMaintenance" }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "notification-staging-v1",
+      "new_sqlite_classes": [
+        "NotificationStagingRunner",
+        "NotificationStagingThread",
+        "NotificationStagingMaintenance"
+      ]
+    }
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "anchorage-flowsafe-remote-step-staging-db",
+      "database_id": "b863a219-2096-4e13-92fe-4db592b67944"
+    }
+  ],
+  "vars": {
+    "DEPLOYMENT_TENANT": "flowsafenotificationstaging",
+    "STAGING_MUTATION_EPOCH": "0",
+    "NOTIFICATION_PROOF_ENABLED": "false"
+  }
+}

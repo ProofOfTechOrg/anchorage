@@ -726,3 +726,111 @@ describe('protected replay workflow transport', () => {
     );
   });
 });
+
+describe('private start-principal receipt transport', () => {
+  const receipt = {
+    version: 1,
+    execution: {
+      tablePrefix: 'tenant_',
+      workflowId: 'workflow-1',
+      runId: 'run-1',
+      startToken: 'generation-1',
+    },
+    owner: { kind: 'agent', id: 'agent-1' },
+    principal: {
+      kind: 'agent',
+      id: 'agent-1',
+      purpose: 'customer.dispatch',
+      delegatedBy: 'operator-1',
+    },
+  };
+
+  function topologyFor(payload: unknown, status = 200) {
+    const fetch = vi.fn(
+      async (
+        _url: string,
+        _init?: Parameters<
+          ReturnType<RunnerNamespaceLike<string>['get']>['fetch']
+        >[1],
+      ) => Response.json(payload, { status }),
+    );
+    const idFromName = vi.fn((name: string) => name);
+    return {
+      fetch,
+      idFromName,
+      topology: createDoRunTopology(
+        { idFromName, get: () => ({ fetch }) },
+        DEPLOYMENT_IDENTITY_SECRET,
+      ),
+    };
+  }
+
+  it('reads the exact run receipt over the authenticated private DO route', async () => {
+    const { topology, fetch, idFromName } = topologyFor(receipt);
+    await expect(
+      topology.startPrincipal('workflow-1', 'run-1'),
+    ).resolves.toEqual(receipt);
+    expect(idFromName).toHaveBeenCalledWith('workflow-1:run-1');
+    expect(fetch).toHaveBeenCalledWith(
+      'http://do/runs/workflow-1/run-1/start-principal',
+      expect.objectContaining({ headers: expect.any(Object) }),
+    );
+    const headers = new Headers(fetch.mock.calls[0]?.[1]?.headers);
+    expect(headers.get('x-flowsafe-deployment-identity')).toBe(
+      DEPLOYMENT_IDENTITY_SECRET,
+    );
+    expect(headers.has(EXECUTION_PRINCIPAL_HEADER)).toBe(false);
+  });
+
+  it('treats a missing receipt as absence and refuses path-unsafe selectors locally', async () => {
+    await expect(
+      topologyFor({ error: 'run not found' }, 404).topology.startPrincipal(
+        'workflow-1',
+        'run-1',
+      ),
+    ).resolves.toBeUndefined();
+    const { topology, fetch, idFromName } = topologyFor(receipt);
+    await expect(
+      topology.startPrincipal('workflow/1', 'run-1'),
+    ).rejects.toMatchObject({
+      status: 400,
+    });
+    expect(idFromName).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [
+      'foreign run',
+      { ...receipt, execution: { ...receipt.execution, runId: 'other' } },
+    ],
+    [
+      'foreign workflow',
+      { ...receipt, execution: { ...receipt.execution, workflowId: 'other' } },
+    ],
+    ['owner mismatch', { ...receipt, owner: { kind: 'agent', id: 'other' } }],
+    ['unknown version', { ...receipt, version: 2 }],
+    [
+      'noncanonical prefix',
+      {
+        ...receipt,
+        execution: { ...receipt.execution, tablePrefix: 'TENANT_' },
+      },
+    ],
+    [
+      'unknown authority field',
+      { ...receipt, callerPrincipal: receipt.principal },
+    ],
+    [
+      'malformed principal',
+      { ...receipt, principal: { ...receipt.principal, purpose: '' } },
+    ],
+  ])('refuses a %s private receipt', async (_label, payload) => {
+    await expect(
+      topologyFor(payload).topology.startPrincipal('workflow-1', 'run-1'),
+    ).rejects.toMatchObject({
+      status: 503,
+      message: 'run start principal is not readable',
+    });
+  });
+});

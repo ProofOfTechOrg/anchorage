@@ -156,6 +156,7 @@ function fakeRuntime(
     workflowIds,
     start,
     resume,
+    authoritativeStatus: async () => null,
     ...(overrides.pubsub !== undefined ? { pubsub: overrides.pubsub } : {}),
   } as unknown as RunnerRuntime;
   return {
@@ -642,8 +643,222 @@ async function realAgentBridgeFixture(
       : {}),
   });
   const start = vi.spyOn(runtime, 'start');
-  return { sql, fence, workflows, counts, runtime, agent, start };
+  return { sql, binding, fence, workflows, counts, runtime, agent, start };
 }
+
+describe('durable tool suspension after host restart', () => {
+  it.each([
+    ['object', { key: 'account-7' }],
+    ['scalar', 'account-7'],
+    ['array', ['account-7']],
+  ])('restores a %s tool payload and applies the result to the suspended call', async (_shape, suspendedPayload) => {
+    const runId = 'remote-tool-resume';
+    const toolId = 'remote_lookup';
+    const received: unknown[] = [];
+    const tool = createTool({
+      id: toolId,
+      description: 'Wait for a remote lookup result',
+      inputSchema: z.object({ key: z.string() }),
+      suspendSchema: z.unknown(),
+      resumeSchema: z.object({ value: z.string() }),
+      execute: async ({ key }, context) => {
+        const result = context?.agent?.resumeData;
+        if (result) {
+          received.push({
+            key,
+            result,
+            payload: context.agent?.suspendPayload,
+          });
+          return { value: result.value };
+        }
+        if (!context?.agent?.suspend)
+          throw new Error('tool suspension unavailable');
+        await context.agent.suspend(suspendedPayload);
+      },
+    });
+    const text = localModelFixture(() => undefined);
+    const textStream = (
+      text as unknown as {
+        doStream: (options: { abortSignal?: AbortSignal }) => Promise<unknown>;
+      }
+    ).doStream;
+    let modelCalls = 0;
+    const model = {
+      ...(text as object),
+      doStream: async (options: Parameters<typeof textStream>[0]) => {
+        modelCalls++;
+        if (modelCalls > 2) return textStream(options);
+        return {
+          stream: new ReadableStream({
+            start(controller) {
+              controller.enqueue({ type: 'stream-start', warnings: [] });
+              controller.enqueue({
+                type: 'tool-call',
+                toolCallId: `remote-call-${modelCalls}`,
+                toolName: toolId,
+                input: JSON.stringify({ key: 'account-7' }),
+              });
+              controller.enqueue({
+                type: 'finish',
+                finishReason: 'tool-calls',
+                usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+              });
+              controller.close();
+            },
+          }),
+        };
+      },
+    } as unknown as MastraModelConfig;
+    const first = await realAgentBridgeFixture(
+      undefined,
+      undefined,
+      false,
+      undefined,
+      { model, tools: { [toolId]: tool } },
+    );
+    let output:
+      | Awaited<ReturnType<typeof first.agent.streamUntilPersisted>>
+      | undefined;
+    try {
+      output = await first.agent.streamUntilPersisted(
+        'Look up account-7.',
+        { runId, maxSteps: 3, disableBackgroundTasks: true },
+        'operator-1',
+        'human',
+        `${runId}-attempt`,
+        undefined,
+        undefined,
+        startAuthority(),
+      );
+      const workflowId = first.agent.getWorkflow().id;
+      const suspended = await first.runtime.authoritativeStatus(
+        workflowId,
+        runId,
+      );
+      expect(suspended).toMatchObject({ status: 'suspended' });
+      const step = suspended?.suspended?.[0];
+      if (!step) throw new Error('tool did not suspend');
+      const stepKey = step.join('.');
+      expect(
+        (suspended?.suspendPayload as Record<string, unknown> | undefined)?.[
+          stepKey
+        ],
+      ).toMatchObject({
+        type: 'suspension',
+        toolCallId: 'remote-call-1',
+        toolCallSuspended: suspendedPayload,
+      });
+      expect(received).toEqual([]);
+
+      output.cleanup();
+      registryFor(first.agent).clear();
+      globalRunRegistry.delete(runId);
+      const storage = createD1Storage({ binding: first.binding });
+      await storage.init();
+      const { runtime } = init(
+        { storage },
+        {
+          executionFence: first.fence,
+          startIdempotency: 'none',
+          pubsub: createHostPubSub(),
+        },
+      );
+      const restored = createFlowsafeDurableAgent({
+        agent: new Agent({
+          id: 'writer',
+          name: 'Writer',
+          instructions: 'Return done.',
+          model,
+          tools: { [toolId]: tool },
+        }),
+        runtime,
+        cache: false,
+        maxSteps: 1,
+      });
+      const suspendedAt = suspended.suspendedAt?.[stepKey];
+      if (typeof suspendedAt !== 'number') {
+        throw new Error('tool suspension has no timestamp');
+      }
+      const firstResume = {
+        runId,
+        requestedBy: 'operator-1',
+        step,
+        expectedSuspension: {
+          suspendedAt,
+          ...(suspended.resumeCount?.[stepKey] === undefined
+            ? {}
+            : { resumeCount: suspended.resumeCount[stepKey] }),
+        },
+      };
+      await expect(
+        restored.resumeViaRuntime({
+          ...firstResume,
+          resumeData: { value: 7 },
+        }),
+      ).rejects.toThrow();
+      expect(received).toEqual([]);
+      expect(
+        await runtime.authoritativeStatus(workflowId, runId),
+      ).toMatchObject({
+        status: 'suspended',
+      });
+      const resumed = await restored.resumeViaRuntime({
+        ...firstResume,
+        resumeData: { value: 'found' },
+      });
+      expect(resumed.status).toBe('suspended');
+      const nextStep = resumed.suspended?.[0];
+      if (!nextStep) throw new Error('second tool call did not suspend');
+      const nextKey = nextStep.join('.');
+      expect(
+        (resumed.suspendPayload as Record<string, unknown> | undefined)?.[
+          nextKey
+        ],
+      ).toMatchObject({
+        type: 'suspension',
+        toolCallId: 'remote-call-2',
+        toolCallSuspended: suspendedPayload,
+      });
+      const nextTimestamp = resumed.suspendedAt?.[nextKey];
+      if (typeof nextTimestamp !== 'number') {
+        throw new Error('second tool suspension has no timestamp');
+      }
+      const settled = await restored.resumeViaRuntime({
+        runId,
+        requestedBy: 'operator-1',
+        step: nextStep,
+        resumeData: { value: 'again' },
+        expectedSuspension: {
+          suspendedAt: nextTimestamp,
+          ...(resumed.resumeCount?.[nextKey] === undefined
+            ? {}
+            : { resumeCount: resumed.resumeCount[nextKey] }),
+        },
+      });
+      expect(settled.status).toBe('success');
+      expect(received).toEqual([
+        {
+          key: 'account-7',
+          result: { value: 'found' },
+          payload: suspendedPayload,
+        },
+        {
+          key: 'account-7',
+          result: { value: 'again' },
+          payload: suspendedPayload,
+        },
+      ]);
+      registryFor(restored).clear();
+      globalRunRegistry.delete(runId);
+    } finally {
+      output?.cleanup();
+      registryFor(first.agent).clear();
+      globalRunRegistry.delete(runId);
+      first.start.mockRestore();
+      first.sql.close();
+    }
+  });
+});
 
 const OUTCOME_MARKER = 'MKCLIENTOUTCOME';
 const CLEAN_OUTCOME = 'clean client result';
@@ -3741,6 +3956,32 @@ describe('FlowsafeDurableAgent thread runtime registration and rehydration', () 
       agent.getPubSub(),
     );
     expect(agent.getPubSub()).toBe(pubsub);
+  });
+
+  it('passes an explicit automated requester kind to the runtime resume', async () => {
+    const { runtime, resume } = fakeRuntime();
+    const agent = createFlowsafeDurableAgent({ agent: testAgent(), runtime });
+    await agent.resumeViaRuntime({
+      runId: 'run-1',
+      requestedBy: 'service-1',
+      requestedByKind: 'service',
+    });
+    expect(resume).toHaveBeenCalledWith(
+      expect.anything(),
+      'run-1',
+      expect.objectContaining({
+        requestedBy: 'service-1',
+        requestedByKind: 'service',
+      }),
+    );
+    await expect(
+      agent.resumeViaRuntime({
+        runId: 'run-2',
+        requestedBy: 'service-1',
+        requestedByKind: 'forged' as never,
+      }),
+    ).rejects.toBeInstanceOf(InvalidRunRequestError);
+    expect(resume).toHaveBeenCalledTimes(1);
   });
 
   it('resumes observation after retained earlier events on the observer bus', async () => {

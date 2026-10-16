@@ -10,6 +10,14 @@ export {
   ReservedExecutionContextError,
   stripReservedExecutionContext,
 } from '../do-runner/index.js';
+export type {
+  RecordedRemoteStepResult,
+  RemoteStepInvocation,
+  RemoteStepNotificationOperation,
+  RemoteStepPermit,
+  WorkflowRemoteStepAddress,
+  WorkflowRemoteStepInvocation,
+} from '../do-runner/remote-step-journal.js';
 export {
   type AgentApprovalResumer,
   type AgentApprovalResumerOptions,
@@ -50,6 +58,12 @@ export {
   type AgentThreadTopology,
   type AgentThreadTopologyOptions,
   createAgentThreadTopology,
+  createRemoteStepNotificationRecoveryTick,
+  type RemoteStepContinuationReader,
+  type RemoteStepDispatchReader,
+  type RemoteStepDispatchTicket,
+  type WorkflowRemoteStepDispatchReader,
+  type WorkflowRemoteStepDispatchTicket,
 } from './thread-topology.js';
 export {
   AGENT_AUDIT_CONTEXT_KEY,
@@ -70,3 +84,8 @@ export type {
   TrustedAgentExecution,
 } from './types.js';
 export { isPermissionIdentifier } from './types.js';
+export type { WorkflowDispatchPort } from './workflow-remote-step-route.js';
+export {
+  createWorkflowRemoteStepPreRoute,
+  WORKFLOW_REMOTE_STEP_ROUTE,
+} from './workflow-remote-step-route.js';

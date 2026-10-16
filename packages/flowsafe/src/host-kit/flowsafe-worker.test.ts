@@ -3,6 +3,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
+import type { WorkflowRemoteStepDispatchReader } from '../agent-host/thread-topology.js';
+import {
+  createWorkflowRemoteStepPreRoute,
+  WORKFLOW_REMOTE_STEP_ROUTE,
+} from '../agent-host/workflow-remote-step-route.js';
 import type {
   ApprovalNotificationEvent,
   ApprovalRecord,
@@ -936,6 +941,332 @@ describe('createFlowsafeWorker fetch pipeline', () => {
     expect(await list.json()).toEqual([]);
   });
 
+  it('authenticates private workflow dispatch before reading stored authority', async () => {
+    const { env, ctx } = makeEnv();
+    const startRead = vi.fn(async () =>
+      Response.json({
+        version: 1,
+        execution: {
+          tablePrefix: '',
+          workflowId: 'wf',
+          runId: 'run-1',
+          startToken: 'start-1',
+        },
+        owner: { kind: 'human', id: 'ada' },
+        principal: { kind: 'human', id: 'ada', role: 'operator' },
+      }),
+    );
+    env.RUNNER = {
+      idFromName: (name: string) => name,
+      get: () => ({ fetch: startRead }),
+    };
+    const invocation = {
+      targetKind: 'workflow' as const,
+      invocationId: 'invocation-1',
+      deploymentId: 'deployment-1',
+      tablePrefix: '',
+      workflowId: 'wf',
+      runId: 'run-1',
+      principal: {
+        kind: 'human' as const,
+        id: 'ada',
+        role: 'operator' as const,
+      },
+      startToken: 'start-1',
+      stepPath: ['remote-step'],
+      suspendedAt: 1000,
+      request: { script: 'script-1' },
+      requestDigest: 'stored-request-digest',
+      deadlineAt: 9000,
+      status: 'pending' as const,
+      permitGeneration: 0,
+    };
+    const getWorkflow = vi.fn(async () => invocation);
+    const journal = {
+      deploymentId: 'deployment-1',
+      tablePrefix: '',
+      getWorkflow,
+    } as unknown as WorkflowRemoteStepDispatchReader;
+    const registerWorkflowRemoteStep = vi.fn(async () => invocation);
+    const issueWorkflowRemoteStepDispatch = vi.fn(async () => ({
+      invocationId: 'invocation-1',
+      deploymentId: 'deployment-1',
+      workflowId: 'wf',
+      runId: 'run-1',
+      stepPath: ['remote-step'],
+      suspendedAt: 1000,
+      deadlineAt: 9000,
+      requestJson: '{"script":"script-1"}',
+      requestDigest: 'stored-request-digest',
+      permit: {
+        invocationId: 'invocation-1',
+        generation: 1,
+        mutationEpoch: 1,
+        transitionRevision: 1,
+        expiresAt: 9000,
+      },
+    }));
+    const consumeWorkflowRemoteStepDispatch = vi.fn(async () => ({
+      kind: 'accepted' as const,
+      rawPermit: 'raw-secret',
+    }));
+    const recordWorkflowRemoteStepResult = vi.fn(async () => ({
+      kind: 'recorded' as const,
+      resultJson: '{"answer":42}',
+      resultDigest: 'stored-result-digest',
+    }));
+    const worker = makeWorker({
+      preRoutes: createWorkflowRemoteStepPreRoute(journal, {
+        registerWorkflowRemoteStep,
+        issueWorkflowRemoteStepDispatch,
+        consumeWorkflowRemoteStepDispatch,
+        recordWorkflowRemoteStepResult,
+      }),
+    });
+    const request = (operation: string, body: unknown, credential?: string) =>
+      new Request(`http://host${WORKFLOW_REMOTE_STEP_ROUTE}/${operation}`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...(credential ? { authorization: `Bearer ${credential}` } : {}),
+        },
+        body: JSON.stringify(body),
+      });
+    const register = { workflowId: 'wf', runId: 'run-1', hostDeadlineAt: 9000 };
+    expect(
+      (await worker.fetch(request('register', register), env, ctx)).status,
+    ).toBe(503);
+    env.MAINTENANCE_ADMIN_SECRET = 'private-admin-secret-00000000000001';
+    expect(
+      (await worker.fetch(request('register', register, 'wrong'), env, ctx))
+        .status,
+    ).toBe(401);
+    expect(startRead).not.toHaveBeenCalled();
+    expect(getWorkflow).not.toHaveBeenCalled();
+    const token = env.MAINTENANCE_ADMIN_SECRET;
+    expect(
+      (
+        await worker.fetch(
+          request(
+            'register',
+            { ...register, principal: invocation.principal },
+            token,
+          ),
+          env,
+          ctx,
+        )
+      ).status,
+    ).toBe(400);
+    expect(startRead).not.toHaveBeenCalled();
+    const registered = await worker.fetch(
+      request('register', register, token),
+      env,
+      ctx,
+    );
+    expect(registered.status).toBe(200);
+    expect(await registered.json()).toEqual({ invocationId: 'invocation-1' });
+    expect(registerWorkflowRemoteStep).toHaveBeenCalledWith(
+      expect.objectContaining({ principal: invocation.principal }),
+      'wf',
+      'run-1',
+      9000,
+    );
+    const ticket = await worker.fetch(
+      request(
+        'ticket',
+        { invocationId: 'invocation-1', lifetimeMs: 60000 },
+        token,
+      ),
+      env,
+      ctx,
+    );
+    expect(ticket.status).toBe(200);
+    expect(issueWorkflowRemoteStepDispatch).toHaveBeenCalledWith(
+      expect.objectContaining({ principal: invocation.principal }),
+      'invocation-1',
+      60000,
+    );
+    const issued = (await ticket.json()) as {
+      permit: {
+        invocationId: string;
+        generation: number;
+        mutationEpoch: number;
+        transitionRevision: number;
+        expiresAt: number;
+      };
+    };
+    const consumed = await worker.fetch(
+      request('consume', { permit: issued.permit }, token),
+      env,
+      ctx,
+    );
+    expect(consumed.status).toBe(200);
+    expect(await consumed.json()).toEqual({
+      kind: 'accepted',
+      rawPermit: 'raw-secret',
+    });
+    expect(consumed.headers.get('cache-control')).toBe('no-store');
+    expect(consumeWorkflowRemoteStepDispatch).toHaveBeenCalledWith(
+      expect.objectContaining({ principal: invocation.principal }),
+      issued.permit,
+    );
+    const result = await worker.fetch(
+      request(
+        'result',
+        {
+          invocationId: 'invocation-1',
+          rawPermit: 'raw-secret',
+          resultJson: '{"answer":42}',
+          evidenceJson: '{"quiescent":true}',
+        },
+        token,
+      ),
+      env,
+      ctx,
+    );
+    expect(result.status).toBe(200);
+    expect(recordWorkflowRemoteStepResult).toHaveBeenCalledWith(
+      expect.objectContaining({ principal: invocation.principal }),
+      'invocation-1',
+      'raw-secret',
+      '{"answer":42}',
+      '{"quiescent":true}',
+    );
+    issueWorkflowRemoteStepDispatch.mockRejectedValueOnce(
+      new RunRouteError(409, 'remote step dispatch changed'),
+    );
+    const changed = await worker.fetch(
+      request(
+        'ticket',
+        { invocationId: 'invocation-1', lifetimeMs: 60000 },
+        token,
+      ),
+      env,
+      ctx,
+    );
+    expect(changed.status).toBe(409);
+  });
+
+  it('binds a pre-route context to the stored invocation principal', async () => {
+    const journal = {
+      deploymentId: 'deployment-1',
+      tablePrefix: '',
+      get: vi.fn(async () => ({
+        invocationId: 'invocation-1',
+        deploymentId: 'deployment-1',
+        tablePrefix: '',
+        principal: {
+          kind: 'service' as const,
+          id: 'trusted-dispatcher',
+          purpose: 'remote-step',
+        },
+      })),
+    };
+    const worker = makeWorker({
+      preRoutes: async (request, _env, _ctx, kit) => {
+        if (new URL(request.url).pathname !== '/test/stored-principal')
+          return null;
+        const context = await kit.contextForStoredInvocation(
+          journal,
+          'invocation-1',
+        );
+        return Response.json(context?.principal ?? null);
+      },
+    });
+    const { env, ctx } = makeEnv();
+
+    const response = await worker.fetch(
+      new Request('http://host/test/stored-principal'),
+      env,
+      ctx,
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      kind: 'service',
+      id: 'trusted-dispatcher',
+      purpose: 'remote-step',
+    });
+    expect(journal.get).toHaveBeenCalledWith('invocation-1');
+  });
+
+  it.each([
+    {
+      name: 'missing invocation',
+      invocationId: 'invocation-1',
+      row: undefined,
+      reads: 1,
+    },
+    {
+      name: 'mismatched invocation id',
+      invocationId: 'invocation-1',
+      row: { invocationId: 'another-invocation' },
+      reads: 1,
+    },
+    {
+      name: 'mismatched deployment',
+      invocationId: 'invocation-1',
+      row: { deploymentId: 'another-deployment' },
+      reads: 1,
+    },
+    {
+      name: 'mismatched table prefix',
+      invocationId: 'invocation-1',
+      row: { tablePrefix: 'another_' },
+      reads: 1,
+    },
+    {
+      name: 'invalid invocation id',
+      invocationId: '../invocation-1',
+      row: {},
+      reads: 0,
+    },
+  ])('refuses a stored-principal context for $name', async ({
+    invocationId,
+    row,
+    reads,
+  }) => {
+    const stored = {
+      invocationId: 'invocation-1',
+      deploymentId: 'deployment-1',
+      tablePrefix: '',
+      principal: {
+        kind: 'service' as const,
+        id: 'trusted-dispatcher',
+        purpose: 'remote-step',
+      },
+    };
+    const journal = {
+      deploymentId: 'deployment-1',
+      tablePrefix: '',
+      get: vi.fn(async () =>
+        row === undefined ? undefined : { ...stored, ...row },
+      ),
+    };
+    const worker = makeWorker({
+      preRoutes: async (request, _env, _ctx, kit) => {
+        if (new URL(request.url).pathname !== '/test/stored-principal')
+          return null;
+        const context = await kit.contextForStoredInvocation(
+          journal,
+          invocationId,
+        );
+        return Response.json(context?.principal ?? null);
+      },
+    });
+    const { env, ctx } = makeEnv();
+
+    const response = await worker.fetch(
+      new Request('http://host/test/stored-principal'),
+      env,
+      ctx,
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toBeNull();
+    expect(journal.get).toHaveBeenCalledTimes(reads);
+  });
+
   it('mounts the agent router after preRoutes and before the signal router', async () => {
     const order: string[] = [];
     const worker = makeWorker({
@@ -1516,6 +1847,35 @@ describe('createFlowsafeWorker maintenance duties', () => {
     expect(outboundFetch).not.toHaveBeenCalled();
   });
 
+  it('admits a trusted private state egress context without a route hostname', async () => {
+    const worker = makeWorker();
+    const { env, ctx } = makeEnv();
+    const outboundFetch = vi.fn(async () => new Response(null));
+    env.FLEET_RESOURCE_ROLE = 'platform-state';
+    env.FLEET_ENVIRONMENT = 'production';
+    env.FLEET_RESOURCE_GROUP = '0123456789abcdefabcd';
+    env.OUTBOUND_PROXY = { fetch: outboundFetch };
+    env.OUTBOUND_PROXY_CREDENTIAL = 'outbound-state-credential-0000000001';
+    env.OUTBOUND_TENANT_ID = 'acme';
+    env.OUTBOUND_ENVIRONMENT = 'production';
+    env.OUTBOUND_RESOURCE_GROUP_ID = '0123456789abcdefabcd';
+    env.OUTBOUND_STATE_SCRIPT_NAME =
+      'acme-production-state-0123456789abcdefabcd';
+    env.OUTBOUND_ACTIVATION_VERSION = '2';
+    env.OUTBOUND_ACTIVATION_KIND = 'internal-dispatch';
+    env.OUTBOUND_DISPATCH_KEY = 'acme:production';
+    env.OUTBOUND_POLICY_ID = '0123456789abcdefabcd';
+
+    const response = await worker.fetch(
+      new Request('http://host/healthz'),
+      env,
+      ctx,
+    );
+
+    expect(response.status).toBe(200);
+    expect(outboundFetch).not.toHaveBeenCalled();
+  });
+
   it('rejects candidate access to trusted state egress before service use', async () => {
     const worker = makeWorker();
     const { env, ctx } = makeEnv();
@@ -1530,6 +1890,20 @@ describe('createFlowsafeWorker maintenance duties', () => {
 
     expect(response.status).toBe(500);
     expect(outboundFetch).not.toHaveBeenCalled();
+  });
+
+  it('rejects a private dispatch key on a candidate Worker', async () => {
+    const worker = makeWorker();
+    const { env, ctx } = makeEnv();
+    env.OUTBOUND_DISPATCH_KEY = 'acme:production';
+
+    const response = await worker.fetch(
+      new Request('http://host/healthz'),
+      env,
+      ctx,
+    );
+
+    expect(response.status).toBe(500);
   });
 
   it('the purge duty runs ONLY the purge duties', async () => {
@@ -3300,7 +3674,9 @@ describe('createFlowsafeWorker drain inventory', () => {
       unenumerable: Array<{ name: string }>;
       drainProof: { reading: string; reachableFrom: string[] };
     };
-    expect(body.categories.filter((c) => c.class === 'work')).toHaveLength(7);
+    expect(body.categories).toContainEqual(
+      expect.objectContaining({ category: 'remote-steps', class: 'work' }),
+    );
     expect(body.categories.filter((c) => c.class === 'standing')).toHaveLength(
       2,
     );

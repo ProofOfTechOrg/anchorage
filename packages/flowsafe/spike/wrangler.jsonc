@@ -16,6 +16,7 @@
       { "name": "HUB", "class_name": "DemoHub" },
       { "name": "THREAD", "class_name": "DemoThread" },
       { "name": "BACKGROUND_TASKS", "class_name": "DemoBackgroundTasks" },
+      { "name": "MAINTENANCE", "class_name": "DemoPrivateMaintenance" },
       {
         "name": "SIGNAL_PROVIDER_HOST",
         "class_name": "DemoSignalProviderHost"
@@ -29,7 +30,8 @@
     { "tag": "v2", "new_sqlite_classes": ["DemoHub"] },
     { "tag": "v3", "new_sqlite_classes": ["DemoThread"] },
     { "tag": "v4", "new_sqlite_classes": ["DemoSignalProviderHost"] },
-    { "tag": "v5", "new_sqlite_classes": ["DemoBackgroundTasks"] }
+    { "tag": "v5", "new_sqlite_classes": ["DemoBackgroundTasks"] },
+    { "tag": "v6", "new_sqlite_classes": ["DemoPrivateMaintenance"] }
   ],
   "d1_databases": [
     {
@@ -46,6 +48,7 @@
   "vars": {
     "DEPLOYMENT_TENANT": "spike",
     "DEPLOYMENT_IDENTITY_SECRET": "spike-local-deployment-identity-secret",
+    "MAINTENANCE_ADMIN_SECRET": "spike-local-private-admin-secret-2026",
     "STREAM_TICKET_SECRET": "spike-local-stream-secret-do-not-deploy",
     // Track E: the github webhook signing secret. spike-verify.mjs re-passes it
     // via `--var` and signs its webhook probes with it (byte-equal). Never a real

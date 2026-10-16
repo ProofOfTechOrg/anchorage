@@ -15,10 +15,14 @@ import {
   APPROVAL_ROLES,
   createActorResolver,
   createApprovalRouter,
+  createPrincipalActorContext,
   createResourceOwnershipSchema,
+  DECIDER_ROLES,
   RESOURCE_OWNERSHIP_TABLE,
+  selfDecisionExempts,
   trustAutomationPrincipal,
 } from '../approval-api/index.js';
+import type { ExecutionPrincipal } from '../approval-api/principal.js';
 import {
   type AuditProxyNamespaceLike,
   type AuditQueue,
@@ -68,6 +72,7 @@ import {
   verifyDurableObjectDeploymentIdentity,
   verifyDurableObjectDeploymentRequest,
 } from '../do-runner/index.js';
+import { isPathSafeId } from '../do-runner/path-safe-id.js';
 import { validateTablePrefix } from '../do-runner/table-prefix.js';
 import { readBoundedBody } from '../http-body.js';
 import {
@@ -124,6 +129,39 @@ export interface FlowsafeWorkerContext {
 /** Fixed instance name used by every deployment maintenance namespace. */
 export const MAINTENANCE_INSTANCE_NAME = 'deployment-maintenance';
 
+export async function ensureRemoteStepNotificationRecoveryDuty(
+  env: FlowsafeWorkerEnv,
+): Promise<void> {
+  const id = env.MAINTENANCE.idFromName(MAINTENANCE_INSTANCE_NAME);
+  const response = await env.MAINTENANCE.get(id).fetch(
+    'http://maintenance/ensure',
+    {
+      method: 'POST',
+      headers: deploymentIdentityHeaders(env.DEPLOYMENT_IDENTITY_SECRET),
+    },
+  );
+  if (!response.ok)
+    throw new Error('remote step notification recovery duty is unavailable');
+  let value: unknown;
+  try {
+    value = await response.json();
+  } catch {
+    throw new Error('remote step notification recovery duty is unreadable');
+  }
+  const health =
+    value !== null && typeof value === 'object'
+      ? (value as Record<string, unknown>)
+      : undefined;
+  const next = validTime(health?.nextRemoteStepRecoveryAt);
+  const alarmAt = validTime(health?.alarmAt);
+  if (
+    next === undefined ||
+    alarmAt === undefined ||
+    alarmAt > Math.max(Date.now(), next)
+  )
+    throw new Error('remote step notification recovery duty is not armed');
+}
+
 export interface MaintenanceStubLike {
   fetch(
     url: string,
@@ -142,20 +180,24 @@ export interface MaintenanceHealth {
   nextPurgeAt: number;
   nextTickAt?: number;
   nextNotificationAt?: number;
+  nextRemoteStepRecoveryAt?: number;
   lastSweepAt?: number;
   lastPurgeAt?: number;
   lastTickAt?: number;
   lastNotificationAt?: number;
+  lastRemoteStepRecoveryAt?: number;
   lastDeadlineAt?: number;
   lastSweepAttemptAt?: number;
   lastPurgeAttemptAt?: number;
   lastTickAttemptAt?: number;
   lastNotificationAttemptAt?: number;
+  lastRemoteStepRecoveryAttemptAt?: number;
   lastDeadlineAttemptAt?: number;
   lastSweepError?: string;
   lastPurgeError?: string;
   lastTickError?: string;
   lastNotificationError?: string;
+  lastRemoteStepRecoveryError?: string;
   lastDeadlineError?: string;
 }
 
@@ -301,6 +343,9 @@ export interface FlowsafeWorkerEnv {
   OUTBOUND_RESOURCE_GROUP_ID?: string;
   OUTBOUND_STATE_SCRIPT_NAME?: string;
   OUTBOUND_ROUTE_HOSTNAME?: string;
+  OUTBOUND_ACTIVATION_VERSION?: string;
+  OUTBOUND_ACTIVATION_KIND?: string;
+  OUTBOUND_DISPATCH_KEY?: string;
   OUTBOUND_POLICY_ID?: string;
   /** Dedicated control-plane credential for maintenance administration. */
   MAINTENANCE_ADMIN_SECRET?: string;
@@ -361,13 +406,15 @@ export interface FlowsafeWorkerConfig<Env extends FlowsafeWorkerEnv>
    * Recurrence intervals for the singleton maintenance Durable Object. Every
    * duty receives its own alarm invocation; `tickIntervalMs` is required when
    * `scheduleTick` is configured and omitted otherwise, and
-   * `notificationIntervalMs` likewise with `notificationTick`.
+   * `notificationIntervalMs` likewise with `notificationTick`, and
+   * `remoteStepRecoveryIntervalMs` with `remoteStepRecoveryTick`.
    */
   maintenance: {
     sweepIntervalMs: number;
     purgeIntervalMs: number;
     tickIntervalMs?: number;
     notificationIntervalMs?: number;
+    remoteStepRecoveryIntervalMs?: number;
     /** Deadline duty cadence. Defaults to sweepIntervalMs. */
     deadlineIntervalMs?: number;
     /** Maximum runs per deadline pass. Default 100. */
@@ -383,7 +430,49 @@ export interface FlowsafeWorkerConfig<Env extends FlowsafeWorkerEnv>
     request: Request,
     env: Env,
     ctx: FlowsafeWorkerContext,
-    kit: { resolve: ActorResolver; topology: DoRunTopology },
+    kit: {
+      resolve: ActorResolver;
+      topology: DoRunTopology;
+      authorizePrivateWorkflowDispatch: (
+        request: Request,
+      ) => Promise<Response | undefined>;
+      contextForStoredWorkflowStart: (
+        workflowId: string,
+        runId: string,
+      ) => Promise<ActorContext | undefined>;
+      contextForStoredWorkflowInvocation: (
+        journal: {
+          deploymentId: string;
+          tablePrefix: string;
+          getWorkflow: (invocationId: string) => Promise<
+            | {
+                invocationId: string;
+                deploymentId: string;
+                tablePrefix: string;
+                principal: ExecutionPrincipal;
+              }
+            | undefined
+          >;
+        },
+        invocationId: string,
+      ) => Promise<ActorContext | undefined>;
+      contextForStoredInvocation: (
+        journal: {
+          deploymentId: string;
+          tablePrefix: string;
+          get: (invocationId: string) => Promise<
+            | {
+                invocationId: string;
+                deploymentId: string;
+                tablePrefix: string;
+                principal: ExecutionPrincipal;
+              }
+            | undefined
+          >;
+        },
+        invocationId: string,
+      ) => Promise<ActorContext | undefined>;
+    },
   ) => Promise<Response | null>;
   /** Host policy immediately before a validated start reaches the run DO. */
   beforeStart?: (
@@ -501,6 +590,7 @@ export interface FlowsafeWorkerConfig<Env extends FlowsafeWorkerEnv>
    * notification duty.
    */
   notificationTick?: (env: Env) => () => Promise<unknown>;
+  remoteStepRecoveryTick?: (env: Env) => () => Promise<unknown>;
   /**
    * Extra purge duties. The
    * returned fields fold into the ONE combined `{type:'maintenance'}` log
@@ -647,6 +737,9 @@ const STATE_EGRESS_ENV_KEYS = [
   'OUTBOUND_RESOURCE_GROUP_ID',
   'OUTBOUND_STATE_SCRIPT_NAME',
   'OUTBOUND_ROUTE_HOSTNAME',
+  'OUTBOUND_ACTIVATION_VERSION',
+  'OUTBOUND_ACTIVATION_KIND',
+  'OUTBOUND_DISPATCH_KEY',
   'OUTBOUND_POLICY_ID',
 ] as const;
 
@@ -710,7 +803,8 @@ export type MaintenanceDuty =
   | 'sweep'
   | 'purge'
   | 'tick'
-  | 'notification';
+  | 'notification'
+  | 'remoteStepRecovery';
 
 /**
  * The cursor seam a duty resumes from and advances. Each field is optional
@@ -760,6 +854,11 @@ const INJECTED_TICK_DUTIES = {
     builder: 'notificationTick',
     interval: 'notificationIntervalMs',
     logType: 'notification-dispatch',
+  },
+  remoteStepRecovery: {
+    builder: 'remoteStepRecoveryTick',
+    interval: 'remoteStepRecoveryIntervalMs',
+    logType: 'remote-step-notification-recovery',
   },
 } as const;
 
@@ -1177,7 +1276,7 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
     'storageTablePrefix',
   );
   // Authenticate before constructing request-scoped services.
-  const buildResolve = (
+  const buildContexts = (
     env: Env,
     topology: DoRunTopology,
     waitUntil: (promise: Promise<unknown>) => void,
@@ -1185,28 +1284,41 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
     selfDecision: SelfDecisionPolicy,
     stream: ApprovalStreamSink | undefined,
     mutationEpoch: number | undefined,
-  ): ActorResolver => {
-    const base = createActorResolver({
+  ) => {
+    const storeFactory = approvalStoreFactoryFor(env.DB, storageTablePrefix);
+    const buildService = (store: ApprovalStore) =>
+      buildConfiguredApprovalService(config, env, topology, {
+        store,
+        executionFence: executionFenceForEnv(env),
+        workflowTablePrefix: (storageTablePrefix ?? '').toLowerCase(),
+        waitUntil,
+        notify,
+        stream,
+        allowSelfDecision: selfDecision,
+      });
+    const resolve = createActorResolver({
       mutationEpoch,
       authenticate: bearerActorAuthenticator(config.buildVerifier(env)),
-      storeFactory: approvalStoreFactoryFor(env.DB, storageTablePrefix),
+      storeFactory,
       deploymentTag: env.DEPLOYMENT_TENANT,
-      buildService: (store) =>
-        buildConfiguredApprovalService(config, env, topology, {
-          store,
-          executionFence: executionFenceForEnv(env),
-          workflowTablePrefix: (storageTablePrefix ?? '').toLowerCase(),
-          waitUntil,
-          notify,
-          stream,
-          allowSelfDecision: selfDecision,
-        }),
+      buildService,
       // The resolver's canSelfDecide display hint reads the SAME policy the
       // service enforces (passed to the shared service builder above), so the
       // /workflows echo can never contradict decide().
       allowSelfDecision: selfDecision,
     });
-    return base;
+    const contextForPrincipal = (principal: ExecutionPrincipal): ActorContext =>
+      createPrincipalActorContext({
+        principal,
+        mutationEpoch,
+        storeFactory,
+        deploymentTag: env.DEPLOYMENT_TENANT,
+        buildService,
+        canSelfDecide: (role) =>
+          DECIDER_ROLES.includes(role) &&
+          selfDecisionExempts(selfDecision, role),
+      });
+    return { resolve, contextForPrincipal };
   };
 
   // Parse ONCE per deployment value, memoized by the RAW
@@ -1595,7 +1707,7 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
               ),
             );
         }
-        const resolve = buildResolve(
+        const { resolve, contextForPrincipal } = buildContexts(
           env,
           topology,
           waitUntil,
@@ -1606,9 +1718,67 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
         );
 
         if (config.preRoutes) {
+          const contextForStoredInvocation = async (
+            journal: {
+              deploymentId: string;
+              tablePrefix: string;
+              get: (invocationId: string) => Promise<
+                | {
+                    invocationId: string;
+                    deploymentId: string;
+                    tablePrefix: string;
+                    principal: ExecutionPrincipal;
+                  }
+                | undefined
+              >;
+            },
+            invocationId: string,
+          ) => {
+            if (!isPathSafeId(invocationId)) return undefined;
+            const invocation = await journal.get(invocationId);
+            if (
+              !invocation ||
+              invocation.invocationId !== invocationId ||
+              invocation.deploymentId !== journal.deploymentId ||
+              invocation.tablePrefix !== journal.tablePrefix ||
+              invocation.tablePrefix !==
+                (storageTablePrefix ?? '').toLowerCase()
+            )
+              return undefined;
+            return contextForPrincipal(invocation.principal);
+          };
           const preResponse = await config.preRoutes(request, env, ctx, {
             resolve,
             topology,
+            authorizePrivateWorkflowDispatch: async (privateRequest) => {
+              const gate = await authorizeAdminCredential(privateRequest, env, {
+                surface: 'private workflow dispatch',
+                delegateCapability: false,
+              });
+              return gate.authorized ? undefined : gate.response;
+            },
+            contextForStoredWorkflowStart: async (workflowId, runId) => {
+              if (!isPathSafeId(workflowId) || !isPathSafeId(runId))
+                return undefined;
+              const receipt = await topology.startPrincipal(workflowId, runId);
+              if (
+                !receipt ||
+                receipt.execution.tablePrefix !==
+                  (storageTablePrefix ?? '').toLowerCase()
+              )
+                return undefined;
+              return contextForPrincipal(receipt.principal);
+            },
+            contextForStoredWorkflowInvocation: (journal, invocationId) =>
+              contextForStoredInvocation(
+                {
+                  deploymentId: journal.deploymentId,
+                  tablePrefix: journal.tablePrefix,
+                  get: journal.getWorkflow.bind(journal),
+                },
+                invocationId,
+              ),
+            contextForStoredInvocation,
           });
           if (preResponse) return preResponse;
         }
@@ -1816,6 +1986,7 @@ const DUTY_ORDER = [
   'purge',
   'tick',
   'notification',
+  'remoteStepRecovery',
 ] as const;
 
 export type MaintenanceDurableObjectConstructor<Env extends FlowsafeWorkerEnv> =
@@ -1839,6 +2010,7 @@ export function createFlowsafeMaintenanceDurableObject<
     purge: config.maintenance.purgeIntervalMs,
     tick: config.maintenance.tickIntervalMs,
     notification: config.maintenance.notificationIntervalMs,
+    remoteStepRecovery: config.maintenance.remoteStepRecoveryIntervalMs,
   };
   for (const duty of DUTY_ORDER) {
     const interval = intervals[duty];
@@ -2221,6 +2393,12 @@ const DUTY_HEALTH_FIELDS = {
     last: 'lastNotificationAt',
     attempt: 'lastNotificationAttemptAt',
     error: 'lastNotificationError',
+  },
+  remoteStepRecovery: {
+    next: 'nextRemoteStepRecoveryAt',
+    last: 'lastRemoteStepRecoveryAt',
+    attempt: 'lastRemoteStepRecoveryAttemptAt',
+    error: 'lastRemoteStepRecoveryError',
   },
 } as const satisfies Record<
   MaintenanceDuty,

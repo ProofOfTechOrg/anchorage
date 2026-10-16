@@ -17,6 +17,9 @@ import {
 
 const OUTBOUND_CREDENTIAL = 'outbound-state-credential-0000000001';
 const DEPLOYMENT_IDENTITY = 'deployment-identity-credential-00001';
+const PRIVATE_VERSION_HEADER = 'x-anchorage-state-activation-version';
+const PRIVATE_KIND_HEADER = 'x-anchorage-state-activation-kind';
+const PRIVATE_KEY_HEADER = 'x-anchorage-state-dispatch-key';
 
 function stateEnv(
   fetch = vi.fn(async (_request: Request) => new Response('proxied')),
@@ -35,6 +38,87 @@ function stateEnv(
 }
 
 describe('trusted state egress adapter', () => {
+  it('uses a private dispatch key without a host route and removes the spoofed host header', async () => {
+    const bindingFetch = vi.fn(
+      async (_request: Request) => new Response('private'),
+    );
+    const { OUTBOUND_ROUTE_HOSTNAME: _route, ...legacy } =
+      stateEnv(bindingFetch);
+    const env = {
+      ...legacy,
+      OUTBOUND_ACTIVATION_VERSION: '2',
+      OUTBOUND_ACTIVATION_KIND: 'internal-dispatch',
+      OUTBOUND_DISPATCH_KEY: 'acme:production',
+    } as unknown as StateEgressEnv;
+
+    await expect(validateStateEgressEnv(env)).resolves.toMatchObject({
+      activationVersion: '2',
+      activationKind: 'internal-dispatch',
+      dispatchKey: 'acme:production',
+    });
+    const response = await createStateEgressFetch(env)(
+      new Request('https://api.vendor.test/write', {
+        headers: {
+          [STATE_EGRESS_ROUTE_HOSTNAME_HEADER]: 'victim.example.test',
+          [PRIVATE_KEY_HEADER]: 'victim:production',
+        },
+      }),
+    );
+    expect(await response.text()).toBe('private');
+    const forwarded = bindingFetch.mock.calls[0]?.[0];
+    expect(
+      forwarded?.headers.get(STATE_EGRESS_ROUTE_HOSTNAME_HEADER),
+    ).toBeNull();
+    expect(forwarded?.headers.get(PRIVATE_VERSION_HEADER)).toBe('2');
+    expect(forwarded?.headers.get(PRIVATE_KIND_HEADER)).toBe(
+      'internal-dispatch',
+    );
+    expect(forwarded?.headers.get(PRIVATE_KEY_HEADER)).toBe('acme:production');
+  });
+
+  it('rejects mixed host and private activation bindings', async () => {
+    const env = {
+      ...stateEnv(),
+      OUTBOUND_ACTIVATION_VERSION: '2',
+      OUTBOUND_ACTIVATION_KIND: 'internal-dispatch',
+      OUTBOUND_DISPATCH_KEY: 'acme:production',
+    } as StateEgressEnv;
+    await expect(validateStateEgressEnv(env)).rejects.toThrow();
+  });
+
+  it.each([
+    ['unknown version', { OUTBOUND_ACTIVATION_VERSION: '3' }],
+    ['unknown kind', { OUTBOUND_ACTIVATION_KIND: 'host' }],
+    ['foreign key', { OUTBOUND_DISPATCH_KEY: 'other:production' }],
+    ['host value', { OUTBOUND_ROUTE_HOSTNAME: 'acme.example.test' }],
+  ])('rejects a private activation with %s', async (_case, patch) => {
+    const { OUTBOUND_ROUTE_HOSTNAME: _route, ...legacy } = stateEnv();
+    const env = {
+      ...legacy,
+      OUTBOUND_ACTIVATION_VERSION: '2',
+      OUTBOUND_ACTIVATION_KIND: 'internal-dispatch',
+      OUTBOUND_DISPATCH_KEY: 'acme:production',
+      ...patch,
+    } as unknown as StateEgressEnv;
+    await expect(validateStateEgressEnv(env)).rejects.toThrow();
+  });
+
+  it('strips private authority headers from a legacy host request', async () => {
+    const bindingFetch = vi.fn(async (_request: Request) => new Response());
+    await createStateEgressFetch(stateEnv(bindingFetch))(
+      new Request('https://api.vendor.test/write', {
+        headers: {
+          [PRIVATE_VERSION_HEADER]: '2',
+          [PRIVATE_KIND_HEADER]: 'internal-dispatch',
+          [PRIVATE_KEY_HEADER]: 'victim:production',
+        },
+      }),
+    );
+    const forwarded = bindingFetch.mock.calls[0]?.[0];
+    expect(forwarded?.headers.get(PRIVATE_VERSION_HEADER)).toBeNull();
+    expect(forwarded?.headers.get(PRIVATE_KIND_HEADER)).toBeNull();
+    expect(forwarded?.headers.get(PRIVATE_KEY_HEADER)).toBeNull();
+  });
   it('matches a presented credential against its canonical SHA-256 digest', async () => {
     const digest = await crypto.subtle.digest(
       'SHA-256',
