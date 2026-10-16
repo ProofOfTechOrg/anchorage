@@ -64,6 +64,11 @@ import {
 import type { FencedWorkflowsStorageD1 } from './fenced-workflows-d1.js';
 import { init } from './init.js';
 import {
+  RemoteStepJournal,
+  WORKFLOW_REMOTE_STEP_MARKER,
+  WORKFLOW_REMOTE_STEP_RESULT_KEY,
+} from './remote-step-journal.js';
+import {
   type RequestContextProvider,
   type RunnerRuntime,
   RunStateUnreadableError,
@@ -423,6 +428,230 @@ class TestRunner extends DurableObjectRunner<TestEnv> {
   }
 }
 
+async function workflowRemoteFixture() {
+  const env = makeProductionEnv();
+  const fence = env.fence;
+  if (!fence) throw new Error('execution fence unavailable');
+  await fence.seed('open');
+  let effects = 0;
+  const app = init(
+    { storage: env.storage },
+    {
+      executionFence: fence,
+      startIdempotency: newTestStartIdempotency(env.storage),
+    },
+  );
+  const result = z.object({ answer: z.number() });
+  app
+    .createWorkflow({
+      id: 'remote',
+      inputSchema: z.object({}),
+      outputSchema: result,
+    })
+    .then(
+      app.createStep({
+        id: 'execute',
+        inputSchema: z.object({}),
+        outputSchema: result,
+        resumeSchema: z.object({
+          [WORKFLOW_REMOTE_STEP_RESULT_KEY]: z.object({
+            version: z.literal(1),
+            invocationId: z.string(),
+            requestDigest: z.string(),
+            resultJson: z.string(),
+            resultDigest: z.string(),
+          }),
+        }),
+        execute: async ({ resumeData, suspend }) => {
+          if (!resumeData)
+            return suspend({
+              type: 'suspension',
+              remoteStep: {
+                marker: WORKFLOW_REMOTE_STEP_MARKER,
+                request: { input: 'trusted' },
+              },
+            });
+          effects += 1;
+          return result.parse(
+            JSON.parse(resumeData[WORKFLOW_REMOTE_STEP_RESULT_KEY].resultJson),
+          );
+        },
+      }),
+    )
+    .then(
+      app.createStep({
+        id: 'next',
+        inputSchema: result,
+        outputSchema: result,
+        execute: async ({ inputData, suspend }) =>
+          suspend({ answer: inputData.answer }),
+      }),
+    )
+    .commit();
+  env.runtime = app.runtime;
+  const buildJournal = (runtime: RunnerRuntime) =>
+    new RemoteStepJournal({
+      db: testDatabase(env.storage),
+      fence,
+      runtime,
+      deploymentId: 'acme',
+      tablePrefix: '',
+      allowedToolIds: ['unused'],
+      verifyCompletion: async () => {
+        throw new Error('agent completion unavailable');
+      },
+      verifyWorkflowCompletion: async () => undefined,
+    });
+  class RemoteRunner extends TestRunner {
+    protected async workflowRemoteSteps(_env: TestEnv, runtime: RunnerRuntime) {
+      const journal = buildJournal(runtime);
+      await journal.initialize();
+      return journal;
+    }
+  }
+  const storage = durableKeyValueStorageFixture().state.storage;
+  const state = {
+    id: { name: 'remote:remote-run' },
+    storage,
+  } as unknown as DurableObjectState;
+  const runner = new RemoteRunner(state, env);
+  const started = await runner.fetch(
+    post('/runs', { workflowId: 'remote', runId: 'remote-run', inputData: {} }),
+  );
+  expect(started.status).toBe(200);
+  const journal = buildJournal(app.runtime);
+  await journal.initialize();
+  const invocation = await journal.registerWorkflow(
+    {
+      targetKind: 'workflow',
+      deploymentId: 'acme',
+      tablePrefix: '',
+      workflowId: 'remote',
+      runId: 'remote-run',
+    },
+    Date.now() + 60_000,
+    OWNER_PRINCIPAL,
+  );
+  const permit = await journal.issuePermit(invocation.invocationId, 30_000);
+  const consumed = await journal.consumePermit(permit);
+  if (consumed.kind !== 'accepted') throw new Error('permit was not won');
+  await journal.recordResult(
+    invocation.invocationId,
+    consumed.rawPermit,
+    '{"answer":42}',
+    '{"complete":true}',
+  );
+  return {
+    runner,
+    journal,
+    invocation,
+    env,
+    effects: () => effects,
+    reopen: () => new RemoteRunner(state, env),
+  };
+}
+
+describe('workflow remote result continuation', () => {
+  it('applies retained bytes once and returns its receipt after terminal ownership cleanup', async () => {
+    const h = await workflowRemoteFixture();
+    const path = '/runs/remote/remote-run/remote-step-resume';
+    const body = { invocationId: h.invocation.invocationId };
+    const forged = await h.runner.fetch(
+      post('/runs/remote/remote-run/resume', {
+        step: 'execute',
+        resumeData: {
+          [WORKFLOW_REMOTE_STEP_RESULT_KEY]: {
+            version: 1,
+            resultJson: '{"answer":999}',
+          },
+        },
+      }),
+    );
+    expect(forged.status).toBe(400);
+    expect(h.effects()).toBe(0);
+    const foreign = await h.runner.fetch(
+      post(path, body, { ...OWNER_PRINCIPAL, id: 'other' }),
+    );
+    expect(foreign.status).toBe(404);
+    const attempts = await Promise.all([
+      h.runner.fetch(post(path, body)),
+      h.runner.fetch(post(path, body)),
+    ]);
+    const values = await Promise.all(
+      attempts.map((response) => response.json()),
+    );
+    expect(values).toEqual([
+      expect.objectContaining({
+        kind: 'applied',
+        summary: expect.objectContaining({
+          status: 'suspended',
+          suspendPayload: { next: { answer: 42 } },
+        }),
+      }),
+      { kind: 'already-applied', invocationId: h.invocation.invocationId },
+    ]);
+    expect(h.effects()).toBe(1);
+    expect(
+      (await h.runner.fetch(post('/runs/remote/remote-run/terminate', {})))
+        .status,
+    ).toBe(200);
+    expect(await h.env.owners.owner('run', 'remote-run')).toBeUndefined();
+    const replay = await h.reopen().fetch(post(path, body));
+    expect(replay.status).toBe(200);
+    expect(await replay.json()).toEqual({
+      kind: 'already-applied',
+      invocationId: h.invocation.invocationId,
+    });
+    expect(h.effects()).toBe(1);
+    await h.env.owners.reserveAll(
+      [{ kind: 'run', resourceId: 'remote-run' }],
+      { kind: 'human', id: 'other' },
+      'foreign-reservation',
+    );
+    await h.env.owners.settleReservation('foreign-reservation', []);
+    expect((await h.reopen().fetch(post(path, body))).status).toBe(404);
+  });
+
+  it('keeps an admitted continuation unresolved after the host is recreated', async () => {
+    const h = await workflowRemoteFixture();
+    await h.journal.claimWorkflowResume(h.invocation.invocationId, 1);
+    const response = await h.reopen().fetch(
+      post('/runs/remote/remote-run/remote-step-resume', {
+        invocationId: h.invocation.invocationId,
+      }),
+    );
+    expect(response.status).toBe(503);
+    expect(h.effects()).toBe(0);
+    expect(
+      await h.journal.getWorkflow(h.invocation.invocationId),
+    ).toMatchObject({ status: 'resuming' });
+  });
+
+  it('refuses workflow continuation while deployment execution is locked', async () => {
+    const h = await workflowRemoteFixture();
+    const fence = h.env.fence;
+    if (!fence) throw new Error('execution fence unavailable');
+    const before = await fence.read();
+    await fence.transition({
+      expected: 'open',
+      next: 'migration-locked',
+      expectedMutationEpoch: before.mutationEpoch,
+      expectedRevision: before.transitionRevision,
+      advanceMutationEpoch: true,
+    });
+    const response = await h.runner.fetch(
+      post('/runs/remote/remote-run/remote-step-resume', {
+        invocationId: h.invocation.invocationId,
+      }),
+    );
+    expect(response.status).toBe(503);
+    expect(h.effects()).toBe(0);
+    expect(
+      await h.journal.getWorkflow(h.invocation.invocationId),
+    ).toMatchObject({ status: 'result-retained' });
+  });
+});
+
 function makeRunner(): TestRunner {
   return new TestRunner(undefined, makeProductionEnv());
 }
@@ -458,7 +687,8 @@ function post(
     path === '/runs' ||
     path.endsWith('/terminate') ||
     path.endsWith('/terminate-replay') ||
-    path.endsWith('/deadline')
+    path.endsWith('/deadline') ||
+    path.endsWith('/remote-step-resume')
   ) {
     headers[EXECUTION_PRINCIPAL_HEADER] = encodeExecutionPrincipal(principal);
   }

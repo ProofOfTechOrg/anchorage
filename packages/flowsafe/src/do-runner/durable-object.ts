@@ -19,7 +19,10 @@ import {
   type ExecutionPrincipalKind,
   isExecutionPrincipalId,
   isExecutionPrincipalKind,
+  isOwnedBy,
+  samePrincipal,
 } from '../approval-api/principal.js';
+import { readBoundedBody } from '../http-body.js';
 import { errorMessageOf } from './cause-chain.js';
 import type { DurableObjectRunnerState, WebSocketLike } from './cf-types.js';
 import { newWebSocketPair, safeSend } from './cf-types.js';
@@ -52,6 +55,11 @@ import {
 import { EXECUTION_PRINCIPAL_HEADER } from './execution-principal-header.js';
 import { isDefinitiveInitialAdmissionRefusal } from './initial-admission-refusal.js';
 import { isPathSafeId } from './path-safe-id.js';
+import {
+  WORKFLOW_REMOTE_STEP_RESULT_KEY,
+  type WorkflowRemoteStepContinuationReader,
+  type WorkflowRemoteStepResumeData,
+} from './remote-step-journal.js';
 import {
   lifecycleFromRequestContext,
   terminalCleanupFor,
@@ -437,6 +445,7 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
   /** Absent in Node tests; present under workerd for storage and the alarm. */
   protected readonly state?: DurableObjectRunnerState;
   #runtime?: RunnerRuntime;
+  #workflowRemoteReader?: WorkflowRemoteStepContinuationReader;
   #operationTail = Promise.resolve();
   /** `step\0reason` of every suspension deadline this object has reported. */
   #reportedSuspensionRejections = new Set<string>();
@@ -452,6 +461,13 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
 
   /** Define workflows via init() and return its runtime. Called once, lazily. */
   protected abstract build(env: TEnv): RunnerRuntime;
+
+  protected async workflowRemoteSteps(
+    _env: TEnv,
+    _runtime: RunnerRuntime,
+  ): Promise<WorkflowRemoteStepContinuationReader | undefined> {
+    return undefined;
+  }
 
   /** The deployment-local ownership registry used for recoverable run starts. */
   protected abstract runOwnership(env: TEnv): DurableObjectRunOwnershipStore;
@@ -593,10 +609,15 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
     if (
       value !== null &&
       typeof value === 'object' &&
-      SUSPENSION_TIMEOUT_RESUME_KEY in value
+      (SUSPENSION_TIMEOUT_RESUME_KEY in value ||
+        WORKFLOW_REMOTE_STEP_RESULT_KEY in value)
     ) {
+      const key =
+        SUSPENSION_TIMEOUT_RESUME_KEY in value
+          ? SUSPENSION_TIMEOUT_RESUME_KEY
+          : WORKFLOW_REMOTE_STEP_RESULT_KEY;
       throw new InvalidRunRequestError(
-        `resume data must not carry the reserved '${SUSPENSION_TIMEOUT_RESUME_KEY}' key`,
+        `resume data must not carry the reserved '${key}' key`,
       );
     }
     return value;
@@ -2867,6 +2888,176 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
         status: 101,
         webSocket: client,
       } as unknown as ResponseInit);
+    }
+    if (
+      request.method === 'POST' &&
+      segments.length === 4 &&
+      action === 'remote-step-resume' &&
+      workflowId &&
+      runId
+    ) {
+      this.#assertRunIdentity(workflowId, runId);
+      const principal = this.#trustedExecutionPrincipal(encodedPrincipal);
+      const body = await readBoundedBody(request, 1_024);
+      if (!body.ok) return json({ error: 'invalid request body' }, 400);
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(body.text);
+      } catch {
+        return json({ error: 'invalid request body' }, 400);
+      }
+      if (
+        parsed === null ||
+        typeof parsed !== 'object' ||
+        Array.isArray(parsed) ||
+        Object.keys(parsed).length !== 1 ||
+        !('invocationId' in parsed) ||
+        !isPathSafeId(parsed.invocationId) ||
+        new URL(request.url).search
+      )
+        return json({ error: 'invalid request body' }, 400);
+      const invocationId = parsed.invocationId;
+      return this.#withOperationLock(async () => {
+        const runtime = this.#ensureRuntime();
+        const reader =
+          this.#workflowRemoteReader ??
+          (await this.workflowRemoteSteps(this.env, runtime));
+        if (!reader)
+          return json({ error: 'remote steps are unavailable' }, 503);
+        this.#workflowRemoteReader = reader;
+        const invocation = await reader.getWorkflow(invocationId);
+        const deploymentId =
+          this.env &&
+          typeof this.env === 'object' &&
+          'DEPLOYMENT_TENANT' in this.env
+            ? this.env.DEPLOYMENT_TENANT
+            : undefined;
+        if (
+          invocation?.targetKind !== 'workflow' ||
+          invocation.invocationId !== invocationId ||
+          invocation.deploymentId !== reader.deploymentId ||
+          invocation.deploymentId !== deploymentId ||
+          invocation.tablePrefix !== reader.tablePrefix ||
+          invocation.workflowId !== workflowId ||
+          invocation.runId !== runId ||
+          !samePrincipal(invocation.principal, principal)
+        )
+          return json({ error: 'invocation not found' }, 404);
+        const state = await runtime.authoritativeStartState(workflowId, runId);
+        const identity = state?.provenance.startIdentity;
+        if (
+          state?.storage !== 'd1' ||
+          state.kind !== 'result' ||
+          state.execution.tablePrefix !== invocation.tablePrefix ||
+          state.execution.workflowId !== workflowId ||
+          state.execution.runId !== runId ||
+          state.execution.startToken !== invocation.startToken ||
+          identity?.target.kind !== 'workflow' ||
+          identity.target.id !== workflowId ||
+          !isOwnedBy(identity.owner, principal) ||
+          state.provenance.agentStart !== undefined
+        )
+          return json({ error: 'remote step run changed' }, 409);
+        const owner = await this.runOwnership(this.env).owner('run', runId);
+        if (owner && !isOwnedBy(owner, principal))
+          return json({ error: 'run not found' }, 404);
+        if (
+          invocation.status === 'settled' &&
+          invocation.settlementOutcome === 'applied'
+        ) {
+          if (!owner) {
+            const receipt = await this.#startPrincipalReceipt(
+              workflowId,
+              runId,
+            );
+            if (receipt.status !== 200)
+              return json({ error: 'run not found' }, 404);
+            const value = (await receipt.json()) as {
+              principal: ExecutionPrincipal;
+            };
+            if (!samePrincipal(value.principal, principal))
+              return json({ error: 'run not found' }, 404);
+          }
+          return json({ kind: 'already-applied', invocationId });
+        }
+        if (!owner) return json({ error: 'run not found' }, 404);
+        if (invocation.status === 'resuming')
+          return json(
+            { error: 'remote step resume outcome is unresolved' },
+            503,
+          );
+        if (invocation.status !== 'result-retained')
+          return json({ error: 'remote step result is unavailable' }, 409);
+        await runtime.assertExistingRunAllowed(workflowId, runId);
+        const leaseOwner = await reader.claimWorkflowResume(
+          invocationId,
+          60_000,
+          mutationEpoch,
+        );
+        const retained = await reader.readRetainedResult(invocationId);
+        if (!retained || retained.invocationId !== invocationId)
+          return json({ error: 'remote step result is unreadable' }, 503);
+        const resumeData: WorkflowRemoteStepResumeData = {
+          [WORKFLOW_REMOTE_STEP_RESULT_KEY]: {
+            version: 1,
+            invocationId,
+            requestDigest: invocation.requestDigest,
+            resultJson: retained.resultJson,
+            resultDigest: retained.resultDigest,
+          },
+        };
+        const summary = await this.#withLeg(
+          workflowId,
+          runId,
+          'resume',
+          () =>
+            runtime.resume(workflowId, runId, {
+              step: [...invocation.stepPath],
+              resumeData,
+              requestedBy: principal.id,
+              requestedByKind: principal.kind,
+              expectedSuspension: {
+                suspendedAt: invocation.suspendedAt,
+                ...(invocation.resumeCount === undefined
+                  ? {}
+                  : { resumeCount: invocation.resumeCount }),
+              },
+            }),
+          false,
+        );
+        const outcome = await reader.settleWorkflowAfterResume(
+          invocationId,
+          leaseOwner,
+          summary,
+        );
+        await this.#reconcileApprovalsBestEffort(workflowId, runId);
+        if (
+          await this.#reconcileSuspensionDeadlinesBestEffort(
+            workflowId,
+            runId,
+            summary,
+          )
+        ) {
+          try {
+            await this.#armNextAlarm();
+          } catch (error) {
+            console.error('remote step resume boundary re-arm failed', error);
+          }
+        }
+        this.#broadcastRunSummary(summary);
+        if (outcome === 'unresolved')
+          return json(
+            { error: 'remote step resume outcome is unresolved' },
+            503,
+          );
+        if (outcome !== 'applied')
+          return json({ error: 'remote step result was not applied' }, 409);
+        return json({
+          kind: 'applied',
+          invocationId,
+          summary: await this.#withSuspensionTimers(workflowId, summary),
+        });
+      });
     }
     if (
       request.method === 'POST' &&

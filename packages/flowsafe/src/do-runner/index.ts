@@ -230,7 +230,11 @@ export {
   RemoteStepJournal,
   type RemoteStepNotificationOperation,
   type RemoteStepPermit,
+  WORKFLOW_REMOTE_STEP_RESULT_KEY,
   type WorkflowRemoteStepAddress,
+  type WorkflowRemoteStepContinuationReader,
+  type WorkflowRemoteStepResumeData,
+  type WorkflowRemoteStepResumeResult,
 } from './remote-step-journal.js';
 export type {
   RunEconomicOperation,

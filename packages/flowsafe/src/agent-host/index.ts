@@ -16,7 +16,10 @@ export type {
   RemoteStepNotificationOperation,
   RemoteStepPermit,
   WorkflowRemoteStepAddress,
+  WorkflowRemoteStepContinuationReader,
   WorkflowRemoteStepInvocation,
+  WorkflowRemoteStepResumeData,
+  WorkflowRemoteStepResumeResult,
 } from '../do-runner/remote-step-journal.js';
 export {
   type AgentApprovalResumer,

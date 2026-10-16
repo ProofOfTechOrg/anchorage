@@ -26,6 +26,7 @@ import {
   stampMutationEpoch,
 } from '../do-runner/index.js';
 import { isPathSafeId } from '../do-runner/path-safe-id.js';
+import type { WorkflowRemoteStepResumeResult } from '../do-runner/remote-step-journal.js';
 import type { PersistedStartResult } from '../do-runner/start-idempotency.js';
 import { captureReservation } from '../do-runner/start-reservation-contract.js';
 import {
@@ -34,6 +35,7 @@ import {
   doStartLiveness,
   doStartPrincipal,
   doSummary,
+  doWorkflowRemoteStepResume,
   type StartPrincipalReceipt,
 } from './do-response.js';
 import { RunRouteError } from './run-route-error.js';
@@ -121,10 +123,20 @@ export type DoRunStartInput = RunStartInput & {
   initialState?: unknown;
 };
 
+export interface DoRunRemoteStepTopology extends DoRunLifecycleTopology {
+  resumeWorkflowRemoteStep(
+    workflowId: string,
+    runId: string,
+    invocationId: string,
+    principal: ExecutionPrincipal,
+    mutationEpoch?: number,
+  ): Promise<WorkflowRemoteStepResumeResult>;
+}
+
 export function createDoRunTopology<Id>(
   namespace: RunnerNamespaceLike<Id>,
   deploymentIdentitySecret: string,
-): DoRunLifecycleTopology {
+): DoRunRemoteStepTopology {
   // One DO per (workflowId, runId): the name join is unambiguous because
   // PATH_SAFE_ID_PATTERN excludes ':' from both ids.
   const stub = (workflowId: string, runId: string): RunnerStubLike =>
@@ -155,6 +167,36 @@ export function createDoRunTopology<Id>(
     );
 
   return {
+    resumeWorkflowRemoteStep: async (
+      workflowId,
+      runId,
+      invocationId,
+      principal,
+      mutationEpoch,
+    ) => {
+      if (![workflowId, runId, invocationId].every(isPathSafeId))
+        throw new RunRouteError(400, 'invalid remote step identity');
+      const headers = new Headers({
+        'content-type': 'application/json',
+        [EXECUTION_PRINCIPAL_HEADER]: encodeExecutionPrincipal(principal),
+      });
+      stampMutationEpoch(headers, mutationEpoch);
+      return doWorkflowRemoteStepResume(
+        await stub(workflowId, runId).fetch(
+          `http://do/runs/${workflowId}/${runId}/remote-step-resume`,
+          {
+            method: 'POST',
+            headers: deploymentIdentityHeaders(
+              deploymentIdentitySecret,
+              headers,
+            ),
+            body: JSON.stringify({ invocationId }),
+          },
+        ),
+        invocationId,
+        runId,
+      );
+    },
     startPrincipal: async (workflowId, runId) => {
       if (!isPathSafeId(workflowId) || !isPathSafeId(runId)) {
         throw new RunRouteError(400, 'invalid run identity');
