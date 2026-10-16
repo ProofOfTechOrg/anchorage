@@ -54,6 +54,58 @@ function harness() {
 }
 
 describe('workflow epoch transport', () => {
+  it('routes retained-result continuation with stored principal and epoch and refuses displaced receipts', async () => {
+    const principal = { kind: 'human', id: 'owner', role: 'operator' } as const;
+    const fetch = vi.fn(
+      async (
+        _url: string,
+        _init?: { headers?: Record<string, string>; body?: string },
+      ) =>
+        Response.json({
+          kind: 'applied',
+          invocationId: 'invocation',
+          summary: { runId: 'run', status: 'success', result: { answer: 42 } },
+        }),
+    );
+    const idFromName = vi.fn((name: string) => name);
+    const topology = createDoRunTopology(
+      { idFromName, get: () => ({ fetch }) },
+      DEPLOYMENT_IDENTITY_SECRET,
+    );
+    expect(
+      await topology.resumeWorkflowRemoteStep(
+        'workflow',
+        'run',
+        'invocation',
+        principal,
+        7,
+      ),
+    ).toEqual({
+      kind: 'applied',
+      invocationId: 'invocation',
+      summary: { runId: 'run', status: 'success', result: { answer: 42 } },
+    });
+    expect(idFromName).toHaveBeenCalledWith('workflow:run');
+    const [url, init] = fetch.mock.calls[0] ?? [];
+    expect(url).toBe('http://do/runs/workflow/run/remote-step-resume');
+    expect(init?.body).toBe('{"invocationId":"invocation"}');
+    expect(init?.headers?.[MUTATION_EPOCH_HEADER]).toBe('7');
+    expect(
+      JSON.parse(init?.headers?.[EXECUTION_PRINCIPAL_HEADER] ?? ''),
+    ).toEqual(principal);
+    fetch.mockResolvedValueOnce(
+      Response.json({ kind: 'already-applied', invocationId: 'foreign' }),
+    );
+    await expect(
+      topology.resumeWorkflowRemoteStep(
+        'workflow',
+        'run',
+        'invocation',
+        principal,
+        7,
+      ),
+    ).rejects.toMatchObject({ status: 503 });
+  });
   it.each([
     undefined,
     0,

@@ -258,6 +258,8 @@ describe('remote step journal dispatch admission', () => {
       if (!state) return state;
       return {
         ...state,
+        kind: 'result',
+        summary: await h.runtime.authoritativeStatus(workflowId, runId),
         provenance: {
           startIdentity: {
             owner: { kind: PRINCIPAL.kind, id: PRINCIPAL.id },
@@ -283,6 +285,7 @@ describe('remote step journal dispatch admission', () => {
       },
     });
     h.setSummary(summary(request));
+    let now = 1_000;
     const verifyWorkflowCompletion = vi.fn(async () => undefined);
     const journal = () =>
       new RemoteStepJournal({
@@ -294,7 +297,7 @@ describe('remote step journal dispatch admission', () => {
         allowedToolIds: ['remote_lookup'],
         verifyCompletion: h.verifyCompletion,
         verifyWorkflowCompletion,
-        now: () => 1_000,
+        now: () => now,
       });
     const address = {
       targetKind: 'workflow',
@@ -303,8 +306,209 @@ describe('remote step journal dispatch admission', () => {
       workflowId: ADDRESS.workflowId,
       runId: ADDRESS.runId,
     } as const;
-    return { ...h, address, journal, summary, verifyWorkflowCompletion };
+    return {
+      ...h,
+      address,
+      journal,
+      summary,
+      verifyWorkflowCompletion,
+      setWorkflowNow: (value: number) => {
+        now = value;
+      },
+      retainWorkflowResult: async () => {
+        const writer = journal();
+        const invocation = await writer.registerWorkflow(
+          address,
+          10_000,
+          PRINCIPAL,
+        );
+        const permit = await writer.issuePermit(invocation.invocationId, 1_000);
+        const consumed = await writer.consumePermit(permit);
+        if (consumed.kind !== 'accepted') throw new Error('permit was not won');
+        await writer.recordResult(
+          invocation.invocationId,
+          consumed.rawPermit,
+          '{"answer":42}',
+          '{"receipt":"verified"}',
+        );
+        return invocation;
+      },
+    };
   }
+
+  it('admits a workflow continuation once and settles only its witnessed result', async () => {
+    const h = await workflowFixture();
+    const invocation = await h.retainWorkflowResult();
+    const journal = h.journal();
+    const owner = await journal.claimWorkflowResume(
+      invocation.invocationId,
+      100,
+    );
+    await expect(
+      h.journal().claimWorkflowResume(invocation.invocationId, 100),
+    ).rejects.toMatchObject({ status: 409 });
+    const next: RunSummary = {
+      runId: ADDRESS.runId,
+      status: 'success',
+      result: { answer: 42 },
+    };
+    expect(
+      await journal.settleWorkflowAfterResume(
+        invocation.invocationId,
+        owner,
+        next,
+      ),
+    ).toBe('unresolved');
+    h.setWorkflowNow(2_000);
+    await expect(
+      h.journal().claimWorkflowResume(invocation.invocationId, 100),
+    ).rejects.toMatchObject({ status: 409 });
+    expect(
+      (await new DeploymentInventory(h.db).read('remote-steps')).count,
+    ).toBe(1);
+    h.setSummary(next);
+    expect(
+      await journal.settleWorkflowAfterResume(invocation.invocationId, owner, {
+        runId: ADDRESS.runId,
+        status: 'success',
+        result: { answer: 7 },
+      }),
+    ).toBe('unresolved');
+    expect(
+      await h.journal().getWorkflow(invocation.invocationId),
+    ).toMatchObject({ status: 'resuming' });
+    expect(
+      (await new DeploymentInventory(h.db).read('remote-steps')).count,
+    ).toBe(1);
+    await expect(
+      journal.settleWorkflowAfterResume(
+        invocation.invocationId,
+        'foreign-lease',
+        next,
+      ),
+    ).rejects.toMatchObject({ status: 409 });
+    expect(
+      await journal.settleWorkflowAfterResume(
+        invocation.invocationId,
+        owner,
+        next,
+      ),
+    ).toBe('applied');
+    expect(
+      await h.journal().getWorkflow(invocation.invocationId),
+    ).toMatchObject({ status: 'settled', settlementOutcome: 'applied' });
+    expect(
+      (await new DeploymentInventory(h.db).read('remote-steps')).count,
+    ).toBe(0);
+    await expect(
+      journal.claimResume(invocation.invocationId, 100),
+    ).rejects.toMatchObject({ status: 404 });
+  });
+
+  it('refuses displaced or nested workflow suspensions and expired result admission', async () => {
+    const h = await workflowFixture();
+    const invocation = await h.retainWorkflowResult();
+    const journal = h.journal();
+    h.setSummary(h.summary({ version: 2, input: { query: 'displaced' } }));
+    await expect(
+      journal.claimWorkflowResume(invocation.invocationId, 100),
+    ).rejects.toMatchObject({ status: 409 });
+    const nested = h.summary(invocation.request);
+    nested.suspendPayload = {
+      execute: {
+        type: 'suspension',
+        __workflow_meta: { path: ['child'] },
+        remoteStep: {
+          marker: WORKFLOW_REMOTE_STEP_MARKER,
+          request: invocation.request,
+        },
+      },
+    };
+    h.setSummary(nested);
+    await expect(
+      journal.claimWorkflowResume(invocation.invocationId, 100),
+    ).rejects.toMatchObject({ status: 409 });
+    h.setSummary(h.summary(invocation.request));
+    h.setWorkflowNow(10_000);
+    await expect(
+      journal.claimWorkflowResume(invocation.invocationId, 100),
+    ).rejects.toMatchObject({ status: 409 });
+    expect(await journal.getWorkflow(invocation.invocationId)).toMatchObject({
+      status: 'result-retained',
+    });
+  });
+
+  it('binds workflow admission to the current fence epoch and start generation', async () => {
+    const h = await workflowFixture();
+    const invocation = await h.retainWorkflowResult();
+    const before = await h.fence.read();
+    await h.fence.transition({
+      expected: 'open',
+      next: 'migration-locked',
+      expectedMutationEpoch: before.mutationEpoch,
+      expectedRevision: before.transitionRevision,
+      advanceMutationEpoch: true,
+    });
+    await expect(
+      h.journal().claimWorkflowResume(invocation.invocationId, 100),
+    ).rejects.toMatchObject({ status: 503 });
+    const locked = await h.fence.read();
+    await h.fence.transition({
+      expected: 'migration-locked',
+      next: 'open',
+      expectedMutationEpoch: locked.mutationEpoch,
+      expectedRevision: locked.transitionRevision,
+      advanceMutationEpoch: true,
+    });
+    await expect(
+      h
+        .journal()
+        .claimWorkflowResume(
+          invocation.invocationId,
+          100,
+          before.mutationEpoch,
+        ),
+    ).rejects.toMatchObject({ name: 'MutationEpochMismatchError' });
+    h.sqlite
+      .prepare(
+        `UPDATE ${REMOTE_STEP_TABLE} SET start_token = 'displaced-start', write_revision = write_revision + 1, write_generation = write_generation + 1 WHERE invocation_id = ?`,
+      )
+      .run(invocation.invocationId);
+    await expect(
+      h.journal().claimWorkflowResume(invocation.invocationId, 100),
+    ).rejects.toMatchObject({ status: 409 });
+    expect(
+      await h.journal().getWorkflow(invocation.invocationId),
+    ).toMatchObject({ status: 'result-retained' });
+  });
+
+  it.each([
+    ['parent.child'],
+    ['parent', 'child'],
+  ])('retains unsupported workflow path %j without continuation', async (...path) => {
+    const h = await workflowFixture();
+    const key = path.join('.');
+    const request = { input: 'nested' };
+    h.setSummary({
+      runId: ADDRESS.runId,
+      status: 'suspended',
+      suspended: [path],
+      suspendedAt: { [key]: 500 },
+      suspendPayload: {
+        [key]: {
+          type: 'suspension',
+          remoteStep: { marker: WORKFLOW_REMOTE_STEP_MARKER, request },
+        },
+      },
+    });
+    const invocation = await h.retainWorkflowResult();
+    await expect(
+      h.journal().claimWorkflowResume(invocation.invocationId, 100),
+    ).rejects.toMatchObject({ status: 409 });
+    expect(
+      await h.journal().readRetainedResult(invocation.invocationId),
+    ).toMatchObject({ resultJson: '{"answer":42}' });
+  });
 
   it('converges repeated observation on one invocation without a permit', async () => {
     const h = await fixture();

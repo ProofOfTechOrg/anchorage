@@ -368,6 +368,9 @@ import {
   purgeExpiredWorkflowRuns,
   FENCED_WORKFLOW_STORAGE,
   FencedWorkflowsStorageD1,
+  DurableObjectRunner,
+  type RunnerRuntime,
+  type WorkflowRemoteStepContinuationReader,
   type InitialRunAdmission,
   type InitialTerminalizationRequest,
   type InitialTerminalizationResult,
@@ -437,6 +440,13 @@ import {
 } from '@proofoftech/flowsafe/schedules';
 // @ts-expect-error internal context capture is not a schedules export
 import type { captureActorContext as ScheduleCapture } from '@proofoftech/flowsafe/schedules';
+
+declare const workflowContinuation: WorkflowRemoteStepContinuationReader;
+abstract class PackedWorkflowRunner<Env> extends DurableObjectRunner<Env> {
+  protected override async workflowRemoteSteps(_env: Env, _runtime: RunnerRuntime) {
+    return workflowContinuation;
+  }
+}
 
 const automation: AgentAutomationRule = {
   kind: 'system',
@@ -960,6 +970,16 @@ void [legacyContext, epochContext, legacyScope, epochScope, legacyInput, epochIn
     ),
   );
   writeFileSync(
+    join(consumer, 'durable-storage-fixture.mjs'),
+    transpile(
+      readFileSync(
+        join(packageRoot, 'test-support/durable-key-value-storage.ts'),
+        'utf8',
+      ),
+      { target: ScriptTarget.ES2022, module: ModuleKind.ES2022 },
+    ),
+  );
+  writeFileSync(
     join(consumer, 'runtime.mjs'),
     `import assert from 'node:assert/strict';
 import * as host from '@proofoftech/flowsafe/agent-host';
@@ -978,6 +998,7 @@ import { InMemoryStore } from '@mastra/core/storage';
 import { createStep, createWorkflow } from '@mastra/core/workflows';
 import { z } from 'zod';
 import { openSqlite, sqliteUnitDatabase } from './sqlite-fixture.mjs';
+import { durableKeyValueStorageFixture } from './durable-storage-fixture.mjs';
 assert.equal(doRunner.isArmableSuspensionDeadlineMs, deadlineConstants.isArmableSuspensionDeadlineMs);
 assert.equal(doRunner.isSuspensionTimeoutResumeData, deadlineConstants.isSuspensionTimeoutResumeData);
 assert.equal(doRunner.MIN_SUSPENSION_DEADLINE_MS, deadlineConstants.MIN_SUSPENSION_DEADLINE_MS);
@@ -1387,6 +1408,54 @@ const privateRemoteRoute = host.createWorkflowRemoteStepPreRoute(remoteStepJourn
 const privateRemoteMethod = await privateRemoteRoute(new Request('https://packed.test/_flowsafe/workflow-remote-step/ticket'), {}, {}, {});
 assert.equal(privateRemoteMethod.status, 405);
 assert.deepEqual(await privateRemoteMethod.json(), { error: 'method not allowed' });
+const workflowBinding = sqliteUnitDatabase(openSqlite());
+await doRunner.seedDeploymentIdentity(workflowBinding, 'packedremote', 'open');
+const workflowStorage = doRunner.createD1Storage({ binding: workflowBinding });
+const workflowFence = new doRunner.ExecutionFenceStore(workflowBinding);
+await workflowFence.seed('open');
+const workflowApp = doRunner.init({ storage: workflowStorage }, {
+  executionFence: workflowFence,
+  startIdempotency: new doRunner.StartIdempotencyStore(workflowBinding),
+});
+let workflowEffects = 0;
+workflowApp.createWorkflow({ id: 'packed-remote', inputSchema: z.object({}), outputSchema: z.object({ answer: z.number() }) })
+  .then(workflowApp.createStep({ id: 'execute', inputSchema: z.object({}), outputSchema: z.object({ answer: z.number() }),
+    execute: async ({ resumeData, suspend }) => {
+      if (!resumeData) return suspend({ type: 'suspension', remoteStep: { marker: 'flowsafe.remote-step.workflow/v1', request: { query: 'packed' } } });
+      const envelope = resumeData[doRunner.WORKFLOW_REMOTE_STEP_RESULT_KEY];
+      assert.equal(envelope.version, 1);
+      workflowEffects += 1;
+      return z.object({ answer: z.number() }).parse(JSON.parse(envelope.resultJson));
+    },
+  })).commit();
+const workflowJournal = new doRunner.RemoteStepJournal({
+  db: workflowBinding, fence: workflowFence, runtime: workflowApp.runtime,
+  deploymentId: 'packedremote', tablePrefix: '', allowedToolIds: ['unused'],
+  verifyCompletion: async () => { throw new Error('agent completion unavailable'); },
+  verifyWorkflowCompletion: async () => undefined,
+});
+await workflowJournal.initialize();
+const workflowOwners = new approvals.D1ResourceOwnershipStore(workflowBinding);
+class PackedRemoteRunner extends doRunner.DurableObjectRunner {
+  build() { return workflowApp.runtime; }
+  runOwnership() { return workflowOwners; }
+  async workflowRemoteSteps() { return workflowJournal; }
+}
+const workflowRunner = new PackedRemoteRunner({ ...durableKeyValueStorageFixture().state, id: { name: 'packed-remote:packed-run' } }, { DB: workflowBinding, DEPLOYMENT_TENANT: 'packedremote', DEPLOYMENT_IDENTITY_SECRET: 'packed-workflow-deployment-secret-0001' });
+const workflowTopology = hostKit.createDoRunTopology({ idFromName: name => name, get: () => ({ fetch: (url, init) => workflowRunner.fetch(new Request(url, init)) }) }, 'packed-workflow-deployment-secret-0001');
+const workflowPrincipal = { kind: 'human', id: 'packed-owner', role: 'operator' };
+const workflowStarted = await workflowTopology.start({ workflowId: 'packed-remote', runId: 'packed-run', inputData: {}, principal: workflowPrincipal });
+assert.equal(workflowStarted.status, 'suspended');
+const workflowInvocation = await workflowJournal.registerWorkflow({ targetKind: 'workflow', deploymentId: 'packedremote', tablePrefix: '', workflowId: 'packed-remote', runId: 'packed-run' }, Date.now() + 60_000, workflowPrincipal);
+const workflowPermit = await workflowJournal.issuePermit(workflowInvocation.invocationId, 30_000);
+const workflowConsumed = await workflowJournal.consumePermit(workflowPermit);
+assert.equal(workflowConsumed.kind, 'accepted');
+await workflowJournal.recordResult(workflowInvocation.invocationId, workflowConsumed.rawPermit, '{"answer":42}', '{"complete":true}');
+const workflowApplied = await workflowTopology.resumeWorkflowRemoteStep('packed-remote', 'packed-run', workflowInvocation.invocationId, workflowPrincipal);
+assert.equal(workflowApplied.kind, 'applied');
+assert.deepEqual(workflowApplied.summary.result, { answer: 42 });
+assert.equal((await workflowTopology.resumeWorkflowRemoteStep('packed-remote', 'packed-run', workflowInvocation.invocationId, workflowPrincipal)).kind, 'already-applied');
+assert.equal(workflowEffects, 1);
 observer.register(workflow);
 const initial = await observer.authoritativeStartState(workflow.id, repairExecution.runId);
 assert.equal(initial.kind, 'initial');

@@ -324,6 +324,18 @@ A workflow journal must match its named Durable Object before recovery can use t
 
 Strict terminal reservation settlement precedes managed approval, dispatch, owner and completion cleanup, with exact journal clearing last. Failures retain the journal and watchdog. A missing snapshot after fenced preparation also retains the journal and agent record/binding, preventing an unkeyed same-ID retry from executing again. Before either host commits a start's ownership claim, its journal records that the host read the start's outcome from the run's row; a snapshot missing after that read is a run that ended and that retention removed, so recovery clears the journal, deletes the agent record and releases an unthreaded run's thread and resource claims instead of retaining them. Only an actual local, matching zero-insert receipt with an unwound owning frame and an absent row permits complete rollback. Prepared-unfenced absence/pending never enters initial repair or unspends a bound key. Final schedule enforcement and deployment-wide acceptance remain required before enabling artifact epochs across the deployment.
 
+### Continue a retained workflow result
+
+A trusted host can resume a workflow suspension from a verified remote result. Pass a `verifyWorkflowCompletion` callback to `RemoteStepJournal` to verify the executor’s completion evidence, and mount `createWorkflowRemoteStepPreRoute` from `@proofoftech/flowsafe/agent-host` on the private state Worker. The route uses the existing private administrative credential and the run’s stored initiating principal. An ordinary actor bearer cannot invoke it.
+
+Override `DurableObjectRunner.workflowRemoteSteps(env, runtime)` to construct and initialize the journal against the supplied runtime and that deployment’s D1 database and execution fence. Return the initialized journal. The default hook disables continuation; the host must opt in. Register the trusted workflow through the normal runtime registry, and use a top-level step ID without dots for the remote suspension.
+
+After the private result operation retains verified bytes, call `POST /_flowsafe/workflow-remote-step/resume` with `{"invocationId":"your_invocation_id"}`. The owning RunDO checks stored start authority, current ownership, suspension and fence before admitting the continuation. It passes a `WorkflowRemoteStepResumeData` envelope under `WORKFLOW_REMOTE_STEP_RESULT_KEY` to the step’s `resumeData`. Both exports are available from `@proofoftech/flowsafe/do-runner`. The trusted workflow parses the retained `resultJson` and validates its application result schema. Result data cannot authorize further effects or supply execution identity.
+
+Ordinary `/resume` refuses the reserved envelope. A successful private resume returns `{kind:'applied', invocationId, summary}`. A later call returns `{kind:'already-applied', invocationId}` without executing again, including after terminal ownership cleanup when retained start authority still verifies. A present conflicting owner refuses the request.
+
+The resume lease permits one engine admission. If a process stops after admission without a matching persisted outcome witness, the invocation stays `resuming` and remains in drain inventory. Neither an expired lease, a fresh isolate nor an unchanged suspension authorizes replay. The private route returns an error for this unresolved state. General automatic Mastra continuation recovery is unsupported.
+
 ### Snapshot provenance
 
 Flowsafe stores trusted run provenance under reserved request-context keys in the same authoritative snapshot as the workflow state. Provenance records the initiating actor, a per-leg attempt token, and a monotonic ordinal per run and step:

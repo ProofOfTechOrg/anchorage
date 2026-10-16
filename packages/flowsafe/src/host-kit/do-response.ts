@@ -20,6 +20,7 @@ import {
   type StartExecutionIdentity,
 } from '../do-runner/execution-admission.js';
 import type { RunSummary } from '../do-runner/index.js';
+import type { WorkflowRemoteStepResumeResult } from '../do-runner/remote-step-journal.js';
 import { isRunTerminalErrorCode } from '../do-runner/run-lifecycle.js';
 import { isRunStatus } from '../do-runner/run-terminal-state.js';
 import type { PersistedStartResult } from '../do-runner/start-idempotency.js';
@@ -128,6 +129,31 @@ export async function doSummary(response: DoResponseLike): Promise<RunSummary> {
     throw await objectAnswerError('run-object', response, 'run');
   }
   return (await response.json()) as RunSummary;
+}
+
+/** @internal */
+export async function doWorkflowRemoteStepResume(
+  response: DoResponseLike,
+  invocationId: string,
+  runId: string,
+): Promise<WorkflowRemoteStepResumeResult> {
+  if (!response.ok)
+    throw await objectAnswerError('run-object', response, 'run');
+  const value: unknown = await response.json();
+  if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
+    const body = value as Record<string, unknown>;
+    if (body.invocationId === invocationId) {
+      if (body.kind === 'already-applied' && Object.keys(body).length === 2)
+        return { kind: 'already-applied', invocationId };
+      if (body.kind === 'applied' && Object.keys(body).length === 3)
+        return {
+          kind: 'applied',
+          invocationId,
+          summary: publicRunSummary(body.summary, runId),
+        };
+    }
+  }
+  throw new RunRouteError(503, 'remote step outcome is unreadable');
 }
 
 const EXECUTION_AUTHORITY_FIELDS = new Set([

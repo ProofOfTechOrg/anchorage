@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import { isOwnedBy, samePrincipal } from '../approval-api/principal.js';
 import { doErrorResponse } from '../do-runner/do-error-response.js';
 import { isPathSafeId } from '../do-runner/path-safe-id.js';
 import type { RemoteStepPermit } from '../do-runner/remote-step-journal.js';
@@ -7,6 +8,7 @@ import type {
   FlowsafeWorkerConfig,
   FlowsafeWorkerEnv,
 } from '../host-kit/flowsafe-worker.js';
+import { requireResourceAccess } from '../host-kit/resource-access.js';
 import {
   RunRouteError,
   runRouteErrorBody,
@@ -27,13 +29,14 @@ export type WorkflowDispatchPort = Pick<
   | 'recordWorkflowRemoteStepResult'
 >;
 
-type Operation = 'register' | 'ticket' | 'consume' | 'result';
+type Operation = 'register' | 'ticket' | 'consume' | 'result' | 'resume';
 
 const fields: Record<Operation, readonly string[]> = {
   register: ['workflowId', 'runId', 'hostDeadlineAt'],
   ticket: ['invocationId', 'lifetimeMs'],
   consume: ['permit'],
   result: ['invocationId', 'rawPermit', 'resultJson', 'evidenceJson'],
+  resume: ['invocationId'],
 };
 
 function json(value: unknown, status = 200): Response {
@@ -140,6 +143,43 @@ export function createWorkflowRemoteStepPreRoute(
         invocationId,
       );
       if (!context) return json({ error: 'invocation not found' }, 404);
+      if (operation === 'resume') {
+        const invocation = await journal.getWorkflow(invocationId);
+        if (
+          invocation?.targetKind !== 'workflow' ||
+          invocation.invocationId !== invocationId ||
+          invocation.deploymentId !== journal.deploymentId ||
+          invocation.tablePrefix !== journal.tablePrefix ||
+          !samePrincipal(invocation.principal, context.principal)
+        )
+          return json({ error: 'invocation not found' }, 404);
+        const owner = await context.resourceOwnerFor('run', invocation.runId);
+        if (owner !== undefined) {
+          if (!isOwnedBy(owner, invocation.principal))
+            return json({ error: 'run not found' }, 404);
+          await requireResourceAccess(
+            context,
+            'run',
+            invocation.runId,
+            'write',
+            'run',
+          );
+        } else if (
+          invocation.status !== 'settled' ||
+          invocation.settlementOutcome !== 'applied'
+        ) {
+          return json({ error: 'run not found' }, 404);
+        }
+        return json(
+          await kit.topology.resumeWorkflowRemoteStep(
+            invocation.workflowId,
+            invocation.runId,
+            invocationId,
+            context.principal,
+            context.mutationEpoch,
+          ),
+        );
+      }
       if (operation === 'ticket') {
         if (
           !Number.isSafeInteger(body.lifetimeMs) ||
