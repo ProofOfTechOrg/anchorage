@@ -29,6 +29,7 @@ import {
   notificationTimestampMillis,
   notificationTimestampSql,
 } from '../do-runner/notification-predicate.js';
+import { isPathSafeId } from '../do-runner/path-safe-id.js';
 import { validateTablePrefix } from '../do-runner/table-prefix.js';
 import { nonnegativeSafeInteger } from '../numeric-config.js';
 import {
@@ -40,12 +41,71 @@ import {
   type SignalDatabase,
   type SignalStatement,
 } from './d1-shared.js';
-import type {
-  NotificationDeliveryFailure,
-  NotificationDeliveryObservation,
-  NotificationDeliveryStorage,
-  NotificationDeliveryUpdateResult,
-} from './notification-dispatch.js';
+
+/** Scalar values preserve the attempted observation across asynchronous writes. */
+export type NotificationDeliveryObservation = Readonly<{
+  id: string;
+  threadId: string;
+  source: string;
+  kind: string;
+  priority: NotificationRecord['priority'];
+  status: NotificationRecord['status'];
+  summary: string;
+  payload: string | null;
+  resourceId: string | null;
+  agentId: string | null;
+  sourceId: string | null;
+  dedupeKey: string | null;
+  coalesceKey: string | null;
+  coalescedCount: number;
+  attributes: string | null;
+  createdAt: string;
+  updatedAt: string;
+  deliverAt: string | null;
+  summaryAt: string | null;
+  deliveryReason: string | null;
+  deliveryAttempts: number;
+  lastDeliveryAttemptAt: string | null;
+  lastDeliveryError: string | null;
+  deliveredSignalId: string | null;
+  summarySignalId: string | null;
+  deliveredAt: string | null;
+  seenAt: string | null;
+  dismissedAt: string | null;
+  archivedAt: string | null;
+  discardedAt: string | null;
+  metadata: string | null;
+}>;
+
+export type NotificationDeliveryFailure =
+  | Readonly<{
+      type: 'retry';
+      updatedAt: string;
+      deliveryAttempts: number;
+      lastDeliveryAttemptAt: string;
+      lastDeliveryError: string;
+      deliverAt?: string;
+      summaryAt?: string;
+    }>
+  | Readonly<{
+      type: 'discard';
+      updatedAt: string;
+      deliveryAttempts: number;
+      lastDeliveryAttemptAt: string;
+      lastDeliveryError: string;
+    }>
+  | Readonly<{ type: 'exhausted'; updatedAt: string }>;
+
+export type NotificationDeliveryUpdateResult =
+  | { applied: true; record: NotificationRecord }
+  | { applied: false };
+
+export interface NotificationDeliveryStorage extends NotificationsStorage {
+  updateNotificationDeliveryIfUnchanged(input: {
+    expected: NotificationDeliveryObservation;
+    failure: NotificationDeliveryFailure;
+  }): Promise<NotificationDeliveryUpdateResult>;
+}
 
 /** The raw row shape `mastra_notifications` stores and `rowToRecord` reads. */
 interface NotificationRow {
@@ -332,6 +392,76 @@ function isDuplicateColumn(error: unknown): boolean {
  * a template literal is one the census can only match by restating it.
  */
 export const NOTIFICATION_SEQUENCE_TABLE = 'flowsafe_notification_sequence';
+export const NOTIFICATION_OPERATION_PROJECTION_VERSION =
+  'notification-record-values-v1';
+export const NOTIFICATION_OPERATION_RECEIPTS_TABLE =
+  'flowsafe_notification_operation_receipts';
+export const NOTIFICATION_RECEIPT_SCOPE_TABLE =
+  'flowsafe_notification_receipt_scope';
+export const DEFAULT_NOTIFICATION_OPERATION_RECEIPT_LIMIT = 100_000;
+
+export type NotificationOperationInput = CreateNotificationInput & {
+  id: string;
+  createdAt: Date;
+};
+
+export async function projectNotificationOperation(
+  input: NotificationOperationInput,
+): Promise<{
+  version: typeof NOTIFICATION_OPERATION_PROJECTION_VERSION;
+  values: unknown[];
+  requestJson: string;
+  requestDigest: string;
+}> {
+  if (
+    !isPathSafeId(input.id) ||
+    !isPathSafeId(input.threadId) ||
+    !(input.createdAt instanceof Date) ||
+    !Number.isFinite(input.createdAt.getTime())
+  )
+    throw new TypeError('notification operation identity is malformed');
+  const record: NotificationRecord = {
+    id: input.id,
+    threadId: input.threadId,
+    source: input.source,
+    kind: input.kind,
+    priority: input.priority ?? 'medium',
+    status: 'pending',
+    summary: input.summary,
+    payload: input.payload,
+    resourceId: input.resourceId,
+    agentId: input.agentId,
+    sourceId: input.sourceId,
+    dedupeKey: input.dedupeKey,
+    coalesceKey: input.coalesceKey,
+    coalescedCount: 1,
+    attributes: input.attributes,
+    createdAt: input.createdAt,
+    updatedAt: input.createdAt,
+    deliverAt: input.deliverAt,
+    summaryAt: input.summaryAt,
+    deliveryReason: input.deliveryReason,
+    deliveryAttempts: 0,
+    metadata: input.metadata,
+  };
+  const values = recordValues(record);
+  validateNotificationDeliveryValues(values, true);
+  const requestJson = JSON.stringify(values);
+  const digestBytes = new Uint8Array(
+    await crypto.subtle.digest(
+      'SHA-256',
+      new TextEncoder().encode(requestJson),
+    ),
+  );
+  return {
+    version: NOTIFICATION_OPERATION_PROJECTION_VERSION,
+    values,
+    requestJson,
+    requestDigest: Array.from(digestBytes, (byte) =>
+      byte.toString(16).padStart(2, '0'),
+    ).join(''),
+  };
+}
 
 export class D1NotificationsStorage
   extends NotificationsStorage
@@ -340,17 +470,37 @@ export class D1NotificationsStorage
   readonly #db: SignalDatabase;
   readonly #table: string;
   readonly #sequenceTable: string;
+  readonly #operationReceiptTable: string;
+  readonly #operationReceiptLimit: number;
+  readonly #prefix: string;
   readonly #ordinalIndex: string;
   readonly #legacyReplaceTrigger: string;
   readonly #legacyInsertTrigger: string;
   #ready?: Promise<void>;
+  #receiptScopeReady?: Promise<void>;
 
-  constructor(db: SignalDatabase, tablePrefix = '') {
+  constructor(
+    db: SignalDatabase,
+    tablePrefix = '',
+    operationReceiptLimit = DEFAULT_NOTIFICATION_OPERATION_RECEIPT_LIMIT,
+  ) {
     super();
     const prefix = validateTablePrefix(tablePrefix) ?? '';
     this.#db = db;
+    this.#prefix = prefix;
     this.#table = `${prefix}mastra_notifications`;
     this.#sequenceTable = `${prefix}${NOTIFICATION_SEQUENCE_TABLE}`;
+    this.#operationReceiptTable = `${prefix}${NOTIFICATION_OPERATION_RECEIPTS_TABLE}`;
+    this.#operationReceiptLimit = nonnegativeSafeInteger(
+      operationReceiptLimit,
+      'operationReceiptLimit',
+    );
+    if (
+      this.#operationReceiptLimit > DEFAULT_NOTIFICATION_OPERATION_RECEIPT_LIMIT
+    )
+      throw new RangeError(
+        'operationReceiptLimit exceeds the deployment maximum',
+      );
     this.#ordinalIndex = `idx_${this.#table}_insertion_ordinal`;
     this.#legacyReplaceTrigger = `trg_${this.#table}_preserve_insertion_ordinal`;
     this.#legacyInsertTrigger = `trg_${this.#table}_allocate_insertion_ordinal`;
@@ -413,6 +563,25 @@ export class D1NotificationsStorage
       )
       .run();
     await this.#migrateOrdinalSchema(true);
+    await this.#db
+      .prepare(
+        `CREATE TABLE IF NOT EXISTS ${this.#operationReceiptTable} (
+           operation_key TEXT PRIMARY KEY,
+           request_digest TEXT NOT NULL,
+           thread_id TEXT NOT NULL,
+           notification_id TEXT NOT NULL,
+           UNIQUE (thread_id, notification_id)
+         )`,
+      )
+      .run();
+    await this.#db
+      .prepare(`CREATE TABLE IF NOT EXISTS ${NOTIFICATION_RECEIPT_SCOPE_TABLE} (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        version INTEGER NOT NULL CHECK (version = 1),
+        table_prefix TEXT NOT NULL,
+        receipt_limit INTEGER NOT NULL CHECK (receipt_limit BETWEEN 0 AND ${DEFAULT_NOTIFICATION_OPERATION_RECEIPT_LIMIT})
+      )`)
+      .run();
   }
 
   async #migrateOrdinalSchema(retryDuplicateColumn: boolean): Promise<void> {
@@ -545,6 +714,240 @@ export class D1NotificationsStorage
 
   async init(): Promise<void> {
     await this.#ensureSchema();
+  }
+
+  #ensureReceiptScope(): Promise<void> {
+    if (!this.#receiptScopeReady) {
+      this.#receiptScopeReady = this.#registerReceiptScope().catch(
+        (error: unknown) => {
+          this.#receiptScopeReady = undefined;
+          throw error;
+        },
+      );
+    }
+    return this.#receiptScopeReady;
+  }
+
+  async #registerReceiptScope(): Promise<void> {
+    const legacyTables = await this.#db
+      .prepare(`SELECT name FROM sqlite_master
+        WHERE type = 'table' AND substr(name, -length(?)) = ?`)
+      .bind(
+        NOTIFICATION_OPERATION_RECEIPTS_TABLE,
+        NOTIFICATION_OPERATION_RECEIPTS_TABLE,
+      )
+      .all<{ name: string }>();
+    for (const { name } of legacyTables.results) {
+      const prefix = name.slice(
+        0,
+        -NOTIFICATION_OPERATION_RECEIPTS_TABLE.length,
+      );
+      if (validateTablePrefix(prefix) !== prefix)
+        throw new Error('notification receipt history has an invalid prefix');
+      const retained = await this.#db
+        .prepare(`SELECT 1 AS retained FROM "${name}" LIMIT 1`)
+        .first<{ retained: number }>();
+      if (retained && prefix !== this.#prefix)
+        throw new Error('notification receipt history spans another prefix');
+    }
+    const columns = await this.#db
+      .prepare(`PRAGMA table_info(${NOTIFICATION_RECEIPT_SCOPE_TABLE})`)
+      .all<{ name: string; type: string; notnull: number; pk: number }>();
+    if (
+      JSON.stringify(
+        columns.results.map(({ name, type, notnull, pk }) => [
+          name,
+          type,
+          notnull,
+          pk,
+        ]),
+      ) !==
+      JSON.stringify([
+        ['id', 'INTEGER', 0, 1],
+        ['version', 'INTEGER', 1, 0],
+        ['table_prefix', 'TEXT', 1, 0],
+        ['receipt_limit', 'INTEGER', 1, 0],
+      ])
+    )
+      throw new Error('notification receipt scope schema is unknown');
+    await this.#db
+      .prepare(`INSERT INTO ${NOTIFICATION_RECEIPT_SCOPE_TABLE}
+        (id, version, table_prefix, receipt_limit)
+        VALUES (1, 1, ?, ?) ON CONFLICT(id) DO NOTHING`)
+      .bind(this.#prefix, this.#operationReceiptLimit)
+      .run();
+    const scopes = await this.#db
+      .prepare(`SELECT id, version, table_prefix, receipt_limit
+        FROM ${NOTIFICATION_RECEIPT_SCOPE_TABLE}`)
+      .all<{
+        id: number;
+        version: number;
+        table_prefix: string;
+        receipt_limit: number;
+      }>();
+    if (
+      scopes.results.length !== 1 ||
+      scopes.results[0]?.id !== 1 ||
+      scopes.results[0]?.version !== 1 ||
+      scopes.results[0]?.table_prefix !== this.#prefix ||
+      scopes.results[0]?.receipt_limit !== this.#operationReceiptLimit
+    )
+      throw new Error(
+        'notification receipt scope differs from this deployment',
+      );
+  }
+
+  async createNotificationOnce(
+    operationKey: string,
+    input: NotificationOperationInput,
+  ): Promise<{
+    operationKey: string;
+    notificationId: string;
+    threadId: string;
+    requestDigest: string;
+  }> {
+    if (
+      !isPathSafeId(operationKey) ||
+      !isPathSafeId(input.id) ||
+      !isPathSafeId(input.threadId) ||
+      !(input.createdAt instanceof Date) ||
+      !Number.isFinite(input.createdAt.getTime())
+    ) {
+      throw new TypeError('notification operation identity is malformed');
+    }
+    await this.#ensureSchema();
+    await this.#ensureReceiptScope();
+    const batch = this.#db.batch?.bind(this.#db);
+    if (!batch)
+      throw new Error('notification operation requires database.batch()');
+    const { values, requestDigest } = await projectNotificationOperation(input);
+    const receipt = {
+      operationKey,
+      notificationId: input.id,
+      threadId: input.threadId,
+      requestDigest,
+    };
+    const readReceipt = async () =>
+      this.#db
+        .prepare(
+          `SELECT request_digest, thread_id, notification_id
+           FROM ${this.#operationReceiptTable} WHERE operation_key = ?`,
+        )
+        .bind(operationKey)
+        .first<{
+          request_digest: string;
+          thread_id: string;
+          notification_id: string;
+        }>();
+    const existing = await readReceipt();
+    if (existing) {
+      if (existing.request_digest !== requestDigest)
+        throw new Error('notification operation has a different request');
+      return {
+        operationKey,
+        notificationId: existing.notification_id,
+        threadId: existing.thread_id,
+        requestDigest: existing.request_digest,
+      };
+    }
+    try {
+      // The inbox's legacy insert trigger updates existing IDs, so the receipt
+      // reserves both the operation key and inbox identity before insertion.
+      await batch([
+        this.#db
+          .prepare(
+            `INSERT INTO ${this.#operationReceiptTable}
+             (operation_key, request_digest, thread_id, notification_id)
+             SELECT ?, ?, ?, ?
+             WHERE NOT EXISTS (
+               SELECT 1 FROM ${this.#table}
+               WHERE thread_id = ? AND id = ?
+             ) AND (
+               SELECT COUNT(*) FROM ${this.#operationReceiptTable}
+             ) < ?`,
+          )
+          .bind(
+            operationKey,
+            requestDigest,
+            input.threadId,
+            input.id,
+            input.threadId,
+            input.id,
+            this.#operationReceiptLimit,
+          ),
+        this.#db
+          .prepare(
+            `INSERT INTO ${this.#table} (${NOTIFICATION_COLUMNS.join(', ')})
+             SELECT ${NOTIFICATION_COLUMNS.map(() => '?').join(', ')}
+             WHERE changes() = 1 AND EXISTS (
+               SELECT 1 FROM ${this.#operationReceiptTable}
+               WHERE operation_key = ? AND request_digest = ?
+             )`,
+          )
+          .bind(...values, operationKey, requestDigest),
+      ]);
+      const committed = await readReceipt();
+      if (!committed) {
+        const count = await this.#db
+          .prepare(
+            `SELECT COUNT(*) AS count FROM ${this.#operationReceiptTable}`,
+          )
+          .first<{ count: number }>();
+        if (count && count.count >= this.#operationReceiptLimit)
+          throw new Error('notification operation receipt cap reached');
+        throw new Error('notification operation was not committed');
+      }
+      return receipt;
+    } catch (error) {
+      const committed = await readReceipt();
+      if (!committed) throw error;
+      if (committed.request_digest !== requestDigest)
+        throw new Error('notification operation has a different request');
+      return {
+        operationKey,
+        notificationId: committed.notification_id,
+        threadId: committed.thread_id,
+        requestDigest: committed.request_digest,
+      };
+    }
+  }
+
+  async readNotificationOperationReceipt(operationKey: string): Promise<
+    | {
+        operationKey: string;
+        notificationId: string;
+        threadId: string;
+        requestDigest: string;
+      }
+    | undefined
+  > {
+    if (!isPathSafeId(operationKey))
+      throw new TypeError('notification operation identity is malformed');
+    await this.#ensureSchema();
+    const row = await this.#db
+      .prepare(
+        `SELECT request_digest, thread_id, notification_id
+       FROM ${this.#operationReceiptTable} WHERE operation_key = ?`,
+      )
+      .bind(operationKey)
+      .first<{
+        request_digest: string;
+        thread_id: string;
+        notification_id: string;
+      }>();
+    if (!row) return undefined;
+    if (
+      !/^[a-f0-9]{64}$/.test(row.request_digest) ||
+      !isPathSafeId(row.thread_id) ||
+      !isPathSafeId(row.notification_id)
+    )
+      throw new Error('notification operation receipt is unreadable');
+    return {
+      operationKey,
+      notificationId: row.notification_id,
+      threadId: row.thread_id,
+      requestDigest: row.request_digest,
+    };
   }
 
   async createNotification(

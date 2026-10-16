@@ -111,6 +111,7 @@ const AUTH = {
 const STREAM_TICKET_SECRET = 'spike-local-stream-secret-do-not-deploy';
 const DEPLOYMENT_TENANT = 'spike';
 const DEPLOYMENT_IDENTITY_SECRET = 'spike-local-deployment-identity-secret';
+const PRIVATE_REMOTE_SECRET = 'spike-local-private-admin-secret-2026';
 const nowSec = () => Math.floor(Date.now() / 1000);
 
 // Track E (M-007): the github webhook signing secret. MUST equal
@@ -168,6 +169,8 @@ function startServer(generation, stateDir, logPath) {
       `DEPLOYMENT_TENANT:${DEPLOYMENT_TENANT}`,
       '--var',
       `DEPLOYMENT_IDENTITY_SECRET:${DEPLOYMENT_IDENTITY_SECRET}`,
+      '--var',
+      `MAINTENANCE_ADMIN_SECRET:${PRIVATE_REMOTE_SECRET}`,
       // Sign stream tickets with the SAME key spike-verify forges with, so the
       // ticket fail-closed probes exercise CLAIM rejection, not signature drift.
       '--var',
@@ -176,6 +179,11 @@ function startServer(generation, stateDir, logPath) {
       // with, so a valid webhook is ACCEPTED and a forged one REJECTED (E-S2).
       '--var',
       `GITHUB_WEBHOOK_SECRET:${GITHUB_WEBHOOK_SECRET}`,
+      ...(generation.startsWith('gen-remote-') ||
+      generation.startsWith('gen-workflow-remote-') ||
+      generation.startsWith('gen-private-remote-')
+        ? ['--var', 'SPIKE_REMOTE_STEP_PROOF:enabled']
+        : []),
     ],
     {
       cwd: FLOWSAFE,
@@ -437,7 +445,7 @@ async function readInventoryIndex() {
 }
 
 // One category, PAGED TO EXHAUSTION through the inventory's own cursors — the
-// sweep an operator's drain proof is actually made of, not a single page that
+// sweep an operator's drain proof needs, not a single page that
 // could hide the rows behind it. `limit: 3` forces several continuations even
 // on the spike's small data, so the keyset is exercised rather than skipped.
 async function sweepInventoryCategory(category) {
@@ -466,7 +474,7 @@ async function sweepInventoryCategory(category) {
   throw new Error(`inventory paging did not terminate for ${category}`);
 }
 
-// Every WORK category, swept. The drain proof is defined over exactly these.
+// Every WORK category, swept for the seeded-row visibility check.
 async function sweepInventoryWork(index) {
   const work = index.categories.filter((entry) => entry.class === 'work');
   const swept = {};
@@ -764,6 +772,18 @@ async function main() {
 
   await step('gen-1: server ready', () =>
     launchServer('gen-1', stateDir, join(tmpDir, 'gen1.log')),
+  );
+
+  await step(
+    'RS0 remote-step fixture is absent unless explicitly enabled',
+    async () => {
+      const absent = await http('GET', '/spike/remote-step/scan');
+      assert(
+        absent.status === 404,
+        'remote-step fixture stays unmounted',
+        absent,
+      );
+    },
   );
 
   await step(
@@ -3183,13 +3203,13 @@ async function main() {
     },
   );
 
-  // --- Drain inventory (F2): the migration proof, on real workerd -----------
+  // --- Drain inventory (F2): seeded-row visibility on real workerd ----------
   // Unit tests can prove the queries are pure SELECTs against the real schemas.
   // What they cannot prove is that those queries read the SAME D1 that real
   // HTTP traffic on real workerd wrote its runs, approvals, reservations,
   // notifications, and tasks into — and that the numbers MOVE as that work
   // drains. An inventory that reported the right shape over the wrong database
-  // would pass every unit test and certify a deployment that still owed work.
+  // would pass every unit test while missing this work.
 
   await step(
     'FV1 inventory index: every category, its class, the states no query can ' +
@@ -3203,7 +3223,9 @@ async function main() {
         .filter((entry) => entry.class === 'standing')
         .map((entry) => entry.category);
       assert(
-        work.length === 7 && standing.length === 2,
+        work.length === 8 &&
+          work.includes('remote-steps') &&
+          standing.length === 2,
         'the index splits work from standing configuration',
         { work, standing },
       );
@@ -3225,16 +3247,13 @@ async function main() {
   );
 
   await step(
-    'FV2 drain proof: seeded work appears while draining, leaves as it is ' +
-      'finished, and reads empty across TWO consecutive sweeps before the lock',
+    'FV2 seeded inventory: work appears while draining, leaves as it is ' +
+      'finished, and stays absent under the lock',
     async () => {
       const index = await readInventoryIndex();
 
-      // A BASELINE, because this deployment has been running scenarios for the
-      // whole spike and legitimately still holds work from them. The proof
-      // below is over the seeded DELTA: these exact rows appear, and these
-      // exact rows are gone — which is the same claim an empty sweep makes,
-      // stated about rows whose lifecycle this step controls.
+      // A baseline accounts for work left by earlier spike scenarios. This
+      // check follows the seeded rows; it does not prove that all work drained.
       const before = await sweepInventoryWork(index);
 
       // Seed: a suspended run with a pending approval, and a keyed start
@@ -3322,9 +3341,8 @@ async function main() {
         keyedDecided,
       );
 
-      // The proof: the seeded rows are gone, and STILL gone on a second full
-      // sweep. One sweep is a point-in-time reading: traffic can still create
-      // or complete work while it runs, so the contract asks for two.
+      // The seeded rows are gone on repeated reads. A migration drain proof
+      // also requires an empty work inventory across the recovery interval.
       const gone = (sweep) =>
         !sweep.runs.keys.some((key) => key.endsWith(`/${drained.runId}`)) &&
         !sweep.runs.keys.some((key) => key.endsWith(`/${keyed.body.runId}`)) &&
@@ -3340,7 +3358,7 @@ async function main() {
       const second = await sweepInventoryWork(index);
       assert(
         gone(second),
-        'the second consecutive sweep agrees — the drain proof holds',
+        'the repeated sweep no longer reports the seeded work',
         {
           runs: second.runs.keys,
           approvals: second['approvals-waiting'].keys,
@@ -3357,18 +3375,16 @@ async function main() {
       );
       assert(
         schedules.class === 'standing' && schedules.keys.length >= 1,
-        'schedules are still reported while the drain proof passes',
+        'schedules are still reported while seeded work clears',
         schedules,
       );
       assert(
         subscriptions.class === 'standing' && subscriptions.keys.length >= 1,
-        'provider subscriptions are still reported while the proof passes',
+        'provider subscriptions are still reported while seeded work clears',
         subscriptions,
       );
 
-      // Lock: the proof held, so the deployment may stop executing. The
-      // inventory keeps answering — reads are ungated in every state, which is
-      // what lets an operator verify the lock they just took.
+      // The lock keeps inventory reads available while refusing new execution.
       await moveFence('draining', 'migration-locked');
       const locked = await sweepInventoryWork(index);
       assert(
@@ -3381,11 +3397,446 @@ async function main() {
         headers: AUTH.operator,
       });
       assertFenced(
-        'a run start after the drain proof locked the deployment',
+        'a run start under the migration lock',
         refusedStart,
         'migration-locked',
       );
       await moveFence('migration-locked', 'open');
+    },
+  );
+
+  await step(
+    'RS1 remote-step journal: real D1 permit winner and retained result survive process death',
+    async () => {
+      await killServer(currentServer);
+      // The fixture status is stale so a summary detached from the persisted
+      // snapshot cannot register the still-suspended run.
+      await executeLocalD1(
+        stateDir,
+        'CREATE TABLE spike_remote_step_fixture (id INTEGER PRIMARY KEY, resource_id TEXT NOT NULL, status TEXT NOT NULL); ' +
+          "INSERT INTO spike_remote_step_fixture VALUES (1, 'account-7', 'success'); " +
+          'CREATE TABLE spike_remote_mastra_workflow_snapshot (workflow_name TEXT NOT NULL, run_id TEXT NOT NULL, snapshot TEXT NOT NULL, PRIMARY KEY (workflow_name, run_id)); ' +
+          "INSERT INTO spike_remote_mastra_workflow_snapshot VALUES ('durable-agentic-loop', 'spike-remote-run', '{\"status\":\"suspended\"}');",
+      );
+      await launchServer(
+        'gen-remote-1',
+        stateDir,
+        join(tmpDir, 'gen-remote-1.log'),
+      );
+      const wrong = await http('POST', '/spike/remote-step/register', {
+        body: { resourceId: 'spike-remote-thread' },
+      });
+      assert(
+        wrong.status === 409,
+        'the thread id cannot stand in for the mapped resource',
+        wrong,
+      );
+      const registered = await http('POST', '/spike/remote-step/register', {
+        body: { resourceId: 'account-7' },
+      });
+      assert(
+        registered.status === 200 &&
+          typeof registered.body.invocationId === 'string',
+        'the mapped-resource invocation was registered',
+        registered,
+      );
+      const invocationId = registered.body.invocationId;
+      const issued = await http('POST', '/spike/remote-step/issue', {
+        body: { invocationId },
+      });
+      assert(
+        issued.status === 200 && issued.body.generation === 1,
+        'the dispatch permit was issued',
+        issued,
+      );
+      const attempts = await Promise.all(
+        [0, 1].map(() =>
+          http('POST', '/spike/remote-step/consume', {
+            body: { permit: issued.body },
+          }),
+        ),
+      );
+      assert(
+        attempts.filter((attempt) => attempt.body.kind === 'accepted')
+          .length === 1 &&
+          attempts.filter((attempt) => attempt.body.kind === 'already-consumed')
+            .length === 1,
+        'concurrent permit consumption has one winner',
+        attempts,
+      );
+      const rawPermit = attempts.find(
+        (attempt) => attempt.body.kind === 'accepted',
+      ).body.rawPermit;
+      const recorded = await http('POST', '/spike/remote-step/record', {
+        body: { invocationId, rawPermit },
+      });
+      assert(
+        recorded.status === 200 && recorded.body.kind === 'recorded',
+        'the result was retained',
+        recorded,
+      );
+      await killServer(currentServer);
+      await executeLocalD1(
+        stateDir,
+        "UPDATE spike_remote_step_fixture SET resource_id = 'account-8' WHERE id = 1;",
+      );
+      await launchServer(
+        'gen-remote-2',
+        stateDir,
+        join(tmpDir, 'gen-remote-2.log'),
+      );
+      const retained = await http(
+        'GET',
+        `/spike/remote-step/read?invocationId=${invocationId}`,
+      );
+      assert(
+        retained.status === 200 &&
+          retained.body.invocation.status === 'result-retained' &&
+          retained.body.result.resultJson === '{"answer":1}',
+        'fresh workerd process reads the persisted result',
+        retained,
+      );
+      const permitReplay = await http('POST', '/spike/remote-step/consume', {
+        body: { permit: issued.body },
+      });
+      assert(
+        permitReplay.status === 200 &&
+          permitReplay.body.kind === 'already-consumed',
+        'fresh process refuses to grant the consumed permit again',
+        permitReplay,
+      );
+      const resultReplay = await http('POST', '/spike/remote-step/record', {
+        body: { invocationId, rawPermit },
+      });
+      assert(
+        resultReplay.status === 200 && resultReplay.body.kind === 'replay',
+        'fresh process reads the retained result without a second effect',
+        resultReplay,
+      );
+      const displaced = await http('POST', '/spike/remote-step/claim', {
+        body: { invocationId },
+      });
+      assert(
+        displaced.status === 409,
+        'changed mapped-resource provenance refuses a resume claim',
+        displaced,
+      );
+      await killServer(currentServer);
+      await executeLocalD1(
+        stateDir,
+        "UPDATE spike_remote_step_fixture SET resource_id = 'account-7' WHERE id = 1;",
+      );
+      await launchServer(
+        'gen-remote-3',
+        stateDir,
+        join(tmpDir, 'gen-remote-3.log'),
+      );
+      const scan = await http('GET', '/spike/remote-step/scan');
+      assert(
+        scan.status === 200 && scan.body.invocationIds.includes(invocationId),
+        'fresh process recovery scan finds the retained result',
+        scan,
+      );
+      const claimed = await http('POST', '/spike/remote-step/claim', {
+        body: { invocationId },
+      });
+      assert(
+        claimed.status === 200 && typeof claimed.body.owner === 'string',
+        'one resume claim was persisted',
+        claimed,
+      );
+      await killServer(currentServer);
+      await executeLocalD1(
+        stateDir,
+        'UPDATE spike_remote_mastra_workflow_snapshot SET snapshot = \'{"status":"success"}\' WHERE run_id = \'spike-remote-run\';',
+      );
+      await launchServer(
+        'gen-remote-4',
+        stateDir,
+        join(tmpDir, 'gen-remote-4.log'),
+      );
+      const ambiguous = await http('POST', '/spike/remote-step/reconcile', {
+        body: { invocationId },
+      });
+      assert(
+        ambiguous.status === 200 &&
+          ambiguous.body.outcome === 'pending-quiescence',
+        'fresh process does not replay an ambiguous resume',
+        ambiguous,
+      );
+      const settled = await http('POST', '/spike/remote-step/settle', {
+        body: { invocationId, owner: claimed.body.owner },
+      });
+      assert(
+        settled.status === 200 &&
+          settled.body.outcome === 'advanced-without-proof',
+        'advanced snapshot without a returned witness remains unresolved',
+        settled,
+      );
+      const final = await http(
+        'GET',
+        `/spike/remote-step/read?invocationId=${invocationId}`,
+      );
+      assert(
+        final.status === 200 &&
+          final.body.invocation.status === 'failed' &&
+          final.body.invocation.settlementOutcome === 'advanced-without-proof',
+        'the unresolved outcome remains durable',
+        final,
+      );
+      const drain = await sweepInventoryCategory('remote-steps');
+      assert(
+        drain.class === 'work' && drain.keys.includes(invocationId),
+        'the unresolved result remains in operator drain inventory',
+        drain,
+      );
+    },
+  );
+
+  await step(
+    'RS2 workflow-target journal: D1 permit and retained result survive process death without resume',
+    async () => {
+      await killServer(currentServer);
+      await executeLocalD1(
+        stateDir,
+        "INSERT INTO spike_remote_mastra_workflow_snapshot VALUES ('durable-agentic-loop', 'spike-workflow-run', '{\"status\":\"suspended\"}');",
+      );
+      await launchServer(
+        'gen-workflow-remote-1',
+        stateDir,
+        join(tmpDir, 'gen-workflow-remote-1.log'),
+      );
+      const registered = await http(
+        'POST',
+        '/spike/remote-step/workflow-register',
+        {
+          body: {},
+        },
+      );
+      assert(
+        registered.status === 200 &&
+          registered.body.targetKind === 'workflow' &&
+          typeof registered.body.invocationId === 'string',
+        'trusted workflow provenance registered a workflow row',
+        registered,
+      );
+      const invocationId = registered.body.invocationId;
+      const issued = await http('POST', '/spike/remote-step/workflow-issue', {
+        body: { invocationId },
+      });
+      assert(
+        issued.status === 200 && issued.body.generation === 1,
+        'workflow dispatch permit was issued',
+        issued,
+      );
+      const attempts = await Promise.all(
+        [0, 1].map(() =>
+          http('POST', '/spike/remote-step/workflow-consume', {
+            body: { permit: issued.body },
+          }),
+        ),
+      );
+      assert(
+        attempts.filter((attempt) => attempt.body.kind === 'accepted')
+          .length === 1 &&
+          attempts.filter((attempt) => attempt.body.kind === 'already-consumed')
+            .length === 1,
+        'workflow permit consumption has one winner',
+        attempts,
+      );
+      const rawPermit = attempts.find(
+        (attempt) => attempt.body.kind === 'accepted',
+      ).body.rawPermit;
+      const recorded = await http(
+        'POST',
+        '/spike/remote-step/workflow-record',
+        {
+          body: { invocationId, rawPermit },
+        },
+      );
+      assert(
+        recorded.status === 200 && recorded.body.kind === 'recorded',
+        'workflow result was retained',
+        recorded,
+      );
+      await killServer(currentServer);
+      await launchServer(
+        'gen-workflow-remote-2',
+        stateDir,
+        join(tmpDir, 'gen-workflow-remote-2.log'),
+      );
+      const retained = await http(
+        'GET',
+        `/spike/remote-step/workflow-read?invocationId=${invocationId}`,
+      );
+      assert(
+        retained.status === 200 &&
+          retained.body.invocation.status === 'result-retained' &&
+          retained.body.result.resultJson === '{"answer":1}',
+        'fresh workerd process reads the workflow result',
+        retained,
+      );
+      const replay = await http('POST', '/spike/remote-step/workflow-consume', {
+        body: { permit: issued.body },
+      });
+      assert(
+        replay.status === 200 && replay.body.kind === 'already-consumed',
+        'fresh process does not grant workflow effect authority twice',
+        replay,
+      );
+      const claim = await http('POST', '/spike/remote-step/workflow-claim', {
+        body: { invocationId },
+      });
+      assert(
+        claim.status === 404,
+        'workflow continuation remains unavailable',
+        claim,
+      );
+    },
+  );
+
+  await step(
+    'RS3 private workflow route: trusted start, one permit winner, retained result and restart refusal',
+    async () => {
+      await killServer(currentServer);
+      await launchServer(
+        'gen-private-remote-1',
+        stateDir,
+        join(tmpDir, 'gen-private-remote-1.log'),
+      );
+      const route = '/_flowsafe/workflow-remote-step';
+      const privateHeaders = {
+        authorization: `Bearer ${PRIVATE_REMOTE_SECRET}`,
+      };
+      const absent = await http('POST', `${route}/register`, {
+        body: {
+          workflowId: 'spike-private-remote',
+          runId: 'unknown-run',
+          hostDeadlineAt: Date.now() + 120_000,
+        },
+      });
+      assert(
+        absent.status === 401,
+        'missing private credential is refused',
+        absent,
+      );
+      const wrong = await http('POST', `${route}/register`, {
+        headers: AUTH.admin,
+        body: {
+          workflowId: 'spike-private-remote',
+          runId: 'unknown-run',
+          hostDeadlineAt: Date.now() + 120_000,
+        },
+      });
+      assert(
+        wrong.status === 401,
+        'ordinary admin bearer cannot delegate private authority',
+        wrong,
+      );
+      const started = await http('POST', '/runs', {
+        headers: AUTH.operator,
+        body: {
+          workflowId: 'spike-private-remote',
+          inputData: { query: 'x' },
+        },
+      });
+      assert(
+        started.status === 200 &&
+          started.body.status === 'suspended' &&
+          typeof started.body.runId === 'string',
+        'real workflow suspends under its Durable Object',
+        started,
+      );
+      const runId = started.body.runId;
+      const registered = await http('POST', `${route}/register`, {
+        headers: privateHeaders,
+        body: {
+          workflowId: 'spike-private-remote',
+          runId,
+          hostDeadlineAt: Date.now() + 120_000,
+        },
+      });
+      assert(
+        registered.status === 200 &&
+          typeof registered.body.invocationId === 'string',
+        'verified stored start registers the workflow invocation',
+        registered,
+      );
+      const invocationId = registered.body.invocationId;
+      const issued = await http('POST', `${route}/ticket`, {
+        headers: privateHeaders,
+        body: { invocationId, lifetimeMs: 60_000 },
+      });
+      assert(
+        issued.status === 200 &&
+          issued.body.runId === runId &&
+          issued.body.requestJson === '{"version":2,"input":{"query":"x"}}' &&
+          issued.body.permit?.generation === 1,
+        'private ticket binds the real suspension and dispatch request',
+        issued,
+      );
+      const attempts = await Promise.all(
+        [0, 1].map(() =>
+          http('POST', `${route}/consume`, {
+            headers: privateHeaders,
+            body: { permit: issued.body.permit },
+          }),
+        ),
+      );
+      assert(
+        attempts.filter((attempt) => attempt.body.kind === 'accepted')
+          .length === 1 &&
+          attempts.filter((attempt) => attempt.body.kind === 'already-consumed')
+            .length === 1,
+        'private workflow permit has one consumer',
+        attempts,
+      );
+      const rawPermit = attempts.find(
+        (attempt) => attempt.body.kind === 'accepted',
+      ).body.rawPermit;
+      const recorded = await http('POST', `${route}/result`, {
+        headers: privateHeaders,
+        body: {
+          invocationId,
+          rawPermit,
+          resultJson: '{"answer":1}',
+          evidenceJson: '{"receipt":"complete"}',
+        },
+      });
+      assert(
+        recorded.status === 200 && recorded.body.kind === 'recorded',
+        'private workflow result is retained',
+        recorded,
+      );
+      await killServer(currentServer);
+      await launchServer(
+        'gen-private-remote-2',
+        stateDir,
+        join(tmpDir, 'gen-private-remote-2.log'),
+      );
+      const replay = await http('POST', `${route}/consume`, {
+        headers: privateHeaders,
+        body: { permit: issued.body.permit },
+      });
+      assert(
+        replay.status === 200 && replay.body.kind === 'already-consumed',
+        'fresh process refuses a second effect authority',
+        replay,
+      );
+      const resultReplay = await http('POST', `${route}/result`, {
+        headers: privateHeaders,
+        body: {
+          invocationId,
+          rawPermit,
+          resultJson: '{"answer":1}',
+          evidenceJson: '{"receipt":"complete"}',
+        },
+      });
+      assert(
+        resultReplay.status === 200 && resultReplay.body.kind === 'replay',
+        'fresh process returns the retained result on replay',
+        resultReplay,
+      );
     },
   );
 
@@ -3484,11 +3935,15 @@ try {
       'class, the Durable Object journal window it cannot see, and the rule an ' +
       'empty answer means something under; seeded runs, an approval, and a ' +
       'start reservation appeared as outstanding work while draining, left as ' +
-      'each was finished, and read absent across TWO consecutive full sweeps ' +
-      'paged through the keyset — after which the deployment locked, still ' +
+      'each was finished, and stayed absent on repeated paged reads ' +
+      'through the keyset — after which the deployment locked, still ' +
       'answered the same inventory, and refused to mint, while its schedules ' +
       'and provider subscriptions kept being reported as standing ' +
       'configuration a migration carries rather than drains. ' +
+      'Remote-step journal (RS1): a single permit winner retained a result ' +
+      'across process death, changed mapped-resource provenance refused a ' +
+      'resume claim, and an advanced snapshot without a returned witness ' +
+      'remained in operator drain inventory after another restart. ' +
       'Finally, a fresh Worker refused a D1 sentinel stamped for ' +
       'another deployment with 503 before authentication or routing.',
   );

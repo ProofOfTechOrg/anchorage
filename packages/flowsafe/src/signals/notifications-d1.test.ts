@@ -38,6 +38,462 @@ function sharedStores(): [D1NotificationsStorage, D1NotificationsStorage] {
   ];
 }
 
+describe('host-owned notification operation receipt', () => {
+  it('admits only one receipt prefix in a D1 deployment', async () => {
+    const db = database();
+    const left = new D1NotificationsStorage(db, 'left_', 1);
+    const right = new D1NotificationsStorage(db, 'right_', 1);
+    await Promise.all([left.init(), right.init()]);
+    const input = {
+      threadId: 'thread',
+      source: 'remote-step',
+      kind: 'result',
+      summary: 'Completed',
+      createdAt: new Date('2026-10-13T00:00:00.000Z'),
+    };
+    const outcomes = await Promise.allSettled([
+      left.createNotificationOnce('operation-left', {
+        ...input,
+        id: 'notification-left',
+      }),
+      right.createNotificationOnce('operation-right', {
+        ...input,
+        id: 'notification-right',
+      }),
+    ]);
+    expect(
+      outcomes.filter((outcome) => outcome.status === 'fulfilled'),
+    ).toHaveLength(1);
+    expect(
+      outcomes.filter((outcome) => outcome.status === 'rejected'),
+    ).toHaveLength(1);
+    const rejected = outcomes.find((outcome) => outcome.status === 'rejected');
+    expect(rejected).toMatchObject({
+      reason: {
+        message: 'notification receipt scope differs from this deployment',
+      },
+    });
+    const loserPrefix = outcomes[0]?.status === 'rejected' ? 'left_' : 'right_';
+    const loserOperation =
+      outcomes[0]?.status === 'rejected' ? 'operation-left' : 'operation-right';
+    const loserNotification =
+      outcomes[0]?.status === 'rejected'
+        ? 'notification-left'
+        : 'notification-right';
+    expect(
+      await db
+        .prepare(
+          `SELECT operation_key FROM ${loserPrefix}flowsafe_notification_operation_receipts WHERE operation_key = ?`,
+        )
+        .bind(loserOperation)
+        .first(),
+    ).toBeNull();
+    expect(
+      await db
+        .prepare(
+          `SELECT id FROM ${loserPrefix}mastra_notifications WHERE id = ?`,
+        )
+        .bind(loserNotification)
+        .first(),
+    ).toBeNull();
+  });
+
+  it('retains a prefix and limit across fresh storage instances', async () => {
+    const db = database();
+    const input = {
+      id: 'notification-1',
+      threadId: 'thread',
+      source: 'remote-step',
+      kind: 'result',
+      summary: 'Completed',
+      createdAt: new Date('2026-10-13T00:00:00.000Z'),
+    };
+    const first = new D1NotificationsStorage(db, 'agent_', 1);
+    const receipt = await first.createNotificationOnce('operation-1', input);
+    const fresh = new D1NotificationsStorage(db, 'agent_', 1);
+    expect(await fresh.createNotificationOnce('operation-1', input)).toEqual(
+      receipt,
+    );
+    await expect(
+      new D1NotificationsStorage(db, 'agent_', 2).createNotificationOnce(
+        'operation-2',
+        { ...input, id: 'notification-2' },
+      ),
+    ).rejects.toThrow(
+      'notification receipt scope differs from this deployment',
+    );
+    expect(
+      await fresh.getNotification({ threadId: 'thread', id: 'notification-2' }),
+    ).toBeNull();
+  });
+
+  it('refuses ambiguous nonempty legacy receipt histories', async () => {
+    const db = database();
+    const left = new D1NotificationsStorage(db, 'left_');
+    const right = new D1NotificationsStorage(db, 'right_');
+    await Promise.all([left.init(), right.init()]);
+    for (const prefix of ['left_', 'right_']) {
+      await db
+        .prepare(`INSERT INTO ${prefix}flowsafe_notification_operation_receipts
+          (operation_key, request_digest, thread_id, notification_id)
+          VALUES (?, ?, ?, ?)`)
+        .bind(
+          `legacy-${prefix}`,
+          'a'.repeat(64),
+          'thread',
+          `notification-${prefix}`,
+        )
+        .run();
+    }
+    await expect(
+      left.createNotificationOnce('operation-new', {
+        id: 'notification-new',
+        threadId: 'thread',
+        source: 'remote-step',
+        kind: 'result',
+        summary: 'Completed',
+        createdAt: new Date('2026-10-13T00:00:00.000Z'),
+      }),
+    ).rejects.toThrow('notification receipt history spans another prefix');
+    const receipt = await db
+      .prepare(
+        'SELECT operation_key FROM left_flowsafe_notification_operation_receipts WHERE operation_key = ?',
+      )
+      .bind('operation-new')
+      .first();
+    expect(receipt).toBeNull();
+  });
+
+  it('adopts the single nonempty legacy prefix', async () => {
+    const db = database();
+    const left = new D1NotificationsStorage(db, 'left_');
+    const right = new D1NotificationsStorage(db, 'right_');
+    await Promise.all([left.init(), right.init()]);
+    await db
+      .prepare(`INSERT INTO left_flowsafe_notification_operation_receipts
+        (operation_key, request_digest, thread_id, notification_id)
+        VALUES ('legacy', ?, 'thread', 'notification-legacy')`)
+      .bind('a'.repeat(64))
+      .run();
+    const input = {
+      id: 'notification-new',
+      threadId: 'thread',
+      source: 'remote-step',
+      kind: 'result',
+      summary: 'Completed',
+      createdAt: new Date('2026-10-13T00:00:00.000Z'),
+    };
+    await expect(
+      right.createNotificationOnce('operation-new', input),
+    ).rejects.toThrow('notification receipt history spans another prefix');
+    await expect(
+      left.createNotificationOnce('operation-new', input),
+    ).resolves.toMatchObject({
+      operationKey: 'operation-new',
+      notificationId: 'notification-new',
+    });
+  });
+
+  it('refuses an unknown receipt scope version', async () => {
+    const db = database();
+    await db
+      .prepare(`CREATE TABLE flowsafe_notification_receipt_scope (
+        id INTEGER PRIMARY KEY,
+        version INTEGER NOT NULL,
+        table_prefix TEXT NOT NULL,
+        receipt_limit INTEGER NOT NULL
+      )`)
+      .run();
+    await db
+      .prepare(`INSERT INTO flowsafe_notification_receipt_scope
+        (id, version, table_prefix, receipt_limit) VALUES (1, 2, '', 100000)`)
+      .run();
+    const notifications = new D1NotificationsStorage(db);
+    await expect(
+      notifications.createNotificationOnce('operation-new', {
+        id: 'notification-new',
+        threadId: 'thread',
+        source: 'remote-step',
+        kind: 'result',
+        summary: 'Completed',
+        createdAt: new Date('2026-10-13T00:00:00.000Z'),
+      }),
+    ).rejects.toThrow(
+      'notification receipt scope differs from this deployment',
+    );
+  });
+
+  it('refuses a new operation at the retained receipt cap while replay still succeeds', async () => {
+    const db = database();
+    const notifications = new D1NotificationsStorage(db, '', 1);
+    const input = {
+      id: 'notification-1',
+      threadId: 'thread',
+      source: 'remote-step',
+      kind: 'result',
+      summary: 'Completed',
+      createdAt: new Date('2026-10-13T00:00:00.000Z'),
+    };
+    const first = await notifications.createNotificationOnce(
+      'operation-1',
+      input,
+    );
+    await expect(
+      notifications.createNotificationOnce('operation-2', {
+        ...input,
+        id: 'notification-2',
+      }),
+    ).rejects.toThrow('notification operation receipt cap reached');
+    expect(
+      await notifications.createNotificationOnce('operation-1', input),
+    ).toEqual(first);
+    expect(
+      await notifications.getNotification({
+        threadId: 'thread',
+        id: 'notification-2',
+      }),
+    ).toBeNull();
+  });
+
+  it('admits at most one concurrent new operation at the last receipt slot', async () => {
+    const db = database();
+    const left = new D1NotificationsStorage(db, '', 1);
+    const right = new D1NotificationsStorage(db, '', 1);
+    const input = {
+      threadId: 'thread',
+      source: 'remote-step',
+      kind: 'result',
+      summary: 'Completed',
+      createdAt: new Date('2026-10-13T00:00:00.000Z'),
+    };
+    const results = await Promise.allSettled([
+      left.createNotificationOnce('operation-1', {
+        ...input,
+        id: 'notification-1',
+      }),
+      right.createNotificationOnce('operation-2', {
+        ...input,
+        id: 'notification-2',
+      }),
+    ]);
+    expect(
+      results.filter((result) => result.status === 'fulfilled'),
+    ).toHaveLength(1);
+    expect(
+      results.filter((result) => result.status === 'rejected'),
+    ).toHaveLength(1);
+    const receipts = await db
+      .prepare(
+        'SELECT operation_key FROM flowsafe_notification_operation_receipts',
+      )
+      .all<{ operation_key: string }>();
+    expect(receipts.results).toHaveLength(1);
+  });
+
+  it('does not reset a delivered notification when a stale same-key retry reaches the cap', async () => {
+    const db = database();
+    const first = new D1NotificationsStorage(db, '', 1);
+    let signalRead: () => void = () => undefined;
+    let releaseRead: () => void = () => undefined;
+    const readPaused = new Promise<void>((resolve) => {
+      signalRead = resolve;
+    });
+    const readReleased = new Promise<void>((resolve) => {
+      releaseRead = resolve;
+    });
+    let intercepted = false;
+    const retry = new D1NotificationsStorage(
+      interceptFirst(db, async (query, read) => {
+        const result = await read();
+        if (
+          !intercepted &&
+          result === null &&
+          query.includes(
+            'FROM flowsafe_notification_operation_receipts WHERE operation_key = ?',
+          )
+        ) {
+          intercepted = true;
+          signalRead();
+          await readReleased;
+        }
+        return result;
+      }),
+      '',
+      1,
+    );
+    await Promise.all([first.init(), retry.init()]);
+    const input = {
+      id: 'notification-1',
+      threadId: 'thread',
+      source: 'remote-step',
+      kind: 'result',
+      summary: 'Completed',
+      createdAt: new Date('2026-10-13T00:00:00.000Z'),
+    };
+    const pendingRetry = retry.createNotificationOnce('operation-1', input);
+    await readPaused;
+    const receipt = await first.createNotificationOnce('operation-1', input);
+    await first.updateNotification({
+      threadId: input.threadId,
+      id: input.id,
+      status: 'delivered',
+    });
+    releaseRead();
+    expect(await pendingRetry).toEqual(receipt);
+    expect(
+      (
+        await first.getNotification({
+          threadId: input.threadId,
+          id: input.id,
+        })
+      )?.status,
+    ).toBe('delivered');
+  });
+
+  it('returns the first durable receipt after a lost acknowledgement without overwriting the inbox', async () => {
+    const db = database();
+    const atomicBatch = db.batch?.bind(db);
+    if (!atomicBatch) throw new Error('D1 batch is unavailable');
+    let loseAcknowledgement = false;
+    const first = new D1NotificationsStorage({
+      prepare: db.prepare.bind(db),
+      async batch(statements) {
+        const results = await atomicBatch(statements);
+        if (loseAcknowledgement) {
+          loseAcknowledgement = false;
+          throw new Error('lost acknowledgement');
+        }
+        return results;
+      },
+    });
+    const retry = new D1NotificationsStorage(db);
+    const input = {
+      id: 'remote-step-notification',
+      threadId: 'thread',
+      source: 'remote-step',
+      kind: 'result',
+      summary: 'Remote work completed',
+      payload: { value: 'private-receipt-canary' },
+      createdAt: new Date('2026-10-13T00:00:00.000Z'),
+    };
+    await first.init();
+    loseAcknowledgement = true;
+    const receipt = await first.createNotificationOnce(
+      'remote-invocation',
+      input,
+    );
+    expect(receipt).toMatchObject({
+      operationKey: 'remote-invocation',
+      notificationId: input.id,
+      threadId: input.threadId,
+    });
+    const retained = await db
+      .prepare('SELECT * FROM flowsafe_notification_operation_receipts')
+      .first<Record<string, unknown>>();
+    expect(retained?.request_digest).toMatch(/^[a-f0-9]{64}$/);
+    expect(receipt.requestDigest).toBe(retained?.request_digest);
+    expect(JSON.stringify(retained)).not.toContain(input.summary);
+    expect(JSON.stringify(retained)).not.toContain('private-receipt-canary');
+    const delivered = await retry.getNotification({
+      threadId: input.threadId,
+      id: input.id,
+    });
+    expect(delivered?.summary).toBe(input.summary);
+    expect(
+      await retry.createNotificationOnce('remote-invocation', input),
+    ).toEqual(receipt);
+    await expect(
+      retry.createNotificationOnce('remote-invocation', {
+        ...input,
+        summary: 'Different result',
+      }),
+    ).rejects.toThrow('different request');
+    expect(
+      (await retry.listNotifications({ threadId: input.threadId })).length,
+    ).toBe(1);
+  });
+
+  it('commits one effect under concurrent retry and rejects inbox identity collisions', async () => {
+    const db = database();
+    const left = new D1NotificationsStorage(db);
+    const right = new D1NotificationsStorage(db);
+    const input = {
+      id: 'notification-1',
+      threadId: 'thread',
+      source: 'remote-step',
+      kind: 'result',
+      summary: 'Completed',
+      createdAt: new Date('2026-10-13T00:00:00.000Z'),
+    };
+    const [first, second] = await Promise.all([
+      left.createNotificationOnce('operation-1', input),
+      right.createNotificationOnce('operation-1', input),
+    ]);
+    expect(first).toEqual(second);
+    expect((await left.listNotifications({ threadId: 'thread' })).length).toBe(
+      1,
+    );
+    await expect(
+      right.createNotificationOnce('operation-2', input),
+    ).rejects.toThrow();
+    const receipts = await db
+      .prepare(
+        'SELECT operation_key FROM flowsafe_notification_operation_receipts ORDER BY operation_key',
+      )
+      .all<{ operation_key: string }>();
+    expect(receipts.results).toEqual([{ operation_key: 'operation-1' }]);
+    await left.createNotification({ ...input, id: 'ordinary-notification' });
+    await expect(
+      right.createNotificationOnce('operation-3', {
+        ...input,
+        id: 'ordinary-notification',
+        summary: 'Overwrite attempt',
+      }),
+    ).rejects.toThrow('not committed');
+    expect(
+      (
+        await left.getNotification({
+          threadId: 'thread',
+          id: 'ordinary-notification',
+        })
+      )?.summary,
+    ).toBe('Completed');
+  });
+
+  it('rolls back a receipt when the inbox insert fails after reservation', async () => {
+    const db = database();
+    const notifications = new D1NotificationsStorage(db);
+    await notifications.init();
+    await db
+      .prepare(`CREATE TRIGGER fail_notification_effect
+        BEFORE INSERT ON mastra_notifications
+        WHEN NEW.id = 'blocked-notification'
+        BEGIN SELECT RAISE(ABORT, 'blocked inbox insert'); END`)
+      .run();
+    await expect(
+      notifications.createNotificationOnce('blocked-operation', {
+        id: 'blocked-notification',
+        threadId: 'thread',
+        source: 'remote-step',
+        kind: 'result',
+        summary: 'This effect does not commit',
+        createdAt: new Date('2026-10-13T00:00:00.000Z'),
+      }),
+    ).rejects.toThrow('blocked inbox insert');
+    const receipt = await db
+      .prepare(`SELECT operation_key FROM flowsafe_notification_operation_receipts
+        WHERE operation_key = 'blocked-operation'`)
+      .first();
+    expect(receipt).toBeNull();
+    expect(
+      await notifications.getNotification({
+        threadId: 'thread',
+        id: 'blocked-notification',
+      }),
+    ).toBeNull();
+  });
+});
+
 function interceptFirst(
   db: SignalDatabase,
   intercept: (query: string, read: () => Promise<unknown>) => Promise<unknown>,

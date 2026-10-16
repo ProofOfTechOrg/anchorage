@@ -9,6 +9,7 @@ import { nestedArray } from '../../test-support/deep-json.js';
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import {
   AgentRunSelectorMismatchError,
+  type AgentStartAuthority,
   FlowsafeDurableAgent,
 } from '../agent-runner/durable-agent-runner.js';
 import {
@@ -22,6 +23,12 @@ import {
   type RecoverableResourceOwnershipStore,
   type ResourceOwnershipDatabase,
 } from '../approval-api/index.js';
+import { decodeExecutionPrincipal } from '../approval-api/principal.js';
+import {
+  credentialsMatch,
+  DEPLOYMENT_IDENTITY_HEADER,
+} from '../do-runner/deployment-identity.js';
+import { EXECUTION_PRINCIPAL_HEADER } from '../do-runner/execution-principal-header.js';
 import {
   FENCED_WORKFLOW_STORAGE,
   type FencedWorkflowAdmissionCapability,
@@ -49,12 +56,30 @@ import {
   resourceIdFromKey,
   SUSPENSION_TIMEOUT_RESUME_KEY,
 } from '../do-runner/index.js';
+import {
+  REMOTE_STEP_MARKER,
+  RemoteStepJournal,
+} from '../do-runner/remote-step-journal.js';
 import { runInputDepthMessage } from '../do-runner/run-input-depth.js';
 import { lifecycleFromRequestContext } from '../do-runner/run-lifecycle.js';
+import {
+  createFlowsafeMaintenanceDurableObject,
+  ensureRemoteStepNotificationRecoveryDuty,
+  type FlowsafeWorkerConfig,
+  type FlowsafeWorkerEnv,
+  MAINTENANCE_INSTANCE_NAME,
+  type MaintenanceDurableObjectState,
+} from '../host-kit/flowsafe-worker.js';
+import type {
+  ThreadNamespaceLike,
+  ThreadRequestInit,
+} from '../host-kit/thread-topology.js';
+import { staticTokenVerifier } from '../host-kit/verifier.js';
 import {
   D1SchedulesStorage,
   type ScheduleDatabase,
 } from '../schedules/schedules-d1.js';
+import { D1NotificationsStorage } from '../signals/notifications-d1.js';
 import {
   type AgentThreadInstanceScope,
   type AgentThreadStateStorage,
@@ -63,7 +88,11 @@ import {
   type PrincipalPermissionResolver,
   type ThreadAgentStartInput,
 } from './thread-host.js';
-import { createAgentThreadTopology } from './thread-topology.js';
+import {
+  createAgentThreadTopology,
+  createRemoteStepNotificationRecoveryTick,
+  type RemoteStepContinuationReader,
+} from './thread-topology.js';
 import type { AgentAutomationRule, Permission } from './types.js';
 
 const mocked = vi.hoisted(() => ({
@@ -264,6 +293,12 @@ function harness(
       dispatchId: string,
       runId: string,
     ) => Promise<void>;
+    remoteSteps?: RemoteStepContinuationReader;
+    remoteStepNotification?: NonNullable<
+      import('./thread-host.js').ThreadAgentHostOptions['remoteStepNotification']
+    >;
+    stateStorage?: AgentThreadStateStorage;
+    resourceIdFromKey?: (threadId: string) => string;
   } = {},
 ): Harness {
   const state = new Map<string, unknown>();
@@ -274,9 +309,24 @@ function harness(
       state.set(key, structuredClone(value));
     },
     delete: async (key) => state.delete(key),
-    list: async <T>({ prefix }: { prefix: string }) =>
+    list: async <T>({
+      prefix,
+      startAfter,
+      limit,
+    }: {
+      prefix: string;
+      startAfter?: string;
+      limit?: number;
+    }) =>
       new Map(
-        [...state.entries()].filter(([key]) => key.startsWith(prefix)),
+        [...state.entries()]
+          .filter(
+            ([key]) =>
+              key.startsWith(prefix) &&
+              (startAfter === undefined || key > startAfter),
+          )
+          .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+          .slice(0, limit),
       ) as Map<string, T>,
     getAlarm: async () =>
       alarm === undefined
@@ -373,7 +423,12 @@ function harness(
             kind: options.principal?.kind ?? 'human',
             id: options.principal?.id ?? 'operator-1',
           },
-          target: { kind: 'agent', id: 'writer', threadId: 'acme_thread' },
+          target: {
+            kind: 'agent',
+            id: 'writer',
+            threadId: 'acme_thread',
+            resourceId: RESOURCE_ID,
+          },
         };
         const current = snapshot as {
           requestContext: Record<string, unknown>;
@@ -425,13 +480,13 @@ function harness(
             : undefined;
         return {
           kind: summary.status === 'pending' ? 'initial' : 'result',
-          storage: 'unfenced',
+          storage: options.remoteSteps ? 'd1' : 'unfenced',
           execution: (
             state.get(OWNER_RECOVERY_PREFIX + runId) as
               | { execution?: unknown }
               | undefined
           )?.execution ?? {
-            tablePrefix: null,
+            tablePrefix: options.remoteSteps?.tablePrefix ?? null,
             workflowId: 'durable-agentic-loop',
             runId,
             startToken: 'test-generation',
@@ -492,6 +547,9 @@ function harness(
     },
   };
   const host = createThreadAgentHost({
+    ...(options.resourceIdFromKey
+      ? { resourceIdFromKey: options.resourceIdFromKey }
+      : {}),
     ...(options.authorizeAutomatedEntry
       ? { authorizeAutomatedEntry: options.authorizeAutomatedEntry }
       : {}),
@@ -523,11 +581,15 @@ function harness(
       storageScopes.push(instanceScope);
       return storage;
     },
-    stateStorage: () => stateStorage,
+    stateStorage: () => options.stateStorage ?? stateStorage,
     resourceAccess: () => resourceAccess,
     scheduleSource: () => scheduleSource,
     ...(options.discardScheduleDispatch
       ? { discardScheduleDispatch: options.discardScheduleDispatch }
+      : {}),
+    ...(options.remoteSteps ? { remoteSteps: options.remoteSteps } : {}),
+    ...(options.remoteStepNotification
+      ? { remoteStepNotification: options.remoteStepNotification }
       : {}),
     approvalService: (instanceScope) => {
       approvalScopes.push(instanceScope);
@@ -1419,7 +1481,12 @@ describe('direct thread host capture', () => {
       mutationEpoch: 2,
       startIdentity: {
         owner: { kind: principal.kind, id: principal.id },
-        target: { kind: 'agent', id: 'writer', threadId: 'acme_thread' },
+        target: {
+          kind: 'agent',
+          id: 'writer',
+          threadId: 'acme_thread',
+          resourceId: RESOURCE_ID,
+        },
       },
       agentStart: { threaded },
       onPreparedStartIdentity: expect.any(Function),
@@ -1572,6 +1639,49 @@ describe('direct thread host capture', () => {
 });
 
 describe('createThreadAgentHost owner recovery', () => {
+  it('advances a bounded notification marker cursor past repeatedly failing early items', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    onTestFinished(() => {
+      vi.restoreAllMocks();
+    });
+    const seen: string[] = [];
+    const journal = {
+      deploymentId: 'deployment',
+      tablePrefix: '',
+      get: async (invocationId: string) => {
+        seen.push(invocationId);
+        throw new Error('recovery item unavailable');
+      },
+    } as unknown as RemoteStepJournal;
+    const fixture = harness(['writer'], {
+      remoteSteps: journal,
+      remoteStepNotification: {
+        journal,
+        agentId: 'writer',
+        operationId: 'enqueue-v1',
+        source: 'flowsafe',
+        kind: 'host-owned',
+        summary: 'Agent notification',
+        ensureScheduledRecovery: async () => undefined,
+      },
+    });
+    const ids = Array.from(
+      { length: 18 },
+      (_, index) => `operation-${String(index).padStart(2, '0')}`,
+    );
+    for (const id of ids)
+      await fixture.stateStorage.put(
+        `flowsafe:agent-notification-recovery:v1:${id}`,
+        id,
+      );
+    const recover = () => fixture.host.recoverOwnership(fixture.scope);
+    await expect(recover()).rejects.toThrow('recovery item unavailable');
+    expect(seen).toEqual(ids.slice(0, 16));
+    await expect(recover()).rejects.toThrow('recovery item unavailable');
+    expect(seen).toEqual(ids);
+    await expect(recover()).rejects.toThrow('recovery item unavailable');
+    expect(seen).toEqual([...ids, ...ids.slice(0, 16)]);
+  });
   async function seedPreparingJournal(
     state: Map<string, unknown>,
     resources: InMemoryResourceOwnershipStore,
@@ -2106,6 +2216,23 @@ describe('createThreadAgentHost owner recovery', () => {
 });
 
 describe('createThreadAgentHost', () => {
+  it('starts under a trusted nonidentity resource mapping', async () => {
+    const f = harness(['writer'], {
+      resourceIdFromKey: () => 'account-7',
+    });
+
+    await f.host.start(f.scope, {
+      agentId: 'writer',
+      threadId: 'acme_thread',
+      resourceId: 'account-7',
+      runId: 'account-run',
+      prompt: 'go',
+      entryPath: 'http.start',
+    });
+
+    const authority = mocked.stream.mock.calls[0]?.[7] as AgentStartAuthority;
+    expect(authority.startIdentity.target.resourceId).toBe('account-7');
+  });
   it.each([
     ['top-level', [{ role: 'system', content: 'x' }]],
     ['once-nested', [[{ role: 'system', content: 'x' }]]],
@@ -3131,7 +3258,12 @@ describe('createThreadAgentHost', () => {
       {
         startIdentity: {
           owner: HUMAN_OWNER,
-          target: { kind: 'agent', id: 'writer', threadId: 'acme_thread' },
+          target: {
+            kind: 'agent',
+            id: 'writer',
+            threadId: 'acme_thread',
+            resourceId: RESOURCE_ID,
+          },
         },
         agentStart: { threaded: false },
         onPreparedStartIdentity: expect.any(Function),
@@ -3455,7 +3587,12 @@ describe('createThreadAgentHost', () => {
       {
         startIdentity: {
           owner: { kind: 'service', id: 'webhook-dispatcher' },
-          target: { kind: 'agent', id: 'writer', threadId: 'acme_thread' },
+          target: {
+            kind: 'agent',
+            id: 'writer',
+            threadId: 'acme_thread',
+            resourceId: RESOURCE_ID,
+          },
         },
         agentStart: { threaded: true },
         onPreparedStartIdentity: expect.any(Function),
@@ -3700,7 +3837,12 @@ describe('createThreadAgentHost', () => {
       {
         startIdentity: {
           owner: { kind: 'system', id: 'signal-dispatcher' },
-          target: { kind: 'agent', id: 'writer', threadId: 'acme_thread' },
+          target: {
+            kind: 'agent',
+            id: 'writer',
+            threadId: 'acme_thread',
+            resourceId: RESOURCE_ID,
+          },
         },
         agentStart: { threaded: true },
         onPreparedStartIdentity: expect.any(Function),
@@ -3952,6 +4094,406 @@ describe('createThreadAgentHost', () => {
       'init',
       'threadId',
     ]);
+  });
+
+  it('resumes a retained remote result for its stored run and suspension', async () => {
+    const principal: ExecutionPrincipal = {
+      kind: 'service',
+      id: 'executor-service',
+      purpose: 'remote-step-run',
+    };
+    const reader: RemoteStepContinuationReader = {
+      deploymentId: 'deployment',
+      tablePrefix: '',
+      get: vi.fn(async () => ({
+        invocationId: 'invocation_1',
+        deploymentId: 'deployment',
+        tablePrefix: '',
+        workflowId: 'durable-agentic-loop',
+        agentId: 'writer',
+        threadId: 'acme_thread',
+        resourceId: RESOURCE_ID,
+        runId: 'acme_run',
+        principal,
+        startToken: 'test-generation',
+        stepPath: ['tool'],
+        suspendedAt: 1000,
+        request: {},
+        deadlineAt: 9999999999999,
+        status: 'result-retained' as const,
+        permitGeneration: 1,
+      })),
+      readRetainedResult: vi.fn(async () => ({
+        invocationId: 'invocation_1',
+        resultJson: '{"answer":1}',
+        resultDigest: 'digest',
+        quiescenceDigest: 'evidence',
+        executorQuiescentAt: 1000,
+      })),
+      claimResume: vi.fn(async () => 'lease-1'),
+      settleAfterResume: vi.fn(async () => 'applied' as const),
+    };
+    const fixture = harness(['writer'], {
+      remoteSteps: reader,
+      principal,
+      allowedAutomation: [{ kind: 'service', entryPaths: ['http.start'] }],
+    });
+    seedSuspendedApprovalRun(fixture);
+    fixture.setSummary({
+      runId: 'acme_run',
+      status: 'suspended',
+      suspended: [['tool']],
+      suspendedAt: { tool: 1000 },
+      suspendPayload: {
+        tool: {
+          type: 'suspension',
+          toolCallSuspended: { remoteStep: REMOTE_STEP_MARKER },
+        },
+      },
+    });
+    const resumed = {
+      runId: 'acme_run',
+      status: 'suspended' as const,
+      suspended: [['next']],
+    };
+    mocked.resumeViaRuntime.mockResolvedValue(resumed);
+    const request = new Request(
+      'https://thread/_flowsafe/agent-host/remote-step-resume',
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          invocationId: 'invocation_1',
+          resultJson: '{"answer":999}',
+        }),
+      },
+    );
+    const response = await fixture.host.route(request, fixture.scope);
+    expect(response?.status).toBe(200);
+    expect(mocked.resumeViaRuntime).toHaveBeenCalledWith(
+      expect.objectContaining({
+        runId: 'acme_run',
+        requestedBy: 'executor-service',
+        requestedByKind: 'service',
+        step: ['tool'],
+        resumeData: { answer: 1 },
+        expectedSuspension: { suspendedAt: 1000 },
+      }),
+    );
+    expect(reader.claimResume).toHaveBeenCalledWith('invocation_1', 60_000);
+    expect(reader.settleAfterResume).toHaveBeenCalledWith(
+      'invocation_1',
+      'lease-1',
+      resumed,
+    );
+
+    mocked.resumeViaRuntime.mockClear();
+    fixture.setSummary({
+      runId: 'acme_run',
+      status: 'suspended',
+      suspended: [['tool']],
+      suspendedAt: { tool: 1001 },
+      suspendPayload: {
+        tool: {
+          type: 'suspension',
+          toolCallSuspended: { remoteStep: REMOTE_STEP_MARKER },
+        },
+      },
+    });
+    await expect(
+      fixture.host.route(
+        new Request('https://thread/_flowsafe/agent-host/remote-step-resume', {
+          method: 'POST',
+          body: JSON.stringify({ invocationId: 'invocation_1' }),
+        }),
+        fixture.scope,
+      ),
+    ).rejects.toMatchObject({ status: 409 });
+    expect(mocked.resumeViaRuntime).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['terminal-not-success', 409],
+    ['deadline-expired', 409],
+    ['retry', 503],
+    ['advanced-without-proof', 503],
+  ] as const)('refuses a stale successful resume response when settlement is %s', async (settlement, expectedStatus) => {
+    const principal: ExecutionPrincipal = {
+      kind: 'human',
+      id: 'operator-1',
+      role: 'operator',
+    };
+    const reader: RemoteStepContinuationReader = {
+      deploymentId: 'deployment',
+      tablePrefix: '',
+      get: async () => ({
+        invocationId: 'invocation_1',
+        deploymentId: 'deployment',
+        tablePrefix: '',
+        workflowId: 'durable-agentic-loop',
+        agentId: 'writer',
+        threadId: 'acme_thread',
+        resourceId: RESOURCE_ID,
+        runId: 'acme_run',
+        principal,
+        startToken: 'test-generation',
+        stepPath: ['tool'],
+        suspendedAt: 1000,
+        request: {},
+        deadlineAt: 9999999999999,
+        status: 'result-retained',
+        permitGeneration: 1,
+      }),
+      readRetainedResult: async () => ({
+        invocationId: 'invocation_1',
+        resultJson: '{"answer":1}',
+        resultDigest: 'digest',
+        quiescenceDigest: 'evidence',
+        executorQuiescentAt: 1000,
+      }),
+      claimResume: vi.fn(async () => 'lease-1'),
+      settleAfterResume: vi.fn(async () => settlement),
+    };
+    const fixture = harness(['writer'], { remoteSteps: reader });
+    seedSuspendedApprovalRun(fixture);
+    fixture.setSummary({
+      runId: 'acme_run',
+      status: 'suspended',
+      suspended: [['tool']],
+      suspendedAt: { tool: 1000 },
+      suspendPayload: {
+        tool: {
+          type: 'suspension',
+          toolCallSuspended: { remoteStep: REMOTE_STEP_MARKER },
+        },
+      },
+    });
+    const stale = { runId: 'acme_run', status: 'success' as const };
+    mocked.resumeViaRuntime.mockResolvedValue(stale);
+
+    await expect(
+      fixture.host.route(
+        new Request('https://thread/_flowsafe/agent-host/remote-step-resume', {
+          method: 'POST',
+          body: JSON.stringify({ invocationId: 'invocation_1' }),
+        }),
+        fixture.scope,
+      ),
+    ).rejects.toMatchObject({ status: expectedStatus });
+    expect(reader.settleAfterResume).toHaveBeenCalledWith(
+      'invocation_1',
+      'lease-1',
+      stale,
+    );
+  });
+
+  it('waits for an in-flight resume before considering its expired lease', async () => {
+    const principal: ExecutionPrincipal = {
+      kind: 'human',
+      id: 'operator-1',
+      role: 'operator',
+    };
+    const entered = deferredSignal();
+    const release = deferredSignal();
+    let status: 'result-retained' | 'resuming' | 'settled' = 'result-retained';
+    const reader: RemoteStepContinuationReader = {
+      deploymentId: 'deployment',
+      tablePrefix: '',
+      get: async () => ({
+        invocationId: 'invocation_1',
+        deploymentId: 'deployment',
+        tablePrefix: '',
+        workflowId: 'durable-agentic-loop',
+        agentId: 'writer',
+        threadId: 'acme_thread',
+        resourceId: RESOURCE_ID,
+        runId: 'acme_run',
+        principal,
+        startToken: 'test-generation',
+        stepPath: ['tool'],
+        suspendedAt: 1000,
+        request: {},
+        deadlineAt: 9999999999999,
+        status,
+        permitGeneration: 1,
+        ...(status === 'resuming'
+          ? { resumeLeaseExpiresAt: Date.now() - 1 }
+          : {}),
+      }),
+      readRetainedResult: async () => ({
+        invocationId: 'invocation_1',
+        resultJson: '{"answer":1}',
+        resultDigest: 'digest',
+        quiescenceDigest: 'evidence',
+        executorQuiescentAt: 1000,
+      }),
+      claimResume: vi.fn(async () => {
+        status = 'resuming';
+        return 'lease-1';
+      }),
+      settleAfterResume: vi.fn(async () => {
+        status = 'settled';
+        return 'applied' as const;
+      }),
+    };
+    const fixture = harness(['writer'], { remoteSteps: reader });
+    seedSuspendedApprovalRun(fixture);
+    fixture.setSummary({
+      runId: 'acme_run',
+      status: 'suspended',
+      suspended: [['tool']],
+      suspendedAt: { tool: 1000 },
+      suspendPayload: {
+        tool: {
+          type: 'suspension',
+          toolCallSuspended: { remoteStep: REMOTE_STEP_MARKER },
+        },
+      },
+    });
+    mocked.resumeViaRuntime.mockImplementation(async () => {
+      entered.resolve();
+      await release.promise;
+      return { runId: 'acme_run', status: 'suspended' };
+    });
+    const request = () =>
+      new Request('https://thread/_flowsafe/agent-host/remote-step-resume', {
+        method: 'POST',
+        body: JSON.stringify({ invocationId: 'invocation_1' }),
+      });
+    const first = fixture.host.route(request(), fixture.scope);
+    await entered.promise;
+    const second = fixture.host
+      .route(request(), fixture.scope)
+      .catch((error) => error);
+    try {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(reader.claimResume).toHaveBeenCalledTimes(1);
+    } finally {
+      release.resolve();
+    }
+    expect((await first)?.status).toBe(200);
+    expect(await second).toMatchObject({ status: 404 });
+    expect(reader.claimResume).toHaveBeenCalledTimes(1);
+    expect(mocked.resumeViaRuntime).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses an expired lease even when the run advanced', async () => {
+    const principal: ExecutionPrincipal = {
+      kind: 'human',
+      id: 'operator-1',
+      role: 'operator',
+    };
+    const reader: RemoteStepContinuationReader = {
+      deploymentId: 'deployment',
+      tablePrefix: '',
+      get: async () => ({
+        invocationId: 'invocation_1',
+        deploymentId: 'deployment',
+        tablePrefix: '',
+        workflowId: 'durable-agentic-loop',
+        agentId: 'writer',
+        threadId: 'acme_thread',
+        resourceId: RESOURCE_ID,
+        runId: 'acme_run',
+        principal,
+        startToken: 'test-generation',
+        stepPath: ['tool'],
+        suspendedAt: 1000,
+        request: {},
+        deadlineAt: 9999999999999,
+        status: 'resuming',
+        resumeLeaseExpiresAt: Date.now() - 1,
+        permitGeneration: 1,
+      }),
+      readRetainedResult: vi.fn(async () => ({
+        invocationId: 'invocation_1',
+        resultJson: '{"answer":1}',
+        resultDigest: 'digest',
+        quiescenceDigest: 'evidence',
+        executorQuiescentAt: 1000,
+      })),
+      claimResume: vi.fn(async () => 'lease-2'),
+      settleAfterResume: vi.fn(async () => 'applied' as const),
+    };
+    const fixture = harness(['writer'], { remoteSteps: reader });
+    seedSuspendedApprovalRun(fixture);
+    fixture.setSummary({ runId: 'acme_run', status: 'success' });
+
+    await expect(
+      fixture.host.route(
+        new Request('https://thread/_flowsafe/agent-host/remote-step-resume', {
+          method: 'POST',
+          body: JSON.stringify({ invocationId: 'invocation_1' }),
+        }),
+        fixture.scope,
+      ),
+    ).rejects.toMatchObject({ status: 503 });
+    expect(reader.claimResume).not.toHaveBeenCalled();
+    expect(reader.readRetainedResult).not.toHaveBeenCalled();
+    expect(mocked.resumeViaRuntime).not.toHaveBeenCalled();
+  });
+
+  it('refuses a reserved timeout envelope in a retained remote result', async () => {
+    const principal: ExecutionPrincipal = {
+      kind: 'human',
+      id: 'operator-1',
+      role: 'operator',
+    };
+    const reader: RemoteStepContinuationReader = {
+      deploymentId: 'deployment',
+      tablePrefix: '',
+      get: async () => ({
+        invocationId: 'invocation_1',
+        deploymentId: 'deployment',
+        tablePrefix: '',
+        workflowId: 'durable-agentic-loop',
+        agentId: 'writer',
+        threadId: 'acme_thread',
+        resourceId: RESOURCE_ID,
+        runId: 'acme_run',
+        principal,
+        startToken: 'test-generation',
+        stepPath: ['tool'],
+        suspendedAt: 1000,
+        request: {},
+        deadlineAt: 9999999999999,
+        status: 'result-retained',
+        permitGeneration: 1,
+      }),
+      readRetainedResult: async () => ({
+        invocationId: 'invocation_1',
+        resultJson: JSON.stringify({ [SUSPENSION_TIMEOUT_RESUME_KEY]: true }),
+        resultDigest: 'digest',
+        quiescenceDigest: 'evidence',
+        executorQuiescentAt: 1000,
+      }),
+      claimResume: async () => 'lease-1',
+      settleAfterResume: async () => 'applied' as const,
+    };
+    const fixture = harness(['writer'], { remoteSteps: reader });
+    seedSuspendedApprovalRun(fixture);
+    fixture.setSummary({
+      runId: 'acme_run',
+      status: 'suspended',
+      suspended: [['tool']],
+      suspendedAt: { tool: 1000 },
+      suspendPayload: {
+        tool: {
+          type: 'suspension',
+          toolCallSuspended: { remoteStep: REMOTE_STEP_MARKER },
+        },
+      },
+    });
+    await expect(
+      fixture.host.route(
+        new Request('https://thread/_flowsafe/agent-host/remote-step-resume', {
+          method: 'POST',
+          body: JSON.stringify({ invocationId: 'invocation_1' }),
+        }),
+        fixture.scope,
+      ),
+    ).rejects.toMatchObject({ status: 400 });
+    expect(mocked.resumeViaRuntime).not.toHaveBeenCalled();
   });
 
   it('accepts an approval-resume requester exactly at the principal-id bound', async () => {
@@ -7047,11 +7589,14 @@ async function hostAgentLifecycleFixture(
     journal?: boolean;
     lifecycle?: boolean;
     snapshotTarget?: { agentId: string; threadId: string };
+    resourceIdFromKey?: (threadId: string) => string;
+    startResourceId?: string;
   } = {},
 ) {
   const core = await vi.importActual<typeof import('@mastra/core/mastra')>(
     '@mastra/core/mastra',
   );
+
   const { InMemoryStore } = await import('@mastra/core/storage');
   const breakwater = await vi.importActual<
     typeof import('@proofoftech/breakwater')
@@ -7075,6 +7620,7 @@ async function hostAgentLifecycleFixture(
   const threaded = input.threaded ?? true;
   const status = input.status ?? 'suspended';
   const version = input.provenance ?? 'v1';
+  const startResourceId = input.startResourceId ?? RESOURCE_ID;
   const sql = openSqlite() as ReturnType<typeof openSqlite> & { close(): void };
   const binding = sqliteUnitDatabase(sql) as ExecutionFenceDatabase &
     ResourceOwnershipDatabase;
@@ -7108,6 +7654,9 @@ async function hostAgentLifecycleFixture(
   };
   const dispatch = vi.fn(async () => {});
   const fixture = harness(['writer'], {
+    ...(input.resourceIdFromKey
+      ? { resourceIdFromKey: input.resourceIdFromKey }
+      : {}),
     storage,
     init: app,
     resourceAccess: resources,
@@ -7137,7 +7686,12 @@ async function hostAgentLifecycleFixture(
     await reservations.bindPreparedStart(claim, {
       ...execution,
       owner: HUMAN_OWNER,
-      target: { kind: 'agent', id: 'writer', threadId: 'acme_thread' },
+      target: {
+        kind: 'agent',
+        id: 'writer',
+        threadId: 'acme_thread',
+        resourceId: startResourceId,
+      },
     });
   }
   const recovery = ownerRecovery('acme_run', {
@@ -7145,15 +7699,22 @@ async function hostAgentLifecycleFixture(
     token: 'host-lifecycle-attempt',
     execution,
     threaded,
+    resourceId: startResourceId,
     ...(claim ? { startReservation: claim } : {}),
   });
   seedRecoveryState(fixture.state, 'acme_run', recovery, threaded);
+  if (threaded && startResourceId !== RESOURCE_ID)
+    fixture.state.set(THREAD_BINDING_KEY, {
+      version: 1,
+      agentId: 'writer',
+      resourceId: startResourceId,
+    });
   if (!input.journal) fixture.state.delete(TEST_OWNER_RECOVERY_KEY);
   await resources.reserveAll(
     [
       { kind: 'run', resourceId: 'acme_run' },
       { kind: 'thread', resourceId: 'acme_thread' },
-      { kind: 'resource', resourceId: RESOURCE_ID },
+      { kind: 'resource', resourceId: startResourceId },
     ],
     HUMAN_OWNER,
     recovery.token as string,
@@ -7164,7 +7725,10 @@ async function hostAgentLifecycleFixture(
   if (!workflows) throw new Error('missing host workflow domain');
   const snapshotAgentId = input.snapshotTarget?.agentId ?? 'writer';
   const snapshotThreadId = input.snapshotTarget?.threadId ?? 'acme_thread';
-  const snapshotResourceId = resourceIdFromKey(snapshotThreadId);
+  const snapshotResourceId =
+    snapshotThreadId === 'acme_thread'
+      ? startResourceId
+      : resourceIdFromKey(snapshotThreadId);
   const snapshot: import('@mastra/core/workflows').WorkflowRunState = {
     runId: 'acme_run',
     status:
@@ -7221,6 +7785,7 @@ async function hostAgentLifecycleFixture(
                         kind: 'agent',
                         id: snapshotAgentId,
                         threadId: snapshotThreadId,
+                        resourceId: snapshotResourceId,
                       },
                     },
                     agentStart: { threaded },
@@ -7266,6 +7831,7 @@ async function hostAgentLifecycleFixture(
       .all();
   return {
     ...fixture,
+    binding,
     storage,
     app,
     sql,
@@ -7285,14 +7851,848 @@ async function hostAgentLifecycleFixture(
   };
 }
 
-function hostAgentLifecycleRequest(suffix = '', query = '') {
+function hostAgentLifecycleRequest(
+  suffix = '',
+  query = '',
+  resourceId = RESOURCE_ID,
+) {
   return new Request(
-    `https://thread/_flowsafe/agent-host/runs/writer/acme_run${suffix}?resourceId=${RESOURCE_ID}${query}`,
+    `https://thread/_flowsafe/agent-host/runs/writer/acme_run${suffix}?resourceId=${resourceId}${query}`,
     suffix ? { method: 'POST' } : undefined,
   );
 }
 
+it('resumes a retained mapped-resource result from D1 after the agent host is recreated', async () => {
+  const mappedResourceId = 'account-7';
+  const mappedResource = () => mappedResourceId;
+  const fixture = await hostAgentLifecycleFixture({
+    mode: 'fenced',
+    provenance: 'modern',
+    resourceIdFromKey: mappedResource,
+    startResourceId: mappedResourceId,
+  });
+  onTestFinished(() => {
+    vi.restoreAllMocks();
+    fixture.sql.close();
+  });
+  fixture.snapshot.suspendedPaths = { tool: [0] };
+  Object.assign(fixture.snapshot.context, {
+    tool: {
+      status: 'suspended',
+      payload: {},
+      startedAt: 50,
+      suspendedAt: 1000,
+      suspendPayload: {
+        type: 'suspension',
+        toolName: 'remote_lookup',
+        toolCallId: 'call-1',
+        toolCallSuspended: {
+          remoteStep: REMOTE_STEP_MARKER,
+          request: { account: 'acme' },
+        },
+      },
+    },
+  });
+  await fixture.persist();
+  await fixture.host.route(
+    hostAgentLifecycleRequest('', '', mappedResourceId),
+    fixture.scope,
+  );
+  const journal = new RemoteStepJournal({
+    db: fixture.binding,
+    fence: fixture.fence,
+    runtime: fixture.app.runtime,
+    deploymentId: 'deployment',
+    tablePrefix: 'host_lifecycle_',
+    allowedToolIds: ['remote_lookup'],
+    verifyCompletion: async () => undefined,
+  });
+  await journal.initialize();
+  const invocation = await journal.register(
+    {
+      deploymentId: 'deployment',
+      tablePrefix: 'host_lifecycle_',
+      workflowId: fixture.execution.workflowId,
+      agentId: 'writer',
+      threadId: 'acme_thread',
+      resourceId: mappedResourceId,
+      runId: 'acme_run',
+    },
+    Date.now() + 60_000,
+    fixture.scope.principal,
+  );
+  const permit = await journal.issuePermit(invocation.invocationId, 5_000);
+  const consumed = await journal.consumePermit(permit);
+  if (consumed.kind !== 'accepted') throw new Error('permit was not won');
+  await journal.recordResult(
+    invocation.invocationId,
+    consumed.rawPermit,
+    '{"answer":1}',
+    '{"receipt":"complete"}',
+  );
+
+  const freshApp = init(
+    { storage: fixture.storage },
+    { executionFence: fixture.fence, startIdempotency: fixture.reservations },
+  );
+  const reopened = new RemoteStepJournal({
+    db: fixture.binding,
+    fence: fixture.fence,
+    runtime: freshApp.runtime,
+    deploymentId: 'deployment',
+    tablePrefix: 'host_lifecycle_',
+    allowedToolIds: ['remote_lookup'],
+    verifyCompletion: async () => undefined,
+  });
+  const fresh = harness(['writer'], {
+    resourceIdFromKey: mappedResource,
+    init: freshApp,
+    storage: fixture.storage,
+    stateStorage: fixture.stateStorage,
+    resourceAccess: fixture.resources,
+    remoteSteps: {
+      deploymentId: 'deployment',
+      tablePrefix: 'host_lifecycle_',
+      get: reopened.get.bind(reopened),
+      readRetainedResult: reopened.readRetainedResult.bind(reopened),
+      claimResume: reopened.claimResume.bind(reopened),
+      settleAfterResume: async () => 'applied' as const,
+    },
+  });
+  const resume = vi
+    .spyOn(FlowsafeDurableAgent.prototype, 'resumeViaRuntime')
+    .mockResolvedValue({ runId: 'acme_run', status: 'suspended' });
+  await fixture.stateStorage.put(THREAD_BINDING_KEY, {
+    version: 1,
+    agentId: 'writer',
+    resourceId: 'other-resource',
+  });
+  const displaced = await fresh.host
+    .route(
+      new Request('https://thread/_flowsafe/agent-host/remote-step-resume', {
+        method: 'POST',
+        body: JSON.stringify({ invocationId: invocation.invocationId }),
+      }),
+      fresh.scope,
+    )
+    .catch((error) => error);
+  expect(displaced).toMatchObject({ status: 404 });
+  expect(resume).not.toHaveBeenCalled();
+  await fixture.stateStorage.put(THREAD_BINDING_KEY, {
+    version: 1,
+    agentId: 'writer',
+    resourceId: mappedResourceId,
+  });
+  const response = await fresh.host.route(
+    new Request('https://thread/_flowsafe/agent-host/remote-step-resume', {
+      method: 'POST',
+      body: JSON.stringify({ invocationId: invocation.invocationId }),
+    }),
+    fresh.scope,
+  );
+  expect(response?.status).toBe(200);
+  expect(resume).toHaveBeenCalledWith(
+    expect.objectContaining({
+      runId: 'acme_run',
+      requestedBy: 'operator-1',
+      requestedByKind: 'human',
+      step: ['tool'],
+      resumeData: { answer: 1 },
+      expectedSuspension: { suspendedAt: 1000 },
+    }),
+  );
+  const leaseBefore = await fixture.binding
+    .prepare(
+      'SELECT resume_lease_owner FROM flowsafe_remote_step_invocations WHERE invocation_id = ?',
+    )
+    .bind(invocation.invocationId)
+    .all();
+  expect(leaseBefore.results).toMatchObject([
+    { resume_lease_owner: expect.any(String) },
+  ]);
+  await fixture.binding
+    .prepare(
+      'UPDATE flowsafe_remote_step_invocations SET resume_lease_expires_at = ?, write_revision = write_revision + 1, write_generation = write_generation + 1 WHERE invocation_id = ?',
+    )
+    .bind(Date.now() - 1, invocation.invocationId)
+    .run();
+  await expect(
+    fresh.host.route(
+      new Request('https://thread/_flowsafe/agent-host/remote-step-resume', {
+        method: 'POST',
+        body: JSON.stringify({ invocationId: invocation.invocationId }),
+      }),
+      fresh.scope,
+    ),
+  ).rejects.toMatchObject({ status: 503 });
+  expect(
+    await fixture.binding
+      .prepare(
+        'SELECT resume_lease_owner FROM flowsafe_remote_step_invocations WHERE invocation_id = ?',
+      )
+      .bind(invocation.invocationId)
+      .all(),
+  ).toMatchObject({ results: leaseBefore.results });
+  expect(resume).toHaveBeenCalledTimes(1);
+});
+
+it('admits a configured notification effect once before agent continuation', async () => {
+  const fixture = await hostAgentLifecycleFixture({
+    mode: 'fenced',
+    provenance: 'modern',
+  });
+  onTestFinished(() => {
+    vi.restoreAllMocks();
+    fixture.sql.close();
+  });
+  fixture.snapshot.suspendedPaths = { tool: [0] };
+  Object.assign(fixture.snapshot.context, {
+    tool: {
+      status: 'suspended',
+      payload: {},
+      startedAt: 50,
+      suspendedAt: 1000,
+      suspendPayload: {
+        type: 'suspension',
+        toolName: 'remote_lookup',
+        toolCallId: 'call-1',
+        toolCallSuspended: {
+          remoteStep: REMOTE_STEP_MARKER,
+          request: { notificationOperationId: 'enqueue-v1' },
+        },
+      },
+    },
+  });
+  await fixture.persist();
+  await fixture.host.route(hostAgentLifecycleRequest(), fixture.scope);
+  const journal = new RemoteStepJournal({
+    db: fixture.binding,
+    fence: fixture.fence,
+    runtime: fixture.app.runtime,
+    deploymentId: 'deployment',
+    tablePrefix: 'host_lifecycle_',
+    allowedToolIds: ['remote_lookup'],
+    verifyCompletion: async () => undefined,
+  });
+  await journal.initialize();
+  const invocation = await journal.register(
+    {
+      deploymentId: 'deployment',
+      tablePrefix: 'host_lifecycle_',
+      workflowId: fixture.execution.workflowId,
+      agentId: 'writer',
+      threadId: 'acme_thread',
+      resourceId: RESOURCE_ID,
+      runId: 'acme_run',
+    },
+    Date.now() + 60_000,
+    fixture.scope.principal,
+  );
+  const permit = await journal.issuePermit(invocation.invocationId, 5_000);
+  const consumed = await journal.consumePermit(permit);
+  if (consumed.kind !== 'accepted') throw new Error('permit was not won');
+  await journal.recordResult(
+    invocation.invocationId,
+    consumed.rawPermit,
+    '{"untrusted":"result"}',
+    '{"receipt":"complete"}',
+  );
+  const freshApp = init(
+    { storage: fixture.storage },
+    { executionFence: fixture.fence, startIdempotency: fixture.reservations },
+  );
+  const reopened = new RemoteStepJournal({
+    db: fixture.binding,
+    fence: fixture.fence,
+    runtime: freshApp.runtime,
+    deploymentId: 'deployment',
+    tablePrefix: 'host_lifecycle_',
+    allowedToolIds: ['remote_lookup'],
+    verifyCompletion: async () => undefined,
+  });
+  const readiness = vi.fn(async () => undefined);
+  const host = harness(['writer'], {
+    init: freshApp,
+    storage: fixture.storage,
+    stateStorage: fixture.stateStorage,
+    resourceAccess: fixture.resources,
+    remoteSteps: reopened,
+    remoteStepNotification: {
+      journal: reopened,
+      agentId: 'writer',
+      operationId: 'enqueue-v1',
+      source: 'flowsafe',
+      kind: 'host-owned',
+      summary: 'Agent notification',
+      payload: { fixed: true },
+      ensureScheduledRecovery: readiness,
+    },
+  });
+  const resume = vi
+    .spyOn(FlowsafeDurableAgent.prototype, 'resumeViaRuntime')
+    .mockResolvedValue({ runId: 'acme_run', status: 'suspended' });
+  const request = () =>
+    new Request('https://thread/_flowsafe/agent-host/remote-step-resume', {
+      method: 'POST',
+      body: JSON.stringify({ invocationId: invocation.invocationId }),
+    });
+  readiness.mockRejectedValueOnce(new Error('recovery duty unavailable'));
+  await expect(host.host.route(request(), host.scope)).rejects.toThrow(
+    'recovery duty unavailable',
+  );
+  expect(
+    (await reopened.readNotificationOperation(invocation.invocationId))?.state,
+  ).toBe('prepared');
+  const admission = vi
+    .spyOn(reopened, 'admitNotificationEffect')
+    .mockRejectedValueOnce(new Error('effect admission refused'));
+  await expect(host.host.route(request(), host.scope)).rejects.toThrow(
+    'effect admission refused',
+  );
+  expect(
+    fixture.sql
+      .prepare(
+        "SELECT COUNT(*) AS count FROM sqlite_master WHERE name = 'host_lifecycle_mastra_notifications'",
+      )
+      .get(),
+  ).toMatchObject({ count: 0 });
+  expect(resume).not.toHaveBeenCalled();
+  admission.mockRestore();
+  const recordReceipt = reopened.recordNotificationReceipt.bind(reopened);
+  const lostReceipt = vi
+    .spyOn(reopened, 'recordNotificationReceipt')
+    .mockImplementationOnce(async (...args) => {
+      await recordReceipt(...args);
+      throw new Error('receipt acknowledgement lost');
+    });
+  await expect(host.host.route(request(), host.scope)).rejects.toThrow(
+    'receipt acknowledgement lost',
+  );
+  expect(resume).not.toHaveBeenCalled();
+  lostReceipt.mockRestore();
+  const restartedStorage = createD1Storage({
+    binding: fixture.binding,
+    tablePrefix: 'host_lifecycle_',
+  });
+  await restartedStorage.init();
+  const restartedApp = init(
+    { storage: restartedStorage },
+    { executionFence: fixture.fence, startIdempotency: fixture.reservations },
+  );
+  const restartedJournal = new RemoteStepJournal({
+    db: fixture.binding,
+    fence: fixture.fence,
+    runtime: restartedApp.runtime,
+    deploymentId: 'deployment',
+    tablePrefix: 'host_lifecycle_',
+    allowedToolIds: ['remote_lookup'],
+    verifyCompletion: async () => undefined,
+  });
+  const restartedHost = harness(['writer'], {
+    init: restartedApp,
+    storage: restartedStorage,
+    stateStorage: { ...fixture.stateStorage },
+    resourceAccess: fixture.resources,
+    remoteSteps: restartedJournal,
+    remoteStepNotification: {
+      journal: restartedJournal,
+      agentId: 'writer',
+      operationId: 'enqueue-v1',
+      source: 'flowsafe',
+      kind: 'host-owned',
+      summary: 'Changed after deployment',
+      payload: { fixed: false },
+      ensureScheduledRecovery: async () => undefined,
+    },
+  });
+  await expect(
+    restartedHost.host.route(request(), restartedHost.scope),
+  ).rejects.toMatchObject({
+    status: 503,
+  });
+  const operation = await restartedJournal.readNotificationOperation(
+    invocation.invocationId,
+  );
+  expect(operation?.state).toBe('resume-admitted');
+  expect(
+    await restartedJournal
+      .notificationStorage()
+      .readNotificationOperationReceipt(operation?.operationKey ?? ''),
+  ).toMatchObject({
+    requestDigest: operation?.requestDigest,
+    notificationId: operation?.notificationId,
+  });
+  expect(
+    fixture.sql
+      .prepare(
+        'SELECT source, kind, summary, payload FROM host_lifecycle_mastra_notifications',
+      )
+      .get(),
+  ).toMatchObject({
+    source: 'flowsafe',
+    kind: 'host-owned',
+    summary: 'Agent notification',
+    payload: '{"fixed":true}',
+  });
+  expect(resume).toHaveBeenCalledTimes(1);
+  await expect(
+    restartedHost.host.route(request(), restartedHost.scope),
+  ).rejects.toMatchObject({
+    status: 503,
+  });
+  expect(resume).toHaveBeenCalledTimes(1);
+  expect(
+    fixture.sql
+      .prepare(
+        'SELECT COUNT(*) AS count FROM host_lifecycle_mastra_notifications',
+      )
+      .get(),
+  ).toMatchObject({ count: 1 });
+});
+
+it.each([
+  'before write',
+  'after write',
+  'scheduled tick',
+] as const)('recovers an admitted notification after its deadline without resuming Mastra (%s)', async (failurePoint) => {
+  const fixture = await hostAgentLifecycleFixture({
+    mode: 'fenced',
+    provenance: 'modern',
+  });
+  onTestFinished(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    fixture.sql.close();
+  });
+  fixture.snapshot.suspendedPaths = { tool: [0] };
+  Object.assign(fixture.snapshot.context, {
+    tool: {
+      status: 'suspended',
+      payload: {},
+      startedAt: 50,
+      suspendedAt: 1000,
+      suspendPayload: {
+        type: 'suspension',
+        toolName: 'remote_lookup',
+        toolCallId: 'call-1',
+        toolCallSuspended: {
+          remoteStep: REMOTE_STEP_MARKER,
+          request: { notificationOperationId: 'enqueue-v1' },
+        },
+      },
+    },
+  });
+  await fixture.persist();
+  await fixture.host.route(hostAgentLifecycleRequest(), fixture.scope);
+  const journal = new RemoteStepJournal({
+    db: fixture.binding,
+    fence: fixture.fence,
+    runtime: fixture.app.runtime,
+    deploymentId: 'deployment',
+    tablePrefix: 'host_lifecycle_',
+    allowedToolIds: ['remote_lookup'],
+    verifyCompletion: async () => undefined,
+  });
+  await journal.initialize();
+  const invocation = await journal.register(
+    {
+      deploymentId: 'deployment',
+      tablePrefix: 'host_lifecycle_',
+      workflowId: fixture.execution.workflowId,
+      agentId: 'writer',
+      threadId: 'acme_thread',
+      resourceId: RESOURCE_ID,
+      runId: 'acme_run',
+    },
+    Date.now() + 60_000,
+    fixture.scope.principal,
+  );
+  const permit = await journal.issuePermit(invocation.invocationId, 5_000);
+  const consumed = await journal.consumePermit(permit);
+  if (consumed.kind !== 'accepted') throw new Error('permit was not won');
+  await journal.recordResult(
+    invocation.invocationId,
+    consumed.rawPermit,
+    '{"untrusted":"result"}',
+    '{"receipt":"complete"}',
+  );
+  const freshApp = init(
+    { storage: fixture.storage },
+    { executionFence: fixture.fence, startIdempotency: fixture.reservations },
+  );
+  const reopened = new RemoteStepJournal({
+    db: fixture.binding,
+    fence: fixture.fence,
+    runtime: freshApp.runtime,
+    deploymentId: 'deployment',
+    tablePrefix: 'host_lifecycle_',
+    allowedToolIds: ['remote_lookup'],
+    verifyCompletion: async () => undefined,
+  });
+  const host = harness(['writer'], {
+    init: freshApp,
+    storage: fixture.storage,
+    stateStorage: fixture.stateStorage,
+    resourceAccess: fixture.resources,
+    remoteSteps: reopened,
+    remoteStepNotification: {
+      journal: reopened,
+      agentId: 'writer',
+      operationId: 'enqueue-v1',
+      source: 'flowsafe',
+      kind: 'host-owned',
+      summary: 'Agent notification',
+      ensureScheduledRecovery: async () => undefined,
+    },
+  });
+  const retained = await reopened.readRetainedResult(invocation.invocationId);
+  if (!retained) throw new Error('retained result is missing');
+  await reopened.prepareNotificationOperation(
+    invocation.invocationId,
+    'enqueue-v1',
+    {
+      threadId: invocation.threadId,
+      resourceId: invocation.resourceId,
+      agentId: invocation.agentId,
+      source: 'flowsafe',
+      kind: 'host-owned',
+      summary: 'Agent notification',
+      sourceId: invocation.invocationId,
+      createdAt: new Date(retained.executorQuiescentAt),
+    },
+  );
+  expect(
+    await host.host.recoverNotificationOperation(
+      host.scope,
+      invocation.invocationId,
+    ),
+  ).toBe('unresolved');
+  const resume = vi.spyOn(FlowsafeDurableAgent.prototype, 'resumeViaRuntime');
+  const create = D1NotificationsStorage.prototype.createNotificationOnce;
+  const lostCall = vi
+    .spyOn(D1NotificationsStorage.prototype, 'createNotificationOnce')
+    .mockImplementationOnce(async function (
+      this: D1NotificationsStorage,
+      ...args: Parameters<typeof create>
+    ) {
+      if (failurePoint === 'after write') await create.apply(this, args);
+      throw new Error('executor unavailable after admission');
+    });
+  await expect(
+    host.host.route(
+      new Request('https://thread/_flowsafe/agent-host/remote-step-resume', {
+        method: 'POST',
+        body: JSON.stringify({ invocationId: invocation.invocationId }),
+      }),
+      host.scope,
+    ),
+  ).rejects.toThrow('executor unavailable after admission');
+  lostCall.mockRestore();
+  expect(
+    (await journal.readNotificationOperation(invocation.invocationId))?.state,
+  ).toBe('effect-admitted');
+  expect(fixture.alarmAt()).toBeDefined();
+  await fixture.binding
+    .prepare(
+      'UPDATE flowsafe_remote_step_invocations SET deadline_at = ?, write_revision = write_revision + 1, write_generation = write_generation + 1 WHERE invocation_id = ?',
+    )
+    .bind(Date.now() - 1, invocation.invocationId)
+    .run();
+  const restartedStorage = createD1Storage({
+    binding: fixture.binding,
+    tablePrefix: 'host_lifecycle_',
+  });
+  await restartedStorage.init();
+  const restartedApp = init(
+    { storage: restartedStorage },
+    { executionFence: fixture.fence, startIdempotency: fixture.reservations },
+  );
+  const restartedJournal = new RemoteStepJournal({
+    db: fixture.binding,
+    fence: fixture.fence,
+    runtime: restartedApp.runtime,
+    deploymentId: 'deployment',
+    tablePrefix: 'host_lifecycle_',
+    allowedToolIds: ['remote_lookup'],
+    verifyCompletion: async () => undefined,
+  });
+  const restarted = harness(['writer'], {
+    init: restartedApp,
+    storage: restartedStorage,
+    stateStorage: { ...fixture.stateStorage },
+    resourceAccess: fixture.resources,
+    remoteSteps: restartedJournal,
+    remoteStepNotification: {
+      journal: restartedJournal,
+      agentId: 'writer',
+      operationId: 'enqueue-v1',
+      source: 'flowsafe',
+      kind: 'host-owned',
+      summary: 'Agent notification',
+      ensureScheduledRecovery: async () => undefined,
+    },
+  });
+  const recoveryRequest = () =>
+    new Request(
+      'https://thread/_flowsafe/agent-host/remote-step-notification-recover',
+      {
+        method: 'POST',
+        body: JSON.stringify({ invocationId: invocation.invocationId }),
+      },
+    );
+  await expect(
+    restarted.host.route(recoveryRequest(), {
+      ...restarted.scope,
+      principal: { ...restarted.scope.principal, id: 'different-user' },
+    }),
+  ).rejects.toMatchObject({ status: 404 });
+  if (failurePoint === 'before write')
+    expect(
+      fixture.sql
+        .prepare(
+          "SELECT COUNT(*) AS count FROM sqlite_master WHERE name = 'host_lifecycle_mastra_notifications'",
+        )
+        .get(),
+    ).toMatchObject({ count: 0 });
+  if (failurePoint === 'before write') {
+    await restarted.host.recoverOwnership({
+      threadId: restarted.scope.threadId,
+      init: restarted.scope.init,
+      deploymentTag: restarted.scope.deploymentTag,
+    });
+  } else if (failurePoint === 'after write') {
+    const recovered = await restarted.host.route(
+      recoveryRequest(),
+      restarted.scope,
+    );
+    expect(recovered?.status).toBe(200);
+    expect(await recovered?.json()).toEqual({ state: 'receipt-recorded' });
+  } else {
+    fixture.sql.exec(`CREATE TABLE flowsafe_deployment (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      tenant_tag TEXT NOT NULL,
+      provisioned_at TEXT NOT NULL
+    ); INSERT INTO flowsafe_deployment VALUES
+      (1, 'acme', '2026-10-14T00:00:00.000Z')`);
+    const secret = 'test-deployment-identity-secret-0001';
+    let failFirst = true;
+    const namespace: ThreadNamespaceLike<string> = {
+      idFromName: (name) => name,
+      get: () => ({
+        fetch: (async (
+          url: Request | string,
+          requestInit?: ThreadRequestInit,
+        ) => {
+          const request =
+            typeof url === 'string' ? new Request(url, requestInit) : url;
+          if (
+            !(await credentialsMatch(
+              request.headers.get(DEPLOYMENT_IDENTITY_HEADER) ?? '',
+              secret,
+            ))
+          )
+            return new Response(null, { status: 403 });
+          const principal = decodeExecutionPrincipal(
+            request.headers.get(EXECUTION_PRINCIPAL_HEADER) ?? '',
+          );
+          if (!principal) return new Response(null, { status: 403 });
+          if (failFirst) {
+            failFirst = false;
+            return new Response(null, { status: 503 });
+          }
+          try {
+            return (
+              (await restarted.host.route(request, {
+                ...restarted.scope,
+                principal,
+              })) ?? new Response(null, { status: 404 })
+            );
+          } catch (error) {
+            return doErrorResponse(error);
+          }
+        }) as ReturnType<ThreadNamespaceLike<string>['get']>['fetch'],
+      }),
+    };
+    const tick = createRemoteStepNotificationRecoveryTick({
+      journal: restartedJournal,
+      namespace,
+      deploymentIdentitySecret: secret,
+      limit: 1,
+    });
+    const values = new Map<string, unknown>();
+    let alarmAt: number | null = null;
+    const maintenanceState: MaintenanceDurableObjectState = {
+      id: { name: MAINTENANCE_INSTANCE_NAME },
+      storage: {
+        get: async <T>(key: string) => values.get(key) as T | undefined,
+        getAlarm: async () => alarmAt,
+        setAlarm: async (time) => {
+          alarmAt = Number(time);
+        },
+        transaction: async (work) => {
+          const writes = new Map<string, unknown>();
+          let planned = alarmAt;
+          const result = await work({
+            get: async <T>(key: string) => values.get(key) as T | undefined,
+            put: async (key, value) => {
+              writes.set(key, structuredClone(value));
+            },
+            setAlarm: async (time) => {
+              planned = Number(time);
+            },
+          });
+          for (const [key, value] of writes) values.set(key, value);
+          alarmAt = planned;
+          return result;
+        },
+      },
+    };
+    const config: FlowsafeWorkerConfig<FlowsafeWorkerEnv> = {
+      workflows: [],
+      systemPrincipalId: 'maintenance-test',
+      buildVerifier: () => staticTokenVerifier(new Map()),
+      maintenance: {
+        sweepIntervalMs: 60_000,
+        purgeIntervalMs: 60_000,
+        remoteStepRecoveryIntervalMs: 1_000,
+      },
+      remoteStepRecoveryTick: () => tick,
+    };
+    const Maintenance = createFlowsafeMaintenanceDurableObject(config);
+    let maintenance: {
+      fetch(request: Request): Promise<Response>;
+      alarm(): Promise<void>;
+    };
+    const env: FlowsafeWorkerEnv = {
+      DB: fixture.binding as FlowsafeWorkerEnv['DB'],
+      DEPLOYMENT_TENANT: 'acme',
+      DEPLOYMENT_IDENTITY_SECRET: secret,
+      RUNNER: {
+        idFromName: (name) => name,
+        get: () => ({ fetch: async () => new Response(null, { status: 503 }) }),
+      },
+      MAINTENANCE: {
+        idFromName: (name) => name,
+        get: () => ({
+          fetch: (url, requestInit) =>
+            maintenance.fetch(new Request(url, requestInit)),
+        }),
+      },
+    };
+    maintenance = new Maintenance(maintenanceState, env);
+    const now = Date.now();
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    await ensureRemoteStepNotificationRecoveryDuty(env);
+    for (let index = 0; index < 4; index += 1) await maintenance.alarm();
+    expect(
+      (
+        await restartedJournal.readNotificationOperation(
+          invocation.invocationId,
+        )
+      )?.state,
+    ).toBe('effect-admitted');
+    expect(
+      fixture.sql
+        .prepare(
+          'SELECT after_invocation_id FROM flowsafe_remote_step_notification_cursor',
+        )
+        .get(),
+    ).toMatchObject({ after_invocation_id: invocation.invocationId });
+    maintenance = new Maintenance(maintenanceState, env);
+    vi.setSystemTime(now + 1_000);
+    await maintenance.alarm();
+    await maintenance.alarm();
+    expect(
+      (
+        await restartedJournal.readNotificationOperation(
+          invocation.invocationId,
+        )
+      )?.state,
+    ).toBe('receipt-recorded');
+  }
+  expect(
+    await restarted.host.recoverNotificationOperation(
+      restarted.scope,
+      invocation.invocationId,
+    ),
+  ).toBe('receipt-recorded');
+  expect(
+    (await journal.readNotificationOperation(invocation.invocationId))?.state,
+  ).toBe('receipt-recorded');
+  await restarted.host.recoverOwnership({
+    threadId: restarted.scope.threadId,
+    init: restarted.scope.init,
+    deploymentTag: restarted.scope.deploymentTag,
+  });
+  await restarted.host.recoverOwnership({
+    threadId: restarted.scope.threadId,
+    init: restarted.scope.init,
+    deploymentTag: restarted.scope.deploymentTag,
+  });
+  expect(fixture.alarmAt()).toBeUndefined();
+  expect(
+    fixture.sql
+      .prepare(
+        'SELECT COUNT(*) AS count FROM host_lifecycle_mastra_notifications',
+      )
+      .get(),
+  ).toMatchObject({ count: 1 });
+  await expect(
+    restarted.host.route(
+      new Request('https://thread/_flowsafe/agent-host/remote-step-resume', {
+        method: 'POST',
+        body: JSON.stringify({ invocationId: invocation.invocationId }),
+      }),
+      restarted.scope,
+    ),
+  ).rejects.toMatchObject({ status: 404 });
+  expect(resume).not.toHaveBeenCalled();
+  expect(D1NotificationsStorage.prototype.createNotificationOnce).toBe(create);
+});
+
 describe('agent host selector lookup isolation', () => {
+  it.each([
+    ['modern', 'status'],
+    ['modern', 'resume'],
+    ['v1', 'status'],
+  ] as const)('refuses an unthreaded %s run started under an older resource mapping on %s', async (provenance, route) => {
+    const f = await hostAgentLifecycleFixture({
+      provenance,
+      threaded: false,
+      resourceIdFromKey: () => 'account-7',
+    });
+    onTestFinished(() => {
+      vi.restoreAllMocks();
+      f.sql.close();
+    });
+    const resume = vi.spyOn(FlowsafeDurableAgent.prototype, 'resumeViaRuntime');
+    const request =
+      route === 'status'
+        ? new Request(
+            'https://thread/_flowsafe/agent-host/runs/writer/acme_run?resourceId=account-7',
+          )
+        : new Request('https://thread/_flowsafe/agent-host/resume', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              agentId: 'writer',
+              threadId: 'acme_thread',
+              resourceId: 'account-7',
+              runId: 'acme_run',
+              requestedBy: 'reviewer-2',
+              entryPath: 'approval.resume',
+              resumeData: {},
+            }),
+          });
+    const outcome = await f.host
+      .route(request, f.scope)
+      .catch((error) => error);
+    if (route === 'status') expect(outcome).toMatchObject({ status: 404 });
+    else expect(outcome).toBeInstanceOf(AgentRunSelectorMismatchError);
+    expect(resume).not.toHaveBeenCalled();
+  });
+
   it.each([
     ['modern', true, 'status'],
     ['modern', false, 'stream'],
@@ -7405,6 +8805,8 @@ describe('agent host selector lookup isolation', () => {
         const context = f.snapshot.requestContext;
         if (!context) throw new Error('missing snapshot context');
         context['flowsafe.runProvenance'].startIdentity.target.threadId =
+          'other-thread';
+        context['flowsafe.runProvenance'].startIdentity.target.resourceId =
           'other-thread';
         Object.assign(context, {
           threadId: 'other-thread',

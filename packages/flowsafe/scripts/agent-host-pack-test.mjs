@@ -717,7 +717,7 @@ import {
   type SignalDatabase, type SignalRouterOptions,
 } from '@proofoftech/flowsafe/signals';
 import {
-  type RunnerRuntime, type RunExecutionIdentity, type StartRunOptions,
+  type RunnerRuntime, type RunExecutionIdentity, type StartRunOptions, type RemoteStepJournal,
   type ThreadScope, type StartReservationReading, type PersistedStartResult,
   type RunSummary,
 } from '@proofoftech/flowsafe/do-runner';
@@ -729,6 +729,9 @@ import {
 import {
   type AgentStartAuthority, type FlowsafeDurableAgent,
 } from '@proofoftech/flowsafe/agent-runner';
+import {
+  createWorkflowRemoteStepPreRoute, type AgentThreadDispatchTopology,
+} from '@proofoftech/flowsafe/agent-host';
 // @ts-expect-error internal context capture is not a root export
 import type { captureActorContext as RootCapture } from '@proofoftech/flowsafe';
 // @ts-expect-error internal context capture is not an approval export
@@ -839,6 +842,9 @@ const workerConfig: FlowsafeWorkerConfig<EpochEnv> = {
 createFlowsafeWorker(workerConfig);
 createFlowsafeWorker({ ...workerConfig, mutationEpoch: 0 });
 createFlowsafeWorker({ ...workerConfig, beforeStart: legacyWorkerHook });
+declare const remoteStepJournal: RemoteStepJournal;
+declare const remoteStepDispatch: AgentThreadDispatchTopology;
+createFlowsafeWorker({ ...workerConfig, preRoutes: createWorkflowRemoteStepPreRoute(remoteStepJournal, remoteStepDispatch) });
 void [contextInput, doContextInput, legacyDoInput, legacyRouterHook, routerPolicyResult, workerPolicyResult];
 const onPrepared = (execution: RunExecutionIdentity): void => { void execution.startToken; };
 const legacyOptions: StartRunOptions = { runId: 'legacy' };
@@ -1369,6 +1375,18 @@ const repair = await capability.withInitialAdmission({ execution: repairExecutio
 }, () => workflow.createRun({ runId: repairExecution.runId }));
 const repairRequest = { expected: repair.witness.row, execution: repairExecution, attemptToken: 'repair-correlation', nowMs: 1700000000123 };
 const observer = doRunner.init({ storage }, { executionFence: new doRunner.ExecutionFenceStore(binding), startIdempotency: 'none' }).runtime;
+const remoteStepBinding = sqliteUnitDatabase(openSqlite());
+const remoteStepJournal = new doRunner.RemoteStepJournal({
+  db: remoteStepBinding, fence: new doRunner.ExecutionFenceStore(remoteStepBinding), runtime: observer,
+  deploymentId: 'packed-remote-step', tablePrefix: '', allowedToolIds: ['remote-tool'],
+  verifyCompletion: async () => { throw new Error('no remote completion is configured'); },
+});
+await remoteStepJournal.initialize();
+assert.equal(await remoteStepJournal.getWorkflow('absent-invocation'), undefined);
+const privateRemoteRoute = host.createWorkflowRemoteStepPreRoute(remoteStepJournal, {});
+const privateRemoteMethod = await privateRemoteRoute(new Request('https://packed.test/_flowsafe/workflow-remote-step/ticket'), {}, {}, {});
+assert.equal(privateRemoteMethod.status, 405);
+assert.deepEqual(await privateRemoteMethod.json(), { error: 'method not allowed' });
 observer.register(workflow);
 const initial = await observer.authoritativeStartState(workflow.id, repairExecution.runId);
 assert.equal(initial.kind, 'initial');

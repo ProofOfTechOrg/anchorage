@@ -28,6 +28,7 @@ export {
   type NotificationDispatchTickOptions,
   type NotificationDispatchTickResult,
 } from './notification-dispatch.js';
+export type { NotificationOperationInput } from './notifications-d1.js';
 export { D1NotificationsStorage } from './notifications-d1.js';
 // The P6 ingestion trust boundary router (CI-M-004-004).
 export {

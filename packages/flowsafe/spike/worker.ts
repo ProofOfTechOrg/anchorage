@@ -87,7 +87,9 @@ import {
   createAgentRouter,
   createAgentThreadTopology,
   createThreadAgentHost,
+  createWorkflowRemoteStepPreRoute,
   type ThreadAgentHost,
+  WORKFLOW_REMOTE_STEP_ROUTE,
 } from '../src/agent-host/index.js';
 import { readAgentThreadBinding } from '../src/agent-runner/index.js';
 import {
@@ -139,6 +141,7 @@ import {
   isSuspensionTimeoutResumeData,
   mintThreadId,
   type RunnerRuntime,
+  type RunSummary,
   resourceIdFromKey,
   type StartIdempotencyStore,
   SUSPENSION_DEADLINE_PAYLOAD_KEY,
@@ -151,6 +154,12 @@ import {
   verifyDurableObjectDeploymentRequest,
 } from '../src/do-runner/index.js';
 import {
+  REMOTE_STEP_MARKER,
+  RemoteStepJournal,
+  type RemoteStepPermit,
+  WORKFLOW_REMOTE_STEP_MARKER,
+} from '../src/do-runner/remote-step-journal.js';
+import {
   createObjectiveRouter,
   type ObjectiveAuditEvent,
 } from '../src/goals/index.js';
@@ -158,11 +167,14 @@ import {
   abandonApprovalsForRun,
   bearerActorAuthenticator,
   createDoRunTopology,
+  createFlowsafeMaintenanceDurableObject,
+  createFlowsafeWorker,
   createHubTopology,
   createRunRouter,
   createStreamRouter,
   createThreadTopology,
   doSummary,
+  type FlowsafeWorkerConfig,
   RunRouteError,
   staticTokenVerifier,
   type WorkflowMeta,
@@ -208,6 +220,9 @@ interface Env {
   /** Singleton deployment signal-provider host DO; see DemoSignalProviderHost (Track E). */
   SIGNAL_PROVIDER_HOST: DurableObjectNamespace;
   BACKGROUND_TASKS: DurableObjectNamespace;
+  MAINTENANCE: DurableObjectNamespace;
+  MAINTENANCE_ADMIN_SECRET: string;
+  SPIKE_REMOTE_STEP_PROOF?: string;
   SPIKE_LLM_MODEL_ID?: string;
   SPIKE_LLM_API_KEY?: string;
   SPIKE_LLM_BASE_URL?: string;
@@ -662,6 +677,12 @@ async function countExecution(db: D1Database, counterId: string) {
 
 const WORKFLOWS: ReadonlyArray<WorkflowMeta> = [
   {
+    id: 'spike-private-remote',
+    title: 'Private remote-step proof',
+    description: 'Suspends a real D1-backed workflow for private dispatch',
+    sampleInput: { query: 'x' },
+  },
+  {
     id: 'demo-approval',
     title: 'Demo approval',
     description:
@@ -849,6 +870,28 @@ function defineWorkflows(env: Env): RunnerRuntime {
     .then(research)
     .then(approval)
     .then(publish)
+    .commit();
+
+  createWorkflow({
+    id: 'spike-private-remote',
+    inputSchema: z.object({ query: z.string() }),
+    outputSchema: z.object({ query: z.string() }),
+  })
+    .then(
+      createStep({
+        id: 'execute',
+        inputSchema: z.object({ query: z.string() }),
+        outputSchema: z.object({ query: z.string() }),
+        execute: async ({ inputData, suspend }) =>
+          suspend({
+            type: 'suspension',
+            remoteStep: {
+              marker: WORKFLOW_REMOTE_STEP_MARKER,
+              request: { version: 2, input: { query: inputData.query } },
+            },
+          }),
+      }),
+    )
     .commit();
 
   // FI1/FI2: demo-approval's shape with a COUNTING first step. The step is
@@ -3073,6 +3116,245 @@ async function handleInventoryProbe(
   }
 }
 
+// Local workerd fixture: the journal reads a persisted suspension and start
+// identity without entering Mastra. It proves D1 recovery, not agent replay.
+async function handleRemoteStepProbe(
+  request: Request,
+  env: Env,
+): Promise<Response | null> {
+  const path = new URL(request.url).pathname;
+  if (!path.startsWith('/spike/remote-step/')) return null;
+  if (env.SPIKE_REMOTE_STEP_PROOF !== 'enabled')
+    return json({ error: 'not found' }, 404);
+  const operation = path.slice('/spike/remote-step/'.length);
+  const workflow = operation.startsWith('workflow-');
+  const action = workflow ? operation.slice('workflow-'.length) : operation;
+  const runId = workflow ? 'spike-workflow-run' : 'spike-remote-run';
+  if (
+    request.method !== (action === 'read' || action === 'scan' ? 'GET' : 'POST')
+  )
+    return json({ error: 'method not allowed' }, 405);
+  try {
+    const fixture = await env.DB.prepare(
+      'SELECT resource_id FROM spike_remote_step_fixture WHERE id = 1',
+    ).first<{ resource_id: string }>();
+    const snapshot = await env.DB.prepare(
+      'SELECT snapshot FROM spike_remote_mastra_workflow_snapshot WHERE workflow_name = ? AND run_id = ?',
+    )
+      .bind('durable-agentic-loop', runId)
+      .first<{ snapshot: string }>();
+    if (!fixture || !snapshot)
+      throw new Error('remote-step fixture is unavailable');
+    const persisted = JSON.parse(snapshot.snapshot) as { status?: unknown };
+    if (persisted.status !== 'suspended' && persisted.status !== 'success')
+      throw new Error('remote-step snapshot status is unavailable');
+    const summary: RunSummary =
+      persisted.status === 'success'
+        ? {
+            runId,
+            status: 'success',
+            result: { answer: 1 },
+          }
+        : workflow
+          ? {
+              runId,
+              status: 'suspended',
+              suspended: [['execute']],
+              suspendedAt: { execute: 1000 },
+              suspendPayload: {
+                execute: {
+                  type: 'suspension',
+                  remoteStep: {
+                    marker: WORKFLOW_REMOTE_STEP_MARKER,
+                    request: { version: 2, input: { query: 'x' } },
+                  },
+                },
+              },
+            }
+          : {
+              runId,
+              status: 'suspended',
+              suspended: [['durable-agentic-execution']],
+              suspendedAt: { 'durable-agentic-execution': 1000 },
+              suspendPayload: {
+                'durable-agentic-execution': {
+                  type: 'suspension',
+                  toolName: 'remote_lookup',
+                  toolCallId: 'call-1',
+                  toolCallSuspended: {
+                    remoteStep: REMOTE_STEP_MARKER,
+                    request: { account: 'acme' },
+                  },
+                },
+              },
+            };
+    const runtime = {
+      authoritativeStatus: async () => summary,
+      authoritativeStartState: async () => ({
+        storage: 'd1',
+        snapshot: persisted,
+        execution: {
+          tablePrefix: 'spike_remote_',
+          workflowId: 'durable-agentic-loop',
+          runId,
+          startToken: 'spike-start-token',
+        },
+        provenance: {
+          startIdentity: {
+            owner: { kind: 'human', id: 'operator-1' },
+            target: workflow
+              ? { kind: 'workflow', id: 'durable-agentic-loop' }
+              : {
+                  kind: 'agent',
+                  id: 'writer',
+                  threadId: 'spike-remote-thread',
+                  resourceId: fixture.resource_id,
+                },
+          },
+        },
+      }),
+    } as unknown as Pick<
+      RunnerRuntime,
+      'authoritativeStatus' | 'authoritativeStartState'
+    >;
+    const journal = new RemoteStepJournal({
+      db: env.DB as unknown as never,
+      fence: executionFenceForEnv(env),
+      runtime,
+      deploymentId: 'spike',
+      tablePrefix: 'spike_remote_',
+      allowedToolIds: ['remote_lookup'],
+      verifyCompletion: async () => undefined,
+      ...(workflow ? { verifyWorkflowCompletion: async () => undefined } : {}),
+    });
+    await journal.initialize();
+    const body =
+      request.method === 'POST'
+        ? ((await request.json()) as Record<string, unknown>)
+        : {};
+    const invocationId =
+      request.method === 'GET'
+        ? (new URL(request.url).searchParams.get('invocationId') ?? '')
+        : String(body.invocationId ?? '');
+    switch (action) {
+      case 'register':
+        return json(
+          await (workflow
+            ? journal.registerWorkflow(
+                {
+                  targetKind: 'workflow',
+                  deploymentId: 'spike',
+                  tablePrefix: 'spike_remote_',
+                  workflowId: 'durable-agentic-loop',
+                  runId,
+                },
+                Date.now() + 120_000,
+                { kind: 'human', id: 'operator-1', role: 'operator' },
+              )
+            : journal.register(
+                {
+                  deploymentId: 'spike',
+                  tablePrefix: 'spike_remote_',
+                  workflowId: 'durable-agentic-loop',
+                  agentId: 'writer',
+                  threadId: 'spike-remote-thread',
+                  resourceId: String(body.resourceId ?? ''),
+                  runId,
+                },
+                Date.now() + 120_000,
+                { kind: 'human', id: 'operator-1', role: 'operator' },
+              )),
+        );
+      case 'issue':
+        return json(await journal.issuePermit(invocationId, 60_000));
+      case 'consume':
+        return json(
+          await journal.consumePermit(body.permit as RemoteStepPermit),
+        );
+      case 'record':
+        return json(
+          await journal.recordResult(
+            invocationId,
+            String(body.rawPermit),
+            '{"answer":1}',
+            '{"receipt":"complete"}',
+          ),
+        );
+      case 'read':
+        return json({
+          invocation: workflow
+            ? await journal.getWorkflow(invocationId)
+            : await journal.get(invocationId),
+          result: await journal.readRetainedResult(invocationId),
+        });
+      case 'scan':
+        return json(await journal.recoverableResults(10));
+      case 'claim':
+        return json({ owner: await journal.claimResume(invocationId, 60_000) });
+      case 'reconcile':
+        return json({ outcome: await journal.reconcileResult(invocationId) });
+      case 'settle':
+        return json({
+          outcome: await journal.settleAfterResume(
+            invocationId,
+            String(body.owner),
+          ),
+        });
+      default:
+        return json({ error: 'not found' }, 404);
+    }
+  } catch (error) {
+    return doErrorResponse(error);
+  }
+}
+
+const privateRemoteConfig: FlowsafeWorkerConfig<Env> = {
+  systemPrincipalId: SYSTEM_PRINCIPAL_ID,
+  workflows: WORKFLOWS,
+  maintenance: { sweepIntervalMs: 60_000, purgeIntervalMs: 60_000 },
+  buildVerifier: () => staticTokenVerifier(SPIKE_ACTORS),
+  preRoutes: async (request, env, ctx, kit) => {
+    if (
+      !new URL(request.url).pathname.startsWith(
+        `${WORKFLOW_REMOTE_STEP_ROUTE}/`,
+      )
+    )
+      return null;
+    const unauthorized = await kit.authorizePrivateWorkflowDispatch(request);
+    if (unauthorized) return unauthorized;
+    const journal = new RemoteStepJournal({
+      db: env.DB as unknown as never,
+      fence: executionFenceForEnv(env),
+      runtime: defineWorkflows(env),
+      deploymentId: env.DEPLOYMENT_TENANT,
+      tablePrefix: '',
+      allowedToolIds: ['remote_lookup'],
+      verifyCompletion: async () => undefined,
+      verifyWorkflowCompletion: async () => undefined,
+    });
+    await journal.initialize();
+    const dispatch = createAgentThreadTopology(
+      env.THREAD,
+      env.DEPLOYMENT_IDENTITY_SECRET,
+      {
+        startIdempotency: startIdempotencyForEnv(env),
+        executionFence: executionFenceForEnv(env),
+        workflowRemoteStepDispatch: journal,
+      },
+    );
+    return createWorkflowRemoteStepPreRoute(journal, dispatch)(
+      request,
+      env,
+      ctx,
+      kit,
+    );
+  },
+};
+
+const privateRemoteWorker = createFlowsafeWorker(privateRemoteConfig);
+export const DemoPrivateMaintenance =
+  createFlowsafeMaintenanceDurableObject(privateRemoteConfig);
+
 const handler: ExportedHandler<Env> = {
   async fetch(
     request: CfRequest,
@@ -3109,6 +3391,13 @@ const handler: ExportedHandler<Env> = {
       buildService: (store) => buildApprovalService(store, env, streamSink),
     });
     const routed = request as unknown as Request;
+    if (
+      new URL(routed.url).pathname.startsWith(`${WORKFLOW_REMOTE_STEP_ROUTE}/`)
+    ) {
+      if (env.SPIKE_REMOTE_STEP_PROOF !== 'enabled')
+        return json({ error: 'not found' }, 404);
+      return privateRemoteWorker.fetch(routed, env, ctx);
+    }
     const runTopology = createDoRunTopology(
       env.RUNNER,
       env.DEPLOYMENT_IDENTITY_SECRET,
@@ -3124,6 +3413,9 @@ const handler: ExportedHandler<Env> = {
     // refusing everything else.
     const inventoryProbe = await handleInventoryProbe(routed, env);
     if (inventoryProbe) return inventoryProbe;
+
+    const remoteStepProbe = await handleRemoteStepProbe(routed, env);
+    if (remoteStepProbe) return remoteStepProbe;
 
     const agentProbeResponse = await handleLiveAgentRoute(routed, env, resolve);
     if (agentProbeResponse) return agentProbeResponse;

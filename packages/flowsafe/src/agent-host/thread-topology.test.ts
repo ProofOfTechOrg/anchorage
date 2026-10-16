@@ -19,6 +19,9 @@ import { RunRouteError } from '../host-kit/run-route-error.js';
 import {
   type AgentThreadDispatchTopology,
   createAgentThreadTopology,
+  type RemoteStepContinuationReader,
+  type RemoteStepDispatchReader,
+  type WorkflowRemoteStepDispatchReader,
 } from './thread-topology.js';
 
 const DEPLOYMENT_IDENTITY_SECRET = 'test-deployment-identity-secret-0001';
@@ -29,7 +32,11 @@ interface Hit {
   init?: ThreadRequestInit;
 }
 
-function harness(): {
+function harness(
+  remoteSteps?: RemoteStepContinuationReader,
+  remoteStepDispatch?: RemoteStepDispatchReader,
+  workflowRemoteStepDispatch?: WorkflowRemoteStepDispatchReader,
+): {
   topology: AgentThreadDispatchTopology;
   hits: Hit[];
 } {
@@ -50,7 +57,7 @@ function harness(): {
             summary: { runId: body.runId, status: 'success' },
           });
         }
-        if (url.endsWith('/resume')) {
+        if (url.endsWith('/resume') || url.endsWith('/remote-step-resume')) {
           const body = JSON.parse(init?.body ?? '{}') as Record<string, string>;
           return Response.json({
             agentId: body.agentId,
@@ -92,10 +99,397 @@ function harness(): {
     topology: createAgentThreadTopology(namespace, DEPLOYMENT_IDENTITY_SECRET, {
       startIdempotency: 'none',
       executionFence: 'none',
+      ...(remoteSteps ? { remoteSteps } : {}),
+      ...(remoteStepDispatch ? { remoteStepDispatch } : {}),
+      ...(workflowRemoteStepDispatch ? { workflowRemoteStepDispatch } : {}),
     }),
     hits,
   };
 }
+
+it('keeps workflow remote-step dispatch within the stored owner and deployment', async () => {
+  const owner = context().value;
+  const permit = {
+    invocationId: 'workflow-invocation',
+    generation: 2,
+    mutationEpoch: 7,
+    transitionRevision: 4,
+    expiresAt: 9_999_999_999_999,
+  };
+  const invocation = {
+    targetKind: 'workflow' as const,
+    invocationId: permit.invocationId,
+    deploymentId: 'deployment',
+    tablePrefix: '',
+    workflowId: 'customer-workflow',
+    runId: 'workflow-run',
+    principal: owner.principal,
+    startToken: 'stored-start-token',
+    stepPath: ['remote-step'],
+    suspendedAt: 1000,
+    request: { script: 'script-1' },
+    requestDigest: 'stored-request-digest',
+    deadlineAt: permit.expiresAt,
+    status: 'pending' as const,
+    permitGeneration: 1,
+  };
+  const dispatched = {
+    ...invocation,
+    status: 'dispatched' as const,
+    permitGeneration: permit.generation,
+  };
+  const reader: WorkflowRemoteStepDispatchReader = {
+    deploymentId: invocation.deploymentId,
+    tablePrefix: invocation.tablePrefix,
+    registerWorkflow: vi.fn(async () => invocation),
+    getWorkflow: vi
+      .fn()
+      .mockResolvedValueOnce(invocation)
+      .mockResolvedValue(dispatched),
+    readWorkflowDispatchRequestJson: vi.fn(async () => '{"script":"script-1"}'),
+    issuePermit: vi.fn(async () => permit),
+    consumePermit: vi
+      .fn()
+      .mockResolvedValueOnce({ kind: 'accepted', rawPermit: 'winner-secret' })
+      .mockResolvedValueOnce({ kind: 'already-consumed' }),
+    recordResult: vi.fn(async () => ({
+      kind: 'recorded' as const,
+      resultJson: '{"answer":42}',
+      resultDigest: 'stored-result-digest',
+    })),
+  };
+  const { topology } = harness(undefined, undefined, reader);
+  expect(
+    await topology.registerWorkflowRemoteStep(
+      owner,
+      invocation.workflowId,
+      invocation.runId,
+      10_000,
+    ),
+  ).toEqual(invocation);
+  expect(reader.registerWorkflow).toHaveBeenCalledWith(
+    {
+      targetKind: 'workflow',
+      deploymentId: invocation.deploymentId,
+      tablePrefix: invocation.tablePrefix,
+      workflowId: invocation.workflowId,
+      runId: invocation.runId,
+    },
+    10_000,
+    owner.principal,
+  );
+  const ticket = await topology.issueWorkflowRemoteStepDispatch(
+    owner,
+    invocation.invocationId,
+    60_000,
+  );
+  expect(ticket).toMatchObject({
+    invocationId: invocation.invocationId,
+    requestJson: '{"script":"script-1"}',
+    requestDigest: invocation.requestDigest,
+    permit,
+  });
+  expect(ticket).not.toHaveProperty('principal');
+  expect(ticket).not.toHaveProperty('startToken');
+  expect(reader.issuePermit).toHaveBeenCalledWith(
+    invocation.invocationId,
+    60_000,
+  );
+  const workflowReadsBeforeGet = vi.mocked(reader.getWorkflow).mock.calls
+    .length;
+  expect(
+    await topology.getWorkflowRemoteStep(owner, invocation.invocationId),
+  ).toEqual(dispatched);
+  expect(vi.mocked(reader.getWorkflow).mock.calls.length).toBe(
+    workflowReadsBeforeGet + 1,
+  );
+  expect(
+    await topology.consumeWorkflowRemoteStepDispatch(owner, permit),
+  ).toEqual({ kind: 'accepted', rawPermit: 'winner-secret' });
+  expect(
+    await topology.consumeWorkflowRemoteStepDispatch(owner, permit),
+  ).toEqual({ kind: 'already-consumed' });
+  expect(reader.consumePermit).toHaveBeenNthCalledWith(1, permit);
+  expect(reader.consumePermit).toHaveBeenNthCalledWith(2, permit);
+  expect(
+    await topology.recordWorkflowRemoteStepResult(
+      owner,
+      invocation.invocationId,
+      'winner-secret',
+      '{"answer":42}',
+      '{"quiescent":true}',
+    ),
+  ).toMatchObject({ kind: 'recorded', resultJson: '{"answer":42}' });
+  expect(reader.recordResult).toHaveBeenCalledWith(
+    invocation.invocationId,
+    'winner-secret',
+    '{"answer":42}',
+    '{"quiescent":true}',
+  );
+  const otherPrincipal = {
+    ...owner,
+    principal: {
+      kind: 'human' as const,
+      id: 'other',
+      role: 'operator' as const,
+    },
+  };
+  await expect(
+    topology.issueWorkflowRemoteStepDispatch(
+      otherPrincipal,
+      invocation.invocationId,
+      60_000,
+    ),
+  ).rejects.toMatchObject({ status: 404 });
+  await expect(
+    topology.getWorkflowRemoteStep(otherPrincipal, invocation.invocationId),
+  ).rejects.toMatchObject({ status: 404 });
+  await expect(
+    topology.consumeWorkflowRemoteStepDispatch(otherPrincipal, permit),
+  ).rejects.toMatchObject({ status: 404 });
+  await expect(
+    topology.recordWorkflowRemoteStepResult(
+      otherPrincipal,
+      invocation.invocationId,
+      'winner-secret',
+      '{"answer":42}',
+      '{"quiescent":true}',
+    ),
+  ).rejects.toMatchObject({ status: 404 });
+  const deniedRun = { ...owner, canAccessResource: async () => false };
+  await expect(
+    topology.registerWorkflowRemoteStep(
+      deniedRun,
+      invocation.workflowId,
+      invocation.runId,
+      10_000,
+    ),
+  ).rejects.toMatchObject({ status: 404 });
+  await expect(
+    topology.issueWorkflowRemoteStepDispatch(
+      deniedRun,
+      invocation.invocationId,
+      60_000,
+    ),
+  ).rejects.toMatchObject({ status: 404 });
+  await expect(
+    topology.getWorkflowRemoteStep(deniedRun, invocation.invocationId),
+  ).rejects.toMatchObject({ status: 404 });
+  vi.mocked(reader.getWorkflow)
+    .mockResolvedValueOnce(dispatched)
+    .mockResolvedValueOnce({
+      ...dispatched,
+      permitGeneration: permit.generation + 1,
+    });
+  await expect(
+    topology.issueWorkflowRemoteStepDispatch(
+      owner,
+      invocation.invocationId,
+      60_000,
+    ),
+  ).rejects.toMatchObject({ status: 409 });
+  vi.mocked(reader.getWorkflow).mockResolvedValueOnce({
+    ...dispatched,
+    deploymentId: 'another-deployment',
+  });
+  await expect(
+    topology.issueWorkflowRemoteStepDispatch(
+      owner,
+      invocation.invocationId,
+      60_000,
+    ),
+  ).rejects.toMatchObject({ status: 404 });
+  vi.mocked(reader.getWorkflow).mockResolvedValueOnce({
+    ...dispatched,
+    deploymentId: 'another-deployment',
+  });
+  await expect(
+    topology.getWorkflowRemoteStep(owner, invocation.invocationId),
+  ).rejects.toMatchObject({ status: 404 });
+  expect(reader.issuePermit).toHaveBeenCalledTimes(2);
+  expect(reader.consumePermit).toHaveBeenCalledTimes(2);
+  expect(reader.recordResult).toHaveBeenCalledTimes(1);
+});
+
+it('issues a remote dispatch ticket and exposes a raw permit to the consume winner', async () => {
+  const permit = {
+    invocationId: 'invocation_1',
+    generation: 2,
+    mutationEpoch: 7,
+    transitionRevision: 4,
+    expiresAt: 9_999_999_999_999,
+  };
+  const invocation = {
+    invocationId: permit.invocationId,
+    deploymentId: 'deployment',
+    tablePrefix: '',
+    workflowId: 'durable-agentic-loop',
+    agentId: 'writer',
+    threadId: 'acme_thread',
+    resourceId: 'acme_resource_acme_thread',
+    runId: 'acme_run',
+    principal: context().value.principal,
+    startToken: 'private-generation',
+    stepPath: ['tool'],
+    suspendedAt: 1000,
+    request: { script: 'script-1' },
+    deadlineAt: permit.expiresAt,
+    status: 'dispatched' as const,
+    permitGeneration: permit.generation,
+  };
+  const reader: RemoteStepDispatchReader = {
+    deploymentId: invocation.deploymentId,
+    tablePrefix: invocation.tablePrefix,
+    get: vi.fn(async () => invocation),
+    readDispatchRequestJson: vi.fn(async () => '{"script":"script-1"}'),
+    issuePermit: vi.fn(async () => permit),
+    consumePermit: vi
+      .fn()
+      .mockResolvedValueOnce({ kind: 'accepted', rawPermit: 'secret' })
+      .mockResolvedValueOnce({ kind: 'already-consumed' }),
+  };
+  const { topology } = harness(undefined, reader);
+  const ticket = await topology.issueRemoteStepDispatch(
+    context().value,
+    permit.invocationId,
+    60_000,
+  );
+  expect(ticket).toMatchObject({
+    invocationId: permit.invocationId,
+    requestJson: '{"script":"script-1"}',
+    permit,
+  });
+  expect(ticket).not.toHaveProperty('principal');
+  expect(ticket).not.toHaveProperty('startToken');
+  expect(reader.issuePermit).toHaveBeenCalledWith(permit.invocationId, 60_000);
+  expect(
+    await topology.consumeRemoteStepDispatch(context().value, permit),
+  ).toEqual({ kind: 'accepted', rawPermit: 'secret' });
+  expect(
+    await topology.consumeRemoteStepDispatch(context().value, permit),
+  ).toEqual({ kind: 'already-consumed' });
+  const displaced = context().value;
+  await expect(
+    topology.issueRemoteStepDispatch(
+      {
+        ...displaced,
+        principal: { kind: 'human', id: 'other', role: 'operator' },
+      },
+      permit.invocationId,
+      60_000,
+    ),
+  ).rejects.toMatchObject({ status: 404 });
+  expect(reader.issuePermit).toHaveBeenCalledTimes(1);
+  await expect(
+    topology.consumeRemoteStepDispatch(
+      {
+        ...displaced,
+        principal: { kind: 'human', id: 'other', role: 'operator' },
+      },
+      permit,
+    ),
+  ).rejects.toMatchObject({ status: 404 });
+  expect(reader.consumePermit).toHaveBeenCalledTimes(2);
+  const deniedAccess = {
+    ...displaced,
+    canAccessResource: async () => false,
+  };
+  await expect(
+    topology.issueRemoteStepDispatch(deniedAccess, permit.invocationId, 60_000),
+  ).rejects.toMatchObject({ status: 404 });
+  await expect(
+    topology.consumeRemoteStepDispatch(deniedAccess, permit),
+  ).rejects.toMatchObject({ status: 404 });
+  const displacedResource = {
+    ...displaced,
+    resourceIdFromKey: () => 'another-resource',
+  };
+  await expect(
+    topology.issueRemoteStepDispatch(
+      displacedResource,
+      permit.invocationId,
+      60_000,
+    ),
+  ).rejects.toMatchObject({ status: 404 });
+  vi.mocked(reader.get).mockResolvedValueOnce({
+    ...invocation,
+    deploymentId: 'other-deployment',
+  });
+  await expect(
+    topology.issueRemoteStepDispatch(displaced, permit.invocationId, 60_000),
+  ).rejects.toMatchObject({ status: 404 });
+  expect(reader.issuePermit).toHaveBeenCalledTimes(1);
+  expect(reader.readDispatchRequestJson).toHaveBeenCalledTimes(1);
+  expect(reader.consumePermit).toHaveBeenCalledTimes(2);
+});
+
+it('routes a retained result under the journaled principal and refuses a changed resource mapping', async () => {
+  const principal = {
+    kind: 'human' as const,
+    id: 'original',
+    role: 'operator' as const,
+  };
+  const reader: RemoteStepContinuationReader = {
+    deploymentId: 'deployment',
+    tablePrefix: '',
+    get: vi.fn(async () => ({
+      invocationId: 'invocation_1',
+      deploymentId: 'deployment',
+      tablePrefix: '',
+      workflowId: 'durable-agentic-loop',
+      agentId: 'writer',
+      threadId: 'acme_thread',
+      resourceId: 'acme_resource_acme_thread',
+      runId: 'acme_run',
+      principal,
+      startToken: 'generation',
+      stepPath: ['tool'],
+      suspendedAt: 1000,
+      request: {},
+      deadlineAt: 9999999999999,
+      status: 'result-retained' as const,
+      permitGeneration: 1,
+    })),
+    readRetainedResult: vi.fn(async () => ({
+      invocationId: 'invocation_1',
+      resultJson: '{"answer":1}',
+      resultDigest: 'digest',
+      quiescenceDigest: 'evidence',
+      executorQuiescentAt: 1000,
+    })),
+    claimResume: vi.fn(async () => 'lease-1'),
+    settleAfterResume: vi.fn(async () => 'applied' as const),
+  };
+  const { topology, hits } = harness(reader);
+  await topology.resumeRemoteStep(context().value, 'invocation_1');
+  const sent = hits[0];
+  expect(sent?.url).toContain('/_flowsafe/agent-host/remote-step-resume');
+  expect(JSON.parse(sent?.init?.body ?? '{}')).toEqual({
+    invocationId: 'invocation_1',
+  });
+  expect(sent?.init?.headers?.['x-flowsafe-principal']).toBe(
+    '{"kind":"human","id":"original","role":"operator"}',
+  );
+  const stored = await reader.get('invocation_1');
+  if (!stored) throw new Error('invocation was not found');
+  vi.mocked(reader.get).mockResolvedValue({
+    ...stored,
+    resourceId: 'displaced-resource',
+  });
+  await expect(
+    topology.resumeRemoteStep(context().value, 'invocation_1'),
+  ).rejects.toMatchObject({ status: 404 });
+  expect(hits).toHaveLength(1);
+  vi.mocked(reader.get).mockResolvedValue({
+    ...stored,
+    status: 'resuming',
+    resumeLeaseExpiresAt: Date.now() - 1,
+  });
+  await expect(
+    topology.resumeRemoteStep(context().value, 'invocation_1'),
+  ).rejects.toMatchObject({ status: 503 });
+  expect(hits).toHaveLength(1);
+});
 
 function context() {
   let runMints = 0;

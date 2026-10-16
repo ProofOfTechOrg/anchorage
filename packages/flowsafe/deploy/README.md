@@ -215,3 +215,57 @@ pnpm --filter @proofoftech/flowsafe spike:verify
 `spike:verify` adds the workerd boundary: suspend, kill, restart on persisted state, resume from an approved record, and refuse a mismatched deployment sentinel.
 
 See the repository [deployment reference](../../../docs/deployment-reference.md), [operations runbook](../../../docs/operations-runbook.md), and [security threat model](../../../docs/security-threat-model.md) before exposing traffic.
+
+## Run the isolated notification staging control
+
+Use `notification-staging-live.mjs` only with the isolated notification staging Worker and its loopback Service-binding probe. Keep the probe bound to `127.0.0.1`. The initial run requires a `migration-locked` fence at epoch and revision zero, an empty v5 journal, and an armed recovery alarm. It acquires a Linux `flock` keyed by Cloudflare account and Worker before reading the enabled version. Its detached watchdog inherits the same locked open file descriptor, seals or relocks the fence after controller death or its 15-minute deadline, and performs the tracked off deployment on controller request or recovery. Sealing advances the locked fence's revision, so a delayed controller unlock cannot succeed after watchdog shutdown starts. The controller never deploys off itself.
+
+A failed preflight may leave the fence sealed at `migration-locked`, epoch and revision `1`, with `requireMutationEpoch=true`, even though no effect ran. An operator may retry this exact state once: verify the prior run's tracked off Worker version, confirm the remote-step journal is empty and the notification and receipt tables are absent, deploy a fresh enabled version under the same lock with `--var STAGING_MUTATION_EPOCH:2`, and set `FLOWSAFE_STAGING_RETRY_OFF_VERSION` to that immediately prior 100% off deployment ID. The retry opens at epoch and revision `2`; the watchdog seals a still-locked fence at `2` or relocks an open fence at `3`. A different fence or a second sealed retry requires operator review; do not update the D1 fence row directly.
+
+Use the same lock for **every** command that can upload, deploy, promote, or change traffic for `anchorage-flowsafe-remote-step-staging`. From `packages/flowsafe`, define the wrapper below and use it for the initial enabled deployment and any other same-Worker deployment command:
+
+```bash
+export FLOWSAFE_CF_ACCOUNT_ID=replace-with-32-lowercase-hex-account-id
+flowsafe_locked_deploy() {
+  [[ "$FLOWSAFE_CF_ACCOUNT_ID" =~ ^[0-9a-f]{32}$ ]] || return 2
+  local lock_dir="/tmp/flowsafe-deploy-locks-$(id -u)"
+  install -d -m 700 "$lock_dir" || return
+  (umask 077; flock -n -E 75 "$lock_dir/${FLOWSAFE_CF_ACCOUNT_ID}-anchorage-flowsafe-remote-step-staging.lock" "$@")
+}
+flowsafe_locked_deploy pnpm exec wrangler deploy \
+  --config deploy/notification-staging.wrangler.jsonc \
+  --var NOTIFICATION_PROOF_ENABLED:true \
+  --var STAGING_MUTATION_EPOCH:1 \
+  --outdir /tmp/flowsafe-notification-enable
+```
+
+The wrapper exits `75` if another local deployment owns the lock. Run the control on the same host and Unix user as the wrapper; the lock directory is fixed under `/tmp`, regardless of `TMPDIR`. Set `FLOWSAFE_STAGING_ENABLED_VERSION` from the exact enabled deployment ID before starting the control. The lock serializes cooperating local processes only. A deployment from another host, the Cloudflare dashboard, or an actor that skips this wrapper can still race the version check and deploy. Confirm exclusive deployment control separately before treating the live proof as safe.
+
+Pin `STAGING_MUTATION_EPOCH` in the enabled version to the epoch its controller will open: `1` for an initial run or `2` for the permitted retry. Keep the off config at `0`. The epoch is deployment configuration; never derive it from a request or adopt the current D1 epoch.
+
+For a fresh isolated proof, create a new Worker and D1 database. Copy `notification-staging.wrangler.jsonc` to an absolute `0600` path outside the repository. Change its Worker name, D1 name and ID, and deployment tenant to unique values. Resolve `main` and each `alias` target to their absolute paths in this checkout. Keep every other field unchanged, including the off flag, disabled public route, version metadata binding, and Durable Object migration. Do not reuse a sealed D1 database for an initial run.
+
+Copy `notification-staging-probe.wrangler.jsonc` to a second absolute `0600` path. Set its `services[0].service` to the new Worker name and resolve its `main` path; keep its other fields unchanged. Set `FLOWSAFE_STAGING_CONFIG_FILE` and `FLOWSAFE_STAGING_PROBE_CONFIG_FILE` to the private paths, and set `FLOWSAFE_STAGING_PROBE_PORT` to the local port. Start the probe before enabling the subject Worker:
+
+```bash
+pnpm exec wrangler dev \
+  --config "$FLOWSAFE_STAGING_PROBE_CONFIG_FILE" \
+  --port "$FLOWSAFE_STAGING_PROBE_PORT"
+```
+
+Use the new Worker name and subject config path in the deployment wrapper. The controller checks the enabled version's D1 and tenant bindings and the probe subject's authenticated version identity before unlocking. It compiles a private off bundle before arming the watchdog; rollback uses that bundle.
+
+Set these environment variables before running `node deploy/notification-staging-live.mjs --run` from `packages/flowsafe`:
+
+| Variable | Value |
+| --- | --- |
+| `FLOWSAFE_STAGING_PROBE_PORT` | Port of the local Service-binding probe |
+| `FLOWSAFE_STAGING_PROBE_SECRET_FILE` | Absolute path to the probe credential in a `0600` file |
+| `FLOWSAFE_CF_TOKEN_FILE` | Absolute path to the Cloudflare API token in a `0600` file |
+| `FLOWSAFE_CF_ACCOUNT_ID` | Cloudflare account ID as 32 lowercase hexadecimal characters; the same value used by the deployment wrapper |
+| `FLOWSAFE_STAGING_ENABLED_VERSION` | Exact 100% enabled subject Worker version ID |
+| `FLOWSAFE_STAGING_RETRY_OFF_VERSION` | Retry only: immediately prior 100% off Worker version ID; omit for an initial run |
+| `FLOWSAFE_STAGING_CONFIG_FILE` | Fresh isolated proof only: absolute path to the private `0600` off config; omit to use the tracked staging Worker |
+| `FLOWSAFE_STAGING_PROBE_CONFIG_FILE` | Fresh isolated proof only: absolute path to the private `0600` local probe config targeting the selected Worker |
+
+The controller writes watchdog state and its error log under `/tmp/flowsafe-notification-control-<pid>/`. If the probe becomes unavailable, the watchdog still attempts the version-checked off deployment and reads the fence through the D1 API. An open or unreadable fence leaves completion unconfirmed. Inspect that private directory's `watchdog.log` and verify the fence and current Worker version before another attempt. An unconfirmed relock or changed deployment requires operator review; do not directly update the D1 fence row.

@@ -11,6 +11,7 @@ import {
 import {
   isExecutionPrincipalId,
   isExecutionPrincipalKind,
+  samePrincipal,
 } from '../approval-api/principal.js';
 import {
   APPROVAL_PRIORITIES,
@@ -30,10 +31,18 @@ import {
   type StartReservation,
   type StartReservationReading,
 } from '../do-runner/index.js';
+import type {
+  RecordedRemoteStepResult,
+  RemoteStepInvocation,
+  RemoteStepJournal,
+  RemoteStepPermit,
+  WorkflowRemoteStepInvocation,
+} from '../do-runner/remote-step-journal.js';
 import {
   isTerminalRunStatus,
   type RunStatus,
 } from '../do-runner/run-terminal-state.js';
+import type { RunSummary } from '../do-runner/runtime.js';
 import {
   captureReservation,
   type StartReservationOwner,
@@ -120,6 +129,88 @@ export interface AgentThreadTopologyOptions {
    * for a host with no fence.
    */
   executionFence: ExecutionFenceWiring;
+  remoteSteps?: RemoteStepContinuationReader;
+  remoteStepDispatch?: RemoteStepDispatchReader;
+  workflowRemoteStepDispatch?: WorkflowRemoteStepDispatchReader;
+}
+
+export type WorkflowRemoteStepDispatchReader = Pick<
+  RemoteStepJournal,
+  | 'deploymentId'
+  | 'tablePrefix'
+  | 'registerWorkflow'
+  | 'getWorkflow'
+  | 'readWorkflowDispatchRequestJson'
+  | 'issuePermit'
+  | 'consumePermit'
+  | 'recordResult'
+>;
+
+export interface WorkflowRemoteStepDispatchTicket {
+  invocationId: string;
+  deploymentId: string;
+  workflowId: string;
+  runId: string;
+  stepPath: readonly string[];
+  suspendedAt: number;
+  resumeCount?: number;
+  deadlineAt: number;
+  requestJson: string;
+  requestDigest: string;
+  permit: RemoteStepPermit;
+}
+
+export interface RemoteStepDispatchReader {
+  deploymentId: string;
+  tablePrefix: string;
+  get(invocationId: string): Promise<RemoteStepInvocation | undefined>;
+  readDispatchRequestJson(invocationId: string): Promise<string>;
+  issuePermit(
+    invocationId: string,
+    lifetimeMs: number,
+  ): Promise<RemoteStepPermit>;
+  consumePermit(
+    permit: RemoteStepPermit,
+  ): Promise<
+    { kind: 'accepted'; rawPermit: string } | { kind: 'already-consumed' }
+  >;
+}
+
+export interface RemoteStepDispatchTicket {
+  invocationId: string;
+  deploymentId: string;
+  workflowId: string;
+  agentId: string;
+  threadId: string;
+  resourceId: string;
+  runId: string;
+  stepPath: readonly string[];
+  suspendedAt: number;
+  resumeCount?: number;
+  deadlineAt: number;
+  requestJson: string;
+  permit: RemoteStepPermit;
+}
+
+export interface RemoteStepContinuationReader {
+  deploymentId: string;
+  tablePrefix: string;
+  get(invocationId: string): Promise<RemoteStepInvocation | undefined>;
+  readRetainedResult(
+    invocationId: string,
+  ): Promise<RecordedRemoteStepResult | undefined>;
+  claimResume(invocationId: string, leaseMs: number): Promise<string>;
+  settleAfterResume(
+    invocationId: string,
+    leaseOwner: string,
+    witnessed?: RunSummary,
+  ): Promise<
+    | 'retry'
+    | 'applied'
+    | 'terminal-not-success'
+    | 'deadline-expired'
+    | 'advanced-without-proof'
+  >;
 }
 
 export interface AgentThreadRunRef {
@@ -181,6 +272,49 @@ export interface AgentThreadDispatchTopology extends AgentThreadBoundTopology {
     context: ActorContext,
     input: AgentThreadRunRef,
   ): Promise<AgentRunEnvelope | undefined>;
+  resumeRemoteStep(
+    context: ActorContext,
+    invocationId: string,
+  ): Promise<AgentRunEnvelope>;
+  issueRemoteStepDispatch(
+    context: ActorContext,
+    invocationId: string,
+    lifetimeMs: number,
+  ): Promise<RemoteStepDispatchTicket>;
+  consumeRemoteStepDispatch(
+    context: ActorContext,
+    permit: RemoteStepPermit,
+  ): Promise<
+    { kind: 'accepted'; rawPermit: string } | { kind: 'already-consumed' }
+  >;
+  registerWorkflowRemoteStep(
+    context: ActorContext,
+    workflowId: string,
+    runId: string,
+    hostDeadlineAt: number,
+  ): Promise<WorkflowRemoteStepInvocation>;
+  getWorkflowRemoteStep(
+    context: ActorContext,
+    invocationId: string,
+  ): Promise<WorkflowRemoteStepInvocation | undefined>;
+  issueWorkflowRemoteStepDispatch(
+    context: ActorContext,
+    invocationId: string,
+    lifetimeMs: number,
+  ): Promise<WorkflowRemoteStepDispatchTicket>;
+  consumeWorkflowRemoteStepDispatch(
+    context: ActorContext,
+    permit: RemoteStepPermit,
+  ): Promise<
+    { kind: 'accepted'; rawPermit: string } | { kind: 'already-consumed' }
+  >;
+  recordWorkflowRemoteStepResult(
+    context: ActorContext,
+    invocationId: string,
+    rawPermit: string,
+    resultJson: string,
+    evidenceJson: string,
+  ): ReturnType<RemoteStepJournal['recordResult']>;
 }
 
 function errorFrom(response: Response): Promise<RunRouteError> {
@@ -230,6 +364,75 @@ export function createAgentThreadTopology<Id>(
     namespace,
     deploymentIdentitySecret,
   );
+  const dispatchInvocation = async (
+    context: ActorContext,
+    invocationId: string,
+  ) => {
+    const reader = options.remoteStepDispatch;
+    if (!reader) throw new RunRouteError(503, 'remote steps are unavailable');
+    if (!isPathSafeId(invocationId))
+      throw new RunRouteError(404, 'invocation not found');
+    const invocation = await reader.get(invocationId);
+    if (
+      !invocation ||
+      invocation.deploymentId !== reader.deploymentId ||
+      invocation.tablePrefix !== reader.tablePrefix ||
+      !samePrincipal(invocation.principal, context.principal)
+    )
+      throw new RunRouteError(404, 'invocation not found');
+    expectedResource(context, invocation.threadId, invocation.resourceId);
+    await requireResourceAccess(
+      context,
+      'thread',
+      invocation.threadId,
+      'write',
+      'run',
+    );
+    await requireResourceAccess(
+      context,
+      'resource',
+      invocation.resourceId,
+      'write',
+      'run',
+    );
+    await requireResourceAccess(
+      context,
+      'run',
+      invocation.runId,
+      'write',
+      'run',
+    );
+    return { reader, invocation };
+  };
+  const workflowDispatchInvocation = async (
+    context: ActorContext,
+    invocationId: string,
+    access: 'read' | 'write',
+    loadedInvocation?: WorkflowRemoteStepInvocation,
+  ) => {
+    const reader = options.workflowRemoteStepDispatch;
+    if (!reader) throw new RunRouteError(503, 'remote steps are unavailable');
+    if (!isPathSafeId(invocationId))
+      throw new RunRouteError(404, 'invocation not found');
+    const invocation =
+      loadedInvocation ?? (await reader.getWorkflow(invocationId));
+    if (
+      invocation?.targetKind !== 'workflow' ||
+      invocation.invocationId !== invocationId ||
+      invocation.deploymentId !== reader.deploymentId ||
+      invocation.tablePrefix !== reader.tablePrefix ||
+      !samePrincipal(invocation.principal, context.principal)
+    )
+      throw new RunRouteError(404, 'invocation not found');
+    await requireResourceAccess(
+      context,
+      'run',
+      invocation.runId,
+      access,
+      'run',
+    );
+    return { reader, invocation };
+  };
   const fetchStatus = async (
     context: ActorContext,
     input: AgentThreadRunRef,
@@ -386,6 +589,147 @@ export function createAgentThreadTopology<Id>(
     }
   };
   return {
+    registerWorkflowRemoteStep: async (
+      context,
+      workflowId,
+      runId,
+      hostDeadlineAt,
+    ) => {
+      const reader = options.workflowRemoteStepDispatch;
+      if (!reader) throw new RunRouteError(503, 'remote steps are unavailable');
+      if (!isPathSafeId(workflowId))
+        throw new RunRouteError(404, 'workflow not found');
+      await requireResourceAccess(context, 'run', runId, 'write', 'run');
+      return reader.registerWorkflow(
+        {
+          targetKind: 'workflow',
+          deploymentId: reader.deploymentId,
+          tablePrefix: reader.tablePrefix,
+          workflowId,
+          runId,
+        },
+        hostDeadlineAt,
+        context.principal,
+      );
+    },
+    getWorkflowRemoteStep: async (context, invocationId) => {
+      const reader = options.workflowRemoteStepDispatch;
+      if (!reader) throw new RunRouteError(503, 'remote steps are unavailable');
+      if (!isPathSafeId(invocationId))
+        throw new RunRouteError(404, 'invocation not found');
+      const invocation = await reader.getWorkflow(invocationId);
+      if (!invocation) return undefined;
+      return (
+        await workflowDispatchInvocation(
+          context,
+          invocationId,
+          'read',
+          invocation,
+        )
+      ).invocation;
+    },
+    issueWorkflowRemoteStepDispatch: async (
+      context,
+      invocationId,
+      lifetimeMs,
+    ) => {
+      const { reader } = await workflowDispatchInvocation(
+        context,
+        invocationId,
+        'write',
+      );
+      const permit = await reader.issuePermit(invocationId, lifetimeMs);
+      const { invocation } = await workflowDispatchInvocation(
+        context,
+        invocationId,
+        'write',
+      );
+      if (
+        invocation.status !== 'dispatched' ||
+        invocation.permitGeneration !== permit.generation ||
+        invocation.deadlineAt < permit.expiresAt
+      )
+        throw new RunRouteError(409, 'remote step dispatch changed');
+      const requestJson =
+        await reader.readWorkflowDispatchRequestJson(invocationId);
+      return {
+        invocationId,
+        deploymentId: invocation.deploymentId,
+        workflowId: invocation.workflowId,
+        runId: invocation.runId,
+        stepPath: invocation.stepPath,
+        suspendedAt: invocation.suspendedAt,
+        ...(invocation.resumeCount === undefined
+          ? {}
+          : { resumeCount: invocation.resumeCount }),
+        deadlineAt: invocation.deadlineAt,
+        requestJson,
+        requestDigest: invocation.requestDigest,
+        permit,
+      };
+    },
+    consumeWorkflowRemoteStepDispatch: async (context, permit) => {
+      const { reader } = await workflowDispatchInvocation(
+        context,
+        permit.invocationId,
+        'write',
+      );
+      return reader.consumePermit(permit);
+    },
+    recordWorkflowRemoteStepResult: async (
+      context,
+      invocationId,
+      rawPermit,
+      resultJson,
+      evidenceJson,
+    ) => {
+      const { reader } = await workflowDispatchInvocation(
+        context,
+        invocationId,
+        'write',
+      );
+      return reader.recordResult(
+        invocationId,
+        rawPermit,
+        resultJson,
+        evidenceJson,
+      );
+    },
+    issueRemoteStepDispatch: async (context, invocationId, lifetimeMs) => {
+      await dispatchInvocation(context, invocationId);
+      const reader = options.remoteStepDispatch;
+      if (!reader) throw new RunRouteError(503, 'remote steps are unavailable');
+      const permit = await reader.issuePermit(invocationId, lifetimeMs);
+      const { invocation } = await dispatchInvocation(context, invocationId);
+      if (
+        invocation.status !== 'dispatched' ||
+        invocation.permitGeneration !== permit.generation ||
+        invocation.deadlineAt < permit.expiresAt
+      )
+        throw new RunRouteError(409, 'remote step dispatch changed');
+      const requestJson = await reader.readDispatchRequestJson(invocationId);
+      return {
+        invocationId,
+        deploymentId: invocation.deploymentId,
+        workflowId: invocation.workflowId,
+        agentId: invocation.agentId,
+        threadId: invocation.threadId,
+        resourceId: invocation.resourceId,
+        runId: invocation.runId,
+        stepPath: invocation.stepPath,
+        suspendedAt: invocation.suspendedAt,
+        ...(invocation.resumeCount === undefined
+          ? {}
+          : { resumeCount: invocation.resumeCount }),
+        deadlineAt: invocation.deadlineAt,
+        requestJson,
+        permit,
+      };
+    },
+    consumeRemoteStepDispatch: async (context, permit) => {
+      const { reader } = await dispatchInvocation(context, permit.invocationId);
+      return reader.consumePermit(permit);
+    },
     requireBoundThread: async (context, target: BoundThreadTarget) => {
       const threadId = validThread(target.threadId);
       const resourceId = expectedResource(context, threadId, target.resourceId);
@@ -737,6 +1081,118 @@ export function createAgentThreadTopology<Id>(
         ),
       );
     },
+    resumeRemoteStep: async (context, invocationId) => {
+      const reader = options.remoteSteps;
+      if (!reader) throw new RunRouteError(503, 'remote steps are unavailable');
+      if (!isPathSafeId(invocationId))
+        throw new RunRouteError(404, 'invocation not found');
+      const invocation = await reader.get(invocationId);
+      if (invocation?.status === 'resuming')
+        throw new RunRouteError(
+          503,
+          'remote step resume awaits executor quiescence',
+        );
+      if (
+        invocation?.status !== 'result-retained' ||
+        invocation.deploymentId !== reader.deploymentId ||
+        invocation.tablePrefix !== reader.tablePrefix ||
+        !isPathSafeId(invocation.agentId) ||
+        !isPathSafeId(invocation.runId) ||
+        !(await reader.readRetainedResult(invocationId))
+      )
+        throw new RunRouteError(404, 'invocation not found');
+      expectedResource(context, invocation.threadId, invocation.resourceId);
+      return envelope(
+        await threads.send(
+          {
+            principal: invocation.principal,
+            mutationEpoch: context.mutationEpoch,
+          },
+          invocation.threadId,
+          `${AGENT_HOST_ROUTE_PREFIX}/remote-step-resume`,
+          {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ invocationId }),
+          },
+        ),
+      );
+    },
+  };
+}
+
+export function createRemoteStepNotificationRecoveryTick<Id>(options: {
+  journal: RemoteStepJournal;
+  namespace: ThreadNamespaceLike<Id>;
+  deploymentIdentitySecret: string;
+  limit?: number;
+}): () => Promise<{ scanned: number; recovered: number; unresolved: number }> {
+  const limit = options.limit ?? 16;
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100)
+    throw new TypeError('notification recovery limit is malformed');
+  const threads = createThreadTopology(
+    options.namespace,
+    options.deploymentIdentitySecret,
+  );
+  return async () => {
+    const ids = await options.journal.nextNotificationRecoveryBatch(limit);
+    let recovered = 0;
+    let unresolved = 0;
+    let firstFailure: { error: unknown } | undefined;
+    for (const invocationId of ids) {
+      try {
+        const invocation = await options.journal.get(invocationId);
+        if (
+          !invocation ||
+          !['result-retained', 'resuming'].includes(invocation.status)
+        )
+          continue;
+        if (
+          invocation.invocationId !== invocationId ||
+          invocation.deploymentId !== options.journal.deploymentId ||
+          invocation.tablePrefix !== options.journal.tablePrefix
+        )
+          throw new RunRouteError(409, 'remote step recovery identity changed');
+        const operation =
+          await options.journal.readNotificationOperation(invocationId);
+        if (!operation || operation.invocationId !== invocationId)
+          throw new RunRouteError(
+            409,
+            'remote step recovery operation changed',
+          );
+        if (operation.state !== 'effect-admitted') {
+          unresolved += 1;
+          continue;
+        }
+        const response = await threads.send(
+          { principal: invocation.principal },
+          invocation.threadId,
+          `${AGENT_HOST_ROUTE_PREFIX}/remote-step-notification-recover`,
+          {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ invocationId }),
+          },
+        );
+        if (!response.ok)
+          throw new RunRouteError(
+            response.status,
+            'remote step notification recovery failed',
+          );
+        const after =
+          await options.journal.readNotificationOperation(invocationId);
+        if (after?.state !== 'receipt-recorded')
+          throw new RunRouteError(
+            503,
+            'remote step notification receipt is unresolved',
+          );
+        recovered += 1;
+      } catch (error) {
+        firstFailure ??= { error };
+      }
+    }
+    if (firstFailure) throw firstFailure.error;
+    return { scanned: ids.length, recovered, unresolved };
   };
 }
 

@@ -87,6 +87,7 @@ export interface StartIdentity {
         readonly kind: 'agent';
         readonly id: string;
         readonly threadId: string;
+        readonly resourceId?: string;
       };
 }
 
@@ -112,6 +113,8 @@ const IDENTITY_ERRORS = {
   'target.id': 'target.id must be a URL-path-safe identifier',
   'target.threadId':
     'target.threadId is required only for an agent target and must be URL-path-safe',
+  'target.resourceId':
+    'target.resourceId is valid only for an agent target and must be URL-path-safe',
 } as const;
 
 export class InvalidExecutionIdentityError extends DoStatusError {
@@ -226,7 +229,10 @@ export function normalizeStartIdentity(value: unknown): StartIdentity {
     'identity',
   );
   const { kind: ownerKind, id: ownerId } = identityObject(rawOwner, 'owner');
-  const { kind, id, threadId } = identityObject(rawTarget, 'target');
+  const { kind, id, threadId, resourceId } = identityObject(
+    rawTarget,
+    'target',
+  );
   if (!isExecutionPrincipalKind(ownerKind))
     throw new InvalidExecutionIdentityError('owner.kind');
   if (!isExecutionPrincipalId(ownerId))
@@ -238,13 +244,22 @@ export function normalizeStartIdentity(value: unknown): StartIdentity {
   if (kind === 'agent') {
     if (!isPathSafeId(threadId))
       throw new InvalidExecutionIdentityError('target.threadId');
+    if (resourceId !== undefined && !isPathSafeId(resourceId))
+      throw new InvalidExecutionIdentityError('target.resourceId');
     return Object.freeze({
       owner,
-      target: Object.freeze({ kind, id, threadId }),
+      target: Object.freeze({
+        kind,
+        id,
+        threadId,
+        ...(resourceId === undefined ? {} : { resourceId }),
+      }),
     });
   }
   if (threadId !== undefined)
     throw new InvalidExecutionIdentityError('target.threadId');
+  if (resourceId !== undefined)
+    throw new InvalidExecutionIdentityError('target.resourceId');
   return Object.freeze({ owner, target: Object.freeze({ kind, id }) });
 }
 

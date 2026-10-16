@@ -389,6 +389,31 @@ test('reachability follows absolute repository links into the docs tree', () => 
   );
 });
 
+test('design plans do not require a public documentation index link', () => {
+  const root = fixture({
+    'docs/README.md': '# Documentation\n',
+    'docs/plans/internal-recovery.md': '# Recovery design plan\n',
+    'docs/unlinked.md': '# Unlinked guide\n',
+  });
+
+  const result = checkRepository({
+    root,
+    markdownFiles: markdownFiles(root, [
+      'docs/README.md',
+      'docs/plans/internal-recovery.md',
+      'docs/unlinked.md',
+    ]),
+    packageChecks: false,
+  });
+
+  assert.deepEqual(
+    result.errors.map((error) => `${error.file}: ${error.message}`),
+    [
+      'docs/unlinked.md: guide is not reachable from a public documentation index',
+    ],
+  );
+});
+
 test('reachability skips ignored schemes, off-repository URLs, and missing blob targets', () => {
   const root = fixture({
     'docs/README.md': `# Documentation

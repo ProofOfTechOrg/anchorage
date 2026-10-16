@@ -83,6 +83,12 @@ import {
 import { isDefinitiveInitialAdmissionRefusal } from '../do-runner/initial-admission-refusal.js';
 import { mastraRegistryEntries } from '../do-runner/mastra-registry.js';
 import {
+  REMOTE_STEP_MARKER,
+  type RemoteStepInvocation,
+  type RemoteStepJournal,
+  type RemoteStepNotificationOperation,
+} from '../do-runner/remote-step-journal.js';
+import {
   exceedsRunInputDepth,
   runInputDepthMessage,
   someValueExceedsRunInputDepth,
@@ -109,10 +115,15 @@ import {
   abandonApprovalsForRun,
   reconcileApprovalsForSummary,
 } from '../host-kit/index.js';
+import {
+  type NotificationOperationInput,
+  projectNotificationOperation,
+} from '../signals/notifications-d1.js';
 import { createAgentModuleCatalog } from './catalog.js';
 import {
   AGENT_HOST_ROUTE_PREFIX,
   publicAgentRunEnvelope,
+  type RemoteStepContinuationReader,
 } from './thread-topology.js';
 import {
   createTrustedAgentRequestContext,
@@ -132,7 +143,11 @@ export interface AgentThreadStateStorage {
   get<T = unknown>(key: string): Promise<T | undefined>;
   put<T>(key: string, value: T): Promise<void>;
   delete(key: string): Promise<boolean>;
-  list<T = unknown>(options: { prefix: string }): Promise<Map<string, T>>;
+  list<T = unknown>(options: {
+    prefix: string;
+    startAfter?: string;
+    limit?: number;
+  }): Promise<Map<string, T>>;
   getAlarm(): Promise<number | null>;
   setAlarm(scheduledTime: number | Date): Promise<void>;
   deleteAlarm(): Promise<void>;
@@ -171,6 +186,19 @@ export type {
 } from './types.js';
 
 export interface ThreadAgentHostOptions {
+  remoteSteps?: RemoteStepContinuationReader;
+  remoteStepNotification?: {
+    journal: RemoteStepJournal;
+    agentId: string;
+    operationId: string;
+    source: string;
+    kind: string;
+    summary: string;
+    payload?: unknown;
+    receiptLimit?: number;
+    ensureScheduledRecovery: () => Promise<void>;
+  };
+  resourceIdFromKey?: (threadId: string) => string;
   /** Narrows automated entry beyond what each agent's metadata declares. */
   authorizeAutomatedEntry?: AutomatedEntryAuthorizer;
   /**
@@ -298,6 +326,10 @@ export interface ThreadAgentHost {
     input: { agentId: string; resourceId: string; runId: string },
   ): Promise<RunSummary | undefined>;
   recoverOwnership(scope: AgentThreadInstanceScope): Promise<void>;
+  recoverNotificationOperation(
+    scope: ThreadScope,
+    invocationId: string,
+  ): Promise<'receipt-recorded' | 'unresolved'>;
   route(request: Request, scope: ThreadScope): Promise<Response | null>;
 }
 
@@ -345,6 +377,11 @@ async function objectBody(request: Request): Promise<Record<string, unknown>> {
 }
 
 const AGENT_OWNER_RECOVERY_PREFIX = 'flowsafe:agent-owner-recovery:v1:';
+const AGENT_NOTIFICATION_RECOVERY_PREFIX =
+  'flowsafe:agent-notification-recovery:v1:';
+const AGENT_NOTIFICATION_RECOVERY_CURSOR_KEY =
+  'flowsafe:agent-notification-recovery-cursor:v1';
+const AGENT_NOTIFICATION_RECOVERY_BATCH = 16;
 const AGENT_OWNER_RECOVERY_DELAY_MS = 60_000;
 
 type AgentOwnerRecovery = {
@@ -463,6 +500,45 @@ function record(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : undefined;
+}
+
+async function retainedNotificationInput(
+  invocation: RemoteStepInvocation,
+  operation: RemoteStepNotificationOperation,
+  executorQuiescentAt: number,
+): Promise<NotificationOperationInput> {
+  let savedInput: Record<string, unknown> | undefined;
+  try {
+    savedInput = record(JSON.parse(operation.requestJson));
+  } catch {
+    throw new AgentHostRequestError(503, 'remote step operation is unreadable');
+  }
+  if (typeof savedInput?.createdAt !== 'string')
+    throw new AgentHostRequestError(503, 'remote step operation is unreadable');
+  const stableInput = {
+    ...savedInput,
+    createdAt: new Date(savedInput.createdAt),
+  } as NotificationOperationInput;
+  let projection: Awaited<ReturnType<typeof projectNotificationOperation>>;
+  try {
+    projection = await projectNotificationOperation(stableInput);
+  } catch {
+    throw new AgentHostRequestError(503, 'remote step operation is unreadable');
+  }
+  if (
+    JSON.stringify(stableInput) !== operation.requestJson ||
+    stableInput.id !== operation.notificationId ||
+    stableInput.threadId !== invocation.threadId ||
+    stableInput.resourceId !== invocation.resourceId ||
+    stableInput.agentId !== invocation.agentId ||
+    stableInput.sourceId !== invocation.invocationId ||
+    savedInput.createdAt !== new Date(executorQuiescentAt).toISOString() ||
+    projection.version !== operation.projectionVersion ||
+    projection.requestJson !== operation.projectionJson ||
+    projection.requestDigest !== operation.requestDigest
+  )
+    throw new AgentHostRequestError(503, 'remote step operation is unreadable');
+  return stableInput;
 }
 
 function scheduleAgentContext(
@@ -620,6 +696,36 @@ function ndjson(
 export function createThreadAgentHost(
   options: ThreadAgentHostOptions,
 ): ThreadAgentHost {
+  const notificationProfile = options.remoteStepNotification;
+  if (
+    notificationProfile &&
+    (options.remoteSteps !== notificationProfile.journal ||
+      !isPathSafeId(notificationProfile.agentId) ||
+      !isPathSafeId(notificationProfile.operationId) ||
+      !notificationProfile.source ||
+      !notificationProfile.kind ||
+      !notificationProfile.summary ||
+      typeof notificationProfile.ensureScheduledRecovery !== 'function' ||
+      (notificationProfile.receiptLimit !== undefined &&
+        (!Number.isSafeInteger(notificationProfile.receiptLimit) ||
+          notificationProfile.receiptLimit < 0)))
+  )
+    throw new TypeError('remote step notification profile is malformed');
+  const notificationReceiptLimit = notificationProfile?.receiptLimit;
+  let notificationStorage:
+    | ReturnType<RemoteStepJournal['notificationStorage']>
+    | undefined;
+  const resourceForThread = (threadId: string): string => {
+    let resourceId: string;
+    try {
+      resourceId = (options.resourceIdFromKey ?? resourceIdFromKey)(threadId);
+    } catch {
+      throw new AgentHostRequestError(503, 'resource mapping is unavailable');
+    }
+    if (!isPathSafeId(resourceId))
+      throw new AgentHostRequestError(503, 'resource mapping is unavailable');
+    return resourceId;
+  };
   let catalogPromise: Promise<AgentModuleCatalog> | undefined;
   let runtime:
     | {
@@ -883,7 +989,7 @@ export function createThreadAgentHost(
         scope,
         {
           agentId: runRecord.agentId,
-          resourceId: resourceIdFromKey(scope.threadId),
+          resourceId: resourceForThread(scope.threadId),
           runId,
         },
         { includeLegacy: true },
@@ -1056,7 +1162,7 @@ export function createThreadAgentHost(
         !isPathSafeId(stored.agentId) ||
         !isPathSafeId(stored.threadId) ||
         !isPathSafeId(stored.resourceId) ||
-        stored.resourceId !== resourceIdFromKey(threadId) ||
+        stored.resourceId !== resourceForThread(threadId) ||
         !isPathSafeId(stored.runId) ||
         !isPathSafeId(stored.token) ||
         ownerRecoveryKey(stored.runId) !== key ||
@@ -1203,6 +1309,14 @@ export function createThreadAgentHost(
   };
 
   type NormalAgentRunState = AuthoritativeAgentStartState | LegacyAgentRunState;
+  const matchesStartResource = (
+    threadId: string,
+    resourceId: string,
+    persistedResourceId: string | undefined,
+  ): boolean =>
+    persistedResourceId === undefined
+      ? resourceId === resourceIdFromKey(threadId)
+      : persistedResourceId === resourceId;
 
   async function selectedAgentState(
     scope: AgentThreadInstanceScope,
@@ -1219,23 +1333,47 @@ export function createThreadAgentHost(
     readOptions?: { readonly includeLegacy: true },
   ): Promise<NormalAgentRunState | null> {
     const includeLegacy = readOptions?.includeLegacy === true;
-    if (ref.resourceId !== resourceIdFromKey(scope.threadId))
+    if (ref.resourceId !== resourceForThread(scope.threadId))
       throw new AgentHostRequestError(404, 'run not found');
     const current = await runtimeFor(scope);
     const durable = current.agents.get(ref.agentId);
     if (!current.catalog.get(ref.agentId) || !durable)
       throw new AgentHostRequestError(404, 'agent not found');
+    const assertSelectedResource = <T extends NormalAgentRunState | null>(
+      state: T,
+    ): T => {
+      const target =
+        state && state.kind !== 'legacy' ? state.execution.target : undefined;
+      if (
+        state &&
+        (target?.kind === 'workflow' ||
+          !matchesStartResource(
+            scope.threadId,
+            ref.resourceId,
+            target?.kind === 'agent' ? target.resourceId : undefined,
+          ))
+      )
+        throw new AgentRunSelectorMismatchError(
+          durable.getWorkflow().id,
+          ref.runId,
+        );
+      return state;
+    };
     if (includeLegacy)
-      return durable.authoritativeAgentStartState(
+      return assertSelectedResource(
+        await durable.authoritativeAgentStartState(
+          scope.init.runtime,
+          scope.threadId,
+          ref.runId,
+          { includeLegacy: true },
+        ),
+      );
+    return assertSelectedResource(
+      await durable.authoritativeAgentStartState(
         scope.init.runtime,
         scope.threadId,
         ref.runId,
-        { includeLegacy: true },
-      );
-    return durable.authoritativeAgentStartState(
-      scope.init.runtime,
-      scope.threadId,
-      ref.runId,
+      ),
     );
   }
 
@@ -1268,6 +1406,11 @@ export function createThreadAgentHost(
       state.execution.target.kind !== 'agent' ||
       state.execution.target.id !== recovery.agentId ||
       state.execution.target.threadId !== recovery.threadId ||
+      !matchesStartResource(
+        recovery.threadId,
+        recovery.resourceId,
+        state.execution.target.resourceId,
+      ) ||
       state.execution.owner.kind !== recovery.runRecord.principal.kind ||
       state.execution.owner.id !== recovery.runRecord.principal.id
     )
@@ -1362,7 +1505,7 @@ export function createThreadAgentHost(
     if (state.kind === 'legacy') {
       const ref = {
         agentId: expected.agentId,
-        resourceId: resourceIdFromKey(scope.threadId),
+        resourceId: resourceForThread(scope.threadId),
         runId,
       };
       await assertLegacyTerminalCurrent(scope, ref, state, expected);
@@ -1377,6 +1520,11 @@ export function createThreadAgentHost(
       state.execution.target.kind !== 'agent' ||
       state.execution.target.id !== expected.agentId ||
       state.execution.target.threadId !== scope.threadId ||
+      !matchesStartResource(
+        scope.threadId,
+        resourceForThread(scope.threadId),
+        state.execution.target.resourceId,
+      ) ||
       state.execution.owner.kind !== expected.principal.kind ||
       state.execution.owner.id !== expected.principal.id
     )
@@ -1724,6 +1872,49 @@ export function createThreadAgentHost(
     };
   };
 
+  const readRemoteStepHostAuthority = async (
+    scope: ThreadScope,
+    invocation: RemoteStepInvocation,
+  ) => {
+    const ref = {
+      agentId: invocation.agentId,
+      resourceId: invocation.resourceId,
+      runId: invocation.runId,
+    };
+    const selected = await snapshotExecutionFor(scope, ref);
+    const state = selected.state;
+    if (
+      state.kind !== 'result' ||
+      state.storage !== 'd1' ||
+      state.execution.tablePrefix !== invocation.tablePrefix ||
+      state.execution.workflowId !== invocation.workflowId ||
+      state.execution.startToken !== invocation.startToken ||
+      state.execution.target.kind !== 'agent' ||
+      state.execution.target.id !== invocation.agentId ||
+      state.execution.target.threadId !== invocation.threadId ||
+      state.execution.target.resourceId !== invocation.resourceId ||
+      state.execution.owner.kind !== invocation.principal.kind ||
+      state.execution.owner.id !== invocation.principal.id
+    )
+      throw new AgentHostRequestError(409, 'remote step run changed');
+    const stored = await readRun(ref.runId);
+    if (
+      !stored ||
+      stored.agentId !== ref.agentId ||
+      !samePrincipal(stored.principal, invocation.principal)
+    )
+      throw new AgentHostRequestError(404, 'run not found');
+    const binding = await readBinding();
+    if (
+      (selected.threaded &&
+        (binding?.agentId !== ref.agentId ||
+          binding.resourceId !== ref.resourceId)) ||
+      (!selected.threaded && binding)
+    )
+      throw new AgentHostRequestError(404, 'run not found');
+    return { ref, selected, state, stored };
+  };
+
   const statusFor = async (
     scope: ThreadScope,
     ref: { agentId: string; resourceId: string; runId: string },
@@ -1955,6 +2146,73 @@ export function createThreadAgentHost(
       }),
     );
 
+  const recoverNotificationOperation = async (
+    scope: ThreadScope,
+    invocationId: string,
+  ): Promise<'receipt-recorded' | 'unresolved'> => {
+    instanceScopeFor(scope);
+    const profile = notificationProfile;
+    if (!profile || !isPathSafeId(invocationId))
+      throw new AgentHostRequestError(404, 'invocation not found');
+    const invocation = await profile.journal.get(invocationId);
+    if (
+      !invocation ||
+      invocation.deploymentId !== profile.journal.deploymentId ||
+      invocation.tablePrefix !== profile.journal.tablePrefix ||
+      invocation.threadId !== scope.threadId ||
+      invocation.agentId !== profile.agentId ||
+      !samePrincipal(invocation.principal, scope.principal) ||
+      record(invocation.request)?.notificationOperationId !==
+        profile.operationId
+    )
+      throw new AgentHostRequestError(404, 'invocation not found');
+    const operation =
+      await profile.journal.readNotificationOperation(invocationId);
+    if (!operation || operation.operationId !== profile.operationId)
+      throw new AgentHostRequestError(409, 'remote step operation changed');
+    if (
+      operation.state === 'resume-admitted' ||
+      operation.state === 'unresolved' ||
+      operation.state === 'prepared'
+    )
+      return 'unresolved';
+    await readRemoteStepHostAuthority(scope, invocation);
+    const retained = await profile.journal.readRetainedResult(invocationId);
+    if (!retained || invocation.status !== 'result-retained')
+      throw new AgentHostRequestError(409, 'remote step result is unavailable');
+    const stableInput = await retainedNotificationInput(
+      invocation,
+      operation,
+      retained.executorQuiescentAt,
+    );
+    if (!notificationStorage)
+      notificationStorage = profile.journal.notificationStorage(
+        notificationReceiptLimit,
+      );
+    const storage = notificationStorage;
+    if (operation.state === 'effect-admitted') {
+      const receipt = await storage.createNotificationOnce(
+        operation.operationKey,
+        stableInput,
+      );
+      await profile.journal.recordNotificationReceipt(invocationId, receipt);
+      return 'receipt-recorded';
+    }
+    const receipt = await storage.readNotificationOperationReceipt(
+      operation.operationKey,
+    );
+    if (
+      receipt?.requestDigest !== operation.requestDigest ||
+      receipt.notificationId !== operation.notificationId ||
+      receipt.threadId !== invocation.threadId
+    )
+      throw new AgentHostRequestError(
+        503,
+        'remote step notification receipt is unreadable',
+      );
+    return 'receipt-recorded';
+  };
+
   const host: ThreadAgentHost = {
     requestContextForRun: (base) => async (workflowId, runId, leg) => {
       const values = base ? await base(workflowId, runId, leg) : undefined;
@@ -1969,6 +2227,8 @@ export function createThreadAgentHost(
         : values;
     },
     serializeDispatch: withDispatchLock,
+    recoverNotificationOperation: (scope, invocationId) =>
+      withDispatchLock(() => recoverNotificationOperation(scope, invocationId)),
     notificationDispatchAllowed: async (scope, agentId) => {
       instanceScopeFor(scope);
       return (await catalogFor(scope)).automationAllowed(
@@ -2040,11 +2300,111 @@ export function createThreadAgentHost(
               firstFailure ??= { error };
             }
           }
+          if (notificationProfile) {
+            const cursor =
+              (await storage.get<unknown>(
+                AGENT_NOTIFICATION_RECOVERY_CURSOR_KEY,
+              )) ?? '';
+            if (
+              typeof cursor !== 'string' ||
+              (cursor !== '' &&
+                (!cursor.startsWith(AGENT_NOTIFICATION_RECOVERY_PREFIX) ||
+                  !isPathSafeId(
+                    cursor.slice(AGENT_NOTIFICATION_RECOVERY_PREFIX.length),
+                  )))
+            )
+              throw new AgentHostRequestError(
+                503,
+                'remote step recovery cursor is unreadable',
+              );
+            let notifications = await storage.list({
+              prefix: AGENT_NOTIFICATION_RECOVERY_PREFIX,
+              ...(cursor === '' ? {} : { startAfter: cursor }),
+              limit: AGENT_NOTIFICATION_RECOVERY_BATCH,
+            });
+            if (notifications.size === 0 && cursor !== '')
+              notifications = await storage.list({
+                prefix: AGENT_NOTIFICATION_RECOVERY_PREFIX,
+                limit: AGENT_NOTIFICATION_RECOVERY_BATCH,
+              });
+            for (const [key, stored] of notifications) {
+              const invocationId = key.slice(
+                AGENT_NOTIFICATION_RECOVERY_PREFIX.length,
+              );
+              try {
+                if (stored !== invocationId || !isPathSafeId(invocationId))
+                  throw new AgentHostRequestError(
+                    503,
+                    'remote step recovery marker is unreadable',
+                  );
+                const invocation =
+                  await notificationProfile.journal.get(invocationId);
+                if (
+                  !invocation ||
+                  invocation.threadId !== scope.threadId ||
+                  invocation.deploymentId !==
+                    notificationProfile.journal.deploymentId ||
+                  invocation.tablePrefix !==
+                    notificationProfile.journal.tablePrefix
+                )
+                  throw new AgentHostRequestError(
+                    503,
+                    'remote step recovery identity changed',
+                  );
+                const operation =
+                  await notificationProfile.journal.readNotificationOperation(
+                    invocationId,
+                  );
+                if (
+                  operation?.state === 'effect-admitted' ||
+                  operation?.state === 'receipt-recorded'
+                ) {
+                  const recovered = await recoverNotificationOperation(
+                    { ...scope, principal: invocation.principal },
+                    invocationId,
+                  );
+                  if (recovered !== 'receipt-recorded')
+                    throw new AgentHostRequestError(
+                      503,
+                      'remote step notification recovery is unresolved',
+                    );
+                } else if (
+                  operation?.state !== 'resume-admitted' &&
+                  operation?.state !== 'unresolved'
+                ) {
+                  throw new AgentHostRequestError(
+                    503,
+                    'remote step notification recovery is unresolved',
+                  );
+                }
+                await storage.delete(key);
+              } catch (error) {
+                console.error(
+                  JSON.stringify({
+                    type: 'remote-step-notification-recovery-failed',
+                    threadId: scope.threadId,
+                    invocationId,
+                    error: errorMessageOf(error),
+                  }),
+                );
+                firstFailure ??= { error };
+              }
+            }
+            const last = [...notifications.keys()].at(-1);
+            await storage.put(
+              AGENT_NOTIFICATION_RECOVERY_CURSOR_KEY,
+              last ?? '',
+            );
+          }
           await withRecoveryLock(async () => {
             const remaining = await storage.list({
               prefix: AGENT_OWNER_RECOVERY_PREFIX,
             });
-            if (remaining.size > 0) {
+            const remainingNotifications = await storage.list({
+              prefix: AGENT_NOTIFICATION_RECOVERY_PREFIX,
+              limit: 1,
+            });
+            if (remaining.size > 0 || remainingNotifications.size > 0) {
               await ensureOwnerRecoveryAlarm(storage);
             } else {
               await storage.deleteAlarm();
@@ -2148,6 +2508,7 @@ export function createThreadAgentHost(
             kind: 'agent',
             id: ref.agentId,
             threadId: ref.threadId,
+            resourceId: ref.resourceId,
           }),
         },
       );
@@ -2216,7 +2577,7 @@ export function createThreadAgentHost(
         entry,
         scope.principal,
       );
-      if (ref.resourceId !== resourceIdFromKey(scope.threadId)) {
+      if (ref.resourceId !== resourceForThread(scope.threadId)) {
         throw new AgentHostRequestError(404, 'run not found');
       }
       const execution: TrustedAgentExecution = {
@@ -2465,7 +2826,7 @@ export function createThreadAgentHost(
     resolveBoundAgent: async (scope, input) => {
       const binding = await readBinding();
       if (!binding) throw new AgentHostRequestError(404, 'agent not found');
-      if (binding.resourceId !== resourceIdFromKey(scope.threadId)) {
+      if (binding.resourceId !== resourceForThread(scope.threadId)) {
         throw new AgentHostRequestError(404, 'agent not found');
       }
       if (input.agentId && input.agentId !== binding.agentId) {
@@ -2588,6 +2949,18 @@ export function createThreadAgentHost(
         preflightUrl.pathname === `${AGENT_HOST_ROUTE_PREFIX}/resume`
           ? await objectBody(request)
           : undefined;
+      const remoteStepBody =
+        request.method === 'POST' &&
+        preflightUrl.pathname ===
+          `${AGENT_HOST_ROUTE_PREFIX}/remote-step-resume`
+          ? await objectBody(request)
+          : undefined;
+      const notificationRecoveryBody =
+        request.method === 'POST' &&
+        preflightUrl.pathname ===
+          `${AGENT_HOST_ROUTE_PREFIX}/remote-step-notification-recover`
+          ? await objectBody(request)
+          : undefined;
       return withDispatchLock(async () => {
         const url = new URL(request.url);
 
@@ -2600,7 +2973,7 @@ export function createThreadAgentHost(
           const binding = await readBinding();
           if (
             !resourceId ||
-            resourceId !== resourceIdFromKey(scope.threadId) ||
+            resourceId !== resourceForThread(scope.threadId) ||
             binding?.resourceId !== resourceId ||
             (agentId !== null && binding.agentId !== agentId)
           ) {
@@ -2691,6 +3064,272 @@ export function createThreadAgentHost(
                 : {}),
             }),
           );
+        }
+
+        if (notificationRecoveryBody) {
+          const invocationId = notificationRecoveryBody.invocationId;
+          if (!isPathSafeId(invocationId))
+            throw new AgentHostRequestError(404, 'invocation not found');
+          return json({
+            state: await recoverNotificationOperation(scope, invocationId),
+          });
+        }
+
+        if (remoteStepBody) {
+          const reader = options.remoteSteps;
+          if (!reader)
+            throw new AgentHostRequestError(
+              503,
+              'remote steps are unavailable',
+            );
+          const invocationId = remoteStepBody.invocationId;
+          if (!isPathSafeId(invocationId))
+            throw new AgentHostRequestError(404, 'invocation not found');
+          const invocation = await reader.get(invocationId);
+          if (
+            !invocation ||
+            invocation.deploymentId !== reader.deploymentId ||
+            invocation.tablePrefix !== reader.tablePrefix ||
+            invocation.threadId !== scope.threadId ||
+            !samePrincipal(invocation.principal, scope.principal)
+          )
+            throw new AgentHostRequestError(404, 'invocation not found');
+          if (invocation.status === 'resuming')
+            throw new AgentHostRequestError(
+              503,
+              'remote step resume awaits executor quiescence',
+            );
+          const retained = await reader.readRetainedResult(invocationId);
+          if (
+            !invocation ||
+            !retained ||
+            retained.invocationId !== invocationId ||
+            invocation.status !== 'result-retained' ||
+            invocation.deadlineAt <= Date.now()
+          )
+            throw new AgentHostRequestError(404, 'invocation not found');
+          const { ref, selected, state, stored } =
+            await readRemoteStepHostAuthority(scope, invocation);
+          const key = invocation.stepPath.join('.');
+          const summary = state.summary;
+          const payload =
+            summary.suspendPayload !== null &&
+            typeof summary.suspendPayload === 'object' &&
+            !Array.isArray(summary.suspendPayload)
+              ? (summary.suspendPayload as Record<string, unknown>)[key]
+              : undefined;
+          const suspended =
+            payload !== null && typeof payload === 'object'
+              ? (payload as Record<string, unknown>)
+              : undefined;
+          const tool =
+            suspended?.toolCallSuspended !== null &&
+            typeof suspended?.toolCallSuspended === 'object'
+              ? (suspended.toolCallSuspended as Record<string, unknown>)
+              : undefined;
+          if (
+            summary.status !== 'suspended' ||
+            !summary.suspended?.some(
+              (path) =>
+                JSON.stringify(path) === JSON.stringify(invocation.stepPath),
+            ) ||
+            summary.suspendedAt?.[key] !== invocation.suspendedAt ||
+            summary.resumeCount?.[key] !== invocation.resumeCount ||
+            suspended?.type !== 'suspension' ||
+            tool?.remoteStep !== REMOTE_STEP_MARKER
+          )
+            throw new AgentHostRequestError(
+              409,
+              'remote step suspension changed',
+            );
+          let recordedResult: unknown;
+          try {
+            recordedResult = JSON.parse(retained.resultJson);
+          } catch {
+            throw new AgentHostRequestError(
+              503,
+              'remote step result is unreadable',
+            );
+          }
+          const { current, module, principalPermissions } = await authorize(
+            scope,
+            ref.agentId,
+            'remote-step.resume',
+            stored.principal,
+          );
+          const durable = current.agents.get(module.meta.id);
+          if (!durable) throw new Error('guarded agent was not registered');
+          const execution: TrustedAgentExecution = {
+            agentId: ref.agentId,
+            deploymentTag: scope.deploymentTag,
+            principal: stored.principal,
+            threadId: scope.threadId,
+            resourceId: ref.resourceId,
+            runId: ref.runId,
+            entryPath: 'remote-step.resume',
+            principalPermissions,
+            safeContext: selected.safeContext,
+          };
+          let leaseOwner: string;
+          if (
+            notificationProfile &&
+            invocation.agentId === notificationProfile.agentId &&
+            record(invocation.request)?.notificationOperationId ===
+              notificationProfile.operationId
+          ) {
+            const journal = notificationProfile.journal;
+            const existing =
+              await journal.readNotificationOperation(invocationId);
+            if (
+              existing &&
+              (existing.invocationId !== invocationId ||
+                existing.operationId !== notificationProfile.operationId)
+            )
+              throw new AgentHostRequestError(
+                409,
+                'remote step operation changed',
+              );
+            const operation =
+              existing ??
+              (await journal.prepareNotificationOperation(
+                invocationId,
+                notificationProfile.operationId,
+                {
+                  threadId: invocation.threadId,
+                  resourceId: invocation.resourceId,
+                  agentId: invocation.agentId,
+                  source: notificationProfile.source,
+                  kind: notificationProfile.kind,
+                  summary: notificationProfile.summary,
+                  sourceId: invocation.invocationId,
+                  createdAt: new Date(retained.executorQuiescentAt),
+                  ...(notificationProfile.payload === undefined
+                    ? {}
+                    : { payload: notificationProfile.payload }),
+                },
+              ));
+            const stableInput = await retainedNotificationInput(
+              invocation,
+              operation,
+              retained.executorQuiescentAt,
+            );
+            if (!notificationStorage)
+              notificationStorage = journal.notificationStorage(
+                notificationReceiptLimit,
+              );
+            const notifications = notificationStorage;
+            if (
+              operation.state === 'prepared' ||
+              operation.state === 'effect-admitted'
+            ) {
+              if (operation.state === 'prepared')
+                await notificationProfile.ensureScheduledRecovery();
+              const admitted =
+                await journal.admitNotificationEffect(invocationId);
+              if (
+                admitted.operationKey !== operation.operationKey ||
+                admitted.requestDigest !== operation.requestDigest
+              )
+                throw new AgentHostRequestError(
+                  409,
+                  'remote step operation changed',
+                );
+              await withRecoveryLock(async () => {
+                const storage = options.stateStorage();
+                await ensureOwnerRecoveryAlarm(storage);
+                await storage.put(
+                  `${AGENT_NOTIFICATION_RECOVERY_PREFIX}${invocationId}`,
+                  invocationId,
+                );
+                await ensureOwnerRecoveryAlarm(storage);
+              });
+              const receipt = await notifications.createNotificationOnce(
+                admitted.operationKey,
+                stableInput,
+              );
+              await journal.recordNotificationReceipt(invocationId, receipt);
+              await options
+                .stateStorage()
+                .delete(`${AGENT_NOTIFICATION_RECOVERY_PREFIX}${invocationId}`);
+            } else if (operation.state === 'receipt-recorded') {
+              const receipt =
+                await notifications.readNotificationOperationReceipt(
+                  operation.operationKey,
+                );
+              if (
+                receipt?.requestDigest !== operation.requestDigest ||
+                receipt.notificationId !== operation.notificationId ||
+                receipt.threadId !== invocation.threadId
+              )
+                throw new AgentHostRequestError(
+                  503,
+                  'remote step notification receipt is unreadable',
+                );
+            } else {
+              throw new AgentHostRequestError(
+                503,
+                'remote step continuation is unresolved',
+              );
+            }
+            execution.principalPermissions = (
+              await authorize(
+                scope,
+                ref.agentId,
+                'remote-step.resume',
+                stored.principal,
+              )
+            ).principalPermissions;
+            leaseOwner = await journal.admitNotificationResume(invocationId);
+          } else {
+            leaseOwner = await reader.claimResume(invocationId, 60_000);
+          }
+          const resumed = await withExecution(execution, () =>
+            durable.resumeViaRuntime({
+              runId: ref.runId,
+              requestedBy: stored.principal.id,
+              step: [...invocation.stepPath],
+              resumeData: resumeData(recordedResult),
+              requestedByKind: stored.principal.kind,
+              expectedSuspension: {
+                suspendedAt: invocation.suspendedAt,
+                ...(invocation.resumeCount === undefined
+                  ? {}
+                  : { resumeCount: invocation.resumeCount }),
+              },
+              ...(selected.threaded
+                ? {
+                    memory: {
+                      thread: scope.threadId,
+                      resource: ref.resourceId,
+                    },
+                  }
+                : {}),
+            }),
+          );
+          const settlement = await reader.settleAfterResume(
+            invocationId,
+            leaseOwner,
+            resumed,
+          );
+          if (settlement === 'retry' || settlement === 'advanced-without-proof')
+            throw new AgentHostRequestError(
+              503,
+              'remote step resume outcome is unresolved',
+            );
+          if (settlement !== 'applied')
+            throw new AgentHostRequestError(
+              409,
+              'remote step result was not applied',
+            );
+          const result = await envelopeFor(
+            scope,
+            ref,
+            stored.principal,
+            resumed,
+          );
+          if (isTerminalRunStatus(resumed.status))
+            await finalizeTerminalAgentState(scope, ref, undefined, stored);
+          return json(result);
         }
 
         if (resumeBody) {

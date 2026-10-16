@@ -76,6 +76,7 @@ import {
   type InventoryTableAccounting,
 } from './inventory.js';
 import { mintThreadId, resourceIdFromKey } from './memory-id.js';
+import { RemoteStepJournal } from './remote-step-journal.js';
 import type { RunnerRuntime } from './runtime.js';
 import {
   START_IDEMPOTENCY_TABLE,
@@ -485,7 +486,17 @@ describe('Mastra persistence guards (D1Store SQL over node:sqlite)', () => {
         threadId: 'thr-1',
         resourceId: 'res-1',
       });
-    await new ExecutionFenceStore(binding as never).seed('open');
+    const fence = new ExecutionFenceStore(binding as never);
+    await fence.seed('open');
+    await new RemoteStepJournal({
+      db: binding as never,
+      fence,
+      runtime,
+      deploymentId: 'census-deployment',
+      tablePrefix: '',
+      allowedToolIds: ['census-tool'],
+      verifyCompletion: async () => undefined,
+    }).initialize();
     sqlite.exec(
       `CREATE TABLE IF NOT EXISTS ${DEPLOYMENT_SENTINEL_TABLE} (
          id INTEGER PRIMARY KEY CHECK (id = 1),
