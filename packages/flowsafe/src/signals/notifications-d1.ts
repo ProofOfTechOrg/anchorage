@@ -27,6 +27,7 @@ import {
 import {
   type MutationEpochContext,
   normalizeMutationEpoch,
+  type RemoteStepInvocation,
 } from '../do-runner/execution-admission.js';
 import { prepareProducerMutationAdmission } from '../do-runner/execution-fence.js';
 
@@ -41,7 +42,6 @@ import {
   REMOTE_STEP_TABLE,
 } from '../do-runner/notification-predicate.js';
 import { isPathSafeId } from '../do-runner/path-safe-id.js';
-import type { RemoteStepInvocation } from '../do-runner/remote-step-journal.js';
 import { validateTablePrefix } from '../do-runner/table-prefix.js';
 import { nonnegativeSafeInteger } from '../numeric-config.js';
 import {
