@@ -108,6 +108,12 @@ Breakwater enforces declared hosts and actual HTTP hops only for requests made t
 
 Provider output and successful connector output are untrusted data even after transport policy passes.
 
+### Remote executor to workflow host
+
+The host owns the isolation and evidence needed by the [workflow completion verifier](do-runner-design.md#continue-a-retained-workflow-result). Customer code, its result, and its claim to have stopped cannot certify that boundary. Verify completion through trusted evidence bound to the actual executor and invocation before admitting the result.
+
+When accepting permanent effect closure, the host must enforce the isolation profile throughout the invocation’s lifetime. Changes to bindings, egress policy, capabilities or deployment identity must not restore its authority, directly or through retained state. Host notification and capability records remain authoritative; isolated executor data cannot replace them. Residual logging, computation and storage remain subject to confidentiality, accounting and cleanup controls even when workflow effects are permanently closed. Empty remote-step drain inventory does not certify those separate obligations.
+
 ### Agent CLI to workspace and host
 
 Claude Code and Codex run as child processes with workspace-edit permissions. Approval authorizes dispatch, not every file or command the child will choose.

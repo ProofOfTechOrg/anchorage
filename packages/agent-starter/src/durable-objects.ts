@@ -318,7 +318,8 @@ export class StarterThread extends ThreadDurableObject<Env> {
       if (!storage) throw new Error('notifications storage is unavailable');
       return storage;
     },
-    resolveScheduleDispatchStore: () => {
+    resolveScheduleDispatchStore: (scope) => {
+      const context = { mutationEpoch: scope.mutationEpoch };
       const store = schedulesStore(this.env.DB);
       return {
         begin: async (scheduleId, dispatchId) => {
@@ -334,7 +335,13 @@ export class StarterThread extends ThreadDurableObject<Env> {
             await this.state?.storage.delete(key);
             return { state: 'settled' as const, receipt: local };
           }
-          return store.beginAgentScheduleDispatch(scheduleId, dispatchId);
+          return store.beginAgentScheduleDispatch(
+            scheduleId,
+            dispatchId,
+            undefined,
+            undefined,
+            context,
+          );
         },
         settle: async (scheduleId, dispatchId, receipt) => {
           const key = `flowsafe:schedule-dispatch-receipt:v1:${dispatchId}`;

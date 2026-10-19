@@ -87,6 +87,7 @@ export {
   type D1StartExecutionIdentity,
   InvalidExecutionIdentityError,
   InvalidMutationEpochError,
+  isMutationEpochMismatchError,
   isRunStartPendingError,
   MUTATION_EPOCH_HEADER,
   type MutationEpochContext,

@@ -9,6 +9,7 @@ import type {
 import { describe, expect, it } from 'vitest';
 
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
+import { ExecutionFenceStore } from '../do-runner/execution-fence.js';
 import {
   notificationTimestampMillis,
   notificationTimestampSql,
@@ -2475,5 +2476,81 @@ describe('notification timestamp conversion', () => {
       .bind(timestamp)
       .first<{ epoch: number | null }>();
     expect(row?.epoch).toBeNull();
+  });
+});
+
+describe('notification producer mutation epoch', () => {
+  it('refuses stale enqueue and coalescing while preserving accepted receipt settlement', async () => {
+    const db = database();
+    const storage = new D1NotificationsStorage(db);
+    const fence = new ExecutionFenceStore(db);
+    await fence.seed('open');
+    const input = {
+      id: 'existing',
+      threadId: 'thread',
+      source: 'provider',
+      kind: 'update',
+      summary: 'original',
+      coalesceKey: 'same',
+    };
+    await storage.createNotification(input);
+    const operation = {
+      id: 'receipt-notification',
+      threadId: 'thread',
+      source: 'provider',
+      kind: 'update',
+      summary: 'accepted',
+      createdAt: new Date('2026-10-19T00:00:00Z'),
+    };
+    const receipt = await storage.createNotificationOnce(
+      'operation',
+      operation,
+    );
+    await fence.transition({
+      expected: 'open',
+      next: 'draining',
+      expectedMutationEpoch: 0,
+      expectedRevision: 0,
+      advanceMutationEpoch: true,
+    });
+    await fence.transition({
+      expected: 'draining',
+      next: 'open',
+      expectedMutationEpoch: 1,
+      expectedRevision: 1,
+    });
+    await expect(
+      storage.createNotification(
+        { ...input, id: 'late', summary: 'late' },
+        { mutationEpoch: 0 },
+      ),
+    ).rejects.toMatchObject({ reason: { code: 'MUTATION_EPOCH_MISMATCH' } });
+    await expect(
+      storage.createNotificationOnce(
+        'late-operation',
+        { ...operation, id: 'late-operation-notification' },
+        { mutationEpoch: 0 },
+      ),
+    ).rejects.toMatchObject({ reason: { code: 'MUTATION_EPOCH_MISMATCH' } });
+    expect(
+      await storage.createNotificationOnce('operation', operation, {
+        mutationEpoch: 0,
+      }),
+    ).toEqual(receipt);
+    await storage.updateNotification({
+      threadId: 'thread',
+      id: 'existing',
+      status: 'delivered',
+    });
+    expect(
+      await storage.getNotification({ threadId: 'thread', id: 'existing' }),
+    ).toMatchObject({
+      summary: 'original',
+      status: 'delivered',
+      coalescedCount: 1,
+    });
+    expect(
+      await storage.listNotifications({ threadId: 'thread' }),
+    ).toHaveLength(2);
   });
 });

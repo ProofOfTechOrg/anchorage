@@ -34,6 +34,7 @@ import {
   signalToXmlMarkup,
 } from '@mastra/core/agent';
 import {
+  type CreateNotificationInput,
   createNotificationSignal,
   createNotificationSummarySignal,
   type NotificationRecord,
@@ -52,6 +53,12 @@ import {
   type ExecutionPrincipal,
   samePrincipal,
 } from '../approval-api/index.js';
+import {
+  ExecutionFenceUnreadableError,
+  isMutationEpochMismatchError,
+  type MutationEpochContext,
+  normalizeMutationEpoch,
+} from '../do-runner/execution-admission.js';
 import {
   admitsExistingRun,
   type D1RunExecutionIdentity,
@@ -88,6 +95,7 @@ import {
   recordNotificationDeliveryFailure,
   reportNotificationDeliveryError,
 } from './notification-dispatch.js';
+import type { MutationEpochNotificationsStorage } from './notifications-d1.js';
 
 // The schedule tick settles a threaded fire as failed when this route answers
 // one of the permanent statuses `ScheduleTickSignalAgent` documents, so a
@@ -323,11 +331,11 @@ export interface ThreadSignalRoutesOptions {
    * would persist its input, and its deliveries carry a marker that keeps the
    * runner's terminal refusal from persisting them.
    *
-   * For `/signal/notification`, an owner's notification to a runtime-driven
+   * In compatibility mode, an owner's `/signal/notification` to a runtime-driven
    * agent is delivered at ingestion under the owner's principal, and a
    * non-owner's is recorded for the notification dispatch tick, which this
    * callback then judges as the dispatch principal. An unbranded agent's owner
-   * notification follows Mastra's delivery policy.
+   * notification follows Mastra's delivery policy in compatibility mode.
    */
   canPersist?: (scope: ThreadScope) => boolean | Promise<boolean>;
   /**
@@ -349,7 +357,10 @@ export interface ThreadSignalRoutesOptions {
   /**
    * Durable inbox used by the trusted due-notification dispatch route. Required
    * for `/signal/notification` ingestion to a runtime-driven agent or from a
-   * non-owner, which returns 409 without it.
+   * non-owner, which returns 409 without it. Required mutation epochs require
+   * `MutationEpochNotificationsStorage` for record-only enqueue. Owner delivery
+   * and delayed dispatch refuse required-epoch mode until they have atomic
+   * effect admission.
    */
   resolveNotificationsStorage?: (
     scope: ThreadScope,
@@ -641,6 +652,15 @@ export function createThreadSignalRoutes(
       );
       if (executionFence.state === 'migration-locked') {
         return executionFencedResponse(executionFence.state, entryPath);
+      }
+      if (
+        path === '/signal/notifications/dispatch' &&
+        (executionFence.requireMutationEpoch === true ||
+          (scope.mutationEpoch ?? 0) > 0)
+      ) {
+        throw new ExecutionFenceUnreadableError(
+          'notification dispatch requires atomic effect admission in mutation epoch mode',
+        );
       }
       let scheduleTarget: AgentScheduleTarget | undefined;
       if (path === '/signal/schedule') {
@@ -992,6 +1012,9 @@ export function createThreadSignalRoutes(
               blockingRun,
               persistenceAllowed,
               runtimeDriven,
+              mutationEpoch: scope.mutationEpoch,
+              requireMutationEpoch:
+                executionFence.requireMutationEpoch === true,
               memoryAvailable,
               inspectContent,
               notificationDispatchAllowed: notificationDispatchAllowed
@@ -1008,7 +1031,10 @@ export function createThreadSignalRoutes(
       // and reason rather than the 502 below: a caller must be able to tell "this
       // deployment is deliberately not executing" (retry after the migration)
       // from "the model or a route is broken".
-      if (isExecutionFenceRefusal(error)) {
+      if (
+        isExecutionFenceRefusal(error) ||
+        isMutationEpochMismatchError(error)
+      ) {
         return json(
           { error: error.message, reason: error.reason },
           error.status,
@@ -1033,6 +1059,10 @@ export function createThreadSignalRoutes(
     if (path !== '/signal' && !path.startsWith('/signal/')) return null;
     const entryPath = entryPathForSignalRoute(path);
     if (entryPath === undefined) return json({ error: 'not found' }, 404);
+    scope = {
+      ...scope,
+      mutationEpoch: normalizeMutationEpoch(scope.mutationEpoch),
+    };
     // A queued request keeps its parsed body if the sender disconnects.
     const body = await readJson(request);
     if (!body) return json({ error: 'a JSON body is required' }, 400);
@@ -2801,6 +2831,21 @@ async function matchingPendingNotifications(
   );
 }
 
+async function createNotificationWithAdmission(
+  storage: NotificationsStorage,
+  input: CreateNotificationInput,
+  context: MutationEpochContext & { requireMutationEpoch: boolean },
+): Promise<NotificationRecord> {
+  const owned = storage as Partial<MutationEpochNotificationsStorage>;
+  if (typeof owned.createNotificationWithAdmission === 'function')
+    return owned.createNotificationWithAdmission(input, context);
+  if (context.requireMutationEpoch)
+    throw new ExecutionFenceUnreadableError(
+      'notifications storage has no mutation epoch admission',
+    );
+  return storage.createNotification(input);
+}
+
 async function handleNotification(
   agent: Agent,
   body: Record<string, unknown>,
@@ -2814,6 +2859,8 @@ async function handleNotification(
     blockingRun: BlockingRunResolver | undefined;
     persistenceAllowed: boolean;
     runtimeDriven: boolean;
+    mutationEpoch?: number;
+    requireMutationEpoch: boolean;
     memoryAvailable: MemoryAvailable;
     inspectContent: InspectSignalContent | undefined;
     notificationDispatchAllowed?: () => boolean | Promise<boolean>;
@@ -2854,6 +2901,14 @@ async function handleNotification(
     return json(
       { error: 'this thread has no resourceId wired; notifications need one' },
       409,
+    );
+  }
+  if (
+    options.persistenceAllowed &&
+    (options.requireMutationEpoch || (options.mutationEpoch ?? 0) > 0)
+  ) {
+    throw new ExecutionFenceUnreadableError(
+      'owner notification delivery requires atomic effect admission in mutation epoch mode',
     );
   }
   // An owner's notification to a runtime-driven agent is recorded, then
@@ -2951,13 +3006,17 @@ async function handleNotification(
     }
     await options.proof?.check();
     options.proof?.assertActive();
-    const record = await storage.createNotification({
-      ...notification,
-      threadId,
-      resourceId,
-      agentId: agent.id,
-      deliverAt: new Date(),
-    });
+    const record = await createNotificationWithAdmission(
+      storage,
+      {
+        ...notification,
+        threadId,
+        resourceId,
+        agentId: agent.id,
+        deliverAt: new Date(),
+      },
+      options,
+    );
     return json({
       record,
       delivery: { action: 'deferred', reason: 'dispatcher' },
@@ -3005,6 +3064,8 @@ async function handleOwnerNotification(
     | undefined,
   options: {
     principal: ExecutionPrincipal;
+    mutationEpoch?: number;
+    requireMutationEpoch: boolean;
     blockingRun: BlockingRunResolver | undefined;
     memoryAvailable: MemoryAvailable;
     inspectContent: InspectSignalContent | undefined;
@@ -3047,13 +3108,17 @@ async function handleOwnerNotification(
   await options.proof?.check();
   options.proof?.assertActive();
   // No deliverAt or summaryAt, so no dispatch pass ever selects the row.
-  const stored = await storage.createNotification({
-    ...notification,
-    id: crypto.randomUUID(),
-    threadId,
-    resourceId,
-    agentId: agent.id,
-  });
+  const stored = await createNotificationWithAdmission(
+    storage,
+    {
+      ...notification,
+      id: crypto.randomUUID(),
+      threadId,
+      resourceId,
+      agentId: agent.id,
+    },
+    options,
+  );
   const now = new Date();
   let settled = false;
   let accepted:

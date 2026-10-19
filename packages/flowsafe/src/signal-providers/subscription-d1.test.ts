@@ -2,6 +2,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
+import { ExecutionFenceStore } from '../do-runner/execution-fence.js';
 import type { SignalDatabase } from '../signals/d1-shared.js';
 import {
   D1SubscriptionStoreFactory,
@@ -439,4 +440,40 @@ describe('deployment-wide subscription schema', () => {
       `sqlite_autoindex_${SIGNAL_SUBSCRIPTIONS_TABLE}_1`,
     ]);
   });
+});
+
+it('refuses stale subscription replacement and deletion but allows current drain deletion', async () => {
+  const db = sqliteUnitDatabase(openSqlite());
+  const fence = new ExecutionFenceStore(db);
+  const storage = new D1SubscriptionStoreFactory(db).store();
+  await fence.seed('open');
+  const input = {
+    providerId: 'github',
+    externalResourceId: 'repo',
+    threadId: 'thread',
+    resourceId: 'owner',
+  };
+  await storage.subscribe(input);
+  await fence.transition({
+    expected: 'open',
+    next: 'draining',
+    expectedMutationEpoch: 0,
+    expectedRevision: 0,
+    advanceMutationEpoch: true,
+  });
+  await expect(
+    storage.subscribe(
+      { ...input, resourceId: 'different' },
+      { mutationEpoch: 0 },
+    ),
+  ).rejects.toMatchObject({ reason: { code: 'MUTATION_EPOCH_MISMATCH' } });
+  await expect(
+    storage.unsubscribe('github', 'repo', 'thread', { mutationEpoch: 0 }),
+  ).rejects.toMatchObject({ reason: { code: 'MUTATION_EPOCH_MISMATCH' } });
+  expect(await storage.listForThread('thread')).toMatchObject([
+    { resourceId: 'owner' },
+  ]);
+  expect(
+    await storage.unsubscribe('github', 'repo', 'thread', { mutationEpoch: 1 }),
+  ).toBe(true);
 });

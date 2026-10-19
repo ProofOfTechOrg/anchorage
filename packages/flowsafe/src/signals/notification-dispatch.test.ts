@@ -1303,7 +1303,6 @@ describe('bounded notification dispatch tick', () => {
       status: 'discarded',
     });
     expect(send).not.toHaveBeenCalled();
-    expect(context).not.toHaveBeenCalled();
     expect(current?.deliverAt).toBeUndefined();
     expect(current?.summaryAt).toBeUndefined();
   });
@@ -1723,4 +1722,43 @@ describe('notification bookkeeping diagnostics', () => {
       log.mockRestore();
     }
   });
+});
+
+it('retains the tick entry epoch and does not spend delivery attempts on a cutover refusal', async () => {
+  const storage = notificationStorage();
+  const record = await pending(storage);
+  let epoch = 1;
+  const list = storage.listDueNotifications.bind(storage);
+  storage.listDueNotifications = async (...args) => {
+    epoch = 2;
+    return list(...args);
+  };
+  const epochs: (number | undefined)[] = [];
+  const tick = createNotificationDispatchTick({
+    storage,
+    now: () => NOW,
+    resolveContext: () => ({ ...actorContext(), mutationEpoch: epoch }),
+    topology: {
+      send: async (context) => {
+        epochs.push(context.mutationEpoch);
+        return Response.json(
+          {
+            error: 'epoch mismatch',
+            reason: {
+              code: 'MUTATION_EPOCH_MISMATCH',
+              classification: 'stale',
+              mutationEpoch: 2,
+            },
+          },
+          { status: 409 },
+        );
+      },
+      forward: async () => new Response(),
+    },
+  });
+  await tick();
+  expect(epochs).toEqual([1]);
+  expect(
+    await storage.getNotification({ threadId: record.threadId, id: record.id }),
+  ).toMatchObject({ deliveryAttempts: 0, status: 'pending' });
 });

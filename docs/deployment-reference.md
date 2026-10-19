@@ -195,6 +195,32 @@ Custom run-router idempotency wiring must supply the topology's private `persist
 
 The liveness callback must observe the owning execution surface and reject when that observation is unavailable. Returning `false` permits reclaiming an existing reserved key with no persisted result. The built-in topologies require a valid boolean response, and the agent host includes Core's retained stream registrations.
 
+### Fence unattended producers
+
+Configure a trusted artifact epoch for unattended work before enabling `requireMutationEpoch`. Use `mutationEpoch` on `createScheduleTick()`, `createWebhookRouter()`, and `SignalProviderHostWiring`; each accepts a number or a synchronous zero-argument callback. These producers capture the value at event entry, before asynchronous work. For notification dispatch, return an epoch-bearing `ActorContext` from `resolveContext()`; the tick captures it before reading due records. A subscription router uses the epoch from its trusted actor resolver.
+
+Preserve the captured value when adapting a schedule start or signal to your host. Forward the start input’s `mutationEpoch` into the topology context and the schedule dispatch store. Never replace a delayed caller’s epoch with a fresh database reading. External request headers and bodies cannot choose this value.
+
+Use the owned storage admission contracts at the write boundary:
+
+- Pass `MutationEpochContext` to direct schedule fire, due-time and agent-dispatch claims. The D1 store requires transactional `batch()`. A refused fire claim must leave its next fire time and trigger records unchanged.
+- For custom notification storage, implement `MutationEpochNotificationsStorage.createNotificationWithAdmission()` with an atomic fence and epoch predicate. An asynchronous precheck followed by an unconditional insert or coalescing update does not satisfy this contract. `D1NotificationsStorage` implements the capability; its direct create and operation-receipt methods also accept a context.
+- Pass the captured context to subscription creation and removal. Subscription creation requires an open fence. Notification enqueue with an omitted or zero caller epoch remains available while draining when the stored epoch is zero. A positive or required epoch needs open admission for new enqueue. Removal retains its drain allowance but still requires the current epoch after activation.
+
+Keep the original epoch with deferred work. Scheduled signal retries use the epoch retained with their fire; a new caller cannot obtain an agent-dispatch lease for an older fire. Restricted remote notification recovery preserves the invocation’s retained permit epoch, separate from permit generation. Generic new effects cannot acquire current authority through recovery.
+
+Compatibility mode has epoch zero and allows an omitted caller epoch. After activation, missing, stale and future epochs refuse new authority. A typed `MUTATION_EPOCH_MISMATCH` or execution-fence refusal is retryable for provider delivery; an unrelated `409` is not. Authentic deferred webhooks receive `503`, and notification dispatch preserves delivery attempts on these refusals. Poll adapters must retain events that the deployment has not accepted.
+
+Immediate owner notification delivery and delayed notification dispatch refuse when the fence requires an epoch or the captured caller epoch is positive. They lack atomic execution admission and return `503` with `EXECUTION_FENCE_UNREADABLE`. Owner ingestion refuses before creating an inbox record, including the generic Mastra path.
+
+Existing pending inbox records remain retained. Nonowner record-only ingestion can enqueue through the owned storage capability, but enqueue success does not promise delivery. Do not enable required epochs for a workload that depends on the refused paths.
+
+For a restricted remote notification effect already accepted by `RemoteStepJournal.admitNotificationEffect()`, pass its retained invocation through `NotificationOperationContext.admittedInvocation` to `createNotificationOnce()`. The store verifies the held operation’s provenance, projected notification and generation inside the receipt transaction. This permits accepted completion during proof-only or cutover; the supplied object alone grants no authority. Generic new receipt creation remains fence-gated.
+
+Retained operation receipts remain readable and replayable after cutover; accepted schedule receipt settlement remains available. These operations do not grant permission for a new effect. The schedule tick itself skips closed-fence passes, including deferred reconciliation, so use the owning settlement APIs when reconciliation must finish while closed.
+
+These contracts do not prove a safe rollout of historical binaries. Keep new authority closed while upgrading writers, account for in-flight work, and verify the deployment’s final-write boundaries before advancing its epoch. Local storage tests do not establish production cutover or quiescence.
+
 ### Advanced routes
 
 ```text
