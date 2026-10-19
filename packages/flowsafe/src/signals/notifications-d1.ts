@@ -25,11 +25,23 @@ import {
   type UpdateNotificationInput,
 } from '@mastra/core/notifications';
 import {
+  type MutationEpochContext,
+  normalizeMutationEpoch,
+} from '../do-runner/execution-admission.js';
+import { prepareProducerMutationAdmission } from '../do-runner/execution-fence.js';
+
+type ProducerAdmission = Awaited<
+  ReturnType<typeof prepareProducerMutationAdmission>
+>;
+
+import {
   DUE_NOTIFICATION_SQL,
   notificationTimestampMillis,
   notificationTimestampSql,
+  REMOTE_STEP_TABLE,
 } from '../do-runner/notification-predicate.js';
 import { isPathSafeId } from '../do-runner/path-safe-id.js';
+import type { RemoteStepInvocation } from '../do-runner/remote-step-journal.js';
 import { validateTablePrefix } from '../do-runner/table-prefix.js';
 import { nonnegativeSafeInteger } from '../numeric-config.js';
 import {
@@ -99,6 +111,14 @@ export type NotificationDeliveryFailure =
 export type NotificationDeliveryUpdateResult =
   | { applied: true; record: NotificationRecord }
   | { applied: false };
+
+export interface MutationEpochNotificationsStorage
+  extends NotificationsStorage {
+  createNotificationWithAdmission(
+    input: CreateNotificationInput,
+    context: MutationEpochContext,
+  ): Promise<NotificationRecord>;
+}
 
 export interface NotificationDeliveryStorage extends NotificationsStorage {
   updateNotificationDeliveryIfUnchanged(input: {
@@ -399,6 +419,10 @@ export const NOTIFICATION_OPERATION_RECEIPTS_TABLE =
 export const NOTIFICATION_RECEIPT_SCOPE_TABLE =
   'flowsafe_notification_receipt_scope';
 export const DEFAULT_NOTIFICATION_OPERATION_RECEIPT_LIMIT = 100_000;
+
+export interface NotificationOperationContext extends MutationEpochContext {
+  readonly admittedInvocation?: RemoteStepInvocation;
+}
 
 export type NotificationOperationInput = CreateNotificationInput & {
   id: string;
@@ -800,12 +824,40 @@ export class D1NotificationsStorage
   async createNotificationOnce(
     operationKey: string,
     input: NotificationOperationInput,
+    context?: NotificationOperationContext,
   ): Promise<{
     operationKey: string;
     notificationId: string;
     threadId: string;
     requestDigest: string;
   }> {
+    const captured = {
+      mutationEpoch: normalizeMutationEpoch(context?.mutationEpoch),
+    };
+    const invocation = context?.admittedInvocation;
+    const retainedAuthority:
+      | ReadonlyArray<readonly [string, unknown]>
+      | undefined =
+      invocation === undefined
+        ? undefined
+        : [
+            ['invocation_id', invocation.invocationId],
+            ['deployment_id', invocation.deploymentId],
+            ['table_prefix', invocation.tablePrefix],
+            ['workflow_id', invocation.workflowId],
+            ['agent_id', invocation.agentId],
+            ['thread_id', invocation.threadId],
+            ['resource_id', invocation.resourceId],
+            ['run_id', invocation.runId],
+            ['start_token', invocation.startToken],
+            ['principal_json', JSON.stringify(invocation.principal)],
+            ['request_json', JSON.stringify(invocation.request)],
+            ['step_path', JSON.stringify(invocation.stepPath)],
+            ['suspended_at', invocation.suspendedAt],
+            ['resume_count', invocation.resumeCount ?? -1],
+            ['permit_generation', invocation.permitGeneration],
+            ['permit_epoch', invocation.permitEpoch ?? null],
+          ];
     if (
       !isPathSafeId(operationKey) ||
       !isPathSafeId(input.id) ||
@@ -820,7 +872,8 @@ export class D1NotificationsStorage
     const batch = this.#db.batch?.bind(this.#db);
     if (!batch)
       throw new Error('notification operation requires database.batch()');
-    const { values, requestDigest } = await projectNotificationOperation(input);
+    const { values, requestDigest, requestJson, version } =
+      await projectNotificationOperation(input);
     const receipt = {
       operationKey,
       notificationId: input.id,
@@ -850,6 +903,21 @@ export class D1NotificationsStorage
         requestDigest: existing.request_digest,
       };
     }
+    const admission =
+      retainedAuthority === undefined
+        ? await prepareProducerMutationAdmission(this.#db, captured, {
+            allowLegacyDraining: true,
+          })
+        : await this.#admittedOperation([
+            ...retainedAuthority,
+            ['table_prefix', this.#prefix],
+            ['operation_key', operationKey],
+            ['notification_id', input.id],
+            ['thread_id', input.threadId],
+            ['notification_request_digest', requestDigest],
+            ['notification_projection_json', requestJson],
+            ['notification_projection_version', version],
+          ]);
     try {
       // The inbox's legacy insert trigger updates existing IDs, so the receipt
       // reserves both the operation key and inbox identity before insertion.
@@ -864,7 +932,7 @@ export class D1NotificationsStorage
                WHERE thread_id = ? AND id = ?
              ) AND (
                SELECT COUNT(*) FROM ${this.#operationReceiptTable}
-             ) < ?`,
+             ) < ? AND ${admission.sql(7)}`,
           )
           .bind(
             operationKey,
@@ -874,6 +942,7 @@ export class D1NotificationsStorage
             input.threadId,
             input.id,
             this.#operationReceiptLimit,
+            ...admission.bindings,
           ),
         this.#db
           .prepare(
@@ -888,6 +957,7 @@ export class D1NotificationsStorage
       ]);
       const committed = await readReceipt();
       if (!committed) {
+        await this.#assertAdmission(admission);
         const count = await this.#db
           .prepare(
             `SELECT COUNT(*) AS count FROM ${this.#operationReceiptTable}`,
@@ -910,6 +980,52 @@ export class D1NotificationsStorage
         requestDigest: committed.request_digest,
       };
     }
+  }
+
+  async #admittedOperation(
+    expected: ReadonlyArray<readonly [string, unknown]>,
+  ): Promise<ProducerAdmission> {
+    const refusal = (): never => {
+      throw new Error('notification effect admission changed');
+    };
+    const predicate = (
+      facts: ReadonlyArray<readonly [string, unknown]>,
+      offset: number,
+    ): string =>
+      `target_kind = 'agent' AND status = 'result-retained' AND operation_state = 'effect-admitted'
+       AND effect_admitted_at IS NOT NULL AND receipt_recorded_at IS NULL AND resume_admitted_at IS NULL
+       AND json_array(${facts.map(([column]) => column).join(', ')}) COLLATE BINARY IS ?${offset + 1}`;
+    const row = await this.#db
+      .prepare(
+        `SELECT write_revision, write_generation, result_digest FROM ${REMOTE_STEP_TABLE} WHERE ${predicate(expected, 0)}`,
+      )
+      .bind(JSON.stringify(expected.map(([, value]) => value)))
+      .first<{
+        write_revision: number;
+        write_generation: number;
+        result_digest: string;
+      }>();
+    if (
+      !row ||
+      !Number.isSafeInteger(row.write_revision) ||
+      row.write_revision < 0 ||
+      !Number.isSafeInteger(row.write_generation) ||
+      row.write_generation < 1 ||
+      !/^[a-f0-9]{64}$/.test(row.result_digest)
+    )
+      return refusal();
+    const committedFacts = [
+      ...expected,
+      ['write_revision', row.write_revision],
+      ['write_generation', row.write_generation],
+      ['result_digest', row.result_digest],
+    ] as ReadonlyArray<readonly [string, unknown]>;
+    return {
+      bindings: [JSON.stringify(committedFacts.map(([, value]) => value))],
+      sql: (offset) =>
+        `EXISTS (SELECT 1 FROM ${REMOTE_STEP_TABLE} WHERE ${predicate(committedFacts, offset)})`,
+      refused: async () => refusal(),
+    };
   }
 
   async readNotificationOperationReceipt(operationKey: string): Promise<
@@ -950,10 +1066,26 @@ export class D1NotificationsStorage
     };
   }
 
+  async createNotificationWithAdmission(
+    input: CreateNotificationInput,
+    context: MutationEpochContext,
+  ): Promise<NotificationRecord> {
+    return this.createNotification(input, context);
+  }
+
   async createNotification(
     input: CreateNotificationInput,
+    context?: MutationEpochContext,
   ): Promise<NotificationRecord> {
+    const captured = {
+      mutationEpoch: normalizeMutationEpoch(context?.mutationEpoch),
+    };
     await this.#ensureSchema();
+    const admission = await prepareProducerMutationAdmission(
+      this.#db,
+      captured,
+      { allowLegacyDraining: true },
+    );
     const now = input.createdAt ?? new Date();
     const record: NotificationRecord = {
       id: input.id ?? crypto.randomUUID(),
@@ -979,15 +1111,20 @@ export class D1NotificationsStorage
       deliveryAttempts: 0,
       metadata: input.metadata,
     };
-    const insertionOrdinal = await this.#allocateInsertionOrdinal();
+    const insertionOrdinal = await this.#allocateInsertionOrdinal(admission);
     if (!input.dedupeKey && !input.coalesceKey) {
-      await this.#insert(record, insertionOrdinal);
+      await this.#insert(record, insertionOrdinal, admission);
       return record;
     }
 
     for (let attempt = 0; attempt < 16; attempt += 1) {
       if (
-        await this.#insertUnlessCoalescable(record, input, insertionOrdinal)
+        await this.#insertUnlessCoalescable(
+          record,
+          input,
+          insertionOrdinal,
+          admission,
+        )
       ) {
         return record;
       }
@@ -1043,6 +1180,8 @@ export class D1NotificationsStorage
         guards.push('metadata IS ?');
         binds.push(existing.metadata);
       }
+      guards.push(admission.sql(binds.length));
+      binds.push(...admission.bindings);
       const updated = await this.#db
         .prepare(
           `UPDATE ${this.#table}
@@ -1053,6 +1192,7 @@ export class D1NotificationsStorage
         .bind(...binds)
         .first<NotificationRow>();
       if (updated) return rowToRecord(updated);
+      await this.#assertAdmission(admission);
     }
     throw new Error(
       'Notification coalescing failed after 16 contention attempts',
@@ -1402,6 +1542,7 @@ export class D1NotificationsStorage
     record: NotificationRecord,
     input: CreateNotificationInput,
     insertionOrdinal: number,
+    admission: ProducerAdmission,
   ): Promise<boolean> {
     const match = this.#coalescableMatch(input);
     const result = await this.#db
@@ -1410,14 +1551,20 @@ export class D1NotificationsStorage
          SELECT ${NOTIFICATION_COLUMNS.map(() => '?').join(', ')}, ?
          WHERE NOT EXISTS (
            SELECT 1 FROM ${this.#table} WHERE ${match.clause}
-         )
+         ) AND ${admission.sql(NOTIFICATION_COLUMNS.length + 1 + match.binds.length)}
          ON CONFLICT(thread_id, id) DO UPDATE SET
            ${NOTIFICATION_UPDATE_COLUMNS.map(
              (column) => `${column} = excluded.${column}`,
            ).join(', ')}`,
       )
-      .bind(...recordValues(record), insertionOrdinal, ...match.binds)
+      .bind(
+        ...recordValues(record),
+        insertionOrdinal,
+        ...match.binds,
+        ...admission.bindings,
+      )
       .run();
+    if (d1Changes(result) === 0) await this.#assertAdmission(admission);
     return d1Changes(result) > 0;
   }
 
@@ -1425,30 +1572,45 @@ export class D1NotificationsStorage
   async #insert(
     record: NotificationRecord,
     insertionOrdinal: number,
+    admission: ProducerAdmission,
   ): Promise<void> {
-    await this.#db
+    const result = await this.#db
       .prepare(
         `INSERT INTO ${this.#table} (${NOTIFICATION_COLUMNS.join(', ')}, insertionOrdinal)
-         VALUES (${NOTIFICATION_COLUMNS.map(() => '?').join(', ')}, ?)
+         SELECT ${NOTIFICATION_COLUMNS.map(() => '?').join(', ')}, ?
+         WHERE ${admission.sql(NOTIFICATION_COLUMNS.length + 1)}
          ON CONFLICT(thread_id, id) DO UPDATE SET
            ${NOTIFICATION_UPDATE_COLUMNS.map(
              (column) => `${column} = excluded.${column}`,
            ).join(', ')}`,
       )
-      .bind(...recordValues(record), insertionOrdinal)
+      .bind(...recordValues(record), insertionOrdinal, ...admission.bindings)
       .run();
+    if (d1Changes(result) === 0) await admission.refused();
   }
 
-  async #allocateInsertionOrdinal(): Promise<number> {
+  async #assertAdmission(admission: ProducerAdmission): Promise<void> {
+    const row = await this.#db
+      .prepare(`SELECT 1 WHERE ${admission.sql(0)}`)
+      .bind(...admission.bindings)
+      .first();
+    if (!row) await admission.refused();
+  }
+
+  async #allocateInsertionOrdinal(
+    admission: ProducerAdmission,
+  ): Promise<number> {
     const row = await this.#db
       .prepare(
         `UPDATE ${this.#sequenceTable}
          SET value = value + 1
-         WHERE id = 1
+         WHERE id = 1 AND ${admission.sql(0)}
          RETURNING value`,
       )
+      .bind(...admission.bindings)
       .first<{ value: number }>();
-    if (!row || !Number.isSafeInteger(row.value) || row.value < 1) {
+    if (!row) return admission.refused();
+    if (!Number.isSafeInteger(row.value) || row.value < 1) {
       throw new Error('Notification insertion ordinal allocation failed');
     }
     return row.value;

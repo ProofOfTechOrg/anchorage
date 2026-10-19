@@ -2194,6 +2194,7 @@ export function createThreadAgentHost(
       const receipt = await storage.createNotificationOnce(
         operation.operationKey,
         stableInput,
+        { admittedInvocation: invocation },
       );
       await profile.journal.recordNotificationReceipt(invocationId, receipt);
       return 'receipt-recorded';
@@ -3246,6 +3247,7 @@ export function createThreadAgentHost(
               const receipt = await notifications.createNotificationOnce(
                 admitted.operationKey,
                 stableInput,
+                { admittedInvocation: invocation },
               );
               await journal.recordNotificationReceipt(invocationId, receipt);
               await options

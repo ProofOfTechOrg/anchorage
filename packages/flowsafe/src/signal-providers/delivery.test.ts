@@ -107,3 +107,22 @@ describe('isTerminalDelivery', () => {
     expect(isTerminalDelivery(outcome as DeliveryOutcome)).toBe(terminal);
   });
 });
+
+it('defers a routed mutation epoch refusal without deferring unrelated conflicts', () => {
+  expect(
+    classifyDeliveryError(
+      new RunRouteError(409, 'epoch mismatch', {
+        code: 'MUTATION_EPOCH_MISMATCH',
+        classification: 'stale',
+        mutationEpoch: 2,
+      }),
+    ),
+  ).toBe('deferred');
+  expect(
+    classifyDeliveryError(
+      new RunRouteError(409, 'other conflict', {
+        code: 'OTHER_CONFLICT',
+      }),
+    ),
+  ).toBe('failed');
+});

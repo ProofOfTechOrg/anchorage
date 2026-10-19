@@ -3,8 +3,13 @@
 // topology with a least-privileged service principal.
 
 import type { SendNotificationSignalInput } from '@mastra/core/notifications';
-
 import type { ExecutionPrincipal } from '../approval-api/index.js';
+import {
+  isMutationEpochMismatchError,
+  type MutationEpochContext,
+} from '../do-runner/execution-admission.js';
+import { isExecutionFenceRefusal } from '../do-runner/execution-fence.js';
+import { objectAnswerError } from '../host-kit/do-response.js';
 import type {
   ThreadPrincipalContext,
   ThreadTopology,
@@ -12,22 +17,30 @@ import type {
 import { RunRouteError } from '../host-kit/run-route-error.js';
 import type { StoredSubscription } from './subscription-d1.js';
 
-function deliveryPrincipalContext(): ThreadPrincipalContext {
+function deliveryPrincipalContext(
+  context?: MutationEpochContext,
+): ThreadPrincipalContext {
   const principal: ExecutionPrincipal = {
     kind: 'service',
     id: 'signal-provider-delivery',
     purpose: 'signal-provider-delivery',
   };
-  return { principal };
+  return {
+    principal,
+    ...(context?.mutationEpoch === undefined
+      ? {}
+      : { mutationEpoch: context.mutationEpoch }),
+  };
 }
 
 export async function deliverNotification(
   topology: ThreadTopology,
   subscription: StoredSubscription,
   notification: SendNotificationSignalInput,
+  context?: MutationEpochContext,
 ): Promise<Response> {
-  return topology.send(
-    deliveryPrincipalContext(),
+  const response = await topology.send(
+    deliveryPrincipalContext(context),
     subscription.threadId,
     `/signal/notification?resourceId=${encodeURIComponent(
       subscription.resourceId,
@@ -38,6 +51,15 @@ export async function deliverNotification(
       body: JSON.stringify(notification),
     },
   );
+  if (response.status === 409) {
+    const error = await objectAnswerError(
+      'provider delivery',
+      response.clone(),
+      'thread',
+    );
+    if (isMutationEpochMismatchError(error)) throw error;
+  }
+  return response;
 }
 
 /**
@@ -75,6 +97,8 @@ export function classifyDeliveryResponse(status: number): DeliveryOutcome {
  */
 export function classifyDeliveryError(error: unknown): DeliveryOutcome {
   if (error instanceof RunRouteError) {
+    if (isExecutionFenceRefusal(error) || isMutationEpochMismatchError(error))
+      return 'deferred';
     const outcome = classifyDeliveryResponse(error.status);
     // A throw is never a delivery, whatever status rode along with it.
     return outcome === 'delivered' ? 'deferred' : outcome;

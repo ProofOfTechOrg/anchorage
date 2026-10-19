@@ -2202,3 +2202,152 @@ describe('schedule deletion, preparation and compatibility', () => {
     }
   });
 });
+
+describe('schedule producer mutation admission', () => {
+  it.each([
+    'draining',
+    'epoch',
+  ] as const)('refuses a %s transition between preparation and fire claim without consuming the fire', async (transition) => {
+    const fixture = await mutationFixture();
+    await activateFence(fixture.fence);
+    const before = rawScheduleState(fixture);
+    fixture.hooks.beforeBatch = async () => {
+      await moveFence(fixture.fence, 'draining', transition === 'epoch');
+      if (transition === 'epoch') await moveFence(fixture.fence, 'open');
+    };
+    await expect(
+      fixture.store.claimScheduleFire({
+        mutationEpoch: 1,
+        scheduleId: 'schedule_a',
+        expectedNextFireAt: NOW,
+        newNextFireAt: NOW + 60_000,
+        actualFireAt: NOW,
+        runId: 'producer-run',
+        trigger: {
+          id: 'producer-trigger',
+          scheduleId: 'schedule_a',
+          runId: 'producer-run',
+          scheduledFireAt: NOW,
+          actualFireAt: NOW,
+          outcome: 'deferred',
+        },
+      }),
+    ).rejects.toBeInstanceOf(
+      transition === 'epoch'
+        ? MutationEpochMismatchError
+        : ExecutionFencedError,
+    );
+    expect(rawScheduleState(fixture)).toEqual(before);
+  });
+});
+
+it('refuses an epoch advance before agent dispatch lease without upgrading the retained fire', async () => {
+  const fixture = await mutationFixture();
+  await activateFence(fixture.fence);
+  await fixture.store.claimScheduleFire({
+    mutationEpoch: 1,
+    scheduleId: 'schedule_a',
+    expectedNextFireAt: NOW,
+    newNextFireAt: NOW + 60_000,
+    actualFireAt: NOW,
+    runId: 'lease-run',
+    trigger: {
+      id: 'lease-trigger',
+      scheduleId: 'schedule_a',
+      runId: 'lease-run',
+      scheduledFireAt: NOW,
+      actualFireAt: NOW,
+      outcome: 'deferred',
+      metadata: { dispatchState: 'prepared' },
+    },
+  });
+  const before = await fixture.store.listTriggers('schedule_a');
+  fixture.hooks.beforeBatch = async () => {
+    await moveFence(fixture.fence, 'draining', true);
+  };
+  await expect(
+    fixture.store.beginAgentScheduleDispatch(
+      'schedule_a',
+      'lease-trigger',
+      NOW,
+      60_000,
+      { mutationEpoch: 1 },
+    ),
+  ).rejects.toBeInstanceOf(MutationEpochMismatchError);
+  expect(await fixture.store.listTriggers('schedule_a')).toEqual(before);
+  await moveFence(fixture.fence, 'open');
+  expect(
+    await fixture.store.beginAgentScheduleDispatch(
+      'schedule_a',
+      'lease-trigger',
+      NOW,
+      60_000,
+      { mutationEpoch: 2 },
+    ),
+  ).toEqual({ state: 'pending' });
+});
+
+it('settles an accepted agent schedule receipt during cutover and replays it without new epoch authority', async () => {
+  const fixture = await mutationFixture();
+  await activateFence(fixture.fence);
+  await fixture.store.claimScheduleFire({
+    mutationEpoch: 1,
+    scheduleId: 'schedule_a',
+    expectedNextFireAt: NOW,
+    newNextFireAt: NOW + 60_000,
+    actualFireAt: NOW,
+    runId: 'accepted-run',
+    trigger: {
+      id: 'accepted-trigger',
+      scheduleId: 'schedule_a',
+      runId: 'accepted-run',
+      scheduledFireAt: NOW,
+      actualFireAt: NOW,
+      outcome: 'deferred',
+      metadata: { dispatchState: 'prepared' },
+    },
+  });
+  expect(
+    await fixture.store.beginAgentScheduleDispatch(
+      'schedule_a',
+      'accepted-trigger',
+      NOW,
+      60_000,
+      { mutationEpoch: 1 },
+    ),
+  ).toEqual({ state: 'ready' });
+  await moveFence(fixture.fence, 'draining', true);
+  const receipt = createScheduleAgentDispatchReceipt('persist', {
+    signalId: 'accepted-signal',
+  });
+  await fixture.store.settleAgentScheduleDispatch(
+    'schedule_a',
+    'accepted-trigger',
+    receipt,
+  );
+  expect(
+    await fixture.store.beginAgentScheduleDispatch(
+      'schedule_a',
+      'accepted-trigger',
+      NOW,
+      60_000,
+      { mutationEpoch: 1 },
+    ),
+  ).toEqual({ state: 'settled', receipt });
+});
+
+it('refuses a legacy due-time claim after the deployment epoch advances', async () => {
+  const fixture = await mutationFixture();
+  const before = rawScheduleState(fixture);
+  await activateFence(fixture.fence);
+  await expect(
+    fixture.store.updateScheduleNextFire(
+      'schedule_a',
+      NOW,
+      NOW + 60_000,
+      NOW,
+      'legacy-run',
+    ),
+  ).rejects.toBeInstanceOf(MutationEpochMismatchError);
+  expect(rawScheduleState(fixture)).toEqual(before);
+});

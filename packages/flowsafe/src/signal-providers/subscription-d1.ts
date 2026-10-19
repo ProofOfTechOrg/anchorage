@@ -4,6 +4,11 @@
 
 import type { SignalSubscription } from '@mastra/core/signals';
 
+import {
+  type MutationEpochContext,
+  normalizeMutationEpoch,
+} from '../do-runner/execution-admission.js';
+import { prepareProducerMutationAdmission } from '../do-runner/execution-fence.js';
 import { isPathSafeId } from '../do-runner/index.js';
 import {
   d1Changes,
@@ -32,11 +37,15 @@ export interface SubscribeInput {
 }
 
 export interface SubscriptionStore {
-  subscribe(input: SubscribeInput): Promise<StoredSubscription>;
+  subscribe(
+    input: SubscribeInput,
+    context?: MutationEpochContext,
+  ): Promise<StoredSubscription>;
   unsubscribe(
     providerId: string,
     externalResourceId: string,
     threadId: string,
+    context?: MutationEpochContext,
   ): Promise<boolean>;
   listForThread(threadId: string): Promise<StoredSubscription[]>;
   listForProvider(providerId: string): Promise<StoredSubscription[]>;
@@ -265,16 +274,26 @@ class D1SubscriptionStore implements SubscriptionStore {
     this.#uuid = options.uuid;
   }
 
-  async subscribe(input: SubscribeInput): Promise<StoredSubscription> {
+  async subscribe(
+    input: SubscribeInput,
+    context?: MutationEpochContext,
+  ): Promise<StoredSubscription> {
+    const captured = {
+      mutationEpoch: normalizeMutationEpoch(context?.mutationEpoch),
+    };
     const canonical = canonicalSubscriptionInput(input);
     await this.#ready();
+    const admission = await prepareProducerMutationAdmission(
+      this.#db,
+      captured,
+    );
     const id = this.#uuid();
     assertSubscriptionId(id);
     const row = await this.#db
       .prepare(
         `INSERT INTO ${SIGNAL_SUBSCRIPTIONS_TABLE}
            (id, provider_id, thread_id, resource_id, external_resource_id, subscribed_at, metadata)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
+         SELECT ?, ?, ?, ?, ?, ?, ? WHERE ${admission.sql(7)}
          ON CONFLICT (provider_id, external_resource_id, thread_id)
          DO UPDATE SET resource_id = excluded.resource_id,
                        metadata = COALESCE(excluded.metadata, metadata)
@@ -288,9 +307,10 @@ class D1SubscriptionStore implements SubscriptionStore {
         canonical.externalResourceId,
         isoOrNull(new Date()),
         canonical.metadataJson,
+        ...admission.bindings,
       )
       .first<SubscriptionRow>();
-    if (row === null) throw new Error('subscribe: upsert returned no row');
+    if (row === null) return admission.refused();
     return rowToSubscription(row);
   }
 
@@ -298,18 +318,34 @@ class D1SubscriptionStore implements SubscriptionStore {
     providerId: string,
     externalResourceId: string,
     threadId: string,
+    context?: MutationEpochContext,
   ): Promise<boolean> {
+    const captured = {
+      mutationEpoch: normalizeMutationEpoch(context?.mutationEpoch),
+    };
     assertProviderId(providerId, 'unsubscribe');
     assertExternalResourceId(externalResourceId, 'unsubscribe');
     assertThreadId(threadId, 'unsubscribe');
     await this.#ready();
+    const admission = await prepareProducerMutationAdmission(
+      this.#db,
+      captured,
+      { requireOpen: false },
+    );
     const result = await this.#db
       .prepare(
         `DELETE FROM ${SIGNAL_SUBSCRIPTIONS_TABLE}
-         WHERE provider_id = ? AND external_resource_id = ? AND thread_id = ?`,
+         WHERE provider_id = ? AND external_resource_id = ? AND thread_id = ? AND ${admission.sql(3)}`,
       )
-      .bind(providerId, externalResourceId, threadId)
+      .bind(providerId, externalResourceId, threadId, ...admission.bindings)
       .run();
+    if (d1Changes(result) === 0) {
+      const current = await this.#db
+        .prepare(`SELECT 1 AS allowed WHERE ${admission.sql(0)}`)
+        .bind(...admission.bindings)
+        .first();
+      if (!current) return admission.refused();
+    }
     return d1Changes(result) > 0;
   }
 

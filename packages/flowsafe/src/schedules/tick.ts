@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import { isRunStartPendingError } from '../do-runner/execution-admission.js';
+import {
+  assertMutationEpoch,
+  isRunStartPendingError,
+  normalizeMutationEpoch,
+} from '../do-runner/execution-admission.js';
 // createScheduleTick. WE OWN THE TICK: a Durable Object alarm drives
 // listDueSchedules -> CAS updateScheduleNextFire claim -> fire, bypassing
 // core's pubsub worker loop entirely under the "one chokepoint, no second
@@ -128,6 +132,7 @@ export interface ScheduleTickStore {
  * must resolve `scheduleId` to its registered owner before starting `runId`.
  */
 export interface ScheduleTickStartInput {
+  mutationEpoch?: number;
   scheduleId: string;
   /** Prepared trigger that authorizes this one fire. */
   dispatchId: string;
@@ -156,6 +161,7 @@ export type ScheduleStartSourceTarget =
   | AgentScheduleTarget;
 
 export interface ScheduleTickStartAgentInput {
+  mutationEpoch?: number;
   /** The schedule whose owner must own all resources minted by this fire. */
   scheduleId: string;
   /** Prepared trigger that authorizes this one fire. */
@@ -363,6 +369,8 @@ export type ScheduleTickAuditSink = (
 ) => void | Promise<void>;
 
 export interface ScheduleTickOptions {
+  /** Trusted deployment epoch captured synchronously at each tick entry. */
+  mutationEpoch?: number | (() => unknown);
   /** The schedules store (a D1SchedulesStorage) the tick claims + records over. */
   store: ScheduleTickStore;
   /** The same catalog policy enforced at create/update, rechecked per fire. */
@@ -1084,6 +1092,9 @@ export function createScheduleTick(
   ): Promise<void> => {
     const pending = await store.listDeferredTriggers(limit);
     for (const trigger of pending) {
+      const mutationEpoch = normalizeMutationEpoch(
+        trigger.metadata?.mutationEpoch,
+      );
       const storedRef = trigger.metadata?.dispatchRef;
       const ref = scheduleTickDispatchRef(storedRef);
       if (!ref) {
@@ -1171,6 +1182,7 @@ export function createScheduleTick(
         ) {
           try {
             const receipt = await options.signalAgent({
+              ...(mutationEpoch === undefined ? {} : { mutationEpoch }),
               scheduleId: ref.scheduleId,
               target: ref.agentTarget,
               ...(options.deploymentTag !== undefined
@@ -1359,6 +1371,7 @@ export function createScheduleTick(
     schedule: Schedule,
     at: number,
     result: ScheduleTickResult,
+    mutationEpoch: number | undefined,
   ): Promise<void> => {
     const targetType = auditTargetOfKind(schedule.target.type);
     // 1. Compute the next fire time. A corrupt cron cannot be advanced — the
@@ -1414,12 +1427,14 @@ export function createScheduleTick(
       outcome: 'deferred',
       error: 'dispatch has not reached an authoritative target state',
       metadata: triggerMetadata({
+        ...(mutationEpoch === undefined ? {} : { mutationEpoch }),
         reason: 'dispatch-preparing',
         reconcileAttempts: 0,
         reconcileAfter: at,
       }),
     };
     const claimed = await store.claimScheduleFire({
+      ...(mutationEpoch === undefined ? {} : { mutationEpoch }),
       scheduleId: schedule.id,
       expectedNextFireAt: schedule.nextFireAt,
       newNextFireAt,
@@ -1567,6 +1582,7 @@ export function createScheduleTick(
         let receipt: ScheduleAgentDispatchReceipt;
         try {
           receipt = await options.signalAgent({
+            ...(mutationEpoch === undefined ? {} : { mutationEpoch }),
             scheduleId: schedule.id,
             target,
             ...(options.deploymentTag !== undefined
@@ -1588,7 +1604,10 @@ export function createScheduleTick(
             {
               ...claimTrigger,
               error: error instanceof Error ? error.message : String(error),
-              metadata: triggerMetadata({ dispatchRef: dispatch }),
+              metadata: triggerMetadata({
+                ...(claimTrigger.metadata ?? {}),
+                dispatchRef: dispatch,
+              }),
             },
             error,
             result,
@@ -1649,6 +1668,7 @@ export function createScheduleTick(
       let summary: { runId: string };
       try {
         summary = await options.startAgent({
+          ...(mutationEpoch === undefined ? {} : { mutationEpoch }),
           scheduleId: schedule.id,
           dispatchId: claimTrigger.id,
           target,
@@ -1670,7 +1690,10 @@ export function createScheduleTick(
           {
             ...claimTrigger,
             error: error instanceof Error ? error.message : String(error),
-            metadata: triggerMetadata({ dispatchRef: dispatch }),
+            metadata: triggerMetadata({
+              ...(claimTrigger.metadata ?? {}),
+              dispatchRef: dispatch,
+            }),
           },
           error,
           result,
@@ -1718,6 +1741,7 @@ export function createScheduleTick(
     let summary: { runId: string };
     try {
       summary = await start({
+        ...(mutationEpoch === undefined ? {} : { mutationEpoch }),
         scheduleId: schedule.id,
         dispatchId: claimTrigger.id,
         workflowId: target.workflowId,
@@ -1732,7 +1756,10 @@ export function createScheduleTick(
         {
           ...claimTrigger,
           error: error instanceof Error ? error.message : String(error),
-          metadata: triggerMetadata({ dispatchRef: dispatch }),
+          metadata: triggerMetadata({
+            ...(claimTrigger.metadata ?? {}),
+            dispatchRef: dispatch,
+          }),
         },
         error,
         result,
@@ -1756,6 +1783,11 @@ export function createScheduleTick(
   });
 
   return async () => {
+    const mutationEpoch = normalizeMutationEpoch(
+      typeof options.mutationEpoch === 'function'
+        ? options.mutationEpoch()
+        : options.mutationEpoch,
+    );
     if (limit === 0) return idlePass();
     // ONE fence read per pass, before the due list and before any claim.
     // Nothing at all runs on a fenced pass — not the deferred reconciliation
@@ -1768,9 +1800,9 @@ export function createScheduleTick(
     // deployment whose state is unknown.
     let admitted: boolean;
     try {
-      admitted = admitsWorkAuthoring(
-        await readExecutionFence(options.executionFence),
-      );
+      const fence = await readExecutionFence(options.executionFence);
+      assertMutationEpoch(fence, mutationEpoch);
+      admitted = admitsWorkAuthoring(fence);
     } catch (error) {
       console.error(
         JSON.stringify({
@@ -1805,7 +1837,7 @@ export function createScheduleTick(
       // Per-schedule isolation: one wedged row (an unexpected store/audit throw)
       // must not abort the pass and strand every due schedule behind it.
       try {
-        await fireOne(schedule, at, result);
+        await fireOne(schedule, at, result, mutationEpoch);
       } catch (error) {
         result.failed += 1;
         console.error(

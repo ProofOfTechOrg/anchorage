@@ -7840,3 +7840,187 @@ describe('notification delivery failure receipts', () => {
     }
   });
 });
+
+describe('notification route mutation epoch', () => {
+  it('carries the trusted epoch into owned storage after asynchronous storage resolution', async () => {
+    const db = sqliteUnitDatabase(openSqlite());
+    const fence = new ExecutionFenceStore(db);
+    const storage = new D1NotificationsStorage(db);
+    await fence.seed('open');
+    await fence.transition({
+      expected: 'open',
+      next: 'draining',
+      expectedMutationEpoch: 0,
+      expectedRevision: 0,
+      advanceMutationEpoch: true,
+    });
+    await fence.transition({
+      expected: 'draining',
+      next: 'open',
+      expectedMutationEpoch: 1,
+      expectedRevision: 1,
+    });
+    const { agent, calls } = mockAgent();
+    const entered = deferred<void>();
+    const release = deferred<void>();
+    const scope = { ...scopeWith(undefined, fence), mutationEpoch: 1 };
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      canPersist: () => false,
+      resolveResourceId: () => 'acme_res',
+      resolveNotificationsStorage: async () => {
+        entered.resolve();
+        await release.promise;
+        return storage;
+      },
+    });
+    const responsePromise = routes(
+      post('/signal/notification', {
+        source: 'provider',
+        kind: 'update',
+        summary: 'hello',
+      }),
+      scope,
+    );
+    await entered.promise;
+    scope.mutationEpoch = 2;
+    release.resolve();
+    const response = await responsePromise;
+    expect(response?.status).toBe(200);
+    expect(calls).toEqual([]);
+    expect(await response?.json()).toMatchObject({
+      delivery: { action: 'deferred', reason: 'dispatcher' },
+    });
+    expect(
+      await storage.listNotifications({ threadId: 'acme_t1' }),
+    ).toMatchObject([{ summary: 'hello', status: 'pending' }]);
+  });
+
+  it('refuses owner notification delivery across cutover without altering retained inbox authority', async () => {
+    const db = sqliteUnitDatabase(openSqlite());
+    const fence = new ExecutionFenceStore(db);
+    const storage = new D1NotificationsStorage(db);
+    await fence.seed('open');
+    const retainedInput = {
+      id: 'retained',
+      threadId: 'acme_t1',
+      source: 'previous',
+      kind: 'result',
+      summary: 'retained',
+      createdAt: new Date('2026-10-19T00:00:00Z'),
+    };
+    const receipt = await storage.createNotificationOnce(
+      'retained-operation',
+      retainedInput,
+    );
+    await fence.transition({
+      expected: 'open',
+      next: 'draining',
+      expectedMutationEpoch: 0,
+      expectedRevision: 0,
+      advanceMutationEpoch: true,
+    });
+    await fence.transition({
+      expected: 'draining',
+      next: 'open',
+      expectedMutationEpoch: 1,
+      expectedRevision: 1,
+    });
+    const { agent, calls } = mockAgent();
+    const entered = deferred<void>();
+    const release = deferred<void>();
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+      resolveNotificationsStorage: () => storage,
+      contentPolicy: async () => {
+        entered.resolve();
+        await release.promise;
+        return { allowed: true };
+      },
+    });
+    const responsePromise = routes(
+      post('/signal/notification', {
+        source: 'provider',
+        kind: 'update',
+        summary: 'new notification',
+      }),
+      { ...scopeWith(undefined, fence), mutationEpoch: 1 },
+    );
+    const reached = await Promise.race([
+      entered.promise.then(() => 'policy' as const),
+      responsePromise.then(() => 'response' as const),
+    ]);
+    if (reached === 'policy') {
+      expect(
+        await storage.listNotifications({
+          threadId: 'acme_t1',
+          source: 'provider',
+        }),
+      ).toMatchObject([{ summary: 'new notification', status: 'pending' }]);
+      await fence.transition({
+        expected: 'open',
+        next: 'migration-locked',
+        expectedMutationEpoch: 1,
+        expectedRevision: 2,
+        advanceMutationEpoch: true,
+      });
+      release.resolve();
+    }
+    const response = await responsePromise;
+    expect(calls).toEqual([]);
+    expect(response?.status).toBe(503);
+    expect(await response?.json()).toMatchObject({
+      reason: { code: 'EXECUTION_FENCE_UNREADABLE' },
+    });
+    expect(
+      await storage.listNotifications({ threadId: 'acme_t1' }),
+    ).toMatchObject([
+      { id: 'retained', status: 'pending', summary: 'retained' },
+    ]);
+    expect(
+      await storage.listNotifications({ threadId: 'acme_t1' }),
+    ).toHaveLength(1);
+    expect(
+      await storage.createNotificationOnce(
+        'retained-operation',
+        retainedInput,
+        { mutationEpoch: 1 },
+      ),
+    ).toEqual(receipt);
+  });
+
+  it('refuses legacy Mastra notification delivery after required epoch activation', async () => {
+    const db = sqliteUnitDatabase(openSqlite());
+    const fence = new ExecutionFenceStore(db);
+    await fence.seed('open');
+    await fence.transition({
+      expected: 'open',
+      next: 'draining',
+      expectedMutationEpoch: 0,
+      expectedRevision: 0,
+      advanceMutationEpoch: true,
+    });
+    await fence.transition({
+      expected: 'draining',
+      next: 'open',
+      expectedMutationEpoch: 1,
+      expectedRevision: 1,
+    });
+    const { agent, calls } = mockAgent({ runtimeDriven: false });
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+    });
+    const response = await routes(
+      post('/signal/notification', {
+        source: 'provider',
+        kind: 'update',
+        summary: 'hello',
+      }),
+      { ...scopeWith(undefined, fence), mutationEpoch: 1 },
+    );
+    expect(response?.status).toBe(503);
+    expect(calls).toEqual([]);
+  });
+});

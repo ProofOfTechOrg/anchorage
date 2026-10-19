@@ -1280,3 +1280,52 @@ describe('createWebhookRouter audit isolation', () => {
     expect(replacement).not.toHaveBeenCalled();
   });
 });
+
+it('captures the trusted producer epoch before subscription lookup and defers its stale refusal', async () => {
+  const factory = new InMemorySubscriptionStoreFactory();
+  await seed(factory, 'acme', 'acme_t1');
+  const subscriptions = factory.store();
+  const lookup = subscriptions.listByResource.bind(subscriptions);
+  let epoch = 1;
+  subscriptions.listByResource = async (...args) => {
+    epoch = 2;
+    return lookup(...args);
+  };
+  const epochs: (string | null)[] = [];
+  const router = createWebhookRouter({
+    mutationEpoch: () => epoch,
+    providers: { test: testProvider() },
+    subscriptions,
+    secretForProvider: () => 'secret',
+    topology: createThreadTopology({
+      idFromName: (name) => name,
+      get: () => ({
+        fetch: async (
+          _input: Request | string,
+          init?: { headers?: Record<string, string> },
+        ) => {
+          epochs.push(
+            new Headers(init?.headers).get('x-flowsafe-mutation-epoch'),
+          );
+          return Response.json(
+            {
+              error: 'epoch mismatch',
+              reason: {
+                code: 'MUTATION_EPOCH_MISMATCH',
+                classification: 'stale',
+                mutationEpoch: 2,
+              },
+            },
+            { status: 409 },
+          );
+        },
+      }),
+    }),
+  });
+  const request = webhookRequest('good', {});
+  request.headers.set('x-flowsafe-mutation-epoch', '99');
+  const response = await router(request);
+  expect(epochs).toEqual(['1']);
+  expect(response?.status).toBe(503);
+  expect(await response?.json()).toMatchObject({ deferred: 1, delivered: 0 });
+});
