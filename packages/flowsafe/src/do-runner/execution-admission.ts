@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import type { ExecutionPrincipal } from '../approval-api/principal.js';
 import {
   type ExecutionPrincipalKind,
   isExecutionPrincipalId,
@@ -31,6 +32,45 @@ export function isRunStartPendingError(error: unknown): boolean {
   } catch {
     return false;
   }
+}
+
+export interface RemoteStepAddress {
+  deploymentId: string;
+  tablePrefix: string;
+  workflowId: string;
+  agentId: string;
+  threadId: string;
+  resourceId: string;
+  runId: string;
+}
+
+export interface RemoteStepInvocation extends RemoteStepAddress {
+  invocationId: string;
+  principal: ExecutionPrincipal;
+  startToken: string;
+  stepPath: readonly string[];
+  suspendedAt: number;
+  resumeCount?: number;
+  request: unknown;
+  deadlineAt: number;
+  status:
+    | 'pending'
+    | 'dispatched'
+    | 'result-retained'
+    | 'resuming'
+    | 'settled'
+    | 'failed';
+  permitGeneration: number;
+  permitEpoch?: number;
+  permitRevision?: number;
+  permitExpiresAt?: number;
+  permitConsumedAt?: number;
+  resumeLeaseExpiresAt?: number;
+  settlementOutcome?:
+    | 'applied'
+    | 'terminal-not-success'
+    | 'deadline-expired'
+    | 'advanced-without-proof';
 }
 
 export interface MutationEpochContext {

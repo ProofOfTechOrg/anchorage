@@ -16,7 +16,17 @@ import {
 } from '../signals/notifications-d1.js';
 import { credentialsMatch } from './deployment-identity.js';
 import { DoStatusError } from './do-status-error.js';
-import { assertMutationEpoch } from './execution-admission.js';
+import {
+  assertMutationEpoch,
+  type RemoteStepAddress,
+  type RemoteStepInvocation,
+} from './execution-admission.js';
+
+export type {
+  RemoteStepAddress,
+  RemoteStepInvocation,
+} from './execution-admission.js';
+
 import {
   admitsExistingRun,
   captureExecutionFenceAdmissionSchema,
@@ -251,51 +261,12 @@ const SNAPSHOT_EXECUTION_OPEN_SQL = `json_valid(snapshot)
   AND json_type(snapshot, '$.requestContext."${RUN_LIFECYCLE_CONTEXT_KEY}".transitionIntent') IS NULL
   AND json_type(snapshot, '$.requestContext."${RUN_LIFECYCLE_CONTEXT_KEY}".terminal') IS NULL`;
 
-export interface RemoteStepAddress {
-  deploymentId: string;
-  tablePrefix: string;
-  workflowId: string;
-  agentId: string;
-  threadId: string;
-  resourceId: string;
-  runId: string;
-}
-
 export interface WorkflowRemoteStepAddress {
   targetKind: 'workflow';
   deploymentId: string;
   tablePrefix: string;
   workflowId: string;
   runId: string;
-}
-
-export interface RemoteStepInvocation extends RemoteStepAddress {
-  invocationId: string;
-  principal: ExecutionPrincipal;
-  startToken: string;
-  stepPath: readonly string[];
-  suspendedAt: number;
-  resumeCount?: number;
-  request: unknown;
-  deadlineAt: number;
-  status:
-    | 'pending'
-    | 'dispatched'
-    | 'result-retained'
-    | 'resuming'
-    | 'settled'
-    | 'failed';
-  permitGeneration: number;
-  permitEpoch?: number;
-  permitRevision?: number;
-  permitExpiresAt?: number;
-  permitConsumedAt?: number;
-  resumeLeaseExpiresAt?: number;
-  settlementOutcome?:
-    | 'applied'
-    | 'terminal-not-success'
-    | 'deadline-expired'
-    | 'advanced-without-proof';
 }
 
 export interface WorkflowRemoteStepInvocation
