@@ -144,7 +144,7 @@ try {
   );
   await writeFile(
     join(consumerDirectory, 'pnpm-workspace.yaml'),
-    `packages:\n  - "."\noverrides:\n  zod: ${JSON.stringify(
+    `packages:\n  - "."\nminimumReleaseAge: 10080\noverrides:\n  zod: ${JSON.stringify(
       `link:${join(packageRoot, 'node_modules/zod')}`,
     )}\n`,
   );
@@ -759,16 +759,9 @@ assert.equal(globalThis.fetch, conformanceFetch);
 `,
   );
 
-  run(
-    'pnpm',
-    [
-      'install',
-      '--offline',
-      '--ignore-scripts',
-      '--config.minimum-release-age=0',
-    ],
-    { cwd: consumerDirectory },
-  );
+  run('pnpm', ['install', '--offline', '--ignore-scripts'], {
+    cwd: consumerDirectory,
+  });
   run(join(packageRoot, 'node_modules/.bin/tsc'), ['-p', 'tsconfig.json'], {
     cwd: consumerDirectory,
   });
