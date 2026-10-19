@@ -1,4 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
+import {
+  assertMutationEpoch,
+  isMutationEpochMismatchError,
+  normalizeMutationEpoch,
+} from '../do-runner/execution-admission.js';
 // Alarm-driven provider host for one physically isolated deployment.
 
 import type { DurableObjectState } from '@cloudflare/workers-types';
@@ -66,6 +71,8 @@ export interface SignalProviderHostWiring {
    * ExecutionFenceWiring.
    */
   executionFence: ExecutionFenceWiring;
+  /** Trusted host epoch captured at fetch, alarm, or direct poll entry. */
+  mutationEpoch?: number | (() => unknown);
 }
 
 export interface PollResult {
@@ -136,8 +143,16 @@ export abstract class SignalProviderHost<TEnv = unknown> {
     return this.#wiring;
   }
 
+  #captureMutationEpoch(): number | undefined {
+    const configured = this.#ensureWiring().mutationEpoch;
+    return normalizeMutationEpoch(
+      typeof configured === 'function' ? configured() : configured,
+    );
+  }
+
   async fetch(request: Request): Promise<Response> {
     try {
+      const mutationEpoch = this.#captureMutationEpoch();
       await verifyDurableObjectDeploymentRequest(request, this.state, this.env);
       await this.#verifyIdentity();
       const path = new URL(request.url).pathname;
@@ -146,7 +161,7 @@ export abstract class SignalProviderHost<TEnv = unknown> {
         return json({ armed: true });
       }
       if (request.method === 'POST' && path === '/poll') {
-        return json(await this.poll());
+        return json(await this.#poll(mutationEpoch));
       }
       return json({ error: 'not found' }, 404);
     } catch (error) {
@@ -155,6 +170,7 @@ export abstract class SignalProviderHost<TEnv = unknown> {
   }
 
   async alarm(): Promise<void> {
+    const mutationEpoch = this.#captureMutationEpoch();
     // The instance name is local and safe to reject before touching storage.
     // D1 identity verification can fail transiently, so persist the next wake
     // before that external I/O consumes this one-shot platform alarm.
@@ -163,7 +179,7 @@ export abstract class SignalProviderHost<TEnv = unknown> {
       const prearmedAt = await this.#prearmUnlocked();
       await this.#verifyIdentity();
       try {
-        await this.poll();
+        await this.#poll(mutationEpoch);
       } catch (error) {
         // The fence refusing (or failing to answer) is not an alarm failure:
         // workerd retries a thrown alarm() up to six times, which would answer
@@ -171,7 +187,11 @@ export abstract class SignalProviderHost<TEnv = unknown> {
         // IS the re-arm, so the next wake polls again once the fence reopens —
         // and #armUnlocked is deliberately skipped, because its subscription
         // read would recompute a cadence from a pass that never ran.
-        if (!isExecutionFenceRefusal(error)) throw error;
+        if (
+          !isExecutionFenceRefusal(error) &&
+          !isMutationEpochMismatchError(error)
+        )
+          throw error;
         console.error(
           JSON.stringify({
             type: 'signal-provider.poll-fenced',
@@ -185,6 +205,10 @@ export abstract class SignalProviderHost<TEnv = unknown> {
   }
 
   async poll(): Promise<PollResult> {
+    return this.#poll(this.#captureMutationEpoch());
+  }
+
+  async #poll(mutationEpoch: number | undefined): Promise<PollResult> {
     await this.#verifyIdentity();
     const { store, topology, providers, executionFence } = this.#ensureWiring();
     // ONE fence read per PASS, before any provider is polled. Throwing rather
@@ -192,6 +216,7 @@ export abstract class SignalProviderHost<TEnv = unknown> {
     // answer 503 so the caller can tell a fenced deployment from an idle one,
     // and alarm() catches this exact family above.
     const fence = await readExecutionFence(executionFence);
+    assertMutationEpoch(fence, mutationEpoch);
     if (!admitsDrainableExecution(fence)) {
       throw new ExecutionFencedError(fence.state, 'signal provider poll');
     }
@@ -231,6 +256,7 @@ export abstract class SignalProviderHost<TEnv = unknown> {
               topology,
               subscription,
               delivery.notification,
+              { mutationEpoch },
             );
             const outcome = classifyDeliveryResponse(response.status);
             if (outcome === 'delivered') {

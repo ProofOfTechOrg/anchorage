@@ -103,6 +103,7 @@ function pollProvider(
 }
 
 interface TestEnv {
+  mutationEpoch?: number | (() => unknown);
   factory: SubscriptionStoreFactory;
   topology: ThreadTopology;
   providers: readonly SignalProviderAdapter[];
@@ -133,6 +134,7 @@ class TestHost extends SignalProviderHost<TestEnv> {
       // an in-memory factory, so there is no database to fence. The fence cases
       // supply a real store.
       executionFence: env.executionFence ?? 'none',
+      mutationEpoch: env.mutationEpoch,
     };
   }
 }
@@ -828,4 +830,42 @@ describe('SignalProviderHost and the deployment execution fence', () => {
     });
     expect(addressed).toEqual(['acme_t1']);
   });
+});
+
+it('retains the poll entry epoch when provider I/O crosses a cutover', async () => {
+  const factory = new InMemorySubscriptionStoreFactory();
+  await seed(factory, 'acme', 'poller', 'acme_t1');
+  let epoch = 1;
+  const provider = pollProvider('poller');
+  const poll = provider.pollForDeliveries;
+  if (!poll) throw new Error('poll provider has no poll method');
+  provider.pollForDeliveries = async (subscriptions) => {
+    epoch = 2;
+    return poll(subscriptions);
+  };
+  const epochs: (number | undefined)[] = [];
+  const host = new TestHost(state(SIGNAL_PROVIDER_HOST_INSTANCE_NAME), {
+    factory,
+    providers: [provider],
+    mutationEpoch: () => epoch,
+    topology: {
+      send: async (context) => {
+        epochs.push(context.mutationEpoch);
+        return Response.json(
+          {
+            error: 'epoch mismatch',
+            reason: {
+              code: 'MUTATION_EPOCH_MISMATCH',
+              classification: 'stale',
+              mutationEpoch: 2,
+            },
+          },
+          { status: 409 },
+        );
+      },
+      forward: async () => new Response(),
+    },
+  });
+  expect(await host.poll()).toMatchObject({ delivered: 0, deferred: 1 });
+  expect(epochs).toEqual([1]);
 });

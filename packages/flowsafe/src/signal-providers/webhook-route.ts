@@ -1,4 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
+import {
+  assertMutationEpoch,
+  isMutationEpochMismatchError,
+  normalizeMutationEpoch,
+} from '../do-runner/execution-admission.js';
 // Webhook ingress that terminates on the Worker, plus the human-only
 // subscribe/unsubscribe surface.
 //
@@ -166,6 +171,8 @@ export interface WebhookRouterOptions {
    * event is then lost at the migration boundary. See ExecutionFenceWiring.
    */
   executionFence: ExecutionFenceWiring;
+  /** Trusted host epoch, captured before request body or provider I/O. */
+  mutationEpoch?: number | (() => unknown);
 }
 
 export type WebhookRouter = (request: Request) => Promise<Response | null>;
@@ -301,6 +308,11 @@ export function createWebhookRouter(
   };
 
   return async (request) => {
+    const mutationEpoch = normalizeMutationEpoch(
+      typeof options.mutationEpoch === 'function'
+        ? options.mutationEpoch()
+        : options.mutationEpoch,
+    );
     const url = new URL(request.url);
     const segments = url.pathname.split('/').filter(Boolean);
     // /api/signal-providers/:providerId/webhook
@@ -376,6 +388,7 @@ export function createWebhookRouter(
       // than being half-landed in this database. Draining still delivers —
       // the thread routes degrade a wake to a persist there.
       const fenceReading = await readExecutionFence(options.executionFence);
+      assertMutationEpoch(fenceReading, mutationEpoch);
       if (!admitsDrainableExecution(fenceReading)) {
         await auditWebhook({
           providerId,
@@ -450,12 +463,17 @@ export function createWebhookRouter(
           continue;
         }
         try {
-          const response = await deliverNotification(topology, row, {
-            ...built,
-            dedupeKey:
-              built.dedupeKey ??
-              webhookDeliveryDedupeKey(providerId, row.id, eventDigest),
-          });
+          const response = await deliverNotification(
+            topology,
+            row,
+            {
+              ...built,
+              dedupeKey:
+                built.dedupeKey ??
+                webhookDeliveryDedupeKey(providerId, row.id, eventDigest),
+            },
+            { mutationEpoch },
+          );
           const outcome = classifyDeliveryResponse(response.status);
           if (outcome === 'delivered') {
             delivered += 1;
@@ -522,11 +540,11 @@ export function createWebhookRouter(
       // A fence that could not be READ is not evidence the deployment is open.
       // 503 rather than the 500 below so the provider's own at-least-once
       // redelivery is what recovers the event, exactly as for a refusal.
-      if (isExecutionFenceRefusal(error)) {
-        return json(
-          { error: error.message, reason: error.reason },
-          error.status,
-        );
+      if (
+        isExecutionFenceRefusal(error) ||
+        isMutationEpochMismatchError(error)
+      ) {
+        return json({ error: error.message, reason: error.reason }, 503);
       }
       reportError({
         type: 'signal-provider.webhook-error',
@@ -718,6 +736,9 @@ export function createSubscriptionRouter(
       // 1. Resolve.
       context = await resolve(request);
       if (!context) return json({ error: 'authentication required' }, 401);
+      const mutationContext = {
+        mutationEpoch: normalizeMutationEpoch(context.mutationEpoch),
+      };
 
       // 2. Resolve thread ownership before the role gate. Foreign and missing
       // ids collapse to the same 404.
@@ -799,6 +820,7 @@ export function createSubscriptionRouter(
           providerId,
           externalResourceId,
           threadId,
+          mutationContext,
         );
         await finishCommittedMutation(providerId, externalResourceId);
         return json({ removed });
@@ -857,16 +879,28 @@ export function createSubscriptionRouter(
         throw new RunRouteError(404, 'target resource not found');
       }
       await options.validateThreadTarget(context, { threadId, resourceId });
-      const subscription = await store.subscribe({
-        providerId,
-        externalResourceId,
-        threadId,
-        resourceId,
-        ...(metadata === undefined ? {} : { metadata }),
-      });
+      const subscription = await store.subscribe(
+        {
+          providerId,
+          externalResourceId,
+          threadId,
+          resourceId,
+          ...(metadata === undefined ? {} : { metadata }),
+        },
+        mutationContext,
+      );
       await finishCommittedMutation(providerId, externalResourceId);
       return json({ subscription });
     } catch (error) {
+      if (
+        isExecutionFenceRefusal(error) ||
+        isMutationEpochMismatchError(error)
+      ) {
+        return json(
+          { error: error.message, reason: error.reason },
+          error.status,
+        );
+      }
       if (error instanceof RunRouteError && isRefusalStatus(error.status)) {
         await audit('rejected', {
           reason:

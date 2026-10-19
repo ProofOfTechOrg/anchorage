@@ -54,10 +54,12 @@ import {
 import { missingTableReadsEmpty } from './cause-chain.js';
 import { DoStatusError } from './do-status-error.js';
 import {
+  assertMutationEpoch,
   type D1RunExecutionIdentity,
   type D1StartExecutionIdentity,
   ExecutionFenceUnreadableError,
   InvalidExecutionIdentityError,
+  type MutationEpochContext,
   normalizeD1RunExecutionIdentity,
   normalizeMutationEpoch,
   normalizeStartExecutionIdentity,
@@ -660,6 +662,67 @@ export function executionFenceAdmissionSql(input: {
         AND ${nullable}
         AND (f.require_mutation_epoch = 0 OR f.mutation_epoch = ${callerEpoch})
         AND (${statePredicate}))`;
+}
+
+/** @internal Atomic admission frame shared by owned producer stores. */
+export async function prepareProducerMutationAdmission(
+  db: ExecutionFenceDatabase,
+  context: MutationEpochContext | undefined,
+  options: { requireOpen?: boolean; allowLegacyDraining?: boolean } = {},
+): Promise<{
+  readonly bindings: readonly unknown[];
+  sql(bindingOffset: number): string;
+  refused(): Promise<never>;
+}> {
+  const epoch = normalizeMutationEpoch(context?.mutationEpoch);
+  const requireOpen = options.requireOpen !== false;
+  const allowLegacyDraining =
+    options.allowLegacyDraining === true &&
+    (epoch === undefined || epoch === 0);
+  const fence = new ExecutionFenceStore(db);
+  await fence.seed('open');
+  const assertAllowed = (reading: ExecutionFenceVersionedReading): void => {
+    assertMutationEpoch(reading, epoch);
+    if (
+      requireOpen &&
+      !admitsWorkAuthoring(reading) &&
+      !(
+        allowLegacyDraining &&
+        reading.state === 'draining' &&
+        reading.mutationEpoch === 0 &&
+        !reading.requireMutationEpoch
+      )
+    )
+      throw new ExecutionFencedError(reading.state);
+  };
+  const observed = await fence.readForAdmission();
+  assertAllowed(observed.reading);
+  const semantic = executionFenceAdmissionValues(observed);
+  const schema = await captureExecutionFenceAdmissionSchema(
+    await db.prepare(`PRAGMA table_xinfo(${EXECUTION_FENCE_TABLE})`).all(),
+  );
+  return {
+    bindings: [epoch ?? null, ...semantic, schema],
+    sql(bindingOffset) {
+      return executionFenceAdmissionSql({
+        callerEpoch: `?${bindingOffset + 1}`,
+        semantic: semantic.map((_, index) => `?${bindingOffset + index + 2}`),
+        schema: `?${bindingOffset + 12}`,
+        statePredicate: !requireOpen
+          ? '1'
+          : allowLegacyDraining
+            ? "(f.state COLLATE BINARY = 'open' OR (f.state COLLATE BINARY = 'draining' AND f.mutation_epoch = 0 AND f.require_mutation_epoch = 0))"
+            : "f.state COLLATE BINARY = 'open'",
+      });
+    },
+    async refused(): Promise<never> {
+      const current = await fence.readForAdmission();
+      assertAllowed(current.reading);
+      throw new ExecutionFenceUnreadableError(
+        'execution fence changed during producer admission',
+      );
+    },
+  };
 }
 
 function isFenceCounter(value: unknown): value is number {

@@ -25,6 +25,7 @@ import {
   executionFenceAdmissionSql,
   executionFenceAdmissionValues,
 } from './execution-fence.js';
+import { REMOTE_STEP_TABLE } from './notification-predicate.js';
 import { isPathSafeId } from './path-safe-id.js';
 import {
   lifecycleFromRequestContext,
@@ -34,7 +35,7 @@ import type { RunnerRuntime, RunSummary } from './runtime.js';
 import { MASTRA_WORKFLOW_META_KEY } from './suspension-deadline.js';
 import { validateTablePrefix } from './table-prefix.js';
 
-export const REMOTE_STEP_TABLE = 'flowsafe_remote_step_invocations';
+export { REMOTE_STEP_TABLE } from './notification-predicate.js';
 export const REMOTE_STEP_SCHEMA_TABLE = 'flowsafe_remote_step_schema';
 export const REMOTE_STEP_NOTIFICATION_CURSOR_TABLE =
   'flowsafe_remote_step_notification_cursor';

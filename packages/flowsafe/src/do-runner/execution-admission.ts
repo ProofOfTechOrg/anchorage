@@ -163,6 +163,32 @@ export class MutationEpochMismatchError extends DoStatusError {
   }
 }
 
+export function isMutationEpochMismatchError(
+  error: unknown,
+): error is MutationEpochMismatchError {
+  if (error === null || typeof error !== 'object') return false;
+  const candidate = error as {
+    status?: unknown;
+    message?: unknown;
+    reason?: {
+      code?: unknown;
+      classification?: unknown;
+      mutationEpoch?: unknown;
+    };
+  };
+  return (
+    candidate.status === 409 &&
+    typeof candidate.message === 'string' &&
+    candidate.reason?.code === 'MUTATION_EPOCH_MISMATCH' &&
+    (candidate.reason.classification === 'missing' ||
+      candidate.reason.classification === 'stale' ||
+      candidate.reason.classification === 'future') &&
+    typeof candidate.reason.mutationEpoch === 'number' &&
+    Number.isSafeInteger(candidate.reason.mutationEpoch) &&
+    candidate.reason.mutationEpoch > 0
+  );
+}
+
 export class ExecutionFenceUnreadableError extends DoStatusError {
   readonly status = 503;
   readonly reason: { readonly code: 'EXECUTION_FENCE_UNREADABLE' };

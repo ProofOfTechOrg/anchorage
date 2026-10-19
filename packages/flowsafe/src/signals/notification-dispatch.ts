@@ -4,14 +4,20 @@ import type {
   NotificationRecord,
   NotificationsStorage,
 } from '@mastra/core/notifications';
-
 import type { ActorContext } from '../approval-api/index.js';
+import {
+  assertMutationEpoch,
+  isMutationEpochMismatchError,
+  normalizeMutationEpoch,
+} from '../do-runner/execution-admission.js';
+import { isExecutionFenceRefusal } from '../do-runner/execution-fence.js';
 import {
   admitsDrainableExecution,
   type ExecutionFenceWiring,
   isPathSafeId,
   readExecutionFence,
 } from '../do-runner/index.js';
+import { objectAnswerError } from '../host-kit/do-response.js';
 import type { ThreadTopology } from '../host-kit/index.js';
 import {
   nonnegativeSafeInteger,
@@ -616,15 +622,20 @@ export function createNotificationDispatchTick(
   if (limit === 0) return async () => ({ due: 0, delivered: 0, failed: 0 });
   const { topology, resolveContext, now: clock, executionFence } = options;
   return async () => {
+    const resolved = resolveContext();
+    const context = {
+      ...resolved,
+      mutationEpoch: normalizeMutationEpoch(resolved.mutationEpoch),
+    };
     // The fence, before the due read and before any delivery. This runs on a
     // maintenance alarm, so a fence that cannot be READ degrades closed by
     // skipping the pass and logging: throwing would fail the duty, and
     // proceeding would dispatch on a deployment whose state is unknown.
     let admitted: boolean;
     try {
-      admitted = admitsDrainableExecution(
-        await readExecutionFence(executionFence),
-      );
+      const fence = await readExecutionFence(executionFence);
+      assertMutationEpoch(fence, context.mutationEpoch);
+      admitted = admitsDrainableExecution(fence);
     } catch (error) {
       // `reason` matches schedule-tick-fence-error, so the two alarm lanes
       // degrade closed identically and an operator greps one field.
@@ -724,7 +735,6 @@ export function createNotificationDispatchTick(
       let batchThreadState: 'active' | 'idle' | null = null;
       for (const records of batches) {
         try {
-          const context = resolveContext();
           const response = await topology.send(
             context,
             group.threadId,
@@ -742,6 +752,16 @@ export function createNotificationDispatchTick(
             },
           );
           if (!response.ok) {
+            const error = await objectAnswerError(
+              'notification dispatch',
+              response.clone(),
+              'thread',
+            );
+            if (
+              isExecutionFenceRefusal(error) ||
+              isMutationEpochMismatchError(error)
+            )
+              throw error;
             throw new Error(
               `thread notification dispatch returned ${response.status}`,
             );
@@ -765,6 +785,13 @@ export function createNotificationDispatchTick(
             batchThreadState = body.batchThreadState;
           }
         } catch (error) {
+          if (
+            isExecutionFenceRefusal(error) ||
+            isMutationEpochMismatchError(error)
+          ) {
+            result.failed += records.length;
+            continue;
+          }
           for (const record of records) {
             const expected = selected.get(record);
             if (expected)

@@ -3152,3 +3152,50 @@ describe('host activation pending schedule status', () => {
     expect(result).toMatchObject({ deferred: 1, fired: 0, failed: 0 });
   });
 });
+
+it('preserves the producer epoch across the due-list await and start callback', async () => {
+  const store = new FakeStore();
+  store.seed(workflowSchedule());
+  let epoch = 1;
+  const due = store.listDueSchedules.bind(store);
+  store.listDueSchedules = async (...args) => {
+    epoch = 2;
+    return due(...args);
+  };
+  const claim = vi.spyOn(store, 'claimScheduleFire');
+  const start = vi.fn(async ({ runId }) => ({ runId }));
+  await createScheduleTick({
+    store,
+    mutationEpoch: () => epoch,
+    start,
+    now: () => NOW,
+  })();
+  expect(claim).toHaveBeenCalledWith(
+    expect.objectContaining({ mutationEpoch: 1 }),
+  );
+  expect(start).toHaveBeenCalledWith(
+    expect.objectContaining({ mutationEpoch: 1 }),
+  );
+});
+
+it('retries a deferred signal with its original producer epoch after a later tick captures another epoch', async () => {
+  const store = new FakeStore();
+  store.seed(threadedSchedule());
+  let epoch = 1;
+  const observed: (number | undefined)[] = [];
+  const tick = createScheduleTick({
+    store,
+    mutationEpoch: () => epoch,
+    start: vi.fn(),
+    now: () => NOW,
+    status: pendingTargetReceipt,
+    signalAgent: async (input) => {
+      observed.push(input.mutationEpoch);
+      throw new Error('target receipt unavailable');
+    },
+  });
+  await tick();
+  epoch = 2;
+  await tick();
+  expect(observed).toEqual([1, 1]);
+});

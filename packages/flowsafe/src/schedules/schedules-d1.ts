@@ -84,7 +84,7 @@ export type ScheduleStatement = SignalStatement;
 /** The D1 database subset the schedules domain uses (workers-types-free). */
 export type ScheduleDatabase = SignalDatabase;
 
-export interface ScheduleFireClaim {
+export interface ScheduleFireClaim extends MutationEpochContext {
   scheduleId: string;
   expectedNextFireAt: number;
   newNextFireAt: number;
@@ -226,6 +226,7 @@ const SCHEDULE_COLUMNS = [
 
 type ScheduleMutationOperation =
   | 'create'
+  | 'fire'
   | 'update'
   | 'pause'
   | 'resume'
@@ -436,7 +437,10 @@ function captureSchedulePatch(patch: ScheduleUpdate): Partial<ScheduleRow> {
 
 function requiresOpenFence(operation: ScheduleMutationOperation): boolean {
   return (
-    operation === 'create' || operation === 'update' || operation === 'resume'
+    operation === 'create' ||
+    operation === 'fire' ||
+    operation === 'update' ||
+    operation === 'resume'
   );
 }
 
@@ -1174,86 +1178,93 @@ export class D1SchedulesStorage extends SchedulesStorage {
     newNextFireAt: number,
     lastFireAt: number,
     lastRunId: string,
+    context?: MutationEpochContext,
   ): Promise<boolean> {
-    await this.#ensureSchema();
-    // The CAS: advance only if nextFireAt still equals what the caller read AND
-    // the row is still ACTIVE. Two concurrent ticks over one due schedule both
-    // read nextFireAt = T; the first UPDATE advances it to T2 (changes = 1 ->
-    // true), the second's `nextFireAt = T` no longer matches (changes = 0 ->
-    // false). This serializes one claim under concurrent ticks on real workerd +
-    // D1 (spike D-S1); it does not claim end-to-end exactly-once dispatch. The
-    // `status = 'active'` guard closes the pause race: a
-    // schedule paused AFTER a tick read it as due but BEFORE this claim (status
-    // flips, nextFireAt unchanged) fails the CAS here, so a just-paused schedule
-    // does not fire one last time.
-    const result = await this.#db
-      .prepare(
-        `UPDATE ${this.#schedules}
-         SET nextFireAt = ?, lastFireAt = ?, lastRunId = ?, updatedAt = ?
-         WHERE id = ? AND nextFireAt = ? AND status = 'active'
-           AND deletionRequestedAt IS NULL`,
-      )
-      .bind(
-        newNextFireAt,
-        lastFireAt,
-        lastRunId,
-        Date.now(),
-        id,
-        expectedNextFireAt,
-      )
-      .run();
-    return d1Changes(result) === 1;
+    const epoch = normalizeMutationEpoch(context?.mutationEpoch);
+    const prepared = await this.#prepareMutation(epoch, 'fire');
+    const results = await this.#executeMutation(
+      prepared,
+      [
+        ...this.#mutationDiagnostics(),
+        this.#db
+          .prepare(
+            `UPDATE ${this.#schedules}
+         SET nextFireAt = ?13, lastFireAt = ?14, lastRunId = ?15, updatedAt = ?16
+         WHERE id = ?17 AND nextFireAt = ?18 AND status = 'active'
+           AND deletionRequestedAt IS NULL AND ${scheduleMutationGuard(prepared)}
+         RETURNING id`,
+          )
+          .bind(
+            ...prepared.bindings,
+            newNextFireAt,
+            lastFireAt,
+            lastRunId,
+            Date.now(),
+            id,
+            expectedNextFireAt,
+          ),
+      ],
+      [2],
+    );
+    return results[2].rows.length === 1;
   }
 
   /** Atomically claim one due fire and persist its recoverable dispatch row. */
   async claimScheduleFire(claim: ScheduleFireClaim): Promise<boolean> {
-    await this.#ensureSchema();
-    const batch = this.#db.batch?.bind(this.#db);
-    if (!batch) {
-      throw new Error(
-        'D1SchedulesStorage requires database.batch() for atomic schedule fire claims',
-      );
-    }
-    const { trigger } = claim;
-    const [claimed] = await batch([
-      this.#db
-        .prepare(
-          `UPDATE ${this.#schedules}
-           SET nextFireAt = ?, lastFireAt = ?, lastRunId = ?, updatedAt = ?
-           WHERE id = ? AND nextFireAt = ? AND status = 'active'
-             AND deletionRequestedAt IS NULL`,
-        )
-        .bind(
-          claim.newNextFireAt,
-          claim.actualFireAt,
-          claim.runId,
-          Date.now(),
-          claim.scheduleId,
-          claim.expectedNextFireAt,
-        ),
-      this.#db
-        .prepare(
-          `INSERT INTO ${this.#triggers} (
-             id, scheduleId, runId, scheduledFireAt, actualFireAt, outcome,
-             error, triggerKind, parentTriggerId, metadata
-           )
-           SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-           WHERE changes() = 1`,
-        )
-        .bind(
-          trigger.id,
-          trigger.scheduleId,
-          trigger.runId,
-          trigger.scheduledFireAt,
-          trigger.actualFireAt,
-          trigger.outcome,
-          trigger.error ?? null,
-          trigger.triggerKind ?? 'schedule-fire',
-          trigger.parentTriggerId ?? null,
-          jsonOrNull(trigger.metadata),
-        ),
-    ]);
-    return d1Changes(claimed as { meta?: { changes?: number } }) === 1;
+    const epoch = normalizeMutationEpoch(claim.mutationEpoch);
+    const captured = { ...claim, trigger: { ...claim.trigger } };
+    const triggerMetadata = jsonOrNull(
+      epoch === undefined
+        ? captured.trigger.metadata
+        : { ...captured.trigger.metadata, mutationEpoch: epoch },
+    );
+    const prepared = await this.#prepareMutation(epoch, 'fire');
+    const { trigger } = captured;
+    const results = await this.#executeMutation(
+      prepared,
+      [
+        ...this.#mutationDiagnostics(),
+        this.#db
+          .prepare(
+            `UPDATE ${this.#schedules}
+         SET nextFireAt = ?13, lastFireAt = ?14, lastRunId = ?15, updatedAt = ?16
+         WHERE id = ?17 AND nextFireAt = ?18 AND status = 'active'
+           AND deletionRequestedAt IS NULL AND ${scheduleMutationGuard(prepared)}
+         RETURNING id`,
+          )
+          .bind(
+            ...prepared.bindings,
+            captured.newNextFireAt,
+            captured.actualFireAt,
+            captured.runId,
+            Date.now(),
+            captured.scheduleId,
+            captured.expectedNextFireAt,
+          ),
+        this.#db
+          .prepare(
+            `INSERT INTO ${this.#triggers} (
+           id, scheduleId, runId, scheduledFireAt, actualFireAt, outcome,
+           error, triggerKind, parentTriggerId, metadata
+         ) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE changes() = 1
+         RETURNING id`,
+          )
+          .bind(
+            trigger.id,
+            trigger.scheduleId,
+            trigger.runId,
+            trigger.scheduledFireAt,
+            trigger.actualFireAt,
+            trigger.outcome,
+            trigger.error ?? null,
+            trigger.triggerKind ?? 'schedule-fire',
+            trigger.parentTriggerId ?? null,
+            triggerMetadata,
+          ),
+      ],
+      [2, 3],
+    );
+    return results[2].rows.length === 1;
   }
 
   /**
@@ -1268,30 +1279,40 @@ export class D1SchedulesStorage extends SchedulesStorage {
     triggerId: string,
     now = Date.now(),
     leaseMs = 60_000,
+    context?: MutationEpochContext,
   ): Promise<ScheduleAgentDispatchState> {
-    await this.#ensureSchema();
-    const claimed = await this.#db
-      .prepare(
-        `UPDATE ${this.#triggers}
-         SET metadata = json_set(
-           COALESCE(metadata, '{}'),
-           '$.dispatchState', 'executing',
-           '$.dispatchLeaseUntil', ?
-         )
-         WHERE id = ? AND scheduleId = ? AND outcome = 'deferred'
-           AND (
-             json_extract(metadata, '$.dispatchState') = 'prepared'
-             OR (
-               json_extract(metadata, '$.dispatchState') = 'executing'
-               AND COALESCE(
-                 json_extract(metadata, '$.dispatchLeaseUntil'), 0
-               ) <= ?
-             )
-           )`,
-      )
-      .bind(now + leaseMs, triggerId, scheduleId, now)
-      .run();
-    if (d1Changes(claimed) === 1) return { state: 'ready' };
+    const epoch = normalizeMutationEpoch(context?.mutationEpoch);
+    const prior = await this.agentScheduleDispatchState(scheduleId, triggerId);
+    if (prior.state !== 'pending') return prior;
+    const prepared = await this.#prepareMutation(epoch, 'fire');
+    const results = await this.#executeMutation(
+      prepared,
+      [
+        ...this.#mutationDiagnostics(),
+        this.#db
+          .prepare(
+            `UPDATE ${this.#triggers}
+         SET metadata = json_set(COALESCE(metadata, '{}'),
+           '$.dispatchState', 'executing', '$.dispatchLeaseUntil', ?13)
+         WHERE id = ?14 AND scheduleId = ?15 AND outcome = 'deferred'
+           AND json_extract(metadata, '$.mutationEpoch') IS ?1
+           AND (json_extract(metadata, '$.dispatchState') = 'prepared'
+             OR (json_extract(metadata, '$.dispatchState') = 'executing'
+               AND COALESCE(json_extract(metadata, '$.dispatchLeaseUntil'), 0) <= ?16))
+           AND ${scheduleMutationGuard(prepared)}
+         RETURNING id`,
+          )
+          .bind(
+            ...prepared.bindings,
+            now + leaseMs,
+            triggerId,
+            scheduleId,
+            now,
+          ),
+      ],
+      [2],
+    );
+    if (results[2].rows.length === 1) return { state: 'ready' };
     return this.agentScheduleDispatchState(scheduleId, triggerId);
   }
 

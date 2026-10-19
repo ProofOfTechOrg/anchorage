@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+export const REMOTE_STEP_TABLE = 'flowsafe_remote_step_invocations';
+
 const NOTIFICATION_TIMESTAMP_COLUMNS = [
   'deliverAt',
   'summaryAt',
